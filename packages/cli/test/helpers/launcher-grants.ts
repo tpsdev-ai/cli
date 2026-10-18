@@ -95,10 +95,10 @@ export type NonoProbeVerdict =
  *
  *   - the marker, exit 0: nono ran and the read was denied — "denied";
  *   - the nonce, exit 0: the default policy grants read there — "granted";
- *   - non-zero with no output: "refused" — nono did not run the command, with
- *     its stderr; a status alone cannot establish that nono started, so this is
- *     never read as "granted" (on macOS, a default group's grant overlapping
- *     the state root HOME/.nono shows up this way);
+ *   - non-zero with no output: "refused" — the probe produced no output and
+ *     exited nonzero, with its stderr; that cannot show whether nono started
+ *     its command, so this is never read as "granted" (on macOS, a default
+ *     group's grant overlapping the state root HOME/.nono appears this way);
  *   - anything else throws: an unknown answer is never "not granted".
  *
  * Neither the nonce nor the whole marker appears in nono's argv, so nono
@@ -171,10 +171,11 @@ export function realNonoHomeBaseCandidates(platform: NodeJS.Platform = process.p
  * A base for a fixture HOME that REAL nono confines (cli#516): a writable
  * directory outside every launcher grant, as sandboxHomeBase() requires, where
  * real nono (probeNonoBuiltinRead) denies a sandboxed read of a scratch file
- * under it. Inside a granted base the fixture tests nothing real: nono refuses
- * to start (the grant overlaps its state root HOME/.nono), or the launcher
- * refuses the profile (nono reports read access to the fixture HOME's
- * credential files). A candidate is probed only once it is a writable directory
+ * under it. Inside a granted base the fixture tests nothing real: the probe
+ * produces no output with a nonzero exit (a fixture HOME under a grant that
+ * overlaps nono's state root appears this way), or the launcher refuses the
+ * profile (nono reports read access to the fixture HOME's credential files).
+ * A candidate is probed only once it is a writable directory
  * outside the launcher's grants; when none qualifies this throws, naming each
  * candidate and what ruled it out. An unknown probe answer throws at once
  * rather than moving on to the next candidate.
@@ -201,7 +202,7 @@ export function realNonoHomeBase(
     rejected.push(
       verdict.kind === "granted"
         ? `${candidate}: nono's default policy lets a sandboxed process read a file under it`
-        : `${candidate}: nono refused to start with a fixture HOME under it: ${verdict.stderr || "(no stderr)"}`,
+        : `${candidate}: the probe produced no output and exited nonzero: ${verdict.stderr || "(no stderr)"}`,
     );
   }
   throw new Error(

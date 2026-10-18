@@ -247,14 +247,14 @@ describe("realNonoHomeBase", () => {
     }
   });
 
-  test("rejects a candidate where nono refuses to start, quoting its stderr, and returns the next one", () => {
+  test("rejects a candidate whose probe produces no output with a nonzero exit, quoting its stderr, and returns the next one", () => {
     const { parent, dirs } = probeCandidates("refused", "free");
     try {
       const nono = fakeProbeNono(parent);
       const env = { ...process.env, FAKE_REFUSED_UNDER: realpathSync(dirs.refused) };
       expect(realNonoHomeBase(nono, [dirs.refused, dirs.free], env)).toBe(realpathSync(dirs.free));
       expect(() => realNonoHomeBase(nono, [dirs.refused], env)).toThrow(
-        /refused: nono refused to start with a fixture HOME under it: nono: Sandbox initialization failed: fake refusal/,
+        /refused: the probe produced no output and exited nonzero: nono: Sandbox initialization failed: fake refusal/,
       );
     } finally {
       rmSync(parent, { recursive: true, force: true });
@@ -285,7 +285,7 @@ describe("realNonoHomeBase", () => {
       };
       const missing = join(parent, "missing");
       expect(() => realNonoHomeBase(nono, [dirs.granted, dirs.refused, "/tmp", missing], env)).toThrow(
-        /granted: nono's default policy lets .*; .*refused: nono refused to start .*fake refusal; \/tmp: inside the launcher's '\/tmp' grant; .*missing: not a writable directory/,
+        /granted: nono's default policy lets .*; .*refused: the probe produced no output and exited nonzero: .*fake refusal; \/tmp: inside the launcher's '\/tmp' grant; .*missing: not a writable directory/,
       );
     } finally {
       rmSync(parent, { recursive: true, force: true });

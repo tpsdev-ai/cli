@@ -19,8 +19,16 @@ import {
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
-import { NONO_MIN_VERSION, nonoVersion, versionAtLeast } from "../src/utils/nono.js";
-import { onStart, onStop, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
+import {
+  NONO_MIN_VERSION,
+  agentLaunchGrants,
+  approveRuntimeNonoOptions,
+  buildNonoArgs,
+  nonoVersion,
+  runtimeNonoProfile,
+  versionAtLeast,
+} from "../src/utils/nono.js";
+import { checkoutWorktree, onStart, onStop, WorktreeLifecycleError, worktreeCommonDir } from "../src/utils/agent-lifecycle.js";
 import { realNonoHomeBase, sandboxHomeBase, NONO_PROBE_DENIED_PREFIX } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -793,15 +801,17 @@ function seedRealNonoProfiles(home: string): void {
   // The monorepo root (packages/cli/test -> the checkout), where the hoisted
   // node_modules the CLI resolves its dependencies from lives.
   const repoRoot = resolve(import.meta.dir, "..", "..", "..");
-  // On macOS, these exact directories rather than their ancestors: a read
-  // grant is recursive, so an ancestor grant reaches every sibling of the
-  // checkout and the interpreter. With bun under ~/.bun that is /Users and the
-  // operator's whole home, the fixture HOME's base among them, which the
-  // launcher then (correctly) refuses. Under macOS Seatbelt, node and bun run a
-  // script and a binary below an exact grant without one (measured). On the
-  // Linux Docker lane /usr is granted and is an ancestor of the interpreter's
-  // directory; that lane's grants are otherwise unchanged: /app has no ancestor
-  // below /, and the oven/bun image's /usr/local/bin already sits under /usr.
+  // On macOS, the checkout, interpreter and ~/.bun roots are granted as exact
+  // directories rather than their ancestors (the fixed SYSTEM_READ roots are
+  // ancestor grants by design): a read grant is recursive, so an ancestor of
+  // the checkout or interpreter reaches every sibling of it. With bun under
+  // ~/.bun that would be /Users and the operator's whole home, the fixture
+  // HOME's base among them, which the launcher then (correctly) refuses. Under
+  // macOS Seatbelt, node and bun run a script and a binary below an exact grant
+  // without one (measured). On the Linux Docker lane /usr is granted and is an
+  // ancestor of the interpreter's directory; that lane's grants are otherwise
+  // unchanged: /app has no ancestor below /, and the oven/bun image's
+  // /usr/local/bin already sits under /usr.
   const read = [
     ...new Set([
       ...SYSTEM_READ,
@@ -885,7 +895,7 @@ const realNonoSuite = realNono ? describe : describe.skip;
 realNonoSuite(
   realNono ? `cli#516 — real nono (${realNono})` : `cli#516 — real nono SKIPPED: ${realNonoSkip}`,
   () => {
-    test("the base repository is a repo outside the sandbox and unreadable inside it", () => {
+    test("the launch's grants read the worktree and deny an untracked base-repository file", () => {
       const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.root, "base");
@@ -895,64 +905,76 @@ realNonoSuite(
         g(["init", "-q"]);
         g(["config", "user.email", "agent-a@tps.dev"]);
         g(["config", "user.name", "agent-a"]);
-        writeFileSync(join(base, "README.md"), "# base\n");
-        g(["add", "README.md"]);
+        writeFileSync(join(base, "checked-out.txt"), "from the base repository\n");
+        g(["add", "checked-out.txt"]);
         g(["commit", "-qm", "init"]);
+        // Untracked in the base repository's working tree, never committed.
+        writeFileSync(join(base, "untracked-in-base.txt"), "base-untracked\n");
+        rmSync(sb.ws, { recursive: true, force: true });
 
-        const profileDir = join(sb.home, ".config", "nono", "profiles");
-        for (const name of ["tps-base.json", "tps-agent-run.json"]) {
-          writeFileSync(
-            join(profileDir, name),
-            readFileSync(resolve(import.meta.dir, "../nono-profiles", name), "utf-8"),
-          );
-        }
+        // Create the same deferred worktree the launch's parent creates, and
+        // resolve its git metadata the same way, so the grant set below is
+        // built from the real worktree layout.
+        g(["-C", base, "worktree", "add", "--no-checkout", sb.ws, "--detach"]);
+        const gitDir = g(["-C", sb.ws, "rev-parse", "--absolute-git-dir"]).stdout.trim();
+        expect(gitDir).not.toBe("");
+        const gitCommonDir = worktreeCommonDir(gitDir);
+        checkoutWorktree(sb.ws);
 
-        // Outside: the base repo is a repo (the default the parent sees).
-        const outside = g(["-C", base, "rev-parse", "--is-inside-work-tree"]);
-        expect(outside.stdout.trim()).toBe("true");
+        seedRealNonoProfiles(sb.home);
+        // The launch grants ~/.bun; create it so nono does not warn on stdout.
+        mkdirSync(join(sb.home, ".bun"), { recursive: true });
+        const env = { ...process.env, HOME: sb.home, XDG_STATE_HOME: join(sb.root, "nono-state") };
+        const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        writeFileSync(cfg, agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"));
 
-        const nonoRun = (cmd: string[]) =>
-          spawnSync(
-            realNono as string,
-            [
-              "run",
-              "-s",
-              "--profile",
-              join(profileDir, "tps-agent-run.json"),
-              "--workdir",
-              sb.ws,
-              "--allow",
-              sb.ws,
-              "--",
-              ...cmd,
-            ],
-            {
-              cwd: sb.ws,
-              encoding: "utf-8",
-              env: { ...process.env, HOME: sb.home, XDG_STATE_HOME: join(sb.root, "nono-state") },
-            },
-          );
+        // The grants and profile are built by the same functions the launch
+        // uses, so this cannot pass against a grant set the launch does not
+        // pass. The payload is a probe instead of the re-exec.
+        const grants = agentLaunchGrants({
+          configPath: cfg,
+          workspace: sb.ws,
+          launchId: "probe",
+          runtime: "codex",
+          home: sb.home,
+          env,
+          mailDir: join(sb.home, ".tps", "mail"),
+          tmpDir: sb.tmp,
+          agentDir: join(sb.home, ".tps", "agents", "probe"),
+          worktreeGit: { gitDir, gitCommonDir },
+        });
+        const approval = approveRuntimeNonoOptions(
+          "codex",
+          { ...grants, workdir: sb.ws, cwd: sb.run },
+          env,
+          "probe",
+        );
+        expect(approval.refusal).toBeNull();
+        for (const dir of approval.runtimeDirectories) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-        // One successful real-nono run proves both: it reads the granted
-        // control file, and the base-repository read in the same sandbox is
-        // denied with a distinct marker. A nono that failed to start, or that
-        // granted the base read, yields neither line and fails below.
-        const controlFile = join(sb.ws, "control-inside");
-        writeFileSync(controlFile, "control-nonce\n");
         const token = randomBytes(8).toString("hex");
         const deniedMarker = `${NONO_PROBE_DENIED_PREFIX}${token}`;
-        const probe = nonoRun([
-          "sh",
-          "-c",
-          `cat "$1" 2>/dev/null || echo CONTROL-UNREADABLE; cat "$2" 2>/dev/null || echo "${NONO_PROBE_DENIED_PREFIX}$3"`,
-          "sh",
-          controlFile,
-          join(base, "README.md"),
-          token,
-        ]);
+        const probe = spawnSync(
+          realNono as string,
+          buildNonoArgs(
+            runtimeNonoProfile("codex"),
+            approval.options,
+            [
+              "sh",
+              "-c",
+              `cat "$1" || echo CONTROL-UNREADABLE; cat "$2" 2>/dev/null || echo "${NONO_PROBE_DENIED_PREFIX}$3"`,
+              "sh",
+              join(sb.ws, "checked-out.txt"),
+              join(base, "untracked-in-base.txt"),
+              token,
+            ],
+            env,
+          ),
+          { cwd: sb.run, encoding: "utf-8", env },
+        );
         const lines = probe.stdout.trim().split("\n");
         expect(probe.status, `nono run exited ${probe.status}: ${probe.stderr}`).toBe(0);
-        expect(lines[0]).toBe("control-nonce");
+        expect(lines[0]).toBe("from the base repository");
         expect(lines[1]).toBe(deniedMarker);
       } finally {
         rmSync(sb.root, { recursive: true, force: true });

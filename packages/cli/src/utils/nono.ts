@@ -275,12 +275,12 @@ export const BUN_TEMP_DIR = "/tmp";
  * cache, the running interpreter's own directory, plus the system roots. One
  * definition so `agent start` and `mail watch` cannot drift apart (cli#341 S1b).
  */
-export function harnessReadPaths(): string[] {
+export function harnessReadPaths(home: string = homedir()): string[] {
   // NOTE: no identity directory here. The identity dir holds every agent's key
   // on a shared-UID host; granting it read would let one agent read all others.
   // The launch grants exactly the launching agent's own key via
   // harnessReadFiles(agentId) → --read-file (cli#351 r4).
-  return [join(homedir(), ".bun"), dirname(process.execPath), ...systemReadPaths()];
+  return [join(home, ".bun"), dirname(process.execPath), ...systemReadPaths()];
 }
 
 /**
@@ -288,13 +288,67 @@ export function harnessReadPaths(): string[] {
  * the public key beside it (the runtime resolves `~/.tps/identity/<id>.key`;
  * the `.pub` is granted too since it is the same agent's own material).
  */
-export function harnessReadFiles(agentId?: string): string[] {
+export function harnessReadFiles(agentId?: string, home: string = homedir()): string[] {
   const files = [...systemReadFiles()];
   if (agentId) {
-    const idDir = join(homedir(), ".tps", "identity");
+    const idDir = join(home, ".tps", "identity");
     files.push(join(idDir, `${agentId}.key`), join(idDir, `${agentId}.pub`));
   }
   return files;
+}
+
+export interface AgentLaunchGrantInput {
+  configPath: string;
+  workspace: string;
+  launchId: string;
+  runtime?: string;
+  /** The HOME the launch runs under; defaults to this process's. */
+  home?: string;
+  /** The environment runtime grants resolve against; defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
+  mailDir: string;
+  tmpDir: string;
+  agentDir: string;
+  /**
+   * A worktree this launch created with its checkout deferred. `gitDir` is
+   * writable (checkout writes index and HEAD there); `gitCommonDir` is the
+   * base repository's metadata directory, read-only. The base repository's
+   * working tree is not granted.
+   */
+  worktreeGit?: { gitDir: string; gitCommonDir: string };
+}
+
+/**
+ * The nono grants for a sandboxed agent launch. Shared by the launch and its
+ * fixtures so a test cannot assert a grant set the launch does not pass.
+ */
+export function agentLaunchGrants(
+  input: AgentLaunchGrantInput,
+): { read: string[]; readFiles: string[]; allowFiles: string[]; allow: string[] } {
+  const home = input.home ?? homedir();
+  const runtimeGrants = runtimeNonoOptions(input.runtime, input.env);
+  return {
+    read: [
+      ...new Set([
+        ...harnessReadPaths(home),
+        dirname(input.configPath),
+        ...(input.worktreeGit ? [input.worktreeGit.gitCommonDir] : []),
+      ]),
+    ],
+    readFiles: harnessReadFiles(input.launchId, home),
+    allowFiles: runtimeGrants.allowFiles ?? [],
+    allow: [
+      ...new Set([
+        input.mailDir,
+        input.tmpDir,
+        BUN_TEMP_DIR,
+        input.workspace,
+        input.agentDir,
+        ...(runtimeGrants.allow ?? []),
+        ...(input.worktreeGit ? [input.worktreeGit.gitDir] : []),
+      ]),
+    ],
+  };
 }
 
 export function runtimeNonoProfile(runtime?: string): NonoProfile {

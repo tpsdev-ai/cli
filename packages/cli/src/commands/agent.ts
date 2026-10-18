@@ -19,15 +19,13 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, resolve as resolvePathMod } from "node:path";
+import { join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
   isInteractiveTty,
   isSupervised,
-  harnessReadPaths,
-  harnessReadFiles,
-  BUN_TEMP_DIR,
+  agentLaunchGrants,
   runtimeNonoOptions,
   runtimeNonoProfile,
   approveRuntimeNonoOptions,
@@ -1241,29 +1239,17 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // and releases the child over its own socket only after `nono ps`
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
-            const runtimeGrants = runtimeNonoOptions(selectedRuntime);
             const launchOptions = {
               workdir: config.workspace,
-              // CHANGE (cli#341 S1b): this used to grant a read of the
-              // filesystem root. A root grant is refused outright by nono
-              // 0.70+ (exit 1). Use the explicit toolchain read set instead —
-              // the macOS roots Kern validated, and their Linux equivalents
-              // (systemReadPaths()).
-              // Read the toolchain roots plus the directory the config was read
-              // from, so the child can re-read `--config` inside the sandbox
-              // (cli#516). This adds read access to that directory; when it is
-              // the agent dir, the `allow` grant below also makes it writable.
-              read: [...new Set([...harnessReadPaths(), dirname(configPath)])],
-              // Exactly this agent's own identity files, not the shared
-              // identity directory (cli#351 r4).
-              readFiles: harnessReadFiles(launchId),
-              allowFiles: runtimeGrants.allowFiles,
-              // Bun's own temp dir is /tmp regardless of TMPDIR, and an
-              // unreadable temp dir is fatal to it — grant BOTH /tmp and the
-              // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
-              // to /var/folders/…, so /tmp would otherwise not be granted at
-              // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-              allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
+              ...agentLaunchGrants({
+                configPath,
+                workspace: config.workspace,
+                launchId,
+                runtime: selectedRuntime,
+                mailDir,
+                tmpDir,
+                agentDir,
+              }),
             };
             const profile = runtimeNonoProfile(selectedRuntime);
             let approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
@@ -1279,24 +1265,25 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // With deferCheckout: true, when a base repository exists and the
             // workspace is absent, the parent creates the worktree without
             // checkout; the sandboxed child checks it out (cli#516). Grant read
-            // of the base repository and write of the worktree's git directory.
+            // of the base repository's git metadata and write of the worktree's
+            // git directory, not the base repository's working tree.
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
             let worktreeGitDir: string | undefined;
-            let worktreeBaseRepo: string | undefined;
+            let worktreeGitCommonDir: string | undefined;
             if (selectedRuntime) {
               try {
                 const startResult = onStart(launchId, config.workspace, { deferCheckout: true });
                 worktreeCreated = startResult.changed;
                 worktreeGitDir = startResult.gitDir;
-                worktreeBaseRepo = startResult.baseRepo;
+                worktreeGitCommonDir = startResult.gitCommonDir;
               } catch (err) {
                 console.error(`❌ ${(err as Error).message}`);
                 process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
               }
             }
-            if (worktreeGitDir && worktreeBaseRepo) {
-              launchOptions.read.push(worktreeBaseRepo);
+            if (worktreeGitDir && worktreeGitCommonDir) {
+              launchOptions.read.push(worktreeGitCommonDir);
               launchOptions.allow.push(worktreeGitDir);
               const recheck = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
               if (recheck.refusal) {

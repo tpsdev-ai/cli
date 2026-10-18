@@ -230,9 +230,12 @@ export interface AgentLifecycleResult {
    * (cli#516): the caller needs it to grant the checking-out side access.
    */
   gitDir?: string;
-  /** Absolute path of the base repository the worktree belongs to. Present in
-   *  the same case as `gitDir`. */
-  baseRepo?: string;
+  /**
+   * Absolute path of the worktree's git common directory — the base
+   * repository's metadata that `gitDir`'s `commondir` file points to. Present
+   * in the same case as `gitDir`.
+   */
+  gitCommonDir?: string;
 }
 
 /**
@@ -411,7 +414,41 @@ export function onStart(
       `worktree git directory could not be resolved for ${workspace}: ${gitDir.stderr || gitDir.stdout || "git rev-parse produced no output"}`,
     );
   }
-  return { changed: true, reason: "worktree created; checkout deferred", gitDir: gitDir.stdout, baseRepo };
+  // A linked worktree's git directory holds a `commondir` file naming the
+  // base repository's metadata directory. Git needs that metadata, not the
+  // base repository's working tree.
+  let commonDir: string;
+  try {
+    commonDir = worktreeCommonDir(gitDir.stdout);
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `worktree common git directory could not be resolved for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+  return {
+    changed: true,
+    reason: "worktree created; checkout deferred",
+    gitDir: gitDir.stdout,
+    gitCommonDir: commonDir,
+  };
+}
+
+/**
+ * Resolve a linked worktree's common git directory from its git directory
+ * (cli#516). The git directory holds a `commondir` file naming the base
+ * repository's metadata directory (objects, refs, config) relative to it.
+ */
+export function worktreeCommonDir(gitDir: string): string {
+  let raw: string;
+  try {
+    raw = readFileSync(join(gitDir, "commondir"), "utf-8").trim();
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `worktree common git directory could not be read for ${gitDir}: ${(err as Error).message}`,
+    );
+  }
+  if (!raw) throw new WorktreeLifecycleError(`the commondir file in ${gitDir} is empty`);
+  return resolve(gitDir, raw);
 }
 
 /**
