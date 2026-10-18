@@ -912,9 +912,9 @@ realNonoSuite(
         writeFileSync(join(base, "untracked-in-base.txt"), "base-untracked\n");
         rmSync(sb.ws, { recursive: true, force: true });
 
-        // Create the same deferred worktree the launch's parent creates, and
-        // resolve its git metadata the same way, so the grant set below is
-        // built from the real worktree layout.
+        // Create a deferred worktree as the launch's parent does, and resolve
+        // its git metadata the same way, so the grant set below is built from
+        // the real worktree layout.
         g(["-C", base, "worktree", "add", "--no-checkout", sb.ws, "--detach"]);
         const gitDir = g(["-C", sb.ws, "rev-parse", "--absolute-git-dir"]).stdout.trim();
         expect(gitDir).not.toBe("");

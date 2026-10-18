@@ -1266,7 +1266,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // workspace is absent, the parent creates the worktree without
             // checkout; the sandboxed child checks it out (cli#516). Grant read
             // of the base repository's git metadata and write of the worktree's
-            // git directory, not the base repository's working tree.
+            // git directory, rather than the base repository's working tree.
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
             let worktreeGitDir: string | undefined;

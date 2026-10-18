@@ -312,8 +312,8 @@ export interface AgentLaunchGrantInput {
   /**
    * A worktree this launch created with its checkout deferred. `gitDir` is
    * writable (checkout writes index and HEAD there); `gitCommonDir` is the
-   * base repository's metadata directory, read-only. The base repository's
-   * working tree is not granted.
+   * base repository's metadata directory, read-only. This grant does not
+   * include the base repository's working tree.
    */
   worktreeGit?: { gitDir: string; gitCommonDir: string };
 }
