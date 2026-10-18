@@ -145,10 +145,9 @@ function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
     mkdirSync(d, { recursive: true });
   }
   writeProfilePair(join(home, ".config", "nono", "profiles"), "tps-agent-run");
-  writeFileSync(
-    join(home, ".tps", "identity", "probe.key"),
-    "fixture-key\n",
-  );
+  // A runtime that starts with the fixture HOME reads this key; a placeholder
+  // string makes it exit before the case under test can observe the launch.
+  writeFileSync(join(home, ".tps", "identity", "probe.key"), randomBytes(32));
   writeFileSync(
     join(home, ".tps", "identity", "probe.pub"),
     "fixture-pub\n",

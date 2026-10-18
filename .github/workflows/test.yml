@@ -530,6 +530,13 @@ jobs:
       - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
         with:
           bun-version: "1.3.10"
+      # The gate imports this tree's launch-args helper, which imports the
+      # workspace agent package. Without the install and build, bun resolves a
+      # published @tpsdev-ai/agent instead of this tree's.
+      - name: Install workspace dependencies
+        run: bun install --frozen-lockfile
+      - name: Build agent package
+        run: cd packages/agent && bun run build
       - name: Resolve the pinned nono commit
         id: pin
         run: |
