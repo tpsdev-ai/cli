@@ -2,13 +2,16 @@
  * flair-task-loop.ts — Polls OrgEventCatchup for task.assigned events
  * targeting this agent. Runtime-agnostic: works without OpenClaw.
  *
- * CURSOR. The loop reads the catch-up feed through `FlairClient.getEventsSince`
- * (the validated reader in org-event-read.ts, cli#619), always sending its
- * position as Flair's `after` cursor, so Flair's own watermark for the agent
- * never chooses where reading starts. The position is persisted in
- * `~/.tps/cursors/<agentId>-task-loop.json` as `{ position, updatedAt }` and
- * replaced atomically (a temporary file in the same directory, fsynced, then
- * renamed over it). With no usable cursor file, the loop sets the position to
+ * CURSOR. The loop reads `agentId`'s catch-up feed through
+ * `FlairClient.getEventsSince` (the validated reader in org-event-read.ts,
+ * cli#619), always sending its position as Flair's `after` cursor, so Flair's
+ * own watermark for the agent never chooses where reading starts. The position
+ * is persisted in `~/.tps/cursors/<loopId>-task-loop.json` as
+ * `{ position, updatedAt }` and replaced atomically (a temporary file in the
+ * same directory, fsynced, then renamed over it). The task and review loops use
+ * different cursor filenames; callers that omit `loopId` use the `agentId` cursor. It must
+ * be a single safe filename component (see `LOOP_ID_PATTERN`); `startTaskLoop` refuses any other with
+ * `InvalidLoopIdError` before reading or writing a cursor. With no usable cursor file, the loop sets the position to
  * FIRST_BOOT_LOOKBACK_MS before now, once, and does not read the feed until
  * that position is saved: a failed save is logged by name and retried with
  * backoff, with the same position, and `stop()` ends the retrying. A legacy
@@ -35,8 +38,9 @@
  * memory, so the saved position stays behind it until a later save succeeds; a
  * restart before that replays the events in between rather than skipping them.
  *
- * SAFETY. The saved position never passes a task before its handler succeeds,
- * provided that once saved, the cursor file is not removed or corrupted; the
+ * SAFETY. The saved position never passes a task before its handler succeeds or
+ * the task is recorded and skipped (BOUNDED RETRIES below), provided that once
+ * saved, the cursor file is not removed or corrupted; the
  * feed only appends (a new event sorts after those already served), with
  * positions within MAX_POSITION_SKEW_MS of the server's time; and an event does
  * not expire before its handler succeeds.
@@ -50,6 +54,14 @@
  * handler returning and the save that follows replays that task, as does a
  * restart after a failed save if it occurs before a later successful save.
  * Handlers must be idempotent.
+ *
+ * BOUNDED RETRIES. Classified terminal failures (`PermanentEventError`) and
+ * other failures that exhaust the caller's `maxAttempts` are recorded and marked
+ * handled; the cursor advances past them
+ * subject to the existing skew and persistence rules. Within a running loop
+ * whose handler attempts return, no event holds the cursor beyond the attempt
+ * bound. Attempts reset on restart; a review-request subprocess with no timeout
+ * can hold a single attempt. With `maxAttempts` unset the retry is unbounded.
  *
  * Usage:
  *   import { startTaskLoop, TaskHandler } from "./flair-task-loop.js";
@@ -95,9 +107,44 @@ function cursorDir(): string {
   return join(homeDir(), ".tps", "cursors");
 }
 
-/** The task loop's cursor file for `agentId`. */
-export function taskLoopCursorPath(agentId: string): string {
-  return join(cursorDir(), `${agentId}-task-loop.json`);
+/**
+ * The allowed set for `loopId`: a single filename component of 1..79 characters
+ * from `A-Z a-z 0-9 . _ -`, excluding the two dot components `.` and `..`. It
+ * names the cursor file `<loopId>-task-loop.json` inside the cursors directory,
+ * so a path separator, a NUL, an empty or over-long string, or `.`/`..` is
+ * refused rather than allowed to resolve a cursor outside that directory.
+ */
+const LOOP_ID_PATTERN = /^[A-Za-z0-9._-]{1,79}$/;
+
+/** Whether `loopId` is a single safe filename component (see `LOOP_ID_PATTERN`). */
+export function isSafeLoopId(loopId: string): boolean {
+  return LOOP_ID_PATTERN.test(loopId) && loopId !== "." && loopId !== "..";
+}
+
+/**
+ * Thrown by a task handler for a failure classified terminal, such as a
+ * malformed event or a 404/422 from the upstream API. The loop records its reason and marks the
+ * event handled; the cursor advances past it subject to the existing skew and
+ * persistence rules.
+ */
+export class PermanentEventError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "PermanentEventError";
+  }
+}
+
+/** Thrown by `startTaskLoop` for a `loopId` that is not a single safe filename component. */
+export class InvalidLoopIdError extends Error {
+  constructor(loopId: string) {
+    super(`Invalid loopId ${JSON.stringify(loopId)}: it must be a single filename component matching ${LOOP_ID_PATTERN} and not "." or ".."`);
+    this.name = "InvalidLoopIdError";
+  }
+}
+
+/** The loop's cursor file for `loopId`. */
+export function taskLoopCursorPath(loopId: string): string {
+  return join(cursorDir(), `${loopId}-task-loop.json`);
 }
 
 /**
@@ -125,10 +172,10 @@ export function cursorFilePosition(data: unknown): string | undefined {
 }
 
 /** The persisted feed position (Flair's `after` cursor), or undefined when there is none to resume from. */
-function loadCursor(agentId: string): string | undefined {
-  const path = taskLoopCursorPath(agentId);
+function loadCursor(loopId: string): string | undefined {
+  const path = taskLoopCursorPath(loopId);
   if (!existsSync(path)) {
-    slog(`[${agentId}] No task loop cursor at ${path}; ${LOOKBACK_NOTE}`);
+    slog(`[${loopId}] No task loop cursor at ${path}; ${LOOKBACK_NOTE}`);
     return undefined;
   }
   let position: string | undefined;
@@ -139,7 +186,7 @@ function loadCursor(agentId: string): string | undefined {
     problem = e instanceof SyntaxError ? "it is not JSON" : `it cannot be read (${(e as NodeJS.ErrnoException).code ?? (e as Error).name})`;
   }
   if (position === undefined) {
-    swarn(`[${agentId}] Task loop cursor at ${path} is unusable (${problem}); treating it as no cursor, so ${LOOKBACK_NOTE}`);
+    swarn(`[${loopId}] Task loop cursor at ${path} is unusable (${problem}); treating it as no cursor, so ${LOOKBACK_NOTE}`);
   }
   return position;
 }
@@ -149,8 +196,8 @@ function loadCursor(agentId: string): string | undefined {
  * it, rename it over the cursor. Returns undefined on success, or the failure's
  * name (its code, such as EACCES, or its class) for the caller to log.
  */
-function saveCursor(agentId: string, position: string): string | undefined {
-  const path = taskLoopCursorPath(agentId);
+function saveCursor(loopId: string, position: string): string | undefined {
+  const path = taskLoopCursorPath(loopId);
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
     mkdirSync(cursorDir(), { recursive: true });
@@ -190,11 +237,23 @@ export function startTaskLoop(
   flair: FlairClient,
   agentId: string,
   handler: TaskHandler,
-  opts: { pollIntervalMs?: number; kinds?: string[] } = {},
+  opts: { pollIntervalMs?: number; kinds?: string[]; loopId?: string; authorId?: string; maxAttempts?: number } = {},
 ): { stop: () => Promise<void> } {
   const basePollMs = opts.pollIntervalMs ?? DEFAULT_POLL_MS;
   const kinds = new Set(opts.kinds ?? ["task.assigned"]);
-  const loaded = loadCursor(agentId);
+  // Filter by stored attribution; an admin caller may supply authorId.
+  const authorId = opts.authorId;
+  // Other failures are given bounded attempts, then recorded and skipped.
+  // Undefined keeps the original unbounded retry.
+  const maxAttempts = opts.maxAttempts ?? Infinity;
+  const attempts = new Map<string, number>();
+  // Omitted loop IDs use the agentId cursor.
+  const loopId = opts.loopId ?? agentId;
+  // Refuse an unsafe loopId before any cursor is read or written: it names the
+  // cursor file, so one with a path separator or a traversal segment could
+  // resolve a cursor outside the cursors directory.
+  if (!isSafeLoopId(loopId)) throw new InvalidLoopIdError(loopId);
+  const loaded = loadCursor(loopId);
   // A new initial position is computed once, here; saving it is retried with
   // this same value until it succeeds, and the feed is not read before then.
   let position: string = loaded ?? initialPosition();
@@ -216,11 +275,11 @@ export function startTaskLoop(
   /** Save the initial position, retrying with backoff; false when stopped first. */
   async function saveInitialPosition(): Promise<boolean> {
     for (let attempt = 1; running; attempt++) {
-      const failure = saveCursor(agentId, position);
+      const failure = saveCursor(loopId, position);
       if (failure === undefined) return true;
       const delay = Math.min(basePollMs * 2 ** (attempt - 1), MAX_BACKOFF_MS);
       swarn(
-        `[${agentId}] Task loop cannot save its initial position to ${taskLoopCursorPath(agentId)} (${failure}); ` +
+        `[${loopId}] Task loop cannot save its initial position to ${taskLoopCursorPath(loopId)} (${failure}); ` +
           `the feed is not read until it is saved; retrying in ${delay} ms`,
       );
       await sleep(delay);
@@ -254,15 +313,28 @@ export function startTaskLoop(
           for (const event of read.events) {
             if (!seen.has(event.id)) {
               const targets = event.targetIds ?? [];
-              if (kinds.has(event.kind) && (targets.length === 0 || targets.includes(agentId))) {
+              if (kinds.has(event.kind) && (authorId === undefined || event.authorId === authorId) && (targets.length === 0 || targets.includes(agentId))) {
                 slog(`[${agentId}] Task received: ${event.kind} — ${event.summary}`);
                 try {
                   await handler(event);
+                  attempts.delete(event.id);
                 } catch (e) {
                   const err = e as Error;
-                  serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}; it will be retried`);
-                  failed = true;
-                  break;
+                  const count = (attempts.get(event.id) ?? 0) + 1;
+                  if (err instanceof PermanentEventError) {
+                    // Classified terminal by the handler: record its reason and let the cursor advance.
+                    attempts.delete(event.id);
+                    serror(`[${agentId}] Task ${event.id} failure classified terminal (${err.message}); recorded and marked handled`);
+                  } else if (count >= maxAttempts) {
+                    // Other failures, given bounded attempts: record and skip at the bound.
+                    attempts.delete(event.id);
+                    serror(`[${agentId}] Task ${event.id} failed ${count} times (last: ${err.message}); recorded and skipped after the attempt bound of ${maxAttempts}`);
+                  } else {
+                    attempts.set(event.id, count);
+                    serror(`[${agentId}] Task handler error for ${event.id}: ${err.message}; it will be retried`);
+                    failed = true;
+                    break;
+                  }
                 }
               }
               // Marked seen only once done, so a failed event stays eligible.
@@ -290,8 +362,8 @@ export function startTaskLoop(
             // A failed save is logged and the loop goes on from the position in
             // memory. The saved position is then behind it, so a restart replays
             // events rather than skipping them.
-            const failure = saveCursor(agentId, position);
-            if (failure !== undefined) swarn(`[${agentId}] Failed to persist cursor to ${taskLoopCursorPath(agentId)} (${failure})`);
+            const failure = saveCursor(loopId, position);
+            if (failure !== undefined) swarn(`[${loopId}] Failed to persist cursor to ${taskLoopCursorPath(loopId)} (${failure})`);
           }
 
           // Cap seen set

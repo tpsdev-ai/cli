@@ -82,9 +82,9 @@ function setPhase(fields: Record<string, unknown>, file = "m1.json"): Buffer {
 function committed(messageId: string, fields: Record<string, unknown>): Buffer {
   signedRecord(fresh(), messageId);
   const replay = mailboxReplayStore(root);
-  replay.beginPlacement(messageId, "m1.json", fresh());
   linkSync(fresh(), cur());
   unlinkSync(fresh());
+  replay.beginPlacement(messageId, "m1.json", cur());
   replay.recordConsumed(messageId);
   return setPhase(fields);
 }

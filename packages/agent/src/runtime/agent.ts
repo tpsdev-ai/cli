@@ -66,26 +66,24 @@ export class AgentRuntime {
   }
 
   async start(): Promise<void> {
-    const checkInbox = async () => this.mail.checkNewMail();
-    const deliverOutbox = () => this.mail.deliverOutbox();
-
-
     const pidPath = join(this.config.workspace, ".tps-agent.pid");
     mkdirSync(dirname(pidPath), { recursive: true });
     writeFileSync(pidPath, `${process.pid}\n`, "utf-8");
 
-    const shutdown = new Promise<void>((resolve) => {
-      const onStop = async () => {
-        await this.loop.stop();
-        resolve();
-      };
-      process.once("SIGINT", onStop);
-      process.once("SIGTERM", onStop);
-    });
+    let loopRun: Promise<void>;
+    const onStop = async () => {
+      await this.loop.stop();
+      await loopRun.catch(() => {});
+    };
+    process.once("SIGINT", onStop);
+    process.once("SIGTERM", onStop);
 
     try {
-      await Promise.race([this.loop.run(checkInbox), shutdown]);
+      loopRun = this.loop.runDeliveries(this.mail);
+      await loopRun;
     } finally {
+      process.removeListener("SIGINT", onStop);
+      process.removeListener("SIGTERM", onStop);
       rmSync(pidPath, { force: true });
     }
   }

@@ -576,6 +576,7 @@ async function main() {
             try {
               if (runtimeArg === "codex") {
               const { runCodexRuntime } = await import("../src/utils/codex-runtime.js");
+              const { parseReviewTriggerConfig } = await import("../src/utils/pr-review-trigger.js");
               await runCodexRuntime({
                 agentId: agentId!,
                 workspace: agentWorkspace,
@@ -595,6 +596,7 @@ async function main() {
                 systemPrompt: typeof agentCfg.systemPrompt === "string" ? agentCfg.systemPrompt : undefined,
                 workspaceProvider,
                 autoCommit: agentCfg.autoCommit,
+                reviewTrigger: parseReviewTriggerConfig(agentCfg),
               });
             } else if (runtimeArg === "gemini") {
               const { runGeminiRuntime } = await import("../src/utils/gemini-runtime.js");

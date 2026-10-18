@@ -2,8 +2,10 @@
  * office-status.ts — `tps office status`
  *
  * Full office state at a glance:
- *   - All agents: role, model, status, last heartbeat
- *   - Current task (from recent OrgEvents)
+ *   - Agents in the Agent list: role, model, status, presence status and last
+ *     heartbeat on the queried Flair instance (its Presence roster)
+ *   - Current activity (Presence's currentTask, else its activity, shown as
+ *     "was: <lastActivity>" once Flair reports the activity stale)
  *   - Open PRs (via gh-as)
  *   - Task loop cursor age per agent
  *   - Git branch + dirty status for known workspaces
@@ -16,7 +18,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { cursorFilePosition, positionTimestamp, taskLoopCursorPath } from "../utils/flair-task-loop.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { activityState, orgEventReadNotice, readOrgEvents, type OrgEventRecord } from "../utils/org-event-read.js";
+import { NO_PRESENCE_TEXT, presenceReadNotice, presenceState, readPresence, relativeAgo, type PresenceRecord } from "../utils/presence-read.js";
 
 interface FlairAgent {
   id?: string;
@@ -54,7 +56,17 @@ const green  = (t: string, nc: boolean) => esc(32, t, nc);
 const yellow = (t: string, nc: boolean) => esc(33, t, nc);
 const cyan   = (t: string, nc: boolean) => esc(36, t, nc);
 const dim    = (t: string, nc: boolean) => esc(2,  t, nc);
-const red    = (t: string, nc: boolean) => esc(31, t, nc);
+
+/**
+ * Replace terminal control characters (C0 0x00-0x1F, DEL 0x7F, C1 0x80-0x9F)
+ * in a table value with U+FFFD, so each becomes visible. Widths are minimums, not caps.
+ * Flair caps a current task but does not redact its content
+ * (resources/Presence.ts), so the renderer makes controls visible here.
+ */
+function visibleControls(text: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: deliberate — replace terminal control chars before they reach stdout
+  return text.replace(/[\x00-\x1f\x7f-\x9f]/g, "\uFFFD");
+}
 
 // ── Auth helper ───────────────────────────────────────────────────────────────
 function makeAuth(viewerId: string, keyPath: string, method: string, urlPath: string): string | undefined {
@@ -140,26 +152,37 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
     else { console.error(`Flair unreachable at ${flairUrl} (HTTP ${res.status})`); process.exit(1); }
   } catch { console.error(`Flair unreachable at ${flairUrl}. Is it running?`); process.exit(1); }
 
-  // Recent OrgEvents for task + heartbeat status: the viewer's catch-up feed
-  // over the last 6h (see utils/org-event-read.ts). A read that does not return
-  // the events is reported, and the task column says "unavailable", not "idle".
-  const read = await readOrgEvents({ flairUrl, viewerId, since: new Date(Date.now() - 6 * 3_600_000), sign: a });
-  const notice = orgEventReadNotice(flairUrl, read);
+  // Per-agent presence for the last-seen and activity columns: the Presence
+  // roster of the Flair instance at flairUrl (see utils/presence-read.ts).
+  // Agents push heartbeats and activity there; Flair derives the status and
+  // whether the activity is fresh. Only agents in the Agent list are displayed.
+  // A listed agent with no stored Presence row on the queried instance reads
+  // "no presence on this instance". A read that cannot be signed (it is then
+  // not sent) or fails, or that returns a roster the reader does not accept,
+  // is reported, and the columns say "unavailable" instead.
+  const read = await readPresence({ flairUrl, sign: a });
+  const notice = presenceReadNotice(flairUrl, read);
   if (notice) console.error(notice);
-  const activity = activityState(read);
-  const events = read.status === "ok" ? read.events : [];
+  const presenceByAgent = new Map<string, PresenceRecord>();
+  for (const rec of read.status === "ok" ? read.agents : []) presenceByAgent.set(rec.id, rec);
+  const state = presenceState(read);
 
-  // Per-agent newest task event of the kinds task.assigned, task.started and
-  // task.completed (other task kinds, such as task.failed, are not considered),
-  // and newest heartbeat event. The feed is oldest first, so a later event
-  // replaces an earlier one.
-  const lastTask   = new Map<string, OrgEventRecord>();
-  const lastHbTime = new Map<string, string>();
-  for (const ev of events) {
-    const id = ev.authorId;
-    if (["task.assigned","task.completed","task.started"].includes(ev.kind)) lastTask.set(id, ev);
-    if (ev.kind === "agent.heartbeat") lastHbTime.set(id, ev.createdAt);
-  }
+  const lastSeenText = (id: string): string => {
+    if (state === "unavailable") return "unavailable";
+    const rec = presenceByAgent.get(id);
+    return rec ? `${rec.presenceStatus} (${relativeAgo(rec.lastHeartbeatAt)})` : NO_PRESENCE_TEXT;
+  };
+  // What the agent is doing: its current task, else its activity, or
+  // "was: <lastActivity>" once Flair reports the activity stale (Flair then
+  // serves no current task, and the reader refuses a record that has one).
+  // Null for a listed agent with no stored Presence row on the queried instance.
+  const doingText = (id: string): string | null => {
+    if (state === "unavailable") return "unavailable";
+    const rec = presenceByAgent.get(id);
+    if (!rec) return null;
+    if (rec.currentTask !== null) return rec.currentTask;
+    return rec.activityFresh ? rec.activity : `was: ${rec.lastActivity}`;
+  };
 
   // Fetch open PRs
   const openPrs: PrInfo[] = repo ? fetchOpenPrs(ghAgent, repo) : [];
@@ -170,9 +193,10 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
       const id = ag.id ?? ag.agentId ?? "?";
       return {
         id, name: ag.name, role: ag.role, model: ag.model, status: ag.status,
-        lastHeartbeat: ag.lastHeartbeat ?? lastHbTime.get(id),
-        lastTask: lastTask.get(id),
-        activity,
+        presence: presenceByAgent.get(id) ?? null,
+        lastSeen: lastSeenText(id),
+        doing: doingText(id),
+        presenceState: state,
         cursorSince: loadCursorIso(id),
         git: gitBranchStatus(ag.workspace),
       };
@@ -187,29 +211,22 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
   console.log(`${bold("⚒️  TPS Office", nc)}  ${dim(now, nc)}`);
   console.log(dim("─".repeat(74), nc));
   console.log(
-    dim(`  ${"AGENT".padEnd(12)} ${"ROLE".padEnd(26)} ${"MODEL".padEnd(18)} ${"HEARTBEAT".padEnd(12)} TASK`, nc)
+    dim(`  ${"AGENT".padEnd(12)} ${"ROLE".padEnd(26)} ${"MODEL".padEnd(18)} ${"LAST SEEN".padEnd(28)} ACTIVITY`, nc)
   );
   console.log(dim("─".repeat(74), nc));
 
   for (const ag of agents) {
     const id   = ag.id ?? ag.agentId ?? "?";
-    const name = (ag.name ?? id).padEnd(12);
-    const role = (ag.role ?? "?").padEnd(26);
-    const model= ((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
-    const hbIso= ag.lastHeartbeat ?? lastHbTime.get(id);
-    const hb   = (!hbIso && activity === "unavailable" ? "unavailable" : relTime(hbIso)).padEnd(12);
+    const name = visibleControls(ag.name ?? id).padEnd(12);
+    const role = visibleControls(ag.role ?? "?").padEnd(26);
+    const model= visibleControls((ag.model ?? "?").split("/").pop() ?? "?").padEnd(18);
+    const rec  = presenceByAgent.get(id);
+    const lastSeen = visibleControls(lastSeenText(id));
+    const doing = visibleControls(doingText(id) ?? "—");
     const dot  = ag.status === "active" ? green("●", nc) : yellow("○", nc);
-    const task = lastTask.get(id);
-    const partial = activity === "incomplete" ? dim(" (incomplete)", nc) : "";
-    const taskStr = activity === "unavailable"
-      ? dim("unavailable", nc)
-      : task
-        ? (task.kind === "task.completed"
-            ? green("✓ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)
-            : yellow("→ " + (task.summary.length > 30 ? task.summary.slice(0,30)+"…" : task.summary), nc)) + partial
-        : dim(activity === "incomplete" ? "incomplete" : "idle", nc);
+    const doingColored = state !== "unavailable" && rec?.currentTask ? cyan(doing, nc) : dim(doing, nc);
 
-    console.log(`${dot} ${cyan(name, nc)} ${role} ${dim(model, nc)} ${hb} ${taskStr}`);
+    console.log(`${dot} ${cyan(name, nc)} ${role} ${dim(model, nc)} ${lastSeen.padEnd(28)} ${doingColored}`);
 
     // Sub-lines: git + cursor
     const git = gitBranchStatus(ag.workspace);
@@ -234,11 +251,6 @@ export async function runOfficeStatus(opts: OfficeStatusOpts): Promise<void> {
       }
     }
   }
-
-  // Blockers: the newest one read.
-  let blocker: OrgEventRecord | undefined;
-  for (const e of events) if (e.kind === "blocker") blocker = e;
-  if (blocker) console.log(`  ${red(`⚠ BLOCKER: ${blocker.summary}`, nc)}`);
 
   console.log();
 }

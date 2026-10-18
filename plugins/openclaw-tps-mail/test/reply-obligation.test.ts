@@ -1,4 +1,4 @@
-import { mailboxReplayStore } from "@tpsdev-ai/agent";
+import { MailClient, mailboxReplayStore } from "@tpsdev-ai/agent";
 /**
  * reply-obligation.test.ts — slice S2 of the reply-OBLIGATION work (the
  * follow-up to cli#392's S0/S1).
@@ -24,7 +24,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSyn
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
 
 import { hashes } from "@noble/ed25519";
@@ -39,7 +39,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 
 // Import the plugin — default export gives us { register }.
 import pluginModule from "../src/index.js";
-import { sweepTerminalObligations } from "../src/obligations.js";
+import { createObligation, sweepTerminalObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
 let capturedSubscription: any;
@@ -165,12 +165,15 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     agentId: string,
     sender: string,
     opts: {
+      beforeVerify?: (name: string) => Promise<void>;
       localSender?: boolean;
       branchHost?: boolean;
       bodyFrom?: string;
       bodySeed?: Buffer;
       signAgentKey?: boolean;
       noInbound?: boolean;
+      /** With noInbound: a cur/ file left in its raw form (not rewritten to the promoted shape). */
+      keepRawCur?: string;
       accounts?: Record<string, { mailDir: string }>;
       dispatchFailedCounts?: any;
       warnCalls?: string[];
@@ -181,6 +184,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
+          await opts.beforeVerify?.(name);
           if (name === sender) return { publicKey: pubkeyFromSeed(FLINT_SEED) };
           if (name === agentId) return { publicKey: pubkeyFromSeed(ANVIL_SEED) };
           return null;
@@ -250,6 +254,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
     if (opts.noInbound) {
       for (const file of readdirSafe(resolve(tempMailDir, agentId, "cur"))) {
+        if (file === opts.keepRawCur) continue;
         const path = resolve(tempMailDir, agentId, "cur", file);
         const record = JSON.parse(readFileSync(path, "utf8"));
         if (record.envelope) {
@@ -443,6 +448,145 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(obligationFile("anvil", h.inboundId)?.state).toBe("acked");
     await h2.stop();
   }, 20000);
+
+  // ── cli#617 slice (b) ──────────────────────────────────────────────────────
+  it("cli#617: a raw cur/ record with a synthetic in_progress intent is not settled on restart", async () => {
+    const h = await start("anvil", "flint", { localSender: true });
+    await h.deliver("final answer", "final");
+    h.settle();
+    await pollUntil(() => !!curRecord("anvil")?.ackedAt, 3000);
+    await h.stop();
+
+    const file = curFiles("anvil")[0]!;
+    const curFilePath = resolve(tempMailDir, "anvil", "cur", file);
+    const cur = JSON.parse(readFileSync(curFilePath, "utf-8"));
+    writeFileSync(curFilePath, JSON.stringify({
+      id: cur.id, from: cur.from, to: cur.to, body: JSON.stringify(cur.envelope), timestamp: cur.timestamp, read: false,
+    }, null, 2), "utf-8");
+    const mailboxRoot = resolve(tempMailDir, "anvil");
+    mailboxReplayStore(mailboxRoot).beginPlacement(cur.envelope.messageId, file, curFilePath);
+    const intentPath = join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
+    writeFileSync(intentPath, JSON.stringify({
+      ...JSON.parse(readFileSync(intentPath, "utf-8")), version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
+    }));
+    const ob = obligationFile("anvil", h.inboundId);
+    writeFileSync(
+      resolve(tempMailDir, "anvil", ".obligations", `${h.inboundId}.json`),
+      JSON.stringify({ ...ob, state: "posted" }, null, 2),
+      "utf-8",
+    );
+    const before = readFileSync(curFilePath, "utf-8");
+
+    const h2 = await start("anvil", "flint", { localSender: true, noInbound: true, keepRawCur: file });
+    await sleep(1500);
+    expect(obligationFile("anvil", h.inboundId)?.state).toBe("posted"); // not settled
+    expect(readFileSync(curFilePath, "utf-8")).toBe(before); // not stamped
+    await h2.stop();
+  }, 20000);
+
+  it("cli#617: plugin startup and reconciliation leave a real active MailClient delivery untouched", async () => {
+    const agent = "anvil";
+    const inboundId = "real-delivery";
+    const body = buildSignedBody("flint", agent, "active delivery", FLINT_SEED);
+    const envelope = JSON.parse(body);
+    const root = resolve(tempMailDir, agent);
+    const filename = `${inboundId}.json`;
+    mkdirSync(join(root, "new"), { recursive: true });
+    writeFileSync(join(root, "new", filename), JSON.stringify({
+      id: inboundId, from: "flint", to: agent, body, timestamp: envelope.timestamp, read: false,
+    }));
+    const client = new MailClient(tempMailDir, undefined, agent, {
+      async getAgent(name: string) {
+        return name === "flint" ? { publicKey: pubkeyFromSeed(FLINT_SEED) } : null;
+      },
+    });
+    const result = await client.deliverNext();
+    expect(result.status).toBe("delivered");
+    if (result.status !== "delivered") throw new Error(JSON.stringify(result));
+    const curPath = join(root, "cur", filename);
+    const before = readFileSync(curPath, "utf8");
+    expect(JSON.parse(before).envelope).toBeUndefined();
+    expect(mailboxReplayStore(root).placementPhase(filename)).toBe("in_progress");
+    createObligation(tempMailDir, agent, () => ({
+      obligationId: randomUUID(), inboundId, inboundEnvelopeId: envelope.messageId,
+      inboundTimestamp: envelope.timestamp, from: "flint", to: agent, accountId: "default",
+      state: "posted", deadlineAt: null, attempts: 1,
+    }));
+    const obligationBefore = obligationFile(agent, inboundId);
+    const warnings: string[] = [];
+    let verifications = 0;
+    const h = await start(agent, "flint", {
+      noInbound: true, keepRawCur: filename, warnCalls: warnings,
+      beforeVerify: async () => { verifications++; },
+    });
+    try {
+      expect(await pollUntil(() => warnings.some((w) => w.includes(`cur/ recovery refused ${inboundId} (busy)`)))).toBe(true);
+      await sleep(100);
+      expect(h.dispatchCount).toBe(0);
+      expect(verifications).toBe(0);
+      expect(readFileSync(curPath, "utf8")).toBe(before);
+      expect(obligationFile(agent, inboundId)).toEqual(obligationBefore);
+      expect(readdirSafe(join(root, "dlq"))).toEqual([]);
+      expect(await client.deliverNext()).toMatchObject({ status: "deferred", reason: "active" });
+    } finally {
+      await h.stop();
+      expect(client.releaseDelivery(result.delivery)).toEqual({ status: "released" });
+    }
+  });
+
+  for (const intentTiming of ["before verification", "during verification", "absent"] as const) {
+    it(`cli#617: raw reconciliation with a synthetic intent ${intentTiming}`, async () => {
+      const agent = "anvil";
+      const inboundId = "raw-guard";
+      const filename = `${inboundId}.json`;
+      const root = resolve(tempMailDir, agent);
+      const curPath = join(root, "cur", filename);
+      const body = buildSignedBody("flint", agent, "raw guard", FLINT_SEED);
+      const envelope = JSON.parse(body);
+      mkdirSync(join(root, "cur"), { recursive: true });
+      writeFileSync(curPath, JSON.stringify({
+        id: inboundId, from: "flint", to: agent, body, timestamp: envelope.timestamp,
+        read: true, ackedAt: envelope.timestamp,
+      }));
+      createObligation(tempMailDir, agent, () => ({
+        obligationId: randomUUID(), inboundId, inboundEnvelopeId: envelope.messageId,
+        inboundTimestamp: envelope.timestamp, from: "flint", to: agent, accountId: "default",
+        state: "posted", deadlineAt: null, attempts: 1,
+      }));
+      const before = readFileSync(curPath, "utf8");
+      const obligationBefore = obligationFile(agent, inboundId);
+      const place = () => mailboxReplayStore(root).beginPlacement(envelope.messageId, filename, curPath);
+      if (intentTiming === "before verification") place();
+      let verifications = 0;
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const h = await start(agent, "flint", {
+        noInbound: true, keepRawCur: filename,
+        beforeVerify: async () => { verifications++; await gate; },
+      });
+      try {
+        if (intentTiming !== "before verification") {
+          expect(await pollUntil(() => verifications > 0)).toBe(true);
+          if (intentTiming === "during verification") place();
+        }
+        release();
+        if (intentTiming === "absent") {
+          expect(await pollUntil(() => obligationFile(agent, inboundId)?.deadlineAt !== null)).toBe(true);
+        } else {
+          await sleep(100);
+          expect(obligationFile(agent, inboundId)).toEqual(obligationBefore);
+        }
+        if (intentTiming === "before verification") expect(verifications).toBe(0);
+        expect(h.dispatchCount).toBe(0);
+        expect(readFileSync(curPath, "utf8")).toBe(before);
+        expect(readdirSafe(join(root, "dlq"))).toEqual([]);
+      } finally {
+        release();
+        await h.stop();
+      }
+    });
+  }
 
   // ── F-S2f ──────────────────────────────────────────────────────────────────
   it("F-S2f: crash with an armed deadline before the post — re-armed from deadlineAt (not a fresh window)", async () => {

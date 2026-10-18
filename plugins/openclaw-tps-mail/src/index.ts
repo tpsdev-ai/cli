@@ -59,7 +59,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import { deliverToRemoteBranch, deliverToSandbox, resolveAgentMailRoot } from "@tpsdev-ai/cli/utils/relay";
@@ -641,8 +641,9 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
         return null;
       }
       return Object.assign(current, patch);
-    });
+    }, { withholdPlacement: true });
     if (r.status === "changed" && alreadyStamped) return { ok: true };
+    if (r.status === "withheld") return { ok: false, reason: "write-failed", path, code: "PLACEMENT_WITHHELD" };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
     return { ok: false, reason: "write-failed", path, code: undefined };
@@ -1046,9 +1047,11 @@ async function internalInbound(ctx: YieldContext): Promise<boolean> {
   try {
     const record = readMailFile(ctx.curPath);
     if (!record) return false;
+    if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     const recovered = record.envelope
-      ? await recoverPromoted(ctx.agent, ctx.curPath)
+      ? await recoverPromoted(ctx.agent, ctx.curPath, {}, { waitForLock: true })
       : await verifyRecordForMailbox(ctx.agent, record as any, mailRootForRecordPath(ctx.curPath));
+    if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     if (!isLiveContext(ctx) || !recovered.ok || recovered.message.trustTier === "external") return false;
     return recovered.message.from === ctx.sender && recovered.message.id === ctx.inboundId
       && (ctx.inboundEnvelopeId === undefined || recovered.message.envelopeId === ctx.inboundEnvelopeId);
@@ -1882,7 +1885,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
       try {
         if (!isLive()) return;
-        const recovered = await recoverPromoted(recipient, curPath);
+        const recovered = await recoverPromoted(recipient, curPath, {}, { claim: recipient });
         if (!isLive()) return;
         if (!recovered.ok) {
           log?.warn?.(

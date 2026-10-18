@@ -1,13 +1,13 @@
-/** Real filesystem crash-boundary and unresolved-intent regressions (cli#600). */
+/** Filesystem crash and unresolved-intent regressions for the per-message delivery API. */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, writeFileSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, writeFileSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as ed from "@noble/ed25519";
-import { MailClient } from "../src/io/mail.js";
+import { type DeliverNextResult, MailClient } from "../src/io/mail.js";
 import { hasCommittedMessageId, mailboxReplayStore } from "../src/lib/mailbox-policy.js";
 import { acquireMailLock } from "../src/lib/mail-lock.js";
 import { mailboxLockRoot } from "../src/lib/mail-lock-namespace.js";
@@ -42,14 +42,14 @@ beforeEach(() => {
 afterEach(() => rmSync(mailDir, { recursive: true, force: true }));
 
 /** Plant one signed record in new/ and return its path. */
-function plant(messageId: string): string {
+function plant(messageId: string, body = "recovery-body"): string {
   const timestamp = new Date().toISOString();
   const envelope = signEnvelope(
     {
       v: 1,
       from: FROM,
       to: AGENT,
-      body: "recovery-body",
+      body,
       messageId,
       timestamp,
       delegationChain: [
@@ -77,15 +77,17 @@ interface KillRun {
   stderr: string;
 }
 
-/** Run checkNewMail() in a child and SIGKILL it at `killAt`; resolve on exit. */
-function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promise<KillRun> {
+/** Run deliverNext() in a child and SIGKILL it at `killAt`; resolve on exit. */
+function runAndKillAt(killAt: string, source: string, after = false, timeoutMs = 20_000): Promise<KillRun> {
   const marker = join(mailDir, `paused.${killAt}`);
   const child = spawn(process.execPath, [CHILD, mailDir, AGENT], {
     env: {
       HOME: mailDir,
       PATH: process.env.PATH,
       TPS_MAIL_MODULE: MODULE,
+      TPS_DRIVE: "deliverNext",
       TPS_KILL_AT: killAt,
+      ...(after ? { TPS_KILL_AFTER: "1" } : {}),
       TPS_KILL_MARKER: marker,
       TPS_MAIL_ROOT: mailboxRoot,
       TPS_SRC: source,
@@ -131,14 +133,20 @@ function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promi
   });
 }
 
-/** Check consecutive calls from a fresh client and placement cleanup. */
-async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
-  const client = new MailClient(mailDir, undefined, AGENT, verifier());
-  const first = await client.checkNewMail();
-  const second = await client.checkNewMail();
+const reasonOf = (result: DeliverNextResult) => (result.status === "deferred" ? result.reason : result.status);
 
-  expect(first.map((m) => m.verifiedEnvelope?.messageId)).toEqual([messageId]);
-  expect(second).toEqual([]);
+async function assertDeliveredUntilCompleted(messageId: string): Promise<void> {
+  const client = new MailClient(mailDir, undefined, AGENT, verifier());
+  const first = await client.deliverNext();
+  if (first.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(first)}`);
+  expect(first.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(reasonOf(await client.deliverNext())).toBe("active");
+  expect(client.releaseDelivery(first.delivery)).toEqual({ status: "released" });
+  const second = await client.deliverNext();
+  if (second.status !== "delivered") throw new Error(`expected a delivery, got ${JSON.stringify(second)}`);
+  expect(second.delivery.message.verifiedEnvelope?.messageId).toBe(messageId);
+  expect(await client.completeDelivery(second.delivery)).toEqual({ status: "completed" });
+  expect(await client.deliverNext()).toEqual({ status: "idle" });
   expect(existsSync(newPath())).toBe(false);
   expect(jsonFiles(join(mailboxRoot, "cur"))).toEqual(["m1.json"]);
   expect(jsonFiles(join(mailboxRoot, "dlq"))).toEqual([]);
@@ -148,19 +156,145 @@ async function assertDeliveredExactlyOnce(messageId: string): Promise<void> {
   ).toBe(false);
 }
 
-const CASES = ["intent-write", "link-to-cur", "source-removal", "ledger-commit", "intent-finish"];
+const CASES: Array<{ at: string; after?: boolean }> = [
+  { at: "intent-write" },
+  { at: "link-to-cur" },
+  { at: "source-removal" },
+  { at: "ledger-commit" },
+  { at: "phase-write", after: true },
+];
 
 describe("MailClient recovery at the tested placement boundaries (cli#600)", () => {
-  for (const at of CASES) {
-    test(`a later check returns the message once after a kill before ${at}`, async () => {
+  for (const { at, after } of CASES) {
+    test(`recovers, releases, re-presents and completes after a kill at ${at}`, async () => {
       const messageId = `kill-${at}`;
       const source = plant(messageId);
-      const run = await runAndKillAt(at, source);
+      const run = await runAndKillAt(at, source, after);
       expect(run.reached, `child never reached ${at}; stderr=${run.stderr}`).toBe(true);
       expect(run.signal).toBe("SIGKILL");
-      await assertDeliveredExactlyOnce(messageId);
+      await assertDeliveredUntilCompleted(messageId);
     });
   }
+});
+
+for (const at of ["link-to-cur", "source-removal"]) {
+  test(`a kill after ${at} leaves the original message deliverable`, async () => {
+    const messageId = `after-${at}`;
+    const run = await runAndKillAt(at, plant(messageId), true);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    await assertDeliveredUntilCompleted(messageId);
+  });
+
+  test(`a different-byte replacement after a kill after ${at} is withheld`, async () => {
+    const run = await runAndKillAt(at, plant(`replaced-${at}`), true);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    const name = readdirSync(mailboxRoot).find((name) => name.startsWith(".placement-") && name.endsWith(".json"))!;
+    const intent = readFileSync(join(mailboxRoot, name));
+    const bytes = readFileSync(curPath(), "utf8");
+    unlinkSync(curPath());
+    writeFileSync(curPath(), bytes + " ");
+    const c = new MailClient(mailDir, undefined, AGENT, verifier());
+    expect(await c.deliverNext()).toMatchObject({ status: "deferred", reason: "record-changed" });
+    expect(readFileSync(join(mailboxRoot, name))).toEqual(intent);
+    expect(readFileSync(curPath(), "utf8")).toBe(bytes + " ");
+  });
+}
+
+describe("pending record classification", () => {
+  function plantLater(): void {
+    renameSync(plant("later-mail"), join(mailboxRoot, "new", "z-later.json"));
+  }
+
+  async function deliverLater(client: MailClient): Promise<void> {
+    const later = await client.deliverNext();
+    expect(later.status).toBe("delivered");
+    if (later.status !== "delivered") throw new Error(JSON.stringify(later));
+    expect(later.delivery.message.verifiedEnvelope?.messageId).toBe("later-mail");
+    expect(await client.completeDelivery(later.delivery)).toEqual({ status: "completed" });
+  }
+
+  test("a raw wrapper with an extra envelope object recovers after a kill before the phase write", async () => {
+    plantLater();
+    const source = plant("raw-extra-envelope");
+    const raw = { ...JSON.parse(readFileSync(source, "utf8")), envelope: { extra: true } };
+    writeFileSync(source, JSON.stringify(raw));
+    const run = await runAndKillAt("phase-write", source);
+    expect(run.reached, run.stderr).toBe(true);
+    expect(run.signal).toBe("SIGKILL");
+    expect(mailboxReplayStore(mailboxRoot).placementPhase("m1.json")).toBe("placing");
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    const recovered = await client.deliverNext();
+    expect(recovered.status).toBe("delivered");
+    if (recovered.status !== "delivered") throw new Error(JSON.stringify(recovered));
+    expect(recovered.delivery.message.verifiedEnvelope?.messageId).toBe("raw-extra-envelope");
+    expect(JSON.parse(recovered.delivery.message.body)).toEqual(raw);
+    expect(await client.completeDelivery(recovered.delivery)).toEqual({ status: "completed" });
+    expect(mailboxReplayStore(mailboxRoot).placementPhase("m1.json")).toBeNull();
+    await deliverLater(client);
+  });
+
+  test.each([null, {}, { envelope: {} }, { body: "plain text", envelopeId: "self-asserted" }])(
+    "a record matching neither kind is quarantined and its intent cleared: %j", async (record) => {
+      plantLater();
+      const source = plant("invalid-pending");
+      writeFileSync(source, JSON.stringify(record));
+      const client = new MailClient(mailDir, undefined, AGENT, verifier());
+      const replay = mailboxReplayStore(mailboxRoot);
+      renameSync(source, curPath());
+      replay.beginPlacement("invalid-pending", "m1.json", curPath());
+      expect(await client.deliverNext()).toMatchObject({ status: "deferred", reason: "pending-record-invalid" });
+      expect(replay.placementPhase("m1.json")).toBeNull();
+      expect(existsSync(curPath())).toBe(false);
+      expect(JSON.parse(readFileSync(join(mailboxRoot, "dlq", "m1.json"), "utf8"))).toEqual(record);
+      expect(readFileSync(join(mailboxRoot, "dlq", "m1.json.reason"), "utf8")).toContain("Reason: pending-record-invalid");
+      await deliverLater(client);
+    },
+  );
+
+  test.each(["both", "raw", "cli"])("overlapping shapes select by verification: %s", async (verified) => {
+    plantLater();
+    const source = plant("raw-inner");
+    const raw = JSON.parse(readFileSync(source, "utf8"));
+    plant("cli-outer", raw.body);
+    const envelope = JSON.parse(JSON.parse(readFileSync(source, "utf8")).body);
+    const record = {
+      id: "record-id", from: FROM, to: AGENT, body: raw.body, timestamp: envelope.timestamp,
+      read: false, envelopeId: envelope.messageId, envelope,
+      trustTier: "internal", checkedOutAt: new Date().toISOString(), checkedOutBy: AGENT, deliveryAttempts: 1,
+    };
+    if (verified === "raw") record.envelope.signature = "invalid";
+    if (verified === "cli") {
+      const inner = JSON.parse(record.body);
+      inner.signature = "invalid";
+      record.body = JSON.stringify(inner);
+      plant("cli-outer", record.body);
+      record.envelope = JSON.parse(JSON.parse(readFileSync(source, "utf8")).body);
+      record.timestamp = record.envelope.timestamp;
+    }
+    writeFileSync(source, JSON.stringify(record));
+    const client = new MailClient(mailDir, undefined, AGENT, verifier());
+    const replay = mailboxReplayStore(mailboxRoot);
+    renameSync(source, curPath());
+    replay.beginPlacement(verified === "cli" ? "cli-outer" : "raw-inner", "m1.json", curPath());
+    const result = await client.deliverNext();
+    if (verified === "both") {
+      expect(result).toMatchObject({ status: "deferred", reason: "pending-record-ambiguous" });
+      expect(replay.placementPhase("m1.json")).toBeNull();
+      expect(readFileSync(join(mailboxRoot, "dlq", "m1.json.reason"), "utf8")).toContain("Reason: pending-record-ambiguous");
+      await deliverLater(client);
+    } else if (verified === "raw") {
+      expect(result.status).toBe("delivered");
+      if (result.status !== "delivered") throw new Error(JSON.stringify(result));
+      expect(result.delivery.message.verifiedEnvelope?.messageId).toBe("raw-inner");
+      expect(await client.completeDelivery(result.delivery)).toEqual({ status: "completed" });
+      await deliverLater(client);
+    } else {
+      expect(result).toMatchObject({ status: "deferred", reason: "cli-record" });
+      expect(replay.placementPhase("m1.json")).toBe("placing");
+    }
+  });
 });
 
 describe("MailClient defers unresolved placements", () => {
@@ -176,8 +310,9 @@ describe("MailClient defers unresolved placements", () => {
     const intentPath = join(mailboxRoot, readdirSync(mailboxRoot).find((n) => n.startsWith(".placement-") && n.endsWith(".json"))!);
     const intent = readFileSync(intentPath);
 
-    expect(await client.checkNewMail()).toEqual([]);
-    expect(await client.checkNewMail()).toEqual([]);
+    // The cur/ copy verifies, but as another message: deferred by name, twice, unchanged.
+    expect(reasonOf(await client.deliverNext())).toBe("verification-failed");
+    expect(reasonOf(await client.deliverNext())).toBe("verification-failed");
     expect(readFileSync(intentPath).equals(intent)).toBe(true);
     expect(existsSync(source)).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
@@ -195,9 +330,9 @@ describe("MailClient defers unresolved placements", () => {
     expect(original.equals(replacement)).toBe(false);
     expect(original.toString("utf8")).toBe(replacement.toString("utf8"));
     writeFileSync(source, original);
-    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     mkdirSync(join(mailboxRoot, "cur"));
     renameSync(source, curPath());
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", curPath());
     const normal = verifier();
     let changed = false;
     const client = new MailClient(mailDir, undefined, AGENT, {
@@ -210,10 +345,11 @@ describe("MailClient defers unresolved placements", () => {
       },
     });
 
-    expect(await client.checkNewMail()).toEqual([]);
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
-    await assertDeliveredExactlyOnce(messageId);
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
+    expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
   });
 
   test("an older intent without identity with only a cur copy is withheld", async () => {
@@ -222,7 +358,7 @@ describe("MailClient defers unresolved placements", () => {
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
     mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json");
     renameSync(source, curPath());
-    expect(await client.checkNewMail()).toEqual([]);
+    expect(reasonOf(await client.deliverNext())).toBe("record-changed");
     expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     expect(hasCommittedMessageId(mailboxRoot, messageId)).toBe(false);
   });
@@ -242,16 +378,16 @@ describe("MailClient defers unresolved placements", () => {
     const messageId = "lock-failure";
     const source = plant(messageId);
     const client = new MailClient(mailDir, undefined, AGENT, verifier());
-    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", source);
     renameSync(source, curPath());
-    const lock = await acquireMailLock(mailboxRoot);
+    mailboxReplayStore(mailboxRoot).beginPlacement(messageId, "m1.json", curPath());
+    const lock = await acquireMailLock(realpathSync(mailboxRoot));
     expect(lock).not.toBeNull();
     try {
-      expect(await client.checkNewMail()).toEqual([]);
+      expect(reasonOf(await client.deliverNext())).toBe("lock-busy");
       expect(mailboxReplayStore(mailboxRoot).hasPendingPlacement(messageId, "m1.json")).toBe(true);
     } finally {
       lock?.release();
     }
-    await assertDeliveredExactlyOnce(messageId);
+    await assertDeliveredUntilCompleted(messageId);
   });
 });

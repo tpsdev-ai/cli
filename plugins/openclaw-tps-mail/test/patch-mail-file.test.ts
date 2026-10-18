@@ -2,6 +2,7 @@ import { afterAll, afterEach, describe, expect, test, mock } from "bun:test";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
 
 const realFs = { ...fs };
 let removeAfterRead: string | undefined;
@@ -48,7 +49,7 @@ mock.module("node:fs", () => ({
   },
 }));
 
-const { acquireMailLockSync, mailLockPath } = await import("@tpsdev-ai/agent");
+const { acquireMailLockSync, mailLockPath, mailboxReplayStore } = await import("@tpsdev-ai/agent");
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
 const { sweepTerminalObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
@@ -69,6 +70,23 @@ afterEach(() => {
 afterAll(() => realFs.rmSync(root, { recursive: true, force: true }));
 
 describe("patchMailFile", () => {
+  test("cli#617: a record held by an in_progress placement intent is not stamped", () => {
+    const f = terminalFixture("acked");
+    const file = f.curPath.split("/").pop()!;
+    const mailboxRoot = join(root, "anvil");
+    mailboxReplayStore(mailboxRoot).beginPlacement("held-message", file, f.curPath);
+    const intent = join(mailboxRoot, `.placement-${createHash("sha256").update(file).digest("hex")}.json`);
+    realFs.writeFileSync(intent, JSON.stringify({
+      ...JSON.parse(String(realFs.readFileSync(intent))), version: 1, phase: "in_progress", presentations: 1,
+      firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
+    }));
+    const before = String(realFs.readFileSync(f.curPath));
+    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toEqual({
+      ok: false, reason: "write-failed", path: f.curPath, code: "PLACEMENT_WITHHELD",
+    });
+    expect(String(realFs.readFileSync(f.curPath))).toBe(before);
+  });
+
   test("a nested lock failure names the lock path", () => {
     const f = terminalFixture("acked");
     const lock = acquireMailLockSync(join(root, "anvil"))!;

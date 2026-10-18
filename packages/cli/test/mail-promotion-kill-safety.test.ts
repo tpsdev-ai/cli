@@ -4,14 +4,14 @@ const patchShared = createPatchShared();
  * mail-promotion-kill-safety.test.ts — cli#515.
  *
  * Each case runs a REAL promote() in a child process and SIGKILLs it at an
- * injected pause point BEFORE a named filesystem operation — a killed process,
+ * injected pause point at a named filesystem operation — a killed process,
  * never an injected error — then runs a fresh in-process restart and checks the
  * end state. Every spawned process has a deadline; roots are mkdtemp'd.
  */
 
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -87,7 +87,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
   }
 
   /** Run promote() in a child and SIGKILL it at `killAt`; resolve on exit. */
-  function runAndKillAt(killAt: string, source: string, timeoutMs = 20_000): Promise<KillRun> {
+  function runAndKillAt(killAt: string, source: string, after = false, timeoutMs = 20_000): Promise<KillRun> {
     const inbox = getInbox(AGENT);
     const marker = join(root, `paused.${killAt}`);
     // The runtime running this suite (bun): the child imports the TypeScript Flair stub, which a
@@ -102,6 +102,7 @@ describe("promotion at the listed pause points (cli#515)", () => {
         FLAIR_KEY_PATH: process.env.FLAIR_KEY_PATH,
         TPS_PROMOTE_MODULE: SOURCE_MAIL,
         TPS_KILL_AT: killAt,
+        ...(after ? { TPS_KILL_AFTER: "1" } : {}),
         TPS_KILL_MARKER: marker,
         TPS_MAIL_ROOT: inbox.root,
         TPS_SRC: source,
@@ -189,6 +190,39 @@ describe("promotion at the listed pause points (cli#515)", () => {
         writeFileSync(cur, JSON.stringify(record));
       }
       await assertDeliveredExactlyOnce(messageId);
+    });
+  }
+
+  for (const at of ["link-to-cur", "scratch-removal"]) {
+    test(`a kill after ${at} leaves the original promoted message deliverable`, async () => {
+      const messageId = `after-${at}`;
+      const run = await runAndKillAt(at, plant(messageId), true);
+      expect(run.reached, run.stderr).toBe(true);
+      expect(run.signal).toBe("SIGKILL");
+      expect(await checkMessages(AGENT)).toEqual([]);
+      const path = join(getInbox(AGENT).cur, "record.json");
+      const record = JSON.parse(readFileSync(path, "utf8"));
+      record.checkedOutAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+      writeFileSync(path, JSON.stringify(record));
+      await assertDeliveredExactlyOnce(messageId);
+    });
+
+    test(`a different-byte replacement after a kill after ${at} stays withheld`, async () => {
+      const source = plant(`replaced-${at}`);
+      const run = await runAndKillAt(at, source, true);
+      expect(run.reached, run.stderr).toBe(true);
+      expect(run.signal).toBe("SIGKILL");
+      const inbox = getInbox(AGENT);
+      const path = join(inbox.cur, "record.json");
+      const bytes = readFileSync(path, "utf8");
+      const name = readdirSync(inbox.root).find((name) => name.startsWith(".placement-") && name.endsWith(".json"))!;
+      const intent = readFileSync(join(inbox.root, name));
+      unlinkSync(path);
+      writeFileSync(path, bytes + " ");
+      expect(await checkMessages(AGENT)).toEqual([]);
+      expect(await checkMessages(AGENT)).toEqual([]);
+      expect(readFileSync(path, "utf8")).toBe(bytes + " ");
+      expect(readFileSync(join(inbox.root, name))).toEqual(intent);
     });
   }
 

@@ -1,6 +1,8 @@
 /**
- * org-event-read.ts — the recent-OrgEvent read behind `tps roster dashboard`
- * and `tps office status` (cli#606, cli#620).
+ * org-event-read.ts — the validated OrgEvent catch-up read behind
+ * `FlairClient.getEventsSince`: the task loop, `tps agent logs`, `tps status`
+ * and the agent boot context read through it (cli#606, cli#620, cli#624). The
+ * dashboard and office status read Presence instead (presence-read.ts, cli#622).
  *
  * `GET /OrgEventCatchup/<viewer>` is the viewer's catch-up feed in Flair: the
  * events addressed to the viewer or broadcast, after the viewer's acknowledged
@@ -104,9 +106,8 @@ const optionalString = (v: unknown) => v === undefined || v === null || typeof v
  * `parsePage` checks its value); and the optional `targetIds`, which may be
  * absent or null and is otherwise an array of strings, and `refId`, `detail`,
  * `scope` and `expiresAt`, which may be absent or null and are otherwise
- * strings. These are the fields the dashboard, office status, `tps agent logs`,
- * the task loop and its handlers read. Any other field is passed through
- * unchecked.
+ * strings. These are the fields `tps agent logs`, the task loop and its
+ * handlers read. Any other field is passed through unchecked.
  */
 function isEvent(value: unknown): value is OrgEventRecord {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
@@ -224,24 +225,4 @@ function ok(events: OrgEventRecord[], complete: boolean, nextAfter: string, serv
   return serverTime === undefined
     ? { status: "ok", events, complete, nextAfter }
     : { status: "ok", events, complete, nextAfter, serverTime };
-}
-
-/** The per-agent activity state both commands print and emit as JSON. */
-export type ActivityState = "ok" | "incomplete" | "unavailable";
-
-export function activityState(read: OrgEventRead): ActivityState {
-  if (read.status === "unavailable") return "unavailable";
-  return read.complete ? "ok" : "incomplete";
-}
-
-/**
- * The one line a command prints about the read, or null when the read was
- * complete. It names the Flair URL and, for an unavailable read, the bounded
- * reason.
- */
-export function orgEventReadNotice(flairUrl: string, read: OrgEventRead, maxPages = ORG_EVENT_MAX_PAGES): string | null {
-  if (read.status === "unavailable") return `Cannot read OrgEvents from ${flairUrl} (${read.reason}); activity is unavailable.`;
-  if (!read.complete)
-    return `OrgEvents from ${flairUrl} exceed the ${maxPages}-page read bound; newer events were not read and activity is incomplete.`;
-  return null;
 }

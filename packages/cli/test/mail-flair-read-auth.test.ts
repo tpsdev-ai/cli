@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { hasCommittedMessageId } from "@tpsdev-ai/agent";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { checkMessages, getInbox } from "../src/utils/mail.js";
+import { flairTarget } from "./helpers/scratch-flair.js";
 import { buildSignedEnvelope, pubkeyFromSeed, stubFlairHandler, writeKeyFile } from "./helpers/stub-flair.js";
 
 afterEach(() => {
@@ -91,11 +92,10 @@ test("a refused Agent read leaves mail undelivered and recoverable", async () =>
 });
 
 test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair Agent read guards and refused-read mail recovery", async () => {
-  const baseUrl = "http://127.0.0.1:9926";
-  const opsUrl = "http://127.0.0.1:9925";
+  const { baseUrl, opsUrl, admin: adminAuth } = flairTarget();
   const to = `auth-receiver-${randomUUID()}`;
   const from = `auth-sender-${randomUUID()}`;
-  const admin = `Basic ${Buffer.from("admin:test123").toString("base64")}`;
+  const admin = `Basic ${Buffer.from(adminAuth).toString("base64")}`;
   const operation = (body: unknown) => fetch(opsUrl, {
     method: "POST", headers: { Authorization: admin, "Content-Type": "application/json" }, body: JSON.stringify(body),
   });
@@ -115,4 +115,4 @@ test.skipIf(process.env.TPS_TEST_REAL_FLAIR !== "1")("real Flair Agent read guar
     const deleted = await operation({ operation: "delete", database: "flair", table: "Agent", ids: [to, from] });
     expect(deleted.ok).toBe(true);
   }
-}, 30_000);
+}, 240_000);

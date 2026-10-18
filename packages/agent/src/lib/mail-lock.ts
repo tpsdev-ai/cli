@@ -146,6 +146,16 @@ function ownerState(
   return "unverifiable";
 }
 
+/**
+ * cli#617 slice (b): is the process named by (pid, start token) provably gone?
+ * The same rule a lock owner is reclaimed by: the pid is gone, or it is alive
+ * with a different start token from the same source. A live pid whose identity
+ * cannot be checked is NOT gone.
+ */
+export function processIsGone(pid: number, startToken: string | null): boolean {
+  return ownerState({ pid, startToken }) === "dead";
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((r) => setTimeout(r, ms));
 }
