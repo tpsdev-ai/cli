@@ -11,7 +11,7 @@
 
 import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
@@ -445,7 +445,7 @@ function resolvableWorkspacePath(workspace: string, links = 0): string {
 }
 
 /** Find `workspace`'s git directory in `baseRepo`'s worktree registry.
- *  Relative gitdirs resolve from the entry directory, without following the marker. */
+ *  Relative gitdirs require the base's relativeworktrees extension and format >= 1. */
 function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string, baseRepo: string): string | undefined {
   const common = git(baseRepo, ["rev-parse", "--git-common-dir"]);
   if (!common.ok || !common.stdout) {
@@ -478,6 +478,13 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
     try {
       const recorded = readFileSync(join(gitDir, "gitdir"), "utf-8").trim();
       if (!recorded) throw new Error("empty gitdir");
+      if (!isAbsolute(recorded)) {
+        const extension = git(baseRepo, ["config", "--local", "--includes", "--bool", "extensions.relativeworktrees"]);
+        const format = git(baseRepo, ["config", "--local", "--includes", "--int", "core.repositoryformatversion"]);
+        if (!extension.ok || extension.stdout !== "true" || !format.ok || !(Number(format.stdout) >= 1)) {
+          throw new Error("relative gitdir requires extensions.relativeworktrees=true and core.repositoryformatversion >= 1");
+        }
+      }
       const recordedPath = resolve(gitDir, recorded);
       const markerPath = join(resolvableWorkspacePath(dirname(recordedPath)), basename(recordedPath));
       if (markerPaths.has(markerPath)) registeredGitDir = realpathSync(gitDir);

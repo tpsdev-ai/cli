@@ -361,6 +361,12 @@ for (const layout of ["absolute", "relative"] as const) {
       const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
       expect(metadata.status, metadata.stderr).toBe(0);
       const gitDir = realpathSync(metadata.stdout.trim());
+      if (layout === "relative") {
+        for (const [key, value] of [["core.repositoryformatversion", "1"], ["extensions.relativeworktrees", "true"]] as const) {
+          const configured = spawnSync("git", ["config", "--local", key, value], { cwd: base, encoding: "utf8" });
+          expect(configured.status, configured.stderr).toBe(0);
+        }
+      }
       const recordedPath = join(gitDir, "gitdir");
       const recorded = `${layout === "absolute" ? join(workspace, ".git") : relative(dirname(recordedPath), join(workspace, ".git"))}\n`;
       writeFileSync(recordedPath, recorded);
@@ -408,6 +414,36 @@ for (const layout of ["absolute", "relative"] as const) {
   }
 }
 
+for (const config of ["absent", "false", "format-zero"] as const) {
+  test(`relative registry gitdir with ${config} extension config is a named lifecycle error`, () => fixture((input, base) => {
+    const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: input.workspace, encoding: "utf8" });
+    expect(metadata.status, metadata.stderr).toBe(0);
+    const gitDir = realpathSync(metadata.stdout.trim());
+    for (const [key, value] of [
+      ["core.repositoryformatversion", config === "format-zero" ? "0" : "1"],
+      ["extensions.relativeworktrees", config === "false" ? "false" : "true"],
+    ] as const) {
+      if (config === "absent" && key === "extensions.relativeworktrees") continue;
+      const configured = spawnSync("git", ["config", "--local", key, value], { cwd: base, encoding: "utf8" });
+      expect(configured.status, configured.stderr).toBe(0);
+    }
+    writeFileSync(join(gitDir, "gitdir"), `${relative(gitDir, join(input.workspace, ".git"))}\n`);
+    for (const operation of [
+      () => worktreeLaunchBinding(input.workspace),
+      () => agentLaunchOptions(input),
+      () => onStart("probe", input.workspace, { deferCheckout: true }),
+      () => onStop("probe", input.workspace),
+    ]) {
+      expect(operation).toThrow(WorktreeLifecycleError);
+      expect(operation).toThrow(config === "format-zero"
+        ? "git probe failed for the base repository"
+        : "relative gitdir requires extensions.relativeworktrees=true and core.repositoryformatversion >= 1");
+    }
+    expect(existsSync(input.workspace)).toBe(true);
+    expect(existsSync(gitDir)).toBe(true);
+  }));
+}
+
 for (const corruption of ["unreadable", "unresolvable", "empty"] as const) {
   test(`lifecycle and launch reject a ${corruption} registry entry`, () => fixture((input, base) => {
     const registry = join(base, ".git", "worktrees", "invalid");
@@ -417,7 +453,7 @@ for (const corruption of ["unreadable", "unresolvable", "empty"] as const) {
     else if (corruption === "unresolvable") {
       const loop = join(registry, "loop");
       symlinkSync("loop", loop);
-      writeFileSync(recordedPath, "loop/.git\n");
+      writeFileSync(recordedPath, `${loop}/.git\n`);
     } else writeFileSync(recordedPath, "\n");
     for (const operation of [
       () => onStart("probe", input.workspace, { deferCheckout: true }),
