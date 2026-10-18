@@ -213,6 +213,13 @@ test("a registry read failure is a named WorktreeLifecycleError", () => fixture(
   expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow("worktree registry could not be read");
 }));
 
+test("a symlink marker is refused with no trusted base repository", () => fixture((input, _base, root) => {
+  const { ws } = unrelatedWorktree(join(root, "elsewhere"), "symlinked-nobase");
+  rmSync(join(ws, ".git"));
+  symlinkSync(join(root, "missing-target"), join(ws, ".git"));
+  expect(() => agentLaunchOptions({ ...input, workspace: ws, runtime: undefined })).toThrow(WorktreeLifecycleError);
+}));
+
 test("a worktree with no trusted base repository launches with no metadata grants", () => fixture((input, _base, root) => {
   // No sibling tps next to this workspace, and the test home has no ~/ops/tps.
   const { repo, ws } = unrelatedWorktree(join(root, "elsewhere"), "nobase");

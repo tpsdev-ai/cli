@@ -371,6 +371,17 @@ export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBind
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
     throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
   }
+  const markerPath = join(workspace, ".git");
+  let marker: ReturnType<typeof lstatSync> | undefined;
+  try {
+    marker = lstatSync(markerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+    }
+  }
+  // A symlink marker is refused wherever it appears, before any base lookup.
+  if (marker?.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
   const trustedBase = resolveBaseRepo(workspace);
   // No tps base repository: not a tps-managed worktree, so no metadata grants.
   if (!trustedBase) return { kind: "none" };
@@ -382,20 +393,12 @@ export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBind
   }
   if (resolvedWorkspace === trustedBase) return { kind: "none" };
   const registered = trustedBaseRegistersWorkspace(workspace, resolvedWorkspace, trustedBase);
-  const markerPath = join(workspace, ".git");
-  let marker;
-  try {
-    marker = lstatSync(markerPath);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
-      if (registered) {
-        throw new WorktreeLifecycleError(`worktree git marker is missing for a registered worktree: ${workspace}`);
-      }
-      return { kind: "none" };
+  if (!marker) {
+    if (registered) {
+      throw new WorktreeLifecycleError(`worktree git marker is missing for a registered worktree: ${workspace}`);
     }
-    throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+    return { kind: "none" };
   }
-  if (marker.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
   if (registered) {
     if (!marker.isFile()) {
       throw new WorktreeLifecycleError(`worktree git marker is not a regular file for a registered worktree: ${workspace}`);
