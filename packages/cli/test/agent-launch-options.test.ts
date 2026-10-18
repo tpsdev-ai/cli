@@ -26,7 +26,9 @@ function fixture(run: (input: AgentLaunchGrantInput, base: string, root: string)
     expect(created.changed).toBe(true);
     const existing = onStart("probe", workspace, { deferCheckout: true });
     expect(existing.changed).toBe(false);
-    expect(existing.gitDir).toBe(created.gitDir);
+    expect(worktreeLaunchBinding(workspace)).toEqual({
+      kind: "registered", gitDir: created.gitDir, gitCommonDir: created.gitCommonDir, baseWorkingTree: base,
+    });
     const configPath = join(home, "agent.yaml");
     writeFileSync(configPath, "agentId: probe\n");
     process.chdir(base);
@@ -344,28 +346,32 @@ test("a dangling workspace symlink to a registered target is refused before gran
   }
 }));
 
-test("a relative registry gitdir binds launch and deferred-checkout metadata", () => fixture((input, base, root) => {
-  const workspace = join(root, "relative-worktree");
-  const added = spawnSync("git", ["-c", "worktree.useRelativePaths=true", "worktree", "add", "--no-checkout", "--detach", workspace], { cwd: base, encoding: "utf8" });
-  expect(added.status, added.stderr).toBe(0);
-  const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
-  expect(metadata.status, metadata.stderr).toBe(0);
-  const gitDir = realpathSync(metadata.stdout.trim());
-  const recordedPath = join(gitDir, "gitdir");
-  if (isAbsolute(readFileSync(recordedPath, "utf8").trim())) {
+for (const marker of ["absolute", "relative"] as const) {
+  test(`a relative registry gitdir binds launch metadata and preserves an existing worktree (${marker} marker)`, () => fixture((input, base, root) => {
+    const workspace = join(root, "relative-worktree");
+    const added = spawnSync("git", ["-c", "worktree.useRelativePaths=true", "worktree", "add", "--no-checkout", "--detach", workspace], { cwd: base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
+    expect(metadata.status, metadata.stderr).toBe(0);
+    const gitDir = realpathSync(metadata.stdout.trim());
+    const recordedPath = join(gitDir, "gitdir");
     writeFileSync(recordedPath, `${relative(dirname(recordedPath), join(workspace, ".git"))}\n`);
-  }
-  expect(isAbsolute(readFileSync(recordedPath, "utf8").trim())).toBe(false);
-  const gitCommonDir = realpathSync(join(base, ".git"));
-  expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
-  const result = agentLaunchOptions({ ...input, workspace, cwd: base });
-  expect(result.refusal).toBeNull();
-  expect(result.options.cwd).toBe(workspace);
-  expect(result.options.allow).toContain(gitDir);
-  expect(result.options.read).toContain(gitCommonDir);
-  const existing = onStart("probe", workspace, { deferCheckout: true });
-  expect(existing.changed).toBe(false);
-  expect(existing.gitDir).toBe(gitDir);
-  expect(existing.gitCommonDir).toBe(gitCommonDir);
-  expect(existing.baseWorkingTree).toBe(base);
-}));
+    const gitfile = `gitdir: ${marker === "absolute" ? gitDir : relative(workspace, gitDir)}\n`;
+    writeFileSync(join(workspace, ".git"), gitfile);
+    expect(isAbsolute(readFileSync(recordedPath, "utf8").trim())).toBe(false);
+    const gitCommonDir = realpathSync(join(base, ".git"));
+    expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
+    const result = agentLaunchOptions({ ...input, workspace, cwd: base });
+    expect(result.refusal).toBeNull();
+    expect(result.options.cwd).toBe(workspace);
+    expect(result.options.allow).toContain(gitDir);
+    expect(result.options.read).toContain(gitCommonDir);
+    const existing = onStart("probe", workspace, { deferCheckout: true });
+    expect(existing.changed).toBe(false);
+    expect(readFileSync(join(workspace, ".git"), "utf8")).toBe(gitfile);
+    expect(readFileSync(recordedPath, "utf8")).toBe(`${relative(gitDir, join(workspace, ".git"))}\n`);
+    expect(existsSync(join(gitDir, "index"))).toBe(false);
+    expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
+    expect(agentLaunchOptions({ ...input, workspace, cwd: base })).toEqual(result);
+  }));
+}
