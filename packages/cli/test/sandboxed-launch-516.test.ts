@@ -1015,7 +1015,10 @@ realNonoSuite(
     test(`the launch grants deny an untracked base file with base cwd/config ${fromBase}`, () => {
       const sb = makeRealNonoSandbox();
       try {
-        const base = join(sb.root, "base");
+        // A trusted base location: the launch resolves the sibling `tps` next
+        // to the workspace (this call runs in-process, so ~/ops/tps would be
+        // the test runner's home, not the sandbox's).
+        const base = join(dirname(sb.ws), "tps");
         mkdirSync(base, { recursive: true });
         const g = (args: string[], cwd = base) =>
           spawnSync("git", args, { cwd, encoding: "utf-8" });
