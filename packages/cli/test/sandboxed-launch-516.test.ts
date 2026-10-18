@@ -751,7 +751,6 @@ describe("cli#516 (3) — --sandbox/--sandboxed inside a message or wrapped comm
   });
 
   test("an invalid --sandbox value tps itself owns is still refused by name", () => {
-    // The scan must still catch tps's OWN flag, or the fix would be a bypass.
     const sb = makeSandbox();
     try {
       const r = runLauncher(
@@ -790,9 +789,32 @@ describe("cli#516 (3) — --sandbox/--sandboxed inside a message or wrapped comm
     }
   });
 
+  for (const payload of [true, false]) {
+    test(`codex start --sandbox-required requires confinement (payload=${payload})`, () => {
+      const sb = makeSandbox();
+      try {
+        const config = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        writeFileSync(config, agentYaml(sb, sb.ws));
+        const r = runLauncher([
+          "agent", "start", "--id", "probe", "--runtime", "codex",
+          "--config", config, SANDBOX_REQUIRED,
+          ...(payload ? ["--", "--sandboxed"] : ["--sandboxed"]),
+        ], {
+          cwd: sb.run,
+          env: cliEnv(sb, { TPS_LAUNCH_SOCK: undefined }),
+        });
+        expect(r.status, output(r)).toBe(78);
+        expect(output(r)).toContain(payload
+          ? "refusing to launch runtime 'codex': no nono at the pinned absolute path"
+          : "--sandboxed is refused: no launcher released this process");
+        expect(fakeNonoRuns(sb.root)).toEqual([]);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   test("an actual, unattested --sandboxed flag is still refused", () => {
-    // The gate must still refuse tps's OWN --sandboxed, or the fix would let a
-    // hand-typed claim through.
     const sb = makeSandbox();
     try {
       const r = runLauncher(["agent", "start", "--sandboxed"], {

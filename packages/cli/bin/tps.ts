@@ -17,14 +17,7 @@ try {
   process.exit(1);
 }
 
-/**
- * tps's OWN arguments — the parsed list, with `--` inserted before a wrapped
- * payload (`--message`, mail-watch `--exec`, secrets-guard's command). The
- * sandbox-flag scan and the `--sandboxed` gate read these, so a
- * `--sandbox <word>` inside a message or a wrapped command is not a flag
- * (cli#516). Node and the script path are prepended so the callers' index-2
- * convention is unchanged.
- */
+/** Parsed CLI arguments, with `--` separating payload. */
 function ownArgv(): string[] {
   return [process.argv[0]!, process.argv[1]!, ...helpArgs.argv];
 }
@@ -115,37 +108,26 @@ const [command, ...rest] = cli.input;
  * an interactive TTY, and refuses a non-interactive agent launch that did not
  * assert `--sandbox-required`. Implementation lives in src/utils/nono.ts.
  */
-async function enforceLaunchControlOrExit(): Promise<void> {
-  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG, SANDBOXED_FLAG } = await import(
+async function enforceLaunchControlOrExit() {
+  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG } = await import(
     "../src/utils/nono.js"
   );
-  // Under `--sandboxed` this process must HOLD THE LAUNCHER'S RELEASE before the
-  // gate may honour the flag (cli#350 round 4e). The handshake lives here, not
-  // in the gate: it is I/O (connect, report the pid, prove the canaries, wait —
-  // bounded — for `CONFINED <session> <this pid>`), while the gate stays pure.
-  // Nothing this process can observe about itself is proof; the launcher's view
-  // from OUTSIDE the sandbox is.
-  //
-  // cli#350 r4f — attest whenever a LAUNCHER launched this process, keyed on the
-  // locator (set by the launcher and only by it), NEVER on the TTY: the launcher
-  // requires the release on every launch, so a TTY child that skipped the
-  // handshake made every interactive `tps agent start` refuse with
-  // `no released child within …`. A human who types `--sandboxed` at a terminal
-  // carries no locator, so confinement stays undefined and rule 1b refuses it.
+  const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
+    "../src/utils/launch-attestation.js"
+  );
   let confinement: { released: boolean; reason?: string } | undefined;
-  if (ownArgv().includes(SANDBOXED_FLAG)) {
-    const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
-      "../src/utils/launch-attestation.js"
-    );
-    if (process.env[LAUNCH_SOCK_ENV]) {
-      const attestation = await attestConfinement();
-      confinement = { released: attestation.ok, reason: attestation.reason };
-    }
+  if (process.env[LAUNCH_SOCK_ENV]) {
+    const attestation = await attestConfinement();
+    confinement = { released: attestation.ok, reason: attestation.reason };
   }
-  enforceLaunchControl({ command, rest, argv: ownArgv(), parsedFlags: cli.flags, confinement });
-  if (launchFlags.noSandbox && isInteractiveTty()) {
+  const sandboxed = confinement?.released === true;
+  enforceLaunchControl({ command, rest, argv: ownArgv(), parsedFlags: cli.flags,
+    confinement: { released: sandboxed, reason: confinement?.reason } });
+  const flags = readLaunchFlags(ownArgv(), cli.flags);
+  if (flags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
+  return { ...flags, sandboxed };
 }
 
 // nono availability check (skip for --quiet-nono-check or office/mail relay commands)
@@ -288,7 +270,7 @@ async function main() {
     return;
   }
 
-  await enforceLaunchControlOrExit();
+  const launchDecision = await enforceLaunchControlOrExit();
   await checkNono();
   switch (command) {
     case "init": {
@@ -492,14 +474,16 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          const runtimeArg = process.argv.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
+          const payloadStart = helpArgs.argv.indexOf("--");
+          const ownArgs = payloadStart === -1 ? helpArgs.argv : helpArgs.argv.slice(0, payloadStart);
+          const runtimeArg = ownArgs.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
           const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
           if (runtimeArg !== undefined && runtimeArg !== "openclaw" && !attestedRuntime) {
             console.error(`❌ refusing to launch runtime '${runtimeArg}': unsupported runtime`);
             process.exit(78);
           }
-          const sandboxed = process.argv.includes("--sandboxed");
-          const noSandbox = launchFlags.noSandbox;
+          const sandboxed = launchDecision.sandboxed;
+          const noSandbox = launchDecision.noSandbox;
           // Selected runners execute after launcher release or an interactive
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
@@ -648,7 +632,7 @@ async function main() {
               id: agentId,
               sandbox: !noSandbox,
               sandboxed,
-              sandboxRequired: launchFlags.sandboxRequired,
+              sandboxRequired: launchDecision.sandboxRequired,
               // Carry the runtime into the re-exec so the sandboxed child runs the
               // runtime runner (cli#363 slice B); undefined for the default path.
               runtime: attestedRuntime ? runtimeArg : undefined,
