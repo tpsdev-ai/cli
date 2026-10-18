@@ -50,7 +50,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
-import { worktreeLaunchGit } from "./agent-lifecycle.js";
+import { worktreeLaunchBinding } from "./agent-lifecycle.js";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -349,16 +349,23 @@ export class WorktreeGrantError extends Error {
 }
 
 export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typeof approveRuntimeNonoOptions> {
-  const worktreeGit = worktreeLaunchGit(input.workspace);
+  const binding = worktreeLaunchBinding(input.workspace);
+  const worktreeGit = binding.kind === "registered" ? binding : undefined;
+  // An unregistered worktree gets no metadata grants and must not inherit the
+  // caller's cwd as a writable grant: the sandbox's working directory is the
+  // workspace in both worktree cases.
+  const cwd = worktreeGit || binding.kind === "unregistered"
+    ? input.workspace
+    : input.cwd ?? process.cwd();
   const grants = {
     ...agentLaunchGrants({ ...input, worktreeGit }),
-    cwd: worktreeGit ? input.workspace : input.cwd ?? process.cwd(),
+    cwd,
     workdir: input.workspace,
   };
   const approval = approveRuntimeNonoOptions(input.runtime, grants, input.env, input.launchId, input.configPath);
-  if (!worktreeGit) return approval;
+  if (binding.kind === "none") return approval;
   const options = approval.refusal ? grants : approval.options;
-  const base = canonicalPath(worktreeGit.baseWorkingTree);
+  const base = canonicalPath(binding.baseWorkingTree);
   const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
   const check = (path: string) => {
     if (pathContainsOrEquals(compare(canonicalPath(path)), compare(base))) throw new WorktreeGrantError(path);

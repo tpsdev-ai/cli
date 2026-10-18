@@ -343,51 +343,116 @@ function resolveBaseRepo(workspacePath: string): string | null {
   return null;
 }
 
-export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
+export type WorktreeLaunchBinding =
+  | { kind: "none" }
+  | { kind: "unregistered"; baseWorkingTree: string }
+  | { kind: "registered"; gitDir: string; gitCommonDir: string; baseWorkingTree: string };
+
+/**
+ * Classify a launch workspace against the trusted base repository.
+ *
+ * Registry ownership is decided from the trusted base's registry alone: the
+ * recorded `.git` path is compared to the workspace's `.git` path, so a
+ * registered entry is found even when its marker is missing or is a directory.
+ * A registered workspace must then carry a regular `.git` file; anything else
+ * is refused before any grant is computed. An unregistered regular `.git`
+ * file is a worktree we do not manage: it gets no metadata grants, but the
+ * caller still needs the trusted base so grants can be checked against it.
+ */
+export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
   const workspace = resolve(workspacePath);
+  try {
+    const workspaceStat = lstatSync(workspace);
+    if (!workspaceStat.isDirectory()) {
+      throw new WorktreeLifecycleError(`worktree marker probe failed: workspace is not a directory: ${workspace}`);
+    }
+  } catch (err) {
+    if (err instanceof WorktreeLifecycleError) throw err;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
+    throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+  }
+  const trustedBase = resolveBaseRepo(workspace);
+  // No tps base repository: not a tps-managed worktree, so no metadata grants.
+  if (!trustedBase) return { kind: "none" };
+  let resolvedWorkspace: string;
+  try {
+    resolvedWorkspace = realpathSync(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+  }
+  if (resolvedWorkspace === trustedBase) return { kind: "none" };
+  const registered = trustedBaseRegistersWorkspace(workspace, resolvedWorkspace, trustedBase);
+  const markerPath = join(workspace, ".git");
   let marker;
   try {
-    marker = lstatSync(join(workspace, ".git"));
+    marker = lstatSync(markerPath);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      if (registered) {
+        throw new WorktreeLifecycleError(`worktree git marker is missing for a registered worktree: ${workspace}`);
+      }
+      return { kind: "none" };
+    }
     throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
   }
   if (marker.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
-  if (!marker.isFile()) return undefined;
-  const trustedBase = resolveBaseRepo(workspace);
-  // No tps base repository: not a tps-managed worktree, so no metadata grants.
-  if (!trustedBase) return undefined;
-  if (realpathSync(workspace) === trustedBase) return undefined;
-  // Only the trusted base's own worktree registry makes this a tps-managed
-  // worktree. An unrelated worktree, a submodule or a --separate-git-dir
-  // checkout gets no metadata grants; its .git file is never trusted.
-  if (!trustedBaseRegistersWorkspace(workspace, trustedBase)) return undefined;
-  return worktreeGitMetadata(workspace, trustedBase);
+  if (registered) {
+    if (!marker.isFile()) {
+      throw new WorktreeLifecycleError(`worktree git marker is not a regular file for a registered worktree: ${workspace}`);
+    }
+    return { kind: "registered", ...worktreeGitMetadata(workspace, trustedBase) };
+  }
+  // Only a regular `.git` marker makes this an unregistered worktree; a plain
+  // directory or an ordinary repository keeps the caller's cwd policy.
+  if (!marker.isFile()) return { kind: "none" };
+  return { kind: "unregistered", baseWorkingTree: trustedBase };
 }
 
-/** Whether `baseRepo`'s worktree registry lists `workspace`'s .git file. The
- *  registry lives in the trusted base, not in the workspace. */
-function trustedBaseRegistersWorkspace(workspace: string, baseRepo: string): boolean {
+export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
+  const binding = worktreeLaunchBinding(workspacePath);
+  if (binding.kind !== "registered") return undefined;
+  return { gitDir: binding.gitDir, gitCommonDir: binding.gitCommonDir, baseWorkingTree: binding.baseWorkingTree };
+}
+
+/** Whether `baseRepo`'s worktree registry lists `workspace`'s .git path. The
+ *  registry lives in the trusted base, not in the workspace, and the recorded
+ *  path is compared without resolving the marker itself. */
+function trustedBaseRegistersWorkspace(workspace: string, resolvedWorkspace: string, baseRepo: string): boolean {
   const common = git(baseRepo, ["rev-parse", "--git-common-dir"]);
   if (!common.ok || !common.stdout) {
     throw new WorktreeLifecycleError(`trusted base common git directory could not be resolved for ${baseRepo}`);
   }
-  const registry = join(realpathSync(resolve(baseRepo, common.stdout)), "worktrees");
+  let commonDir: string;
+  try {
+    commonDir = realpathSync(resolve(baseRepo, common.stdout));
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `trusted base common git directory could not be resolved for ${baseRepo}: ${(err as Error).message}`,
+    );
+  }
+  const registry = join(commonDir, "worktrees");
   let entries: string[];
   try {
     entries = readdirSync(registry);
   } catch (err) {
+    // No registry directory means the base has no linked worktrees.
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw err;
+    throw new WorktreeLifecycleError(`worktree registry could not be read for ${baseRepo}: ${(err as Error).message}`);
   }
-  const markerPath = realpathSync(join(workspace, ".git"));
+  const markerPaths = new Set([
+    resolve(join(workspace, ".git")),
+    resolve(join(resolvedWorkspace, ".git")),
+  ]);
   return entries.some((entry) => {
+    let recorded: string;
     try {
-      return realpathSync(readFileSync(join(registry, entry, "gitdir"), "utf-8").trim()) === markerPath;
+      recorded = readFileSync(join(registry, entry, "gitdir"), "utf-8").trim();
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
-      throw err;
+      throw new WorktreeLifecycleError(
+        `worktree registry entry could not be read for ${baseRepo}: ${(err as Error).message}`,
+      );
     }
+    return recorded.length > 0 && markerPaths.has(resolve(recorded));
   });
 }
 

@@ -1092,6 +1092,88 @@ realNonoSuite(
     }, 40_000);
     }
 
+    test("an unrelated worktree launched from the base cannot read or write a base file", () => {
+      const sb = makeRealNonoSandbox();
+      try {
+        // The trusted base sits beside the workspace, as it does for a launch
+        // whose current directory is the base.
+        const base = join(dirname(sb.ws), "tps");
+        mkdirSync(base, { recursive: true });
+        const g = (args: string[], cwd = base) => spawnSync("git", args, { cwd, encoding: "utf-8" });
+        g(["init", "-q"]);
+        g(["config", "user.email", "agent-a@tps.dev"]);
+        g(["config", "user.name", "agent-a"]);
+        writeFileSync(join(base, "base-secret.txt"), "base-secret\n");
+        g(["add", "base-secret.txt"]);
+        g(["commit", "-qm", "init"]);
+
+        // An unrelated repository's worktree: its marker is a regular file,
+        // but the trusted base's registry does not list it.
+        const other = join(sb.root, "unrelated");
+        mkdirSync(other, { recursive: true });
+        const go = (args: string[]) => spawnSync("git", args, { cwd: other, encoding: "utf-8" });
+        go(["init", "-q"]);
+        go(["config", "user.email", "agent-a@tps.dev"]);
+        go(["config", "user.name", "agent-a"]);
+        writeFileSync(join(other, "workspace-file.txt"), "workspace-file\n");
+        go(["add", "workspace-file.txt"]);
+        go(["commit", "-qm", "init"]);
+        const ws = join(sb.root, "unrelated-ws");
+        go(["worktree", "add", "--detach", ws]);
+
+        rmSync(join(sb.home, ".config", "nono", "profiles"), { recursive: true });
+        mkdirSync(join(sb.home, ".bun"), { recursive: true });
+        const env = { ...process.env, HOME: sb.home, XDG_STATE_HOME: join(sb.root, "nono-state") };
+        const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        writeFileSync(cfg, agentYaml(sb, ws).replace("provider: ollama", "provider: openai"));
+        const approval = agentLaunchOptions({
+          configPath: cfg,
+          cwd: base,
+          workspace: ws,
+          launchId: "probe",
+          runtime: "codex",
+          home: sb.home,
+          env,
+          mailDir: join(sb.home, ".tps", "mail"),
+          tmpDir: sb.tmp,
+          agentDir: join(sb.home, ".tps", "agents", "probe"),
+        });
+        expect(approval.refusal).toBeNull();
+        expect(approval.options.cwd).toBe(ws);
+        for (const dir of approval.runtimeDirectories) mkdirSync(dir, { recursive: true, mode: 0o700 });
+
+        const token = randomBytes(8).toString("hex");
+        const deniedRead = `${NONO_PROBE_DENIED_PREFIX}${token}`;
+        const deniedWrite = `${NONO_PROBE_DENIED_PREFIX}write-${token}`;
+        const probe = spawnSync(
+          realNono as string,
+          buildNonoArgs(
+            runtimeNonoProfile("codex"),
+            approval.options,
+            [
+              "sh",
+              "-c",
+              `cat "$1" || echo CONTROL-UNREADABLE; cat "$2" 2>/dev/null || echo "${NONO_PROBE_DENIED_PREFIX}$3"; (echo tampered > "$2") 2>/dev/null && echo WRITE-ALLOWED || echo "${NONO_PROBE_DENIED_PREFIX}write-$3"`,
+              "sh",
+              join(ws, "workspace-file.txt"),
+              join(base, "base-secret.txt"),
+              token,
+            ],
+            env,
+          ),
+          { cwd: base, encoding: "utf-8", env },
+        );
+        const lines = probe.stdout.trim().split("\n");
+        expect(probe.status, `nono run exited ${probe.status}: ${probe.stderr}`).toBe(0);
+        expect(lines[0]).toBe("workspace-file");
+        expect(lines[1]).toBe(deniedRead);
+        expect(lines[2]).toBe(deniedWrite);
+        expect(readFileSync(join(base, "base-secret.txt"), "utf-8")).toBe("base-secret\n");
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    }, 40_000);
+
     for (const symlink of [false, true]) {
     test(`the re-exec child loads the custom config with symlink ${symlink}`, async () => {
       const sb = makeRealNonoSandbox();

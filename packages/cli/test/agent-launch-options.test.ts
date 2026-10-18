@@ -176,6 +176,43 @@ test("an unrelated project's worktree launches with no metadata grants", () => f
   expect(result.options.allow).not.toContain(join(repo, ".git"));
 }));
 
+test("an unrelated project's worktree launched from the base gets the workspace as its cwd grant", () => fixture((input, base, root) => {
+  const { ws } = unrelatedWorktree(root, "unregistered-cwd");
+  const result = agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: base });
+  expect(result.refusal).toBeNull();
+  expect(result.options.cwd).toBe(ws);
+  expect(result.options.allow).not.toContain(base);
+  const args = buildNonoArgs("tps-agent-run", result.options, ["payload"], input.env);
+  expect(args[args.indexOf("--allow") + 1]).toBe(ws);
+}));
+
+test("an unregistered worktree refuses a base grant declared by the profile", () => fixture((input, base, root) => {
+  const { ws } = unrelatedWorktree(root, "unregistered-profile");
+  const profiles = join(input.home!, ".config", "nono", "profiles");
+  mkdirSync(profiles, { recursive: true });
+  writeFileSync(join(profiles, "tps-agent-run.json"), JSON.stringify({ filesystem: { read: [base] } }));
+  expect(() => agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: base })).toThrow(WorktreeGrantError);
+}));
+
+for (const marker of ["missing", "directory"] as const) {
+  test(`a registered worktree with a ${marker} marker is refused on the default launch path`, () => fixture((input) => {
+    const gitPath = join(input.workspace, ".git");
+    rmSync(gitPath, { recursive: true, force: true });
+    if (marker === "directory") mkdirSync(gitPath);
+    expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow(WorktreeLifecycleError);
+  }));
+}
+
+test("a registry read failure is a named WorktreeLifecycleError", () => fixture((input, base) => {
+  const common = spawnSync("git", ["rev-parse", "--git-common-dir"], { cwd: base, encoding: "utf8" });
+  expect(common.status).toBe(0);
+  const registry = join(base, common.stdout.trim(), "worktrees");
+  rmSync(registry, { recursive: true, force: true });
+  writeFileSync(registry, "not a directory\n");
+  expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow(WorktreeLifecycleError);
+  expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow("worktree registry could not be read");
+}));
+
 test("a worktree with no trusted base repository launches with no metadata grants", () => fixture((input, _base, root) => {
   // No sibling tps next to this workspace, and the test home has no ~/ops/tps.
   const { repo, ws } = unrelatedWorktree(join(root, "elsewhere"), "nobase");
