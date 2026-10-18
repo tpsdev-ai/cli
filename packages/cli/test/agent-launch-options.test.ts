@@ -153,6 +153,37 @@ for (const marker of ["gitfile", "commondir", "common-only"] as const) {
   }));
 }
 
+function unrelatedWorktree(root: string, name: string): { repo: string; ws: string } {
+  const repo = join(root, `${name}-repo`);
+  mkdirSync(repo, { recursive: true });
+  const g = (args: string[]) => {
+    const result = spawnSync("git", args, { cwd: repo, encoding: "utf8" });
+    expect(result.status, result.stderr).toBe(0);
+  };
+  g(["init", "-q"]);
+  g(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
+  const ws = join(root, `${name}-ws`);
+  g(["worktree", "add", "--detach", ws]);
+  return { repo, ws };
+}
+
+test("an unrelated project's worktree launches with no metadata grants", () => fixture((input, _base, root) => {
+  // A trusted base exists beside it (root/tps), but its registry does not list this workspace.
+  const { repo, ws } = unrelatedWorktree(root, "unrelated");
+  const result = agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: ws });
+  expect(result.refusal).toBeNull();
+  expect(result.options.read).not.toContain(join(repo, ".git"));
+  expect(result.options.allow).not.toContain(join(repo, ".git"));
+}));
+
+test("a worktree with no trusted base repository launches with no metadata grants", () => fixture((input, _base, root) => {
+  // No sibling tps next to this workspace, and the test home has no ~/ops/tps.
+  const { repo, ws } = unrelatedWorktree(join(root, "elsewhere"), "nobase");
+  const result = agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: ws });
+  expect(result.refusal).toBeNull();
+  expect(result.options.read).not.toContain(join(repo, ".git"));
+}));
+
 test("a symlinked base uses resolved metadata grants", () => fixture((input, base, root) => {
   const resolvedBase = join(root, "projects", "repo");
   mkdirSync(join(root, "projects"));

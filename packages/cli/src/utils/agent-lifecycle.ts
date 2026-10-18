@@ -355,9 +355,40 @@ export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitC
   if (marker.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
   if (!marker.isFile()) return undefined;
   const trustedBase = resolveBaseRepo(workspace);
-  if (!trustedBase) throw new WorktreeLifecycleError(`worktree has no trusted base repository: ${workspace}`);
+  // No tps base repository: not a tps-managed worktree, so no metadata grants.
+  if (!trustedBase) return undefined;
   if (realpathSync(workspace) === trustedBase) return undefined;
+  // Only the trusted base's own worktree registry makes this a tps-managed
+  // worktree. An unrelated worktree, a submodule or a --separate-git-dir
+  // checkout gets no metadata grants; its .git file is never trusted.
+  if (!trustedBaseRegistersWorkspace(workspace, trustedBase)) return undefined;
   return worktreeGitMetadata(workspace, trustedBase);
+}
+
+/** Whether `baseRepo`'s worktree registry lists `workspace`'s .git file. The
+ *  registry lives in the trusted base, not in the workspace. */
+function trustedBaseRegistersWorkspace(workspace: string, baseRepo: string): boolean {
+  const common = git(baseRepo, ["rev-parse", "--git-common-dir"]);
+  if (!common.ok || !common.stdout) {
+    throw new WorktreeLifecycleError(`trusted base common git directory could not be resolved for ${baseRepo}`);
+  }
+  const registry = join(realpathSync(resolve(baseRepo, common.stdout)), "worktrees");
+  let entries: string[];
+  try {
+    entries = readdirSync(registry);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+  const markerPath = realpathSync(join(workspace, ".git"));
+  return entries.some((entry) => {
+    try {
+      return realpathSync(readFileSync(join(registry, entry, "gitdir"), "utf-8").trim()) === markerPath;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw err;
+    }
+  });
 }
 
 /**
