@@ -287,6 +287,42 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
     }
   });
 
+  for (const dangling of [false, true]) {
+    test(dangling ? "a dangling base symlink stops launch before nono" : "a valid base symlink launches with resolved grants", () => {
+      const sb = makeSandbox();
+      try {
+        const base = join(sb.home, "ops", "tps");
+        const target = join(sb.root, "projects", "repo");
+        mkdirSync(dirname(base), { recursive: true });
+        if (!dangling) {
+          mkdirSync(target, { recursive: true });
+          for (const args of [["init", "-q"], ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]]) {
+            expect(spawnSync("git", args, { cwd: target }).status).toBe(0);
+          }
+        }
+        symlinkSync(target, base);
+        rmSync(sb.ws, { recursive: true });
+        installFakeNono(sb, "  :");
+        writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+        writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, sb.ws));
+        const result = runLauncher(
+          ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+          { cwd: sb.run, env: cliEnv(sb) },
+        );
+        if (dangling) {
+          expect(output(result)).toContain("git probe failed for the base repository");
+          expect(fakeNonoRuns(sb.root)).toEqual([]);
+        } else {
+          expect(fakeNonoRuns(sb.root).length, output(result)).toBeGreaterThan(0);
+          expect(fakeNonoRuns(sb.root).join("\n")).toContain(`--read ${target}/.git`);
+          expect(fakeNonoRuns(sb.root).join("\n")).not.toContain(`--read ${base}/.git`);
+        }
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
   test("a blocked workspace parent stops launch before the sandbox", () => {
     const sb = makeSandbox();
     try {
@@ -807,6 +843,38 @@ describe("cli#516 (3) — --sandbox/--sandboxed inside a message or wrapped comm
           ? "refusing to launch runtime 'codex': no nono at the pinned absolute path"
           : "--sandboxed is refused: no launcher released this process");
         expect(fakeNonoRuns(sb.root)).toEqual([]);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const flag of ["absent", "payload", "own"] as const) {
+    test(`attestation requires an own --sandboxed argument (${flag})`, () => {
+      const own = flag === "own";
+      const sb = makeSandbox();
+      try {
+        const attempts = join(sb.root, "attestation-attempts");
+        const preload = join(sb.root, "observe-connect.mjs");
+        writeFileSync(preload, [
+          'import { Socket } from "node:net";',
+          'import { appendFileSync } from "node:fs";',
+          'const connect = Socket.prototype.connect;',
+          'Socket.prototype.connect = function (...args) {',
+          `  appendFileSync(${JSON.stringify(attempts)}, "connect\\n");`,
+          '  return connect.apply(this, args);',
+          '};',
+        ].join("\n"));
+        const result = spawnSync(NODE, ["--import", preload, TPS_BIN,
+          ...(own ? ["agent", "start", "--sandboxed"] : ["agent", "run", "--id", "ghost", "--message", "hi", ...(flag === "payload" ? ["--", "--sandboxed"] : [])]),
+        ], {
+          encoding: "utf8", cwd: sb.run, timeout: 20_000,
+          env: cliEnv(sb, { TPS_LAUNCH_SOCK: join(sb.root, "inherited.sock") }),
+        });
+        expect(result.error).toBeUndefined();
+        expect(existsSync(attempts), output(result)).toBe(own);
+        if (own) expect(output(result)).toContain("--sandboxed is refused: no launcher released this process");
+        else expect(output(result)).not.toContain("no launcher released this process");
       } finally {
         rmSync(sb.root, { recursive: true, force: true });
       }

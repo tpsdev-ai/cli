@@ -3,7 +3,7 @@ import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
 import { cliFlagDefinitions } from "../src/utils/cli-flags.js";
 import { parseCliArgs } from "../src/utils/cli-args.js";
-import { enforceLaunchControl, readLaunchFlags } from "../src/utils/nono.js";
+import { enforceLaunchControl, ownFlag, readLaunchFlags, SANDBOXED_FLAG } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
@@ -116,7 +116,7 @@ async function enforceLaunchControlOrExit() {
     "../src/utils/launch-attestation.js"
   );
   let confinement: { released: boolean; reason?: string } | undefined;
-  if (process.env[LAUNCH_SOCK_ENV]) {
+  if (ownFlag(ownArgv(), SANDBOXED_FLAG) && process.env[LAUNCH_SOCK_ENV]) {
     const attestation = await attestConfinement();
     confinement = { released: attestation.ok, reason: attestation.reason };
   }

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
 import { onStart, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { agentLaunchOptions, approveRuntimeNonoOptions, buildNonoArgs, WorktreeGrantError, type AgentLaunchGrantInput } from "../src/utils/nono.js";
@@ -123,4 +123,52 @@ test("an existing worktree is confined without a selected runtime", () => fixtur
   expect(result.options.cwd).toBe(input.workspace);
   expect(result.options.allow).not.toContain(base);
   expect(result.options.read).not.toContain(base);
+}));
+
+for (const marker of ["gitfile", "commondir", "common-only"] as const) {
+  test(`launch requires trusted worktree metadata (${marker})`, () => fixture((input, base, root) => {
+    const other = join(root, "other");
+    mkdirSync(other);
+    const g = (args: string[]) => {
+      const result = spawnSync("git", args, { cwd: other, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return result.stdout.trim();
+    };
+    g(["init", "-q"]);
+    g(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
+    if (marker === "gitfile") {
+      const linked = join(root, "other-worktree");
+      g(["worktree", "add", "--detach", linked]);
+      writeFileSync(join(input.workspace, ".git"), readFileSync(join(linked, ".git")));
+    } else {
+      const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: input.workspace, encoding: "utf8" });
+      expect(metadata.status).toBe(0);
+      if (marker === "common-only") g(["config", "core.worktree", base]);
+      writeFileSync(join(metadata.stdout.trim(), "commondir"), join(other, ".git"));
+    }
+    let approval: ReturnType<typeof agentLaunchOptions> | undefined;
+    expect(() => { approval = agentLaunchOptions(input); }).toThrow(WorktreeLifecycleError);
+    expect(() => agentLaunchOptions(input)).toThrow("worktree metadata binding failed");
+    expect(approval).toBeUndefined();
+  }));
+}
+
+test("a symlinked base uses resolved metadata grants", () => fixture((input, base, root) => {
+  const resolvedBase = join(root, "projects", "repo");
+  mkdirSync(join(root, "projects"));
+  renameSync(base, resolvedBase);
+  symlinkSync(resolvedBase, base);
+  const result = agentLaunchOptions(input);
+  expect(result.refusal).toBeNull();
+  expect(result.options.read).toContain(join(resolvedBase, ".git"));
+  expect(result.options.read).not.toContain(join(base, ".git"));
+  expect(result.options.allow).toContain(realpathSync(join(resolvedBase, ".git", "worktrees", "ws")));
+}));
+
+test("launch options accept a registered worktree beside a prunable entry", () => fixture((input, base, root) => {
+  const stale = join(root, "a-stale");
+  const added = spawnSync("git", ["worktree", "add", "--detach", stale], { cwd: base, encoding: "utf8" });
+  expect(added.status, added.stderr).toBe(0);
+  rmSync(stale, { recursive: true });
+  expect(agentLaunchOptions(input).refusal).toBeNull();
 }));

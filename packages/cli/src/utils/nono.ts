@@ -1292,7 +1292,7 @@ export interface ConfinementVerdict {
  * secrets-guard's command) (cli#516). A `--sandboxed` inside a payload is not
  * this process's flag, so it must not trip the `--sandboxed` gate.
  */
-function ownFlag(argv: readonly string[], flag: string): boolean {
+export function ownFlag(argv: readonly string[], flag: string): boolean {
   const end = argv.indexOf("--");
   return (end === -1 ? argv : argv.slice(0, end)).includes(flag);
 }

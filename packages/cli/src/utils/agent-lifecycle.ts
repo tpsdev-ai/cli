@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, lstatSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, realpathSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -238,8 +238,7 @@ export interface AgentLifecycleResult {
 /**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
  * caller can tell a worktree failure from any other error and report it as one;
- * the message names the operation that failed. A workspace with no base
- * repository is reported as changed:false.
+ * the message names the operation that failed.
  */
 export class WorktreeLifecycleError extends Error {
   constructor(message: string) {
@@ -271,7 +270,7 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
 }
 
 type RepoProbe =
-  | { kind: "repo" }
+  | { kind: "repo"; path: string }
   | { kind: "not-a-repo" }
   | { kind: "error"; detail: string };
 
@@ -284,7 +283,9 @@ function probeRepo(path: string): RepoProbe {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
       throw err;
     }
-    if (!candidate.isDirectory() || candidate.isSymbolicLink()) {
+    path = realpathSync(path);
+    candidate = lstatSync(path);
+    if (!candidate.isDirectory()) {
       return { kind: "error", detail: "base path is not a plain directory" };
     }
     readdirSync(path);
@@ -305,7 +306,7 @@ function probeRepo(path: string): RepoProbe {
     return { kind: "error", detail: (err as Error).message };
   }
   const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
-  if (out.ok && out.stdout === "true") return { kind: "repo" };
+  if (out.ok && out.stdout === "true") return { kind: "repo", path };
   return { kind: "error", detail: out.stderr || out.stdout || "git probe produced no output" };
 }
 
@@ -332,7 +333,7 @@ function resolveBaseRepo(workspacePath: string): string | null {
   ];
   for (const candidate of candidates) {
     const probe = probeRepo(candidate);
-    if (probe.kind === "repo") return candidate;
+    if (probe.kind === "repo") return probe.path;
     if (probe.kind === "error") {
       throw new WorktreeLifecycleError(
         `git probe failed for the base repository ${candidate}: ${probe.detail}`,
@@ -353,9 +354,10 @@ export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitC
   }
   if (marker.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
   if (!marker.isFile()) return undefined;
-  const base = parseWorktreePaths(workspace).values().next().value;
-  if (!base || base === workspace) return undefined;
-  return worktreeGitMetadata(workspace, base);
+  const trustedBase = resolveBaseRepo(workspace);
+  if (!trustedBase) throw new WorktreeLifecycleError(`worktree has no trusted base repository: ${workspace}`);
+  if (realpathSync(workspace) === trustedBase) return undefined;
+  return worktreeGitMetadata(workspace, trustedBase);
 }
 
 /**
@@ -438,22 +440,36 @@ function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: str
       `worktree git directory could not be resolved for ${workspace}: ${gitDir.stderr || gitDir.stdout || "git rev-parse produced no output"}`,
     );
   }
-  // A linked worktree's git directory holds a `commondir` file naming the
-  // base repository's metadata directory. Git needs that metadata, not the
-  // base repository's working tree.
-  let commonDir: string;
   try {
-    commonDir = worktreeCommonDir(gitDir.stdout);
+    const base = parseWorktreePaths(workspace).values().next().value;
+    const trustedCommon = git(baseRepo, ["rev-parse", "--git-common-dir"]);
+    if (!trustedCommon.ok || !trustedCommon.stdout) {
+      throw new Error("trusted base common git directory could not be resolved");
+    }
+    const gitCommonDir = realpathSync(resolve(baseRepo, trustedCommon.stdout));
+    if (!base || realpathSync(base) !== baseRepo ||
+        realpathSync(worktreeCommonDir(gitDir.stdout)) !== gitCommonDir) {
+      throw new Error("worktree metadata does not belong to the trusted base");
+    }
+    const registry = join(gitCommonDir, "worktrees");
+    const markerPath = realpathSync(join(workspace, ".git"));
+    const trustedGitDir = readdirSync(registry)
+      .map((entry) => join(registry, entry))
+      .find((entry) => {
+        try {
+          return realpathSync(readFileSync(join(entry, "gitdir"), "utf-8").trim()) === markerPath;
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+          throw err;
+        }
+      });
+    if (!trustedGitDir || realpathSync(gitDir.stdout) !== realpathSync(trustedGitDir)) {
+      throw new Error("worktree git directory does not belong to the trusted base");
+    }
+    return { gitDir: realpathSync(trustedGitDir), gitCommonDir, baseWorkingTree: baseRepo };
   } catch (err) {
-    throw new WorktreeLifecycleError(
-      `worktree common git directory could not be resolved for ${workspace}: ${(err as Error).message}`,
-    );
+    throw new WorktreeLifecycleError(`worktree metadata binding failed for ${workspace}: ${(err as Error).message}`);
   }
-  return {
-    gitDir: gitDir.stdout,
-    gitCommonDir: commonDir,
-    baseWorkingTree: baseRepo,
-  };
 }
 
 /**
