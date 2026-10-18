@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative } from "node:path";
-import { onStart, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
+import { dirname, isAbsolute, join, relative } from "node:path";
+import { onStart, worktreeLaunchBinding, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { agentLaunchOptions, approveRuntimeNonoOptions, buildNonoArgs, WorktreeGrantError, type AgentLaunchGrantInput } from "../src/utils/nono.js";
 import { sandboxHomeBase } from "./helpers/launcher-grants.js";
 
@@ -271,4 +271,101 @@ test("launch options accept a registered worktree beside a prunable entry", () =
   expect(added.status, added.stderr).toBe(0);
   rmSync(stale, { recursive: true });
   expect(agentLaunchOptions(input).refusal).toBeNull();
+}));
+
+for (const runtime of [undefined, "codex"] as const) {
+  test(`a workspace symlink uses its registered target's launch options (${runtime ?? "default"})`, () => fixture((input, base, root) => {
+    const aliases = join(root, "aliases");
+    mkdirSync(aliases);
+    writeFileSync(join(aliases, "tps"), "not a base directory\n");
+    const alias = join(aliases, "workspace");
+    symlinkSync(input.workspace, alias);
+    const direct = { ...input, runtime, cwd: base };
+    const linked = { ...direct, workspace: alias };
+    expect(worktreeLaunchBinding(alias)).toEqual(worktreeLaunchBinding(input.workspace));
+    expect(worktreeLaunchBinding(alias).kind).toBe("registered");
+    expect(onStart("probe", alias, { deferCheckout: true }))
+      .toEqual(onStart("probe", input.workspace, { deferCheckout: true }));
+    const target = agentLaunchOptions(direct);
+    const result = agentLaunchOptions(linked);
+    expect(target.refusal).toBeNull();
+    expect(result).toEqual(target);
+    expect(result.options.cwd).toBe(input.workspace);
+    expect(result.options.workdir).toBe(input.workspace);
+    expect(result.options.allow).not.toContain(alias);
+    expect(buildNonoArgs("tps-agent-run", result.options, ["payload"], input.env))
+      .toEqual(buildNonoArgs("tps-agent-run", target.options, ["payload"], input.env));
+    expect(() => agentLaunchOptions({ ...direct, tmpDir: base })).toThrow(WorktreeGrantError);
+    expect(() => agentLaunchOptions({ ...linked, tmpDir: base })).toThrow(WorktreeGrantError);
+    expect(agentLaunchOptions({ ...linked, workspace: `${input.workspace}/../ws` }).refusal)
+      .toContain("unsupported parent-directory segment '..'");
+  }));
+}
+
+test("a workspace symlink to the trusted base uses the base's launch options", () => fixture((input, base, root) => {
+  const aliases = join(root, "aliases");
+  mkdirSync(aliases);
+  writeFileSync(join(aliases, "tps"), "not a base directory\n");
+  const alias = join(aliases, "base");
+  symlinkSync(base, alias);
+  expect(worktreeLaunchBinding(alias)).toEqual(worktreeLaunchBinding(base));
+  expect(worktreeLaunchBinding(alias).kind).toBe("none");
+  expect(onStart("probe", alias, { deferCheckout: true }))
+    .toEqual(onStart("probe", base, { deferCheckout: true }));
+  const target = agentLaunchOptions({ ...input, workspace: base, cwd: base });
+  const result = agentLaunchOptions({ ...input, workspace: alias, cwd: base });
+  expect(target.refusal).toBeNull();
+  expect(result).toEqual(target);
+  expect(result.options.workdir).toBe(base);
+  expect(result.options.allow).not.toContain(alias);
+  expect(buildNonoArgs("tps-agent-run", result.options, ["payload"], input.env))
+    .toEqual(buildNonoArgs("tps-agent-run", target.options, ["payload"], input.env));
+}));
+
+test("a dangling workspace symlink to a registered target is refused before grants", () => fixture((input, _base, root) => {
+  const aliases = join(root, "aliases");
+  mkdirSync(aliases);
+  const alias = join(aliases, "workspace");
+  symlinkSync(relative(aliases, input.workspace), alias);
+  rmSync(input.workspace, { recursive: true });
+  const loop = join(root, "config-loop");
+  symlinkSync(loop, loop);
+  for (const workspace of [input.workspace, alias]) {
+    let error: unknown;
+    try {
+      agentLaunchOptions({ ...input, workspace, configPath: loop });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toBe(
+      `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+    );
+  }
+}));
+
+test("a relative registry gitdir binds launch and deferred-checkout metadata", () => fixture((input, base, root) => {
+  const workspace = join(root, "relative-worktree");
+  const added = spawnSync("git", ["-c", "worktree.useRelativePaths=true", "worktree", "add", "--no-checkout", "--detach", workspace], { cwd: base, encoding: "utf8" });
+  expect(added.status, added.stderr).toBe(0);
+  const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
+  expect(metadata.status, metadata.stderr).toBe(0);
+  const gitDir = realpathSync(metadata.stdout.trim());
+  const recordedPath = join(gitDir, "gitdir");
+  if (isAbsolute(readFileSync(recordedPath, "utf8").trim())) {
+    writeFileSync(recordedPath, `${relative(dirname(recordedPath), join(workspace, ".git"))}\n`);
+  }
+  expect(isAbsolute(readFileSync(recordedPath, "utf8").trim())).toBe(false);
+  const gitCommonDir = realpathSync(join(base, ".git"));
+  expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
+  const result = agentLaunchOptions({ ...input, workspace, cwd: base });
+  expect(result.refusal).toBeNull();
+  expect(result.options.cwd).toBe(workspace);
+  expect(result.options.allow).toContain(gitDir);
+  expect(result.options.read).toContain(gitCommonDir);
+  const existing = onStart("probe", workspace, { deferCheckout: true });
+  expect(existing.changed).toBe(false);
+  expect(existing.gitDir).toBe(gitDir);
+  expect(existing.gitCommonDir).toBe(gitCommonDir);
+  expect(existing.baseWorkingTree).toBe(base);
 }));

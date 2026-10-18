@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, lstatSync, realpathSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
@@ -361,15 +361,17 @@ export type WorktreeLaunchBinding =
  * base to check launch options and explicit profile filesystem grants.
  */
 export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
-  const workspace = resolve(workspacePath);
+  let workspace = resolve(workspacePath);
   try {
-    const workspaceStat = lstatSync(workspace);
+    const workspaceStat = statSync(workspace);
     if (!workspaceStat.isDirectory()) {
       throw new WorktreeLifecycleError(`worktree marker probe failed: workspace is not a directory: ${workspace}`);
     }
+    workspace = realpathSync(workspace);
   } catch (err) {
     if (err instanceof WorktreeLifecycleError) throw err;
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      workspace = resolvableWorkspacePath(workspace);
       // The workspace directory is absent, but a registered worktree keeps its
       // ownership in the trusted base's registry. Refuse it before any grant is
       // computed; an absent unregistered path keeps the caller's cwd policy.
@@ -432,17 +434,21 @@ export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitC
   return { gitDir: binding.gitDir, gitCommonDir: binding.gitCommonDir, baseWorkingTree: binding.baseWorkingTree };
 }
 
-/** Canonical form of a workspace path that may not exist yet: resolve the
- *  workspace when present, otherwise its parent directory. */
-function resolvableWorkspacePath(workspace: string): string {
+function resolvableWorkspacePath(workspace: string, links = 0): string {
+  if (links > 40) throw new WorktreeLifecycleError(`worktree path has too many symbolic links: ${workspace}`);
   try {
     return realpathSync(workspace);
   } catch {
+    let target: string;
     try {
-      return join(realpathSync(dirname(workspace)), basename(workspace));
-    } catch {
-      return resolve(workspace);
+      target = readlinkSync(workspace);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOENT") throw err;
+      const parent = dirname(workspace);
+      return parent === workspace ? workspace : join(resolvableWorkspacePath(parent, links), basename(workspace));
     }
+    return resolvableWorkspacePath(resolve(dirname(workspace), target), links + 1);
   }
 }
 
@@ -484,7 +490,7 @@ function trustedBaseRegistersWorkspace(workspace: string, resolvedWorkspace: str
         `worktree registry entry could not be read for ${baseRepo}: ${(err as Error).message}`,
       );
     }
-    return recorded.length > 0 && markerPaths.has(resolve(recorded));
+    return recorded.length > 0 && markerPaths.has(resolve(registry, entry, recorded));
   });
 }
 
@@ -507,7 +513,14 @@ export function onStart(
     return { changed: false, reason: "no workspace path configured" };
   }
 
-  const workspace = resolve(workspacePath);
+  let workspace = resolve(workspacePath);
+  try {
+    workspace = realpathSync(workspace);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+    }
+  }
   const baseRepo = resolveBaseRepo(workspace);
   if (!baseRepo) {
     return { changed: false, reason: "no base repository for the workspace" };
@@ -585,7 +598,8 @@ function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: str
       .map((entry) => join(registry, entry))
       .find((entry) => {
         try {
-          return realpathSync(readFileSync(join(entry, "gitdir"), "utf-8").trim()) === markerPath;
+          const recorded = readFileSync(join(entry, "gitdir"), "utf-8").trim();
+          return recorded.length > 0 && realpathSync(resolve(entry, recorded)) === markerPath;
         } catch (err) {
           if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
           throw err;
