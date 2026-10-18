@@ -498,6 +498,49 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
     }
   });
 
+  test("a child registry rewrite makes parent cleanup fail", () => {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf8" });
+      expect(g(["init", "-q"]).status).toBe(0);
+      expect(g(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]).status).toBe(0);
+      rmSync(sb.ws, { recursive: true });
+      installFakeNono(sb, `  printf '%s/repointed/.git\\n' "\${BASE_REPO:?}" > "\${BASE_REPO:?}/.git/worktrees/ws/gitdir"`);
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, sb.ws));
+      const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
+      const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+      const script = `
+        import { mock } from 'bun:test';
+        import { spawnSync } from 'node:child_process';
+        const attestation = await import(${JSON.stringify(attestationModule)});
+        mock.module(${JSON.stringify(attestationModule)}, () => ({
+          ...attestation,
+          launchAttested: async () => {
+            const child = spawnSync(process.env.NONO_BIN, ['run'], { env: process.env, encoding: 'utf8' });
+            if (child.status !== 0) throw new Error(child.stderr);
+            return 0;
+          },
+        }));
+        const { runAgent } = await import(${JSON.stringify(agentModule)});
+        await runAgent({ action: 'start', id: 'probe', runtime: 'codex', sandboxRequired: true });
+      `;
+      const result = spawnSync("bun", ["-e", script], {
+        cwd: sb.run, encoding: "utf8", timeout: 20_000,
+        env: cliEnv(sb, { BASE_REPO: base }),
+      });
+      expect(result.status, output(result)).not.toBe(0);
+      expect(output(result)).toContain(`worktree cleanup binding changed for ${sb.ws}`);
+      expect(fakeNonoRuns(sb.root).length).toBeGreaterThan(0);
+      expect(readFileSync(join(base, ".git", "worktrees", "ws", "gitdir"), "utf8")).toBe(`${base}/repointed/.git\n`);
+      expect(existsSync(sb.ws)).toBe(true);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
   test("an existing worktree survives the launch", () => {
     const sb = makeSandbox();
     try {

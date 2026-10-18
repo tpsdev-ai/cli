@@ -203,6 +203,11 @@ for (const marker of ["missing", "directory"] as const) {
     rmSync(gitPath, { recursive: true, force: true });
     if (marker === "directory") mkdirSync(gitPath);
     expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow(WorktreeLifecycleError);
+    expect(() => agentLaunchOptions({ ...input, runtime: undefined })).toThrow(
+      marker === "directory"
+        ? `worktree git marker is not a regular file for a registered worktree: ${input.workspace}`
+        : `worktree git marker is missing for a registered worktree: ${input.workspace}`,
+    );
   }));
 }
 
@@ -424,3 +429,67 @@ for (const corruption of ["unreadable", "unresolvable", "empty"] as const) {
     }
   }));
 }
+
+for (const rewrite of [false, true]) {
+  test(`cleanup uses the setup binding with registry rewrite ${rewrite}`, () => fixture((_input, _base, root) => {
+    const workspace = join(root, "cleanup-worktree");
+    const start = onStart("probe", workspace, { deferCheckout: true });
+    expect(start.changed).toBe(true);
+    expect(start.cleanupBinding).toBeDefined();
+    const binding = start.cleanupBinding!;
+    expect(binding.workspace).toBe(realpathSync(workspace));
+    expect(binding.gitDir).toBe(start.gitDir!);
+    if (rewrite) {
+      writeFileSync(binding.registryEntry, join(root, "repointed", ".git") + "\n");
+      let result: ReturnType<typeof onStop> | undefined;
+      let error: unknown;
+      try {
+        result = onStop("probe", workspace, binding);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(WorktreeLifecycleError);
+      expect((error as Error).message).toContain(`worktree cleanup binding changed for ${workspace}`);
+      expect(result).toBeUndefined();
+      expect(existsSync(workspace)).toBe(true);
+      expect(existsSync(binding.gitDir)).toBe(true);
+    } else {
+      expect(onStop("probe", workspace, binding).changed).toBe(true);
+      expect(existsSync(workspace)).toBe(false);
+      expect(existsSync(binding.gitDir)).toBe(false);
+    }
+  }));
+}
+
+for (const target of ["dangling", "loop"] as const) {
+  test(`cleanup names a ${target} workspace symlink resolution failure`, () => fixture((_input, _base, root) => {
+    const workspace = join(root, "cleanup-link");
+    symlinkSync(target === "loop" ? workspace : join(root, "absent"), workspace);
+    let error: unknown;
+    try {
+      onStop("probe", workspace);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree path could not be resolved for ${workspace}`);
+  }));
+}
+
+test("cleanup reports a retained worktree removal failure", () => fixture((_input, base, root) => {
+  const workspace = join(root, "locked-worktree");
+  const start = onStart("probe", workspace, { deferCheckout: true });
+  expect(start.changed).toBe(true);
+  expect(start.cleanupBinding).toBeDefined();
+  const locked = spawnSync("git", ["worktree", "lock", workspace], { cwd: base, encoding: "utf8" });
+  expect(locked.status, locked.stderr).toBe(0);
+  let error: unknown;
+  try {
+    onStop("probe", workspace, start.cleanupBinding);
+  } catch (err) {
+    error = err;
+  }
+  expect(error).toBeInstanceOf(WorktreeLifecycleError);
+  expect((error as Error).message).toContain(`worktree cleanup failed for probe (${workspace})`);
+  expect(existsSync(workspace)).toBe(true);
+}));

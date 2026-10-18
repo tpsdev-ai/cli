@@ -233,6 +233,16 @@ export interface AgentLifecycleResult {
    */
   gitCommonDir?: string;
   baseWorkingTree?: string;
+  cleanupBinding?: WorktreeCleanupBinding;
+}
+
+export interface WorktreeCleanupBinding {
+  workspace: string;
+  baseWorkingTree: string;
+  gitDir: string;
+  gitCommonDir: string;
+  registryEntry: string;
+  recordedGitdir: string;
 }
 
 /**
@@ -546,17 +556,26 @@ export function onStart(
 
   const rollback = () => git(baseRepo, ["worktree", "remove", "--force", workspace]);
   try {
+    const metadata = worktreeGitMetadata(workspace, baseRepo);
+    const registryEntry = join(metadata.gitDir, "gitdir");
     return {
       changed: true,
       reason: defer ? "worktree created; checkout deferred" : "worktree created",
-      ...(defer ? worktreeGitMetadata(workspace, baseRepo) : {}),
+      ...(defer ? metadata : {}),
+      cleanupBinding: {
+        ...metadata,
+        workspace: realpathSync(workspace),
+        registryEntry,
+        recordedGitdir: readFileSync(registryEntry, "utf-8"),
+      },
     };
   } catch (err) {
     const removed = rollback();
     if (!removed.ok) {
       throw new WorktreeLifecycleError(`${(err as Error).message}; worktree cleanup failed: ${removed.stderr || removed.stdout}`);
     }
-    throw err;
+    if (err instanceof WorktreeLifecycleError) throw err;
+    throw new WorktreeLifecycleError(`worktree setup binding failed for ${workspace}: ${(err as Error).message}`);
   }
 }
 
@@ -633,7 +652,37 @@ function pathExists(path: string): boolean {
   }
 }
 
-export function onStop(_agentId: string, workspacePath?: string): AgentLifecycleResult {
+export function onStop(_agentId: string, workspacePath?: string, binding?: WorktreeCleanupBinding): AgentLifecycleResult {
+  if (binding) {
+    const probe = probeRepo(binding.baseWorkingTree);
+    if (probe.kind !== "repo") {
+      throw new WorktreeLifecycleError(
+        `git probe failed for the base repository ${binding.baseWorkingTree}: ${probe.kind === "error" ? probe.detail : "base repository is absent"}`,
+      );
+    }
+    try {
+      const marker = readFileSync(join(binding.workspace, ".git"), "utf-8").trim();
+      if (
+        realpathSync(binding.workspace) !== binding.workspace ||
+        realpathSync(binding.gitDir) !== binding.gitDir ||
+        readFileSync(binding.registryEntry, "utf-8") !== binding.recordedGitdir ||
+        !marker.startsWith("gitdir: ") ||
+        realpathSync(resolve(binding.workspace, marker.slice("gitdir: ".length))) !== binding.gitDir ||
+        realpathSync(worktreeCommonDir(binding.gitDir)) !== binding.gitCommonDir
+      ) {
+        throw new Error("setup binding changed");
+      }
+    } catch (err) {
+      throw new WorktreeLifecycleError(`worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}`);
+    }
+    const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
+    if (!remove.ok) {
+      throw new WorktreeLifecycleError(
+        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}`,
+      );
+    }
+    return { changed: true, reason: "worktree removed" };
+  }
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
   }
@@ -656,7 +705,13 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "workspace does not exist" };
   }
 
-  if (!trustedBaseWorktreeGitDir(workspace, realpathSync(workspace), baseRepo)) {
+  let resolvedWorkspace: string;
+  try {
+    resolvedWorkspace = realpathSync(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+  }
+  if (!trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo)) {
     return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
   }
 

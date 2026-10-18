@@ -1260,6 +1260,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             };
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
+            let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
             let approval: ReturnType<typeof agentLaunchOptions>;
             try {
               approval = approveLaunch();
@@ -1267,12 +1268,13 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
               const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
               worktreeCreated = start?.changed ?? false;
+              cleanupBinding = start?.cleanupBinding;
               approval = approveLaunch();
             } catch (err) {
               console.error(`❌ ${(err as Error).message}`);
               if (worktreeCreated) {
                 try {
-                  onStop(launchId, config.workspace);
+                  onStop(launchId, config.workspace, cleanupBinding);
                 } catch (cleanupErr) {
                   console.error(`❌ ${(cleanupErr as Error).message}`);
                 }
@@ -1302,7 +1304,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
               // Attempt cleanup only after this launch created a worktree (cli#516).
               if (worktreeCreated) {
                 try {
-                  onStop(launchId, config.workspace);
+                  onStop(launchId, config.workspace, cleanupBinding);
                 } catch (err) {
                   console.error(`❌ ${(err as Error).message}`);
                   process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
