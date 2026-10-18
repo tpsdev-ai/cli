@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
-import { onStart, worktreeLaunchBinding, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
+import { onStart, onStop, worktreeLaunchBinding, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { agentLaunchOptions, approveRuntimeNonoOptions, buildNonoArgs, WorktreeGrantError, type AgentLaunchGrantInput } from "../src/utils/nono.js";
 import { sandboxHomeBase } from "./helpers/launcher-grants.js";
 
@@ -26,6 +26,7 @@ function fixture(run: (input: AgentLaunchGrantInput, base: string, root: string)
     expect(created.changed).toBe(true);
     const existing = onStart("probe", workspace, { deferCheckout: true });
     expect(existing.changed).toBe(false);
+    expect(existing.gitDir).toBe(created.gitDir);
     expect(worktreeLaunchBinding(workspace)).toEqual({
       kind: "registered", gitDir: created.gitDir, gitCommonDir: created.gitCommonDir, baseWorkingTree: base,
     });
@@ -346,32 +347,80 @@ test("a dangling workspace symlink to a registered target is refused before gran
   }
 }));
 
-for (const marker of ["absolute", "relative"] as const) {
-  test(`a relative registry gitdir binds launch metadata and preserves an existing worktree (${marker} marker)`, () => fixture((input, base, root) => {
-    const workspace = join(root, "relative-worktree");
-    const added = spawnSync("git", ["-c", "worktree.useRelativePaths=true", "worktree", "add", "--no-checkout", "--detach", workspace], { cwd: base, encoding: "utf8" });
-    expect(added.status, added.stderr).toBe(0);
-    const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
-    expect(metadata.status, metadata.stderr).toBe(0);
-    const gitDir = realpathSync(metadata.stdout.trim());
-    const recordedPath = join(gitDir, "gitdir");
-    writeFileSync(recordedPath, `${relative(dirname(recordedPath), join(workspace, ".git"))}\n`);
-    const gitfile = `gitdir: ${marker === "absolute" ? gitDir : relative(workspace, gitDir)}\n`;
-    writeFileSync(join(workspace, ".git"), gitfile);
-    expect(isAbsolute(readFileSync(recordedPath, "utf8").trim())).toBe(false);
-    const gitCommonDir = realpathSync(join(base, ".git"));
-    expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
-    const result = agentLaunchOptions({ ...input, workspace, cwd: base });
-    expect(result.refusal).toBeNull();
-    expect(result.options.cwd).toBe(workspace);
-    expect(result.options.allow).toContain(gitDir);
-    expect(result.options.read).toContain(gitCommonDir);
-    const existing = onStart("probe", workspace, { deferCheckout: true });
-    expect(existing.changed).toBe(false);
-    expect(readFileSync(join(workspace, ".git"), "utf8")).toBe(gitfile);
-    expect(readFileSync(recordedPath, "utf8")).toBe(`${relative(gitDir, join(workspace, ".git"))}\n`);
-    expect(existsSync(join(gitDir, "index"))).toBe(false);
-    expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
-    expect(agentLaunchOptions({ ...input, workspace, cwd: base })).toEqual(result);
+for (const layout of ["absolute", "relative"] as const) {
+  for (const marker of ["absolute", "relative"] as const) {
+    test(`a ${layout} registry gitdir binds launch metadata and preserves an existing worktree (${marker} marker)`, () => fixture((input, base, root) => {
+      const workspace = join(root, "relative-worktree");
+      const created = onStart("probe", workspace, { deferCheckout: true });
+      expect(created.changed).toBe(true);
+      const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: workspace, encoding: "utf8" });
+      expect(metadata.status, metadata.stderr).toBe(0);
+      const gitDir = realpathSync(metadata.stdout.trim());
+      const recordedPath = join(gitDir, "gitdir");
+      const recorded = `${layout === "absolute" ? join(workspace, ".git") : relative(dirname(recordedPath), join(workspace, ".git"))}\n`;
+      writeFileSync(recordedPath, recorded);
+      const gitfile = `gitdir: ${marker === "absolute" ? gitDir : relative(workspace, gitDir)}\n`;
+      writeFileSync(join(workspace, ".git"), gitfile);
+      expect(isAbsolute(readFileSync(recordedPath, "utf8").trim())).toBe(layout === "absolute");
+      const gitBin = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
+      const bin = join(root, "bin");
+      mkdirSync(bin);
+      const listed = join(root, "worktree-listed");
+      const wrapper = join(bin, "git");
+      writeFileSync(wrapper, [
+        "#!/bin/sh",
+        `if [ "$1" = "worktree" ] && [ "$2" = "list" ]; then touch "${listed}"; fi`,
+        `exec "${gitBin}" "$@"`, "",
+      ].join("\n"));
+      chmodSync(wrapper, 0o755);
+      const oldPath = process.env.PATH;
+      try {
+        process.env.PATH = `${bin}:${oldPath}`;
+        const gitCommonDir = realpathSync(join(base, ".git"));
+        expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
+        const result = agentLaunchOptions({ ...input, workspace, cwd: base });
+        expect(result.refusal).toBeNull();
+        expect(result.options.cwd).toBe(workspace);
+        expect(result.options.allow).toContain(gitDir);
+        expect(result.options.read).toContain(gitCommonDir);
+        const existing = onStart("probe", workspace, { deferCheckout: true });
+        expect(existing.changed).toBe(false);
+        expect(existing.gitDir).toBe(gitDir);
+        expect(readFileSync(join(workspace, ".git"), "utf8")).toBe(gitfile);
+        expect(readFileSync(recordedPath, "utf8")).toBe(recorded);
+        expect(existsSync(join(gitDir, "index"))).toBe(false);
+        expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
+        expect(agentLaunchOptions({ ...input, workspace, cwd: base })).toEqual(result);
+        expect(existsSync(listed)).toBe(false);
+        expect(onStop("probe", workspace).changed).toBe(true);
+        expect(existsSync(listed)).toBe(false);
+        expect(existsSync(workspace)).toBe(false);
+        expect(existsSync(gitDir)).toBe(false);
+      } finally {
+        process.env.PATH = oldPath;
+      }
+    }));
+  }
+}
+
+for (const corruption of ["unreadable", "unresolvable", "empty"] as const) {
+  test(`lifecycle and launch reject a ${corruption} registry entry`, () => fixture((input, base) => {
+    const registry = join(base, ".git", "worktrees", "invalid");
+    mkdirSync(registry);
+    const recordedPath = join(registry, "gitdir");
+    if (corruption === "unreadable") mkdirSync(recordedPath);
+    else if (corruption === "unresolvable") {
+      const loop = join(registry, "loop");
+      symlinkSync("loop", loop);
+      writeFileSync(recordedPath, "loop/.git\n");
+    } else writeFileSync(recordedPath, "\n");
+    for (const operation of [
+      () => onStart("probe", input.workspace, { deferCheckout: true }),
+      () => onStop("probe", input.workspace),
+      () => worktreeLaunchBinding(input.workspace),
+    ]) {
+      expect(operation).toThrow(WorktreeLifecycleError);
+      expect(operation).toThrow("worktree registry entry could not be resolved");
+    }
   }));
 }

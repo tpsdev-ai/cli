@@ -586,7 +586,7 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
   });
 
   for (const kind of ["absent", "plain", "file", "path-link", "marker-link", "marker-dangling"] as const) {
-    test(`setup and cleanup classify a ${kind} candidate consistently`, () => {
+    test(`setup and cleanup classify a ${kind} base candidate consistently`, () => {
       const sb = makeSandbox();
       try {
         const base = join(sb.root, "tps");
@@ -617,7 +617,7 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
   }
 
   for (const metadata of ["config", "gitdir"] as const) {
-    test(`setup and cleanup reject unresolvable ${metadata} metadata with real Git`, () => {
+    test(`setup and cleanup reject unresolvable base ${metadata} metadata with real Git`, () => {
       const sb = makeSandbox();
       try {
         const base = join(sb.root, "tps");
@@ -642,7 +642,7 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
   }
 
   for (const metadata of ["config", "gitdir"] as const) {
-    test(`unresolvable ${metadata} metadata stops setup before nono starts`, () => {
+    test(`unresolvable base ${metadata} metadata stops setup before nono starts`, () => {
       const sb = makeSandbox();
       try {
         const base = join(sb.home, "ops", "tps");
@@ -683,7 +683,7 @@ describe("cli#516 (2) — sandboxed launch defers worktree checkout", () => {
       }
     });
 
-    test(`unresolvable ${metadata} metadata reports a cleanup failure`, () => {
+    test(`unresolvable base ${metadata} metadata reports a cleanup failure`, () => {
       const sb = makeSandbox();
       try {
         const base = join(sb.home, "ops", "tps");
