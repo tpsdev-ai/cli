@@ -1,12 +1,57 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const workspaceModule = resolve(import.meta.dir, "../dist/src/utils/agent-workspace.js");
 const lifecycleModule = resolve(import.meta.dir, "../dist/src/utils/agent-lifecycle.js");
 const configModule = resolve(import.meta.dir, "../../agent/dist/config.js");
+const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+const runtimeModule = resolve(import.meta.dir, "../../agent/dist/index.js");
+
+test("default child uses the parent's absolute workspace with a symlinked config and relative workspace", () => {
+  const root = mkdtempSync(join(tmpdir(), "workspace-symlink-"));
+  try {
+    const launch = join(root, "launch");
+    const target = join(root, "target");
+    mkdirSync(launch);
+    mkdirSync(target);
+    const config = join(target, "agent.yaml");
+    const link = join(launch, "agent.yaml");
+    writeFileSync(config, `agentId: probe\nworkspace: worktree\nmailDir: ${join(root, "mail")}\nmemoryPath: ${join(root, "memory.jsonl")}\nllm:\n  provider: ollama\n  model: probe\n`);
+    symlinkSync(config, link);
+    const childScript = `
+      import { AgentRuntime } from ${JSON.stringify(runtimeModule)};
+      import { runAgent } from ${JSON.stringify(agentModule)};
+      AgentRuntime.prototype.start = async function () { console.log(this.config.workspace); };
+      await runAgent({ action: 'start', config: ${JSON.stringify(realpathSync(link))}, sandboxed: true });
+    `;
+    const parentScript = `
+      import { spawnSync } from 'node:child_process';
+      import { loadAgentConfig } from ${JSON.stringify(configModule)};
+      import { agentWorkspace } from ${JSON.stringify(workspaceModule)};
+      const workspace = agentWorkspace(${JSON.stringify(link)}, loadAgentConfig(${JSON.stringify(link)}).workspace);
+      console.log(workspace);
+      const child = spawnSync('node', ['--input-type=module', '-e', ${JSON.stringify(childScript)}], {
+        encoding: 'utf8', env: { ...process.env, TPS_AGENT_WORKSPACE: workspace },
+      });
+      process.stdout.write(child.stdout);
+      process.stderr.write(child.stderr);
+      process.exit(child.status ?? 1);
+    `;
+    const result = spawnSync("node", ["--input-type=module", "-e", parentScript], {
+      cwd: root, encoding: "utf8", env: { ...process.env, HOME: root }, timeout: 20_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.stderr).toBe("");
+    expect(result.status).toBe(0);
+    const workspace = join(launch, "worktree");
+    expect(result.stdout).toBe(`${workspace}\n${workspace}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 for (const marker of ["matching", "different", "relative"] as const) {
   test(`real-file relative workspace child launch with ${marker} pending marker`, () => {

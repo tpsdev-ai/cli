@@ -356,9 +356,8 @@ export type WorktreeLaunchBinding =
  * registered entry is found even when its marker is missing, is a directory,
  * or its workspace directory is absent. A registered workspace must then
  * carry a regular `.git` file; anything else is refused before any grant is
- * computed. An unregistered regular `.git` file is a worktree we do not
- * manage: it gets no metadata grants, but the caller still needs the trusted
- * base to check launch options and explicit profile filesystem grants.
+ * computed. An unregistered regular `.git` file gets no metadata grants;
+ * launch remains subject to grant and profile checks.
  */
 export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
   let workspace = resolve(workspacePath);
@@ -422,7 +421,7 @@ export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBind
     }
     return { kind: "registered", ...worktreeGitMetadata(workspace, trustedBase) };
   }
-  // Only a regular `.git` marker makes this an unregistered worktree; a plain
+  // A regular `.git` marker is treated as unregistered; a plain
   // directory or an ordinary repository keeps the caller's cwd policy.
   if (!marker.isFile()) return { kind: "none" };
   return { kind: "unregistered", baseWorkingTree: trustedBase };

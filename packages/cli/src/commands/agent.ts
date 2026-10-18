@@ -1121,7 +1121,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
-      config.workspace = agentWorkspace(configPath, config.workspace);
+      config.workspace = agentWorkspace(configPath, config.workspace, args.sandboxed ? process.env : undefined);
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
       // workload can rewrite (`agentDir` is granted r+w, so the agent can edit

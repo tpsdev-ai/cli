@@ -1174,8 +1174,8 @@ realNonoSuite(
       }
     }, 40_000);
 
-    for (const symlink of [false, true]) {
-    test(`the re-exec child loads the custom config with symlink ${symlink}`, async () => {
+    for (const variant of ["regular", "symlink", "symlink-relative"] as const) {
+    test(`the default re-exec child starts in the custom workspace with config ${variant}`, async () => {
       const sb = makeRealNonoSandbox();
       try {
         // The default config points at one workspace and the custom config at a
@@ -1188,9 +1188,9 @@ realNonoSuite(
         seedRealNonoProfiles(sb.home);
         writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, wsDefault));
         const target = join(customDir, "agent.yaml");
-        writeFileSync(target, agentYaml(sb, wsCustom));
-        const customConfig = symlink ? join(sb.root, "config-link.yaml") : target;
-        if (symlink) symlinkSync(target, customConfig);
+        writeFileSync(target, agentYaml(sb, variant === "symlink-relative" ? "ws-custom" : wsCustom));
+        const customConfig = variant === "regular" ? target : join(sb.root, "config-link.yaml");
+        if (variant !== "regular") symlinkSync(target, customConfig);
 
         const child = spawn(
           NODE,

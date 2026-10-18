@@ -167,7 +167,7 @@ function unrelatedWorktree(root: string, name: string): { repo: string; ws: stri
   return { repo, ws };
 }
 
-test("an unrelated project's worktree launches with no metadata grants", () => fixture((input, _base, root) => {
+test("an unrelated project's worktree receives no metadata grants", () => fixture((input, _base, root) => {
   // A trusted base exists beside it (root/tps), but its registry does not list this workspace.
   const { repo, ws } = unrelatedWorktree(root, "unrelated");
   const result = agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: ws });
@@ -245,7 +245,7 @@ test("a symlink marker is refused with no trusted base repository", () => fixtur
   expect(() => agentLaunchOptions({ ...input, workspace: ws, runtime: undefined })).toThrow(WorktreeLifecycleError);
 }));
 
-test("a worktree with no trusted base repository launches with no metadata grants", () => fixture((input, _base, root) => {
+test("a worktree with no trusted base repository receives no metadata grants", () => fixture((input, _base, root) => {
   // No sibling tps next to this workspace, and the test home has no ~/ops/tps.
   const { repo, ws } = unrelatedWorktree(join(root, "elsewhere"), "nobase");
   const result = agentLaunchOptions({ ...input, workspace: ws, runtime: undefined, cwd: ws });
