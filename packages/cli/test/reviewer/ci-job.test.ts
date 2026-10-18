@@ -184,6 +184,15 @@ describe("the reviewed allowlist of skipped-action refs", () => {
     }
   });
 
+  test("the checkout allowlist accepts v4.4.0 at its release commit", () => {
+    const sha = "11d5960a326750d5838078e36cf38b85af677262";
+    expect(SKIPPED_ACTIONS["actions/checkout"].refs[sha]).toBe("v4.4.0");
+    const uses = `actions/checkout@${sha}`;
+    const t = jobOf(plan(bare(`      - uses: ${uses}\n        with:\n          persist-credentials: false\n          fetch-depth: 0\n      - run: a\n`)));
+    expect(t.skipped).toEqual([{ index: 1, uses, tag: "v4.4.0", reason: SKIPPED_ACTIONS["actions/checkout"].reason }]);
+    expect(refused(bare(`      - uses: ${uses}\n        with:\n          path: elsewhere\n      - run: a\n`)).kind).toBe("ci-unhonourable");
+  });
+
   test("a tag, a branch, a short SHA or an unreviewed SHA refuses", () => {
     for (const ref of ["actions/checkout@v4", "actions/checkout@main", "actions/checkout@11bd719", "actions/checkout@arbitrary-ref", `actions/checkout@${"a".repeat(40)}`]) {
       const r = refused(bare(`      - uses: ${ref}\n      - run: a\n`));

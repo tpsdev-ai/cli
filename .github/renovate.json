@@ -10,6 +10,45 @@
         "@tpsdev-ai/**"
       ],
       "enabled": false
+    },
+    {
+      "matchDepTypes": [
+        "engines"
+      ],
+      "enabled": false
+    },
+    {
+      "matchDepTypes": [
+        "peerDependencies"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
+        "npm",
+        "bun",
+        "github-actions"
+      ],
+      "matchPackageNames": [
+        "bun",
+        "node"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "openclaw"
+      ],
+      "enabled": false
+    },
+    {
+      "matchFileNames": [
+        "packages/**/package.json"
+      ],
+      "matchDepTypes": [
+        "dependencies"
+      ],
+      "rangeStrategy": "widen"
     }
   ]
 }
