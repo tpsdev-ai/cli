@@ -203,6 +203,31 @@ for (const marker of ["missing", "directory"] as const) {
   }));
 }
 
+test("a registered worktree with a missing directory is refused before grants", () => fixture((input, _base, root) => {
+  // Grants are computed from configPath; a symlink loop there throws when grant
+  // computation runs, so the named ownership error proves it did not.
+  const loop = join(root, "config-loop");
+  symlinkSync(loop, loop);
+  rmSync(input.workspace, { recursive: true, force: true });
+  let error: unknown;
+  try {
+    agentLaunchOptions({ ...input, runtime: undefined, configPath: loop });
+  } catch (err) {
+    error = err;
+  }
+  expect(error).toBeInstanceOf(WorktreeLifecycleError);
+  expect((error as Error).message).toBe(
+    `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+  );
+}));
+
+test("an absent unregistered path keeps the caller's cwd policy", () => fixture((input, base, root) => {
+  const absent = join(root, "absent-workspace");
+  const result = agentLaunchOptions({ ...input, workspace: absent, runtime: undefined, cwd: base });
+  expect(result.refusal).toBeNull();
+  expect(result.options.cwd).toBe(base);
+}));
+
 test("a registry read failure is a named WorktreeLifecycleError", () => fixture((input, base) => {
   const common = spawnSync("git", ["rev-parse", "--git-common-dir"], { cwd: base, encoding: "utf8" });
   expect(common.status).toBe(0);

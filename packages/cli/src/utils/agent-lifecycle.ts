@@ -11,7 +11,7 @@
 
 import { existsSync, lstatSync, realpathSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
@@ -353,11 +353,12 @@ export type WorktreeLaunchBinding =
  *
  * Registry ownership is decided from the trusted base's registry alone: the
  * recorded `.git` path is compared to the workspace's `.git` path, so a
- * registered entry is found even when its marker is missing or is a directory.
- * A registered workspace must then carry a regular `.git` file; anything else
- * is refused before any grant is computed. An unregistered regular `.git`
- * file is a worktree we do not manage: it gets no metadata grants, but the
- * caller still needs the trusted base so grants can be checked against it.
+ * registered entry is found even when its marker is missing, is a directory,
+ * or its workspace directory is absent. A registered workspace must then
+ * carry a regular `.git` file; anything else is refused before any grant is
+ * computed. An unregistered regular `.git` file is a worktree we do not
+ * manage: it gets no metadata grants, but the caller still needs the trusted
+ * base so grants can be checked against it.
  */
 export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
   const workspace = resolve(workspacePath);
@@ -368,7 +369,21 @@ export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBind
     }
   } catch (err) {
     if (err instanceof WorktreeLifecycleError) throw err;
-    if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "none" };
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      // The workspace directory is absent, but a registered worktree keeps its
+      // ownership in the trusted base's registry. Refuse it before any grant is
+      // computed; an absent unregistered path keeps the caller's cwd policy.
+      const trustedBase = resolveBaseRepo(workspace);
+      if (
+        trustedBase &&
+        trustedBaseRegistersWorkspace(workspace, resolvableWorkspacePath(workspace), trustedBase)
+      ) {
+        throw new WorktreeLifecycleError(
+          `worktree workspace is missing for a registered worktree: ${workspace}`,
+        );
+      }
+      return { kind: "none" };
+    }
     throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
   }
   const markerPath = join(workspace, ".git");
@@ -415,6 +430,20 @@ export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitC
   const binding = worktreeLaunchBinding(workspacePath);
   if (binding.kind !== "registered") return undefined;
   return { gitDir: binding.gitDir, gitCommonDir: binding.gitCommonDir, baseWorkingTree: binding.baseWorkingTree };
+}
+
+/** Canonical form of a workspace path that may not exist yet: resolve the
+ *  workspace when present, otherwise its parent directory. */
+function resolvableWorkspacePath(workspace: string): string {
+  try {
+    return realpathSync(workspace);
+  } catch {
+    try {
+      return join(realpathSync(dirname(workspace)), basename(workspace));
+    } catch {
+      return resolve(workspace);
+    }
+  }
 }
 
 /** Whether `baseRepo`'s worktree registry lists `workspace`'s .git path. The
