@@ -240,6 +240,7 @@ export const SKIPPED_ACTIONS = {
     refs: {
       "11bd71901bbe5b1630ceea73d27597364c9af683": "v4.2.2",
       "34e114876b0b11c390a56381ad16ebd13914f8d5": "v4.3.1",
+      "11d5960a326750d5838078e36cf38b85af677262": "v4.4.0",
     },
     reason: "the workspace is the host-created clone at the assigned head, checked before the job",
     // Accepted only as a job's first step; the launcher then requires the
