@@ -26,8 +26,20 @@
     {
       "matchManagers": [
         "npm",
+        "bun"
+      ],
+      "matchPackageNames": [
         "bun",
+        "node"
+      ],
+      "enabled": false
+    },
+    {
+      "matchManagers": [
         "github-actions"
+      ],
+      "matchDepTypes": [
+        "uses-with"
       ],
       "matchPackageNames": [
         "bun",
