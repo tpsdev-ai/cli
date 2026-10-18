@@ -3,6 +3,7 @@
   agent start` now resolves `--config` once and carries the path through the
   attested re-exec; when a base repository exists and the workspace is absent,
   the parent creates the worktree with the checkout suppressed
-  and the hook path and fsmonitor disabled, and the sandboxed child checks it out
-  inside the sandbox;
-  and the sandbox-flag scan reads parsed arguments before a wrapped payload.
+  and the hook path and fsmonitor disabled. Relative workspaces use the config
+  pathname’s directory; the child uses the parent’s absolute workspace and refuses
+  a pending-worktree mismatch with `WorktreeLifecycleError` before checkout.
+  The sandbox-flag scan reads parsed arguments before a wrapped payload.

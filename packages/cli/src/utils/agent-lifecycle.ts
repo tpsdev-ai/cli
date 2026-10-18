@@ -364,8 +364,7 @@ export function worktreeLaunchGit(workspacePath: string): { gitDir: string; gitC
  * repository itself, and a workspace with no base repository are left
  * untouched and reported as changed:false.
  *
- * With `deferCheckout: true`, setup disables hooks and fsmonitor and defers
- * checkout to `checkoutWorktree` inside the sandbox (cli#516).
+ * With `deferCheckout: true`, setup disables hooks and fsmonitor and skips checkout.
  *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
@@ -397,7 +396,6 @@ export function onStart(
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  // With deferCheckout: true, checkout runs in the sandbox (cli#516).
   const defer = opts.deferCheckout === true;
   const args = [
     "-c",

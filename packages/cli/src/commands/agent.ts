@@ -11,6 +11,7 @@
  */
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
+import { agentWorkspace } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
@@ -1119,6 +1120,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
+      config.workspace = agentWorkspace(configPath, config.workspace);
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
       // workload can rewrite (`agentDir` is granted r+w, so the agent can edit
@@ -1278,8 +1280,9 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // set it only after a worktree was actually created, so an
             // inherited value never names someone else's worktree (cli#516).
             const launchEnv: NodeJS.ProcessEnv = { ...process.env };
+            launchEnv.TPS_AGENT_WORKSPACE = config.workspace;
             delete launchEnv.TPS_WORKTREE_PENDING;
-            if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = resolvePathMod(config.workspace);
+            if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = config.workspace;
             let exitCode: number;
             try {
               exitCode = await launchAttested(

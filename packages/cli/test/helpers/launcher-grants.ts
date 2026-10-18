@@ -1,12 +1,4 @@
-/**
- * The launcher's grants that are not under the test sandbox HOME, read from the
- * launcher's own definitions (cli#558). A test sandbox HOME created inside any
- * of them makes the launcher's runtime-options gate refuse before the case
- * under test runs, so every test sandbox base must sit outside all of them.
- *
- * The two callers are the launch-control test and the runtime-launch fixture:
- * one shared list and one shared chooser keep them from drifting apart.
- */
+/** Fixture bases checked against the fixed launcher grants. */
 import { spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -27,7 +19,7 @@ function realOrResolved(path: string): string {
   }
 }
 
-/** The launcher grant that covers `path` (equal, or an ancestor directory), or null. */
+/** The fixed launcher grant that covers `path` (equal, or an ancestor directory), or null. */
 export function launcherGrantCovering(path: string): string | null {
   const target = realOrResolved(path);
   for (const grant of LAUNCHER_FIXED_GRANTS) {
@@ -47,14 +39,7 @@ function canCreateDirIn(candidate: string): boolean {
   }
 }
 
-/**
- * A base directory for a test sandbox HOME that lies outside every launcher
- * grant (cli#558). `/var/tmp` is the sibling of the always-granted `/tmp` and
- * sits outside it; the process temp dir is the fallback. If a TMPDIR leaves
- * neither candidate outside the grants, refuse up front, naming TMPDIR and the
- * grant tmpdir() falls inside, rather than let the launcher's gate report a
- * misleading early refusal.
- */
+/** A writable fixture base outside the fixed launcher grants. */
 export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): string {
   for (const candidate of candidates) {
     if (canCreateDirIn(candidate) && launcherGrantCovering(candidate) === null) return realpathSync(candidate);
@@ -63,14 +48,14 @@ export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): 
   if (existing.length === 0) {
     throw new Error(
       `no usable base directory exists or is writable (checked ${candidates.join(", ")}); ` +
-        "a test sandbox HOME needs a base outside every launcher grant.",
+        "a test sandbox HOME needs a base outside every fixed launcher grant.",
     );
   }
   const grant = launcherGrantCovering(existing[0]);
   const suggestion = existing.includes("/var/tmp") ? "" : " (for example /var/tmp)";
   throw new Error(
-    `a test sandbox HOME needs a base outside every launcher grant, but '${existing[0]}' ` +
-      `(TMPDIR=${tmpdir()}) falls inside the launcher's '${grant}' grant — point TMPDIR at a ` +
+    `a test sandbox HOME needs a base outside every fixed launcher grant, but '${existing[0]}' ` +
+      `(TMPDIR=${tmpdir()}) falls inside the fixed launcher '${grant}' grant — point TMPDIR at a ` +
       `directory outside it${suggestion} and re-run.`,
   );
 }
@@ -163,14 +148,7 @@ export function realNonoHomeBaseCandidates(platform: NodeJS.Platform = process.p
   return ["/var/tmp", tmpdir(), ...(platform === "darwin" ? ["/Users/Shared"] : [])];
 }
 
-/**
- * A writable directory outside the launcher's grants where real nono denies
- * a sandboxed read of a scratch file.
- * A candidate is probed only once it is a writable directory
- * outside the launcher's grants; when none qualifies this throws, naming each
- * candidate and what ruled it out. An unknown probe answer throws at once
- * rather than moving on to the next candidate.
- */
+/** A writable base outside the fixed launcher grants where the nono read probe is denied. */
 export function realNonoHomeBase(
   nono: string,
   candidates: string[] = realNonoHomeBaseCandidates(),
@@ -184,7 +162,7 @@ export function realNonoHomeBase(
     }
     const grant = launcherGrantCovering(candidate);
     if (grant !== null) {
-      rejected.push(`${candidate}: inside the launcher's '${grant}' grant`);
+      rejected.push(`${candidate}: inside the fixed launcher '${grant}' grant`);
       continue;
     }
     const base = realpathSync(candidate);
@@ -197,7 +175,7 @@ export function realNonoHomeBase(
     );
   }
   throw new Error(
-    "a real-nono fixture HOME needs a base outside every launcher grant where nono's " +
+    "a real-nono fixture HOME needs a base outside every fixed launcher grant where nono's " +
       `built-in policy denies a scratch file under it, and no candidate qualifies — ${rejected.join("; ")}`,
   );
 }

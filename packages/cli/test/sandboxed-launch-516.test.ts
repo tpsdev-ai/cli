@@ -5,7 +5,7 @@
  * invoke the built CLI directly. Real-nono cases skip when unavailable.
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
-import { resolve, join, dirname } from "node:path";
+import { resolve, join, dirname, relative } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -123,7 +123,7 @@ interface Sandbox {
 }
 
 function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
-  // The base must sit outside every launcher grant (cli#558): a HOME inside one
+  // The base must sit outside every fixed launcher grant (cli#558): a HOME inside one
   // makes the launcher's runtime-options gate refuse before the case under test.
   const root = mkdtempSync(join(base, "tps-516-"));
   const home = join(root, "home");
@@ -1070,7 +1070,8 @@ realNonoSuite(
 
     }
 
-    test("the sandboxed child checks the worktree out inside the sandbox", async () => {
+    for (const relativeWorkspace of [false, true]) {
+    test(`the sandboxed child checks out a worktree with relative workspace ${relativeWorkspace}`, async () => {
       const sb = makeRealNonoSandbox();
       try {
         const base = join(sb.home, "ops", "tps");
@@ -1087,7 +1088,7 @@ realNonoSuite(
 
         seedRealNonoProfiles(sb.home);
         const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
-        writeFileSync(cfg, agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"));
+        writeFileSync(cfg, agentYaml(sb, relativeWorkspace ? relative(dirname(cfg), sb.ws) : sb.ws).replace("provider: ollama", "provider: openai"));
 
         const child = spawn(
           NODE,
@@ -1110,7 +1111,11 @@ realNonoSuite(
         child.stderr?.on("data", (d: Buffer) => {
           out += d.toString();
         });
-        const checkedOut = await waitWhileRunning(child, () => out.includes("worktree checked out"), 45_000);
+        const checkedOut = await waitWhileRunning(
+          child,
+          () => out.includes("worktree checked out") && canRead(join(sb.ws, "checked-out.txt")),
+          45_000,
+        );
         child.kill("SIGTERM");
         await new Promise((r) => setTimeout(r, 500));
         child.kill("SIGKILL");
@@ -1121,5 +1126,6 @@ realNonoSuite(
         rmSync(sb.root, { recursive: true, force: true });
       }
     }, 60_000);
+    }
   },
 );

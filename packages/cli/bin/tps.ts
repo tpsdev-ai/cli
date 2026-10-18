@@ -504,7 +504,7 @@ async function main() {
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
             // Claude Code CLI runtime — OAuth, no TPS proxy needed
-            const { join, resolve } = await import("node:path");
+            const { join } = await import("node:path");
             const { homedir } = await import("node:os");
             const { readFileSync, existsSync } = await import("node:fs");
             const { load: parseYaml } = await import("js-yaml");
@@ -526,7 +526,12 @@ async function main() {
               return null;
             }
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
-            const agentWorkspace = agentCfg.workspace ?? join(homedir(), "ops", "tps");
+            const { agentWorkspace: resolveWorkspace } = await import("../src/utils/agent-workspace.js");
+            const agentWorkspace = resolveWorkspace(
+              cfgPath,
+              agentCfg.workspace ?? join(homedir(), "ops", "tps"),
+              sandboxed ? process.env : undefined,
+            );
 
             // OPS-47: Build workspace provider from agent.yaml config
             const { GitWorkspaceProvider } = await import("../src/utils/workspace-provider.js");
@@ -556,15 +561,11 @@ async function main() {
               }
             }
 
-            // cli#516 — when the parent created the worktree (a base repository
-            // exists and the workspace was absent), it did so outside the sandbox
-            // with the checkout suppressed, and that checkout runs HERE, inside the
-            // sandbox, where a repository-configured filter or hook is confined.
-            // A launch that is not sandboxed owns both halves itself.
+            // Complete this launch's deferred checkout before starting the runtime.
             const { onStart, onStop, checkoutWorktree } = await import("../src/utils/agent-lifecycle.js");
             const pendingCheckout = process.env.TPS_WORKTREE_PENDING;
             let worktreeCreated = false;
-            if (sandboxed && pendingCheckout && resolve(pendingCheckout) === resolve(agentWorkspace)) {
+            if (sandboxed && pendingCheckout !== undefined) {
               const checkedOut = checkoutWorktree(agentWorkspace);
               console.log(`[${agentId}] worktree: ${checkedOut.reason}`);
             } else if (!sandboxed) {
@@ -1525,6 +1526,6 @@ async function main() {
 main()
   .then(() => process.exit(0))
   .catch((err) => {
-    console.error(err?.message || err);
+    console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
     process.exit(1);
   });

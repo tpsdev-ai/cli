@@ -45,7 +45,7 @@ function modeRestrictionEnforced(): boolean {
 const modeRestrictionEnforcedHere = modeRestrictionEnforced();
 
 describe("sandboxHomeBase", () => {
-  test("refuses when every existing candidate is inside a launcher grant, naming TMPDIR and the grant", () => {
+  test("refuses when every existing candidate is inside a fixed launcher grant, naming TMPDIR and the grant", () => {
     expect(() => sandboxHomeBase(["/tmp", "/tmp/x"])).toThrow(/TMPDIR=/);
     expect(() => sandboxHomeBase(["/tmp", "/tmp/x"])).toThrow(/'\/tmp'/);
   });
@@ -54,7 +54,7 @@ describe("sandboxHomeBase", () => {
     expect(() => sandboxHomeBase(["/tmp"])).toThrow(/for example \/var\/tmp/);
   });
 
-  test("returns a candidate that lies outside every grant", () => {
+  test("returns a candidate that lies outside every fixed launcher grant", () => {
     expect(launcherGrantCovering("/var/tmp")).toBeNull();
     expect(sandboxHomeBase(["/tmp", "/var/tmp"])).toBe(realpathSync("/var/tmp"));
   });
@@ -122,10 +122,10 @@ describe("launcherGrantCovering", () => {
     expect(launcherGrantCovering("/tmpfoo")).toBeNull();
   });
 
-  test("resolves a link outside every grant to the grant its real location sits in", () => {
+  test("resolves a link outside every fixed launcher grant to the grant its real location sits in", () => {
     const dir = mkdtempSync(join(sandboxHomeBase(), "lg-link-"));
     try {
-      // The link's own directory is outside every grant, so a match on the
+      // The link's own directory is outside every fixed launcher grant, so a match on the
       // spelled-out path alone cannot pass: only resolving the link reaches /tmp.
       expect(launcherGrantCovering(dir)).toBeNull();
       const link = join(dir, "tmplink");
@@ -208,7 +208,7 @@ function fakeProbeNono(dir: string): string {
   return bin;
 }
 
-/** A parent dir (outside every launcher grant) with one candidate dir per name. */
+/** A parent dir (outside every fixed launcher grant) with one candidate dir per name. */
 function probeCandidates(...names: string[]): { parent: string; dirs: Record<string, string> } {
   const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
   const dirs: Record<string, string> = {};
@@ -283,7 +283,7 @@ describe("realNonoHomeBase", () => {
       };
       const missing = join(parent, "missing");
       expect(() => realNonoHomeBase(nono, [dirs.granted, dirs.refused, "/tmp", missing], env)).toThrow(
-        /granted: nono's default policy lets .*; .*refused: the probe produced no output and exited nonzero: .*fake refusal; \/tmp: inside the launcher's '\/tmp' grant; .*missing: not a writable directory/,
+        /granted: nono's default policy lets .*; .*refused: the probe produced no output and exited nonzero: .*fake refusal; \/tmp: inside the fixed launcher '\/tmp' grant; .*missing: not a writable directory/,
       );
     } finally {
       rmSync(parent, { recursive: true, force: true });
