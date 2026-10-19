@@ -562,6 +562,7 @@ export function sandboxProfileGrantRefusal(
   env: NodeJS.ProcessEnv = process.env,
   runtime?: string,
   bin: string | undefined = env.NONO_BIN,
+  configSnapshotDir?: string,
 ): string | null {
   let grants: ProfileGrant[];
   try {
@@ -586,6 +587,9 @@ export function sandboxProfileGrantRefusal(
     for (const grant of grants) {
       const comparison = asComparison(canonicalPath(grant.path));
       const writable = ["allow", "write", "allow_file", "write_file"].includes(grant.kind);
+      if (writable && configSnapshotDir && pathsOverlap(comparison, asComparison(canonicalPath(configSnapshotDir)))) {
+        return `the sandbox profile '${profile}' grants write access to the config snapshot directory`;
+      }
       const profileDir = writable && profileDirs.find((d) => pathsOverlap(comparison, d.comparison));
       if (profileDir) {
         return `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', which overlaps the sandbox profile directory ${profileDir.path}`;

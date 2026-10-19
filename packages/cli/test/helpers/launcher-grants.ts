@@ -60,7 +60,7 @@ export function sandboxHomeBase(candidates: string[] = ["/var/tmp", tmpdir()]): 
   );
 }
 
-/** The fixed half of the line the probe prints when the sandboxed read fails. */
+/** The prefix emitted after an unsuccessful sandboxed read. */
 export const NONO_PROBE_DENIED_PREFIX = "TPS-NONO-PROBE-DENIED-";
 
 /** What real nono did with a sandboxed read of a file under a candidate base. */
@@ -69,26 +69,7 @@ export type NonoProbeVerdict =
   | { kind: "granted" }
   | { kind: "refused"; stderr: string };
 
-/**
- * Measure, with real nono, whether its built-in policy lets a sandboxed process
- * read a file under `base` (cli#516). A scratch directory under `base` holds a
- * fixture-like HOME and a file with a random nonce; nono runs
- * `sh -c 'cat <file> || echo <marker>'` under a profile that only extends
- * nono's `default`. Behavioural on purpose: it needs nothing from nono beyond
- * `run`, the invocation every real-nono case already depends on (the pinned
- * Linux build answered `nono why --profile default` with exit 0 and no output).
- *
- *   - the marker, exit 0: nono ran and the read was denied — "denied";
- *   - the nonce, exit 0: the default policy grants read there — "granted";
- *   - non-zero with no output: "refused" — the probe produced no output and
- *     exited nonzero, with its stderr; that cannot show whether nono started
- *     its command, so this is never read as "granted" (on macOS, a default
- *     group's grant overlapping the state root HOME/.nono appears this way);
- *   - anything else throws: an unknown answer is never "not granted".
- *
- * Neither the nonce nor the whole marker appears in nono's argv, so nono
- * echoing its command line cannot pass for either answer.
- */
+/** Accept a candidate only after an unsandboxed nonce read succeeds and the sandboxed read reports a permission error. */
 export function probeNonoBuiltinRead(
   nono: string,
   base: string,
@@ -115,19 +96,27 @@ export function probeNonoBuiltinRead(
     writeFileSync(file, `${nonce}\n`);
     const token = randomBytes(8).toString("hex");
     const marker = `${NONO_PROBE_DENIED_PREFIX}${token}`;
+    const probeEnv = { ...env, HOME: home, XDG_STATE_HOME: join(scratch, "nono-state"), LC_ALL: "C" };
+    const baseline = spawnSync("cat", [file], { cwd, encoding: "utf-8", timeout: 20_000, env: probeEnv });
+    if (baseline.error || baseline.status !== 0 || baseline.stdout.trim() !== nonce) {
+      throw new Error(`the unsandboxed read probe failed: ${baseline.error?.message ?? baseline.stderr}`);
+    }
     const args = [
       "run", "-s", "--profile", profile, "--",
-      "sh", "-c", `cat "$1" || echo "${NONO_PROBE_DENIED_PREFIX}$2"`, "sh", file, token,
+      "sh", "-c", `if cat "$1"; then exit 0; else status=$?; printf "${NONO_PROBE_DENIED_PREFIX}%s\\n" "$2"; exit "$status"; fi`, "sh", file, token,
     ];
     const r = spawnSync(nono, args, {
       cwd,
       encoding: "utf-8",
       timeout: 20_000,
-      env: { ...env, HOME: home, XDG_STATE_HOME: join(scratch, "nono-state") },
+      env: probeEnv,
     });
     const stdout = (r.stdout ?? "").trim();
     const stderr = (r.stderr ?? "").trim();
-    if (!r.error && r.status === 0 && stdout === marker) return { kind: "denied" };
+    const permissionDenied = stderr.split("\n").some((line) =>
+      line === `cat: ${file}: Permission denied` || line === `cat: ${file}: Operation not permitted`);
+    if (!r.error && r.status === 1 && stdout === marker && permissionDenied) return { kind: "denied" };
+    if (stdout === marker) throw new Error(`the sandboxed read probe failed: exit ${r.status}, stderr ${JSON.stringify(stderr)}`);
     if (!r.error && r.status === 0 && stdout === nonce) return { kind: "granted" };
     if (!r.error && typeof r.status === "number" && r.status !== 0 && stdout === "") {
       return { kind: "refused", stderr };

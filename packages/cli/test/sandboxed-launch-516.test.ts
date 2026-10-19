@@ -21,6 +21,8 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
+  canonicalPath,
+  harnessReadFiles,
   agentLaunchOptions,
   buildNonoArgs,
   nonoVersion,
@@ -183,7 +185,7 @@ function cliEnv(sb: Sandbox, extra: Record<string, string | undefined> = {}): Re
 }
 
 for (const scenario of ["registered", "unregistered", "rewritten after setup", "no trusted base"] as const) {
-  test(`Codex metadata add-dir uses the setup registry binding: ${scenario}`, () => {
+  test(`additional Codex metadata directories use the setup registry binding: ${scenario}`, () => {
     const sb = makeSandbox();
     try {
       const base = join(sb.home, "ops", "tps");
@@ -278,8 +280,8 @@ for (const scenario of ["registered", "unregistered", "rewritten after setup", "
 // (1) — `--config` survives the attested re-exec
 // ---------------------------------------------------------------------------
 
-describe("cli#516 (1) — the attested re-exec keeps --config", () => {
-  test("agent start --config <file> re-execs with that --config and grants its file", () => {
+describe("cli#516 (1) — the attested re-exec uses a config snapshot", () => {
+  test("agent start re-execs with the config snapshot and grants its file", () => {
     const sb = makeSandbox();
     try {
       installFakeNono(sb, "  :");
@@ -299,14 +301,19 @@ describe("cli#516 (1) — the attested re-exec keeps --config", () => {
       );
 
       const child = fakeNonoRuns(sb.root).find((l) => l.includes("agent start")) ?? "";
-      expect(child, output(result)).toContain(`--config ${customConfig}`);
-      expect(child).toContain(`--read-file ${customConfig}`);
+      const snapshot = /--config (\S+)/.exec(child)?.[1];
+      expect(snapshot, output(result)).toBeDefined();
+      expect(snapshot).toStartWith(join(sb.home, ".tps", "launch", "config-"));
+      expect(child, output(result)).toContain(`--config ${snapshot}`);
+      expect(child).toContain(`--read-file ${snapshot}`);
+      expect(child).not.toContain(`--read-file ${customConfig}`);
+      expect(existsSync(snapshot!)).toBe(false);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
   });
 
-  test("a relative --config resolves to one absolute path before the re-exec", () => {
+  test("a relative --config is carried as an absolute snapshot path", () => {
     const sb = makeSandbox();
     try {
       installFakeNono(sb, "  :");
@@ -323,12 +330,148 @@ describe("cli#516 (1) — the attested re-exec keeps --config", () => {
       );
 
       const child = fakeNonoRuns(sb.root).find((l) => l.includes("agent start")) ?? "";
-      expect(child).toContain(`--config ${customAbs}`);
-      expect(child).toContain(`--read-file ${customAbs}`);
+      const snapshot = /--config (\S+)/.exec(child)?.[1];
+      expect(snapshot).toBeDefined();
+      expect(snapshot).toStartWith(join(sb.home, ".tps", "launch", "config-"));
+      expect(child).toContain(`--config ${snapshot}`);
+      expect(child).toContain(`--read-file ${snapshot}`);
+      expect(child).not.toContain(`--read-file ${customAbs}`);
+      expect(existsSync(snapshot!)).toBe(false);
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
   });
+});
+
+test("config parsing, re-exec and read-file grant use the private snapshot", () => {
+  const sb = makeSandbox();
+  try {
+    const target = join(sb.run, "agent.yaml");
+    const alternate = join(sb.root, "alternate.yaml");
+    const link = join(sb.run, "config.yaml");
+    writeFileSync(target, agentYaml(sb, "../ws"));
+    writeFileSync(alternate, agentYaml(sb, sb.run));
+    symlinkSync(target, link);
+    installFakeNono(sb, "  :");
+    const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
+    const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+    const loader = `
+      const agent = await import(${JSON.stringify(resolve(import.meta.dir, "../../agent/dist/index.js"))});
+      const load = agent.loadAgentConfig;
+      mock.module(${JSON.stringify(resolve(import.meta.dir, "../../agent/dist/index.js"))}, () => ({ ...agent,
+        AgentRuntime: class {
+          constructor(config) { this.config = config; }
+          async start() { console.log('WORKSPACE ' + this.config.workspace); }
+        },
+        loadAgentConfig: (path) => {
+          const config = load(path);
+          console.log('PARSED ' + JSON.stringify({ path, workspace: config.workspace }));
+          return config;
+        },
+      }));
+    `;
+    const preload = join(sb.root, "snapshot-child.ts");
+    writeFileSync(preload, `
+      import { mock } from 'bun:test';
+      ${loader}
+      const attestation = await import(${JSON.stringify(attestationModule)});
+      mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+        attestConfinement: async () => ({ ok: true, worktreeBinding: { kind: 'none' } }),
+      }));
+    `);
+    const result = spawnSync("bun", ["-e", `
+      import { mock } from 'bun:test';
+      import { readFileSync, statSync, unlinkSync, symlinkSync } from 'node:fs';
+      import { dirname } from 'node:path';
+      import { spawnSync } from 'node:child_process';
+      ${loader}
+      const attestation = await import(${JSON.stringify(attestationModule)});
+      mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+        launchAttested: async (_profile, options, cmd, opts) => {
+          const path = cmd[cmd.indexOf('--config') + 1];
+          console.log('LAUNCH ' + JSON.stringify({ options, cmd, path,
+            content: readFileSync(path, 'utf8'),
+            fileMode: statSync(path).mode & 0o777, dirMode: statSync(dirname(path)).mode & 0o777,
+            owner: statSync(dirname(path)).uid, uid: process.getuid(),
+          }));
+          const child = spawnSync('bun', ['--preload', ${JSON.stringify(preload)}, ${JSON.stringify(TPS_BIN)}, ...cmd.slice(cmd.indexOf('agent'))], {
+            encoding: 'utf8', cwd: options.cwd ?? process.cwd(), env: { ...opts.env, TPS_LAUNCH_SOCK: 'fixture' },
+          });
+          process.stdout.write(child.stdout); process.stderr.write(child.stderr);
+          return child.status ?? 1;
+        },
+      }));
+      const { runAgent } = await import(${JSON.stringify(agentModule)});
+      await runAgent({ action: 'start', id: 'probe', config: ${JSON.stringify(link)}, sandboxRequired: true }, {
+        afterConfigSnapshot: (path) => {
+          unlinkSync(${JSON.stringify(link)});
+          symlinkSync(${JSON.stringify(alternate)}, ${JSON.stringify(link)});
+          console.log('SNAPSHOT ' + path);
+        },
+      });
+    `], { cwd: sb.run, encoding: "utf8", timeout: 20_000, env: cliEnv(sb) });
+    expect(result.status, output(result)).toBe(0);
+    const lines = result.stdout.split("\n");
+    const snapshot = lines.find((line) => line.startsWith("SNAPSHOT "))?.slice(9);
+    expect(snapshot, output(result)).toBeDefined();
+    const parsed = lines.filter((line) => line.startsWith("PARSED ")).map((line) => JSON.parse(line.slice(7)));
+    expect(parsed).toEqual([{ path: snapshot, workspace: "../ws" }, { path: snapshot, workspace: "../ws" }]);
+    const launch = JSON.parse(lines.find((line) => line.startsWith("LAUNCH "))!.slice(7));
+    expect(launch.path).toBe(snapshot);
+    expect(launch.content).toBe(agentYaml(sb, "../ws"));
+    expect(launch.fileMode).toBe(0o600);
+    expect(launch.dirMode).toBe(0o700);
+    expect(launch.owner).toBe(launch.uid);
+    expect(launch.options.readFiles).toEqual([...harnessReadFiles("probe", sb.home).map((path) => canonicalPath(path)), snapshot]);
+    for (const path of [launch.options.cwd ?? sb.run, launch.options.workdir, ...launch.options.allow].filter(Boolean)) {
+      expect(snapshot === path || snapshot!.startsWith(`${path}/`)).toBe(false);
+    }
+    expect(launch.options.readFiles).not.toContain(target);
+    expect(launch.options.readFiles).not.toContain(alternate);
+    expect(launch.options.readFiles).not.toContain(link);
+    const grants = buildNonoArgs("tps-agent-run", launch.options, launch.cmd);
+    expect(grants).toContain(snapshot!);
+    expect(grants).not.toContain(target);
+    expect(grants).not.toContain(alternate);
+    expect(grants).not.toContain(link);
+    expect(lines).toContain(`WORKSPACE ${sb.ws}`);
+    expect(existsSync(snapshot!)).toBe(false);
+    expect(existsSync(dirname(snapshot!))).toBe(false);
+  } finally {
+    rmSync(sb.root, { recursive: true, force: true });
+  }
+});
+
+test("the parent removes its config snapshot on SIGTERM", () => {
+  const sb = makeSandbox();
+  try {
+    const config = join(sb.run, "agent.yaml");
+    writeFileSync(config, agentYaml(sb, sb.ws));
+    installFakeNono(sb, "  :");
+    const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+    const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
+    const result = spawnSync("bun", ["-e", `
+      import { mock } from 'bun:test';
+      const attestation = await import(${JSON.stringify(attestationModule)});
+      mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+        launchAttested: async () => {
+          process.kill(process.pid, 'SIGTERM');
+          await new Promise(() => {});
+        },
+      }));
+      const { runAgent } = await import(${JSON.stringify(agentModule)});
+      await runAgent({ action: 'start', config: ${JSON.stringify(config)}, sandboxRequired: true }, {
+        afterConfigSnapshot: (path) => console.log('SNAPSHOT ' + path),
+      });
+    `], { cwd: sb.run, encoding: "utf8", timeout: 20_000, env: cliEnv(sb) });
+    expect(result.signal, output(result)).toBe("SIGTERM");
+    const snapshot = result.stdout.split("\n").find((line) => line.startsWith("SNAPSHOT "))?.slice(9);
+    expect(snapshot).toBeDefined();
+    expect(existsSync(snapshot!)).toBe(false);
+    expect(existsSync(dirname(snapshot!))).toBe(false);
+  } finally {
+    rmSync(sb.root, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

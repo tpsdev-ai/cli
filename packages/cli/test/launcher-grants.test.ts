@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launcherGrantCovering, realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { launcherGrantCovering, probeNonoBuiltinRead, realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 /**
  * Whether a write into the directory under test is refused for want of
@@ -170,20 +170,21 @@ describe("writeRefusedForPermission", () => {
   });
 });
 
-/**
- * A fake nono for the read probe. `run … -- <cmd…>` is decided by the candidate
- * base the probe's `--profile` file sits under:
- *   - under $FAKE_REFUSED_UNDER: refuses to start (stderr, exit 1, no output);
- *   - under $FAKE_UNKNOWN_UNDER: exits 0 with no output (the CI `why` symptom);
- *   - under $FAKE_GRANTED_UNDER: runs the payload as is, so `cat` prints the nonce;
- *   - anywhere else: runs the payload with a `cat` that is denied, so the
- *     payload's own `||` branch prints the marker.
- */
+/** A fake nono that selects a read result by profile location. */
 function fakeProbeNono(dir: string): string {
   const denyBin = join(dir, "deny-bin");
   mkdirSync(denyBin);
   writeFileSync(join(denyBin, "cat"), '#!/bin/sh\necho "cat: $1: Operation not permitted" >&2\nexit 1\n');
   chmodSync(join(denyBin, "cat"), 0o755);
+  for (const [name, message, status] of [
+    ["missing-file", "No such file or directory", 1],
+    ["missing-command", "command not found", 127],
+  ] as const) {
+    const toolDir = join(dir, name);
+    mkdirSync(toolDir);
+    writeFileSync(join(toolDir, "cat"), `#!/bin/sh\necho "cat: $1: ${message}" >&2\nexit ${status}\n`);
+    chmodSync(join(toolDir, "cat"), 0o755);
+  }
   const bin = join(dir, "nono");
   writeFileSync(
     bin,
@@ -200,6 +201,8 @@ function fakeProbeNono(dir: string): string {
       'if under "${FAKE_REFUSED_UNDER:-}"; then echo "nono: Sandbox initialization failed: fake refusal" >&2; exit 1; fi',
       'if under "${FAKE_UNKNOWN_UNDER:-}"; then exit 0; fi',
       'if under "${FAKE_GRANTED_UNDER:-}"; then exec "$@"; fi',
+      `if under "\${FAKE_MISSING_FILE_UNDER:-}"; then PATH="${join(dir, "missing-file")}:$PATH" exec "$@"; fi`,
+      `if under "\${FAKE_MISSING_COMMAND_UNDER:-}"; then PATH="${join(dir, "missing-command")}:$PATH" exec "$@"; fi`,
       `PATH="${denyBin}:$PATH" exec "$@"`,
       "",
     ].join("\n"),
@@ -267,6 +270,32 @@ describe("realNonoHomeBase", () => {
       expect(() => realNonoHomeBase(nono, [dirs.unknown, dirs.free], env)).toThrow(
         /unknown answer, which is never read as "not granted".*exited 0, stdout "", stderr ""/,
       );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  for (const failure of ["FILE", "COMMAND"] as const) {
+    test(`reports the sandboxed read's missing ${failure.toLowerCase()} as a probe failure`, () => {
+      const { parent, dirs } = probeCandidates("candidate");
+      try {
+        const nono = fakeProbeNono(parent);
+        expect(() => realNonoHomeBase(nono, [dirs.candidate], {
+          ...process.env, [`FAKE_MISSING_${failure}_UNDER`]: realpathSync(dirs.candidate),
+        })).toThrow(/sandboxed read probe failed/);
+      } finally {
+        rmSync(parent, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("requires a successful unsandboxed nonce read", () => {
+    const { parent, dirs } = probeCandidates("candidate");
+    try {
+      const nono = fakeProbeNono(parent);
+      expect(() => probeNonoBuiltinRead(nono, dirs.candidate, {
+        ...process.env, PATH: join(parent, "deny-bin"),
+      })).toThrow(/unsandboxed read probe failed.*Operation not permitted/);
     } finally {
       rmSync(parent, { recursive: true, force: true });
     }

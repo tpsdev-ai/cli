@@ -17,7 +17,7 @@ import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/iden
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
@@ -34,7 +34,7 @@ import {
   SUPERVISED_REFUSAL_EXIT_CODE,
   canonicalPath,
 } from "../utils/nono.js";
-import { launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
+import { grantCovers, launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
@@ -1073,7 +1073,55 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 }
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
-export async function runAgent(args: AgentArgs): Promise<void> {
+export async function runAgent(
+  args: AgentArgs,
+  testHooks?: { afterConfigSnapshot?: (path: string) => void },
+): Promise<void> {
+  const original = args.config ?? (args.id ? join(homedir(), ".tps", "agents", args.id, "agent.yaml") : undefined);
+  if (args.action !== "start" || args.sandboxed || !original || !existsSync(original)) {
+    return runAgentCommand(args);
+  }
+  const workspaceConfigPath = resolvePathMod(original);
+  const parent = canonicalPath(join(homedir(), ".tps", "launch"));
+  const createdParent = mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const snapshotRoot = mkdtempSync(join(parent, "config-"));
+  const cleanup = () => {
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    if (createdParent) {
+      try {
+        rmdirSync(parent);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw err;
+      }
+    }
+  };
+  process.once("exit", cleanup);
+  const signalHandlers = (["SIGINT", "SIGTERM", "SIGHUP"] as const).map((signal) => {
+    const handler = () => {
+      cleanup();
+      process.removeListener(signal, handler);
+      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+    };
+    process.once(signal, handler);
+    return { signal, handler };
+  });
+  try {
+    const configPath = join(snapshotRoot, "agent.yaml");
+    writeFileSync(configPath, readFileSync(workspaceConfigPath), { mode: 0o600, flag: "wx" });
+    testHooks?.afterConfigSnapshot?.(configPath);
+    return await runAgentCommand({ ...args, config: configPath }, { workspaceConfigPath, snapshotRoot });
+  } finally {
+    cleanup();
+    process.removeListener("exit", cleanup);
+    for (const { signal, handler } of signalHandlers) process.removeListener(signal, handler);
+  }
+}
+
+async function runAgentCommand(
+  args: AgentArgs,
+  snapshot?: { workspaceConfigPath: string; snapshotRoot: string },
+): Promise<void> {
   switch (args.action) {
     case "create":
       return createAgent(args);
@@ -1121,7 +1169,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
-      config.workspace = agentWorkspace(configPath, config.workspace, args.sandboxed ? process.env : undefined);
+      config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
       // workload can rewrite (`agentDir` is granted r+w, so the agent can edit
@@ -1232,11 +1280,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // the sandboxed child re-enters bin/tps.ts, which runs the runtime
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
-            // Carry the resolved config pathname through the re-exec (cli#516).
-            // The child gets the canonical path, the same file the read-file
-            // grant names: macOS Seatbelt checks a symlink's own path, so a
-            // child opening the link would be denied a file it may read.
-            relaunch.push("--config", canonicalPath(configPath));
+            // Parse, re-exec, and grant the parent's private config snapshot (cli#516).
+            relaunch.push("--config", configPath);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
@@ -1256,6 +1301,13 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             const approveLaunch = () => {
               const result = agentLaunchOptions(launchInput);
               if (result.refusal) throw new Error(`refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${result.refusal}`);
+              if (snapshot) {
+                const writable = [result.options.cwd ?? process.cwd(), result.options.workdir, ...(result.options.allow ?? [])];
+                if (writable.some((path) => path && grantCovers(canonicalPath(path), snapshot.snapshotRoot)) ||
+                    (result.options.allowFiles ?? []).some((path) => canonicalPath(path) === configPath)) {
+                  throw new Error("refusing a writable config snapshot directory");
+                }
+              }
               return result;
             };
             const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
@@ -1264,7 +1316,7 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             let approval: ReturnType<typeof agentLaunchOptions>;
             try {
               approval = approveLaunch();
-              const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
+              const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
               const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
               worktreeCreated = start?.changed ?? false;
