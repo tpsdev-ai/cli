@@ -39,6 +39,37 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
+async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): Promise<boolean> {
+  const releasedPid = /released under nono session \S+ \(child pid (\d+)\)/.exec(output)?.[1];
+  const targets = new Set<number>();
+  if (releasedPid) targets.add(Number(releasedPid));
+  else if (child.pid) targets.add(-child.pid);
+  if (child.pid) targets.add(child.pid);
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    for (const pid of targets) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        /* checked below */
+      }
+    }
+    const deadline = Date.now() + 3_000;
+    do {
+      if ([...targets].every((pid) => !alive(pid))) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    } while (Date.now() < deadline);
+  }
+  return false;
+}
+
 const SANDBOX_REQUIRED = "--sandbox-required";
 const NONO_BIN_ENV = "NONO_BIN";
 const ACCEPTS_ONLY = "accepts only 'true' or 'false'";
@@ -147,8 +178,7 @@ function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
     mkdirSync(d, { recursive: true });
   }
   writeProfilePair(join(home, ".config", "nono", "profiles"), "tps-agent-run");
-  // The runtime reads this key at start; a placeholder string makes it exit
-  // before the launcher's cleanup removes the worktree this case inspects.
+  // Seed fixture identity files.
   writeFileSync(join(home, ".tps", "identity", "probe.key"), randomBytes(32));
   writeFileSync(
     join(home, ".tps", "identity", "probe.pub"),
@@ -1460,6 +1490,8 @@ realNonoSuite(
     for (const variant of ["regular", "symlink", "symlink-relative"] as const) {
     test(`the default re-exec child starts in the custom workspace with config ${variant}`, async () => {
       const sb = makeRealNonoSandbox();
+      let child: ReturnType<typeof spawn> | undefined;
+      let out = "";
       try {
         // The default config points at one workspace and the custom config at a
         // different one; the runtime writes `.tps-agent.pid` into ITS workspace,
@@ -1475,11 +1507,12 @@ realNonoSuite(
         const customConfig = variant === "regular" ? target : join(sb.root, "config-link.yaml");
         if (variant !== "regular") symlinkSync(target, customConfig);
 
-        const child = spawn(
+        child = spawn(
           NODE,
           [TPS_BIN, "agent", "start", "--config", customConfig, SANDBOX_REQUIRED],
           {
             cwd: sb.run,
+            detached: true,
             env: {
               ...process.env,
               HOME: sb.home,
@@ -1489,7 +1522,6 @@ realNonoSuite(
             },
           },
         );
-        let out = "";
         child.stdout?.on("data", (d: Buffer) => {
           out += d.toString();
         });
@@ -1497,31 +1529,20 @@ realNonoSuite(
           out += d.toString();
         });
         const customPid = join(wsCustom, ".tps-agent.pid");
-        const loaded = await waitWhileRunning(child, () => canRead(customPid), 45_000);
-
-        // Stop the released agent before asserting, so a failure cannot leak it.
-        let pid = Number.NaN;
-        try {
-          pid = Number.parseInt(readFileSync(customPid, "utf-8").trim(), 10);
-        } catch {
-          /* the child never wrote it (the launch refused, or used the default) */
-        }
-        if (Number.isInteger(pid)) {
-          try {
-            process.kill(pid, "SIGTERM");
-          } catch {
-            /* already gone */
-          }
-        }
-        child.kill("SIGTERM");
-        await new Promise((r) => setTimeout(r, 500));
-        child.kill("SIGKILL");
+        const loaded = await waitWhileRunning(
+          child,
+          () => canRead(customPid) && /released under nono session \S+ \(child pid \d+\)/.test(out),
+          45_000,
+        );
 
         expect(loaded, `no pid file in the custom workspace; launcher output:\n${out}`).toBe(true);
         // The child did NOT fall back to the default config's workspace.
         expect(canRead(join(wsDefault, ".tps-agent.pid"))).toBe(false);
       } finally {
+        // Signal and check the release PID and launcher, or the group without a release line.
+        const stopped = !child || await stopRealLaunch(child, out);
         rmSync(sb.root, { recursive: true, force: true });
+        expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
       }
     }, 60_000);
 
@@ -1530,6 +1551,8 @@ realNonoSuite(
     for (const relativeWorkspace of [false, true]) {
     test(`the sandboxed child checks out a worktree with relative workspace ${relativeWorkspace}`, async () => {
       const sb = makeRealNonoSandbox();
+      let child: ReturnType<typeof spawn> | undefined;
+      let out = "";
       try {
         const base = join(sb.home, "ops", "tps");
         mkdirSync(base, { recursive: true });
@@ -1547,11 +1570,12 @@ realNonoSuite(
         const cfg = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
         writeFileSync(cfg, agentYaml(sb, relativeWorkspace ? relative(dirname(cfg), sb.ws) : sb.ws).replace("provider: ollama", "provider: openai"));
 
-        const child = spawn(
+        child = spawn(
           NODE,
           [TPS_BIN, "agent", "start", "--config", cfg, "--runtime", "codex", SANDBOX_REQUIRED],
           {
             cwd: sb.run,
+            detached: true,
             env: {
               ...process.env,
               HOME: sb.home,
@@ -1561,7 +1585,6 @@ realNonoSuite(
             },
           },
         );
-        let out = "";
         child.stdout?.on("data", (d: Buffer) => {
           out += d.toString();
         });
@@ -1573,14 +1596,14 @@ realNonoSuite(
           () => out.includes("worktree checked out") && canRead(join(sb.ws, "checked-out.txt")),
           45_000,
         );
-        child.kill("SIGTERM");
-        await new Promise((r) => setTimeout(r, 500));
-        child.kill("SIGKILL");
 
         // Git reported checkout success inside the sandbox.
         expect(checkedOut, `no checkout report; launcher output:\n${out}`).toBe(true);
       } finally {
+        // Signal and check the release PID and launcher, or the group without a release line.
+        const stopped = !child || await stopRealLaunch(child, out);
         rmSync(sb.root, { recursive: true, force: true });
+        expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
       }
     }, 60_000);
     }
