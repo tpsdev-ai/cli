@@ -3,7 +3,7 @@ import { requireLocalAgentId } from "../src/utils/local-agent.js";
 import meow from "meow";
 import { cliFlagDefinitions } from "../src/utils/cli-flags.js";
 import { parseCliArgs } from "../src/utils/cli-args.js";
-import { enforceLaunchControl, readLaunchFlags } from "../src/utils/nono.js";
+import { enforceLaunchControl, ownFlag, readLaunchFlags, SANDBOXED_FLAG } from "../src/utils/nono.js";
 
 // Injected at compile time via --define flag; falls back to "dev" in dev mode.
 declare const INJECTED_VERSION: string;
@@ -17,8 +17,13 @@ try {
   process.exit(1);
 }
 
-const launchFlags = readLaunchFlags(process.argv);
-if (launchFlags.refusal) enforceLaunchControl({ argv: process.argv });
+/** Parsed CLI arguments, with `--` separating payload. */
+function ownArgv(): string[] {
+  return [process.argv[0]!, process.argv[1]!, ...helpArgs.argv];
+}
+
+const launchFlags = readLaunchFlags(ownArgv());
+if (launchFlags.refusal) enforceLaunchControl({ argv: ownArgv() });
 
 const cli = meow(
   `
@@ -103,37 +108,28 @@ const [command, ...rest] = cli.input;
  * an interactive TTY, and refuses a non-interactive agent launch that did not
  * assert `--sandbox-required`. Implementation lives in src/utils/nono.ts.
  */
-async function enforceLaunchControlOrExit(): Promise<void> {
-  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG, SANDBOXED_FLAG } = await import(
+async function enforceLaunchControlOrExit() {
+  const { enforceLaunchControl, isInteractiveTty, NO_SANDBOX_FLAG } = await import(
     "../src/utils/nono.js"
   );
-  // Under `--sandboxed` this process must HOLD THE LAUNCHER'S RELEASE before the
-  // gate may honour the flag (cli#350 round 4e). The handshake lives here, not
-  // in the gate: it is I/O (connect, report the pid, prove the canaries, wait —
-  // bounded — for `CONFINED <session> <this pid>`), while the gate stays pure.
-  // Nothing this process can observe about itself is proof; the launcher's view
-  // from OUTSIDE the sandbox is.
-  //
-  // cli#350 r4f — attest whenever a LAUNCHER launched this process, keyed on the
-  // locator (set by the launcher and only by it), NEVER on the TTY: the launcher
-  // requires the release on every launch, so a TTY child that skipped the
-  // handshake made every interactive `tps agent start` refuse with
-  // `no released child within …`. A human who types `--sandboxed` at a terminal
-  // carries no locator, so confinement stays undefined and rule 1b refuses it.
+  const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
+    "../src/utils/launch-attestation.js"
+  );
   let confinement: { released: boolean; reason?: string } | undefined;
-  if (process.argv.includes(SANDBOXED_FLAG)) {
-    const { attestConfinement, LAUNCH_SOCK_ENV } = await import(
-      "../src/utils/launch-attestation.js"
-    );
-    if (process.env[LAUNCH_SOCK_ENV]) {
-      const attestation = await attestConfinement();
-      confinement = { released: attestation.ok, reason: attestation.reason };
-    }
+  let worktreeBinding: import("../src/utils/agent-lifecycle.js").WorktreeLaunchBinding | undefined;
+  if (ownFlag(ownArgv(), SANDBOXED_FLAG) && process.env[LAUNCH_SOCK_ENV]) {
+    const attestation = await attestConfinement();
+    confinement = { released: attestation.ok, reason: attestation.reason };
+    worktreeBinding = attestation.worktreeBinding;
   }
-  enforceLaunchControl({ command, rest, argv: process.argv, parsedFlags: cli.flags, confinement });
-  if (launchFlags.noSandbox && isInteractiveTty()) {
+  const sandboxed = confinement?.released === true;
+  enforceLaunchControl({ command, rest, argv: ownArgv(), parsedFlags: cli.flags,
+    confinement: { released: sandboxed, reason: confinement?.reason } });
+  const flags = readLaunchFlags(ownArgv(), cli.flags);
+  if (flags.noSandbox && isInteractiveTty()) {
     console.warn(`⚠️  ${NO_SANDBOX_FLAG}: running WITHOUT nono isolation (interactive override).`);
   }
+  return { ...flags, sandboxed, worktreeBinding: confinement?.released ? worktreeBinding : undefined };
 }
 
 // nono availability check (skip for --quiet-nono-check or office/mail relay commands)
@@ -276,7 +272,7 @@ async function main() {
     return;
   }
 
-  await enforceLaunchControlOrExit();
+  const launchDecision = await enforceLaunchControlOrExit();
   await checkNono();
   switch (command) {
     case "init": {
@@ -480,14 +476,16 @@ async function main() {
           const message = msgIdx >= 0 ? process.argv.slice(msgIdx + 1).join(" ") : undefined;
           await runAgent({ action: "run", config: configPath, id: agentId, message });
         } else if (action === "start") {
-          const runtimeArg = process.argv.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
+          const payloadStart = helpArgs.argv.indexOf("--");
+          const ownArgs = payloadStart === -1 ? helpArgs.argv : helpArgs.argv.slice(0, payloadStart);
+          const runtimeArg = ownArgs.some((arg) => arg === "--runtime" || arg.startsWith("--runtime=")) ? cli.flags.runtime : undefined;
           const attestedRuntime = runtimeArg === "claude-code" || runtimeArg === "codex" || runtimeArg === "gemini";
           if (runtimeArg !== undefined && runtimeArg !== "openclaw" && !attestedRuntime) {
             console.error(`❌ refusing to launch runtime '${runtimeArg}': unsupported runtime`);
             process.exit(78);
           }
-          const sandboxed = process.argv.includes("--sandboxed");
-          const noSandbox = launchFlags.noSandbox;
+          const sandboxed = launchDecision.sandboxed;
+          const noSandbox = launchDecision.noSandbox;
           // Selected runners execute after launcher release or an interactive
           // TTY `--no-sandbox` opt-out.
           if (attestedRuntime && (sandboxed || noSandbox)) {
@@ -498,11 +496,6 @@ async function main() {
             const { load: parseYaml } = await import("js-yaml");
             const cfgPath = configPath ?? join(homedir(), ".tps", "agents", agentId!, "agent.yaml");
 
-            /** Resolve the git worktree metadata dir for a workspace.
-             *  A worktree's .git is a file containing "gitdir: /path/to/.git/worktrees/<name>".
-             *  Codex workspace-write sandbox restricts writes to the workspace dir; the worktree
-             *  metadata dir (index, HEAD, etc.) is outside that boundary and must be added to
-             *  extraDirs so git commit/push can write index.lock. */
             function resolveWorktreeGitDir(workspace: string): string | null {
               try {
                 const dotGit = join(workspace, ".git");
@@ -514,7 +507,12 @@ async function main() {
               return null;
             }
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
-            const agentWorkspace = agentCfg.workspace ?? join(homedir(), "ops", "tps");
+            const { agentWorkspace: resolveWorkspace } = await import("../src/utils/agent-workspace.js");
+            const agentWorkspace = resolveWorkspace(
+              cfgPath,
+              agentCfg.workspace ?? join(homedir(), "ops", "tps"),
+              sandboxed ? process.env : undefined,
+            );
 
             // OPS-47: Build workspace provider from agent.yaml config
             const { GitWorkspaceProvider } = await import("../src/utils/workspace-provider.js");
@@ -544,12 +542,25 @@ async function main() {
               }
             }
 
-            const { onStart, onStop } = await import("../src/utils/agent-lifecycle.js");
-            const startResult = onStart(agentId!, agentWorkspace);
-            if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
+            // Complete this launch's deferred checkout before starting the runtime.
+            const { onStart, onStop, checkoutWorktree, worktreeLaunchBinding, worktreeLaunchGit } = await import("../src/utils/agent-lifecycle.js");
+            const pendingCheckout = process.env.TPS_WORKTREE_PENDING;
+            let worktreeCreated = false;
+            if (sandboxed && pendingCheckout !== undefined) {
+              const checkedOut = checkoutWorktree(agentWorkspace);
+              console.log(`[${agentId}] worktree: ${checkedOut.reason}`);
+            } else if (!sandboxed) {
+              const startResult = onStart(agentId!, agentWorkspace);
+              worktreeCreated = startResult.changed;
+              if (startResult.changed) console.log(`[${agentId}] worktree: ${startResult.reason}`);
+            }
 
             try {
               if (runtimeArg === "codex") {
+              const worktreeGit = worktreeLaunchGit(sandboxed
+                ? launchDecision.worktreeBinding ?? { kind: "none" }
+                : worktreeLaunchBinding(agentWorkspace));
+
               const { runCodexRuntime } = await import("../src/utils/codex-runtime.js");
               const { parseReviewTriggerConfig } = await import("../src/utils/pr-review-trigger.js");
               await runCodexRuntime({
@@ -561,7 +572,7 @@ async function main() {
                   join(homedir(), ".tps", "mail", agentId!),
                   join(homedir(), "ops", "tps"),
                   join(homedir(), "ops", "flair"),
-                  ...((worktreeGitDir) => worktreeGitDir ? [worktreeGitDir] : [])(resolveWorktreeGitDir(agentWorkspace)),
+                  ...(worktreeGit ? [worktreeGit.gitDir, worktreeGit.gitCommonDir] : []),
                   ...(agentCfg.codex?.extraDirs ?? []),
                 ],
                 taskTimeoutMs: agentCfg.taskTimeoutMs,
@@ -610,8 +621,10 @@ async function main() {
               });
             }
             } finally {
-              const stopResult = onStop(agentId!, agentWorkspace);
-              if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
+              if (worktreeCreated) {
+                const stopResult = onStop(agentId!, agentWorkspace);
+                if (stopResult.changed) console.log(`[${agentId}] worktree removed: ${stopResult.reason}`);
+              }
             }
           } else {
             await runAgent({
@@ -620,7 +633,7 @@ async function main() {
               id: agentId,
               sandbox: !noSandbox,
               sandboxed,
-              sandboxRequired: launchFlags.sandboxRequired,
+              sandboxRequired: launchDecision.sandboxRequired,
               // Carry the runtime into the re-exec so the sandboxed child runs the
               // runtime runner (cli#363 slice B); undefined for the default path.
               runtime: attestedRuntime ? runtimeArg : undefined,
@@ -1498,6 +1511,6 @@ async function main() {
 main()
   .then(() => process.exit(0))
   .catch((err) => {
-    console.error(err?.message || err);
+    console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
     process.exit(1);
   });

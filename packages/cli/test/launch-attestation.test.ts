@@ -42,6 +42,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { connect } from "node:net";
+import type { WorktreeLaunchBinding } from "../src/utils/agent-lifecycle.js";
 import { join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import {
@@ -647,6 +648,7 @@ async function runLauncherInProcess(opts: {
   publishStore?: boolean;
   storeSessions?: unknown;
   peerEnv?: Record<string, string | undefined>;
+  worktreeBinding?: WorktreeLaunchBinding;
   failFirst?: { disableCanaryCheck?: boolean; disablePidBinding?: boolean };
 }): Promise<LauncherRun> {
   const sb = opts.sb;
@@ -745,6 +747,7 @@ exit 0
         },
         home: sb.home,
         failFirstSeam: opts.failFirst,
+        worktreeBinding: opts.worktreeBinding,
       }
     );
     await peerProc.done;
@@ -809,6 +812,7 @@ function attempt() {
     sock.write("CANARY INSIDE " + (mode === "blind-denied" ? "DENIED" : "READ:" + inside) + "\\n");
   });
   sock.on("data", (chunk) => {
+    if (process.env.FAKE_NONO_RELEASE_LOG) require("node:fs").appendFileSync(process.env.FAKE_NONO_RELEASE_LOG, chunk);
     if (String(chunk).includes("CONFINED")) {
       if (process.env.FAKE_NONO_STOP) {
         try { require("node:fs").writeFileSync(process.env.FAKE_NONO_STOP, "released"); } catch {}
@@ -895,6 +899,55 @@ describe("4e fixtures — the launcher's own checks (scripted peer)", () => {
     }
   });
 });
+
+test("the launcher release carries its retained worktree binding", async () => {
+  const sb = makeSandbox("worktree-binding");
+  try {
+    const worktreeBinding: WorktreeLaunchBinding = {
+      kind: "registered", gitDir: join(sb.root, "git dir"),
+      gitCommonDir: join(sb.root, "common dir"), baseWorkingTree: join(sb.root, "base"),
+    };
+    const log = join(sb.root, "release");
+    const run = await runLauncherInProcess({
+      sb, peer: "confined", worktreeBinding, peerEnv: { FAKE_NONO_RELEASE_LOG: log },
+    });
+    expect(run.exitCode, run.stderr).toBe(0);
+    const release = readFileSync(log, "utf8").trim().split(" ");
+    expect(release[0]).toBe("CONFINED");
+    expect(JSON.parse(Buffer.from(release[3]!, "base64url").toString("utf8"))).toEqual(worktreeBinding);
+  } finally {
+    rmSync(sb.root, { recursive: true, force: true });
+  }
+});
+
+for (const payload of ["registered", "unregistered", "none", "invalid JSON"] as const) {
+  test(`the child reads the release worktree binding: ${payload}`, async () => {
+    const sb = makeSandbox("binding-child");
+    const dir = sb.root;
+    const { createServer } = await import("node:net");
+    const binding: WorktreeLaunchBinding = payload === "registered"
+      ? { kind: "registered", gitDir: join(dir, "git dir"), gitCommonDir: join(dir, "common"), baseWorkingTree: join(dir, "base") }
+      : payload === "unregistered" ? { kind: "unregistered", baseWorkingTree: join(dir, "base") } : { kind: "none" };
+    const token = Buffer.from(payload === "invalid JSON" ? "{" : JSON.stringify(binding)).toString("base64url");
+    const server = createServer((conn) => {
+      conn.once("data", () => conn.write(`CONFINED fixture ${process.pid} ${token}\n`));
+    });
+    try {
+      const sockPath = join(dir, "launch.sock");
+      await new Promise<void>((resolvePromise, reject) => {
+        server.once("error", reject);
+        server.listen(sockPath, resolvePromise);
+      });
+      const result = await attestConfinement({ [LAUNCH_SOCK_ENV]: sockPath }, 1000);
+      expect(result.ok).toBe(payload !== "invalid JSON");
+      if (payload === "invalid JSON") expect(result.reason).toBe("launcher sent an invalid worktree binding");
+      else expect(result.worktreeBinding).toEqual(binding);
+    } finally {
+      server.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 describe("4e FAILS-FIRST — each check is what refuses its fixture", () => {
   test("canary check reverted → the unconfined-child fixture goes GREEN", async () => {

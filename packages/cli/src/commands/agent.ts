@@ -11,12 +11,13 @@
  */
 
 import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
+import { agentWorkspace } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve as resolvePathMod } from "node:path";
@@ -25,17 +26,15 @@ import {
   isNonoStrict,
   isInteractiveTty,
   isSupervised,
-  harnessReadPaths,
-  harnessReadFiles,
-  BUN_TEMP_DIR,
+  agentLaunchOptions,
   runtimeNonoOptions,
   runtimeNonoProfile,
-  approveRuntimeNonoOptions,
   sandboxProfileGrantRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
+  canonicalPath,
 } from "../utils/nono.js";
-import { launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
+import { grantCovers, launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
@@ -1074,7 +1073,55 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 }
 // ─── Entry ───────────────────────────────────────────────────────────────────
 
-export async function runAgent(args: AgentArgs): Promise<void> {
+export async function runAgent(
+  args: AgentArgs,
+  testHooks?: { afterConfigSnapshot?: (path: string) => void },
+): Promise<void> {
+  const original = args.config ?? (args.id ? join(homedir(), ".tps", "agents", args.id, "agent.yaml") : undefined);
+  if (args.action !== "start" || args.sandboxed || !original || !existsSync(original)) {
+    return runAgentCommand(args);
+  }
+  const workspaceConfigPath = resolvePathMod(original);
+  const parent = canonicalPath(join(homedir(), ".tps", "launch"));
+  const createdParent = mkdirSync(parent, { recursive: true, mode: 0o700 });
+  const snapshotRoot = mkdtempSync(join(parent, "config-"));
+  const cleanup = () => {
+    rmSync(snapshotRoot, { recursive: true, force: true });
+    if (createdParent) {
+      try {
+        rmdirSync(parent);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTEMPTY" && code !== "EEXIST") throw err;
+      }
+    }
+  };
+  process.once("exit", cleanup);
+  const signalHandlers = (["SIGINT", "SIGTERM", "SIGHUP"] as const).map((signal) => {
+    const handler = () => {
+      cleanup();
+      process.removeListener(signal, handler);
+      if (process.listenerCount(signal) === 0) process.kill(process.pid, signal);
+    };
+    process.once(signal, handler);
+    return { signal, handler };
+  });
+  try {
+    const configPath = join(snapshotRoot, "agent.yaml");
+    writeFileSync(configPath, readFileSync(workspaceConfigPath), { mode: 0o600, flag: "wx" });
+    testHooks?.afterConfigSnapshot?.(configPath);
+    return await runAgentCommand({ ...args, config: configPath }, { workspaceConfigPath, snapshotRoot });
+  } finally {
+    cleanup();
+    process.removeListener("exit", cleanup);
+    for (const { signal, handler } of signalHandlers) process.removeListener(signal, handler);
+  }
+}
+
+async function runAgentCommand(
+  args: AgentArgs,
+  snapshot?: { workspaceConfigPath: string; snapshotRoot: string },
+): Promise<void> {
   switch (args.action) {
     case "create":
       return createAgent(args);
@@ -1113,6 +1160,8 @@ export async function runAgent(args: AgentArgs): Promise<void> {
         console.error("   or: tps agent run --config <path> --message <text>");
         process.exit(1);
       }
+      // Resolve relative --config before reading or re-executing (cli#516).
+      configPath = resolvePathMod(configPath);
       if (!existsSync(configPath)) {
         console.error(`Config not found: ${configPath}`);
         console.error(`Run 'tps agent create --id ${args.id ?? "<id>"}' first.`);
@@ -1120,6 +1169,11 @@ export async function runAgent(args: AgentArgs): Promise<void> {
       }
 
       const config = loadAgentConfig(configPath);
+      config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
+      if (snapshot) {
+        const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+        writeFileSync(configPath, yaml.dump({ ...document, workspace: config.workspace }, { lineWidth: -1 }));
+      }
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
       // workload can rewrite (`agentDir` is granted r+w, so the agent can edit
@@ -1230,48 +1284,90 @@ export async function runAgent(args: AgentArgs): Promise<void> {
             // the sandboxed child re-enters bin/tps.ts, which runs the runtime
             // runner on the execution side.
             if (selectedRuntime) relaunch.push("--runtime", selectedRuntime);
+            // Parse, re-exec, and grant the parent's private config snapshot (cli#516).
+            relaunch.push("--config", configPath);
             // THE ATTESTED LAUNCH (cli#350 round 4e): the launcher creates the
             // private dir, plants the canaries, spawns nono by absolute path,
             // and releases the child over its own socket only after `nono ps`
             // binds a live session to the pid it spawned and to the pid the
             // child reports, with the OUTSIDE canary still unreadable to it.
-            const runtimeGrants = runtimeNonoOptions(selectedRuntime);
-            const launchOptions = {
-              workdir: config.workspace,
-              // CHANGE (cli#341 S1b): this used to grant a read of the
-              // filesystem root. A root grant is refused outright by nono
-              // 0.70+ (exit 1). Use the explicit toolchain read set instead —
-              // the macOS roots Kern validated, and their Linux equivalents
-              // (systemReadPaths()).
-              read: harnessReadPaths(),
-              // Exactly this agent's own identity files, not the shared
-              // identity directory (cli#351 r4).
-              readFiles: harnessReadFiles(launchId),
-              allowFiles: runtimeGrants.allowFiles,
-              // Bun's own temp dir is /tmp regardless of TMPDIR, and an
-              // unreadable temp dir is fatal to it — grant BOTH /tmp and the
-              // configured TMPDIR (cli#350 r4g). On macOS launchd sets TMPDIR
-              // to /var/folders/…, so /tmp would otherwise not be granted at
-              // all; on Linux TMPDIR is usually /tmp and the Set dedupes.
-              allow: [...new Set([mailDir, tmpDir, BUN_TEMP_DIR, config.workspace, agentDir, ...(runtimeGrants.allow ?? [])])],
-            };
             const profile = runtimeNonoProfile(selectedRuntime);
-            const approval = approveRuntimeNonoOptions(selectedRuntime, { ...launchOptions, cwd: process.cwd() }, process.env, launchId);
-            if (approval.refusal) {
-              console.error(`❌ refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${approval.refusal}`);
+            const launchInput = {
+              configPath,
+              cwd: process.cwd(),
+              workspace: config.workspace,
+              launchId,
+              runtime: selectedRuntime,
+              mailDir,
+              tmpDir,
+              agentDir,
+            };
+            const approveLaunch = () => {
+              const result = agentLaunchOptions(launchInput);
+              if (result.refusal) throw new Error(`refusing to launch runtime '${selectedRuntime ?? "AgentRuntime"}': ${result.refusal}`);
+              if (snapshot) {
+                const writable = [result.options.cwd ?? process.cwd(), result.options.workdir, ...(result.options.allow ?? [])];
+                if (writable.some((path) => path && grantCovers(canonicalPath(path), snapshot.snapshotRoot)) ||
+                    (result.options.allowFiles ?? []).some((path) => canonicalPath(path) === configPath)) {
+                  throw new Error("refusing a writable config snapshot directory");
+                }
+              }
+              return result;
+            };
+            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            let worktreeCreated = false;
+            let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
+            let approval: ReturnType<typeof agentLaunchOptions>;
+            try {
+              approval = approveLaunch();
+              const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
+              if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
+              const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
+              worktreeCreated = start?.changed ?? false;
+              cleanupBinding = start?.cleanupBinding;
+              approval = approveLaunch();
+            } catch (err) {
+              console.error(`❌ ${(err as Error).message}`);
+              if (worktreeCreated) {
+                try {
+                  onStop(launchId, config.workspace, cleanupBinding);
+                } catch (cleanupErr) {
+                  console.error(`❌ ${(cleanupErr as Error).message}`);
+                }
+              }
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
-            const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable);
-            if (profileRefusal) {
-              console.error(`❌ refusing to launch profile '${profile}': ${profileRefusal}`);
-              process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+            // The child checks the worktree out only when THIS launch created
+            // it. Remove any inherited TPS_WORKTREE_PENDING before launch and
+            // set it only after a worktree was actually created, so an
+            // inherited value never names someone else's worktree (cli#516).
+            const launchEnv: NodeJS.ProcessEnv = { ...process.env };
+            launchEnv.TPS_AGENT_WORKSPACE = config.workspace;
+            delete launchEnv.TPS_WORKTREE_PENDING;
+            if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = config.workspace;
+            let exitCode: number;
+            try {
+              exitCode = await launchAttested(
+                profile,
+                approval.options,
+                relaunch,
+                {
+                  runtimeDirectories: approval.runtimeDirectories,
+                  worktreeBinding: approval.worktreeBinding,
+                  env: launchEnv,
+                },
+              );
+            } finally {
+              // Attempt cleanup only after this launch created a worktree (cli#516).
+              if (worktreeCreated) {
+                try {
+                  onStop(launchId, config.workspace, cleanupBinding);
+                } catch (err) {
+                  console.error(`❌ ${(err as Error).message}`);
+                  process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
+                }
+              }
             }
-            const exitCode = await launchAttested(
-              profile,
-              approval.options,
-              relaunch,
-              { runtimeDirectories: approval.runtimeDirectories },
-            );
             process.exit(exitCode);
           }
         } else if (!sandboxed && nonoAvailable) {

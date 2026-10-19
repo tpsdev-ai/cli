@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { launcherGrantCovering, sandboxHomeBase } from "./helpers/launcher-grants.js";
+import { launcherGrantCovering, probeNonoBuiltinRead, realNonoHomeBase, sandboxHomeBase } from "./helpers/launcher-grants.js";
 
 /**
  * Whether a write into the directory under test is refused for want of
@@ -45,7 +45,7 @@ function modeRestrictionEnforced(): boolean {
 const modeRestrictionEnforcedHere = modeRestrictionEnforced();
 
 describe("sandboxHomeBase", () => {
-  test("refuses when every existing candidate is inside a launcher grant, naming TMPDIR and the grant", () => {
+  test("refuses when every existing candidate is inside a fixed launcher grant, naming TMPDIR and the grant", () => {
     expect(() => sandboxHomeBase(["/tmp", "/tmp/x"])).toThrow(/TMPDIR=/);
     expect(() => sandboxHomeBase(["/tmp", "/tmp/x"])).toThrow(/'\/tmp'/);
   });
@@ -54,7 +54,7 @@ describe("sandboxHomeBase", () => {
     expect(() => sandboxHomeBase(["/tmp"])).toThrow(/for example \/var\/tmp/);
   });
 
-  test("returns a candidate that lies outside every grant", () => {
+  test("returns a candidate that lies outside every fixed launcher grant", () => {
     expect(launcherGrantCovering("/var/tmp")).toBeNull();
     expect(sandboxHomeBase(["/tmp", "/var/tmp"])).toBe(realpathSync("/var/tmp"));
   });
@@ -122,10 +122,10 @@ describe("launcherGrantCovering", () => {
     expect(launcherGrantCovering("/tmpfoo")).toBeNull();
   });
 
-  test("resolves a link outside every grant to the grant its real location sits in", () => {
+  test("resolves a link outside every fixed launcher grant to the grant its real location sits in", () => {
     const dir = mkdtempSync(join(sandboxHomeBase(), "lg-link-"));
     try {
-      // The link's own directory is outside every grant, so a match on the
+      // The link's own directory is outside every fixed launcher grant, so a match on the
       // spelled-out path alone cannot pass: only resolving the link reaches /tmp.
       expect(launcherGrantCovering(dir)).toBeNull();
       const link = join(dir, "tmplink");
@@ -166,6 +166,156 @@ describe("writeRefusedForPermission", () => {
       expect(readdirSync(dir)).toEqual([]);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+/** A fake nono that selects a read result by profile location. */
+function fakeProbeNono(dir: string): string {
+  const denyBin = join(dir, "deny-bin");
+  mkdirSync(denyBin);
+  writeFileSync(join(denyBin, "cat"), '#!/bin/sh\necho "cat: $1: Operation not permitted" >&2\nexit 1\n');
+  chmodSync(join(denyBin, "cat"), 0o755);
+  for (const [name, message, status] of [
+    ["missing-file", "No such file or directory", 1],
+    ["missing-command", "command not found", 127],
+  ] as const) {
+    const toolDir = join(dir, name);
+    mkdirSync(toolDir);
+    writeFileSync(join(toolDir, "cat"), `#!/bin/sh\necho "cat: $1: ${message}" >&2\nexit ${status}\n`);
+    chmodSync(join(toolDir, "cat"), 0o755);
+  }
+  const bin = join(dir, "nono");
+  writeFileSync(
+    bin,
+    [
+      "#!/usr/bin/env bash",
+      'if [ "${1:-}" != "run" ]; then echo "fake nono: unexpected $*" >&2; exit 64; fi',
+      'profile=""',
+      'while [ $# -gt 0 ] && [ "$1" != "--" ]; do',
+      '  if [ "$1" = "--profile" ]; then profile="$2"; shift; fi',
+      "  shift",
+      "done",
+      "shift",
+      'under() { [ -n "$1" ] && case "$profile" in "$1"/*) return 0 ;; esac; return 1; }',
+      'if under "${FAKE_REFUSED_UNDER:-}"; then echo "nono: Sandbox initialization failed: fake refusal" >&2; exit 1; fi',
+      'if under "${FAKE_UNKNOWN_UNDER:-}"; then exit 0; fi',
+      'if under "${FAKE_GRANTED_UNDER:-}"; then exec "$@"; fi',
+      `if under "\${FAKE_MISSING_FILE_UNDER:-}"; then PATH="${join(dir, "missing-file")}:$PATH" exec "$@"; fi`,
+      `if under "\${FAKE_MISSING_COMMAND_UNDER:-}"; then PATH="${join(dir, "missing-command")}:$PATH" exec "$@"; fi`,
+      `PATH="${denyBin}:$PATH" exec "$@"`,
+      "",
+    ].join("\n"),
+  );
+  chmodSync(bin, 0o755);
+  return bin;
+}
+
+/** A parent dir (outside every fixed launcher grant) with one candidate dir per name. */
+function probeCandidates(...names: string[]): { parent: string; dirs: Record<string, string> } {
+  const parent = mkdtempSync(join(sandboxHomeBase(), "lg-nono-"));
+  const dirs: Record<string, string> = {};
+  for (const name of names) {
+    dirs[name] = join(parent, name);
+    mkdirSync(dirs[name]);
+  }
+  return { parent, dirs };
+}
+
+describe("realNonoHomeBase", () => {
+  test("accepts a candidate whose sandboxed read nono denies, and leaves no probe behind", () => {
+    const { parent, dirs } = probeCandidates("free");
+    try {
+      const nono = fakeProbeNono(parent);
+      expect(realNonoHomeBase(nono, [dirs.free], process.env)).toBe(realpathSync(dirs.free));
+      expect(readdirSync(dirs.free)).toEqual([]);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a candidate whose sandboxed read nono grants, and returns the next one", () => {
+    const { parent, dirs } = probeCandidates("granted", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_GRANTED_UNDER: realpathSync(dirs.granted) };
+      expect(realNonoHomeBase(nono, [dirs.granted, dirs.free], env)).toBe(realpathSync(dirs.free));
+      expect(() => realNonoHomeBase(nono, [dirs.granted], env)).toThrow(
+        /granted: nono's default policy lets a sandboxed process read a file under it/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects a candidate whose probe produces no output with a nonzero exit, quoting its stderr, and returns the next one", () => {
+    const { parent, dirs } = probeCandidates("refused", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_REFUSED_UNDER: realpathSync(dirs.refused) };
+      expect(realNonoHomeBase(nono, [dirs.refused, dirs.free], env)).toBe(realpathSync(dirs.free));
+      expect(() => realNonoHomeBase(nono, [dirs.refused], env)).toThrow(
+        /refused: the probe produced no output and exited nonzero: nono: Sandbox initialization failed: fake refusal/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("an unknown answer throws instead of reading as not granted or moving on", () => {
+    const { parent, dirs } = probeCandidates("unknown", "free");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = { ...process.env, FAKE_UNKNOWN_UNDER: realpathSync(dirs.unknown) };
+      expect(() => realNonoHomeBase(nono, [dirs.unknown, dirs.free], env)).toThrow(
+        /unknown answer, which is never read as "not granted".*exited 0, stdout "", stderr ""/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  for (const failure of ["FILE", "COMMAND"] as const) {
+    test(`reports the sandboxed read's missing ${failure.toLowerCase()} as a probe failure`, () => {
+      const { parent, dirs } = probeCandidates("candidate");
+      try {
+        const nono = fakeProbeNono(parent);
+        expect(() => realNonoHomeBase(nono, [dirs.candidate], {
+          ...process.env, [`FAKE_MISSING_${failure}_UNDER`]: realpathSync(dirs.candidate),
+        })).toThrow(/sandboxed read probe failed/);
+      } finally {
+        rmSync(parent, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("requires a successful unsandboxed nonce read", () => {
+    const { parent, dirs } = probeCandidates("candidate");
+    try {
+      const nono = fakeProbeNono(parent);
+      expect(() => probeNonoBuiltinRead(nono, dirs.candidate, {
+        ...process.env, PATH: join(parent, "deny-bin"),
+      })).toThrow(/unsandboxed read probe failed.*Operation not permitted/);
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("names every rejected candidate when none qualifies", () => {
+    const { parent, dirs } = probeCandidates("granted", "refused");
+    try {
+      const nono = fakeProbeNono(parent);
+      const env = {
+        ...process.env,
+        FAKE_GRANTED_UNDER: realpathSync(dirs.granted),
+        FAKE_REFUSED_UNDER: realpathSync(dirs.refused),
+      };
+      const missing = join(parent, "missing");
+      expect(() => realNonoHomeBase(nono, [dirs.granted, dirs.refused, "/tmp", missing], env)).toThrow(
+        /granted: nono's default policy lets .*; .*refused: the probe produced no output and exited nonzero: .*fake refusal; \/tmp: inside the fixed launcher '\/tmp' grant; .*missing: not a writable directory/,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 });

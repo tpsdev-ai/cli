@@ -9,9 +9,9 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
@@ -224,10 +224,54 @@ export async function writeTaskMemory(
 export interface AgentLifecycleResult {
   changed: boolean;
   reason: string;
+  /** Git metadata for a worktree launch with deferred checkout. */
+  gitDir?: string;
+  /**
+   * Absolute path of the worktree's git common directory — the base
+   * repository's metadata that `gitDir`'s `commondir` file points to. Present
+   * in the same case as `gitDir`.
+   */
+  gitCommonDir?: string;
+  baseWorkingTree?: string;
+  cleanupBinding?: WorktreeCleanupBinding;
+}
+
+export interface WorktreeCleanupBinding {
+  workspace: string;
+  baseWorkingTree: string;
+  gitDir: string;
+  gitCommonDir: string;
+  registryEntry: string;
+  recordedGitdir: string;
+}
+
+/**
+ * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
+ * caller can tell a worktree failure from any other error and report it as one;
+ * the message names the operation that failed.
+ */
+export class WorktreeLifecycleError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorktreeLifecycleError";
+  }
+}
+
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!key.startsWith("GIT_")) env[key] = value;
+  }
+  // Disable inherited GIT_* variables and system/global config entry points;
+  // local config includes remain enabled.
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
 }
 
 function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr: string } {
-  const out = spawnSync("git", args, { cwd, encoding: "utf-8" });
+  const out = spawnSync("git", args, { cwd, encoding: "utf-8", env: gitEnv() });
   return {
     ok: out.status === 0,
     stdout: (out.stdout ?? "").trim(),
@@ -235,68 +279,416 @@ function git(cwd: string, args: string[]): { ok: boolean; stdout: string; stderr
   };
 }
 
-function isGitRepo(path: string): boolean {
-  const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
-  return out.ok && out.stdout === "true";
-}
+type RepoProbe =
+  | { kind: "repo"; path: string }
+  | { kind: "not-a-repo" }
+  | { kind: "error"; detail: string };
 
-function parseWorktreePaths(baseRepo: string): Set<string> {
-  const out = git(baseRepo, ["worktree", "list", "--porcelain"]);
-  if (!out.ok) {
-    throw new Error(out.stderr || out.stdout || "git worktree list failed");
-  }
-  const paths = new Set<string>();
-  for (const line of out.stdout.split("\n")) {
-    if (line.startsWith("worktree ")) {
-      paths.add(resolve(line.slice("worktree ".length).trim()));
+function probeRepo(path: string): RepoProbe {
+  try {
+    let candidate;
+    try {
+      candidate = lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
     }
+    path = realpathSync(path);
+    candidate = lstatSync(path);
+    if (!candidate.isDirectory()) {
+      return { kind: "error", detail: "base path is not a plain directory" };
+    }
+    readdirSync(path);
+    const markerPath = join(path, ".git");
+    let marker;
+    try {
+      marker = lstatSync(markerPath);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-a-repo" };
+      throw err;
+    }
+    if (marker.isSymbolicLink() || (!marker.isDirectory() && !marker.isFile())) {
+      return { kind: "error", detail: "git marker is not a regular file or directory" };
+    }
+    if (marker.isDirectory()) readdirSync(markerPath);
+    else readFileSync(markerPath);
+  } catch (err) {
+    return { kind: "error", detail: (err as Error).message };
   }
-  return paths;
+  const out = git(path, ["rev-parse", "--is-inside-work-tree"]);
+  if (out.ok && out.stdout === "true") return { kind: "repo", path };
+  return { kind: "error", detail: out.stderr || out.stdout || "git probe produced no output" };
 }
 
 function resolveBaseRepo(workspacePath: string): string | null {
-  const defaultBase = resolve(join(homedir(), "ops", "tps"));
-  if (isGitRepo(defaultBase)) return defaultBase;
-
-  const derivedBase = resolve(join(dirname(workspacePath), "tps"));
-  if (isGitRepo(derivedBase)) return derivedBase;
-
+  const candidates = [
+    resolve(join(homedir(), "ops", "tps")),
+    resolve(join(dirname(workspacePath), "tps")),
+  ];
+  for (const candidate of candidates) {
+    const probe = probeRepo(candidate);
+    if (probe.kind === "repo") return probe.path;
+    if (probe.kind === "error") {
+      throw new WorktreeLifecycleError(
+        `git probe failed for the base repository ${candidate}: ${probe.detail}`,
+      );
+    }
+  }
   return null;
 }
 
-export function onStart(agentId: string, workspacePath?: string): AgentLifecycleResult {
+export type WorktreeLaunchBinding =
+  | { kind: "none" }
+  | { kind: "unregistered"; baseWorkingTree: string }
+  | { kind: "registered"; gitDir: string; gitCommonDir: string; baseWorkingTree: string };
+
+/**
+ * Classify a launch workspace against the trusted base repository.
+ *
+ * Registry ownership is decided from the trusted base's registry alone: the
+ * recorded `.git` path is compared to the workspace's `.git` path, so a
+ * registered entry is found even when its marker is missing, is a directory,
+ * or its workspace directory is absent. A registered workspace must then
+ * carry a regular `.git` file; anything else is refused before any grant is
+ * computed. An unregistered regular `.git` file gets no metadata grants;
+ * launch remains subject to grant and profile checks.
+ */
+export function worktreeLaunchBinding(workspacePath: string): WorktreeLaunchBinding {
+  let workspace = resolve(workspacePath);
+  try {
+    const workspaceStat = statSync(workspace);
+    if (!workspaceStat.isDirectory()) {
+      throw new WorktreeLifecycleError(`worktree marker probe failed: workspace is not a directory: ${workspace}`);
+    }
+    workspace = realpathSync(workspace);
+  } catch (err) {
+    if (err instanceof WorktreeLifecycleError) throw err;
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      workspace = resolvableWorkspacePath(workspace);
+      // The workspace directory is absent, but a registered worktree keeps its
+      // ownership in the trusted base's registry. Refuse it before any grant is
+      // computed; an absent unregistered path keeps the caller's cwd policy.
+      const trustedBase = resolveBaseRepo(workspace);
+      if (
+        trustedBase &&
+        trustedBaseWorktreeGitDir(workspace, resolvableWorkspacePath(workspace), trustedBase)
+      ) {
+        throw new WorktreeLifecycleError(
+          `worktree workspace is missing for a registered worktree: ${workspace}`,
+        );
+      }
+      return { kind: "none" };
+    }
+    throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+  }
+  const markerPath = join(workspace, ".git");
+  let marker: ReturnType<typeof lstatSync> | undefined;
+  try {
+    marker = lstatSync(markerPath);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new WorktreeLifecycleError(`worktree marker probe failed: ${(err as Error).message}`);
+    }
+  }
+  // A symlink marker is refused wherever it appears, before any base lookup.
+  if (marker?.isSymbolicLink()) throw new WorktreeLifecycleError(`worktree git marker is a symlink: ${workspace}`);
+  const trustedBase = resolveBaseRepo(workspace);
+  // No tps base repository: not a tps-managed worktree, so no metadata grants.
+  if (!trustedBase) return { kind: "none" };
+  let resolvedWorkspace: string;
+  try {
+    resolvedWorkspace = realpathSync(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+  }
+  if (resolvedWorkspace === trustedBase) return { kind: "none" };
+  const registered = trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, trustedBase);
+  if (!marker) {
+    if (registered) {
+      throw new WorktreeLifecycleError(`worktree git marker is missing for a registered worktree: ${workspace}`);
+    }
+    return { kind: "none" };
+  }
+  if (registered) {
+    if (!marker.isFile()) {
+      throw new WorktreeLifecycleError(`worktree git marker is not a regular file for a registered worktree: ${workspace}`);
+    }
+    return { kind: "registered", ...worktreeGitMetadata(workspace, trustedBase) };
+  }
+  // A regular `.git` marker is treated as unregistered; a plain
+  // directory or an ordinary repository keeps the caller's cwd policy.
+  if (!marker.isFile()) return { kind: "none" };
+  return { kind: "unregistered", baseWorkingTree: trustedBase };
+}
+
+export function worktreeLaunchGit(binding: WorktreeLaunchBinding): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } | undefined {
+  if (binding.kind !== "registered") return undefined;
+  return { gitDir: binding.gitDir, gitCommonDir: binding.gitCommonDir, baseWorkingTree: binding.baseWorkingTree };
+}
+
+function resolvableWorkspacePath(workspace: string, links = 0): string {
+  if (links > 40) throw new WorktreeLifecycleError(`worktree path has too many symbolic links: ${workspace}`);
+  try {
+    return realpathSync(workspace);
+  } catch {
+    let target: string;
+    try {
+      target = readlinkSync(workspace);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== "EINVAL" && code !== "ENOENT") throw err;
+      const parent = dirname(workspace);
+      return parent === workspace ? workspace : join(resolvableWorkspacePath(parent, links), basename(workspace));
+    }
+    return resolvableWorkspacePath(resolve(dirname(workspace), target), links + 1);
+  }
+}
+
+/** Find `workspace`'s git directory in `baseRepo`'s worktree registry.
+ *  Relative gitdirs require the base's relativeworktrees extension and format >= 1. */
+function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string, baseRepo: string): string | undefined {
+  const common = git(baseRepo, ["rev-parse", "--git-common-dir"]);
+  if (!common.ok || !common.stdout) {
+    throw new WorktreeLifecycleError(`trusted base common git directory could not be resolved for ${baseRepo}`);
+  }
+  let commonDir: string;
+  try {
+    commonDir = realpathSync(resolve(baseRepo, common.stdout));
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `trusted base common git directory could not be resolved for ${baseRepo}: ${(err as Error).message}`,
+    );
+  }
+  const registry = join(commonDir, "worktrees");
+  let entries: string[];
+  try {
+    entries = readdirSync(registry);
+  } catch (err) {
+    // No registry directory means the base has no linked worktrees.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new WorktreeLifecycleError(`worktree registry could not be read for ${baseRepo}: ${(err as Error).message}`);
+  }
+  const markerPaths = new Set([
+    resolve(join(workspace, ".git")),
+    resolve(join(resolvedWorkspace, ".git")),
+  ]);
+  let registeredGitDir: string | undefined;
+  for (const entry of entries) {
+    const gitDir = join(registry, entry);
+    try {
+      const recorded = readFileSync(join(gitDir, "gitdir"), "utf-8").trim();
+      if (!recorded) throw new Error("empty gitdir");
+      if (!isAbsolute(recorded)) {
+        const extension = git(baseRepo, ["config", "--local", "--includes", "--bool", "extensions.relativeworktrees"]);
+        const format = git(baseRepo, ["config", "--local", "--includes", "--int", "core.repositoryformatversion"]);
+        if (!extension.ok || extension.stdout !== "true" || !format.ok || !(Number(format.stdout) >= 1)) {
+          throw new Error("relative gitdir requires extensions.relativeworktrees=true and core.repositoryformatversion >= 1");
+        }
+      }
+      const recordedPath = resolve(gitDir, recorded);
+      const markerPath = join(resolvableWorkspacePath(dirname(recordedPath)), basename(recordedPath));
+      if (markerPaths.has(markerPath)) registeredGitDir = realpathSync(gitDir);
+    } catch (err) {
+      throw new WorktreeLifecycleError(
+        `worktree registry entry could not be resolved for ${baseRepo}: ${(err as Error).message}`,
+      );
+    }
+  }
+  return registeredGitDir;
+}
+
+/**
+ * Create the agent's worktree when a base repository exists and the workspace
+ * is absent. An existing worktree, an existing ordinary workspace, the base
+ * repository itself, and a workspace with no base repository are left
+ * untouched and reported as changed:false.
+ *
+ * With `deferCheckout: true`, setup disables hooks and fsmonitor and skips checkout.
+ *
+ * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
+ */
+export function onStart(
+  agentId: string,
+  workspacePath?: string,
+  opts: { deferCheckout?: boolean } = {},
+): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
   }
 
-  const workspace = resolve(workspacePath);
+  let workspace = resolve(workspacePath);
+  try {
+    workspace = realpathSync(workspace);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+    }
+  }
   const baseRepo = resolveBaseRepo(workspace);
   if (!baseRepo) {
-    return { changed: false, reason: "base repo not found or not a git repo" };
+    return { changed: false, reason: "no base repository for the workspace" };
   }
 
   if (workspace === baseRepo) {
     return { changed: false, reason: "workspace is base repo; skipping worktree add" };
   }
 
-  const worktrees = parseWorktreePaths(baseRepo);
-  if (worktrees.has(workspace)) {
-    return { changed: false, reason: "worktree already exists" };
+  if (trustedBaseWorktreeGitDir(workspace, workspace, baseRepo)) {
+    return { changed: false, reason: "worktree already exists", ...(opts.deferCheckout ? worktreeGitMetadata(workspace, baseRepo) : {}) };
   }
 
   if (existsSync(workspace)) {
     return { changed: false, reason: "workspace exists but is not a worktree; leaving untouched" };
   }
 
-  const add = git(baseRepo, ["worktree", "add", workspace, "--detach"]);
+  const defer = opts.deferCheckout === true;
+  const args = [
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "worktree",
+    "add",
+    ...(defer ? ["--no-checkout"] : []),
+    workspace,
+    "--detach",
+  ];
+  const add = git(baseRepo, args);
   if (!add.ok) {
-    throw new Error(`failed to create worktree for ${agentId}: ${add.stderr || add.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree setup failed for ${agentId} (${baseRepo} -> ${workspace}): ${add.stderr || add.stdout}`,
+    );
   }
 
-  return { changed: true, reason: "worktree created" };
+  const rollback = () => git(baseRepo, ["worktree", "remove", "--force", workspace]);
+  try {
+    const metadata = worktreeGitMetadata(workspace, baseRepo);
+    const registryEntry = join(metadata.gitDir, "gitdir");
+    return {
+      changed: true,
+      reason: defer ? "worktree created; checkout deferred" : "worktree created",
+      ...(defer ? metadata : {}),
+      cleanupBinding: {
+        ...metadata,
+        workspace: realpathSync(workspace),
+        registryEntry,
+        recordedGitdir: readFileSync(registryEntry, "utf-8"),
+      },
+    };
+  } catch (err) {
+    const removed = rollback();
+    if (!removed.ok) {
+      throw new WorktreeLifecycleError(`${(err as Error).message}; worktree cleanup failed: ${removed.stderr || removed.stdout}`);
+    }
+    if (err instanceof WorktreeLifecycleError) throw err;
+    throw new WorktreeLifecycleError(`worktree setup binding failed for ${workspace}: ${(err as Error).message}`);
+  }
 }
 
-export function onStop(_agentId: string, workspacePath?: string): AgentLifecycleResult {
+function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } {
+  const gitDir = git(workspace, ["rev-parse", "--absolute-git-dir"]);
+  if (!gitDir.ok || !gitDir.stdout) {
+    throw new WorktreeLifecycleError(
+      `worktree git directory could not be resolved for ${workspace}: ${gitDir.stderr || gitDir.stdout || "git rev-parse produced no output"}`,
+    );
+  }
+  try {
+    const trustedCommon = git(baseRepo, ["rev-parse", "--git-common-dir"]);
+    if (!trustedCommon.ok || !trustedCommon.stdout) {
+      throw new Error("trusted base common git directory could not be resolved");
+    }
+    const gitCommonDir = realpathSync(resolve(baseRepo, trustedCommon.stdout));
+    if (realpathSync(worktreeCommonDir(gitDir.stdout)) !== gitCommonDir) {
+      throw new Error("worktree metadata does not belong to the trusted base");
+    }
+    const trustedGitDir = trustedBaseWorktreeGitDir(workspace, realpathSync(workspace), baseRepo);
+    if (!trustedGitDir || realpathSync(gitDir.stdout) !== realpathSync(trustedGitDir)) {
+      throw new Error("worktree git directory does not belong to the trusted base");
+    }
+    return { gitDir: realpathSync(trustedGitDir), gitCommonDir, baseWorkingTree: baseRepo };
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree metadata binding failed for ${workspace}: ${(err as Error).message}`);
+  }
+}
+
+/**
+ * Resolve a linked worktree's common git directory from its git directory
+ * (cli#516). The git directory holds a `commondir` file naming the base
+ * repository's metadata directory (objects, refs, config) relative to it.
+ */
+export function worktreeCommonDir(gitDir: string): string {
+  let raw: string;
+  try {
+    raw = readFileSync(join(gitDir, "commondir"), "utf-8").trim();
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `worktree common git directory could not be read for ${gitDir}: ${(err as Error).message}`,
+    );
+  }
+  if (!raw) throw new WorktreeLifecycleError(`the commondir file in ${gitDir} is empty`);
+  return resolve(gitDir, raw);
+}
+
+/**
+ * Populate a worktree the parent created with `--no-checkout` (cli#516). This
+ * checkout may run repository-configured filters and hooks, so the caller must
+ * run it inside the sandbox. Throws `WorktreeLifecycleError` on failure.
+ */
+export function checkoutWorktree(workspacePath: string): AgentLifecycleResult {
+  const workspace = resolve(workspacePath);
+  const out = git(workspace, ["checkout", "--detach"]);
+  if (!out.ok) {
+    throw new WorktreeLifecycleError(
+      `worktree checkout failed for ${workspace}: ${out.stderr || out.stdout}`,
+    );
+  }
+  return { changed: true, reason: "worktree checked out" };
+}
+
+/** True when `path` exists; only ENOENT counts as absent (cli#516). Any other
+ *  lstat failure — e.g. EACCES on a parent, a non-directory in the path — is
+ *  thrown, so a failed probe is never read as "nothing there". */
+function pathExists(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw err;
+  }
+}
+
+export function onStop(_agentId: string, workspacePath?: string, binding?: WorktreeCleanupBinding): AgentLifecycleResult {
+  if (binding) {
+    const probe = probeRepo(binding.baseWorkingTree);
+    if (probe.kind !== "repo") {
+      throw new WorktreeLifecycleError(
+        `git probe failed for the base repository ${binding.baseWorkingTree}: ${probe.kind === "error" ? probe.detail : "base repository is absent"}`,
+      );
+    }
+    try {
+      const marker = readFileSync(join(binding.workspace, ".git"), "utf-8").trim();
+      if (
+        realpathSync(binding.workspace) !== binding.workspace ||
+        realpathSync(binding.gitDir) !== binding.gitDir ||
+        readFileSync(binding.registryEntry, "utf-8") !== binding.recordedGitdir ||
+        !marker.startsWith("gitdir: ") ||
+        realpathSync(resolve(binding.workspace, marker.slice("gitdir: ".length))) !== binding.gitDir ||
+        realpathSync(worktreeCommonDir(binding.gitDir)) !== binding.gitCommonDir
+      ) {
+        throw new Error("setup binding changed");
+      }
+    } catch (err) {
+      throw new WorktreeLifecycleError(`worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}`);
+    }
+    const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
+    if (!remove.ok) {
+      throw new WorktreeLifecycleError(
+        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}`,
+      );
+    }
+    return { changed: true, reason: "worktree removed" };
+  }
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
   }
@@ -307,18 +699,33 @@ export function onStop(_agentId: string, workspacePath?: string): AgentLifecycle
     return { changed: false, reason: "base repo not found or not a git repo" };
   }
 
-  if (!existsSync(workspace)) {
+  let workspaceExists: boolean;
+  try {
+    workspaceExists = pathExists(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(
+      `workspace probe failed for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+  if (!workspaceExists) {
     return { changed: false, reason: "workspace does not exist" };
   }
 
-  const worktrees = parseWorktreePaths(baseRepo);
-  if (!worktrees.has(workspace)) {
+  let resolvedWorkspace: string;
+  try {
+    resolvedWorkspace = realpathSync(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
+  }
+  if (!trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo)) {
     return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
   }
 
   const remove = git(baseRepo, ["worktree", "remove", workspace, "--force"]);
   if (!remove.ok) {
-    throw new Error(`failed to remove worktree: ${remove.stderr || remove.stdout}`);
+    throw new WorktreeLifecycleError(
+      `worktree cleanup failed for ${_agentId} (${workspace}): ${remove.stderr || remove.stdout}`,
+    );
   }
 
   return { changed: true, reason: "worktree removed" };

@@ -43,7 +43,7 @@ services:
   # (DEFAULT_NONO_PATHS in packages/cli/src/utils/launch-attestation.ts).
   attested:
     build: *test-build
-    command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts packages/cli/test/runtime-attested-launch.test.ts
+    command: node scripts/test-suite.mjs attested packages/cli/test/launch-attestation-real-nono.test.ts packages/cli/test/launch-attestation.test.ts packages/cli/test/runtime-attested-launch.test.ts packages/cli/test/sandboxed-launch-516.test.ts
     user: tps
     working_dir: /app
     environment:

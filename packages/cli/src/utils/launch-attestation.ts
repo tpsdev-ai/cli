@@ -36,6 +36,7 @@
  * process that spawns it — that process already owns it.
  */
 
+import type { WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
 import { randomBytes, createHash } from "node:crypto";
@@ -467,6 +468,7 @@ export interface Attestation {
   ok: boolean;
   reason?: string;
   sessionId?: string;
+  worktreeBinding?: WorktreeLaunchBinding;
 }
 
 /**
@@ -474,7 +476,7 @@ export interface Attestation {
  * this process's pid (self-reported: Node/Bun expose no peer credentials on
  * either OS — `getpeereid` returns no pid on macOS, and 4b measured that
  * inherited fds are stripped across `nono run`), attempt both canary reads,
- * report them, and require exactly `CONFINED <session_id> <child_pid>` with
+ * report them, and require a `CONFINED <session_id> <child_pid>` release with
  * `<child_pid>` equal to this pid. Anything else — no locator, connect refused,
  * a wrong pid, a timeout — is a refusal; the caller names the launcher.
  */
@@ -505,7 +507,7 @@ export async function attestConfinement(
     sock.write(`CANARY INSIDE ${inside}\n`);
     const line = await nextLine(sock, waitMs);
     if (typeof line !== "string") return { ok: false, reason: line.reason };
-    const release = line.trim().match(/^CONFINED (\S+) (\d+)$/);
+    const release = line.trim().match(/^CONFINED (\S+) (\d+)(?: (\S+))?$/);
     if (!release) {
       return { ok: false, reason: `launcher wrote '${line.trim()}', not a CONFINED release` };
     }
@@ -516,7 +518,13 @@ export async function attestConfinement(
         reason: `the release names pid ${releasedPid}, not this process (${process.pid})`,
       };
     }
-    return { ok: true, sessionId: release[1] };
+    let worktreeBinding: WorktreeLaunchBinding | undefined;
+    try {
+      if (release[3]) worktreeBinding = JSON.parse(Buffer.from(release[3], "base64url").toString("utf8"));
+    } catch {
+      return { ok: false, reason: "launcher sent an invalid worktree binding" };
+    }
+    return { ok: true, sessionId: release[1], worktreeBinding };
   } finally {
     sock.end();
     sock.destroy();
@@ -733,6 +741,7 @@ export function findBoundSession(
 }
 
 export interface LaunchOptions {
+  worktreeBinding?: WorktreeLaunchBinding;
   env?: NodeJS.ProcessEnv;
   runtimeDirectories?: readonly string[];
   /** Test seam: where the private dir is created (default: $HOME). */
@@ -894,7 +903,10 @@ export async function launchAttested(
               // its own pid back, so a release minted for another pid is
               // useless to it.
               try {
-                conn.write(`CONFINED ${v.session.session_id} ${v.pid}\n`);
+                const binding = opts.worktreeBinding
+                  ? ` ${Buffer.from(JSON.stringify(opts.worktreeBinding)).toString("base64url")}`
+                  : "";
+                conn.write(`CONFINED ${v.session.session_id} ${v.pid}${binding}\n`);
               } catch {
                 /* the child died first; the exit handler refuses the launch */
               }

@@ -17,7 +17,7 @@
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { resolveNonoBinary, checkNonoPin } from "../src/utils/launch-attestation.js";
@@ -28,6 +28,37 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
+async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): Promise<boolean> {
+  const releasedPid = /released under nono session \S+ \(child pid (\d+)\)/.exec(output)?.[1];
+  const targets = new Set<number>();
+  if (releasedPid) targets.add(Number(releasedPid));
+  else if (child.pid) targets.add(-child.pid);
+  if (child.pid) targets.add(child.pid);
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+    for (const pid of targets) {
+      try {
+        process.kill(pid, signal);
+      } catch {
+        /* checked below */
+      }
+    }
+    const deadline = Date.now() + 3_000;
+    do {
+      if ([...targets].every((pid) => !alive(pid))) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    } while (Date.now() < deadline);
+  }
+  return false;
+}
+
 const SANDBOX_REQUIRED = "--sandbox-required";
 
 // cli#350 r4g — these tests wait on a real release window (up to 45s / 60s);
@@ -169,12 +200,12 @@ real("4e positive — real nono (Landlock/Seatbelt): the premise", () => {
 real("4e positive — the attested launch against the pinned nono", () => {
   test("tps agent start is RELEASED: real nono, canaries verified, session bound to the spawned pid", async () => {
     const sb = sandbox();
+    let child: ReturnType<typeof spawn> | undefined;
+    let text = "";
     try {
-      // Spawned ASYNC: once released, the agent runtime keeps running (it is a
-      // long-lived process), so the fixture reads the launch output until the
-      // release line appears and then stops the tree.
-      const child = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
+      child = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
         cwd: sb.ws,
+        detached: true,
         env: {
           ...process.env,
           HOME: sb.home,
@@ -182,27 +213,38 @@ real("4e positive — the attested launch against the pinned nono", () => {
           TPS_LAUNCH_TIMEOUT_MS: "20000",
         },
       });
-      let text = "";
+      const launcher = child;
+      const pidFile = join(sb.ws, ".tps-agent.pid");
       const released = await new Promise<boolean>((resolvePromise) => {
         const timer = setTimeout(() => resolvePromise(false), 45_000);
         const onData = (chunk: Buffer) => {
           text += chunk.toString("utf-8");
-          if (text.includes("released under nono session")) {
+          if (/released under nono session \S+ \(child pid \d+\)/.test(text)) {
             clearTimeout(timer);
             resolvePromise(true);
           }
         };
-        child.stdout?.on("data", onData);
-        child.stderr?.on("data", onData);
-        child.on("exit", () => {
+        launcher.stdout?.on("data", onData);
+        launcher.stderr?.on("data", onData);
+        launcher.on("exit", () => {
           clearTimeout(timer);
-          resolvePromise(text.includes("released under nono session"));
+          resolvePromise(/released under nono session \S+ \(child pid \d+\)/.test(text));
         });
       });
-      child.kill("SIGTERM");
-      await new Promise((r) => setTimeout(r, 500));
-      child.kill("SIGKILL");
-      expect(released).toBe(true);
+      if (released) {
+        await new Promise<void>((resolveReady) => {
+          const deadline = Date.now() + 5_000;
+          const poll = () => {
+            if (existsSync(pidFile) || launcher.exitCode !== null || launcher.signalCode !== null || Date.now() >= deadline) {
+              resolveReady();
+            } else {
+              setTimeout(poll, 10);
+            }
+          };
+          poll();
+        });
+      }
+      expect(released, text).toBe(true);
       // The release line is written only after the launcher bound the live nono
       // session to the pid it spawned and to the pid the child reported, and only
       // after the child reported the OUTSIDE canary DENIED and its granted twin
@@ -212,18 +254,11 @@ real("4e positive — the attested launch against the pinned nono", () => {
       expect(text).not.toContain("READ the OUTSIDE canary");
       // The agent actually ran inside that session (the runtime writes its pid
       // file first thing).
-      const pidFile = join(sb.ws, ".tps-agent.pid");
-      expect(existsSync(pidFile)).toBe(true);
-      if (existsSync(pidFile)) {
-        const pid = Number.parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
-        try {
-          process.kill(pid, "SIGTERM");
-        } catch {
-          /* already gone */
-        }
-      }
+      expect(existsSync(pidFile), text).toBe(true);
     } finally {
+      const stopped = !child || await stopRealLaunch(child, text);
       rmSync(sb.root, { recursive: true, force: true });
+      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
     }
   });
 });
@@ -261,6 +296,7 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
         : ["-qec", cmd, "/dev/null"];
     const child = spawn("script", argv, {
       cwd: sb.ws,
+      detached: true,
       env: {
         ...process.env,
         HOME: sb.home,
@@ -269,35 +305,23 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
       },
     });
     let text = "";
-    const released = await new Promise<boolean>((resolvePromise) => {
-      const timer = setTimeout(() => resolvePromise(false), 60_000);
-      const onData = (chunk: Buffer) => {
-        text += chunk.toString("utf-8");
-        if (text.includes("released under nono session")) {
-          clearTimeout(timer);
-          resolvePromise(true);
-        }
-      };
-      child.stdout?.on("data", onData);
-      child.stderr?.on("data", onData);
-      child.on("exit", () => {
-        clearTimeout(timer);
-        resolvePromise(text.includes("released under nono session"));
-      });
-    });
-    // Stop the tree: the released agent is long-lived.
-    const pidFile = join(sb.ws, ".tps-agent.pid");
-    if (existsSync(pidFile)) {
-      try {
-        process.kill(Number.parseInt(readFileSync(pidFile, "utf-8").trim(), 10), "SIGTERM");
-      } catch {
-        /* already gone */
-      }
-    }
-    child.kill("SIGTERM");
-    await new Promise((r) => setTimeout(r, 500));
-    child.kill("SIGKILL");
     try {
+      const released = await new Promise<boolean>((resolvePromise) => {
+        const timer = setTimeout(() => resolvePromise(false), 60_000);
+        const onData = (chunk: Buffer) => {
+          text += chunk.toString("utf-8");
+          if (/released under nono session \S+ \(child pid \d+\)/.test(text)) {
+            clearTimeout(timer);
+            resolvePromise(true);
+          }
+        };
+        child.stdout?.on("data", onData);
+        child.stderr?.on("data", onData);
+        child.on("exit", () => {
+          clearTimeout(timer);
+          resolvePromise(/released under nono session \S+ \(child pid \d+\)/.test(text));
+        });
+      });
       // Pre-r4f the child skipped the handshake at a TTY and the launcher
       // refused at its window; with the locator keyed instead of the TTY, the
       // interactive path is RELEASED like the piped one.
@@ -305,7 +329,9 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
       expect(text).toContain("released under nono session");
       expect(text).not.toContain("no released child within");
     } finally {
+      const stopped = await stopRealLaunch(child, text);
       rmSync(sb.root, { recursive: true, force: true });
+      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
     }
   });
 });

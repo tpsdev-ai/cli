@@ -50,6 +50,7 @@ import { createHash } from "node:crypto";
 import { join, dirname, basename, isAbsolute, resolve, parse, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { worktreeLaunchBinding, worktreeLaunchGit, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { providerAuthPath, runtimeCredentialFiles, runtimeProviders, type CredentialRuntime } from "./runtime-credentials.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -275,12 +276,12 @@ export const BUN_TEMP_DIR = "/tmp";
  * cache, the running interpreter's own directory, plus the system roots. One
  * definition so `agent start` and `mail watch` cannot drift apart (cli#341 S1b).
  */
-export function harnessReadPaths(): string[] {
+export function harnessReadPaths(home: string = homedir()): string[] {
   // NOTE: no identity directory here. The identity dir holds every agent's key
   // on a shared-UID host; granting it read would let one agent read all others.
   // The launch grants exactly the launching agent's own key via
   // harnessReadFiles(agentId) → --read-file (cli#351 r4).
-  return [join(homedir(), ".bun"), dirname(process.execPath), ...systemReadPaths()];
+  return [join(home, ".bun"), dirname(process.execPath), ...systemReadPaths()];
 }
 
 /**
@@ -288,13 +289,105 @@ export function harnessReadPaths(): string[] {
  * the public key beside it (the runtime resolves `~/.tps/identity/<id>.key`;
  * the `.pub` is granted too since it is the same agent's own material).
  */
-export function harnessReadFiles(agentId?: string): string[] {
+export function harnessReadFiles(agentId?: string, home: string = homedir()): string[] {
   const files = [...systemReadFiles()];
   if (agentId) {
-    const idDir = join(homedir(), ".tps", "identity");
+    const idDir = join(home, ".tps", "identity");
     files.push(join(idDir, `${agentId}.key`), join(idDir, `${agentId}.pub`));
   }
   return files;
+}
+
+export interface AgentLaunchGrantInput {
+  configPath: string;
+  cwd?: string;
+  workspace: string;
+  launchId: string;
+  runtime?: string;
+  /** The HOME the launch runs under; defaults to this process's. */
+  home?: string;
+  /** The environment runtime grants resolve against; defaults to process.env. */
+  env?: NodeJS.ProcessEnv;
+  mailDir: string;
+  tmpDir: string;
+  agentDir: string;
+}
+
+function agentLaunchGrants(
+  input: AgentLaunchGrantInput & { worktreeGit?: { gitDir: string; gitCommonDir: string } },
+): { read: string[]; readFiles: string[]; allowFiles: string[]; allow: string[] } {
+  const home = input.home ?? homedir();
+  const runtimeGrants = runtimeNonoOptions(input.runtime, input.env);
+  return {
+    read: [
+      ...new Set([
+        ...harnessReadPaths(home),
+        ...(input.worktreeGit ? [input.worktreeGit.gitCommonDir] : []),
+      ]),
+    ],
+    readFiles: [...harnessReadFiles(input.launchId, home), canonicalPath(input.configPath)],
+    allowFiles: runtimeGrants.allowFiles ?? [],
+    allow: [
+      ...new Set([
+        input.mailDir,
+        input.tmpDir,
+        BUN_TEMP_DIR,
+        input.workspace,
+        input.agentDir,
+        ...(runtimeGrants.allow ?? []),
+        ...(input.worktreeGit ? [input.worktreeGit.gitDir] : []),
+      ]),
+    ],
+  };
+}
+
+export class WorktreeGrantError extends Error {
+  constructor(path: string) {
+    super(`WorktreeGrantError: grant overlaps the base working tree: ${path}`);
+    this.name = "WorktreeGrantError";
+  }
+}
+
+export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typeof approveRuntimeNonoOptions> & { worktreeBinding: WorktreeLaunchBinding } {
+  const binding = worktreeLaunchBinding(input.workspace);
+  const worktreeGit = worktreeLaunchGit(binding);
+  // An unregistered worktree gets no metadata grants and must not inherit the
+  // caller's cwd as a writable grant: the sandbox's working directory is the
+  // workspace in both worktree cases.
+  const cwd = worktreeGit || binding.kind === "unregistered"
+    ? input.workspace
+    : input.cwd ?? process.cwd();
+  const grants = {
+    ...agentLaunchGrants({ ...input, worktreeGit }),
+    cwd,
+    workdir: input.workspace,
+  };
+  const approval = approveRuntimeNonoOptions(input.runtime, grants, input.env, input.launchId, input.configPath);
+  if (binding.kind === "none") return { ...approval, worktreeBinding: binding };
+  const options = approval.refusal ? grants : approval.options;
+  const base = canonicalPath(binding.baseWorkingTree);
+  const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
+  const allowedInsideBase = new Map<string, string>([
+    ["readFiles", compare(canonicalPath(input.configPath))],
+  ]);
+  if (worktreeGit) {
+    allowedInsideBase.set("read", compare(canonicalPath(worktreeGit.gitCommonDir)));
+    allowedInsideBase.set("allow", compare(canonicalPath(worktreeGit.gitDir)));
+  }
+  const check = (path: string, kind: string) => {
+    const canon = compare(canonicalPath(path));
+    if (canon !== compare(base) && allowedInsideBase.get(kind) === canon) return;
+    if (pathsOverlap(canon, compare(base))) throw new WorktreeGrantError(path);
+  };
+  for (const key of ["cwd", "workdir", "read", "allow", "readFiles", "allowFiles"] as const) {
+    const value = options[key];
+    for (const path of typeof value === "string" ? [value] : value ?? []) check(path, key);
+  }
+  for (const grant of sandboxProfileGrants(runtimeNonoProfile(input.runtime), input.env ?? process.env)) {
+    const kind = { read_file: "readFiles", allow_file: "allowFiles", write_file: "allowFiles", write: "allow" }[grant.kind] ?? grant.kind;
+    check(grant.path, kind);
+  }
+  return { ...approval, worktreeBinding: binding };
 }
 
 export function runtimeNonoProfile(runtime?: string): NonoProfile {
@@ -481,6 +574,7 @@ export function sandboxProfileGrantRefusal(
   env: NodeJS.ProcessEnv = process.env,
   runtime?: string,
   bin: string | undefined = env.NONO_BIN,
+  configSnapshotDir?: string,
 ): string | null {
   let grants: ProfileGrant[];
   try {
@@ -505,6 +599,9 @@ export function sandboxProfileGrantRefusal(
     for (const grant of grants) {
       const comparison = asComparison(canonicalPath(grant.path));
       const writable = ["allow", "write", "allow_file", "write_file"].includes(grant.kind);
+      if (writable && configSnapshotDir && pathsOverlap(comparison, asComparison(canonicalPath(configSnapshotDir)))) {
+        return `the sandbox profile '${profile}' grants write access to the config snapshot directory`;
+      }
       const profileDir = writable && profileDirs.find((d) => pathsOverlap(comparison, d.comparison));
       if (profileDir) {
         return `the sandbox profile '${profile}' grants filesystem.${grant.kind} '${grant.path}', which overlaps the sandbox profile directory ${profileDir.path}`;
@@ -611,7 +708,7 @@ function appendUnresolved(ancestor: string, tail: string[]): string {
   return join(ancestor, ...components);
 }
 
-function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
+export function canonicalPath(p: string, cwd: string = process.cwd(), links = 0): string {
   if (links > 40) throw new Error(`cannot resolve ${p}: too many symbolic links`);
   const inputRoot = parse(p).root;
   const base = sep === "\\" && inputRoot ? resolve(cwd, inputRoot) : cwd;
@@ -658,6 +755,7 @@ export function approveRuntimeNonoOptions(
   grants: NonoOptions,
   env: NodeJS.ProcessEnv = process.env,
   agentId?: string,
+  configPath?: string,
 ): { options: NonoOptions; runtimeDirectories: string[]; refusal: string | null } {
   const options: NonoOptions = {};
   const runtimeDirectories: string[] = [];
@@ -792,7 +890,7 @@ export function approveRuntimeNonoOptions(
       ? [...runtimeCredentialFiles(runtime as CredentialRuntime, env), ...(runtimeNonoOptions(runtime, env).allowFiles ?? [])]
       : [];
     const ownTargets = ownFiles.map((p) => join(canonical(dirname(resolve(p))), basename(p)));
-    const systemTargets = systemReadFiles().map(canonical);
+    const readOnlyTargets = [...systemReadFiles(), ...(configPath ? [configPath] : [])].map(canonical);
     const fileGrants = [
       ...(grants.readFiles ?? []).map((p) => ({ path: p, label: `the read-file grant '${p}'`, readOnly: true })),
       ...(grants.allowFiles ?? []).map((p) => ({ path: p, label: `the writable-file grant '${p}'`, readOnly: false })),
@@ -806,7 +904,7 @@ export function approveRuntimeNonoOptions(
       if (root && !permittedTpsFile) {
         return result(`${grant.label} (${canon}) overlaps the TPS credential root ${root.label} (${root.path})`);
       }
-      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && systemTargets.some((p) => equals(p, canon)))) {
+      if (!root && !ownTargets.some((p) => equals(p, canon)) && !(grant.readOnly && readOnlyTargets.some((p) => equals(p, canon)))) {
         return result(`${grant.label} (${canon}) is not a permitted file for runtime '${runtime}'`);
       }
     }
@@ -1212,6 +1310,17 @@ export interface ConfinementVerdict {
 }
 
 /**
+ * True when `flag` is one of tps's OWN arguments: it appears before the `--`
+ * that separates a wrapped payload (`--message`, `mail watch --exec`,
+ * secrets-guard's command) (cli#516). A `--sandboxed` inside a payload is not
+ * this process's flag, so it must not trip the `--sandboxed` gate.
+ */
+export function ownFlag(argv: readonly string[], flag: string): boolean {
+  const end = argv.indexOf("--");
+  return (end === -1 ? argv : argv.slice(0, end)).includes(flag);
+}
+
+/**
  * Commands that hand control to an agent. These are exactly the commands that
  * generated units invoke, and the ones that must assert `--sandbox-required`
  * when there is no TTY to ask.
@@ -1318,7 +1427,7 @@ export function evaluateLaunchControl(input: LaunchControlInput = {}): LaunchCon
   // spawned and to this pid, with enforcement verified behaviourally). The TTY
   // is irrelevant (cli#350 r4f): an un-released `--sandboxed` is refused
   // everywhere, because the interactive opt-out is `--no-sandbox`.
-  if (argv.includes(SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
+  if (ownFlag(argv, SANDBOXED_FLAG) && !(input.confinement?.released ?? false)) {
     const hint = nonoLaunchHint();
     return deny(
       `${SANDBOXED_FLAG} is refused: no launcher released this process` +
