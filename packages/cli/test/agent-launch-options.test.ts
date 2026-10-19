@@ -175,6 +175,55 @@ test("refuses a tmpDir inside the base working tree", () => fixture((input, base
   expect(() => agentLaunchOptions({ ...input, tmpDir })).toThrow(WorktreeGrantError);
 }));
 
+test("refuses TMPDIR at the registered Git common directory", () => fixture((input, base) => {
+  const previousTmpDir = process.env.TMPDIR;
+  try {
+    process.env.TMPDIR = realpathSync(join(base, ".git"));
+    expect(() => agentLaunchOptions({ ...input, tmpDir: process.env.TMPDIR || "/tmp" })).toThrow(WorktreeGrantError);
+  } finally {
+    if (previousTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpDir;
+  }
+}));
+
+for (const kind of ["allow", "write", "allow_file", "write_file"] as const) {
+  test(`refuses a profile ${kind} grant at the registered Git common directory`, () => fixture((input, base) => {
+    const profiles = join(input.home!, ".config", "nono", "profiles");
+    mkdirSync(profiles, { recursive: true });
+    writeFileSync(join(profiles, "tps-agent-run-codex.json"), JSON.stringify({ filesystem: { [kind]: [join(base, ".git")] } }));
+    expect(() => agentLaunchOptions(input)).toThrow(WorktreeGrantError);
+  }));
+}
+
+test("refuses a writable config snapshot grant inside the base", () => fixture((input, base) => {
+  const configPath = join(base, "snapshot.yaml");
+  writeFileSync(configPath, "agentId: probe\n");
+  expect(() => agentLaunchOptions({ ...input, configPath, tmpDir: configPath })).toThrow(WorktreeGrantError);
+}));
+
+for (const kind of ["allow", "write", "allow_file", "write_file"] as const) {
+  test(`refuses a profile ${kind} grant for the config snapshot inside the base`, () => fixture((input, base) => {
+    const configPath = join(base, "snapshot.yaml");
+    writeFileSync(configPath, "agentId: probe\n");
+    const profiles = join(input.home!, ".config", "nono", "profiles");
+    mkdirSync(profiles, { recursive: true });
+    writeFileSync(join(profiles, "tps-agent-run-codex.json"), JSON.stringify({ filesystem: { [kind]: [configPath] } }));
+    expect(() => agentLaunchOptions({ ...input, configPath })).toThrow(WorktreeGrantError);
+  }));
+}
+
+for (const kind of ["read", "read_file"] as const) {
+  test(`refuses a profile ${kind} grant at the registered Git directory`, () => fixture((input) => {
+    const binding = worktreeLaunchBinding(input.workspace);
+    expect(binding.kind).toBe("registered");
+    if (binding.kind !== "registered") throw new Error("expected registered worktree");
+    const profiles = join(input.home!, ".config", "nono", "profiles");
+    mkdirSync(profiles, { recursive: true });
+    writeFileSync(join(profiles, "tps-agent-run-codex.json"), JSON.stringify({ filesystem: { [kind]: [binding.gitDir] } }));
+    expect(() => agentLaunchOptions(input)).toThrow(WorktreeGrantError);
+  }));
+}
+
 test("refuses a grant beside the registered worktree metadata entry", () => fixture((input, base) => {
   const tmpDir = join(base, ".git", "worktrees", "ws-adjacent");
   mkdirSync(tmpDir);

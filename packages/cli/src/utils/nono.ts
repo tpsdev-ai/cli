@@ -367,20 +367,26 @@ export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typ
   const options = approval.refusal ? grants : approval.options;
   const base = canonicalPath(binding.baseWorkingTree);
   const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
-  const allowedInsideBase = new Set(
-    [input.configPath, ...(worktreeGit ? [worktreeGit.gitDir, worktreeGit.gitCommonDir] : [])]
-      .map((path) => compare(canonicalPath(path))),
-  );
-  const check = (path: string) => {
+  const allowedInsideBase = new Map<string, string>([
+    ["readFiles", compare(canonicalPath(input.configPath))],
+  ]);
+  if (worktreeGit) {
+    allowedInsideBase.set("read", compare(canonicalPath(worktreeGit.gitCommonDir)));
+    allowedInsideBase.set("allow", compare(canonicalPath(worktreeGit.gitDir)));
+  }
+  const check = (path: string, kind: string) => {
     const canon = compare(canonicalPath(path));
-    if (canon !== compare(base) && allowedInsideBase.has(canon)) return;
+    if (canon !== compare(base) && allowedInsideBase.get(kind) === canon) return;
     if (pathsOverlap(canon, compare(base))) throw new WorktreeGrantError(path);
   };
   for (const key of ["cwd", "workdir", "read", "allow", "readFiles", "allowFiles"] as const) {
     const value = options[key];
-    for (const path of typeof value === "string" ? [value] : value ?? []) check(path);
+    for (const path of typeof value === "string" ? [value] : value ?? []) check(path, key);
   }
-  for (const grant of sandboxProfileGrants(runtimeNonoProfile(input.runtime), input.env ?? process.env)) check(grant.path);
+  for (const grant of sandboxProfileGrants(runtimeNonoProfile(input.runtime), input.env ?? process.env)) {
+    const kind = { read_file: "readFiles", allow_file: "allowFiles", write_file: "allowFiles", write: "allow" }[grant.kind] ?? grant.kind;
+    check(grant.path, kind);
+  }
   return { ...approval, worktreeBinding: binding };
 }
 
