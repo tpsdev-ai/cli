@@ -1,10 +1,48 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { onStart, onStop, worktreeLaunchBinding, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { agentLaunchOptions, approveRuntimeNonoOptions, buildNonoArgs, WorktreeGrantError, type AgentLaunchGrantInput } from "../src/utils/nono.js";
 import { sandboxHomeBase } from "./helpers/launcher-grants.js";
+
+function detectRelativeWorktreesSupport(): boolean {
+  const root = mkdtempSync(join(tmpdir(), "relativeworktrees-probe-"));
+  try {
+    const git = (args: string[]) => spawnSync("git", args, { cwd: root, encoding: "utf8" });
+    const initialized = git(["init", "-q"]);
+    expect(initialized.status, initialized.stderr).toBe(0);
+    const baseline = git(["rev-parse", "--is-inside-work-tree"]);
+    expect(baseline.status, baseline.stderr).toBe(0);
+    expect(baseline.stdout.trim()).toBe("true");
+    writeFileSync(join(root, ".git", "config"), "[core]\nrepositoryformatversion = 1\n[extensions]\nrelativeworktrees = true\n");
+    const probe = git(["rev-parse", "--is-inside-work-tree"]);
+    if (probe.status === 0) {
+      expect(probe.stdout.trim()).toBe("true");
+      return true;
+    }
+    expect(probe.status).not.toBeNull();
+    expect(probe.stderr).toContain("unknown repository extension");
+    expect(probe.stderr).toContain("relativeworktrees");
+    return false;
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+const supportsRelativeWorktrees = detectRelativeWorktreesSupport();
+const relativeWorktreesLabel = `relativeworktrees ${supportsRelativeWorktrees ? "supported" : "unsupported"}`;
+
+test(`real Git extension probe agrees with git version (${relativeWorktreesLabel})`, () => {
+  const version = spawnSync("git", ["version"], { encoding: "utf8" });
+  expect(version.status, version.stderr).toBe(0);
+  const parsed = /^git version (\d+)\.(\d+)(?:\.|\s|$)/.exec(version.stdout);
+  expect(parsed).not.toBeNull();
+  const major = Number(parsed![1]);
+  const minor = Number(parsed![2]);
+  expect(supportsRelativeWorktrees).toBe(major > 2 || (major === 2 && minor >= 48));
+});
 
 function fixture(run: (input: AgentLaunchGrantInput, base: string, root: string) => void): void {
   const root = realpathSync(mkdtempSync(join(sandboxHomeBase(), "launch-options-")));
@@ -354,7 +392,7 @@ test("a dangling workspace symlink to a registered target is refused before gran
 
 for (const layout of ["absolute", "relative"] as const) {
   for (const marker of ["absolute", "relative"] as const) {
-    test(`a ${layout} registry gitdir binds launch metadata and preserves an existing worktree (${marker} marker)`, () => fixture((input, base, root) => {
+    test(`a ${layout} registry gitdir ${layout === "relative" && !supportsRelativeWorktrees ? "is refused by the base repository probe" : "binds launch metadata and preserves an existing worktree"} (${marker} marker; ${relativeWorktreesLabel})`, () => fixture((input, base, root) => {
       const workspace = join(root, "relative-worktree");
       const created = onStart("probe", workspace, { deferCheckout: true });
       expect(created.changed).toBe(true);
@@ -387,6 +425,24 @@ for (const layout of ["absolute", "relative"] as const) {
       const oldPath = process.env.PATH;
       try {
         process.env.PATH = `${bin}:${oldPath}`;
+        if (layout === "relative" && !supportsRelativeWorktrees) {
+          for (const operation of [
+            () => worktreeLaunchBinding(workspace),
+            () => agentLaunchOptions({ ...input, workspace, cwd: base }),
+            () => onStart("probe", workspace, { deferCheckout: true }),
+            () => onStop("probe", workspace),
+          ]) {
+            expect(operation).toThrow(WorktreeLifecycleError);
+            expect(operation).toThrow("git probe failed for the base repository");
+          }
+          expect(readFileSync(join(workspace, ".git"), "utf8")).toBe(gitfile);
+          expect(readFileSync(recordedPath, "utf8")).toBe(recorded);
+          expect(existsSync(join(gitDir, "index"))).toBe(false);
+          expect(existsSync(listed)).toBe(false);
+          expect(existsSync(workspace)).toBe(true);
+          expect(existsSync(gitDir)).toBe(true);
+          return;
+        }
         const gitCommonDir = realpathSync(join(base, ".git"));
         expect(worktreeLaunchBinding(workspace)).toEqual({ kind: "registered", gitDir, gitCommonDir, baseWorkingTree: base });
         const result = agentLaunchOptions({ ...input, workspace, cwd: base });
@@ -415,7 +471,7 @@ for (const layout of ["absolute", "relative"] as const) {
 }
 
 for (const config of ["absent", "false", "format-zero"] as const) {
-  test(`relative registry gitdir with ${config} extension config is a named lifecycle error`, () => fixture((input, base) => {
+  test(`relative registry gitdir with ${config} extension config is a named lifecycle error (${relativeWorktreesLabel})`, () => fixture((input, base) => {
     const metadata = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: input.workspace, encoding: "utf8" });
     expect(metadata.status, metadata.stderr).toBe(0);
     const gitDir = realpathSync(metadata.stdout.trim());
@@ -435,7 +491,7 @@ for (const config of ["absent", "false", "format-zero"] as const) {
       () => onStop("probe", input.workspace),
     ]) {
       expect(operation).toThrow(WorktreeLifecycleError);
-      expect(operation).toThrow(config === "format-zero"
+      expect(operation).toThrow((supportsRelativeWorktrees ? config === "format-zero" : config === "false")
         ? "git probe failed for the base repository"
         : "relative gitdir requires extensions.relativeworktrees=true and core.repositoryformatversion >= 1");
     }
