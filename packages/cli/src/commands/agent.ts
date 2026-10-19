@@ -1170,6 +1170,10 @@ async function runAgentCommand(
 
       const config = loadAgentConfig(configPath);
       config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
+      if (snapshot) {
+        const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
+        writeFileSync(configPath, yaml.dump({ ...document, workspace: config.workspace }, { lineWidth: -1 }));
+      }
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
       // workload can rewrite (`agentDir` is granted r+w, so the agent can edit

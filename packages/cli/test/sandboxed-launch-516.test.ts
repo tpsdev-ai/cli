@@ -343,13 +343,15 @@ describe("cli#516 (1) — the attested re-exec uses a config snapshot", () => {
   });
 });
 
-test("config parsing, re-exec and read-file grant use the private snapshot", () => {
+test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace grant resolve %s against the original config directory", (configuredWorkspace) => {
   const sb = makeSandbox();
   try {
+    const workspace = resolve(sb.run, configuredWorkspace);
+    mkdirSync(workspace, { recursive: true });
     const target = join(sb.run, "agent.yaml");
     const alternate = join(sb.root, "alternate.yaml");
     const link = join(sb.run, "config.yaml");
-    writeFileSync(target, agentYaml(sb, "../ws"));
+    writeFileSync(target, agentYaml(sb, configuredWorkspace));
     writeFileSync(alternate, agentYaml(sb, sb.run));
     symlinkSync(target, link);
     installFakeNono(sb, "  :");
@@ -395,7 +397,7 @@ test("config parsing, re-exec and read-file grant use the private snapshot", () 
             owner: statSync(dirname(path)).uid, uid: process.getuid(),
           }));
           const child = spawnSync('bun', ['--preload', ${JSON.stringify(preload)}, ${JSON.stringify(TPS_BIN)}, ...cmd.slice(cmd.indexOf('agent'))], {
-            encoding: 'utf8', cwd: options.cwd ?? process.cwd(), env: { ...opts.env, TPS_LAUNCH_SOCK: 'fixture' },
+            encoding: 'utf8', cwd: options.cwd ?? process.cwd(), env: { ...opts.env, TPS_AGENT_WORKSPACE: undefined, TPS_LAUNCH_SOCK: 'fixture' },
           });
           process.stdout.write(child.stdout); process.stderr.write(child.stderr);
           return child.status ?? 1;
@@ -415,10 +417,13 @@ test("config parsing, re-exec and read-file grant use the private snapshot", () 
     const snapshot = lines.find((line) => line.startsWith("SNAPSHOT "))?.slice(9);
     expect(snapshot, output(result)).toBeDefined();
     const parsed = lines.filter((line) => line.startsWith("PARSED ")).map((line) => JSON.parse(line.slice(7)));
-    expect(parsed).toEqual([{ path: snapshot, workspace: "../ws" }, { path: snapshot, workspace: "../ws" }]);
+    expect(parsed).toEqual([{ path: snapshot, workspace: configuredWorkspace }, { path: snapshot, workspace }]);
     const launch = JSON.parse(lines.find((line) => line.startsWith("LAUNCH "))!.slice(7));
     expect(launch.path).toBe(snapshot);
-    expect(launch.content).toBe(agentYaml(sb, "../ws"));
+    expect(launch.options.workdir).toBe(canonicalPath(workspace));
+    expect(launch.content).toBe(agentYaml(sb, workspace));
+    expect(launch.options.allow).toContain(canonicalPath(workspace));
+    expect(launch.options.allow).not.toContain(resolve(dirname(snapshot!), configuredWorkspace));
     expect(launch.fileMode).toBe(0o600);
     expect(launch.dirMode).toBe(0o700);
     expect(launch.owner).toBe(launch.uid);
@@ -434,7 +439,7 @@ test("config parsing, re-exec and read-file grant use the private snapshot", () 
     expect(grants).not.toContain(target);
     expect(grants).not.toContain(alternate);
     expect(grants).not.toContain(link);
-    expect(lines).toContain(`WORKSPACE ${sb.ws}`);
+    expect(lines).toContain(`WORKSPACE ${workspace}`);
     expect(existsSync(snapshot!)).toBe(false);
     expect(existsSync(dirname(snapshot!))).toBe(false);
   } finally {

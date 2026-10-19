@@ -170,9 +170,6 @@ real("4e positive — the attested launch against the pinned nono", () => {
   test("tps agent start is RELEASED: real nono, canaries verified, session bound to the spawned pid", async () => {
     const sb = sandbox();
     try {
-      // Spawned ASYNC: once released, the agent runtime keeps running (it is a
-      // long-lived process), so the fixture reads the launch output until the
-      // release line appears and then stops the tree.
       const child = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
         cwd: sb.ws,
         env: {
@@ -182,6 +179,7 @@ real("4e positive — the attested launch against the pinned nono", () => {
           TPS_LAUNCH_TIMEOUT_MS: "20000",
         },
       });
+      const pidFile = join(sb.ws, ".tps-agent.pid");
       let text = "";
       const released = await new Promise<boolean>((resolvePromise) => {
         const timer = setTimeout(() => resolvePromise(false), 45_000);
@@ -199,10 +197,23 @@ real("4e positive — the attested launch against the pinned nono", () => {
           resolvePromise(text.includes("released under nono session"));
         });
       });
+      if (released) {
+        await new Promise<void>((resolveReady) => {
+          const deadline = Date.now() + 5_000;
+          const poll = () => {
+            if (existsSync(pidFile) || child.exitCode !== null || child.signalCode !== null || Date.now() >= deadline) {
+              resolveReady();
+            } else {
+              setTimeout(poll, 10);
+            }
+          };
+          poll();
+        });
+      }
       child.kill("SIGTERM");
       await new Promise((r) => setTimeout(r, 500));
       child.kill("SIGKILL");
-      expect(released).toBe(true);
+      expect(released, text).toBe(true);
       // The release line is written only after the launcher bound the live nono
       // session to the pid it spawned and to the pid the child reported, and only
       // after the child reported the OUTSIDE canary DENIED and its granted twin
@@ -212,8 +223,7 @@ real("4e positive — the attested launch against the pinned nono", () => {
       expect(text).not.toContain("READ the OUTSIDE canary");
       // The agent actually ran inside that session (the runtime writes its pid
       // file first thing).
-      const pidFile = join(sb.ws, ".tps-agent.pid");
-      expect(existsSync(pidFile)).toBe(true);
+      expect(existsSync(pidFile), text).toBe(true);
       if (existsSync(pidFile)) {
         const pid = Number.parseInt(readFileSync(pidFile, "utf-8").trim(), 10);
         try {
