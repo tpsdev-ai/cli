@@ -158,6 +158,49 @@ test("refuses a base grant declared by the selected profile", () => fixture((inp
   expect(() => agentLaunchOptions(input)).toThrow(WorktreeGrantError);
 }));
 
+test("refuses a profile read grant for a base subdirectory", () => fixture((input, base) => {
+  const source = join(base, "src");
+  mkdirSync(source);
+  writeFileSync(join(source, "index.ts"), "export {};\n");
+  const profiles = join(input.home!, ".config", "nono", "profiles");
+  mkdirSync(profiles, { recursive: true });
+  writeFileSync(join(profiles, "tps-agent-run-codex.json"), JSON.stringify({ filesystem: { read: [source] } }));
+  expect(() => agentLaunchOptions(input)).toThrow(WorktreeGrantError);
+  expect(() => agentLaunchOptions(input)).toThrow(`grant overlaps the base working tree: ${source}`);
+}));
+
+test("refuses a tmpDir inside the base working tree", () => fixture((input, base) => {
+  const tmpDir = join(base, "tmp");
+  mkdirSync(tmpDir);
+  expect(() => agentLaunchOptions({ ...input, tmpDir })).toThrow(WorktreeGrantError);
+}));
+
+test("refuses a grant beside the registered worktree metadata entry", () => fixture((input, base) => {
+  const tmpDir = join(base, ".git", "worktrees", "ws-adjacent");
+  mkdirSync(tmpDir);
+  writeFileSync(join(tmpDir, "gitdir"), `${join(base, "adjacent-workspace", ".git")}\n`);
+  expect(() => agentLaunchOptions({ ...input, tmpDir })).toThrow(WorktreeGrantError);
+}));
+
+test("launch grants retain the bound metadata paths and config snapshot file", () => fixture((input, base) => {
+  const configPath = join(base, "snapshot.yaml");
+  writeFileSync(configPath, "agentId: probe\n");
+  const binding = worktreeLaunchBinding(input.workspace);
+  expect(binding.kind).toBe("registered");
+  if (binding.kind !== "registered") throw new Error("expected registered worktree");
+  expect(binding.gitDir).toBe(realpathSync(join(base, ".git", "worktrees", "ws")));
+  expect(binding.gitCommonDir).toBe(realpathSync(join(base, ".git")));
+  const result = agentLaunchOptions({ ...input, configPath });
+  expect(result.refusal).toBeNull();
+  expect(result.options.allow).toContain(binding.gitDir);
+  expect(result.options.read).toContain(binding.gitCommonDir);
+  expect(result.options.readFiles).toContain(realpathSync(configPath));
+  const args = buildNonoArgs("tps-agent-run-codex", result.options, ["payload"], input.env);
+  expect(args[args.indexOf(binding.gitDir) - 1]).toBe("--allow");
+  expect(args[args.indexOf(binding.gitCommonDir) - 1]).toBe("--read");
+  expect(args[args.indexOf(realpathSync(configPath)) - 1]).toBe("--read-file");
+}));
+
 test("an existing worktree omits the base from explicit launch grants without a selected runtime", () => fixture((input, base) => {
   const result = agentLaunchOptions({ ...input, runtime: undefined, cwd: base });
   expect(result.refusal).toBeNull();

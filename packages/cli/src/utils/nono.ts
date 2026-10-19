@@ -343,7 +343,7 @@ function agentLaunchGrants(
 
 export class WorktreeGrantError extends Error {
   constructor(path: string) {
-    super(`WorktreeGrantError: grant contains the base working tree: ${path}`);
+    super(`WorktreeGrantError: grant overlaps the base working tree: ${path}`);
     this.name = "WorktreeGrantError";
   }
 }
@@ -367,8 +367,14 @@ export function agentLaunchOptions(input: AgentLaunchGrantInput): ReturnType<typ
   const options = approval.refusal ? grants : approval.options;
   const base = canonicalPath(binding.baseWorkingTree);
   const compare = (p: string) => caseInsensitivePath(p) ? p.toLowerCase() : p;
+  const allowedInsideBase = new Set(
+    [input.configPath, ...(worktreeGit ? [worktreeGit.gitDir, worktreeGit.gitCommonDir] : [])]
+      .map((path) => compare(canonicalPath(path))),
+  );
   const check = (path: string) => {
-    if (pathContainsOrEquals(compare(canonicalPath(path)), compare(base))) throw new WorktreeGrantError(path);
+    const canon = compare(canonicalPath(path));
+    if (canon !== compare(base) && allowedInsideBase.has(canon)) return;
+    if (pathsOverlap(canon, compare(base))) throw new WorktreeGrantError(path);
   };
   for (const key of ["cwd", "workdir", "read", "allow", "readFiles", "allowFiles"] as const) {
     const value = options[key];
