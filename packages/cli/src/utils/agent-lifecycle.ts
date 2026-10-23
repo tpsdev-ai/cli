@@ -11,6 +11,7 @@
 
 import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
@@ -243,7 +244,59 @@ export interface WorktreeCleanupBinding {
   gitCommonDir: string;
   registryEntry: string;
   recordedGitdir: string;
+  /** Nonce written to the worktree's admin git directory; teardown refuses a null marker. */
+  ownerMarker: string | null;
 }
+
+/**
+ * Facts that identify the worktree a launch created, read after the ownership
+ * marker is written. They support the marker check: a different worktree
+ * placed at the same path usually differs in git directory, registry entry or
+ * HEAD, but a detached worktree at the same commit can reproduce every one of
+ * them, so the marker is what decides ownership.
+ */
+export interface WorktreeIdentity {
+  /** Canonical path of the worktree directory. */
+  workspace: string;
+  /** The worktree's admin git directory, named by its `.git` file. */
+  gitDir: string;
+  /** The base repository's common git directory. */
+  gitCommonDir: string;
+  /** `<gitDir>/gitdir`, which records the worktree's `.git` path. */
+  registryEntry: string;
+  /** Contents of `registryEntry` when the worktree was created. */
+  recordedGitdir: string;
+  /** The commit HEAD named when the worktree was created. */
+  head: string;
+  /** The ref HEAD named, or null when HEAD was detached. */
+  headRef: string | null;
+}
+
+/**
+ * The worktree entry this call created, recorded immediately after
+ * `git worktree add` succeeds. `onStart` attempts to write an ownership marker
+ * into the worktree's admin git directory and reports this record through
+ * `onCreated` before it reads the identity facts, so the caller has a record
+ * for a failure after the add, including a marker that could not be written.
+ * The setup-failure cleanup attempts removal when the admin directory still
+ * holds the recorded marker and any recorded identity facts still match; the
+ * removal itself can fail, and a missing or different marker is refused with
+ * the manual command. The add is detached, so no
+ * branch is created and none is removed by the cleanup.
+ */
+export interface WorktreeCreation {
+  workspace: string;
+  baseWorkingTree: string;
+  /** Random nonce written to the worktree's admin git directory, or null when that write failed; cleanup refuses a null marker. */
+  ownerMarker: string | null;
+  /** Read after `onCreated`; absent when that read failed, and the marker alone then decides cleanup. */
+  identity?: WorktreeIdentity;
+  /** Set once this worktree has been removed; a second cleanup attempt is skipped. */
+  removed?: boolean;
+}
+
+/** Marker file written with exclusive create in a created worktree's admin git directory. */
+const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
 
 /**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
@@ -505,12 +558,22 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  *
  * With `deferCheckout: true`, setup disables hooks and fsmonitor and skips checkout.
  *
+ * `onCreated` receives the worktree record after the add, whether or not the
+ * ownership marker was written, before the identity facts are read. A marker
+ * that cannot be written is a setup failure, so `onStart` throws instead of
+ * returning a binding. If a later step throws, `onStart` attempts to remove
+ * the worktree it created when the recorded marker and any recorded identity
+ * facts still match, and otherwise the cleanup refuses. A refusal prints the
+ * manual command; a failed Git removal prints Git's error and the manual
+ * command. The record's `removed`
+ * flag says whether that cleanup succeeded, so a caller can retry once.
+ *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
 export function onStart(
   agentId: string,
   workspacePath?: string,
-  opts: { deferCheckout?: boolean } = {},
+  opts: { deferCheckout?: boolean; onCreated?: (creation: WorktreeCreation) => void } = {},
 ): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
@@ -560,8 +623,29 @@ export function onStart(
     );
   }
 
-  const rollback = () => git(baseRepo, ["worktree", "remove", "--force", workspace]);
+  // Mark the worktree before any other step: a replacement removed and
+  // re-added at the same path gets a fresh admin directory, so it does not
+  // carry this nonce (cli#660). Report the record before the identity read,
+  // so a failure in that read still leaves the caller a record to clean up.
+  const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo, ownerMarker: null };
   try {
+    let markerError: Error | undefined;
+    try {
+      const nonce = randomUUID();
+      writeFileSync(join(worktreeAdminDir(workspace), OWNERSHIP_MARKER_NAME), nonce, { flag: "wx" });
+      created.ownerMarker = nonce;
+    } catch (err) {
+      markerError = err as Error;
+    }
+    opts.onCreated?.(created);
+    // A worktree this launch cannot mark is a setup failure, never a
+    // successful binding: cleanup from the record refuses to remove it.
+    if (markerError) {
+      throw new WorktreeLifecycleError(
+        `worktree ownership marker could not be written for ${workspace}: ${markerError.message}`,
+      );
+    }
+    created.identity = recordWorktreeIdentity(workspace, baseRepo);
     const metadata = worktreeGitMetadata(workspace, baseRepo);
     const registryEntry = join(metadata.gitDir, "gitdir");
     return {
@@ -573,16 +657,239 @@ export function onStart(
         workspace: realpathSync(workspace),
         registryEntry,
         recordedGitdir: readFileSync(registryEntry, "utf-8"),
+        ownerMarker: created.ownerMarker,
       },
     };
   } catch (err) {
-    const removed = rollback();
-    if (!removed.ok) {
-      throw new WorktreeLifecycleError(`${(err as Error).message}; worktree cleanup failed: ${removed.stderr || removed.stdout}`);
+    const removal = tryRemoveCreatedWorktree(created);
+    if (!removal.ok) {
+      throw new WorktreeLifecycleError(
+        removal.refused
+          ? `${(err as Error).message}; worktree cleanup refused for ${created.workspace}: ${removal.detail}`
+          : `${(err as Error).message}; worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+      );
     }
     if (err instanceof WorktreeLifecycleError) throw err;
     throw new WorktreeLifecycleError(`worktree setup binding failed for ${workspace}: ${(err as Error).message}`);
   }
+}
+
+/** The admin git directory named by the worktree's own `.git` file. */
+function worktreeAdminDir(workspace: string): string {
+  const marker = readFileSync(join(workspace, ".git"), "utf-8").trim();
+  if (!marker.startsWith("gitdir: ")) {
+    throw new Error("the worktree .git file does not name a git directory");
+  }
+  return realpathSync(resolve(workspace, marker.slice("gitdir: ".length)));
+}
+
+/**
+ * The reason the worktree at the recorded path is not the one this call
+ * marked, or null when its admin directory still holds the exact nonce. A
+ * marker that is absent or cannot be read is a mismatch, never a match.
+ */
+function createdWorktreeOwnershipError(created: WorktreeCreation): string | null {
+  if (created.ownerMarker === null) return "the worktree ownership marker was not recorded";
+  try {
+    const gitDir = worktreeAdminDir(created.workspace);
+    const recorded = readFileSync(join(gitDir, OWNERSHIP_MARKER_NAME));
+    if (!recorded.equals(Buffer.from(created.ownerMarker, "utf-8"))) {
+      return `the worktree ownership marker changed in ${gitDir}`;
+    }
+  } catch (err) {
+    return `the worktree ownership marker could not be read: ${(err as Error).message}`;
+  }
+  return null;
+}
+
+/** POSIX single-quote a path, including any embedded single quote. */
+function shellQuote(value: string): string {
+  return `'${value.split("'").join(`'\\''`)}'`;
+}
+
+/** The manual `git worktree remove --force` command, with both paths POSIX-quoted. */
+function manualRemovalCommand(target: { baseWorkingTree: string; workspace: string }): string {
+  return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
+}
+
+/**
+ * Read the facts that identify the worktree `git worktree add` just created.
+ * Throws when any of them cannot be read, so an unrecorded identity is never
+ * read as a verified one.
+ */
+function recordWorktreeIdentity(workspace: string, baseWorkingTree: string): WorktreeIdentity {
+  try {
+    const marker = readFileSync(join(workspace, ".git"), "utf-8").trim();
+    if (!marker.startsWith("gitdir: ")) {
+      throw new Error("the worktree .git file does not name a git directory");
+    }
+    const gitDir = realpathSync(resolve(workspace, marker.slice("gitdir: ".length)));
+    const registryEntry = join(gitDir, "gitdir");
+    const recordedGitdir = readFileSync(registryEntry, "utf-8");
+    const common = git(baseWorkingTree, ["rev-parse", "--git-common-dir"]);
+    if (!common.ok || !common.stdout) {
+      throw new Error(common.stderr || common.stdout || "git rev-parse produced no output");
+    }
+    const gitCommonDir = realpathSync(resolve(baseWorkingTree, common.stdout));
+    if (realpathSync(worktreeCommonDir(gitDir)) !== gitCommonDir) {
+      throw new Error("the worktree metadata does not belong to the base repository");
+    }
+    const head = git(workspace, ["rev-parse", "HEAD"]);
+    if (!head.ok || !head.stdout) {
+      throw new Error(head.stderr || head.stdout || "git rev-parse produced no output");
+    }
+    const headRef = readHeadRef(workspace);
+    if (headRef === undefined) throw new Error("git symbolic-ref produced no ref state");
+    return {
+      workspace: comparablePath(workspace),
+      gitDir,
+      gitCommonDir,
+      registryEntry,
+      recordedGitdir,
+      head: head.stdout,
+      headRef,
+    };
+  } catch (err) {
+    if (err instanceof WorktreeLifecycleError) throw err;
+    throw new WorktreeLifecycleError(
+      `worktree identity could not be recorded for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+}
+
+/** HEAD's symbolic ref, null when detached. A failed read is undefined, never detached. */
+function readHeadRef(workspace: string): string | null | undefined {
+  const ref = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], {
+    cwd: workspace,
+    encoding: "utf-8",
+    env: gitEnv(),
+  });
+  if (ref.status === 0) return ref.stdout.trim();
+  if (ref.status === 1) return null;
+  return undefined;
+}
+
+/**
+ * The first recorded identity fact that no longer matches the worktree at the
+ * recorded path, or null when every fact still matches. A fact that cannot be
+ * read is reported as a mismatch, never as a match.
+ */
+function createdWorktreeIdentityError(created: WorktreeCreation): string | null {
+  const identity = created.identity;
+  if (!identity) return "the worktree identity was not recorded";
+  try {
+    if (comparablePath(created.workspace) !== identity.workspace) {
+      return "the worktree path changed";
+    }
+    const marker = readFileSync(join(created.workspace, ".git"), "utf-8").trim();
+    if (!marker.startsWith("gitdir: ")) return "the worktree .git file does not name a git directory";
+    const gitDir = realpathSync(resolve(created.workspace, marker.slice("gitdir: ".length)));
+    if (gitDir !== identity.gitDir) return `the worktree git directory changed (${gitDir})`;
+    if (readFileSync(identity.registryEntry, "utf-8") !== identity.recordedGitdir) {
+      return "the worktree registry entry changed";
+    }
+    if (realpathSync(worktreeCommonDir(identity.gitDir)) !== identity.gitCommonDir) {
+      return "the common git directory changed";
+    }
+    const head = git(created.workspace, ["rev-parse", "HEAD"]);
+    if (!head.ok || !head.stdout) {
+      return `the worktree HEAD could not be read: ${head.stderr || head.stdout || "git produced no output"}`;
+    }
+    if (head.stdout !== identity.head) return `the worktree HEAD changed (${head.stdout})`;
+    const headRef = readHeadRef(created.workspace);
+    if (headRef === undefined) return "the worktree HEAD ref could not be read";
+    if (headRef !== identity.headRef) {
+      return `the worktree HEAD ref changed (${headRef ?? "detached"})`;
+    }
+  } catch (err) {
+    return (err as Error).message;
+  }
+  return null;
+}
+
+function tryRemoveCreatedWorktree(
+  created: WorktreeCreation,
+): { ok: true } | { ok: false; detail: string; refused?: boolean } {
+  // The marker decides ownership. The identity facts are supporting checks,
+  // used when they were recorded: a detached replacement at the same commit
+  // reproduces all of them, so they cannot refuse on their own.
+  const ownershipError = createdWorktreeOwnershipError(created);
+  if (ownershipError) {
+    return { ok: false, refused: true, detail: `${ownershipError}; remove it manually with: ${manualRemovalCommand(created)}` };
+  }
+  const identityError = created.identity ? createdWorktreeIdentityError(created) : null;
+  if (identityError) {
+    return { ok: false, refused: true, detail: `${identityError}; remove it manually with: ${manualRemovalCommand(created)}` };
+  }
+  const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
+  if (!remove.ok) {
+    return {
+      ok: false,
+      detail: `${remove.stderr || remove.stdout || "git produced no output"}; remove it manually with: ${manualRemovalCommand(created)}`,
+    };
+  }
+  created.removed = true;
+  return { ok: true };
+}
+
+/** True when the recorded base repository still lists `workspace` as one of
+ *  its worktrees. A failed listing is an error, never "not registered". */
+function worktreeRegisteredAt(baseWorkingTree: string, workspace: string): boolean {
+  const listed = git(baseWorkingTree, ["worktree", "list", "--porcelain"]);
+  if (!listed.ok) {
+    throw new WorktreeLifecycleError(
+      `worktree registration could not be read for ${workspace}: ${listed.stderr || listed.stdout || "git produced no output"}`,
+    );
+  }
+  const target = comparablePath(workspace);
+  for (const line of listed.stdout.split("\n")) {
+    if (line.startsWith("worktree ") && comparablePath(line.slice("worktree ".length)) === target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function comparablePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+/**
+ * Remove the worktree a launch created, by the record taken at creation time.
+ * A record already marked removed is skipped without a Git call, and a path
+ * the recorded base no longer registers as its worktree is refused with
+ * guidance to inspect it, not a Git command. Removal requires the admin
+ * directory named by the worktree's `.git` file to hold the recorded marker,
+ * and any recorded identity facts to still match; a missing or different
+ * marker is refused with the manual command. A worktree swapped in between that check
+ * and the remove call is not covered: the verify-to-remove race is deferred
+ * and filed separately. Throws `WorktreeLifecycleError` naming the path when
+ * removal fails; a failed Git removal also carries Git's error and the manual
+ * command.
+ */
+export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
+  if (created.removed) {
+    return { changed: false, reason: "worktree already removed" };
+  }
+  if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
+    throw new WorktreeLifecycleError(
+      `worktree cleanup refused for ${created.workspace}: ${created.workspace} is no longer a registered worktree of ` +
+        `${created.baseWorkingTree}; inspect it and remove it yourself if it is yours`,
+    );
+  }
+  const removal = tryRemoveCreatedWorktree(created);
+  if (!removal.ok) {
+    throw new WorktreeLifecycleError(
+      removal.refused
+        ? `worktree cleanup refused for ${created.workspace}: ${removal.detail}`
+        : `worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+    );
+  }
+  return { changed: true, reason: "worktree removed" };
 }
 
 function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } {
@@ -666,11 +973,22 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
         `git probe failed for the base repository ${binding.baseWorkingTree}: ${probe.kind === "error" ? probe.detail : "base repository is absent"}`,
       );
     }
+    // The nonce decides ownership on this route. HEAD is not compared: the
+    // runtime may move it during the run. A mismatch in the remaining facts
+    // makes cleanup refuse; the registry entry can be rewritten while the
+    // worktree exists.
     try {
+      if (binding.ownerMarker === null) throw new Error("the worktree ownership marker was not recorded");
+      const gitDir = worktreeAdminDir(binding.workspace);
+      const recorded = readFileSync(join(gitDir, OWNERSHIP_MARKER_NAME));
+      if (!recorded.equals(Buffer.from(binding.ownerMarker, "utf-8"))) {
+        throw new Error(`the worktree ownership marker changed in ${gitDir}`);
+      }
       const marker = readFileSync(join(binding.workspace, ".git"), "utf-8").trim();
       if (
         realpathSync(binding.workspace) !== binding.workspace ||
         realpathSync(binding.gitDir) !== binding.gitDir ||
+        gitDir !== binding.gitDir ||
         readFileSync(binding.registryEntry, "utf-8") !== binding.recordedGitdir ||
         !marker.startsWith("gitdir: ") ||
         realpathSync(resolve(binding.workspace, marker.slice("gitdir: ".length))) !== binding.gitDir ||
@@ -679,12 +997,15 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
         throw new Error("setup binding changed");
       }
     } catch (err) {
-      throw new WorktreeLifecycleError(`worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}`);
+      throw new WorktreeLifecycleError(
+        `worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}; remove it manually with: ${manualRemovalCommand(binding)}`,
+      );
     }
     const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
     if (!remove.ok) {
       throw new WorktreeLifecycleError(
-        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}`,
+        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}; ` +
+          `remove it manually with: ${manualRemovalCommand(binding)}`,
       );
     }
     return { changed: true, reason: "worktree removed" };

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadAgentConfig } from "../src/config.js";
 
@@ -63,5 +63,88 @@ describe("agent config env interpolation", () => {
     );
 
     expect(() => loadAgentConfig(cfg)).toThrow("Missing environment variable: MISSING_API_KEY");
+  });
+
+  test("resolves a relative workspace against the config directory", () => {
+    const configDir = join(dir, "config");
+    mkdirSync(configDir);
+    const cfg = join(configDir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: worktree\n", "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    const workspace = join(configDir, "worktree");
+    expect(parsed.workspace).toBe(workspace);
+    expect(isAbsolute(parsed.workspace)).toBe(true);
+    expect(parsed.mailDir).toBe(join(workspace, "mail"));
+    expect(parsed.memoryPath).toBe(join(workspace, ".openclaw", "agent.memory.jsonl"));
+  });
+
+  test("normalizes an absolute workspace before deriving the default paths", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, `agentId: probe\nworkspace: ${dir}/elsewhere/../other\n`, "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    expect(parsed.workspace).toBe(join(dir, "other"));
+    expect(parsed.mailDir).toBe(join(dir, "other", "mail"));
+    expect(parsed.memoryPath).toBe(join(dir, "other", ".openclaw", "agent.memory.jsonl"));
+  });
+
+  test("refuses a workspace starting with ~", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: ~/work\n", "utf-8");
+
+    expect(() => loadAgentConfig(cfg)).toThrow(
+      "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+    );
+  });
+
+  const nullRefusal = (key: string) =>
+    `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`;
+  const emptyRefusal = (key: string) =>
+    `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`;
+  for (const [line, message] of [
+    ["workspace: ~", nullRefusal("workspace")],
+    ["workspace:", nullRefusal("workspace")],
+    ["workspace: null", nullRefusal("workspace")],
+    ["workspace: 42", "workspace must be a string path"],
+    ['workspace: ""', emptyRefusal("workspace")],
+    ['workspace: "   "', emptyRefusal("workspace")],
+    ["repo: ~", nullRefusal("repo")],
+    ["repo: 42", "repo must be a string path"],
+    ['repo: ""', emptyRefusal("repo")],
+    [
+      "repo: ~/work",
+      "repo '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+    ],
+  ] as const) {
+    test(`refuses ${JSON.stringify(line)}`, () => {
+      const cfg = join(dir, "agent.yaml");
+      writeFileSync(cfg, `agentId: probe\n${line}\n`, "utf-8");
+
+      expect(() => loadAgentConfig(cfg)).toThrow(message);
+    });
+  }
+
+  test("uses the current directory when the config has no workspace or repo key", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\n", "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    expect(parsed.workspace).toBe(process.cwd());
+    expect(parsed.mailDir).toBe(`${process.cwd()}/mail`);
+  });
+
+  test("resolves a relative repo against the config directory when there is no workspace key", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nrepo: worktree\n", "utf-8");
+
+    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "worktree"));
+  });
+
+  test("uses workspace over repo when both keys are set", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: chosen\nrepo: ignored\n", "utf-8");
+
+    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "chosen"));
   });
 });

@@ -1,4 +1,5 @@
 import { dirname, isAbsolute, resolve } from "node:path";
+import { refuseTildeWorkspace } from "@tpsdev-ai/agent";
 import { WorktreeLifecycleError } from "./agent-lifecycle.js";
 
 export function agentWorkspace(
@@ -6,6 +7,7 @@ export function agentWorkspace(
   configuredWorkspace: string,
   childEnv?: NodeJS.ProcessEnv,
 ): string {
+  refuseTildeWorkspace(configuredWorkspace);
   // Relative workspaces use the config pathname's directory.
   const workspace = childEnv?.TPS_AGENT_WORKSPACE ?? resolve(dirname(configPath), configuredWorkspace);
   const pending = childEnv?.TPS_WORKTREE_PENDING;

@@ -276,7 +276,7 @@ describe("selected runner startup with interactive opt-out", () => {
   }
 });
 
-function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false, flags: string[] = []) {
+function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false, flags: string[] = [], env: Record<string, string | undefined> = {}) {
   const defaultMarker = join(sb.root, "default-started");
   const selectedMarker = join(sb.root, "selected-started");
   const preload = join(sb.root, "interactive.mjs");
@@ -304,7 +304,7 @@ for (const stream of [process.stdout, process.stderr]) {
 `);
   const result = spawnSync(NODE, ["--import", preload, TPS_BIN, "agent", "start", "--id", "probe", ...(rt ? equals ? [`--runtime=${rt}`] : ["--runtime", rt] : []), ...(noSandbox ? ["--no-sandbox"] : []), ...flags], {
     cwd: sb.ws,
-    env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined }),
+    env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined, ...env }),
     encoding: "utf8", timeout: 5000, killSignal: "SIGKILL",
   });
   return { status: result.status, text: `${result.stdout ?? ""}${result.stderr ?? ""}`, defaultMarker, selectedMarker };
@@ -347,6 +347,171 @@ describe("interactive selected runtime with no nono", () => {
   }
 });
 
+const TILDE_REFUSAL = "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file";
+const nullRefusal = (key: string) =>
+  `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`;
+const emptyRefusal = (key: string) =>
+  `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`;
+const STRING_REFUSAL = "workspace must be a string path";
+
+type WorkspaceRun = { result: ReturnType<typeof interactiveRuntimeProbe>; sb: Sandbox; agentDir: string; worktrees: number };
+
+/** The interactive opt-out start for `rt`, with `workspaceLine` in its config and a real base repository. */
+function workspaceOptOut(
+  rt: (typeof RUNTIMES)[number],
+  workspaceLines: string | ((sb: Sandbox) => string),
+  check: (run: WorkspaceRun) => void,
+  env: (sb: Sandbox) => Record<string, string | undefined> = () => ({}),
+): void {
+  const sb = makeSandbox();
+  try {
+    const workspaceLine = typeof workspaceLines === "function" ? workspaceLines(sb) : workspaceLines;
+    const base = join(sb.home, "ops", "tps");
+    mkdirSync(base, { recursive: true });
+    const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+    for (const args of [["init", "-q"], ["config", "user.email", "agent-a@tps.dev"], ["config", "user.name", "agent-a"], ["commit", "-q", "--allow-empty", "-m", "init"]]) {
+      expect(g(args).status).toBe(0);
+    }
+    const agentDir = join(sb.home, ".tps", "agents", "probe");
+    writeFileSync(
+      join(agentDir, "agent.yaml"),
+      `agentId: probe\nname: probe\n${workspaceLine ? `${workspaceLine}\n` : ""}mailDir: ${join(sb.home, ".tps", "mail")}\nllm:\n  provider: ollama\n  model: probe-model\n`,
+    );
+    const result = interactiveRuntimeProbe(sb, rt, true, false, [], env(sb));
+    const worktrees = g(["worktree", "list", "--porcelain"]).stdout.match(/^worktree /gm)?.length ?? 0;
+    check({ result, sb, agentDir, worktrees });
+  } finally {
+    rmSync(sb.root, {recursive: true, force: true});
+  }
+}
+
+function expectRefusedBeforeSetup(run: WorkspaceRun, message: string): void {
+  expect(run.result.text).toContain(message);
+  expect(run.result.status).toBe(1);
+  expect(existsSync(run.result.selectedMarker)).toBe(false);
+  expect(existsSync(run.result.defaultMarker)).toBe(false);
+  expect(existsSync(join(run.agentDir, "~"))).toBe(false);
+  expect(run.worktrees).toBe(1);
+  expect(existsSync(join(run.sb.home, ".tps", "launch"))).toBe(false);
+  expect(fakeNonoRuns(run.sb)).toEqual([]);
+}
+
+describe("interactive selected runtime workspace values", () => {
+  for (const rt of RUNTIMES) {
+    test(`${rt}: --no-sandbox refuses a workspace starting with ~ before worktree setup or runner start`, () => {
+      workspaceOptOut(rt, "workspace: ~/work", (run) => expectRefusedBeforeSetup(run, TILDE_REFUSAL));
+    });
+  }
+
+  for (const [line, message] of [
+    ["workspace: ~", nullRefusal("workspace")],
+    ["workspace:", nullRefusal("workspace")],
+    ["workspace: 42", STRING_REFUSAL],
+    ['workspace: ""', emptyRefusal("workspace")],
+    ["repo: ~", nullRefusal("repo")],
+    ['repo: ""', emptyRefusal("repo")],
+  ] as const) {
+    test(`codex: --no-sandbox refuses ${JSON.stringify(line)} before worktree setup or runner start`, () => {
+      workspaceOptOut("codex", line, (run) => expectRefusedBeforeSetup(run, message));
+    });
+  }
+
+  test("codex: --no-sandbox with no workspace key still starts its runner", () => {
+    workspaceOptOut("codex", "", (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(run.result.defaultMarker)).toBe(false);
+    });
+  });
+
+  const runnerDirs = (sb: Sandbox) => {
+    const dirs = { workspace: join(sb.root, "ws-dir"), repo: join(sb.root, "repo-dir"), fallback: join(sb.home, "ops", "tps") };
+    mkdirSync(dirs.workspace);
+    mkdirSync(dirs.repo);
+    return dirs;
+  };
+
+  test("codex: --no-sandbox with a repo key and no workspace key starts its runner in the repo directory", () => {
+    let dirs: ReturnType<typeof runnerDirs> | undefined;
+    workspaceOptOut("codex", (sb) => {
+      dirs = runnerDirs(sb);
+      return `repo: ${dirs.repo}`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dirs!.repo, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(dirs!.fallback, ".tps-agent.pid"))).toBe(false);
+    });
+  });
+
+  test("codex: --no-sandbox resolves a relative repo against the config directory, not the launch directory", () => {
+    let configRelative = "";
+    let launchRelative = "";
+    workspaceOptOut("codex", (sb) => {
+      configRelative = join(sb.home, ".tps", "agents", "probe", "rel-repo");
+      launchRelative = join(sb.ws, "rel-repo");
+      mkdirSync(configRelative);
+      mkdirSync(launchRelative);
+      return "repo: rel-repo";
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(configRelative, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(launchRelative, ".tps-agent.pid"))).toBe(false);
+    });
+  });
+
+  test("codex: --no-sandbox with workspace and repo keys starts its runner in the workspace", () => {
+    let dirs: ReturnType<typeof runnerDirs> | undefined;
+    workspaceOptOut("codex", (sb) => {
+      dirs = runnerDirs(sb);
+      return `workspace: ${dirs.workspace}\nrepo: ${dirs.repo}`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dirs!.workspace, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(dirs!.repo, ".tps-agent.pid"))).toBe(false);
+      expect(existsSync(join(dirs!.fallback, ".tps-agent.pid"))).toBe(false);
+    });
+  });
+
+  for (const key of ["workspace", "repo"] as const) {
+    test(`codex: --no-sandbox expands \${NAME} in ${key} before starting its runner`, () => {
+      let expanded = "";
+      workspaceOptOut("codex", (sb) => {
+        expanded = join(sb.root, "expanded", "project");
+        mkdirSync(expanded, { recursive: true });
+        return `${key}: \${TPS_TEST_PROJECT_ROOT}/project`;
+      }, (run) => {
+        expect(run.result.status).toBe(0);
+        expect(existsSync(run.result.selectedMarker)).toBe(true);
+        expect(existsSync(join(expanded, ".tps-agent.pid"))).toBe(true);
+      }, (sb) => ({ TPS_TEST_PROJECT_ROOT: join(sb.root, "expanded") }));
+    });
+  }
+
+  test("codex: --no-sandbox refuses an unset variable in repo before worktree setup or runner start", () => {
+    workspaceOptOut(
+      "codex",
+      "repo: ${TPS_TEST_PROJECT_ROOT}/project",
+      (run) => expectRefusedBeforeSetup(run, "Missing environment variable: TPS_TEST_PROJECT_ROOT"),
+      () => ({ TPS_TEST_PROJECT_ROOT: undefined }),
+    );
+  });
+
+  test("codex: --no-sandbox starts with an unset variable in a key other than workspace or repo", () => {
+    let dir = "";
+    workspaceOptOut("codex", (sb) => {
+      dir = join(sb.root, "repo-dir");
+      mkdirSync(dir);
+      return `repo: ${dir}\nsystemPrompt: "\${TPS_TEST_UNSET_VALUE}"`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dir, ".tps-agent.pid"))).toBe(true);
+    }, () => ({ TPS_TEST_UNSET_VALUE: undefined }));
+  });
+});
 
 test("interactive default runtime with no nono still warns and starts", () => {
   const sb = makeSandbox();
