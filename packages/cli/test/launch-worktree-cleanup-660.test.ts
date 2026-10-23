@@ -1,22 +1,35 @@
 /**
- * cli#660 — a launch that adds a worktree and then fails before the parent
- * records the setup binding must remove the worktree it added.
+ * cli#660 — a launch that adds a worktree and fails during setup must clean up
+ * only the worktree it created.
  *
- * Right after a real `git worktree add`, setup writes a random nonce to
+ * Immediately after a real `git worktree add`, setup writes a random nonce to
  * `<admin git dir>/tps-launch-owner` with exclusive create, reports the record
- * through `onCreated`, and only then reads the identity facts. The setup-failure
- * cleanup removes a worktree only when its admin directory still holds that
- * nonce; otherwise it refuses, names the path and prints the manual command. The failure cases
- * inject a metadata error after identity capture, at
- * `rev-parse --absolute-git-dir`.
+ * through `onCreated`, and then reads the identity facts. A marker it cannot
+ * write is a setup failure: `onStart` throws, the record carries no marker, and
+ * cleanup refuses with the manual command. The setup-failure, launch-fallback
+ * and teardown routes remove only when the admin directory still holds the
+ * exact nonce. Most failure cases inject a metadata error after identity
+ * capture, at `rev-parse --absolute-git-dir`; the identity test fails
+ * `rev-parse HEAD` during capture, and the marker test fails only the marker
+ * write.
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   onStart,
+  onStop,
   removeCreatedWorktree,
   WorktreeLifecycleError,
   type WorktreeCreation,
@@ -30,10 +43,11 @@ interface Fixture {
   workspace: string;
 }
 
-/** A base repository at <root>/tps and a workspace at <root>/ws, nothing else. */
-function fixture(): Fixture {
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "launch-cleanup-660-")));
-  const base = join(root, "tps");
+/** A base repository and a workspace under one temporary root. */
+function fixtureIn(root: string, container?: string): Fixture {
+  const dir = container ? join(root, container) : root;
+  if (container) mkdirSync(dir);
+  const base = join(dir, "tps");
   mkdirSync(base);
   const git = (args: string[]) => {
     const result = spawnSync(GIT, args, { cwd: base, encoding: "utf8" });
@@ -42,7 +56,12 @@ function fixture(): Fixture {
   };
   git(["init", "-q"]);
   git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
-  return { root, base, workspace: join(root, "ws") };
+  return { root, base, workspace: join(dir, "ws") };
+}
+
+/** A base repository at <root>/tps and a workspace at <root>/ws, nothing else. */
+function fixture(): Fixture {
+  return fixtureIn(realpathSync(mkdtempSync(join(tmpdir(), "launch-cleanup-660-"))));
 }
 
 function branches(base: string): string[] {
@@ -69,16 +88,27 @@ function adminDir(workspace: string): string {
   return realpathSync(resolve(workspace, file.slice("gitdir: ".length)));
 }
 
+function manualCommand(f: Fixture): string {
+  return `git -C '${f.base}' worktree remove --force '${f.workspace}'`;
+}
+
 /**
  * A git wrapper that fails `rev-parse --absolute-git-dir` (the step after
- * identity capture). `beforeFail` runs before the injected failure,
- * `failRemoval` makes the cleanup's `worktree remove` fail, `blockMarker`
- * creates a directory where the ownership marker goes, and `failHeadIn`
- * fails the identity read's `rev-parse HEAD` in that directory.
+ * identity capture) unless `injectMetadataFailure` is false. `beforeFail` runs
+ * before the injected failure, `failRemoval` makes the cleanup's
+ * `worktree remove` fail, `blockMarker` creates a directory where the
+ * ownership marker goes, and `failHeadIn` fails the identity read's
+ * `rev-parse HEAD` in that directory.
  */
 function installWrapper(
   f: Fixture,
-  opts: { beforeFail?: string; failRemoval?: boolean; blockMarker?: boolean; failHeadIn?: string } = {},
+  opts: {
+    beforeFail?: string;
+    failRemoval?: boolean;
+    blockMarker?: boolean;
+    failHeadIn?: string;
+    injectMetadataFailure?: boolean;
+  } = {},
 ): { bin: string; restore: () => void } {
   const bin = join(f.root, "bin");
   mkdirSync(bin);
@@ -118,11 +148,15 @@ function installWrapper(
             "fi",
           ]
         : []),
-      'if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ]; then',
-      ...(opts.beforeFail ? [opts.beforeFail.split("\n").map((line) => `  ${line}`).join("\n")] : []),
-      '  echo "injected metadata failure" >&2',
-      "  exit 79",
-      "fi",
+      ...(opts.injectMetadataFailure === false
+        ? []
+        : [
+            'if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ]; then',
+            ...(opts.beforeFail ? [opts.beforeFail.split("\n").map((line) => `  ${line}`).join("\n")] : []),
+            '  echo "injected metadata failure" >&2',
+            "  exit 79",
+            "fi",
+          ]),
       ...(opts.failRemoval
         ? [
             'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
@@ -141,7 +175,7 @@ function installWrapper(
   return { bin, restore: () => { process.env.PATH = oldPath; } };
 }
 
-test("a failure after the marker and identity capture removes the worktree it marked", () => {
+test("a failure at the step after identity capture removes the worktree it marked", () => {
   const f = fixture();
   const { restore } = installWrapper(f);
   try {
@@ -308,9 +342,7 @@ test("a same-path detached replacement at the same commit survives setup cleanup
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     expect((error as Error).message).toContain("injected metadata failure");
     expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
-    expect((error as Error).message).toContain(
-      `git -C ${f.base} worktree remove --force ${f.workspace}`,
-    );
+    expect((error as Error).message).toContain(manualCommand(f));
     expect(created).toBeDefined();
     expect(created!.removed).toBeUndefined();
 
@@ -336,7 +368,7 @@ test("a same-path detached replacement at the same commit survives setup cleanup
   }
 });
 
-test("an identity-capture failure after the marker still removes the worktree it owns", () => {
+test("an identity-capture failure at rev-parse HEAD still removes the worktree it owns", () => {
   const f = fixture();
   const { restore } = installWrapper(f, { failHeadIn: f.workspace });
   try {
@@ -363,30 +395,180 @@ test("an identity-capture failure after the marker still removes the worktree it
   }
 });
 
-test("a marker-write failure records a null marker and cleanup refuses with the manual command", () => {
+test("a marker-write failure alone fails setup, records a null marker and refuses cleanup", () => {
   const f = fixture();
-  const { restore } = installWrapper(f, { blockMarker: true });
+  const { restore } = installWrapper(f, { blockMarker: true, injectMetadataFailure: false });
   try {
     let created: WorktreeCreation | undefined;
     let error: unknown;
+    let returned: unknown;
     try {
-      onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+      returned = onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
     } catch (err) {
       error = err;
     }
+    // No successful binding: the launch treats this as a setup failure.
+    expect(returned).toBeUndefined();
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("worktree ownership marker could not be written");
+    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect((error as Error).message).toContain(manualCommand(f));
+    // The record exists with no marker; the worktree is left for the operator.
     expect(created).toBeDefined();
     expect(created!.ownerMarker).toBeNull();
-    expect(error).toBeInstanceOf(WorktreeLifecycleError);
-    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
-    expect((error as Error).message).toContain(
-      `git -C ${f.base} worktree remove --force ${f.workspace}`,
-    );
-    // No marker means no ownership; the worktree is left for the operator.
     expect(created!.removed).toBeUndefined();
     expect(existsSync(f.workspace)).toBe(true);
     expect(worktreeList(f.base)).toContain(f.workspace);
   } finally {
     restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("an added whitespace byte in the ownership marker refuses cleanup", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    const marker = join(adminDir(f.workspace), "tps-launch-owner");
+    writeFileSync(marker, `${readFileSync(marker, "utf-8")}\n`);
+    expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup refused for ${f.workspace}`);
+    expect(() => removeCreatedWorktree(created!)).toThrow(manualCommand(f));
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a changed byte in the ownership marker refuses cleanup", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    const marker = join(adminDir(f.workspace), "tps-launch-owner");
+    const original = readFileSync(marker, "utf-8");
+    const last = original.slice(-1);
+    writeFileSync(marker, `${original.slice(0, -1)}${last === "0" ? "1" : "0"}`);
+    expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup refused for ${f.workspace}`);
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("onStop refuses a same-path replacement on the launch-check and teardown route", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    // Replace the worktree with a fresh one at the same path and commit.
+    expect(spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base }).status).toBe(0);
+    expect(spawnSync(GIT, ["worktree", "add", "--detach", f.workspace, commit], { cwd: f.base }).status).toBe(0);
+    const gitDir = adminDir(f.workspace);
+    const gitFile = readFileSync(join(f.workspace, ".git"), "utf-8");
+    const registry = readFileSync(join(gitDir, "gitdir"), "utf-8");
+    const head = headOf(f.workspace);
+
+    // Both the later launch-check failure and normal teardown call onStop with
+    // the setup binding; the replacement must survive each call.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let error: unknown;
+      try {
+        onStop("agent-a", f.workspace, started.cleanupBinding);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(WorktreeLifecycleError);
+      expect((error as Error).message).toContain(`worktree cleanup binding changed for ${f.workspace}`);
+      expect((error as Error).message).toContain(manualCommand(f));
+    }
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+    expect(existsSync(join(gitDir, "tps-launch-owner"))).toBe(false);
+    expect(readFileSync(join(f.workspace, ".git"), "utf-8")).toBe(gitFile);
+    expect(readFileSync(join(gitDir, "gitdir"), "utf-8")).toBe(registry);
+    expect(headOf(f.workspace)).toBe(head);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("onStop removes the owned worktree after the runtime moved HEAD", () => {
+  const f = fixture();
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    const before = headOf(f.workspace);
+    const committed = spawnSync(
+      GIT,
+      ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "runtime move"],
+      { cwd: f.workspace, encoding: "utf8" },
+    );
+    expect(committed.status, committed.stderr).toBe(0);
+    expect(headOf(f.workspace)).not.toBe(before);
+
+    // Teardown does not compare HEAD: the marker still identifies the worktree.
+    expect(onStop("agent-a", f.workspace, started.cleanupBinding)).toEqual({
+      changed: true,
+      reason: "worktree removed",
+    });
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(worktreeList(f.base)).not.toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("the printed manual command targets a base and workspace with shell metacharacters", () => {
+  const f = fixtureIn(
+    realpathSync(mkdtempSync(join(tmpdir(), "launch-cleanup-660-"))),
+    "run $x;'q",
+  );
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    // Remove the marker so cleanup refuses and prints the command.
+    rmSync(join(adminDir(f.workspace), "tps-launch-owner"));
+    let command = "";
+    try {
+      removeCreatedWorktree(created!);
+    } catch (err) {
+      const prefix = "remove it manually with: ";
+      const message = (err as Error).message;
+      command = message.slice(message.indexOf(prefix) + prefix.length);
+    }
+    expect(command.startsWith("git -C '")).toBe(true);
+
+    // Run it through sh with a dry git shim that records argv and exits 0.
+    const shim = join(f.root, "bin-dry");
+    mkdirSync(shim);
+    const log = join(f.root, "argv.log");
+    writeFileSync(
+      join(shim, "git"),
+      ["#!/bin/sh", `for arg in "$@"; do printf '%s\\n' "$arg" >> "${log}"; done`, "exit 0", ""].join("\n"),
+    );
+    chmodSync(join(shim, "git"), 0o755);
+    const run = spawnSync("sh", ["-c", command], {
+      env: { ...process.env, PATH: `${shim}:${process.env.PATH}` },
+      encoding: "utf8",
+    });
+    expect(run.status, run.stderr).toBe(0);
+    expect(readFileSync(log, "utf-8").split("\n").filter(Boolean)).toEqual([
+      "-C",
+      f.base,
+      "worktree",
+      "remove",
+      "--force",
+      f.workspace,
+    ]);
+    // Real Git confirms the base path and the workspace are the fixture's.
+    expect(worktreeList(f.base)).toContain(f.workspace);
+    expect(existsSync(f.workspace)).toBe(true);
+  } finally {
+    spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base });
     rmSync(f.root, { recursive: true, force: true });
   }
 });
