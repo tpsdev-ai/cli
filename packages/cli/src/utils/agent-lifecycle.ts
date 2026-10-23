@@ -563,8 +563,9 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  * that cannot be written is a setup failure, so `onStart` throws instead of
  * returning a binding. If a later step throws, `onStart` attempts to remove
  * the worktree it created when the recorded marker and any recorded identity
- * facts still match; the removal itself can fail, and otherwise the cleanup
- * refuses. Both failures print the manual command. The record's `removed`
+ * facts still match, and otherwise the cleanup refuses. A refusal prints the
+ * manual command; a failed Git removal prints Git's error and the manual
+ * command. The record's `removed`
  * flag says whether that cleanup succeeded, so a caller can retry once.
  *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
@@ -706,7 +707,7 @@ function shellQuote(value: string): string {
   return `'${value.split("'").join(`'\\''`)}'`;
 }
 
-/** The command an operator runs when cleanup refuses. */
+/** The manual `git worktree remove --force` command, with both paths POSIX-quoted. */
 function manualRemovalCommand(target: { baseWorkingTree: string; workspace: string }): string {
   return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
 }
@@ -822,7 +823,10 @@ function tryRemoveCreatedWorktree(
   }
   const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
   if (!remove.ok) {
-    return { ok: false, detail: remove.stderr || remove.stdout || "git produced no output" };
+    return {
+      ok: false,
+      detail: `${remove.stderr || remove.stdout || "git produced no output"}; remove it manually with: ${manualRemovalCommand(created)}`,
+    };
   }
   created.removed = true;
   return { ok: true };
@@ -857,14 +861,15 @@ function comparablePath(path: string): string {
 /**
  * Remove the worktree a launch created, by the record taken at creation time.
  * A record already marked removed is skipped without a Git call, and a path
- * the recorded base no longer registers as its worktree is refused rather
- * than removed. Removal requires the admin directory named by the worktree's
- * `.git` file to hold the recorded marker, and any recorded identity facts to
- * still match; a missing or different marker is refused with the manual
- * command. A worktree swapped in between that check
+ * the recorded base no longer registers as its worktree is refused with
+ * guidance to inspect it, not a Git command. Removal requires the admin
+ * directory named by the worktree's `.git` file to hold the recorded marker,
+ * and any recorded identity facts to still match; a missing or different
+ * marker is refused with the manual command. A worktree swapped in between that check
  * and the remove call is not covered: the verify-to-remove race is deferred
  * and filed separately. Throws `WorktreeLifecycleError` naming the path when
- * removal fails.
+ * removal fails; a failed Git removal also carries Git's error and the manual
+ * command.
  */
 export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
   if (created.removed) {
@@ -872,8 +877,8 @@ export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycle
   }
   if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
     throw new WorktreeLifecycleError(
-      `worktree cleanup refused for ${created.workspace}: the path is not a worktree of ${created.baseWorkingTree}; ` +
-        `remove it manually with: ${manualRemovalCommand(created)}`,
+      `worktree cleanup refused for ${created.workspace}: ${created.workspace} is no longer a registered worktree of ` +
+        `${created.baseWorkingTree}; inspect it and remove it yourself if it is yours`,
     );
   }
   const removal = tryRemoveCreatedWorktree(created);
@@ -999,7 +1004,8 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
     const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
     if (!remove.ok) {
       throw new WorktreeLifecycleError(
-        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}`,
+        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}; ` +
+          `remove it manually with: ${manualRemovalCommand(binding)}`,
       );
     }
     return { changed: true, reason: "worktree removed" };

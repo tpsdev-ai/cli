@@ -1731,9 +1731,9 @@ describe("cli#660 — real launcher worktree ownership", () => {
     }
   });
 
-  /** The report a confined child sends: the scripted peer reads the launcher's
-   *  own inside canary and reports the OUTSIDE canary DENIED. It states the
-   *  report instead of producing it with a permission denial: the Docker lane
+  /** The lines the scripted peer sends under fake nono: it reads the launcher's
+   *  own inside canary and sends OUTSIDE DENIED without attempting that read.
+   *  It states the report instead of producing it with a permission denial: the Docker lane
    *  runs this suite as root, where chmod 000 does not stop a child reading
    *  the canary. */
   const RELEASE_PEER = `const { connect } = require("node:net");
@@ -1815,16 +1815,15 @@ exit 0
       const gitFile = readFileSync(join(f.sb.ws, ".git"), "utf-8");
       const gitDir = realpathSync(resolve(f.sb.ws, gitFile.trim().slice("gitdir: ".length)));
       expect(readFileSync(join(gitDir, "gitdir"), "utf-8").trim()).toBe(join(f.sb.ws, ".git"));
-      // The running runtime moved HEAD during the launch; teardown must leave a
-      // resolvable HEAD and the registration in place.
-      expect(spawnSync(GIT, ["rev-parse", "--verify", "HEAD"], { cwd: f.sb.ws, encoding: "utf8" }).status).toBe(0);
+      // Teardown leaves the replacement's HEAD at its commit and its registration in place.
+      expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.sb.ws, encoding: "utf8" }).stdout.trim()).toBe(commit);
       expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(f.sb.ws);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   });
 
-  test("teardown removes the owned worktree after the runtime moved HEAD", () => {
+  test("teardown removes the owned worktree after fake nono moved HEAD", () => {
     const f = launchFixture();
     const headFile = join(f.sb.root, "runtime-head");
     installFakeNono(

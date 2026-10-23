@@ -1361,8 +1361,7 @@ async function runAgentCommand(
               // facts (cli#660). A marker it cannot write is a setup failure.
               // Every cleanup route for this launch's worktree attempts removal
               // only when the admin directory still holds the recorded marker
-              // and refuses otherwise with the manual command; the removal
-              // itself can fail.
+              // and refuses otherwise; the removal itself can fail.
               const start = selectedRuntime
                 ? onStart(launchId, config.workspace, {
                     deferCheckout: true,

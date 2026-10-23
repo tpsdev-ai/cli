@@ -1,10 +1,10 @@
 /**
- * cli#660 — a launch that adds a worktree and fails during setup must clean up
- * only the worktree it created.
+ * cli#660 — a launch that adds a worktree and fails during setup attempts to
+ * clean up the worktree it created.
  *
- * Immediately after a real `git worktree add`, setup writes a random nonce to
- * `<admin git dir>/tps-launch-owner` with exclusive create, reports the record
- * through `onCreated`, and then reads the identity facts. A marker it cannot
+ * Immediately after a real `git worktree add`, setup attempts to write a random
+ * nonce to `<admin git dir>/tps-launch-owner` with exclusive create, reports the
+ * record through `onCreated`, and then reads the identity facts. A marker it cannot
  * write is a setup failure: `onStart` throws, the record carries no marker, and
  * cleanup refuses with the manual command. The setup-failure, launch-fallback
  * and teardown routes attempt removal of a created worktree only when the admin
@@ -18,6 +18,7 @@
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
@@ -255,7 +256,7 @@ test("unit — the original failure is what the caller sees when cleanup succeed
   }
 });
 
-test("unit — a removal failure names the worktree path and keeps the original failure", () => {
+test("unit — a Git removal failure prints Git's error and the manual command, and keeps the original failure", () => {
   const f = fixture();
   const { restore } = installWrapper(f, {
     beforeFail: `"${GIT}" -C "${f.base}" worktree lock "${f.workspace}" >/dev/null 2>&1 || true`,
@@ -271,12 +272,23 @@ test("unit — a removal failure names the worktree path and keeps the original 
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     expect((error as Error).message).toContain("injected metadata failure");
     expect((error as Error).message).toContain(`worktree cleanup failed for ${f.workspace}`);
+    expect((error as Error).message).toContain("cannot remove a locked working tree");
+    expect((error as Error).message).toContain(`remove it manually with: ${manualCommand(f)}`);
     expect(existsSync(f.workspace)).toBe(true);
-    // The record says the worktree is still there, so the call the launch makes
-    // next retries and names the path again.
+    // The record says the worktree is still there, so a direct
+    // removeCreatedWorktree retry tries again and names the path.
     expect(created).toBeDefined();
     expect(created!.removed).toBeUndefined();
-    expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup failed for ${f.workspace}`);
+    let retryError: unknown;
+    try {
+      removeCreatedWorktree(created!);
+    } catch (err) {
+      retryError = err;
+    }
+    expect(retryError).toBeInstanceOf(WorktreeLifecycleError);
+    expect((retryError as Error).message).toContain(`worktree cleanup failed for ${f.workspace}`);
+    expect((retryError as Error).message).toContain("cannot remove a locked working tree");
+    expect((retryError as Error).message).toContain(`remove it manually with: ${manualCommand(f)}`);
   } finally {
     restore();
     spawnSync(GIT, ["worktree", "unlock", f.workspace], { cwd: f.base });
@@ -322,7 +334,7 @@ test("unit — a second cleanup of an already-removed record makes no Git call a
   }
 });
 
-test("unit — a same-path detached replacement at the same commit survives setup cleanup and the retry", () => {
+test("unit — a same-path detached replacement at the same commit survives setup cleanup and a direct removeCreatedWorktree retry", () => {
   const f = fixture();
   const commit = headOf(f.base);
   const { restore } = installWrapper(f, {
@@ -358,7 +370,7 @@ test("unit — a same-path detached replacement at the same commit survives setu
     expect(existsSync(f.workspace)).toBe(true);
     expect(worktreeList(f.base)).toContain(f.workspace);
 
-    // The launcher's onStart fallback retries from the record and refuses too.
+    // A direct removeCreatedWorktree retry from the record refuses too.
     expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup refused for ${f.workspace}`);
     expect(existsSync(f.workspace)).toBe(true);
     expect(existsSync(join(gitDir, "tps-launch-owner"))).toBe(false);
@@ -461,7 +473,7 @@ test("unit — a changed byte in the ownership marker refuses cleanup", () => {
   }
 });
 
-test("unit — onStop refuses a same-path replacement on the launch-check and teardown route", () => {
+test("unit — repeated bound onStop refuses a same-path replacement", () => {
   const f = fixture();
   const commit = headOf(f.base);
   try {
@@ -475,8 +487,7 @@ test("unit — onStop refuses a same-path replacement on the launch-check and te
     const registry = readFileSync(join(gitDir, "gitdir"), "utf-8");
     const head = headOf(f.workspace);
 
-    // Both the later launch-check failure and normal teardown call onStop with
-    // the setup binding; the replacement must survive each call.
+    // Call the bound onStop twice; the replacement survives each call.
     for (let attempt = 0; attempt < 2; attempt++) {
       let error: unknown;
       try {
@@ -499,7 +510,7 @@ test("unit — onStop refuses a same-path replacement on the launch-check and te
   }
 });
 
-test("unit — onStop removes the owned worktree after the runtime moved HEAD", () => {
+test("unit — bound onStop removes the owned worktree after a commit moved HEAD", () => {
   const f = fixture();
   try {
     const started = onStart("agent-a", f.workspace, { deferCheckout: true });
@@ -513,7 +524,7 @@ test("unit — onStop removes the owned worktree after the runtime moved HEAD", 
     expect(committed.status, committed.stderr).toBe(0);
     expect(headOf(f.workspace)).not.toBe(before);
 
-    // Teardown does not compare HEAD: the marker still identifies the worktree.
+    // Bound onStop does not compare HEAD: the marker still identifies the worktree.
     expect(onStop("agent-a", f.workspace, started.cleanupBinding)).toEqual({
       changed: true,
       reason: "worktree removed",
@@ -521,6 +532,67 @@ test("unit — onStop removes the owned worktree after the runtime moved HEAD", 
     expect(existsSync(f.workspace)).toBe(false);
     expect(worktreeList(f.base)).not.toContain(f.workspace);
   } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+for (const change of ["a different nonce of the same length", "one extra byte"] as const) {
+  test(`unit — bound onStop refuses a marker rewritten in place with ${change} and leaves the worktree`, () => {
+    const f = fixture();
+    try {
+      const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+      expect(started.cleanupBinding).toBeDefined();
+      const gitDir = adminDir(f.workspace);
+      const marker = join(gitDir, "tps-launch-owner");
+      const original = readFileSync(marker, "utf-8");
+      const rewritten = change === "one extra byte" ? `${original}\n` : randomUUID();
+      expect(rewritten).not.toBe(original);
+      expect(Buffer.byteLength(rewritten)).toBe(Buffer.byteLength(original) + (change === "one extra byte" ? 1 : 0));
+      // Rewrite the bytes of the same marker file.
+      writeFileSync(marker, rewritten);
+      expect(readFileSync(marker, "utf-8")).toBe(rewritten);
+
+      let error: unknown;
+      try {
+        onStop("agent-a", f.workspace, started.cleanupBinding);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(WorktreeLifecycleError);
+      expect((error as Error).message).toContain(`worktree cleanup binding changed for ${f.workspace}`);
+      expect((error as Error).message).toContain(`the worktree ownership marker changed in ${gitDir}`);
+      expect((error as Error).message).toContain(`remove it manually with: ${manualCommand(f)}`);
+      expect(readFileSync(marker, "utf-8")).toBe(rewritten);
+      expect(worktreeList(f.base)).toContain(f.workspace);
+      expect(existsSync(f.workspace)).toBe(true);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+}
+
+test("unit — a Git removal failure on bound onStop prints Git's error and the manual command", () => {
+  const f = fixture();
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    const locked = spawnSync(GIT, ["worktree", "lock", f.workspace], { cwd: f.base, encoding: "utf8" });
+    expect(locked.status, locked.stderr).toBe(0);
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, started.cleanupBinding);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree cleanup failed for agent-a (${f.workspace})`);
+    expect((error as Error).message).toContain("cannot remove a locked working tree");
+    expect((error as Error).message).toContain(`remove it manually with: ${manualCommand(f)}`);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+    expect(existsSync(f.workspace)).toBe(true);
+  } finally {
+    spawnSync(GIT, ["worktree", "unlock", f.workspace], { cwd: f.base });
+    spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base });
     rmSync(f.root, { recursive: true, force: true });
   }
 });
@@ -597,7 +669,7 @@ test("unit — a path re-used by a different worktree after removal is left unto
   }
 });
 
-test("unit — removeCreatedWorktree: an unregistered path refusal prints the manual command", () => {
+test("unit — removeCreatedWorktree: an unregistered path is refused with inspection guidance, not a Git command", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
@@ -613,8 +685,12 @@ test("unit — removeCreatedWorktree: an unregistered path refusal prints the ma
       error = err;
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
-    expect((error as Error).message).toContain(`the path is not a worktree of ${f.base}`);
-    expect((error as Error).message).toContain(manualCommand(f));
+    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect((error as Error).message).toContain(
+      `${f.workspace} is no longer a registered worktree of ${f.base}; inspect it and remove it yourself if it is yours`,
+    );
+    expect((error as Error).message).not.toContain("remove it manually with");
+    expect((error as Error).message).not.toContain("worktree remove");
     expect(existsSync(f.workspace)).toBe(true);
     expect(worktreeList(f.base)).not.toContain(`worktree ${f.workspace}`);
   } finally {
