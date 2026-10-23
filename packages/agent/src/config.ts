@@ -62,6 +62,20 @@ export function refuseTildeWorkspace(configured: string): void {
   }
 }
 
+/** The `workspace` a parsed agent config sets, or undefined when the key is absent. */
+export function readConfiguredWorkspace(parsed: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(parsed, "workspace")) return undefined;
+  const value = parsed.workspace;
+  if (value === null) {
+    throw new Error(
+      "workspace is set but has no value (in YAML, a bare ~ or nothing after 'workspace:' is null): give an absolute path or a path relative to the config file, or remove the key",
+    );
+  }
+  if (typeof value !== "string") throw new Error("workspace must be a string path");
+  refuseTildeWorkspace(value);
+  return value;
+}
+
 /**
  * A relative workspace is anchored at the config file's directory, so the
  * launching process and a sandboxed child resolve the same absolute path. An
@@ -77,7 +91,7 @@ export function loadAgentConfig(path: string, baseDir: string = dirname(path)): 
   const parsedRaw = (yaml.load(raw) ?? {}) as Record<string, any>;
   const parsed = interpolateEnvVars(parsedRaw);
 
-  const configuredWorkspace = parsed.workspace || parsed.repo;
+  const configuredWorkspace = readConfiguredWorkspace(parsed) || parsed.repo;
   const workspace = configuredWorkspace
     ? resolveWorkspace(String(configuredWorkspace), baseDir)
     : process.cwd();

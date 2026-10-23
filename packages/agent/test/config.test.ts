@@ -97,4 +97,29 @@ describe("agent config env interpolation", () => {
       "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
     );
   });
+
+  const nullRefusal =
+    "workspace is set but has no value (in YAML, a bare ~ or nothing after 'workspace:' is null): give an absolute path or a path relative to the config file, or remove the key";
+  for (const [line, message] of [
+    ["workspace: ~", nullRefusal],
+    ["workspace:", nullRefusal],
+    ["workspace: null", nullRefusal],
+    ["workspace: 42", "workspace must be a string path"],
+  ] as const) {
+    test(`refuses ${JSON.stringify(line)}`, () => {
+      const cfg = join(dir, "agent.yaml");
+      writeFileSync(cfg, `agentId: probe\n${line}\n`, "utf-8");
+
+      expect(() => loadAgentConfig(cfg)).toThrow(message);
+    });
+  }
+
+  test("uses the current directory when the config has no workspace key", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\n", "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    expect(parsed.workspace).toBe(process.cwd());
+    expect(parsed.mailDir).toBe(`${process.cwd()}/mail`);
+  });
 });
