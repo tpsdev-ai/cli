@@ -55,9 +55,9 @@ function interpolateEnvVars<T>(value: T): T {
 }
 
 /**
- * A relative workspace is anchored at the config file's directory, so every
- * process that reads this config resolves the same absolute path. An absolute
- * workspace is used unchanged.
+ * A relative workspace is anchored at the config file's directory, so the
+ * launching process and a sandboxed child resolve the same absolute path. An
+ * absolute workspace is used unchanged.
  */
 function resolveWorkspace(configured: string, configDir: string): string {
   return isAbsolute(configured) ? configured : resolve(configDir, configured);
