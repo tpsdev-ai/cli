@@ -231,6 +231,46 @@ test("a second cleanup of an already-removed record makes no Git call and does n
   }
 });
 
+test("a worktree replaced at the same path after the add is not removed", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    expect(created!.identity?.gitDir).toBe(join(f.base, ".git", "worktrees", "ws"));
+    expect(created!.identity?.head).toBe(
+      spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim(),
+    );
+    expect(created!.identity?.headRef).toBeNull();
+
+    // Replace the worktree the add created with a different one at the same path.
+    const removed = spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base, encoding: "utf8" });
+    expect(removed.status, removed.stderr).toBe(0);
+    const added = spawnSync(GIT, ["worktree", "add", "-b", "replacement", f.workspace], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect((error as Error).message).toContain("HEAD ref changed");
+    expect(created!.removed).toBeUndefined();
+
+    // The replacement keeps its marker, its registry entry and its branch.
+    expect(existsSync(join(f.workspace, ".git"))).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+    const registryEntry = join(f.base, ".git", "worktrees", "ws", "gitdir");
+    expect(existsSync(registryEntry)).toBe(true);
+    expect(branches(f.base)).toContain("replacement");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("a path re-used by a different worktree after removal is left untouched", () => {
   const f = fixture();
   try {

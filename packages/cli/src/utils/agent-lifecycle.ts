@@ -246,6 +246,28 @@ export interface WorktreeCleanupBinding {
 }
 
 /**
+ * Facts that identify the worktree a launch created, recorded immediately
+ * after `git worktree add` succeeds. A different worktree later placed at the
+ * same path has a different git directory, registry entry or HEAD.
+ */
+export interface WorktreeIdentity {
+  /** Canonical path of the worktree directory. */
+  workspace: string;
+  /** The worktree's admin git directory, named by its `.git` file. */
+  gitDir: string;
+  /** The base repository's common git directory. */
+  gitCommonDir: string;
+  /** `<gitDir>/gitdir`, which records the worktree's `.git` path. */
+  registryEntry: string;
+  /** Contents of `registryEntry` when the worktree was created. */
+  recordedGitdir: string;
+  /** The commit HEAD named when the worktree was created. */
+  head: string;
+  /** The ref HEAD named, or null when HEAD was detached. */
+  headRef: string | null;
+}
+
+/**
  * The worktree entry this call created, recorded immediately after
  * `git worktree add` succeeds. `onStart` reports it to the caller before it
  * resolves the worktree's git directories, so a failure after the add can
@@ -255,6 +277,8 @@ export interface WorktreeCleanupBinding {
 export interface WorktreeCreation {
   workspace: string;
   baseWorkingTree: string;
+  /** Recorded immediately after the add; absent when that read failed, and cleanup then refuses to remove. */
+  identity?: WorktreeIdentity;
   /** Set once this worktree has been removed; a second cleanup attempt is skipped. */
   removed?: boolean;
 }
@@ -580,9 +604,12 @@ export function onStart(
   }
 
   // Recorded from the path the add just created: no later step has to resolve
-  // anything for the cleanup to know what to remove (cli#660).
+  // anything for the cleanup to know what to remove (cli#660). The identity is
+  // read from the worktree's own `.git` file and HEAD before any later setup
+  // step can fail, so a replacement at the same path is refused (cli#660).
   const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo };
   try {
+    created.identity = recordWorktreeIdentity(workspace, baseRepo);
     opts.onCreated?.(created);
     const metadata = worktreeGitMetadata(workspace, baseRepo);
     const registryEntry = join(metadata.gitDir, "gitdir");
@@ -601,7 +628,9 @@ export function onStart(
     const removal = tryRemoveCreatedWorktree(created);
     if (!removal.ok) {
       throw new WorktreeLifecycleError(
-        `${(err as Error).message}; worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+        removal.refused
+          ? `${(err as Error).message}; worktree cleanup refused for ${created.workspace}: ${removal.detail}`
+          : `${(err as Error).message}; worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
       );
     }
     if (err instanceof WorktreeLifecycleError) throw err;
@@ -609,7 +638,108 @@ export function onStart(
   }
 }
 
-function tryRemoveCreatedWorktree(created: WorktreeCreation): { ok: true } | { ok: false; detail: string } {
+/**
+ * Read the facts that identify the worktree `git worktree add` just created.
+ * Throws when any of them cannot be read, so an unrecorded identity is never
+ * read as a verified one.
+ */
+function recordWorktreeIdentity(workspace: string, baseWorkingTree: string): WorktreeIdentity {
+  try {
+    const marker = readFileSync(join(workspace, ".git"), "utf-8").trim();
+    if (!marker.startsWith("gitdir: ")) {
+      throw new Error("the worktree .git file does not name a git directory");
+    }
+    const gitDir = realpathSync(resolve(workspace, marker.slice("gitdir: ".length)));
+    const registryEntry = join(gitDir, "gitdir");
+    const recordedGitdir = readFileSync(registryEntry, "utf-8");
+    const common = git(baseWorkingTree, ["rev-parse", "--git-common-dir"]);
+    if (!common.ok || !common.stdout) {
+      throw new Error(common.stderr || common.stdout || "git rev-parse produced no output");
+    }
+    const gitCommonDir = realpathSync(resolve(baseWorkingTree, common.stdout));
+    if (realpathSync(worktreeCommonDir(gitDir)) !== gitCommonDir) {
+      throw new Error("the worktree metadata does not belong to the base repository");
+    }
+    const head = git(workspace, ["rev-parse", "HEAD"]);
+    if (!head.ok || !head.stdout) {
+      throw new Error(head.stderr || head.stdout || "git rev-parse produced no output");
+    }
+    const headRef = readHeadRef(workspace);
+    if (headRef === undefined) throw new Error("git symbolic-ref produced no ref state");
+    return {
+      workspace: comparablePath(workspace),
+      gitDir,
+      gitCommonDir,
+      registryEntry,
+      recordedGitdir,
+      head: head.stdout,
+      headRef,
+    };
+  } catch (err) {
+    if (err instanceof WorktreeLifecycleError) throw err;
+    throw new WorktreeLifecycleError(
+      `worktree identity could not be recorded for ${workspace}: ${(err as Error).message}`,
+    );
+  }
+}
+
+/** HEAD's symbolic ref, null when detached. A failed read is undefined, never detached. */
+function readHeadRef(workspace: string): string | null | undefined {
+  const ref = spawnSync("git", ["symbolic-ref", "-q", "HEAD"], {
+    cwd: workspace,
+    encoding: "utf-8",
+    env: gitEnv(),
+  });
+  if (ref.status === 0) return ref.stdout.trim();
+  if (ref.status === 1) return null;
+  return undefined;
+}
+
+/**
+ * The first recorded identity fact that no longer matches the worktree at the
+ * recorded path, or null when every fact still matches. A fact that cannot be
+ * read is reported as a mismatch, never as a match.
+ */
+function createdWorktreeIdentityError(created: WorktreeCreation): string | null {
+  const identity = created.identity;
+  if (!identity) return "the worktree identity was not recorded";
+  try {
+    if (comparablePath(created.workspace) !== identity.workspace) {
+      return "the worktree path changed";
+    }
+    const marker = readFileSync(join(created.workspace, ".git"), "utf-8").trim();
+    if (!marker.startsWith("gitdir: ")) return "the worktree .git file does not name a git directory";
+    const gitDir = realpathSync(resolve(created.workspace, marker.slice("gitdir: ".length)));
+    if (gitDir !== identity.gitDir) return `the worktree git directory changed (${gitDir})`;
+    if (readFileSync(identity.registryEntry, "utf-8") !== identity.recordedGitdir) {
+      return "the worktree registry entry changed";
+    }
+    if (realpathSync(worktreeCommonDir(identity.gitDir)) !== identity.gitCommonDir) {
+      return "the common git directory changed";
+    }
+    const head = git(created.workspace, ["rev-parse", "HEAD"]);
+    if (!head.ok || !head.stdout) {
+      return `the worktree HEAD could not be read: ${head.stderr || head.stdout || "git produced no output"}`;
+    }
+    if (head.stdout !== identity.head) return `the worktree HEAD changed (${head.stdout})`;
+    const headRef = readHeadRef(created.workspace);
+    if (headRef === undefined) return "the worktree HEAD ref could not be read";
+    if (headRef !== identity.headRef) {
+      return `the worktree HEAD ref changed (${headRef ?? "detached"})`;
+    }
+  } catch (err) {
+    return (err as Error).message;
+  }
+  return null;
+}
+
+function tryRemoveCreatedWorktree(
+  created: WorktreeCreation,
+): { ok: true } | { ok: false; detail: string; refused?: boolean } {
+  const identityError = createdWorktreeIdentityError(created);
+  if (identityError) {
+    return { ok: false, refused: true, detail: identityError };
+  }
   const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
   if (!remove.ok) {
     return { ok: false, detail: remove.stderr || remove.stdout || "git produced no output" };
@@ -663,7 +793,9 @@ export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycle
   const removal = tryRemoveCreatedWorktree(created);
   if (!removal.ok) {
     throw new WorktreeLifecycleError(
-      `worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+      removal.refused
+        ? `worktree cleanup refused for ${created.workspace}: ${removal.detail}`
+        : `worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
     );
   }
   return { changed: true, reason: "worktree removed" };
