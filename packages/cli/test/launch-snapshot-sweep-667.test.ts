@@ -16,6 +16,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   utimesSync,
@@ -445,6 +446,125 @@ try {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }, 40_000);
+
+  test("a SIGTERM while the launch is paused before it publishes leaves no pending directory, and the launch exits", async () => {
+    const fixture = makeFixture();
+    const config = join(fixture.root, "agent.yaml");
+    writeFileSync(config, "agentId: probe\n");
+    const pauseFile = join(fixture.root, "paused.json");
+    const releaseFile = join(fixture.root, "release");
+    const scriptPath = join(fixture.root, "signalled-launch.mjs");
+    writeFileSync(
+      scriptPath,
+      `
+import { existsSync, writeFileSync } from "node:fs";
+import { runAgent } from ${JSON.stringify(AGENT_MODULE)};
+try {
+  await runAgent({ action: "start", config: ${JSON.stringify(config)} }, {
+    afterPendingSnapshot: (path) => {
+      writeFileSync(${JSON.stringify(pauseFile)}, JSON.stringify({ path }));
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline && !existsSync(${JSON.stringify(releaseFile)})) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    },
+    afterConfigSnapshot: () => {
+      throw new Error("stop after snapshot");
+    },
+  });
+} catch (error) {
+  if (error?.message === "stop after snapshot") process.exit(0);
+  throw error;
+}
+`,
+    );
+    const child = spawn("bun", [scriptPath], {
+      cwd: fixture.root,
+      env: { ...process.env, HOME: join(fixture.root, "home") },
+      stdio: "ignore",
+    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+      child.once("exit", (code, signal) => resolveExit({ code, signal }));
+    });
+    try {
+      let paused: string | undefined;
+      const pauseDeadline = Date.now() + 10_000;
+      while (paused === undefined && Date.now() < pauseDeadline) {
+        try {
+          paused = JSON.parse(readFileSync(pauseFile, "utf-8")).path as string;
+        } catch {
+          await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+        }
+      }
+      expect(paused, "the launch never paused before publishing").toBeDefined();
+      expect(basename(paused as string).startsWith(".pending-config-")).toBe(true);
+
+      expect(child.kill("SIGTERM")).toBe(true);
+      writeFileSync(releaseFile, "");
+      const exit = await Promise.race([
+        exited,
+        new Promise<null>((resolveTimeout) => setTimeout(() => resolveTimeout(null), 15_000)),
+      ]);
+
+      expect(exit, "the launch did not exit after SIGTERM").not.toBeNull();
+      expect(existsSync(paused as string), "a SIGTERM in the pending window left the pending directory").toBe(false);
+      expect(readdirSync(fixture.launch).filter((name) => name.includes("config-"))).toEqual([]);
+    } finally {
+      child.kill("SIGKILL");
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("an owner-record write failure rejects the launch, removes the pending directory, and leaves no exit or signal listener", () => {
+    const fixture = makeFixture();
+    try {
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+      const script = `
+import { existsSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { runAgent } from ${JSON.stringify(AGENT_MODULE)};
+const counts = () => Object.fromEntries(["exit", "SIGINT", "SIGTERM", "SIGHUP"].map((name) => [name, process.listenerCount(name)]));
+const before = counts();
+let pending = null;
+let during = null;
+let error = null;
+try {
+  await runAgent({ action: "start", config: ${JSON.stringify(config)} }, {
+    afterPendingSnapshot: (path) => {
+      pending = path;
+      during = counts();
+      // A directory where the owner record goes makes its exclusive write fail.
+      mkdirSync(join(path, "owner.json"));
+    },
+    afterConfigSnapshot: () => {
+      throw new Error("stop after snapshot");
+    },
+  });
+} catch (caught) {
+  error = caught?.code ?? String(caught?.message ?? caught);
+}
+console.log("RESULT " + JSON.stringify({ before, during, after: counts(), pending, pendingExists: pending !== null && existsSync(pending), error }));
+`;
+
+      const result = runLaunchChild(fixture, script);
+
+      expect(result.status, result.stderr).toBe(0);
+      const line = result.stdout.split("\n").find((entry) => entry.startsWith("RESULT "));
+      expect(line, result.stdout).toBeDefined();
+      const report = JSON.parse((line as string).slice("RESULT ".length));
+      expect(report.error).toBe("EEXIST");
+      expect(report.pendingExists).toBe(false);
+      expect(report.after).toEqual(report.before);
+      // The exit and signal handlers were installed while the pending directory existed.
+      for (const name of ["exit", "SIGINT", "SIGTERM", "SIGHUP"]) {
+        expect(report.during[name], name).toBe(report.before[name] + 1);
+      }
+      expect(readdirSync(fixture.launch).filter((name) => name.includes("config-"))).toEqual([]);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("a FIFO owner record does not block the launch", () => {
     const fixture = makeFixture();

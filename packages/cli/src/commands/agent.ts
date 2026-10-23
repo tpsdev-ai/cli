@@ -1107,11 +1107,12 @@ export async function runAgent(
   }
   // The snapshot becomes visible as `config-*` only after its owner record is
   // written. Until then it sits in the pending namespace, which the sweep does
-  // not examine.
-  const pendingRoot = mkdtempSync(join(parent, LAUNCH_SNAPSHOT_PENDING_PREFIX));
-  let snapshotRoot = pendingRoot;
+  // not examine. The exit and signal handlers are installed before the pending
+  // directory exists, and cleanup removes whichever of the pending or published
+  // directory this launch holds.
+  let snapshotRoot: string | undefined;
   const cleanup = () => {
-    rmSync(snapshotRoot, { recursive: true, force: true });
+    if (snapshotRoot !== undefined) rmSync(snapshotRoot, { recursive: true, force: true });
     if (createdParent) {
       try {
         rmdirSync(parent);
@@ -1122,11 +1123,6 @@ export async function runAgent(
     }
   };
   process.once("exit", cleanup);
-  testHooks?.afterPendingSnapshot?.(pendingRoot);
-  writeLaunchSnapshotOwner(pendingRoot);
-  const publishedRoot = join(parent, `${LAUNCH_SNAPSHOT_PREFIX}${basename(pendingRoot).slice(LAUNCH_SNAPSHOT_PENDING_PREFIX.length)}`);
-  renameSync(pendingRoot, publishedRoot);
-  snapshotRoot = publishedRoot;
   const signalHandlers = (["SIGINT", "SIGTERM", "SIGHUP"] as const).map((signal) => {
     const handler = () => {
       cleanup();
@@ -1137,6 +1133,13 @@ export async function runAgent(
     return { signal, handler };
   });
   try {
+    const pendingRoot = mkdtempSync(join(parent, LAUNCH_SNAPSHOT_PENDING_PREFIX));
+    snapshotRoot = pendingRoot;
+    testHooks?.afterPendingSnapshot?.(pendingRoot);
+    writeLaunchSnapshotOwner(pendingRoot);
+    const publishedRoot = join(parent, `${LAUNCH_SNAPSHOT_PREFIX}${basename(pendingRoot).slice(LAUNCH_SNAPSHOT_PENDING_PREFIX.length)}`);
+    renameSync(pendingRoot, publishedRoot);
+    snapshotRoot = publishedRoot;
     const configPath = join(snapshotRoot, "agent.yaml");
     writeFileSync(configPath, readFileSync(workspaceConfigPath), { mode: 0o600, flag: "wx" });
     testHooks?.afterConfigSnapshot?.(configPath);

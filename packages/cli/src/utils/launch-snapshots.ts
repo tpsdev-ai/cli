@@ -11,8 +11,9 @@
  * snapshot has its owner record. The sweep does not examine pending entries at
  * all: a pending directory exists between its creation and that rename, and a
  * launch may be paused there for any length of time, so a sweep that touched it
- * could race that launch. A forced kill in that window can leave one small
- * directory behind.
+ * could race that launch. A SIGINT, SIGTERM or SIGHUP, or a throw, in that
+ * window runs the launcher's cleanup; a forced kill there can leave one small
+ * directory behind (cli#677 tracks sweeping those).
  *
  * Each snapshot records its owning launcher: pid and, when one is readable, a
  * process start token. When the recorded and current tokens are both readable
