@@ -1082,7 +1082,7 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 export async function runAgent(
   args: AgentArgs,
   testHooks?: {
-    afterPendingSnapshot?: (path: string) => void;
+    afterPendingSnapshot?: (path: string) => void | Promise<void>;
     afterConfigSnapshot?: (path: string) => void;
     beforeSnapshotSweep?: (launchDir: string) => void;
   },
@@ -1106,10 +1106,9 @@ export async function runAgent(
     );
   }
   // The snapshot becomes visible as `config-*` only after its owner record is
-  // written. Until then it sits in the pending namespace, which the sweep does
-  // not examine. The exit and signal handlers are installed before the pending
-  // directory exists, and cleanup removes whichever of the pending or published
-  // directory this launch holds.
+  // written. Until then it sits in the pending namespace. The exit and signal
+  // handlers are installed before the pending directory exists, and cleanup
+  // removes whichever of the pending or published directory this launch holds.
   let snapshotRoot: string | undefined;
   const cleanup = () => {
     if (snapshotRoot !== undefined) rmSync(snapshotRoot, { recursive: true, force: true });
@@ -1135,7 +1134,8 @@ export async function runAgent(
   try {
     const pendingRoot = mkdtempSync(join(parent, LAUNCH_SNAPSHOT_PENDING_PREFIX));
     snapshotRoot = pendingRoot;
-    testHooks?.afterPendingSnapshot?.(pendingRoot);
+    const paused = testHooks?.afterPendingSnapshot?.(pendingRoot);
+    if (paused) await paused;
     writeLaunchSnapshotOwner(pendingRoot);
     const publishedRoot = join(parent, `${LAUNCH_SNAPSHOT_PREFIX}${basename(pendingRoot).slice(LAUNCH_SNAPSHOT_PENDING_PREFIX.length)}`);
     renameSync(pendingRoot, publishedRoot);

@@ -1,16 +1,17 @@
 /**
- * cli#667 — launch snapshot ownership and sweeping.
+ * cli#667, cli#677, cli#681 — launch snapshot ownership and sweeping.
  *
  * Snapshots are private `config-*` directories under `~/.tps/launch`. A snapshot
  * is created as `.pending-config-*`, gets its owner record (pid, and a start
- * token when one is readable), and is renamed to `config-*`; the sweep does not
- * examine pending entries, and removes a published entry whose recorded owner
- * is dead or that has no readable owner record past the grace period. Age is
- * the entry directory's mtime.
+ * token when one is readable), and is renamed to `config-*`. The sweep removes a
+ * published or pending entry whose recorded owner is dead, or that has no
+ * readable owner record past its grace period (one minute published, 24 hours
+ * pending). Age is the entry directory's mtime.
  */
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
@@ -21,12 +22,14 @@ import {
   symlinkSync,
   utimesSync,
   writeFileSync,
-} from "node:fs";import { tmpdir } from "node:os";
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { processStartToken } from "@tpsdev-ai/agent";
 import {
   LAUNCH_SNAPSHOT_OWNER_FILE,
   LAUNCH_SNAPSHOT_OWNER_GRACE_MS,
+  LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS,
   sweepStaleLaunchSnapshots,
   writeLaunchSnapshotOwner,
 } from "../src/utils/launch-snapshots.js";
@@ -63,6 +66,12 @@ function ageSnapshot(dir: string): void {
   utimesSync(dir, past, past);
 }
 
+/** Make a snapshot look older than the pending grace period. */
+function agePastPendingGrace(dir: string): void {
+  const past = (Date.now() - LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS - 60_000) / 1000;
+  utimesSync(dir, past, past);
+}
+
 function makeFifo(path: string): void {
   const result = spawnSync("mkfifo", [path], { encoding: "utf-8", timeout: 10_000 });
   expect(result.status).toBe(0);
@@ -73,6 +82,21 @@ function deadPid(): number {
   const result = spawnSync(process.execPath, ["-e", ""], { timeout: 10_000 });
   expect(result.pid).toBeGreaterThan(0);
   return result.pid as number;
+}
+
+/** A running child process and its start token. */
+async function liveProcess(): Promise<{ child: ReturnType<typeof spawn>; pid: number; token: string }> {
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const pid = child.pid as number;
+  expect(pid).toBeGreaterThan(0);
+  let token: string | null = null;
+  const deadline = Date.now() + 5_000;
+  while (token === null && Date.now() < deadline) {
+    token = processStartToken(pid);
+    if (token === null) await new Promise((resolveWait) => setTimeout(resolveWait, 20));
+  }
+  expect(token).not.toBeNull();
+  return { child, pid, token: token as string };
 }
 
 describe("launch snapshot owner record", () => {
@@ -155,26 +179,63 @@ describe("sweepStaleLaunchSnapshots", () => {
       writeFileSync(join(target, "keep.txt"), "keep\n");
       const link = join(fixture.launch, "config-link");
       symlinkSync(target, link);
+      const pendingLink = join(fixture.launch, ".pending-config-link");
+      symlinkSync(target, pendingLink);
 
       expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([]);
       expect(lstatSync(link).isSymbolicLink()).toBe(true);
+      expect(lstatSync(pendingLink).isSymbolicLink()).toBe(true);
       expect(readFileSync(join(target, "keep.txt"), "utf-8")).toBe("keep\n");
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   });
-  test("keeps a pending snapshot with no readable owner regardless of age", () => {
+  test("keeps a pending snapshot with no readable owner past the published grace period and removes one past 24 hours", () => {
     const fixture = makeFixture();
     try {
-      const pending = makeSnapshot(fixture.launch, ".pending-config-abc123");
-      ageSnapshot(pending);
+      const young = makeSnapshot(fixture.launch, ".pending-config-young");
+      ageSnapshot(young);
+      const old = makeSnapshot(fixture.launch, ".pending-config-old");
+      // An unparsable record, as a forced kill during the owner write can leave.
+      writeFileSync(join(old, LAUNCH_SNAPSHOT_OWNER_FILE), '{"pid":');
+      agePastPendingGrace(old);
+      const oldEmpty = makeSnapshot(fixture.launch, ".pending-config-old-empty");
+      agePastPendingGrace(oldEmpty);
 
-      expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([]);
-      expect(existsSync(pending)).toBe(true);
+      expect(sweepStaleLaunchSnapshots(fixture.launch).sort()).toEqual([old, oldEmpty].sort());
+      expect(existsSync(young)).toBe(true);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   });
+
+  test("removes a pending snapshot whose recorded owner is dead and keeps one owned by a running process", async () => {
+    const fixture = makeFixture();
+    const live = await liveProcess();
+    try {
+      const gone = makeSnapshot(fixture.launch, ".pending-config-gone");
+      writeOwner(gone, { pid: deadPid(), startToken: "proc:1" });
+      const token = processStartToken(process.pid);
+      expect(token).not.toBeNull();
+      const source = token!.slice(0, token!.indexOf(":") + 1);
+      const reused = makeSnapshot(fixture.launch, ".pending-config-reused");
+      writeOwner(reused, { pid: process.pid, startToken: `${source}stale-token` });
+      // Owned by a running process: kept however old, with its token and with none.
+      const owned = makeSnapshot(fixture.launch, ".pending-config-owned");
+      writeOwner(owned, { pid: live.pid, startToken: live.token });
+      agePastPendingGrace(owned);
+      const ownedNoToken = makeSnapshot(fixture.launch, ".pending-config-owned-no-token");
+      writeOwner(ownedNoToken, { pid: live.pid, startToken: null });
+      agePastPendingGrace(ownedNoToken);
+
+      expect(sweepStaleLaunchSnapshots(fixture.launch).sort()).toEqual([gone, reused].sort());
+      expect(existsSync(owned)).toBe(true);
+      expect(existsSync(ownedNoToken)).toBe(true);
+    } finally {
+      live.child.kill("SIGKILL");
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   test("does not block on a FIFO owner record and removes it past the grace period", () => {
     const fixture = makeFixture();
@@ -603,6 +664,163 @@ console.log("RESULT " + JSON.stringify({ before, during, after: counts(), pendin
       expect(result.stdout).toContain("SNAPSHOT_REACHED");
       expect(existsSync(oversized)).toBe(false);
     } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+  test("the next launch removes a pending snapshot whose recorded owner is dead and keeps one owned by a running process", async () => {
+    const fixture = makeFixture();
+    const live = await liveProcess();
+    try {
+      const gone = makeSnapshot(fixture.launch, ".pending-config-gone");
+      writeOwner(gone, { pid: deadPid(), startToken: "proc:1" });
+      const owned = makeSnapshot(fixture.launch, ".pending-config-owned");
+      writeOwner(owned, { pid: live.pid, startToken: live.token });
+      agePastPendingGrace(owned);
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+
+      const result = runLaunchChild(fixture, launchScript(config, false));
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("SNAPSHOT_REACHED");
+      expect(existsSync(gone)).toBe(false);
+      expect(existsSync(owned)).toBe(true);
+    } finally {
+      live.child.kill("SIGKILL");
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a launch whose ownerless pending directory a sweep removes while it is paused fails writing the owner record and publishes nothing", () => {
+    const fixture = makeFixture();
+    try {
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+      const script = `
+import { utimesSync } from "node:fs";
+import { dirname } from "node:path";
+import { runAgent } from ${JSON.stringify(AGENT_MODULE)};
+import { LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS, sweepStaleLaunchSnapshots } from ${JSON.stringify(SNAPSHOTS_MODULE)};
+let pending = null;
+let removed = null;
+let error = null;
+try {
+  await runAgent({ action: "start", config: ${JSON.stringify(config)} }, {
+    afterPendingSnapshot: (path) => {
+      pending = path;
+      // The directory as a later launch's sweep finds it once this launcher has been stopped here past the grace period.
+      const past = (Date.now() - LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS - 60_000) / 1000;
+      utimesSync(path, past, past);
+      removed = sweepStaleLaunchSnapshots(dirname(path));
+    },
+    afterConfigSnapshot: () => {
+      throw new Error("stop after snapshot");
+    },
+  });
+} catch (caught) {
+  error = caught?.code ?? String(caught?.message ?? caught);
+}
+console.log("RESULT " + JSON.stringify({ pending, removed, error }));
+`;
+
+      const result = runLaunchChild(fixture, script);
+
+      expect(result.status, result.stderr).toBe(0);
+      const line = result.stdout.split("\n").find((entry) => entry.startsWith("RESULT "));
+      expect(line, result.stdout).toBeDefined();
+      const report = JSON.parse((line as string).slice("RESULT ".length));
+      expect(report.removed).toEqual([report.pending]);
+      expect(report.error).toBe("ENOENT");
+      expect(readdirSync(fixture.launch).filter((name) => name.includes("config-"))).toEqual([]);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a SIGTERM while the launch waits at its pending snapshot, with nothing else failing, removes the pending directory through the signal handler", async () => {
+    const fixture = makeFixture();
+    const config = join(fixture.root, "agent.yaml");
+    writeFileSync(config, "agentId: probe\n");
+    const pauseFile = join(fixture.root, "paused.json");
+    const scriptPath = join(fixture.root, "signal-only-launch.mjs");
+    writeFileSync(
+      scriptPath,
+      `
+import { writeFileSync } from "node:fs";
+import { runAgent } from ${JSON.stringify(AGENT_MODULE)};
+await runAgent({ action: "start", config: ${JSON.stringify(config)} }, {
+  // Waits on the event loop, so the SIGTERM handler can run while the snapshot is pending.
+  afterPendingSnapshot: (path) => new Promise(() => {
+    writeFileSync(${JSON.stringify(pauseFile)}, JSON.stringify({ path }));
+    // A bound: SIGKILL runs no handler, so a launch that no signal handler ended exits with its directory left.
+    setTimeout(() => process.kill(process.pid, "SIGKILL"), 20_000);
+  }),
+});
+console.log("LAUNCH_CONTINUED");
+`,
+    );
+    const child = spawn("bun", [scriptPath], {
+      cwd: fixture.root,
+      env: { ...process.env, HOME: join(fixture.root, "home") },
+      stdio: "ignore",
+    });
+    const exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+      child.once("exit", (code, signal) => resolveExit({ code, signal }));
+    });
+    try {
+      let paused: string | undefined;
+      const pauseDeadline = Date.now() + 10_000;
+      while (paused === undefined && Date.now() < pauseDeadline) {
+        try {
+          paused = JSON.parse(readFileSync(pauseFile, "utf-8")).path as string;
+        } catch {
+          await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+        }
+      }
+      expect(paused, "the launch never paused at its pending snapshot").toBeDefined();
+      expect(basename(paused as string).startsWith(".pending-config-")).toBe(true);
+
+      expect(child.kill("SIGTERM")).toBe(true);
+      const exit = await Promise.race([
+        exited,
+        new Promise<null>((resolveTimeout) => setTimeout(() => resolveTimeout(null), 15_000)),
+      ]);
+
+      // The handler re-raises the signal once it has cleaned up.
+      expect(exit).toEqual({ code: null, signal: "SIGTERM" });
+      expect(existsSync(paused as string), "the SIGTERM handler left the pending directory").toBe(false);
+      expect(readdirSync(fixture.launch).filter((name) => name.includes("config-"))).toEqual([]);
+    } finally {
+      child.kill("SIGKILL");
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  // Directory permissions do not stop root, so this case cannot produce the error under root and is skipped there.
+  const RUNS_AS_ROOT = process.getuid?.() === 0;
+  test.skipIf(RUNS_AS_ROOT)("a stale snapshot the sweep cannot read or remove is logged and kept, another stale snapshot is removed, and the launch continues", () => {
+    const fixture = makeFixture();
+    const stuck = makeSnapshot(fixture.launch, "config-stuck");
+    try {
+      writeFileSync(join(stuck, "agent.yaml"), "agentId: probe\n");
+      ageSnapshot(stuck);
+      chmodSync(stuck, 0o000);
+      const stale = makeSnapshot(fixture.launch, "config-stale");
+      writeOwner(stale, { pid: deadPid(), startToken: "proc:1" });
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+
+      const result = runLaunchChild(fixture, launchScript(config, false));
+      chmodSync(stuck, 0o700);
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("SNAPSHOT_REACHED");
+      expect(result.stderr).toContain("warning: could not remove stale launch snapshot ");
+      expect(result.stderr).toContain(`${basename(stuck)}: `);
+      expect(readFileSync(join(stuck, "agent.yaml"), "utf-8")).toBe("agentId: probe\n");
+      expect(existsSync(stale)).toBe(false);
+    } finally {
+      chmodSync(stuck, 0o700);
       rmSync(fixture.root, { recursive: true, force: true });
     }
   }, 30_000);
