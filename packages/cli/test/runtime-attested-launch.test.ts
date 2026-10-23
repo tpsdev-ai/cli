@@ -347,6 +347,39 @@ describe("interactive selected runtime with no nono", () => {
   }
 });
 
+describe("interactive selected runtime with a ~ workspace", () => {
+  for (const rt of RUNTIMES) {
+    test(`${rt}: --no-sandbox refuses a workspace starting with ~ before worktree setup or runner start`, () => {
+      const sb = makeSandbox();
+      try {
+        const base = join(sb.home, "ops", "tps");
+        mkdirSync(base, { recursive: true });
+        const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
+        for (const args of [["init", "-q"], ["config", "user.email", "agent-a@tps.dev"], ["config", "user.name", "agent-a"], ["commit", "-q", "--allow-empty", "-m", "init"]]) {
+          expect(g(args).status).toBe(0);
+        }
+        const agentDir = join(sb.home, ".tps", "agents", "probe");
+        writeFileSync(
+          join(agentDir, "agent.yaml"),
+          `agentId: probe\nname: probe\nworkspace: ~/work\nmailDir: ${join(sb.home, ".tps", "mail")}\nllm:\n  provider: ollama\n  model: probe-model\n`,
+        );
+        const result = interactiveRuntimeProbe(sb, rt, true);
+        expect(result.text).toContain(
+          "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+        );
+        expect(result.status).toBe(1);
+        expect(existsSync(result.selectedMarker)).toBe(false);
+        expect(existsSync(result.defaultMarker)).toBe(false);
+        expect(existsSync(join(agentDir, "~"))).toBe(false);
+        expect(g(["worktree", "list", "--porcelain"]).stdout.match(/^worktree /gm)).toHaveLength(1);
+        expect(existsSync(join(sb.home, ".tps", "launch"))).toBe(false);
+        expect(fakeNonoRuns(sb)).toEqual([]);
+      } finally {
+        rmSync(sb.root, {recursive: true, force: true});
+      }
+    });
+  }
+});
 
 test("interactive default runtime with no nono still warns and starts", () => {
   const sb = makeSandbox();
