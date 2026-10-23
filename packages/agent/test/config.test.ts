@@ -140,4 +140,11 @@ describe("agent config env interpolation", () => {
 
     expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "worktree"));
   });
+
+  test("uses workspace over repo when both keys are set", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: chosen\nrepo: ignored\n", "utf-8");
+
+    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "chosen"));
+  });
 });

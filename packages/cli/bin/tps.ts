@@ -509,9 +509,10 @@ async function main() {
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
             const { agentWorkspace: resolveWorkspace } = await import("../src/utils/agent-workspace.js");
             const { readConfiguredWorkspace } = await import("@tpsdev-ai/agent");
+            const configured = readConfiguredWorkspace(agentCfg);
             const agentWorkspace = resolveWorkspace(
               cfgPath,
-              readConfiguredWorkspace(agentCfg).workspace ?? join(homedir(), "ops", "tps"),
+              configured.workspace ?? configured.repo ?? join(homedir(), "ops", "tps"),
               sandboxed ? process.env : undefined,
             );
 

@@ -1,0 +1,1 @@
+- **A selected runtime uses `repo` when `workspace` is absent, as the native AgentRuntime does.** `tps agent start --runtime codex|gemini|claude-code` resolves its workspace from `workspace`, then `repo`, then its default, so both start routes pick the same directory for a config that names it with `repo` (Closes #679).

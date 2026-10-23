@@ -357,9 +357,14 @@ const STRING_REFUSAL = "workspace must be a string path";
 type WorkspaceRun = { result: ReturnType<typeof interactiveRuntimeProbe>; sb: Sandbox; agentDir: string; worktrees: number };
 
 /** The interactive opt-out start for `rt`, with `workspaceLine` in its config and a real base repository. */
-function workspaceOptOut(rt: (typeof RUNTIMES)[number], workspaceLine: string, check: (run: WorkspaceRun) => void): void {
+function workspaceOptOut(
+  rt: (typeof RUNTIMES)[number],
+  workspaceLines: string | ((sb: Sandbox) => string),
+  check: (run: WorkspaceRun) => void,
+): void {
   const sb = makeSandbox();
   try {
+    const workspaceLine = typeof workspaceLines === "function" ? workspaceLines(sb) : workspaceLines;
     const base = join(sb.home, "ops", "tps");
     mkdirSync(base, { recursive: true });
     const g = (args: string[]) => spawnSync("git", args, { cwd: base, encoding: "utf-8" });
@@ -415,6 +420,40 @@ describe("interactive selected runtime workspace values", () => {
       expect(run.result.status).toBe(0);
       expect(existsSync(run.result.selectedMarker)).toBe(true);
       expect(existsSync(run.result.defaultMarker)).toBe(false);
+    });
+  });
+
+  const runnerDirs = (sb: Sandbox) => {
+    const dirs = { workspace: join(sb.root, "ws-dir"), repo: join(sb.root, "repo-dir"), fallback: join(sb.home, "ops", "tps") };
+    mkdirSync(dirs.workspace);
+    mkdirSync(dirs.repo);
+    return dirs;
+  };
+
+  test("codex: --no-sandbox with a repo key and no workspace key starts its runner in the repo directory", () => {
+    let dirs: ReturnType<typeof runnerDirs> | undefined;
+    workspaceOptOut("codex", (sb) => {
+      dirs = runnerDirs(sb);
+      return `repo: ${dirs.repo}`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dirs!.repo, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(dirs!.fallback, ".tps-agent.pid"))).toBe(false);
+    });
+  });
+
+  test("codex: --no-sandbox with workspace and repo keys starts its runner in the workspace", () => {
+    let dirs: ReturnType<typeof runnerDirs> | undefined;
+    workspaceOptOut("codex", (sb) => {
+      dirs = runnerDirs(sb);
+      return `workspace: ${dirs.workspace}\nrepo: ${dirs.repo}`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dirs!.workspace, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(dirs!.repo, ".tps-agent.pid"))).toBe(false);
+      expect(existsSync(join(dirs!.fallback, ".tps-agent.pid"))).toBe(false);
     });
   });
 });
