@@ -246,6 +246,20 @@ export interface WorktreeCleanupBinding {
 }
 
 /**
+ * The worktree entry this call created, recorded immediately after
+ * `git worktree add` succeeds. `onStart` reports it to the caller before it
+ * resolves the worktree's git directories, so a failure after the add can
+ * still remove exactly this worktree. The add is detached, so no branch is
+ * created and none is removed by the cleanup.
+ */
+export interface WorktreeCreation {
+  workspace: string;
+  baseWorkingTree: string;
+  /** Set once this worktree has been removed; a second cleanup attempt is skipped. */
+  removed?: boolean;
+}
+
+/**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
  * caller can tell a worktree failure from any other error and report it as one;
  * the message names the operation that failed.
@@ -505,12 +519,17 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  *
  * With `deferCheckout: true`, setup disables hooks and fsmonitor and skips checkout.
  *
+ * `onCreated` receives the worktree record as soon as the add succeeds, before
+ * the git directories are resolved. If a later step throws, `onStart` removes
+ * the worktree it created; the record's `removed` flag says whether that
+ * cleanup succeeded, so a caller can retry once.
+ *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
 export function onStart(
   agentId: string,
   workspacePath?: string,
-  opts: { deferCheckout?: boolean } = {},
+  opts: { deferCheckout?: boolean; onCreated?: (creation: WorktreeCreation) => void } = {},
 ): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
@@ -560,8 +579,11 @@ export function onStart(
     );
   }
 
-  const rollback = () => git(baseRepo, ["worktree", "remove", "--force", workspace]);
+  // Recorded from the path the add just created: no later step has to resolve
+  // anything for the cleanup to know what to remove (cli#660).
+  const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo };
   try {
+    opts.onCreated?.(created);
     const metadata = worktreeGitMetadata(workspace, baseRepo);
     const registryEntry = join(metadata.gitDir, "gitdir");
     return {
@@ -576,13 +598,38 @@ export function onStart(
       },
     };
   } catch (err) {
-    const removed = rollback();
-    if (!removed.ok) {
-      throw new WorktreeLifecycleError(`${(err as Error).message}; worktree cleanup failed: ${removed.stderr || removed.stdout}`);
+    const removal = tryRemoveCreatedWorktree(created);
+    if (!removal.ok) {
+      throw new WorktreeLifecycleError(
+        `${(err as Error).message}; worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+      );
     }
     if (err instanceof WorktreeLifecycleError) throw err;
     throw new WorktreeLifecycleError(`worktree setup binding failed for ${workspace}: ${(err as Error).message}`);
   }
+}
+
+function tryRemoveCreatedWorktree(created: WorktreeCreation): { ok: true } | { ok: false; detail: string } {
+  const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
+  if (!remove.ok) {
+    return { ok: false, detail: remove.stderr || remove.stdout || "git produced no output" };
+  }
+  created.removed = true;
+  return { ok: true };
+}
+
+/**
+ * Remove the worktree a launch created, by the record taken at creation time.
+ * Throws `WorktreeLifecycleError` naming the path when removal fails.
+ */
+export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
+  const removal = tryRemoveCreatedWorktree(created);
+  if (!removal.ok) {
+    throw new WorktreeLifecycleError(
+      `worktree cleanup failed for ${created.workspace}: ${removal.detail}`,
+    );
+  }
+  return { changed: true, reason: "worktree removed" };
 }
 
 function worktreeGitMetadata(workspace: string, baseRepo: string): { gitDir: string; gitCommonDir: string; baseWorkingTree: string } {

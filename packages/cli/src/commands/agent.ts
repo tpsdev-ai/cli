@@ -1314,23 +1314,43 @@ async function runAgentCommand(
               }
               return result;
             };
-            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            const { onStart, onStop, removeCreatedWorktree } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
+            let createdWorktree: import("../utils/agent-lifecycle.js").WorktreeCreation | undefined;
             let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
             let approval: ReturnType<typeof agentLaunchOptions>;
             try {
               approval = approveLaunch();
               const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
-              const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
-              worktreeCreated = start?.changed ?? false;
+              // Record the worktree as soon as the add succeeds, so a failure in
+              // any later step (including the rest of setup) can remove exactly
+              // the worktree this launch created (cli#660).
+              const start = selectedRuntime
+                ? onStart(launchId, config.workspace, {
+                    deferCheckout: true,
+                    onCreated: (created) => {
+                      createdWorktree = created;
+                      worktreeCreated = true;
+                    },
+                  })
+                : undefined;
+              worktreeCreated = start?.changed ?? worktreeCreated;
               cleanupBinding = start?.cleanupBinding;
               approval = approveLaunch();
             } catch (err) {
               console.error(`❌ ${(err as Error).message}`);
               if (worktreeCreated) {
                 try {
-                  onStop(launchId, config.workspace, cleanupBinding);
+                  if (cleanupBinding) {
+                    onStop(launchId, config.workspace, cleanupBinding);
+                  } else if (createdWorktree) {
+                    // Cleanup already failed inside setup, or setup failed
+                    // before it returned a binding: try once from the record.
+                    if (!createdWorktree.removed) removeCreatedWorktree(createdWorktree);
+                  } else {
+                    onStop(launchId, config.workspace);
+                  }
                 } catch (cleanupErr) {
                   console.error(`❌ ${(cleanupErr as Error).message}`);
                 }

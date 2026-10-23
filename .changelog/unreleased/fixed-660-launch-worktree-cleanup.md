@@ -1,0 +1,1 @@
+- **A launch that adds a worktree records it immediately, so a failure after the add removes that worktree.** The record carries the workspace path and the base repository; cleanup removes exactly that entry and names the path when removal fails. The worktree is added detached, so no branch is created or removed.
