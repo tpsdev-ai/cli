@@ -24,6 +24,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -693,6 +694,147 @@ test("unit — removeCreatedWorktree: an unregistered path is refused with inspe
     expect((error as Error).message).not.toContain("worktree remove");
     expect(existsSync(f.workspace)).toBe(true);
     expect(worktreeList(f.base)).not.toContain(`worktree ${f.workspace}`);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// cli#676 — setup cleanup and bound onStop give registration-aware guidance
+// ---------------------------------------------------------------------------
+
+/** The guidance for a path the base does not list as its worktree. */
+function inspectGuidance(f: Fixture): string {
+  return `${f.workspace} is no longer a registered worktree of ${f.base}; inspect it and remove it yourself if it is yours`;
+}
+
+/**
+ * Make real `git worktree list` fail in the base: a neighbouring worktree whose
+ * `locked` entry is a directory makes Git's listing exit non-zero. `restore`
+ * removes that directory.
+ */
+function breakWorktreeListing(f: Fixture): { restore: () => void } {
+  const neighbour = join(f.root, "neighbour");
+  const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", neighbour], { cwd: f.base, encoding: "utf8" });
+  expect(added.status, added.stderr).toBe(0);
+  const lock = join(adminDir(neighbour), "locked");
+  mkdirSync(lock);
+  const listed = spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" });
+  expect(listed.status).not.toBe(0);
+  return { restore: () => rmSync(lock, { recursive: true, force: true }) };
+}
+
+test("unit — setup cleanup refuses an unregistered path with inspection guidance, not a Git command", () => {
+  const f = fixture();
+  const { restore } = installWrapper(f, {
+    beforeFail: [`"${GIT}" -C "${f.base}" worktree remove --force "${f.workspace}"`, `mkdir "${f.workspace}"`].join("\n"),
+  });
+  try {
+    let created: WorktreeCreation | undefined;
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain("injected metadata failure");
+    expect(message).toContain(`worktree cleanup refused for ${f.workspace}: `);
+    expect(message).toContain(inspectGuidance(f));
+    expect(message).not.toContain("remove it manually with");
+    expect(message).not.toContain("worktree remove");
+    expect(message).not.toContain("git -C");
+    expect(created!.removed).toBeUndefined();
+    // The plain directory at the path is left as it was.
+    expect(readdirSync(f.workspace)).toEqual([]);
+    expect(worktreeList(f.base)).not.toContain(`worktree ${f.workspace}\n`);
+  } finally {
+    restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — setup cleanup reports a failed worktree listing with inspection guidance, not a Git command", () => {
+  const f = fixture();
+  const listing = breakWorktreeListing(f);
+  const { restore } = installWrapper(f, { blockMarker: true, injectMetadataFailure: false });
+  try {
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain("worktree ownership marker could not be written");
+    expect(message).toContain(`worktree cleanup refused for ${f.workspace}: `);
+    expect(message).toContain(`worktree registration could not be read for ${f.workspace}: `);
+    expect(message).toContain("; inspect it and remove it yourself if it is yours");
+    expect(message).not.toContain("remove it manually with");
+    expect(message).not.toContain("worktree remove");
+    expect(message).not.toContain("git -C");
+    listing.restore();
+    expect(worktreeList(f.base)).toContain(`worktree ${f.workspace}\n`);
+  } finally {
+    restore();
+    listing.restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — bound onStop refuses an unregistered path with inspection guidance, not a Git command", () => {
+  const f = fixture();
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    expect(spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base }).status).toBe(0);
+    mkdirSync(f.workspace);
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, started.cleanupBinding);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain(`worktree cleanup binding changed for ${f.workspace}: `);
+    expect(message).toContain(inspectGuidance(f));
+    expect(message).not.toContain("remove it manually with");
+    expect(message).not.toContain("worktree remove");
+    expect(message).not.toContain("git -C");
+    expect(readdirSync(f.workspace)).toEqual([]);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — bound onStop reports a failed worktree listing with inspection guidance, not a Git command", () => {
+  const f = fixture();
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    // A different marker makes the bound route refuse.
+    writeFileSync(join(adminDir(f.workspace), "tps-launch-owner"), randomUUID());
+    const listing = breakWorktreeListing(f);
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, started.cleanupBinding);
+    } catch (err) {
+      error = err;
+    }
+    listing.restore();
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain(`worktree cleanup binding changed for ${f.workspace}: `);
+    expect(message).toContain("the worktree ownership marker changed in");
+    expect(message).toContain(`worktree registration could not be read for ${f.workspace}: `);
+    expect(message).toContain("; inspect it and remove it yourself if it is yours");
+    expect(message).not.toContain("remove it manually with");
+    expect(message).not.toContain("worktree remove");
+    expect(message).not.toContain("git -C");
+    expect(worktreeList(f.base)).toContain(`worktree ${f.workspace}\n`);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

@@ -281,7 +281,7 @@ export interface WorktreeIdentity {
  * The setup-failure cleanup attempts removal when the admin directory still
  * holds the recorded marker and any recorded identity facts still match; the
  * removal itself can fail, and a missing or different marker is refused with
- * the manual command. The add is detached, so no
+ * the guidance `refusalGuidance` gives. The add is detached, so no
  * branch is created and none is removed by the cleanup.
  */
 export interface WorktreeCreation {
@@ -564,7 +564,8 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  * returning a binding. If a later step throws, `onStart` attempts to remove
  * the worktree it created when the recorded marker and any recorded identity
  * facts still match, and otherwise the cleanup refuses. A refusal prints the
- * manual command; a failed Git removal prints Git's error and the manual
+ * manual command when the base lists the path as its worktree, and inspection
+ * guidance otherwise; a failed Git removal prints Git's error and the manual
  * command. The record's `removed`
  * flag says whether that cleanup succeeded, so a caller can retry once.
  *
@@ -712,6 +713,26 @@ function manualRemovalCommand(target: { baseWorkingTree: string; workspace: stri
   return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
 }
 
+/** Guidance for a path the recorded base does not list as its worktree: no Git command. */
+function unregisteredGuidance(target: { baseWorkingTree: string; workspace: string }): string {
+  return `${target.workspace} is no longer a registered worktree of ${target.baseWorkingTree}; inspect it and remove it yourself if it is yours`;
+}
+
+/**
+ * What a cleanup refusal tells the operator (cli#676): the manual command when
+ * the recorded base lists the path as its worktree, and inspection guidance
+ * when it does not. A failed listing is reported with the inspection guidance.
+ */
+function refusalGuidance(target: { baseWorkingTree: string; workspace: string }): string {
+  let registered: boolean;
+  try {
+    registered = worktreeRegisteredAt(target.baseWorkingTree, target.workspace);
+  } catch (err) {
+    return `${(err as Error).message}; inspect it and remove it yourself if it is yours`;
+  }
+  return registered ? `remove it manually with: ${manualRemovalCommand(target)}` : unregisteredGuidance(target);
+}
+
 /**
  * Read the facts that identify the worktree `git worktree add` just created.
  * Throws when any of them cannot be read, so an unrecorded identity is never
@@ -807,19 +828,23 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
   return null;
 }
 
+/** `registered` is true when the caller has just found the path in the base's worktree list. */
 function tryRemoveCreatedWorktree(
   created: WorktreeCreation,
+  registered = false,
 ): { ok: true } | { ok: false; detail: string; refused?: boolean } {
+  const guidance = () =>
+    registered ? `remove it manually with: ${manualRemovalCommand(created)}` : refusalGuidance(created);
   // The marker decides ownership. The identity facts are supporting checks,
   // used when they were recorded: a detached replacement at the same commit
   // reproduces all of them, so they cannot refuse on their own.
   const ownershipError = createdWorktreeOwnershipError(created);
   if (ownershipError) {
-    return { ok: false, refused: true, detail: `${ownershipError}; remove it manually with: ${manualRemovalCommand(created)}` };
+    return { ok: false, refused: true, detail: `${ownershipError}; ${guidance()}` };
   }
   const identityError = created.identity ? createdWorktreeIdentityError(created) : null;
   if (identityError) {
-    return { ok: false, refused: true, detail: `${identityError}; remove it manually with: ${manualRemovalCommand(created)}` };
+    return { ok: false, refused: true, detail: `${identityError}; ${guidance()}` };
   }
   const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
   if (!remove.ok) {
@@ -876,12 +901,9 @@ export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycle
     return { changed: false, reason: "worktree already removed" };
   }
   if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
-    throw new WorktreeLifecycleError(
-      `worktree cleanup refused for ${created.workspace}: ${created.workspace} is no longer a registered worktree of ` +
-        `${created.baseWorkingTree}; inspect it and remove it yourself if it is yours`,
-    );
+    throw new WorktreeLifecycleError(`worktree cleanup refused for ${created.workspace}: ${unregisteredGuidance(created)}`);
   }
-  const removal = tryRemoveCreatedWorktree(created);
+  const removal = tryRemoveCreatedWorktree(created, true);
   if (!removal.ok) {
     throw new WorktreeLifecycleError(
       removal.refused
@@ -998,7 +1020,7 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
       }
     } catch (err) {
       throw new WorktreeLifecycleError(
-        `worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}; remove it manually with: ${manualRemovalCommand(binding)}`,
+        `worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}; ${refusalGuidance(binding)}`,
       );
     }
     const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
