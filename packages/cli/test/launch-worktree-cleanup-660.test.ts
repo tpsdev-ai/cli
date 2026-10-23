@@ -2,10 +2,9 @@
  * cli#660 — a launch that adds a worktree and then fails before the parent
  * records the setup binding must remove the worktree it added.
  *
- * Real Git only: every case creates a base repository, lets `git worktree add`
- * succeed, and injects the failure at the step that follows it (a `git`
- * wrapper that fails `rev-parse --absolute-git-dir`, which setup runs first
- * after the add).
+ * The failure cases inject a metadata error after a real `git worktree add` (a
+ * `git` wrapper that fails `rev-parse --absolute-git-dir`, which setup runs
+ * first after the add).
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
