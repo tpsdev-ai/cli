@@ -11,6 +11,7 @@
 
 import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
@@ -246,9 +247,11 @@ export interface WorktreeCleanupBinding {
 }
 
 /**
- * Facts that identify the worktree a launch created, recorded immediately
- * after `git worktree add` succeeds. A different worktree later placed at the
- * same path has a different git directory, registry entry or HEAD.
+ * Facts that identify the worktree a launch created, read after the ownership
+ * marker is written. They support the marker check: a different worktree
+ * placed at the same path usually differs in git directory, registry entry or
+ * HEAD, but a detached worktree at the same commit can reproduce every one of
+ * them, so the marker is what decides ownership.
  */
 export interface WorktreeIdentity {
   /** Canonical path of the worktree directory. */
@@ -269,19 +272,28 @@ export interface WorktreeIdentity {
 
 /**
  * The worktree entry this call created, recorded immediately after
- * `git worktree add` succeeds. `onStart` reports it to the caller before it
- * resolves the worktree's git directories, so a failure after the add can
- * still remove exactly this worktree. The add is detached, so no branch is
- * created and none is removed by the cleanup.
+ * `git worktree add` succeeds. `onStart` writes an ownership marker into the
+ * worktree's admin git directory, reports this record through `onCreated`,
+ * and only then reads the identity facts, so the caller always has a record
+ * for a failure after the add. The setup-failure cleanup removes the worktree
+ * when the admin directory still holds the recorded marker and any recorded
+ * identity facts still match; a missing or different marker is refused with
+ * the manual command. The add is detached, so no
+ * branch is created and none is removed by the cleanup.
  */
 export interface WorktreeCreation {
   workspace: string;
   baseWorkingTree: string;
-  /** Recorded immediately after the add; absent when that read failed, and cleanup then refuses to remove. */
+  /** Random nonce written to the worktree's admin git directory, or null when that write failed; cleanup refuses a null marker. */
+  ownerMarker: string | null;
+  /** Read after `onCreated`; absent when that read failed, and the marker alone then decides cleanup. */
   identity?: WorktreeIdentity;
   /** Set once this worktree has been removed; a second cleanup attempt is skipped. */
   removed?: boolean;
 }
+
+/** Marker file written with exclusive create in a created worktree's admin git directory. */
+const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
 
 /**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
@@ -543,10 +555,13 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  *
  * With `deferCheckout: true`, setup disables hooks and fsmonitor and skips checkout.
  *
- * `onCreated` receives the worktree record as soon as the add succeeds, before
- * the git directories are resolved. If a later step throws, `onStart` removes
- * the worktree it created; the record's `removed` flag says whether that
- * cleanup succeeded, so a caller can retry once.
+ * `onCreated` receives the worktree record after the add and its ownership
+ * marker, before the identity facts are read. If a later step throws,
+ * `onStart` removes the worktree it created when the recorded marker and any
+ * recorded identity facts still match, and otherwise refuses and prints the
+ * manual command; the record's
+ * `removed` flag says whether that cleanup succeeded, so a caller can retry
+ * once.
  *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
@@ -603,14 +618,22 @@ export function onStart(
     );
   }
 
-  // Recorded from the path the add just created: no later step has to resolve
-  // anything for the cleanup to know what to remove (cli#660). The identity is
-  // read from the worktree's own `.git` file and HEAD before any later setup
-  // step can fail, so a replacement at the same path is refused (cli#660).
-  const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo };
+  // Mark the worktree before any other step: a replacement removed and
+  // re-added at the same path gets a fresh admin directory, so it never
+  // carries this nonce (cli#660). Report the record before the identity read,
+  // so a failure in that read still leaves the caller a record to clean up.
+  const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo, ownerMarker: null };
   try {
-    created.identity = recordWorktreeIdentity(workspace, baseRepo);
+    const nonce = randomUUID();
+    try {
+      writeFileSync(join(worktreeAdminDir(workspace), OWNERSHIP_MARKER_NAME), nonce, { flag: "wx" });
+      created.ownerMarker = nonce;
+    } catch {
+      // The record reports a null marker; cleanup then refuses and prints the
+      // manual command rather than removing a worktree it cannot identify.
+    }
     opts.onCreated?.(created);
+    created.identity = recordWorktreeIdentity(workspace, baseRepo);
     const metadata = worktreeGitMetadata(workspace, baseRepo);
     const registryEntry = join(metadata.gitDir, "gitdir");
     return {
@@ -636,6 +659,37 @@ export function onStart(
     if (err instanceof WorktreeLifecycleError) throw err;
     throw new WorktreeLifecycleError(`worktree setup binding failed for ${workspace}: ${(err as Error).message}`);
   }
+}
+
+/** The admin git directory named by the worktree's own `.git` file. */
+function worktreeAdminDir(workspace: string): string {
+  const marker = readFileSync(join(workspace, ".git"), "utf-8").trim();
+  if (!marker.startsWith("gitdir: ")) {
+    throw new Error("the worktree .git file does not name a git directory");
+  }
+  return realpathSync(resolve(workspace, marker.slice("gitdir: ".length)));
+}
+
+/**
+ * The reason the worktree at the recorded path is not the one this call
+ * marked, or null when its admin directory still holds the exact nonce. A
+ * marker that is absent or cannot be read is a mismatch, never a match.
+ */
+function createdWorktreeOwnershipError(created: WorktreeCreation): string | null {
+  if (created.ownerMarker === null) return "the worktree ownership marker was not recorded";
+  try {
+    const gitDir = worktreeAdminDir(created.workspace);
+    const recorded = readFileSync(join(gitDir, OWNERSHIP_MARKER_NAME), "utf-8").trim();
+    if (recorded !== created.ownerMarker) return `the worktree ownership marker changed in ${gitDir}`;
+  } catch (err) {
+    return `the worktree ownership marker could not be read: ${(err as Error).message}`;
+  }
+  return null;
+}
+
+/** The command an operator runs when cleanup refuses. */
+function manualRemovalCommand(created: WorktreeCreation): string {
+  return `git -C ${created.baseWorkingTree} worktree remove --force ${created.workspace}`;
 }
 
 /**
@@ -736,9 +790,16 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
 function tryRemoveCreatedWorktree(
   created: WorktreeCreation,
 ): { ok: true } | { ok: false; detail: string; refused?: boolean } {
-  const identityError = createdWorktreeIdentityError(created);
+  // The marker decides ownership. The identity facts are supporting checks,
+  // used when they were recorded: a detached replacement at the same commit
+  // reproduces all of them, so they cannot refuse on their own.
+  const ownershipError = createdWorktreeOwnershipError(created);
+  if (ownershipError) {
+    return { ok: false, refused: true, detail: `${ownershipError}; remove it manually with: ${manualRemovalCommand(created)}` };
+  }
+  const identityError = created.identity ? createdWorktreeIdentityError(created) : null;
   if (identityError) {
-    return { ok: false, refused: true, detail: identityError };
+    return { ok: false, refused: true, detail: `${identityError}; remove it manually with: ${manualRemovalCommand(created)}` };
   }
   const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
   if (!remove.ok) {
@@ -778,8 +839,13 @@ function comparablePath(path: string): string {
  * Remove the worktree a launch created, by the record taken at creation time.
  * A record already marked removed is skipped without a Git call, and a path
  * the recorded base no longer registers as its worktree is refused rather
- * than removed. Throws `WorktreeLifecycleError` naming the path when removal
- * fails.
+ * than removed. Removal requires the admin directory named by the worktree's
+ * `.git` file to hold the recorded marker, and any recorded identity facts to
+ * still match; a missing or different marker is refused with the manual
+ * command. A worktree swapped in between that check
+ * and the remove call is not covered: the verify-to-remove race is deferred
+ * and filed separately. Throws `WorktreeLifecycleError` naming the path when
+ * removal fails.
  */
 export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
   if (created.removed) {

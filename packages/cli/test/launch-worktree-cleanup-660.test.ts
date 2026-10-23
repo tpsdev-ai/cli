@@ -2,15 +2,19 @@
  * cli#660 — a launch that adds a worktree and then fails before the parent
  * records the setup binding must remove the worktree it added.
  *
- * The failure cases inject a metadata error after a real `git worktree add` (a
- * `git` wrapper that fails `rev-parse --absolute-git-dir`, which setup runs
- * first after the add).
+ * Right after a real `git worktree add`, setup writes a random nonce to
+ * `<admin git dir>/tps-launch-owner` with exclusive create, reports the record
+ * through `onCreated`, and only then reads the identity facts. Cleanup removes
+ * a worktree only when its admin directory still holds that nonce; otherwise
+ * it refuses, names the path and prints the manual command. The failure cases
+ * inject a metadata error after identity capture, at
+ * `rev-parse --absolute-git-dir`.
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   onStart,
   removeCreatedWorktree,
@@ -53,18 +57,67 @@ function worktreeList(base: string): string {
   return listed.stdout;
 }
 
+function headOf(workspace: string): string {
+  const head = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: workspace, encoding: "utf8" });
+  expect(head.status, head.stderr).toBe(0);
+  return head.stdout.trim();
+}
+
+function adminDir(workspace: string): string {
+  const file = readFileSync(join(workspace, ".git"), "utf-8").trim();
+  expect(file.startsWith("gitdir: ")).toBe(true);
+  return realpathSync(resolve(workspace, file.slice("gitdir: ".length)));
+}
+
 /**
- * A git wrapper that fails the first metadata step after the add. `beforeFail`
- * runs before the injected failure, and `failRemoval` makes the cleanup's
- * `worktree remove` fail too.
+ * A git wrapper that fails `rev-parse --absolute-git-dir` (the step after
+ * identity capture). `beforeFail` runs before the injected failure,
+ * `failRemoval` makes the cleanup's `worktree remove` fail, `blockMarker`
+ * creates a directory where the ownership marker goes, and `failHeadIn`
+ * fails the identity read's `rev-parse HEAD` in that directory.
  */
-function installWrapper(f: Fixture, opts: { beforeFail?: string; failRemoval?: boolean } = {}): { bin: string; restore: () => void } {
+function installWrapper(
+  f: Fixture,
+  opts: { beforeFail?: string; failRemoval?: boolean; blockMarker?: boolean; failHeadIn?: string } = {},
+): { bin: string; restore: () => void } {
   const bin = join(f.root, "bin");
   mkdirSync(bin);
+  const blockMarker = opts.blockMarker
+    ? [
+        `    GD=$(sed -n 's/^gitdir: //p' "${f.workspace}/.git")`,
+        '    case "$GD" in',
+        "      /*) ;;",
+        `      *) GD="${f.workspace}/$GD" ;;`,
+        "    esac",
+        '    mkdir -p "$GD/tps-launch-owner"',
+      ]
+    : ["    :"];
   writeFileSync(
     join(bin, "git"),
     [
       "#!/bin/sh",
+      "prev=",
+      "is_add=0",
+      'for arg in "$@"; do',
+      '  if [ "$prev" = "worktree" ] && [ "$arg" = "add" ]; then is_add=1; fi',
+      '  prev="$arg"',
+      "done",
+      'if [ "$is_add" = "1" ]; then',
+      `  "${GIT}" "$@"`,
+      "  rc=$?",
+      '  if [ "$rc" = "0" ]; then',
+      ...blockMarker,
+      "  fi",
+      "  exit $rc",
+      "fi",
+      ...(opts.failHeadIn
+        ? [
+            `if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ] && [ "$(pwd -P)" = "${opts.failHeadIn}" ]; then`,
+            '  echo "injected identity failure" >&2',
+            "  exit 78",
+            "fi",
+          ]
+        : []),
       'if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ]; then',
       ...(opts.beforeFail ? [opts.beforeFail.split("\n").map((line) => `  ${line}`).join("\n")] : []),
       '  echo "injected metadata failure" >&2',
@@ -88,7 +141,7 @@ function installWrapper(f: Fixture, opts: { beforeFail?: string; failRemoval?: b
   return { bin, restore: () => { process.env.PATH = oldPath; } };
 }
 
-test("a failure after the worktree add removes the worktree it created", () => {
+test("a failure after the marker and identity capture removes the worktree it marked", () => {
   const f = fixture();
   const { restore } = installWrapper(f);
   try {
@@ -102,13 +155,14 @@ test("a failure after the worktree add removes the worktree it created", () => {
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     expect((error as Error).message).toContain("injected metadata failure");
-    // The record names the worktree the add created, taken before the failure.
+    // The record names the worktree the add created, with its ownership marker.
     expect(created).toBeDefined();
     expect(created!.workspace).toBe(f.workspace);
     expect(created!.baseWorkingTree).toBe(f.base);
+    expect(typeof created!.ownerMarker).toBe("string");
     // Setup's own cleanup succeeded, so the caller's retry is skipped.
     expect(created!.removed).toBe(true);
-    // The worktree and its registration are gone, and no branch was left.
+    // The worktree, its registration and its admin directory are gone, and no branch was left.
     expect(existsSync(f.workspace)).toBe(false);
     expect(worktreeList(f.base)).not.toContain(f.workspace);
     expect(branches(f.base)).toEqual(before);
@@ -231,42 +285,108 @@ test("a second cleanup of an already-removed record makes no Git call and does n
   }
 });
 
-test("a worktree replaced at the same path after the add is not removed", () => {
+test("a same-path detached replacement at the same commit survives setup cleanup and the retry", () => {
   const f = fixture();
+  const commit = headOf(f.base);
+  const { restore } = installWrapper(f, {
+    beforeFail: [
+      `"${GIT}" -C "${f.base}" worktree remove --force "${f.workspace}"`,
+      `"${GIT}" -C "${f.base}" worktree add --detach "${f.workspace}" "${commit}"`,
+    ].join("\n"),
+  });
   try {
     let created: WorktreeCreation | undefined;
-    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
-    expect(created).toBeDefined();
-    expect(created!.identity?.gitDir).toBe(join(f.base, ".git", "worktrees", "ws"));
-    expect(created!.identity?.head).toBe(
-      spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim(),
-    );
-    expect(created!.identity?.headRef).toBeNull();
-
-    // Replace the worktree the add created with a different one at the same path.
-    const removed = spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base, encoding: "utf8" });
-    expect(removed.status, removed.stderr).toBe(0);
-    const added = spawnSync(GIT, ["worktree", "add", "-b", "replacement", f.workspace], { cwd: f.base, encoding: "utf8" });
-    expect(added.status, added.stderr).toBe(0);
-
     let error: unknown;
     try {
-      removeCreatedWorktree(created!);
+      onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
     } catch (err) {
       error = err;
     }
+    // The replacement reproduces every identity fact — same admin directory,
+    // registry entry, common directory, HEAD and detached ref — but carries
+    // no marker, so setup's cleanup refuses and names the manual command.
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("injected metadata failure");
     expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
-    expect((error as Error).message).toContain("HEAD ref changed");
+    expect((error as Error).message).toContain(
+      `git -C ${f.base} worktree remove --force ${f.workspace}`,
+    );
+    expect(created).toBeDefined();
     expect(created!.removed).toBeUndefined();
 
-    // The replacement keeps its marker, its registry entry and its branch.
-    expect(existsSync(join(f.workspace, ".git"))).toBe(true);
+    // The replacement keeps its .git file, registry entry and HEAD.
+    const gitFile = readFileSync(join(f.workspace, ".git"), "utf-8");
+    const gitDir = adminDir(f.workspace);
+    const registry = readFileSync(join(gitDir, "gitdir"), "utf-8");
+    const head = headOf(f.workspace);
+    expect(existsSync(join(gitDir, "tps-launch-owner"))).toBe(false);
+    expect(existsSync(f.workspace)).toBe(true);
     expect(worktreeList(f.base)).toContain(f.workspace);
-    const registryEntry = join(f.base, ".git", "worktrees", "ws", "gitdir");
-    expect(existsSync(registryEntry)).toBe(true);
-    expect(branches(f.base)).toContain("replacement");
+
+    // The launcher's onStart fallback retries from the record and refuses too.
+    expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup refused for ${f.workspace}`);
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(existsSync(join(gitDir, "tps-launch-owner"))).toBe(false);
+    expect(readFileSync(join(f.workspace, ".git"), "utf-8")).toBe(gitFile);
+    expect(readFileSync(join(gitDir, "gitdir"), "utf-8")).toBe(registry);
+    expect(headOf(f.workspace)).toBe(head);
   } finally {
+    restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("an identity-capture failure after the marker still removes the worktree it owns", () => {
+  const f = fixture();
+  const { restore } = installWrapper(f, { failHeadIn: f.workspace });
+  try {
+    let created: WorktreeCreation | undefined;
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    } catch (err) {
+      error = err;
+    }
+    // Report-first: the caller has the record even though the identity read threw.
+    expect(created).toBeDefined();
+    expect(typeof created!.ownerMarker).toBe("string");
+    expect(created!.identity).toBeUndefined();
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("injected identity failure");
+    // The marker matched, so cleanup removed the worktree this call owns.
+    expect(created!.removed).toBe(true);
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(worktreeList(f.base)).not.toContain(f.workspace);
+  } finally {
+    restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a marker-write failure records a null marker and cleanup refuses with the manual command", () => {
+  const f = fixture();
+  const { restore } = installWrapper(f, { blockMarker: true });
+  try {
+    let created: WorktreeCreation | undefined;
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    } catch (err) {
+      error = err;
+    }
+    expect(created).toBeDefined();
+    expect(created!.ownerMarker).toBeNull();
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect((error as Error).message).toContain(
+      `git -C ${f.base} worktree remove --force ${f.workspace}`,
+    );
+    // No marker means no ownership; the worktree is left for the operator.
+    expect(created!.removed).toBeUndefined();
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+  } finally {
+    restore();
     rmSync(f.root, { recursive: true, force: true });
   }
 });

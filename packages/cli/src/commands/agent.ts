@@ -1323,9 +1323,11 @@ async function runAgentCommand(
               approval = approveLaunch();
               const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
-              // Record the worktree as soon as the add succeeds, so a failure in
-              // any later step (including the rest of setup) can remove exactly
-              // the worktree this launch created (cli#660).
+              // Setup marks the worktree and reports it through onCreated before
+              // it reads the identity facts, so a failure in any later step
+              // leaves this launch a record to clean up (cli#660). Cleanup
+              // from that record removes only when the recorded marker still
+              // matches, and otherwise refuses with the manual command.
               const start = selectedRuntime
                 ? onStart(launchId, config.workspace, {
                     deferCheckout: true,
