@@ -1731,7 +1731,28 @@ describe("cli#660 — real launcher worktree ownership", () => {
     }
   });
 
-  /** A fake nono that spawns the wrapped child and reports the live session, so
+  /** The report a confined child sends: the scripted peer reads the launcher's
+   *  own inside canary and reports the OUTSIDE canary DENIED. It states the
+   *  report rather than producing it with a permission denial, which no uid
+   *  can enforce on root (the Docker lane runs as root, where chmod 000 does
+   *  not stop a child reading the canary). */
+  const RELEASE_PEER = `const { connect } = require("node:net");
+const { readFileSync } = require("node:fs");
+const { dirname, join } = require("node:path");
+const sockPath = process.env.TPS_LAUNCH_SOCK;
+const inside = readFileSync(join(dirname(sockPath), "canary-inside"), "utf-8");
+const sock = connect(sockPath);
+sock.on("error", () => process.exit(0));
+sock.on("connect", () => {
+  sock.write("PID " + process.pid + "\\n");
+  sock.write("CANARY OUTSIDE DENIED\\n");
+  sock.write("CANARY INSIDE READ:" + inside + "\\n");
+});
+sock.on("close", () => process.exit(0));
+setTimeout(() => process.exit(0), 15000);
+`;
+
+  /** A fake nono that spawns the scripted peer and reports the live session, so
    *  the launcher releases the child; the fake stops the child after two
    *  seconds so the launch ends and the launcher runs its teardown. */
   const RELEASE_FAKE_NONO = `#!/usr/bin/env bash
@@ -1748,13 +1769,7 @@ if [ "\${1:-}" = "ps" ]; then
   cat "\${FAKE_NONO_PS_JSON:?}"; exit 0
 fi
 if [ "\${1:-}" = "run" ]; then
-  cmd=(); seen=0
-  for a in "$@"; do if [ "$seen" = 1 ]; then cmd+=("$a"); fi; if [ "$a" = "--" ]; then seen=1; fi; done
-  if [ -n "\${TPS_LAUNCH_SOCK:-}" ]; then
-    priv="$(dirname "$(dirname "$TPS_LAUNCH_SOCK")")"
-    [ -f "$priv/canary-outside" ] && chmod 000 "$priv/canary-outside"
-  fi
-  "\${cmd[@]}" &
+  "\${RELEASE_PEER_NODE:?}" "\${RELEASE_PEER:?}" &
   child=$!
   prof=""; args=("$@"); i=0
   for ((i=0; i<\${#args[@]}; i++)); do [ "\${args[$i]}" = "--profile" ] && prof="\${args[$((i+1))]}"; done
@@ -1770,9 +1785,11 @@ exit 0
     const f = launchFixture();
     const commit = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim();
     const wrapper = replaceAtLaunchCheck(f, commit);
-    // A released launch: the fake nono spawns the child and reports the live
-    // session, then stops the child, so the launcher runs its teardown after
-    // the launch ends.
+    // A released launch: the fake nono spawns the scripted peer and reports
+    // the live session, then stops the child, so the launcher runs its
+    // teardown after the launch ends.
+    const peer = join(f.sb.root, "release-peer.cjs");
+    writeFileSync(peer, RELEASE_PEER);
     writeFileSync(f.sb.nonoBin, RELEASE_FAKE_NONO);
     chmodSync(f.sb.nonoBin, 0o755);
     try {
@@ -1783,6 +1800,8 @@ exit 0
         env: cliEnv(f.sb, {
           PATH: wrapper.path,
           FAKE_NONO_PS_JSON: join(f.sb.root, "ps.json"),
+          RELEASE_PEER_NODE: NODE,
+          RELEASE_PEER: peer,
           TPS_LAUNCH_TIMEOUT_MS: "8000",
         }),
       });
