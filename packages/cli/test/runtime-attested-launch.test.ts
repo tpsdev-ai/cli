@@ -443,6 +443,23 @@ describe("interactive selected runtime workspace values", () => {
     });
   });
 
+  test("codex: --no-sandbox resolves a relative repo against the config directory, not the launch directory", () => {
+    let configRelative = "";
+    let launchRelative = "";
+    workspaceOptOut("codex", (sb) => {
+      configRelative = join(sb.home, ".tps", "agents", "probe", "rel-repo");
+      launchRelative = join(sb.ws, "rel-repo");
+      mkdirSync(configRelative);
+      mkdirSync(launchRelative);
+      return "repo: rel-repo";
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(configRelative, ".tps-agent.pid"))).toBe(true);
+      expect(existsSync(join(launchRelative, ".tps-agent.pid"))).toBe(false);
+    });
+  });
+
   test("codex: --no-sandbox with workspace and repo keys starts its runner in the workspace", () => {
     let dirs: ReturnType<typeof runnerDirs> | undefined;
     workspaceOptOut("codex", (sb) => {

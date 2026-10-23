@@ -53,6 +53,23 @@ test("default child uses the parent's absolute workspace with a symlinked config
   }
 });
 
+test("agentWorkspace refuses a workspace starting with ~", () => {
+  const script = `
+    import { agentWorkspace } from ${JSON.stringify(workspaceModule)};
+    try {
+      console.log("resolved " + agentWorkspace("/config/agent.yaml", "~/work"));
+    } catch (err) {
+      console.log(err.message);
+    }
+  `;
+  const result = spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 20_000 });
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+  expect(result.stdout.trim()).toBe(
+    "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+  );
+});
+
 test("parent and child in different directories resolve the same relative workspace", () => {
   const root = mkdtempSync(join(tmpdir(), "workspace-anchor-"));
   try {
