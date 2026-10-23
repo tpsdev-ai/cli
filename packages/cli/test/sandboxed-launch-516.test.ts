@@ -13,6 +13,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -1630,3 +1631,238 @@ realNonoSuite(
     }
   },
 );
+
+// ---------------------------------------------------------------------------
+// cli#660 — the real launcher's own cleanup calls
+// ---------------------------------------------------------------------------
+
+describe("cli#660 — real launcher worktree ownership", () => {
+  const GIT = spawnSync("which", ["git"], { encoding: "utf8" }).stdout?.trim() || "git";
+
+  interface LaunchFixture {
+    sb: Sandbox;
+    base: string;
+  }
+
+  /** A base repository at <home>/ops/tps, an absent workspace, fake nono and a codex config. */
+  function launchFixture(grantInBase?: (base: string) => string): LaunchFixture {
+    const sb = makeSandbox();
+    try {
+      const base = join(sb.home, "ops", "tps");
+      mkdirSync(base, { recursive: true });
+      const git = (args: string[]) => {
+        const result = spawnSync(GIT, args, { cwd: base, encoding: "utf8" });
+        expect(result.status, result.stderr).toBe(0);
+      };
+      git(["init", "-q"]);
+      git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
+      rmSync(sb.ws, { recursive: true, force: true });
+      installFakeNono(sb, "  :");
+      const profiles = join(sb.home, ".config", "nono", "profiles");
+      writeProfilePair(profiles, "tps-agent-run-codex");
+      if (grantInBase) {
+        const grantPath = grantInBase(base);
+        // A write grant inside the base makes the launch check that runs after
+        // setup refuse, while the check before setup passes because the
+        // workspace did not exist yet.
+        writeFileSync(
+          join(profiles, "tps-base-fixture.json"),
+          JSON.stringify({
+            $schema: "https://nono.sh/schemas/nono-profile.schema.json",
+            meta: { name: "tps-base-fixture" },
+            workdir: { access: "readwrite" },
+            filesystem: { read: ["/usr", "/bin", "/lib", "/lib64"], allow: [grantPath], deny: [] },
+          }),
+        );
+      }
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+      );
+      return { sb, base };
+    } catch (err) {
+      rmSync(sb.root, { recursive: true, force: true });
+      throw err;
+    }
+  }
+
+  /**
+   * A git wrapper that, on the second `rev-parse --absolute-git-dir` run in the
+   * workspace (the launch check after setup), replaces the worktree with a
+   * detached one at the same commit and then runs real Git. `replaced` is
+   * written once the swap has run.
+   */
+  function replaceAtLaunchCheck(f: LaunchFixture, commit: string): { replaced: string; path: string } {
+    const bin = join(f.sb.root, "bin");
+    mkdirSync(bin);
+    const afterSetup = join(f.sb.root, "setup-metadata-read");
+    const replaced = join(f.sb.root, "replaced");
+    writeFileSync(
+      join(bin, "git"),
+      [
+        "#!/bin/sh",
+        `if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ] && [ "$(pwd -P)" = "${f.sb.ws}" ]; then`,
+        `  if [ -f "${replaced}" ]; then :; elif [ -f "${afterSetup}" ]; then`,
+        `    "${GIT}" -C "${f.base}" worktree remove --force "${f.sb.ws}" >/dev/null 2>&1`,
+        `    "${GIT}" -C "${f.base}" worktree add --detach "${f.sb.ws}" "${commit}" >/dev/null 2>&1`,
+        `    : > "${replaced}"`,
+        "    cd /",
+        `    exec "${GIT}" -C "${f.sb.ws}" "$@"`,
+        "  else",
+        `    : > "${afterSetup}"`,
+        "  fi",
+        "fi",
+        `exec "${GIT}" "$@"`,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    return { replaced, path: `${bin}:${process.env.PATH}` };
+  }
+
+  function start(sb: Sandbox, path?: string) {
+    return runLauncher(
+      ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+      { cwd: sb.run, env: cliEnv(sb, path ? { PATH: path } : {}) },
+    );
+  }
+
+  test("the later launch-check failure leaves a same-path detached replacement and prints the refusal", () => {
+    const f = launchFixture((base) => join(base, "scratch"));
+    const commit = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim();
+    const wrapper = replaceAtLaunchCheck(f, commit);
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(text).toContain("WorktreeGrantError: grant overlaps the base working tree");
+      expect(text).toContain(`worktree cleanup binding changed for ${f.sb.ws}`);
+      expect(text).toContain(
+        `remove it manually with: git -C '${f.base}' worktree remove --force '${f.sb.ws}'`,
+      );
+      expect(existsSync(wrapper.replaced), text).toBe(true);
+      // The replacement survives with its .git file, registry entry and HEAD.
+      const gitFile = readFileSync(join(f.sb.ws, ".git"), "utf-8");
+      expect(gitFile.startsWith("gitdir: ")).toBe(true);
+      const gitDir = realpathSync(resolve(f.sb.ws, gitFile.trim().slice("gitdir: ".length)));
+      expect(readFileSync(join(gitDir, "gitdir"), "utf-8").trim()).toBe(join(f.sb.ws, ".git"));
+      expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.sb.ws, encoding: "utf8" }).stdout.trim()).toBe(commit);
+      expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(f.sb.ws);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  /** The lines the scripted peer sends under fake nono: it reads the launcher's
+   *  own inside canary and sends OUTSIDE DENIED without attempting that read.
+   *  It states the report instead of producing it with a permission denial: the Docker lane
+   *  runs this suite as root, where chmod 000 does not stop a child reading
+   *  the canary. */
+  const RELEASE_PEER = `const { connect } = require("node:net");
+const { readFileSync } = require("node:fs");
+const { dirname, join } = require("node:path");
+const sockPath = process.env.TPS_LAUNCH_SOCK;
+const inside = readFileSync(join(dirname(sockPath), "canary-inside"), "utf-8");
+const sock = connect(sockPath);
+sock.on("error", () => process.exit(0));
+sock.on("connect", () => {
+  sock.write("PID " + process.pid + "\\n");
+  sock.write("CANARY OUTSIDE DENIED\\n");
+  sock.write("CANARY INSIDE READ:" + inside + "\\n");
+});
+sock.on("close", () => process.exit(0));
+setTimeout(() => process.exit(0), 15000);
+`;
+
+  /** A fake nono that spawns the scripted peer and reports the live session, so
+   *  the launcher releases the child; the fake stops the child after two
+   *  seconds so the launch ends and the launcher runs its teardown. */
+  const RELEASE_FAKE_NONO = `#!/usr/bin/env bash
+set -u
+if [ "\${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi
+if [ "\${1:-}" = "profile" ]; then exit 0; fi
+printf '%s\\n' "ARGV $*" >> "\${NONO_ARGV_LOG:?}"
+if [ "\${1:-}" = "why" ]; then echo '{"status":"denied","reason":"path_not_granted"}'; exit 0; fi
+if [ "\${1:-}" = "ps" ]; then
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    [ -s "\${FAKE_NONO_PS_JSON:?}" ] && break
+    sleep 0.05
+  done
+  cat "\${FAKE_NONO_PS_JSON:?}"; exit 0
+fi
+if [ "\${1:-}" = "run" ]; then
+  "\${RELEASE_PEER_NODE:?}" "\${RELEASE_PEER:?}" &
+  child=$!
+  prof=""; args=("$@"); i=0
+  for ((i=0; i<\${#args[@]}; i++)); do [ "\${args[$i]}" = "--profile" ] && prof="\${args[$((i+1))]}"; done
+  printf '[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n' "$$" "$child" "$prof" > "\${FAKE_NONO_PS_JSON:?}"
+  sleep 2
+  kill -TERM "$child" 2>/dev/null || true
+  wait "$child"; exit $?
+fi
+exit 0
+`;
+
+  test("teardown after a released launch leaves a same-path detached replacement and prints the refusal", () => {
+    const f = launchFixture();
+    const commit = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim();
+    const wrapper = replaceAtLaunchCheck(f, commit);
+    // A released launch: the fake nono spawns the scripted peer and reports
+    // the live session, then stops the child, so the launcher runs its
+    // teardown after the launch ends.
+    const peer = join(f.sb.root, "release-peer.cjs");
+    writeFileSync(peer, RELEASE_PEER);
+    writeFileSync(f.sb.nonoBin, RELEASE_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    try {
+      const result = spawnSync(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED], {
+        cwd: f.sb.run,
+        encoding: "utf8",
+        timeout: 30_000,
+        env: cliEnv(f.sb, {
+          PATH: wrapper.path,
+          FAKE_NONO_PS_JSON: join(f.sb.root, "ps.json"),
+          RELEASE_PEER_NODE: NODE,
+          RELEASE_PEER: peer,
+          TPS_LAUNCH_TIMEOUT_MS: "8000",
+        }),
+      });
+      const text = output(result);
+      expect(text).toContain("released under nono session");
+      expect(text).toContain(`worktree cleanup binding changed for ${f.sb.ws}`);
+      expect(text).toContain(
+        `remove it manually with: git -C '${f.base}' worktree remove --force '${f.sb.ws}'`,
+      );
+      expect(existsSync(wrapper.replaced), text).toBe(true);
+      const gitFile = readFileSync(join(f.sb.ws, ".git"), "utf-8");
+      const gitDir = realpathSync(resolve(f.sb.ws, gitFile.trim().slice("gitdir: ".length)));
+      expect(readFileSync(join(gitDir, "gitdir"), "utf-8").trim()).toBe(join(f.sb.ws, ".git"));
+      // Teardown leaves the replacement's HEAD at its commit and its registration in place.
+      expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.sb.ws, encoding: "utf8" }).stdout.trim()).toBe(commit);
+      expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(f.sb.ws);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("teardown removes the owned worktree after fake nono moved HEAD", () => {
+    const f = launchFixture();
+    const headFile = join(f.sb.root, "runtime-head");
+    installFakeNono(
+      f.sb,
+      `  "${GIT}" -C "\${MOVE_HEAD_IN:?}" -c user.name=fixture -c user.email=fixture@example.com commit --allow-empty -qm runtime-move >/dev/null 2>&1 || true\n` +
+        `  "${GIT}" -C "\${MOVE_HEAD_IN:?}" rev-parse HEAD > "${headFile}"`,
+    );
+    const before = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim();
+    try {
+      const result = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: f.sb.run, env: cliEnv(f.sb, { MOVE_HEAD_IN: f.sb.ws }) },
+      );
+      expect(readFileSync(headFile, "utf-8").trim(), output(result)).not.toBe(before);
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).not.toContain(f.sb.ws);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+});
