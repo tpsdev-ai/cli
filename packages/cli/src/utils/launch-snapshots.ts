@@ -14,9 +14,10 @@
  * could race that launch. A forced kill in that window can leave one small
  * directory behind.
  *
- * Each snapshot records its owning launcher — pid and, when one is readable, a
- * process start token, so a reused pid is not mistaken for the owner — and the
- * next launch removes published entries whose recorded owner is dead, plus
+ * Each snapshot records its owning launcher: pid and, when one is readable, a
+ * process start token. When the recorded and current tokens are both readable
+ * from the same source, a reused pid is not mistaken for the owner. The next
+ * launch removes published entries whose recorded owner is dead, plus
  * published entries with no readable owner record past a grace period.
  */
 
@@ -40,8 +41,10 @@ export const LAUNCH_SNAPSHOT_PENDING_PREFIX = ".pending-config-";
 export const LAUNCH_SNAPSHOT_OWNER_FILE = "owner.json";
 /** An owner record larger than this is treated as unreadable. */
 export const LAUNCH_SNAPSHOT_OWNER_MAX_BYTES = 4096;
-/** How long an ownerless snapshot may exist before it is treated as stale. */
+/** Default for how long an ownerless snapshot may exist before it is treated as stale. */
 export const LAUNCH_SNAPSHOT_OWNER_GRACE_MS = 60_000;
+/** The largest pid Bun's and Node's process.kill accept as an argument. */
+const LAUNCH_SNAPSHOT_MAX_PID = 2_147_483_647;
 
 export interface LaunchSnapshotOwner {
   pid: number;
@@ -61,11 +64,13 @@ export function writeLaunchSnapshotOwner(snapshotDir: string): void {
 }
 
 /**
- * Read an owner record without following a symlink and without blocking on a
- * special file: the leaf is opened O_NOFOLLOW|O_NONBLOCK, must be a regular
- * file, and must be at most LAUNCH_SNAPSHOT_OWNER_MAX_BYTES. Anything else —
- * missing, not a regular file, oversized, unparsable, or a pid/token of the
- * wrong shape — is an unreadable owner, which the sweep treats as ownerless.
+ * Read an owner record without blocking on a special file: the `owner.json`
+ * leaf is opened O_NOFOLLOW|O_NONBLOCK (a symlink at the leaf is not
+ * followed), must be a regular file, and must be at most
+ * LAUNCH_SNAPSHOT_OWNER_MAX_BYTES. Anything else — missing, not a regular file,
+ * oversized, unparsable, a pid that is not an integer in
+ * 1..LAUNCH_SNAPSHOT_MAX_PID, a token of the wrong shape, or an error closing
+ * the file — is an unreadable owner, which the sweep treats as ownerless.
  */
 function readLaunchSnapshotOwner(snapshotDir: string): LaunchSnapshotOwner | null {
   let fd: number;
@@ -77,31 +82,48 @@ function readLaunchSnapshotOwner(snapshotDir: string): LaunchSnapshotOwner | nul
   } catch {
     return null;
   }
+  let owner: LaunchSnapshotOwner | null;
   try {
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) return null;
-    if (stat.size > LAUNCH_SNAPSHOT_OWNER_MAX_BYTES) return null;
-    const buffer = Buffer.allocUnsafe(stat.size);
-    const read = readSync(fd, buffer, 0, stat.size, 0);
-    const parsed = JSON.parse(buffer.subarray(0, read).toString("utf-8")) as Partial<LaunchSnapshotOwner>;
-    if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0) return null;
-    const startToken = parsed.startToken;
-    if (startToken !== null && typeof startToken !== "string") return null;
-    return { pid: parsed.pid, startToken };
+    owner = parseLaunchSnapshotOwner(fd);
+  } catch {
+    owner = null;
+  }
+  try {
+    closeSync(fd);
   } catch {
     return null;
-  } finally {
-    closeSync(fd);
   }
+  return owner;
 }
 
-function pidAlive(pid: number): boolean {
+function parseLaunchSnapshotOwner(fd: number): LaunchSnapshotOwner | null {
+  const stat = fstatSync(fd);
+  if (!stat.isFile()) return null;
+  if (stat.size > LAUNCH_SNAPSHOT_OWNER_MAX_BYTES) return null;
+  const buffer = Buffer.allocUnsafe(stat.size);
+  const read = readSync(fd, buffer, 0, stat.size, 0);
+  const parsed = JSON.parse(buffer.subarray(0, read).toString("utf-8")) as Partial<LaunchSnapshotOwner>;
+  const pid = parsed.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid < 1 || pid > LAUNCH_SNAPSHOT_MAX_PID) return null;
+  const startToken = parsed.startToken;
+  if (startToken !== null && typeof startToken !== "string") return null;
+  return { pid, startToken };
+}
+
+/** Argument errors from process.kill (Bun and Node raise ERR_INVALID_ARG_TYPE for a pid out of range). */
+const PID_ARGUMENT_ERRORS = new Set(["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE", "EINVAL", "ERANGE"]);
+
+function pidState(pid: number): "alive" | "gone" | "invalid" {
   try {
     process.kill(pid, 0);
-    return true;
+    return "alive";
   } catch (error) {
-    // ESRCH: no such process. EPERM: exists but owned by someone else — alive.
-    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    const code = (error as NodeJS.ErrnoException).code;
+    // ESRCH: no such process. An argument error: not a valid owner pid.
+    // EPERM: exists but owned by someone else — alive.
+    if (code === "ESRCH") return "gone";
+    if (code !== undefined && PID_ARGUMENT_ERRORS.has(code)) return "invalid";
+    return "alive";
   }
 }
 
@@ -112,12 +134,16 @@ function tokenSource(token: string): string {
 
 /**
  * "dead" — pid gone, or pid alive under a different readable start token from
- * the same source. A token from another source, or either token unavailable
- * (the recorded token, or the current one), is "unverifiable": it is kept,
- * never treated as dead.
+ * the same source. While the pid is alive, a token from another source, or
+ * either token unavailable (the recorded token, or the current one), is
+ * "unverifiable": it is kept, never treated as dead. A pid for which process.kill
+ * raises one of PID_ARGUMENT_ERRORS is "unreadable", like an owner record that
+ * cannot be read.
  */
-function ownerState(owner: LaunchSnapshotOwner): "alive" | "dead" | "unverifiable" {
-  if (!pidAlive(owner.pid)) return "dead";
+function ownerState(owner: LaunchSnapshotOwner): "alive" | "dead" | "unverifiable" | "unreadable" {
+  const pid = pidState(owner.pid);
+  if (pid === "invalid") return "unreadable";
+  if (pid === "gone") return "dead";
   if (owner.startToken === null) return "unverifiable";
   const current = processStartToken(owner.pid);
   if (current === null) return "unverifiable";
@@ -152,7 +178,8 @@ export function sweepStaleLaunchSnapshots(
 
     const path = join(launchDir, entry.name);
     const owner = readLaunchSnapshotOwner(path);
-    if (owner === null) {
+    const state = owner === null ? "unreadable" : ownerState(owner);
+    if (state === "unreadable") {
       let mtimeMs: number;
       try {
         mtimeMs = lstatSync(path).mtimeMs;
@@ -161,7 +188,7 @@ export function sweepStaleLaunchSnapshots(
         continue;
       }
       if (now - mtimeMs < graceMs) continue;
-    } else if (ownerState(owner) !== "dead") {
+    } else if (state !== "dead") {
       continue;
     }
 

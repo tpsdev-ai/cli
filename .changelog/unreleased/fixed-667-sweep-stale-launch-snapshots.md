@@ -5,8 +5,8 @@
   to `config-*` after its owner record is written, so a published snapshot has
   its owner record; the sweep does not examine pending entries. The owner record
   holds the launching pid and, when one is readable, its process start token. It
-  is read without following a symlink, must be a regular file of at most 4 KiB,
-  and is parsed strictly.
+  is opened without following a symlink at `owner.json` itself, must be a
+  regular file of at most 4 KiB, and is parsed strictly.
 
   The next launch removes a published entry whose pid is gone, or whose pid is
   alive under a different readable start token from the same source; a live pid

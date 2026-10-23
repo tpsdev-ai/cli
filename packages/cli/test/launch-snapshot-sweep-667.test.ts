@@ -56,7 +56,7 @@ function makeSnapshot(launchDir: string, name: string): string {
   return dir;
 }
 
-/** Make a snapshot look older than any grace period. */
+/** Make a snapshot look older than the default grace period. */
 function ageSnapshot(dir: string): void {
   const past = (Date.now() - LAUNCH_SNAPSHOT_OWNER_GRACE_MS - 60_000) / 1000;
   utimesSync(dir, past, past);
@@ -75,7 +75,7 @@ function deadPid(): number {
 }
 
 describe("launch snapshot owner record", () => {
-  test("records the launching pid and its process start token", () => {
+  test("records the launching pid and its process start token, or null when none is readable", () => {
     const fixture = makeFixture();
     try {
       const snapshot = makeSnapshot(fixture.launch, "config-new");
@@ -112,7 +112,7 @@ describe("sweepStaleLaunchSnapshots", () => {
     }
   });
 
-  test("treats a reused pid with a different start token as dead", () => {
+  test("treats the current pid with a planted mismatched start token from the same source as dead", () => {
     const fixture = makeFixture();
     try {
       const reused = makeSnapshot(fixture.launch, "config-reused");
@@ -214,6 +214,44 @@ console.log("REMOVED " + JSON.stringify(sweepStaleLaunchSnapshots(${JSON.stringi
 
       expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([oversized]);
       expect(existsSync(oversized)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test("treats an owner pid outside 1..2147483647 as an unreadable record and keeps the current pid and pid 1", () => {
+    const fixture = makeFixture();
+    try {
+      const unsupported = (
+        [
+          ["config-pid-above-range", 2_147_483_648],
+          ["config-pid-zero", 0],
+          ["config-pid-negative", -1],
+        ] as const
+      ).map(([name, pid]) => {
+        const dir = makeSnapshot(fixture.launch, name);
+        writeOwner(dir, { pid, startToken: null });
+        ageSnapshot(dir);
+        return dir;
+      });
+      // The same record inside the grace period is kept, as an unreadable owner
+      // record is.
+      const young = makeSnapshot(fixture.launch, "config-pid-above-range-young");
+      writeOwner(young, { pid: 2_147_483_648, startToken: null });
+      // Aged snapshots of live pids: this process with its own token, and pid 1
+      // with none (pid 1 always exists; when this process may not signal it,
+      // the check fails with EPERM).
+      const live = makeSnapshot(fixture.launch, "config-live");
+      writeOwner(live, { pid: process.pid, startToken: processStartToken(process.pid) });
+      ageSnapshot(live);
+      const pidOne = makeSnapshot(fixture.launch, "config-pid-one");
+      writeOwner(pidOne, { pid: 1, startToken: null });
+      ageSnapshot(pidOne);
+
+      expect(sweepStaleLaunchSnapshots(fixture.launch).sort()).toEqual([...unsupported].sort());
+      expect(existsSync(young)).toBe(true);
+      expect(existsSync(live)).toBe(true);
+      expect(existsSync(pidOne)).toBe(true);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });
     }
