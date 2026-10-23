@@ -7,11 +7,14 @@
  * through `onCreated`, and then reads the identity facts. A marker it cannot
  * write is a setup failure: `onStart` throws, the record carries no marker, and
  * cleanup refuses with the manual command. The setup-failure, launch-fallback
- * and teardown routes remove only when the admin directory still holds the
- * exact nonce. Most failure cases inject a metadata error after identity
- * capture, at `rev-parse --absolute-git-dir`; the identity test fails
- * `rev-parse HEAD` during capture, and the marker test fails only the marker
- * write.
+ * and teardown routes attempt removal of a created worktree only when the admin
+ * directory still holds the exact nonce; the removal itself can fail. The
+ * direct-call cases in this file are unit tests of `removeCreatedWorktree` and
+ * `onStop`; the cases that run the real launcher are in
+ * `sandboxed-launch-516.test.ts`. Most failure cases inject a metadata error
+ * after identity capture, at `rev-parse --absolute-git-dir`; the identity test
+ * fails `rev-parse HEAD` during capture, and the marker test fails only the
+ * marker write.
  */
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -175,7 +178,7 @@ function installWrapper(
   return { bin, restore: () => { process.env.PATH = oldPath; } };
 }
 
-test("a failure at the step after identity capture removes the worktree it marked", () => {
+test("unit — a failure at the step after identity capture removes the worktree it marked", () => {
   const f = fixture();
   const { restore } = installWrapper(f);
   try {
@@ -206,7 +209,7 @@ test("a failure at the step after identity capture removes the worktree it marke
   }
 });
 
-test("a pre-existing worktree is untouched by the same failure", () => {
+test("unit — a pre-existing worktree is untouched by the same failure", () => {
   const f = fixture();
   const existing = join(f.root, "existing");
   try {
@@ -233,7 +236,7 @@ test("a pre-existing worktree is untouched by the same failure", () => {
   }
 });
 
-test("the original failure is what the caller sees when cleanup succeeds", () => {
+test("unit — the original failure is what the caller sees when cleanup succeeds", () => {
   const f = fixture();
   const { restore } = installWrapper(f);
   try {
@@ -252,7 +255,7 @@ test("the original failure is what the caller sees when cleanup succeeds", () =>
   }
 });
 
-test("a removal failure names the worktree path and keeps the original failure", () => {
+test("unit — a removal failure names the worktree path and keeps the original failure", () => {
   const f = fixture();
   const { restore } = installWrapper(f, {
     beforeFail: `"${GIT}" -C "${f.base}" worktree lock "${f.workspace}" >/dev/null 2>&1 || true`,
@@ -296,7 +299,7 @@ function installLoggingWrapper(f: Fixture, logPath: string): { restore: () => vo
   return { restore: () => { process.env.PATH = oldPath; } };
 }
 
-test("a second cleanup of an already-removed record makes no Git call and does not throw", () => {
+test("unit — a second cleanup of an already-removed record makes no Git call and does not throw", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
@@ -319,7 +322,7 @@ test("a second cleanup of an already-removed record makes no Git call and does n
   }
 });
 
-test("a same-path detached replacement at the same commit survives setup cleanup and the retry", () => {
+test("unit — a same-path detached replacement at the same commit survives setup cleanup and the retry", () => {
   const f = fixture();
   const commit = headOf(f.base);
   const { restore } = installWrapper(f, {
@@ -336,7 +339,7 @@ test("a same-path detached replacement at the same commit survives setup cleanup
     } catch (err) {
       error = err;
     }
-    // The replacement reproduces every identity fact — same admin directory,
+    // The replacement reproduces every identity fact — same admin directory path,
     // registry entry, common directory, HEAD and detached ref — but carries
     // no marker, so setup's cleanup refuses and names the manual command.
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
@@ -368,7 +371,7 @@ test("a same-path detached replacement at the same commit survives setup cleanup
   }
 });
 
-test("an identity-capture failure at rev-parse HEAD still removes the worktree it owns", () => {
+test("unit — an identity-capture failure at rev-parse HEAD still removes the worktree it owns", () => {
   const f = fixture();
   const { restore } = installWrapper(f, { failHeadIn: f.workspace });
   try {
@@ -395,7 +398,7 @@ test("an identity-capture failure at rev-parse HEAD still removes the worktree i
   }
 });
 
-test("a marker-write failure alone fails setup, records a null marker and refuses cleanup", () => {
+test("unit — a marker-write failure alone fails setup, records a null marker and refuses cleanup", () => {
   const f = fixture();
   const { restore } = installWrapper(f, { blockMarker: true, injectMetadataFailure: false });
   try {
@@ -425,7 +428,7 @@ test("a marker-write failure alone fails setup, records a null marker and refuse
   }
 });
 
-test("an added whitespace byte in the ownership marker refuses cleanup", () => {
+test("unit — an added whitespace byte in the ownership marker refuses cleanup", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
@@ -441,7 +444,7 @@ test("an added whitespace byte in the ownership marker refuses cleanup", () => {
   }
 });
 
-test("a changed byte in the ownership marker refuses cleanup", () => {
+test("unit — a changed byte in the ownership marker refuses cleanup", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
@@ -458,7 +461,7 @@ test("a changed byte in the ownership marker refuses cleanup", () => {
   }
 });
 
-test("onStop refuses a same-path replacement on the launch-check and teardown route", () => {
+test("unit — onStop refuses a same-path replacement on the launch-check and teardown route", () => {
   const f = fixture();
   const commit = headOf(f.base);
   try {
@@ -496,7 +499,7 @@ test("onStop refuses a same-path replacement on the launch-check and teardown ro
   }
 });
 
-test("onStop removes the owned worktree after the runtime moved HEAD", () => {
+test("unit — onStop removes the owned worktree after the runtime moved HEAD", () => {
   const f = fixture();
   try {
     const started = onStart("agent-a", f.workspace, { deferCheckout: true });
@@ -522,7 +525,7 @@ test("onStop removes the owned worktree after the runtime moved HEAD", () => {
   }
 });
 
-test("the printed manual command targets a base and workspace with shell metacharacters", () => {
+test("unit — the printed manual command targets a base and workspace with shell metacharacters", () => {
   const f = fixtureIn(
     realpathSync(mkdtempSync(join(tmpdir(), "launch-cleanup-660-"))),
     "run $x;'q",
@@ -573,7 +576,7 @@ test("the printed manual command targets a base and workspace with shell metacha
   }
 });
 
-test("a path re-used by a different worktree after removal is left untouched", () => {
+test("unit — a path re-used by a different worktree after removal is left untouched", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
@@ -589,6 +592,31 @@ test("a path re-used by a different worktree after removal is left untouched", (
     expect(existsSync(join(f.workspace, ".git"))).toBe(true);
     expect(worktreeList(f.base)).toContain(f.workspace);
     expect(branches(f.base)).toContain("reused");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — removeCreatedWorktree: an unregistered path refusal prints the manual command", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    // Drop the registration and leave a plain directory at the same path, so the
+    // recorded base no longer lists it as a worktree.
+    expect(spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base }).status).toBe(0);
+    mkdirSync(f.workspace);
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`the path is not a worktree of ${f.base}`);
+    expect((error as Error).message).toContain(manualCommand(f));
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).not.toContain(`worktree ${f.workspace}`);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

@@ -278,9 +278,9 @@ export interface WorktreeIdentity {
  * into the worktree's admin git directory and reports this record through
  * `onCreated` before it reads the identity facts, so the caller has a record
  * for a failure after the add, including a marker that could not be written.
- * The setup-failure cleanup removes the worktree
- * when the admin directory still holds the recorded marker and any recorded
- * identity facts still match; a missing or different marker is refused with
+ * The setup-failure cleanup attempts removal when the admin directory still
+ * holds the recorded marker and any recorded identity facts still match; the
+ * removal itself can fail, and a missing or different marker is refused with
  * the manual command. The add is detached, so no
  * branch is created and none is removed by the cleanup.
  */
@@ -561,11 +561,11 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
  * `onCreated` receives the worktree record after the add, whether or not the
  * ownership marker was written, before the identity facts are read. A marker
  * that cannot be written is a setup failure, so `onStart` throws instead of
- * returning a binding. If a later step throws, `onStart` removes the worktree
- * it created when the recorded marker and any recorded identity facts still
- * match, and otherwise refuses and prints the manual command; the record's
- * `removed` flag says whether that cleanup succeeded, so a caller can retry
- * once.
+ * returning a binding. If a later step throws, `onStart` attempts to remove
+ * the worktree it created when the recorded marker and any recorded identity
+ * facts still match; the removal itself can fail, and otherwise the cleanup
+ * refuses. Both failures print the manual command. The record's `removed`
+ * flag says whether that cleanup succeeded, so a caller can retry once.
  *
  * Throws `WorktreeLifecycleError` when repository inspection or a git operation fails.
  */
@@ -872,7 +872,8 @@ export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycle
   }
   if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
     throw new WorktreeLifecycleError(
-      `worktree cleanup refused for ${created.workspace}: the path is not a worktree of ${created.baseWorkingTree}`,
+      `worktree cleanup refused for ${created.workspace}: the path is not a worktree of ${created.baseWorkingTree}; ` +
+        `remove it manually with: ${manualRemovalCommand(created)}`,
     );
   }
   const removal = tryRemoveCreatedWorktree(created);
@@ -968,8 +969,9 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
       );
     }
     // The nonce decides ownership on this route. HEAD is not compared: the
-    // runtime may move it during the run. The remaining facts support the
-    // marker and do not change while the worktree exists.
+    // runtime may move it during the run. A mismatch in the remaining facts
+    // makes cleanup refuse; the registry entry can be rewritten while the
+    // worktree exists.
     try {
       if (binding.ownerMarker === null) throw new Error("the worktree ownership marker was not recorded");
       const gitDir = worktreeAdminDir(binding.workspace);

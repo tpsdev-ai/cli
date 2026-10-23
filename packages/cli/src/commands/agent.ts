@@ -1323,12 +1323,13 @@ async function runAgentCommand(
               approval = approveLaunch();
               const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
-              // Setup writes the ownership marker and reports the record
-              // through onCreated before it reads the identity facts
-              // (cli#660). A marker it cannot write is a setup failure, and
-              // every cleanup route for this launch's worktree removes only
-              // when the admin directory still holds the recorded marker;
-              // otherwise it refuses with the manual command.
+              // Setup attempts to write the ownership marker and reports a
+              // nullable marker through onCreated before it reads the identity
+              // facts (cli#660). A marker it cannot write is a setup failure.
+              // Every cleanup route for this launch's worktree attempts removal
+              // only when the admin directory still holds the recorded marker
+              // and refuses otherwise with the manual command; the removal
+              // itself can fail.
               const start = selectedRuntime
                 ? onStart(launchId, config.workspace, {
                     deferCheckout: true,
