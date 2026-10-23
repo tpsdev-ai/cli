@@ -98,13 +98,24 @@ describe("agent config env interpolation", () => {
     );
   });
 
-  const nullRefusal =
-    "workspace is set but has no value (in YAML, a bare ~ or nothing after 'workspace:' is null): give an absolute path or a path relative to the config file, or remove the key";
+  const nullRefusal = (key: string) =>
+    `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`;
+  const emptyRefusal = (key: string) =>
+    `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`;
   for (const [line, message] of [
-    ["workspace: ~", nullRefusal],
-    ["workspace:", nullRefusal],
-    ["workspace: null", nullRefusal],
+    ["workspace: ~", nullRefusal("workspace")],
+    ["workspace:", nullRefusal("workspace")],
+    ["workspace: null", nullRefusal("workspace")],
     ["workspace: 42", "workspace must be a string path"],
+    ['workspace: ""', emptyRefusal("workspace")],
+    ['workspace: "   "', emptyRefusal("workspace")],
+    ["repo: ~", nullRefusal("repo")],
+    ["repo: 42", "repo must be a string path"],
+    ['repo: ""', emptyRefusal("repo")],
+    [
+      "repo: ~/work",
+      "repo '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+    ],
   ] as const) {
     test(`refuses ${JSON.stringify(line)}`, () => {
       const cfg = join(dir, "agent.yaml");
@@ -114,12 +125,19 @@ describe("agent config env interpolation", () => {
     });
   }
 
-  test("uses the current directory when the config has no workspace key", () => {
+  test("uses the current directory when the config has no workspace or repo key", () => {
     const cfg = join(dir, "agent.yaml");
     writeFileSync(cfg, "agentId: probe\n", "utf-8");
 
     const parsed = loadAgentConfig(cfg);
     expect(parsed.workspace).toBe(process.cwd());
     expect(parsed.mailDir).toBe(`${process.cwd()}/mail`);
+  });
+
+  test("resolves a relative repo against the config directory when there is no workspace key", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nrepo: worktree\n", "utf-8");
+
+    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "worktree"));
   });
 });

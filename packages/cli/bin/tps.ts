@@ -511,7 +511,7 @@ async function main() {
             const { readConfiguredWorkspace } = await import("@tpsdev-ai/agent");
             const agentWorkspace = resolveWorkspace(
               cfgPath,
-              readConfiguredWorkspace(agentCfg) ?? join(homedir(), "ops", "tps"),
+              readConfiguredWorkspace(agentCfg).workspace ?? join(homedir(), "ops", "tps"),
               sandboxed ? process.env : undefined,
             );
 

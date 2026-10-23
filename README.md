@@ -172,11 +172,11 @@ flair:
 ```
 
 A relative `workspace` resolves against the directory containing the config
-file; an absolute workspace remains absolute and is normalized. A workspace
-string starting with `~` is refused, because `~` is not expanded. A
-`workspace` key whose value is null (in YAML a bare `~` or nothing after
-`workspace:`) or not a string is refused too. The default `mailDir` and
-`memoryPath` follow the resolved workspace.
+file; an absolute workspace remains absolute and is normalized. A `workspace`
+or `repo` string starting with `~` is refused, because `~` is not expanded. A
+`workspace` or `repo` key whose value is null (in YAML a bare `~` or nothing
+after the key), not a string, or an empty or blank string is refused too. The
+default `mailDir` and `memoryPath` follow the resolved workspace.
 
 ## Docker Office Architecture
 

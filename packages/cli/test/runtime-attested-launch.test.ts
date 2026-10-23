@@ -348,7 +348,10 @@ describe("interactive selected runtime with no nono", () => {
 });
 
 const TILDE_REFUSAL = "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file";
-const NULL_REFUSAL = "workspace is set but has no value (in YAML, a bare ~ or nothing after 'workspace:' is null): give an absolute path or a path relative to the config file, or remove the key";
+const nullRefusal = (key: string) =>
+  `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`;
+const emptyRefusal = (key: string) =>
+  `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`;
 const STRING_REFUSAL = "workspace must be a string path";
 
 type WorkspaceRun = { result: ReturnType<typeof interactiveRuntimeProbe>; sb: Sandbox; agentDir: string; worktrees: number };
@@ -395,9 +398,12 @@ describe("interactive selected runtime workspace values", () => {
   }
 
   for (const [line, message] of [
-    ["workspace: ~", NULL_REFUSAL],
-    ["workspace:", NULL_REFUSAL],
+    ["workspace: ~", nullRefusal("workspace")],
+    ["workspace:", nullRefusal("workspace")],
     ["workspace: 42", STRING_REFUSAL],
+    ['workspace: ""', emptyRefusal("workspace")],
+    ["repo: ~", nullRefusal("repo")],
+    ['repo: ""', emptyRefusal("repo")],
   ] as const) {
     test(`codex: --no-sandbox refuses ${JSON.stringify(line)} before worktree setup or runner start`, () => {
       workspaceOptOut("codex", line, (run) => expectRefusedBeforeSetup(run, message));

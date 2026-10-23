@@ -54,26 +54,35 @@ function interpolateEnvVars<T>(value: T): T {
   return value;
 }
 
-export function refuseTildeWorkspace(configured: string): void {
+export function refuseTildeWorkspace(configured: string, key = "workspace"): void {
   if (configured.startsWith("~")) {
     throw new Error(
-      `workspace '${configured}' starts with '~', which is not expanded: use an absolute path or a path relative to the config file`,
+      `${key} '${configured}' starts with '~', which is not expanded: use an absolute path or a path relative to the config file`,
     );
   }
 }
 
-/** The `workspace` a parsed agent config sets, or undefined when the key is absent. */
-export function readConfiguredWorkspace(parsed: Record<string, unknown>): string | undefined {
-  if (!Object.hasOwn(parsed, "workspace")) return undefined;
-  const value = parsed.workspace;
+function readConfiguredPath(parsed: Record<string, unknown>, key: "workspace" | "repo"): string | undefined {
+  if (!Object.hasOwn(parsed, key)) return undefined;
+  const value = parsed[key];
   if (value === null) {
     throw new Error(
-      "workspace is set but has no value (in YAML, a bare ~ or nothing after 'workspace:' is null): give an absolute path or a path relative to the config file, or remove the key",
+      `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`,
     );
   }
-  if (typeof value !== "string") throw new Error("workspace must be a string path");
-  refuseTildeWorkspace(value);
+  if (typeof value !== "string") throw new Error(`${key} must be a string path`);
+  if (value.trim() === "") {
+    throw new Error(
+      `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`,
+    );
+  }
+  refuseTildeWorkspace(value, key);
   return value;
+}
+
+/** The `workspace` and `repo` values a parsed agent config sets; an absent key reads as undefined. */
+export function readConfiguredWorkspace(parsed: Record<string, unknown>): { workspace?: string; repo?: string } {
+  return { workspace: readConfiguredPath(parsed, "workspace"), repo: readConfiguredPath(parsed, "repo") };
 }
 
 /**
@@ -82,7 +91,6 @@ export function readConfiguredWorkspace(parsed: Record<string, unknown>): string
  * absolute workspace remains absolute and is normalized.
  */
 function resolveWorkspace(configured: string, configDir: string): string {
-  refuseTildeWorkspace(configured);
   return isAbsolute(configured) ? resolve(configured) : resolve(configDir, configured);
 }
 
@@ -91,10 +99,9 @@ export function loadAgentConfig(path: string, baseDir: string = dirname(path)): 
   const parsedRaw = (yaml.load(raw) ?? {}) as Record<string, any>;
   const parsed = interpolateEnvVars(parsedRaw);
 
-  const configuredWorkspace = readConfiguredWorkspace(parsed) || parsed.repo;
-  const workspace = configuredWorkspace
-    ? resolveWorkspace(String(configuredWorkspace), baseDir)
-    : process.cwd();
+  const configured = readConfiguredWorkspace(parsed);
+  const configuredWorkspace = configured.workspace ?? configured.repo;
+  const workspace = configuredWorkspace ? resolveWorkspace(configuredWorkspace, baseDir) : process.cwd();
   const memoryPath = parsed.memoryPath || `${workspace}/.openclaw/agent.memory.jsonl`;
 
   const agent: AgentConfig = {
