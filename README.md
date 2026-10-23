@@ -172,8 +172,9 @@ flair:
 ```
 
 A relative `workspace` resolves against the directory containing the config
-file; an absolute workspace is used unchanged. The default `mailDir` and
-`memoryPath` follow the resolved workspace.
+file; an absolute workspace remains absolute and is normalized. A workspace
+starting with `~` is refused, because `~` is not expanded. The default
+`mailDir` and `memoryPath` follow the resolved workspace.
 
 ## Docker Office Architecture
 

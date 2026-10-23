@@ -79,20 +79,22 @@ describe("agent config env interpolation", () => {
     expect(parsed.memoryPath).toBe(join(workspace, ".openclaw", "agent.memory.jsonl"));
   });
 
-  test("leaves an absolute workspace unchanged", () => {
+  test("normalizes an absolute workspace before deriving the default paths", () => {
     const cfg = join(dir, "agent.yaml");
-    writeFileSync(cfg, `agentId: probe\nworkspace: ${join(dir, "elsewhere")}\n`, "utf-8");
+    writeFileSync(cfg, `agentId: probe\nworkspace: ${dir}/elsewhere/../other\n`, "utf-8");
 
     const parsed = loadAgentConfig(cfg);
-    expect(parsed.workspace).toBe(join(dir, "elsewhere"));
-    expect(parsed.mailDir).toBe(join(dir, "elsewhere", "mail"));
-    expect(parsed.memoryPath).toBe(join(dir, "elsewhere", ".openclaw", "agent.memory.jsonl"));
+    expect(parsed.workspace).toBe(join(dir, "other"));
+    expect(parsed.mailDir).toBe(join(dir, "other", "mail"));
+    expect(parsed.memoryPath).toBe(join(dir, "other", ".openclaw", "agent.memory.jsonl"));
   });
 
-  test("does not expand a tilde workspace", () => {
+  test("refuses a workspace starting with ~", () => {
     const cfg = join(dir, "agent.yaml");
     writeFileSync(cfg, "agentId: probe\nworkspace: ~/work\n", "utf-8");
 
-    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "~", "work"));
+    expect(() => loadAgentConfig(cfg)).toThrow(
+      "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+    );
   });
 });

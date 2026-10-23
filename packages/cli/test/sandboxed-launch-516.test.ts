@@ -373,16 +373,21 @@ describe("cli#516 (1) — the attested re-exec uses a config snapshot", () => {
   });
 });
 
-test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace grant resolve %s against the original config directory", (configuredWorkspace) => {
+function snapshotLaunch(
+  spelling: (sb: Sandbox) => string,
+  configYaml: (sb: Sandbox, workspace: string) => string,
+  paths: (sb: Sandbox, workspace: string) => { mailDir: string; memoryPath: string },
+): void {
   const sb = makeSandbox();
   try {
+    const configuredWorkspace = spelling(sb);
     const workspace = resolve(sb.run, configuredWorkspace);
     mkdirSync(workspace, { recursive: true });
     const target = join(sb.run, "agent.yaml");
     const alternate = join(sb.root, "alternate.yaml");
     const link = join(sb.run, "config.yaml");
-    writeFileSync(target, agentYaml(sb, configuredWorkspace));
-    writeFileSync(alternate, agentYaml(sb, sb.run));
+    writeFileSync(target, configYaml(sb, configuredWorkspace));
+    writeFileSync(alternate, configYaml(sb, sb.run));
     symlinkSync(target, link);
     installFakeNono(sb, "  :");
     const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
@@ -397,7 +402,7 @@ test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace gr
         },
         loadAgentConfig: (path, baseDir) => {
           const config = load(path, baseDir);
-          console.log('PARSED ' + JSON.stringify({ path, workspace: config.workspace }));
+          console.log('PARSED ' + JSON.stringify({ path, workspace: config.workspace, mailDir: config.mailDir, memoryPath: config.memoryPath }));
           return config;
         },
       }));
@@ -447,13 +452,14 @@ test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace gr
     const snapshot = lines.find((line) => line.startsWith("SNAPSHOT "))?.slice(9);
     expect(snapshot, output(result)).toBeDefined();
     const parsed = lines.filter((line) => line.startsWith("PARSED ")).map((line) => JSON.parse(line.slice(7)));
-    expect(parsed).toEqual([{ path: snapshot, workspace }, { path: snapshot, workspace }]);
+    const expected = { path: snapshot, workspace, ...paths(sb, workspace) };
+    expect(parsed).toEqual([expected, expected]);
     const launch = JSON.parse(lines.find((line) => line.startsWith("LAUNCH "))!.slice(7));
     expect(launch.path).toBe(snapshot);
     expect(launch.options.workdir).toBe(canonicalPath(workspace));
-    expect(launch.content).toBe(agentYaml(sb, workspace));
+    expect(launch.content).toBe(configYaml(sb, workspace));
     expect(launch.options.allow).toContain(canonicalPath(workspace));
-    expect(launch.options.allow).not.toContain(resolve(dirname(snapshot!), configuredWorkspace));
+    expect(launch.options.allow).not.toContain(join(dirname(snapshot!), configuredWorkspace));
     expect(launch.fileMode).toBe(0o600);
     expect(launch.dirMode).toBe(0o700);
     expect(launch.owner).toBe(launch.uid);
@@ -475,6 +481,21 @@ test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace gr
   } finally {
     rmSync(sb.root, { recursive: true, force: true });
   }
+}
+
+test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace grant resolve %s against the original config directory", (configuredWorkspace) => {
+  snapshotLaunch(() => configuredWorkspace, agentYaml, (sb) => ({
+    mailDir: join(sb.home, ".tps", "mail"),
+    memoryPath: join(sb.home, ".tps", "agents", "probe", "memory.jsonl"),
+  }));
+});
+
+test("an absolute workspace containing .. is normalized for the parent, the snapshot and the child, which derive the same default paths", () => {
+  snapshotLaunch(
+    (sb) => `${sb.run}/elsewhere/../../ws`,
+    (_sb, workspace) => `agentId: probe\nname: probe\nworkspace: ${workspace}\nllm:\n  provider: ollama\n  model: probe-model\n`,
+    (_sb, workspace) => ({ mailDir: join(workspace, "mail"), memoryPath: join(workspace, ".openclaw", "agent.memory.jsonl") }),
+  );
 });
 
 test("the parent removes its config snapshot on SIGTERM", () => {

@@ -57,10 +57,15 @@ function interpolateEnvVars<T>(value: T): T {
 /**
  * A relative workspace is anchored at the config file's directory, so the
  * launching process and a sandboxed child resolve the same absolute path. An
- * absolute workspace is used unchanged.
+ * absolute workspace remains absolute and is normalized.
  */
 function resolveWorkspace(configured: string, configDir: string): string {
-  return isAbsolute(configured) ? configured : resolve(configDir, configured);
+  if (configured.startsWith("~")) {
+    throw new Error(
+      `workspace '${configured}' starts with '~', which is not expanded: use an absolute path or a path relative to the config file`,
+    );
+  }
+  return isAbsolute(configured) ? resolve(configured) : resolve(configDir, configured);
 }
 
 export function loadAgentConfig(path: string, baseDir: string = dirname(path)): AgentConfig {
