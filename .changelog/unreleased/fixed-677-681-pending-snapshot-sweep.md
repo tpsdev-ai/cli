@@ -15,6 +15,6 @@
 
   The `@tpsdev-ai/agent` mailbox lock, the cli's outbox lock and `tps status`
   check a recorded pid with one rule: a pid that is not an integer from 1 to
-  2147483647 is never treated as a live process, and a process that exists under
-  another user is. `tps status` reported a process that exists under another
-  user as a zombie, and did not check a recorded pid of 0.
+  2147483647 is never treated as a live process, and one whose probe is refused
+  with `EPERM` (permission denied) is. `tps status` reported a pid refused with
+  `EPERM` as a zombie, and did not check a recorded pid of 0.

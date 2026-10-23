@@ -98,8 +98,7 @@ export type PidState = "alive" | "gone" | "invalid";
  * Probe a recorded pid with `process.kill(pid, 0)`. "invalid": not an integer
  * of at least 1 (0 and negative pids do not name one process), or a pid
  * process.kill rejects as an argument. "gone": ESRCH. "alive": the probe
- * succeeds or fails with any other error, EPERM (the process exists under
- * another user) included.
+ * succeeds or fails with any other error, EPERM (permission denied) included.
  */
 export function pidState(pid: number): PidState {
   if (!Number.isInteger(pid) || pid < 1) return "invalid";

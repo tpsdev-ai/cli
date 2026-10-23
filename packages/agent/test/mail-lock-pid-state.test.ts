@@ -69,7 +69,7 @@ describe("pidState", () => {
 });
 
 describe("pidStateFromProbeError", () => {
-  // Errors carrying the codes process.kill raises, so EPERM is covered whichever user runs the test.
+  // Errors carrying the codes process.kill raises, so EPERM is covered on any host.
   test("classifies EPERM as alive, ESRCH as gone, an argument error as invalid, and any other error as alive", () => {
     const withCode = (code: string) => Object.assign(new Error(code), { code });
     expect(pidStateFromProbeError(withCode("EPERM"))).toBe("alive");
