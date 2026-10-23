@@ -20,7 +20,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve as resolvePathMod } from "node:path";
+import { dirname, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -1168,7 +1168,7 @@ async function runAgentCommand(
         process.exit(1);
       }
 
-      const config = loadAgentConfig(configPath);
+      const config = loadAgentConfig(configPath, snapshot ? dirname(snapshot.workspaceConfigPath) : undefined);
       config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
       if (snapshot) {
         const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;

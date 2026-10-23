@@ -395,8 +395,8 @@ test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace gr
           constructor(config) { this.config = config; }
           async start() { console.log('WORKSPACE ' + this.config.workspace); }
         },
-        loadAgentConfig: (path) => {
-          const config = load(path);
+        loadAgentConfig: (path, baseDir) => {
+          const config = load(path, baseDir);
           console.log('PARSED ' + JSON.stringify({ path, workspace: config.workspace }));
           return config;
         },
@@ -447,7 +447,7 @@ test.each(["../ws", "nested/worktree"])("config snapshot, child and workspace gr
     const snapshot = lines.find((line) => line.startsWith("SNAPSHOT "))?.slice(9);
     expect(snapshot, output(result)).toBeDefined();
     const parsed = lines.filter((line) => line.startsWith("PARSED ")).map((line) => JSON.parse(line.slice(7)));
-    expect(parsed).toEqual([{ path: snapshot, workspace: configuredWorkspace }, { path: snapshot, workspace }]);
+    expect(parsed).toEqual([{ path: snapshot, workspace }, { path: snapshot, workspace }]);
     const launch = JSON.parse(lines.find((line) => line.startsWith("LAUNCH "))!.slice(7));
     expect(launch.path).toBe(snapshot);
     expect(launch.options.workdir).toBe(canonicalPath(workspace));

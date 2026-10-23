@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import yaml from "js-yaml";
 import { createHash } from "node:crypto";
 import type { AgentConfig } from "./runtime/types.js";
@@ -53,12 +54,24 @@ function interpolateEnvVars<T>(value: T): T {
   return value;
 }
 
-export function loadAgentConfig(path: string): AgentConfig {
+/**
+ * A relative workspace is anchored at the config file's directory, so every
+ * process that reads this config resolves the same absolute path. An absolute
+ * workspace is used unchanged.
+ */
+function resolveWorkspace(configured: string, configDir: string): string {
+  return isAbsolute(configured) ? configured : resolve(configDir, configured);
+}
+
+export function loadAgentConfig(path: string, baseDir: string = dirname(path)): AgentConfig {
   const raw = readFileSync(path, "utf-8");
   const parsedRaw = (yaml.load(raw) ?? {}) as Record<string, any>;
   const parsed = interpolateEnvVars(parsedRaw);
 
-  const workspace = String(parsed.workspace || parsed.repo || process.cwd());
+  const configuredWorkspace = parsed.workspace || parsed.repo;
+  const workspace = configuredWorkspace
+    ? resolveWorkspace(String(configuredWorkspace), baseDir)
+    : process.cwd();
   const memoryPath = parsed.memoryPath || `${workspace}/.openclaw/agent.memory.jsonl`;
 
   const agent: AgentConfig = {

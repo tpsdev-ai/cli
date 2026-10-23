@@ -171,6 +171,10 @@ flair:
   url: http://localhost:9926      # optional — enables soul & memory
 ```
 
+A relative `workspace` resolves against the directory containing the config
+file; an absolute workspace is used unchanged. The default `mailDir` and
+`memoryPath` follow the resolved workspace.
+
 ## Docker Office Architecture
 
 Each office is a Docker container running agents with layered isolation:

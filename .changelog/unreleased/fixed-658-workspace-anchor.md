@@ -1,0 +1,1 @@
+- **A relative `workspace` in `agent.yaml` resolves against the config file's directory, and a launched child receives the absolute path.** The default `mailDir` and `memoryPath` follow the resolved workspace, so the launching process and the sandboxed child agree on one path (Closes #658).

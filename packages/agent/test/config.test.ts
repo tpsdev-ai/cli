@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadAgentConfig } from "../src/config.js";
 
@@ -63,5 +63,36 @@ describe("agent config env interpolation", () => {
     );
 
     expect(() => loadAgentConfig(cfg)).toThrow("Missing environment variable: MISSING_API_KEY");
+  });
+
+  test("resolves a relative workspace against the config directory", () => {
+    const configDir = join(dir, "config");
+    mkdirSync(configDir);
+    const cfg = join(configDir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: worktree\n", "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    const workspace = join(configDir, "worktree");
+    expect(parsed.workspace).toBe(workspace);
+    expect(isAbsolute(parsed.workspace)).toBe(true);
+    expect(parsed.mailDir).toBe(join(workspace, "mail"));
+    expect(parsed.memoryPath).toBe(join(workspace, ".openclaw", "agent.memory.jsonl"));
+  });
+
+  test("leaves an absolute workspace unchanged", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, `agentId: probe\nworkspace: ${join(dir, "elsewhere")}\n`, "utf-8");
+
+    const parsed = loadAgentConfig(cfg);
+    expect(parsed.workspace).toBe(join(dir, "elsewhere"));
+    expect(parsed.mailDir).toBe(join(dir, "elsewhere", "mail"));
+    expect(parsed.memoryPath).toBe(join(dir, "elsewhere", ".openclaw", "agent.memory.jsonl"));
+  });
+
+  test("does not expand a tilde workspace", () => {
+    const cfg = join(dir, "agent.yaml");
+    writeFileSync(cfg, "agentId: probe\nworkspace: ~/work\n", "utf-8");
+
+    expect(loadAgentConfig(cfg).workspace).toBe(join(dir, "~", "work"));
   });
 });
