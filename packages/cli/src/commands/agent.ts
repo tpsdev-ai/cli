@@ -20,7 +20,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join, resolve as resolvePathMod } from "node:path";
+import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -35,6 +35,12 @@ import {
   canonicalPath,
 } from "../utils/nono.js";
 import { grantCovers, launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
+import {
+  LAUNCH_SNAPSHOT_PENDING_PREFIX,
+  LAUNCH_SNAPSHOT_PREFIX,
+  sweepStaleLaunchSnapshots,
+  writeLaunchSnapshotOwner,
+} from "../utils/launch-snapshots.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
@@ -1075,7 +1081,11 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 
 export async function runAgent(
   args: AgentArgs,
-  testHooks?: { afterConfigSnapshot?: (path: string) => void },
+  testHooks?: {
+    afterPendingSnapshot?: (path: string) => void;
+    afterConfigSnapshot?: (path: string) => void;
+    beforeSnapshotSweep?: (launchDir: string) => void;
+  },
 ): Promise<void> {
   const original = args.config ?? (args.id ? join(homedir(), ".tps", "agents", args.id, "agent.yaml") : undefined);
   if (args.action !== "start" || args.sandboxed || !original || !existsSync(original)) {
@@ -1084,9 +1094,25 @@ export async function runAgent(
   const workspaceConfigPath = resolvePathMod(original);
   const parent = canonicalPath(join(homedir(), ".tps", "launch"));
   const createdParent = mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const snapshotRoot = mkdtempSync(join(parent, "config-"));
+  try {
+    testHooks?.beforeSnapshotSweep?.(parent);
+    sweepStaleLaunchSnapshots(parent);
+  } catch (error) {
+    // A snapshot sweep is housekeeping: log it and continue the launch.
+    console.error(
+      `warning: could not sweep stale launch snapshots in ${parent}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
+  // The snapshot becomes visible as `config-*` only after its owner record is
+  // written. Until then it sits in the pending namespace, which the sweep does
+  // not examine. The exit and signal handlers are installed before the pending
+  // directory exists, and cleanup removes whichever of the pending or published
+  // directory this launch holds.
+  let snapshotRoot: string | undefined;
   const cleanup = () => {
-    rmSync(snapshotRoot, { recursive: true, force: true });
+    if (snapshotRoot !== undefined) rmSync(snapshotRoot, { recursive: true, force: true });
     if (createdParent) {
       try {
         rmdirSync(parent);
@@ -1107,6 +1133,13 @@ export async function runAgent(
     return { signal, handler };
   });
   try {
+    const pendingRoot = mkdtempSync(join(parent, LAUNCH_SNAPSHOT_PENDING_PREFIX));
+    snapshotRoot = pendingRoot;
+    testHooks?.afterPendingSnapshot?.(pendingRoot);
+    writeLaunchSnapshotOwner(pendingRoot);
+    const publishedRoot = join(parent, `${LAUNCH_SNAPSHOT_PREFIX}${basename(pendingRoot).slice(LAUNCH_SNAPSHOT_PENDING_PREFIX.length)}`);
+    renameSync(pendingRoot, publishedRoot);
+    snapshotRoot = publishedRoot;
     const configPath = join(snapshotRoot, "agent.yaml");
     writeFileSync(configPath, readFileSync(workspaceConfigPath), { mode: 0o600, flag: "wx" });
     testHooks?.afterConfigSnapshot?.(configPath);
