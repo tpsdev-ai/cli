@@ -1733,9 +1733,9 @@ describe("cli#660 — real launcher worktree ownership", () => {
 
   /** The report a confined child sends: the scripted peer reads the launcher's
    *  own inside canary and reports the OUTSIDE canary DENIED. It states the
-   *  report rather than producing it with a permission denial, which no uid
-   *  can enforce on root (the Docker lane runs as root, where chmod 000 does
-   *  not stop a child reading the canary). */
+   *  report instead of producing it with a permission denial: the Docker lane
+   *  runs this suite as root, where chmod 000 does not stop a child reading
+   *  the canary. */
   const RELEASE_PEER = `const { connect } = require("node:net");
 const { readFileSync } = require("node:fs");
 const { dirname, join } = require("node:path");
