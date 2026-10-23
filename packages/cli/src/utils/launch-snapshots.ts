@@ -110,9 +110,10 @@ export interface SweepLaunchSnapshotsOptions {
 }
 
 /**
- * Remove `config-*` directories directly under `launchDir` whose owner is not
- * alive. Returns the removed paths. Throws only when the directory itself
- * cannot be listed; the caller decides whether that fails the launch.
+ * Remove `config-*` directories directly under `launchDir` that no live owner
+ * holds: a recorded owner that is dead, or no readable owner record past the
+ * grace period. Returns the removed paths. Throws only when the directory
+ * itself cannot be listed; the caller decides whether that fails the launch.
  */
 export function sweepStaleLaunchSnapshots(
   launchDir: string,
