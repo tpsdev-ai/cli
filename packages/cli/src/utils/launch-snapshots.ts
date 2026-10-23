@@ -6,11 +6,18 @@
  * file that authorized its launch. The launcher removes that directory on exit
  * and on SIGINT/SIGTERM/SIGHUP; a forced termination leaves it behind.
  *
- * Each snapshot records its owning launcher — pid and process start token, so
- * a reused pid is not mistaken for the owner — and the next launch removes
- * entries whose recorded owner is gone. An entry with no owner record is kept
- * for a short grace period, because it may be between `mkdtemp` and the owner
- * write.
+ * A snapshot is created under a `.pending-config-*` name, gets its owner
+ * record, and is then renamed to its final `config-*` name, so a published
+ * snapshot has its owner record. The sweep does not examine pending entries at
+ * all: a pending directory exists between its creation and that rename, and a
+ * launch may be paused there for any length of time, so a sweep that touched it
+ * could race that launch. A forced kill in that window can leave one small
+ * directory behind.
+ *
+ * Each snapshot records its owning launcher — pid and, when one is readable, a
+ * process start token, so a reused pid is not mistaken for the owner — and the
+ * next launch removes published entries whose recorded owner is dead, plus
+ * published entries with no readable owner record past a grace period.
  */
 
 import {
@@ -19,7 +26,7 @@ import {
   fstatSync,
   lstatSync,
   openSync,
-  readFileSync,
+  readSync,
   readdirSync,
   rmSync,
   writeFileSync,
@@ -28,7 +35,11 @@ import { join } from "node:path";
 import { processStartToken } from "@tpsdev-ai/agent";
 
 export const LAUNCH_SNAPSHOT_PREFIX = "config-";
+/** A snapshot in the making: never swept, renamed to `config-*` once owned. */
+export const LAUNCH_SNAPSHOT_PENDING_PREFIX = ".pending-config-";
 export const LAUNCH_SNAPSHOT_OWNER_FILE = "owner.json";
+/** An owner record larger than this is treated as unreadable. */
+export const LAUNCH_SNAPSHOT_OWNER_MAX_BYTES = 4096;
 /** How long an ownerless snapshot may exist before it is treated as stale. */
 export const LAUNCH_SNAPSHOT_OWNER_GRACE_MS = 60_000;
 
@@ -50,24 +61,33 @@ export function writeLaunchSnapshotOwner(snapshotDir: string): void {
 }
 
 /**
- * Read an owner record without following a symlink: the file is opened with
- * O_NOFOLLOW and its type is read from the open descriptor.
+ * Read an owner record without following a symlink and without blocking on a
+ * special file: the leaf is opened O_NOFOLLOW|O_NONBLOCK, must be a regular
+ * file, and must be at most LAUNCH_SNAPSHOT_OWNER_MAX_BYTES. Anything else —
+ * missing, not a regular file, oversized, unparsable, or a pid/token of the
+ * wrong shape — is an unreadable owner, which the sweep treats as ownerless.
  */
 function readLaunchSnapshotOwner(snapshotDir: string): LaunchSnapshotOwner | null {
   let fd: number;
   try {
-    fd = openSync(join(snapshotDir, LAUNCH_SNAPSHOT_OWNER_FILE), constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(
+      join(snapshotDir, LAUNCH_SNAPSHOT_OWNER_FILE),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch {
     return null;
   }
   try {
-    if (!fstatSync(fd).isFile()) return null;
-    const parsed = JSON.parse(readFileSync(fd, "utf-8")) as Partial<LaunchSnapshotOwner>;
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return null;
+    if (stat.size > LAUNCH_SNAPSHOT_OWNER_MAX_BYTES) return null;
+    const buffer = Buffer.allocUnsafe(stat.size);
+    const read = readSync(fd, buffer, 0, stat.size, 0);
+    const parsed = JSON.parse(buffer.subarray(0, read).toString("utf-8")) as Partial<LaunchSnapshotOwner>;
     if (typeof parsed.pid !== "number" || !Number.isInteger(parsed.pid) || parsed.pid <= 0) return null;
-    return {
-      pid: parsed.pid,
-      startToken: typeof parsed.startToken === "string" ? parsed.startToken : null,
-    };
+    const startToken = parsed.startToken;
+    if (startToken !== null && typeof startToken !== "string") return null;
+    return { pid: parsed.pid, startToken };
   } catch {
     return null;
   } finally {
@@ -91,9 +111,10 @@ function tokenSource(token: string): string {
 }
 
 /**
- * "dead" — pid gone, or pid alive under a different start token from the same
- * source. A token from another source, or no recorded token, is
- * "unverifiable": it is kept, never treated as dead.
+ * "dead" — pid gone, or pid alive under a different readable start token from
+ * the same source. A token from another source, or either token unavailable
+ * (the recorded token, or the current one), is "unverifiable": it is kept,
+ * never treated as dead.
  */
 function ownerState(owner: LaunchSnapshotOwner): "alive" | "dead" | "unverifiable" {
   if (!pidAlive(owner.pid)) return "dead";
@@ -110,10 +131,12 @@ export interface SweepLaunchSnapshotsOptions {
 }
 
 /**
- * Remove `config-*` directories directly under `launchDir` that no live owner
- * holds: a recorded owner that is dead, or no readable owner record past the
- * grace period. Returns the removed paths. Throws only when the directory
- * itself cannot be listed; the caller decides whether that fails the launch.
+ * Remove `config-*` directories directly under `launchDir` whose recorded
+ * owner is dead, or that have no readable owner record past the grace period.
+ * Pending (`.pending-config-*`) entries are not examined. Age is the entry
+ * directory's mtime; an entry whose mtime cannot be read is kept. Returns the
+ * removed paths. Throws only when the directory itself cannot be listed; the
+ * caller decides whether that fails the launch.
  */
 export function sweepStaleLaunchSnapshots(
   launchDir: string,

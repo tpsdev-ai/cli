@@ -20,7 +20,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { join, resolve as resolvePathMod } from "node:path";
+import { basename, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -35,7 +35,12 @@ import {
   canonicalPath,
 } from "../utils/nono.js";
 import { grantCovers, launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
-import { sweepStaleLaunchSnapshots, writeLaunchSnapshotOwner } from "../utils/launch-snapshots.js";
+import {
+  LAUNCH_SNAPSHOT_PENDING_PREFIX,
+  LAUNCH_SNAPSHOT_PREFIX,
+  sweepStaleLaunchSnapshots,
+  writeLaunchSnapshotOwner,
+} from "../utils/launch-snapshots.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
@@ -1076,7 +1081,11 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 
 export async function runAgent(
   args: AgentArgs,
-  testHooks?: { afterConfigSnapshot?: (path: string) => void; beforeSnapshotSweep?: (launchDir: string) => void },
+  testHooks?: {
+    afterPendingSnapshot?: (path: string) => void;
+    afterConfigSnapshot?: (path: string) => void;
+    beforeSnapshotSweep?: (launchDir: string) => void;
+  },
 ): Promise<void> {
   const original = args.config ?? (args.id ? join(homedir(), ".tps", "agents", args.id, "agent.yaml") : undefined);
   if (args.action !== "start" || args.sandboxed || !original || !existsSync(original)) {
@@ -1096,8 +1105,11 @@ export async function runAgent(
       }`,
     );
   }
-  const snapshotRoot = mkdtempSync(join(parent, "config-"));
-  writeLaunchSnapshotOwner(snapshotRoot);
+  // The snapshot becomes visible as `config-*` only after its owner record is
+  // written. Until then it sits in the pending namespace, which the sweep does
+  // not examine.
+  const pendingRoot = mkdtempSync(join(parent, LAUNCH_SNAPSHOT_PENDING_PREFIX));
+  let snapshotRoot = pendingRoot;
   const cleanup = () => {
     rmSync(snapshotRoot, { recursive: true, force: true });
     if (createdParent) {
@@ -1110,6 +1122,11 @@ export async function runAgent(
     }
   };
   process.once("exit", cleanup);
+  testHooks?.afterPendingSnapshot?.(pendingRoot);
+  writeLaunchSnapshotOwner(pendingRoot);
+  const publishedRoot = join(parent, `${LAUNCH_SNAPSHOT_PREFIX}${basename(pendingRoot).slice(LAUNCH_SNAPSHOT_PENDING_PREFIX.length)}`);
+  renameSync(pendingRoot, publishedRoot);
+  snapshotRoot = publishedRoot;
   const signalHandlers = (["SIGINT", "SIGTERM", "SIGHUP"] as const).map((signal) => {
     const handler = () => {
       cleanup();

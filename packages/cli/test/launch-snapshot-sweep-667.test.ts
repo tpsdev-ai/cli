@@ -1,9 +1,12 @@
 /**
  * cli#667 — launch snapshot ownership and sweeping.
  *
- * Snapshots are private `config-*` directories under `~/.tps/launch`. Each
- * records its owning launcher (pid and process start token); the next launch
- * removes entries whose recorded owner is gone.
+ * Snapshots are private `config-*` directories under `~/.tps/launch`. A snapshot
+ * is created as `.pending-config-*`, gets its owner record (pid, and a start
+ * token when one is readable), and is renamed to `config-*`; the sweep does not
+ * examine pending entries, and removes a published entry whose recorded owner
+ * is dead or that has no readable owner record past the grace period. Age is
+ * the entry directory's mtime.
  */
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
@@ -17,9 +20,8 @@ import {
   symlinkSync,
   utimesSync,
   writeFileSync,
-} from "node:fs";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+} from "node:fs";import { tmpdir } from "node:os";
+import { basename, dirname, join, resolve } from "node:path";
 import { processStartToken } from "@tpsdev-ai/agent";
 import {
   LAUNCH_SNAPSHOT_OWNER_FILE,
@@ -29,6 +31,7 @@ import {
 } from "../src/utils/launch-snapshots.js";
 
 const AGENT_MODULE = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+const SNAPSHOTS_MODULE = resolve(import.meta.dir, "../src/utils/launch-snapshots.ts");
 
 interface Fixture {
   root: string;
@@ -51,6 +54,17 @@ function makeSnapshot(launchDir: string, name: string): string {
   const dir = join(launchDir, name);
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+/** Make a snapshot look older than any grace period. */
+function ageSnapshot(dir: string): void {
+  const past = (Date.now() - LAUNCH_SNAPSHOT_OWNER_GRACE_MS - 60_000) / 1000;
+  utimesSync(dir, past, past);
+}
+
+function makeFifo(path: string): void {
+  const result = spawnSync("mkfifo", [path], { encoding: "utf-8", timeout: 10_000 });
+  expect(result.status).toBe(0);
 }
 
 /** A pid that has exited and been reaped by this process. */
@@ -148,6 +162,84 @@ describe("sweepStaleLaunchSnapshots", () => {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   });
+  test("keeps a pending snapshot with no readable owner regardless of age", () => {
+    const fixture = makeFixture();
+    try {
+      const pending = makeSnapshot(fixture.launch, ".pending-config-abc123");
+      ageSnapshot(pending);
+
+      expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([]);
+      expect(existsSync(pending)).toBe(true);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test("does not block on a FIFO owner record and removes it past the grace period", () => {
+    const fixture = makeFixture();
+    try {
+      const fifoSnapshot = makeSnapshot(fixture.launch, "config-fifo");
+      makeFifo(join(fifoSnapshot, LAUNCH_SNAPSHOT_OWNER_FILE));
+      ageSnapshot(fifoSnapshot);
+
+      // Run the sweep in a child with a hard timeout: a blocking open would
+      // hang the child instead of the test process.
+      const scriptPath = join(fixture.root, "sweep-fifo.mjs");
+      writeFileSync(
+        scriptPath,
+        `
+import { sweepStaleLaunchSnapshots } from ${JSON.stringify(SNAPSHOTS_MODULE)};
+console.log("REMOVED " + JSON.stringify(sweepStaleLaunchSnapshots(${JSON.stringify(fixture.launch)}, { graceMs: 0 })));
+`,
+      );
+      const result = spawnSync("bun", [scriptPath], { encoding: "utf-8", timeout: 10_000 });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain(`REMOVED [${JSON.stringify(fifoSnapshot)}]`);
+      expect(existsSync(fifoSnapshot)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("refuses an oversized owner record and removes it past the grace period", () => {
+    const fixture = makeFixture();
+    try {
+      const oversized = makeSnapshot(fixture.launch, "config-oversized");
+      writeFileSync(
+        join(oversized, LAUNCH_SNAPSHOT_OWNER_FILE),
+        JSON.stringify({ pid: process.pid, startToken: "proc:1", pad: "x".repeat(5000) }),
+      );
+      ageSnapshot(oversized);
+
+      expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([oversized]);
+      expect(existsSync(oversized)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an owner record whose pid or start token has the wrong shape", () => {
+    const fixture = makeFixture();
+    try {
+      const shapes: Array<[string, unknown]> = [
+        ["config-pid-string", { pid: String(process.pid), startToken: "proc:1" }],
+        ["config-pid-fraction", { pid: 1.5, startToken: "proc:1" }],
+        ["config-token-number", { pid: process.pid, startToken: 7 }],
+        ["config-token-missing", { pid: process.pid }],
+      ];
+      const dirs = shapes.map(([name, owner]) => {
+        const dir = makeSnapshot(fixture.launch, name);
+        writeOwner(dir, owner as Record<string, unknown>);
+        ageSnapshot(dir);
+        return dir;
+      });
+
+      expect(sweepStaleLaunchSnapshots(fixture.launch).sort()).toEqual([...dirs].sort());
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
 });
 
 function launchScript(config: string, sweepThrows: boolean): string {
@@ -183,7 +275,7 @@ function runLaunchChild(fixture: Fixture, script: string) {
 }
 
 describe("launch integration", () => {
-  test("the next launch removes a stale snapshot and keeps a live launcher's snapshot", async () => {
+  test("the next launch removes a stale snapshot and keeps a published snapshot with a live owner record", async () => {
     const fixture = makeFixture();
     const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     try {
@@ -233,4 +325,127 @@ describe("launch integration", () => {
       rmSync(fixture.root, { recursive: true, force: true });
     }
   });
+
+  test("a second launch keeps a first launch paused before it publishes, whose published snapshot then has its owner", async () => {
+    const fixture = makeFixture();
+    const config = join(fixture.root, "agent.yaml");
+    writeFileSync(config, "agentId: probe\n");
+    const pauseFile = join(fixture.root, "paused.json");
+    const releaseFile = join(fixture.root, "release");
+    const resultFile = join(fixture.root, "result.json");
+    const scriptPath = join(fixture.root, "paused-launch.mjs");
+    writeFileSync(
+      scriptPath,
+      `
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { runAgent } from ${JSON.stringify(AGENT_MODULE)};
+try {
+  await runAgent({ action: "start", config: ${JSON.stringify(config)} }, {
+    afterPendingSnapshot: (path) => {
+      writeFileSync(${JSON.stringify(pauseFile)}, JSON.stringify({ path }));
+      const deadline = Date.now() + 20_000;
+      while (Date.now() < deadline && !existsSync(${JSON.stringify(releaseFile)})) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+      }
+    },
+    afterConfigSnapshot: (configPath) => {
+      const snapshotDir = dirname(configPath);
+      writeFileSync(${JSON.stringify(resultFile)}, JSON.stringify({
+        snapshot: basename(snapshotDir),
+        owner: JSON.parse(readFileSync(join(snapshotDir, "owner.json"), "utf8")),
+      }));
+      throw new Error("stop after snapshot");
+    },
+  });
+} catch (error) {
+  if (error?.message === "stop after snapshot") process.exit(0);
+  throw error;
+}
+`,
+    );
+    const first = spawn("bun", [scriptPath], {
+      cwd: fixture.root,
+      encoding: "utf-8",
+      env: { ...process.env, HOME: join(fixture.root, "home") },
+    });
+    try {
+      const pauseDeadline = Date.now() + 10_000;
+      while (Date.now() < pauseDeadline && !existsSync(pauseFile)) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+      }
+      expect(existsSync(pauseFile)).toBe(true);
+      const paused = JSON.parse(readFileSync(pauseFile, "utf-8")).path as string;
+
+      // Old enough that a sweep would remove it were it an ownerless
+      // published entry.
+      ageSnapshot(paused);
+
+      const second = runLaunchChild(fixture, launchScript(config, false));
+      expect(second.status, second.stderr).toBe(0);
+      expect(second.stdout).toContain("SNAPSHOT_REACHED");
+      expect(existsSync(paused), "the second launch's sweep removed a paused launch's directory").toBe(true);
+      // The paused directory must not be visible under its published name.
+      expect(basename(paused).startsWith(".pending-config-")).toBe(true);
+
+      writeFileSync(releaseFile, "");
+      const exitCode = await new Promise<number | null>((resolveExit) => {
+        const timer = setTimeout(() => resolveExit(null), 15_000);
+        first.once("exit", (code) => {
+          clearTimeout(timer);
+          resolveExit(code);
+        });
+      });
+      expect(exitCode).toBe(0);
+
+      const published = JSON.parse(readFileSync(resultFile, "utf-8"));
+      expect(published.snapshot.startsWith("config-")).toBe(true);
+      expect(published.owner.pid).toBe(first.pid);
+      expect(published.owner.startToken === null || typeof published.owner.startToken === "string").toBe(true);
+    } finally {
+      first.kill("SIGKILL");
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a FIFO owner record does not block the launch", () => {
+    const fixture = makeFixture();
+    try {
+      const fifoSnapshot = makeSnapshot(fixture.launch, "config-fifo");
+      makeFifo(join(fifoSnapshot, LAUNCH_SNAPSHOT_OWNER_FILE));
+      ageSnapshot(fifoSnapshot);
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+
+      const result = runLaunchChild(fixture, launchScript(config, false));
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("SNAPSHOT_REACHED");
+      expect(existsSync(fifoSnapshot)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("an oversized owner record does not block the launch", () => {
+    const fixture = makeFixture();
+    try {
+      const oversized = makeSnapshot(fixture.launch, "config-oversized");
+      writeFileSync(
+        join(oversized, LAUNCH_SNAPSHOT_OWNER_FILE),
+        JSON.stringify({ pid: process.pid, startToken: "proc:1", pad: "x".repeat(5000) }),
+      );
+      ageSnapshot(oversized);
+      const config = join(fixture.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\n");
+
+      const result = runLaunchChild(fixture, launchScript(config, false));
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("SNAPSHOT_REACHED");
+      expect(existsSync(oversized)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
