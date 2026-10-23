@@ -276,7 +276,7 @@ describe("selected runner startup with interactive opt-out", () => {
   }
 });
 
-function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false, flags: string[] = []) {
+function interactiveRuntimeProbe(sb: Sandbox, rt: string | undefined, noSandbox = false, equals = false, flags: string[] = [], env: Record<string, string | undefined> = {}) {
   const defaultMarker = join(sb.root, "default-started");
   const selectedMarker = join(sb.root, "selected-started");
   const preload = join(sb.root, "interactive.mjs");
@@ -304,7 +304,7 @@ for (const stream of [process.stdout, process.stderr]) {
 `);
   const result = spawnSync(NODE, ["--import", preload, TPS_BIN, "agent", "start", "--id", "probe", ...(rt ? equals ? [`--runtime=${rt}`] : ["--runtime", rt] : []), ...(noSandbox ? ["--no-sandbox"] : []), ...flags], {
     cwd: sb.ws,
-    env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined }),
+    env: cliEnv(sb, { [NONO_BIN_ENV]: join(sb.nonoDir, "missing"), TPS_NONO_STRICT: undefined, TPS_SUPERVISED: undefined, ...env }),
     encoding: "utf8", timeout: 5000, killSignal: "SIGKILL",
   });
   return { status: result.status, text: `${result.stdout ?? ""}${result.stderr ?? ""}`, defaultMarker, selectedMarker };
@@ -361,6 +361,7 @@ function workspaceOptOut(
   rt: (typeof RUNTIMES)[number],
   workspaceLines: string | ((sb: Sandbox) => string),
   check: (run: WorkspaceRun) => void,
+  env: (sb: Sandbox) => Record<string, string | undefined> = () => ({}),
 ): void {
   const sb = makeSandbox();
   try {
@@ -376,7 +377,7 @@ function workspaceOptOut(
       join(agentDir, "agent.yaml"),
       `agentId: probe\nname: probe\n${workspaceLine ? `${workspaceLine}\n` : ""}mailDir: ${join(sb.home, ".tps", "mail")}\nllm:\n  provider: ollama\n  model: probe-model\n`,
     );
-    const result = interactiveRuntimeProbe(sb, rt, true);
+    const result = interactiveRuntimeProbe(sb, rt, true, false, [], env(sb));
     const worktrees = g(["worktree", "list", "--porcelain"]).stdout.match(/^worktree /gm)?.length ?? 0;
     check({ result, sb, agentDir, worktrees });
   } finally {
@@ -472,6 +473,43 @@ describe("interactive selected runtime workspace values", () => {
       expect(existsSync(join(dirs!.repo, ".tps-agent.pid"))).toBe(false);
       expect(existsSync(join(dirs!.fallback, ".tps-agent.pid"))).toBe(false);
     });
+  });
+
+  for (const key of ["workspace", "repo"] as const) {
+    test(`codex: --no-sandbox expands \${NAME} in ${key} before starting its runner`, () => {
+      let expanded = "";
+      workspaceOptOut("codex", (sb) => {
+        expanded = join(sb.root, "expanded", "project");
+        mkdirSync(expanded, { recursive: true });
+        return `${key}: \${TPS_TEST_PROJECT_ROOT}/project`;
+      }, (run) => {
+        expect(run.result.status).toBe(0);
+        expect(existsSync(run.result.selectedMarker)).toBe(true);
+        expect(existsSync(join(expanded, ".tps-agent.pid"))).toBe(true);
+      }, (sb) => ({ TPS_TEST_PROJECT_ROOT: join(sb.root, "expanded") }));
+    });
+  }
+
+  test("codex: --no-sandbox refuses an unset variable in repo before worktree setup or runner start", () => {
+    workspaceOptOut(
+      "codex",
+      "repo: ${TPS_TEST_PROJECT_ROOT}/project",
+      (run) => expectRefusedBeforeSetup(run, "Missing environment variable: TPS_TEST_PROJECT_ROOT"),
+      () => ({ TPS_TEST_PROJECT_ROOT: undefined }),
+    );
+  });
+
+  test("codex: --no-sandbox starts with an unset variable in a key other than workspace or repo", () => {
+    let dir = "";
+    workspaceOptOut("codex", (sb) => {
+      dir = join(sb.root, "repo-dir");
+      mkdirSync(dir);
+      return `repo: ${dir}\nsystemPrompt: "\${TPS_TEST_UNSET_VALUE}"`;
+    }, (run) => {
+      expect(run.result.status).toBe(0);
+      expect(existsSync(run.result.selectedMarker)).toBe(true);
+      expect(existsSync(join(dir, ".tps-agent.pid"))).toBe(true);
+    }, () => ({ TPS_TEST_UNSET_VALUE: undefined }));
   });
 });
 

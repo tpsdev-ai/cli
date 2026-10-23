@@ -508,8 +508,16 @@ async function main() {
             }
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
             const { agentWorkspace: resolveWorkspace } = await import("../src/utils/agent-workspace.js");
-            const { readConfiguredWorkspace } = await import("@tpsdev-ai/agent");
-            const configured = readConfiguredWorkspace(agentCfg);
+            const { interpolateEnvInString, readConfiguredWorkspace } = await import("@tpsdev-ai/agent");
+            // Expand ${NAME} in the two path keys only (cli#680); a sandboxed child
+            // receives the parent loader's resolved workspace instead.
+            const pathFields: Record<string, unknown> = {};
+            for (const key of ["workspace", "repo"] as const) {
+              if (!Object.hasOwn(agentCfg, key)) continue;
+              const value = agentCfg[key];
+              pathFields[key] = !sandboxed && typeof value === "string" ? interpolateEnvInString(value) : value;
+            }
+            const configured = readConfiguredWorkspace(pathFields);
             const agentWorkspace = resolveWorkspace(
               cfgPath,
               configured.workspace ?? configured.repo ?? join(homedir(), "ops", "tps"),

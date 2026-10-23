@@ -24,7 +24,7 @@ export interface AgentRuntimeConfig {
   execAllowlist?: string[];
 }
 
-function interpolateEnvInString(raw: string): string {
+export function interpolateEnvInString(raw: string): string {
   return raw.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, varName: string) => {
     const resolved = process.env[varName];
     if (resolved === undefined) {
