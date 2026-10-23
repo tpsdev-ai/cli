@@ -2,6 +2,20 @@ import { z } from "zod";
 import * as yaml from "js-yaml";
 import { readFileSync } from "node:fs";
 
+/** The type names zod 3 used in "Expected string, received …". */
+function receivedType(value: unknown): string {
+  if (value === null) return "null";
+  if (Array.isArray(value)) return "array";
+  if (value instanceof Date) return "date";
+  if (typeof value === "number" && Number.isNaN(value)) return "nan";
+  return typeof value;
+}
+
+function requiredMessage(message: string) {
+  return (issue: { input?: unknown }) =>
+    issue.input === undefined ? message : `Expected string, received ${receivedType(issue.input)}`;
+}
+
 export const TPSReportSchema = z.object({
   version: z
     .string()
@@ -9,16 +23,16 @@ export const TPSReportSchema = z.object({
     .describe("TPS report version"),
 
   name: z
-    .string({ required_error: "I'm gonna need you to put a name on that TPS report." })
+    .string({ error: requiredMessage("I'm gonna need you to put a name on that TPS report.") })
     .min(1, "The name field is empty. Did you get the memo about filling out all the fields?"),
 
   description: z
-    .string({ required_error: "Description missing. What exactly would you say... this agent does?" })
+    .string({ error: requiredMessage("Description missing. What exactly would you say... this agent does?") })
     .min(1, "Description can't be blank. We need to know what this agent does here."),
 
   identity: z.object({
     default_name: z
-      .string({ required_error: "Every agent needs a name. Even Milton had a name." })
+      .string({ error: requiredMessage("Every agent needs a name. Even Milton had a name.") })
       .min(1),
     emoji: z.string().default("📋"),
     personality: z
@@ -36,35 +50,35 @@ export const TPSReportSchema = z.object({
 
   model: z.object({
     default: z.string().default("reasoning"),
-  }).default({}),
+  }).prefault({}),
 
   tools: z.object({
     required: z.array(z.string()).default([]),
     optional: z.array(z.string()).default([]),
-  }).default({}),
+  }).prefault({}),
 
   communication: z.object({
     channels: z.array(z.string()).default(["direct"]),
     handoff_targets: z.array(z.string()).default([]),
-  }).default({}),
+  }).prefault({}),
 
   boundaries: z.object({
     can_commit: z.boolean().default(false),
     can_send_external: z.boolean().default(false),
     can_spend: z.boolean().default(false),
-  }).default({}),
+  }).prefault({}),
 
   memory: z.object({
     private: z.boolean().default(true),
     shared_read: z.array(z.string()).default([]),
     shared_write: z.array(z.string()).default([]),
-  }).default({}),
+  }).prefault({}),
 
   openclaw: z.object({
     model: z.string().default("anthropic/claude-sonnet-4-20250514"),
     thinking: z.string().default("off"),
     channel: z.string().default("discord"),
-  }).default({}),
+  }).prefault({}),
 });
 
 export type TPSReport = z.infer<typeof TPSReportSchema>;

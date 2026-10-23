@@ -1,0 +1,1 @@
+- **The CLI workspace now depends on zod 4.6.7, outside the range of GHSA-mrhx-c7xc-m3w5.** Report and wire validation keep the values and the relay input that zod 3 accepted.

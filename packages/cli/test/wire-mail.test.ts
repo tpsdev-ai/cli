@@ -11,7 +11,7 @@ import {
 } from "../src/utils/identity.js";
 import { PlainTcpTransport } from "../src/utils/plain-tcp-transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
-import { MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
+import { HttpRequestBodySchema, MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
 describe("wire mail", () => {
   let root: string;
@@ -168,6 +168,60 @@ describe("wire mail", () => {
 
     await client.close();
     await server.close();
+  });
+
+  test("accepts a non-RFC 8-4-4-4-12 delivery id", () => {
+    const parsed = MailDeliverBodySchema.parse({
+      id: "12345678-1234-1234-1234-123456789abc",
+      from: "brancha",
+      to: "kern",
+      content: "x",
+      timestamp: "2026-01-01T00:00:00.000Z",
+    });
+    expect(parsed.id).toBe("12345678-1234-1234-1234-123456789abc");
+  });
+
+  test("accepts a non-RFC 8-4-4-4-12 reqId", () => {
+    const parsed = HttpRequestBodySchema.parse({
+      reqId: "12345678-1234-1234-1234-123456789abc",
+      method: "GET",
+      path: "/",
+      headers: {},
+    });
+    expect(parsed.reqId).toBe("12345678-1234-1234-1234-123456789abc");
+  });
+
+  test("accepts the zod 3 relay timestamp forms", () => {
+    for (const timestamp of [
+      "2026-01-01T00:00Z",
+      "2026-01-01T00:00:00+0100",
+      "2026-01-01T00:00:00.123+05:30",
+      "2024-02-29T00:00:00Z",
+    ]) {
+      expect(
+        MailDeliverBodySchema.safeParse({
+          id: "550e8400-e29b-41d4-a716-446655440010",
+          from: "brancha",
+          to: "kern",
+          content: "x",
+          timestamp,
+        }).success
+      ).toBe(true);
+    }
+  });
+
+  test("rejects impossible calendar dates and malformed timestamps", () => {
+    for (const timestamp of ["2026-02-30T00:00:00Z", "2026-04-31T00:00:00Z", "not-a-date"]) {
+      expect(
+        MailDeliverBodySchema.safeParse({
+          id: "550e8400-e29b-41d4-a716-446655440011",
+          from: "brancha",
+          to: "kern",
+          content: "x",
+          timestamp,
+        }).success
+      ).toBe(false);
+    }
   });
 
   test("rejects malformed sender/recipient identifiers", () => {

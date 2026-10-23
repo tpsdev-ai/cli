@@ -23,6 +23,41 @@ describe("TPSReportSchema", () => {
     expect(report.openclaw.thinking).toBe("off");
   });
 
+  test("applies the zod 3 default output for omitted blocks", () => {
+    // Expected object captured by parsing this input on main with zod 3.25.76.
+    const expected = {
+      version: "1",
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: {
+        default_name: "Agent A",
+        emoji: "📋",
+        personality: "Professional and helpful.",
+        communication_style: "Clear and direct.",
+      },
+      flair: [],
+      model: { default: "reasoning" },
+      tools: { required: [], optional: [] },
+      communication: { channels: ["direct"], handoff_targets: [] },
+      boundaries: { can_commit: false, can_send_external: false, can_spend: false },
+      memory: { private: true, shared_read: [], shared_write: [] },
+      openclaw: {
+        model: "anthropic/claude-sonnet-4-20250514",
+        thinking: "off",
+        channel: "discord",
+      },
+    };
+
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: "Agent A" },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toEqual(expected);
+  });
+
   test("parses a fully-specified report", () => {
     const report = parseTPSReport(join(FIXTURES, "valid-full.tps"));
     expect(report.name).toBe("Full Test Agent");
