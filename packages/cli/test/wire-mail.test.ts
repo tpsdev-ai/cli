@@ -11,7 +11,7 @@ import {
 } from "../src/utils/identity.js";
 import { PlainTcpTransport } from "../src/utils/plain-tcp-transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
-import { HttpRequestBodySchema, MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
+import { HttpRequestBodySchema, HttpResponseBodySchema, JoinCompleteBodySchema, MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
 describe("wire mail", () => {
   let root: string;
@@ -221,6 +221,29 @@ describe("wire mail", () => {
           timestamp,
         }).success
       ).toBe(false);
+    }
+  });
+
+  test("refuses int wire fields beyond the safe integer range", () => {
+    const joinBody = (localPort: number) => ({
+      hostPubkey: "pubkey",
+      hostFingerprint: "fingerprint",
+      hostId: "host-a",
+      services: [{ name: "svc", localPort }],
+    });
+    const responseBody = (status: number) => ({
+      reqId: "550e8400-e29b-41d4-a716-446655440012",
+      status,
+      headers: {},
+    });
+
+    for (const value of [2 ** 53, Infinity]) {
+      expect(JoinCompleteBodySchema.safeParse(joinBody(value)).success).toBe(false);
+      expect(HttpResponseBodySchema.safeParse(responseBody(value)).success).toBe(false);
+    }
+    for (const value of [Number.MAX_SAFE_INTEGER, 8080]) {
+      expect(JoinCompleteBodySchema.safeParse(joinBody(value)).success).toBe(true);
+      expect(HttpResponseBodySchema.safeParse(responseBody(value)).success).toBe(true);
     }
   });
 

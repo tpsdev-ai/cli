@@ -1,1 +1,1 @@
-- **The CLI workspace now depends on zod 4.6.7, outside the range of GHSA-mrhx-c7xc-m3w5.** Report and wire validation keep the values and the relay input that zod 3 accepted.
+- **The CLI workspace now depends on zod 4.6.7, outside the range of GHSA-mrhx-c7xc-m3w5.** Report defaults, ids, timestamps, records and `Expected string, received …` error text keep their zod 3 behaviour. Two changes are deliberate: `.int()` fields now refuse integers beyond `Number.MAX_SAFE_INTEGER` (they cannot be represented exactly), and `z.number()` now refuses `Infinity`.

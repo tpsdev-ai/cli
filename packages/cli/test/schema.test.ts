@@ -58,6 +58,67 @@ describe("TPSReportSchema", () => {
     if (result.success) expect(result.data).toEqual(expected);
   });
 
+  // Captured from zod 3.25.76 by parsing each value through
+  // z.string({ required_error: "I'm gonna need you to put a name on that TPS report." }).
+  // getParsedType's "unknown" arm is unreachable: typeof does not produce it.
+  const zod3ReceivedMessages: Record<string, string> = {
+    undefined: "I'm gonna need you to put a name on that TPS report.",
+    nan: "Expected string, received nan",
+    number: "Expected string, received number",
+    boolean: "Expected string, received boolean",
+    function: "Expected string, received function",
+    bigint: "Expected string, received bigint",
+    symbol: "Expected string, received symbol",
+    array: "Expected string, received array",
+    null: "Expected string, received null",
+    promise: "Expected string, received promise",
+    map: "Expected string, received map",
+    set: "Expected string, received set",
+    date: "Expected string, received date",
+    object: "Expected string, received object",
+  };
+  const zod3Samples: Record<string, unknown> = {
+    undefined,
+    nan: Number.NaN,
+    number: 42,
+    boolean: true,
+    function: function fixture() {},
+    bigint: 1n,
+    symbol: Symbol("fixture"),
+    array: [],
+    null: null,
+    promise: Promise.resolve(),
+    map: new Map(),
+    set: new Set(),
+    date: new Date(),
+    object: {},
+  };
+
+  for (const [parsedType, value] of Object.entries(zod3Samples)) {
+    test(`reports "${parsedType}" for a ${parsedType} value`, () => {
+      const result = TPSReportSchema.safeParse({
+        name: value,
+        description: "Fixture agent",
+        identity: { default_name: "Agent A" },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "name");
+        expect(issue?.message).toBe(zod3ReceivedMessages[parsedType]);
+      }
+    });
+  }
+
+  test("accepts a string in a string field", () => {
+    expect(
+      TPSReportSchema.safeParse({
+        name: "Agent A",
+        description: "Fixture agent",
+        identity: { default_name: "Agent A" },
+      }).success
+    ).toBe(true);
+  });
+
   test("parses a fully-specified report", () => {
     const report = parseTPSReport(join(FIXTURES, "valid-full.tps"));
     expect(report.name).toBe("Full Test Agent");

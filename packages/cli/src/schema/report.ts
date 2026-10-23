@@ -2,13 +2,39 @@ import { z } from "zod";
 import * as yaml from "js-yaml";
 import { readFileSync } from "node:fs";
 
-/** The type names zod 3 used in "Expected string, received …". */
+/**
+ * The type names zod 3 used in "Expected string, received …", in the order
+ * zod 3.25.76's getParsedType checks them.
+ */
 function receivedType(value: unknown): string {
-  if (value === null) return "null";
-  if (Array.isArray(value)) return "array";
-  if (value instanceof Date) return "date";
-  if (typeof value === "number" && Number.isNaN(value)) return "nan";
-  return typeof value;
+  switch (typeof value) {
+    case "undefined":
+      return "undefined";
+    case "string":
+      return "string";
+    case "number":
+      return Number.isNaN(value) ? "nan" : "number";
+    case "boolean":
+      return "boolean";
+    case "function":
+      return "function";
+    case "bigint":
+      return "bigint";
+    case "symbol":
+      return "symbol";
+    case "object": {
+      if (Array.isArray(value)) return "array";
+      if (value === null) return "null";
+      const thenable = value as { then?: unknown; catch?: unknown };
+      if (typeof thenable.then === "function" && typeof thenable.catch === "function") return "promise";
+      if (value instanceof Map) return "map";
+      if (value instanceof Set) return "set";
+      if (value instanceof Date) return "date";
+      return "object";
+    }
+    default:
+      return "unknown";
+  }
 }
 
 function requiredMessage(message: string) {
