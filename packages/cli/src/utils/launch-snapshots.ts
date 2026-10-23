@@ -24,6 +24,16 @@
  * later launch removes the directory while its launcher is stopped inside that
  * step, the launcher fails writing the owner record when it resumes and
  * publishes nothing.
+ *
+ * The sweep selects an entry only when its name is `config-` or
+ * `.pending-config-` followed by exactly six letters or digits, the suffix
+ * mkdtemp appends. tps's other entries in `~/.tps/launch` are attestation
+ * directories (launch-attestation.ts), named `<id>-<8 hex digits>` or
+ * `<first 16 characters of the id>-<8 hex digits>`, where the id has no `/`
+ * (`tps agent start` accepts only ids matching `^[a-zA-Z0-9._-]{1,64}$`): the
+ * ninth character from the end of such a name is `-`, and in every name the
+ * sweep selects it is the `i` of `config`. So the sweep selects no attestation
+ * directory, whatever the agent id.
  */
 
 import {
@@ -52,6 +62,19 @@ export const LAUNCH_SNAPSHOT_OWNER_GRACE_MS = 60_000;
 export const LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS = 24 * 60 * 60 * 1000;
 /** The largest pid Bun's and Node's process.kill accept as an argument. */
 const LAUNCH_SNAPSHOT_MAX_PID = 2_147_483_647;
+/** The six letters or digits mkdtemp appends to a snapshot prefix. */
+const LAUNCH_SNAPSHOT_SUFFIX = /^[A-Za-z0-9]{6}$/;
+
+/** Which kind of snapshot entry a name is, or null for a name the sweep never selects. */
+function snapshotKind(name: string): "published" | "pending" | null {
+  for (const [prefix, kind] of [
+    [LAUNCH_SNAPSHOT_PENDING_PREFIX, "pending"],
+    [LAUNCH_SNAPSHOT_PREFIX, "published"],
+  ] as const) {
+    if (name.startsWith(prefix) && LAUNCH_SNAPSHOT_SUFFIX.test(name.slice(prefix.length))) return kind;
+  }
+  return null;
+}
 
 export interface LaunchSnapshotOwner {
   pid: number;
@@ -163,8 +186,8 @@ export interface SweepLaunchSnapshotsOptions {
 }
 
 /**
- * Remove `config-*` and `.pending-config-*` directories directly under
- * `launchDir` whose recorded owner is dead, or that have no readable owner
+ * Remove snapshot directories (named as the module header states) directly
+ * under `launchDir` whose recorded owner is dead, or that have no readable owner
  * record and are at least their grace period old: `graceMs` for a published
  * entry, LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS for a pending one. Age is the
  * entry directory's mtime; an entry whose mtime cannot be read is kept. Returns
@@ -180,12 +203,12 @@ export function sweepStaleLaunchSnapshots(
   const removed: string[] = [];
 
   for (const entry of readdirSync(launchDir, { withFileTypes: true })) {
-    const pending = entry.name.startsWith(LAUNCH_SNAPSHOT_PENDING_PREFIX);
-    if (!pending && !entry.name.startsWith(LAUNCH_SNAPSHOT_PREFIX)) continue;
+    const kind = snapshotKind(entry.name);
+    if (kind === null) continue;
     if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
 
     const path = join(launchDir, entry.name);
-    if (!isStale(path, pending ? LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS : graceMs, now)) continue;
+    if (!isStale(path, kind === "pending" ? LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS : graceMs, now)) continue;
 
     try {
       // rm does not traverse a symlink in place of the entry.

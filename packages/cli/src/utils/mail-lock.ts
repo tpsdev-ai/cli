@@ -1,6 +1,6 @@
 // The mailbox lock lives in @tpsdev-ai/agent so MailClient and promote() hold the same one.
 export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, type MailLock, mailLockPath, processStartToken } from "@tpsdev-ai/agent";
-import { processStartToken } from "@tpsdev-ai/agent";
+import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -9,15 +9,6 @@ import type { MailLock } from "@tpsdev-ai/agent";
 const OWNER_FILE = "owner.json";
 
 const TEMP_PREFIX = ".mail-lock.tmp.";
-
-function isPidAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    return err?.code !== "ESRCH";
-  }
-}
 
 interface LockOwner {
   pid?: unknown;
@@ -44,17 +35,18 @@ function ownerState(
   resolveToken: (pid: number) => string | null = processStartToken,
   strict = false,
 ): OwnerState {
-  if (!owner || typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
-    return "unowned";
-  }
+  if (!owner || typeof owner.pid !== "number") return "unowned";
+  // An invalid pid is handled as a missing one is.
+  const pid = pidState(owner.pid);
+  if (pid === "invalid") return "unowned";
   if (strict && (typeof owner.startToken !== "string" || !/^(proc|ps):.+/.test(owner.startToken))) return "unverifiable";
-  if (!isPidAlive(owner.pid)) return "dead";
+  if (pid === "gone") return "dead";
   const token = resolveToken(owner.pid);
   if (token !== null && typeof owner.startToken === "string") {
     if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";
     return token === owner.startToken ? "alive" : "dead";
   }
-  return isPidAlive(owner.pid) ? "unverifiable" : "dead";
+  return pidState(owner.pid) === "gone" ? "dead" : "unverifiable";
 }
 
 function claimLock(lockDir: string, myToken: string | null): boolean {
