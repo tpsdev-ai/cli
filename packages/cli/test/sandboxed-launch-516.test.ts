@@ -12,6 +12,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -22,6 +23,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
+  REFUSAL_EXIT_CODE,
   canonicalPath,
   harnessReadFiles,
   agentLaunchOptions,
@@ -1861,6 +1863,266 @@ exit 0
       expect(readFileSync(headFile, "utf-8").trim(), output(result)).not.toBe(before);
       expect(existsSync(f.sb.ws)).toBe(false);
       expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).not.toContain(f.sb.ws);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // cli#676 — the launcher's own decision after a setup failure
+  // -------------------------------------------------------------------------
+
+  /**
+   * A git wrapper for the launcher. It logs each call's arguments to `log`,
+   * fails the first `rev-parse --absolute-git-dir` in the workspace (setup's
+   * metadata read, inside onStart) after running `beforeSetupFailure`, and
+   * fails the first `failRemovals` `worktree remove` calls. Every other call
+   * runs real Git.
+   */
+  function setupFailureWrapper(
+    f: LaunchFixture,
+    opts: { failRemovals: number; beforeSetupFailure?: string[] },
+  ): { path: string; log: string } {
+    const bin = join(f.sb.root, "bin");
+    mkdirSync(bin);
+    const log = join(f.sb.root, "git-calls.log");
+    const failed = join(f.sb.root, "setup-failed");
+    const removals = join(f.sb.root, "removals");
+    writeFileSync(
+      join(bin, "git"),
+      [
+        "#!/bin/sh",
+        `printf '%s\\n' "$*" >> "${log}"`,
+        `if [ "$1" = "rev-parse" ] && [ "$2" = "--absolute-git-dir" ] && [ "$(pwd -P)" = "${f.sb.ws}" ] && [ ! -f "${failed}" ]; then`,
+        `  : > "${failed}"`,
+        ...(opts.beforeSetupFailure ?? []).map((line) => `  ${line}`),
+        '  echo "injected setup failure" >&2',
+        "  exit 79",
+        "fi",
+        'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+        `  n=$(( $(cat "${removals}" 2>/dev/null || echo 0) + 1 ))`,
+        `  echo "$n" > "${removals}"`,
+        `  if [ "$n" -le ${opts.failRemovals} ]; then`,
+        '    echo "fatal: injected removal failure" >&2',
+        "    exit 1",
+        "  fi",
+        "fi",
+        `exec "${GIT}" "$@"`,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(join(bin, "git"), 0o755);
+    return { path: `${bin}:${process.env.PATH}`, log };
+  }
+
+  /** The git calls the wrapper logged, one argument string per call. */
+  function gitCalls(log: string): string[] {
+    return readFileSync(log, "utf-8").split("\n").filter(Boolean);
+  }
+
+  function worktreeListing(base: string): string {
+    const listed = spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: base, encoding: "utf8" });
+    expect(listed.status, listed.stderr).toBe(0);
+    return listed.stdout;
+  }
+
+  function branchSet(base: string): string[] {
+    const listed = spawnSync(GIT, ["branch", "--format=%(refname:short)"], { cwd: base, encoding: "utf8" });
+    expect(listed.status, listed.stderr).toBe(0);
+    return listed.stdout.split("\n").filter(Boolean).sort();
+  }
+
+  function adminDirOf(workspace: string): string {
+    const file = readFileSync(join(workspace, ".git"), "utf-8").trim();
+    expect(file.startsWith("gitdir: ")).toBe(true);
+    return realpathSync(resolve(workspace, file.slice("gitdir: ".length)));
+  }
+
+  /** The launcher's error lines, each without its leading marker. */
+  function errorLines(text: string): string[] {
+    return text.split("\n").filter((line) => line.startsWith("❌ ")).map((line) => line.slice("❌ ".length));
+  }
+
+  function setupError(f: LaunchFixture): string {
+    return `worktree git directory could not be resolved for ${f.sb.ws}: injected setup failure`;
+  }
+
+  function manualCommandFor(f: LaunchFixture): string {
+    return `git -C '${f.base}' worktree remove --force '${f.sb.ws}'`;
+  }
+
+  test("setup's own removal fails and the launcher's retry removes the worktree; the original error is reported", () => {
+    const f = launchFixture();
+    const wrapper = setupFailureWrapper(f, { failRemovals: 1 });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      // One error line: the original failure, with setup's own failed cleanup.
+      // The retry succeeded and printed no error.
+      expect(errorLines(text)).toEqual([
+        `${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: fatal: injected removal failure; ` +
+          `remove it manually with: ${manualCommandFor(f)}`,
+      ]);
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(worktreeListing(f.base)).not.toContain(`worktree ${f.sb.ws}\n`);
+      // Setup removed once and failed; the retry checked the registration, then removed.
+      const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
+      expect(calls).toEqual([
+        `worktree remove --force ${f.sb.ws}`,
+        "worktree list --porcelain",
+        `worktree remove --force ${f.sb.ws}`,
+      ]);
+      expect(fakeNonoRuns(f.sb.root)).toEqual([]);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("removal keeps failing: the launcher reports the original error and the retry's failure and refuses the launch", () => {
+    const f = launchFixture();
+    const wrapper = setupFailureWrapper(f, { failRemovals: 2 });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      expect(errorLines(text)).toEqual([
+        `${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: fatal: injected removal failure; ` +
+          `remove it manually with: ${manualCommandFor(f)}`,
+        `worktree cleanup failed for ${f.sb.ws}: fatal: injected removal failure; remove it manually with: ${manualCommandFor(f)}`,
+      ]);
+      // The worktree is left, still registered, and nothing was launched.
+      expect(adminDirOf(f.sb.ws)).toBeTruthy();
+      expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
+      const removes = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"));
+      expect(removes).toEqual([`worktree remove --force ${f.sb.ws}`, `worktree remove --force ${f.sb.ws}`]);
+      expect(fakeNonoRuns(f.sb.root)).toEqual([]);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("setup removed the worktree, so the launcher skips its retry", () => {
+    const f = launchFixture();
+    const wrapper = setupFailureWrapper(f, { failRemovals: 0 });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      expect(errorLines(text)).toEqual([setupError(f)]);
+      expect(existsSync(f.sb.ws)).toBe(false);
+      // Setup's removal is the only cleanup call: no registration read, no second removal.
+      const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
+      expect(calls).toEqual([`worktree remove --force ${f.sb.ws}`]);
+      expect(fakeNonoRuns(f.sb.root)).toEqual([]);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("the record fallback removes the recorded worktree and leaves a neighbouring worktree, its branch and the base's worktree list as they were", () => {
+    const f = launchFixture();
+    const neighbour = join(f.sb.root, "neighbour");
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "-b", "neighbour", neighbour], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    const listingBefore = worktreeListing(f.base);
+    const branchesBefore = branchSet(f.base);
+    const neighbourGitFile = readFileSync(join(neighbour, ".git"), "utf-8");
+    const neighbourAdmin = adminDirOf(neighbour);
+    const neighbourRegistry = readFileSync(join(neighbourAdmin, "gitdir"), "utf-8");
+    const neighbourHead = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: neighbour, encoding: "utf8" }).stdout.trim();
+    const adminEntriesBefore = readdirSync(join(f.base, ".git", "worktrees")).sort();
+    const wrapper = setupFailureWrapper(f, { failRemovals: 1 });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      expect(errorLines(text)).toHaveLength(1);
+      expect(errorLines(text)[0]).toStartWith(`${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: `);
+      // The recorded worktree is gone. The base's worktree list, branches and
+      // admin entries are unchanged, and the neighbour keeps its .git file,
+      // registry entry and HEAD.
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(worktreeListing(f.base)).toBe(listingBefore);
+      expect(listingBefore).toContain(`worktree ${neighbour}\n`);
+      expect(branchSet(f.base)).toEqual(branchesBefore);
+      expect(readFileSync(join(neighbour, ".git"), "utf-8")).toBe(neighbourGitFile);
+      expect(readFileSync(join(neighbourAdmin, "gitdir"), "utf-8")).toBe(neighbourRegistry);
+      expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: neighbour, encoding: "utf8" }).stdout.trim()).toBe(neighbourHead);
+      expect(readdirSync(join(f.base, ".git", "worktrees")).sort()).toEqual(adminEntriesBefore);
+      // Every removal the launcher ran named the recorded worktree.
+      const removes = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"));
+      expect(removes).toEqual([`worktree remove --force ${f.sb.ws}`, `worktree remove --force ${f.sb.ws}`]);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("the record fallback refuses a same-path replacement that does not carry the record's marker, and leaves it", () => {
+    const f = launchFixture();
+    const commit = spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.base, encoding: "utf8" }).stdout.trim();
+    // At setup's failing step, the worktree is replaced by a detached one at
+    // the same path and commit, which does not hold the record's marker.
+    const wrapper = setupFailureWrapper(f, {
+      failRemovals: 0,
+      beforeSetupFailure: [
+        `"${GIT}" -C "${f.base}" worktree remove --force "${f.sb.ws}" >/dev/null 2>&1`,
+        `"${GIT}" -C "${f.base}" worktree add --detach "${f.sb.ws}" "${commit}" >/dev/null 2>&1`,
+      ],
+    });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      // The replacement keeps its .git file, registry entry, HEAD and registration,
+      // and carries no marker.
+      const gitDir = adminDirOf(f.sb.ws);
+      expect(readFileSync(join(gitDir, "gitdir"), "utf-8").trim()).toBe(join(f.sb.ws, ".git"));
+      expect(readdirSync(gitDir)).not.toContain("tps-launch-owner");
+      expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: f.sb.ws, encoding: "utf8" }).stdout.trim()).toBe(commit);
+      expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
+      // Setup's cleanup and the fallback each refused; the fallback names the command.
+      const lines = errorLines(text);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toStartWith(`${setupError(f)}; worktree cleanup refused for ${f.sb.ws}: `);
+      expect(lines[1]).toStartWith(`worktree cleanup refused for ${f.sb.ws}: `);
+      expect(lines[1]).toEndWith(`; remove it manually with: ${manualCommandFor(f)}`);
+      // Neither cleanup route ran a removal through the launcher's Git.
+      expect(gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"))).toEqual([]);
+    } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a failed real git worktree list during the record fallback: the launcher removes nothing and reports the failure", () => {
+    const f = launchFixture();
+    // A neighbouring worktree whose `locked` entry is a directory makes real
+    // `git worktree list` exit non-zero.
+    const neighbour = join(f.sb.root, "neighbour");
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", neighbour], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    const lock = join(adminDirOf(neighbour), "locked");
+    mkdirSync(lock);
+    const brokenListing = spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" });
+    expect(brokenListing.status).not.toBe(0);
+    const wrapper = setupFailureWrapper(f, { failRemovals: 1 });
+    try {
+      const result = start(f.sb, wrapper.path);
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      // The worktree and its marker are left.
+      expect(readdirSync(adminDirOf(f.sb.ws))).toContain("tps-launch-owner");
+      const lines = errorLines(text);
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toStartWith(`${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: `);
+      expect(lines[1]).toStartWith(`worktree registration could not be read for ${f.sb.ws}: `);
+      expect(lines[1]).toContain("locked");
+      expect(text).not.toContain("is no longer a registered worktree");
+      // The only removal attempt was setup's failed one.
+      const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
+      expect(calls).toEqual([`worktree remove --force ${f.sb.ws}`, "worktree list --porcelain"]);
+      rmSync(lock, { recursive: true, force: true });
+      expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
     }
