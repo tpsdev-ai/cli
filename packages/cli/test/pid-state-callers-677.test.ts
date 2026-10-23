@@ -81,7 +81,7 @@ describe("tryAcquireMailLock owner pid", () => {
 });
 
 describe("tps status pid check", () => {
-  test("reports pid 1 and a running process as online, and a gone or out-of-range pid as a zombie", async () => {
+  test("reports pid 1 and a running process as online, and a gone, zero, negative, fractional or out-of-range pid as a zombie", async () => {
     const root = mkdtempSync(join(tmpdir(), "tps-677-status-"));
     const home = join(root, "home");
     const nodes = join(home, ".tps", "status", "nodes");
@@ -95,6 +95,9 @@ describe("tps status pid check", () => {
         "agent-b": live.pid,
         "agent-c": reapedPid(),
         "agent-d": 2_147_483_648,
+        "agent-e": 0,
+        "agent-f": -1,
+        "agent-g": 1.5,
       };
       for (const [agentId, pid] of Object.entries(pids)) {
         writeFileSync(
@@ -144,6 +147,9 @@ process.stdout.write("RESULT " + JSON.stringify(JSON.parse(lines.join("\\n"))) +
         "agent-b": "online",
         "agent-c": "zombie",
         "agent-d": "zombie",
+        "agent-e": "zombie",
+        "agent-f": "zombie",
+        "agent-g": "zombie",
       });
     } finally {
       live.child.kill("SIGKILL");

@@ -364,8 +364,9 @@ function computeState(raw: NodeStatus, now: number, staleMs: number, offlineMs: 
   if (raw.status === "error") {
     return "error";
   }
-  // EPERM from the probe means the process exists under another user: pidState reports it alive.
-  if (raw.pid && raw.status === "online" && pidState(raw.pid) !== "alive") {
+  // Every recorded pid, 0 included, goes through pidState. EPERM from the probe
+  // means the process exists under another user: pidState reports it alive.
+  if (raw.pid !== undefined && raw.pid !== null && raw.status === "online" && pidState(raw.pid) !== "alive") {
     return "zombie";
   }
   if (now - hb >= offlineMs) return "offline";

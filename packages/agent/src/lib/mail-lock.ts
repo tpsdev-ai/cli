@@ -107,11 +107,16 @@ export function pidState(pid: number): PidState {
     process.kill(pid, 0);
     return "alive";
   } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return "gone";
-    if (code !== undefined && PID_ARGUMENT_ERRORS.has(code)) return "invalid";
-    return "alive";
+    return pidStateFromProbeError(error);
   }
+}
+
+/** How pidState classifies an error thrown by `process.kill(pid, 0)`. */
+export function pidStateFromProbeError(error: unknown): PidState {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  if (code === "ESRCH") return "gone";
+  if (typeof code === "string" && PID_ARGUMENT_ERRORS.has(code)) return "invalid";
+  return "alive";
 }
 
 interface LockOwner {

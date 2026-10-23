@@ -3,10 +3,11 @@
  *
  * Snapshots are private `config-*` directories under `~/.tps/launch`. A snapshot
  * is created as `.pending-config-*`, gets its owner record (pid, and a start
- * token when one is readable), and is renamed to `config-*`. The sweep removes a
- * published or pending entry whose recorded owner is dead, or that has no
- * readable owner record past its grace period (one minute published, 24 hours
- * pending). Age is the entry directory's mtime.
+ * token when one is readable), and is renamed to `config-*`. The sweep attempts
+ * to remove a published or pending entry whose recorded owner is dead, or that
+ * has no readable owner record past its grace period (one minute published, 24
+ * hours pending); a removal that fails is logged and the entry is kept. Age is
+ * the entry directory's mtime.
  */
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";

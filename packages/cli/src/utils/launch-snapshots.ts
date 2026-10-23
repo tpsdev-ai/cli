@@ -15,10 +15,11 @@
  * Each snapshot records its owning launcher: pid and, when one is readable, a
  * process start token. When the recorded and current tokens are both readable
  * from the same source and differ, the sweep treats the pid as reused and the
- * owner as gone; when they match, the snapshot is kept. The next launch removes
- * published and pending entries whose recorded owner is dead, and entries with
- * no readable owner record whose directory mtime is at least a grace period old:
- * one minute for a published entry, 24 hours for a pending one. A live launch's
+ * owner as gone; when they match, the snapshot is kept. The next launch attempts
+ * to remove published and pending entries whose recorded owner is dead, and
+ * entries with no readable owner record whose directory mtime is at least a
+ * grace period old: one minute for a published entry, 24 hours for a pending
+ * one. A removal that fails is logged and the entry is kept. A live launch's
  * pending entry has no owner record only from creating the directory until it
  * writes the record, which it does next; 24 hours is far past that step. If a
  * later launch removes the directory while its launcher is stopped inside that
@@ -186,12 +187,13 @@ export interface SweepLaunchSnapshotsOptions {
 }
 
 /**
- * Remove snapshot directories (named as the module header states) directly
- * under `launchDir` whose recorded owner is dead, or that have no readable owner
- * record and are at least their grace period old: `graceMs` for a published
- * entry, LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS for a pending one. Age is the
- * entry directory's mtime; an entry whose mtime cannot be read is kept. Returns
- * the removed paths. Throws only when the directory itself cannot be listed;
+ * Attempt to remove snapshot directories (named as the module header states)
+ * directly under `launchDir` whose recorded owner is dead, or that have no
+ * readable owner record and are at least their grace period old: `graceMs` for
+ * a published entry, LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS for a pending one.
+ * Age is the entry directory's mtime; an entry whose mtime cannot be read is
+ * kept. A removal that fails is logged, that entry is kept, and the sweep goes
+ * on to the next entry. Returns the removed paths. Throws only when the directory itself cannot be listed;
  * the caller decides whether that fails the launch.
  */
 export function sweepStaleLaunchSnapshots(

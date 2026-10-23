@@ -7,7 +7,14 @@ import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { acquireMailLockSync, mailLockPath, pidState, processIsGone, processStartToken } from "../src/lib/mail-lock.js";
+import {
+  acquireMailLockSync,
+  mailLockPath,
+  pidState,
+  pidStateFromProbeError,
+  processIsGone,
+  processStartToken,
+} from "../src/lib/mail-lock.js";
 
 /** A pid that has exited and been reaped by this process. */
 function reapedPid(): number {
@@ -58,6 +65,21 @@ describe("pidState", () => {
 
   test("an exited and reaped process is gone", () => {
     expect(pidState(reapedPid())).toBe("gone");
+  });
+});
+
+describe("pidStateFromProbeError", () => {
+  // Errors carrying the codes process.kill raises, so EPERM is covered whichever user runs the test.
+  test("classifies EPERM as alive, ESRCH as gone, an argument error as invalid, and any other error as alive", () => {
+    const withCode = (code: string) => Object.assign(new Error(code), { code });
+    expect(pidStateFromProbeError(withCode("EPERM"))).toBe("alive");
+    expect(pidStateFromProbeError(withCode("ESRCH"))).toBe("gone");
+    for (const code of ["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE", "EINVAL", "ERANGE"]) {
+      expect(pidStateFromProbeError(withCode(code)), code).toBe("invalid");
+    }
+    expect(pidStateFromProbeError(withCode("EIO"))).toBe("alive");
+    expect(pidStateFromProbeError(new Error("no code"))).toBe("alive");
+    expect(pidStateFromProbeError(null)).toBe("alive");
   });
 });
 
