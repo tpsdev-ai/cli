@@ -618,11 +618,48 @@ function tryRemoveCreatedWorktree(created: WorktreeCreation): { ok: true } | { o
   return { ok: true };
 }
 
+/** True when the recorded base repository still lists `workspace` as one of
+ *  its worktrees. A failed listing is an error, never "not registered". */
+function worktreeRegisteredAt(baseWorkingTree: string, workspace: string): boolean {
+  const listed = git(baseWorkingTree, ["worktree", "list", "--porcelain"]);
+  if (!listed.ok) {
+    throw new WorktreeLifecycleError(
+      `worktree registration could not be read for ${workspace}: ${listed.stderr || listed.stdout || "git produced no output"}`,
+    );
+  }
+  const target = comparablePath(workspace);
+  for (const line of listed.stdout.split("\n")) {
+    if (line.startsWith("worktree ") && comparablePath(line.slice("worktree ".length)) === target) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function comparablePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
 /**
  * Remove the worktree a launch created, by the record taken at creation time.
- * Throws `WorktreeLifecycleError` naming the path when removal fails.
+ * A record already marked removed is skipped without a Git call, and a path
+ * the recorded base no longer registers as its worktree is refused rather
+ * than removed. Throws `WorktreeLifecycleError` naming the path when removal
+ * fails.
  */
 export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
+  if (created.removed) {
+    return { changed: false, reason: "worktree already removed" };
+  }
+  if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
+    throw new WorktreeLifecycleError(
+      `worktree cleanup refused for ${created.workspace}: the path is not a worktree of ${created.baseWorkingTree}`,
+    );
+  }
   const removal = tryRemoveCreatedWorktree(created);
   if (!removal.ok) {
     throw new WorktreeLifecycleError(

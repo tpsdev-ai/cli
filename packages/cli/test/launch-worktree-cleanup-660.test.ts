@@ -43,10 +43,9 @@ function fixture(): Fixture {
 }
 
 function branches(base: string): string[] {
-  return spawnSync(GIT, ["branch", "--format=%(refname:short)"], { cwd: base, encoding: "utf8" })
-    .stdout.split("\n")
-    .filter(Boolean)
-    .sort();
+  const listed = spawnSync(GIT, ["branch", "--format=%(refname:short)"], { cwd: base, encoding: "utf8" });
+  expect(listed.status, listed.stderr).toBe(0);
+  return listed.stdout.split("\n").filter(Boolean).sort();
 }
 
 function worktreeList(base: string): string {
@@ -192,6 +191,64 @@ test("a removal failure names the worktree path and keeps the original failure",
     restore();
     spawnSync(GIT, ["worktree", "unlock", f.workspace], { cwd: f.base });
     spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base });
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+/** A git wrapper that logs every invocation to `logPath`, then runs real Git. */
+function installLoggingWrapper(f: Fixture, logPath: string): { restore: () => void } {
+  const bin = join(f.root, "bin-log");
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, "git"),
+    ["#!/bin/sh", `printf '%s\\n' "$*" >> "${logPath}"`, `exec "${GIT}" "$@"`, ""].join("\n"),
+  );
+  chmodSync(join(bin, "git"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
+  return { restore: () => { process.env.PATH = oldPath; } };
+}
+
+test("a second cleanup of an already-removed record makes no Git call and does not throw", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    expect(removeCreatedWorktree(created!)).toEqual({ changed: true, reason: "worktree removed" });
+    expect(created!.removed).toBe(true);
+    expect(existsSync(f.workspace)).toBe(false);
+
+    const log = join(f.root, "git-calls.log");
+    const { restore } = installLoggingWrapper(f, log);
+    try {
+      expect(() => removeCreatedWorktree(created!)).not.toThrow();
+    } finally {
+      restore();
+    }
+    expect(existsSync(log)).toBe(false);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a path re-used by a different worktree after removal is left untouched", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    removeCreatedWorktree(created!);
+    expect(existsSync(f.workspace)).toBe(false);
+
+    const added = spawnSync(GIT, ["worktree", "add", "-b", "reused", f.workspace], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    expect(existsSync(join(f.workspace, ".git"))).toBe(true);
+
+    expect(() => removeCreatedWorktree(created!)).not.toThrow();
+    expect(existsSync(join(f.workspace, ".git"))).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+    expect(branches(f.base)).toContain("reused");
+  } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
 });
