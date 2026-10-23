@@ -1,0 +1,1 @@
+- **A selected runtime expands `${NAME}` references in `workspace` and `repo`.** An interactive `tps agent start --runtime codex|gemini|claude-code --no-sandbox` expands those two keys with the native loader's rule, and an unset variable fails the start with the loader's `Missing environment variable` error; other keys are read as before (Closes #680).

@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 
 const workspaceModule = resolve(import.meta.dir, "../dist/src/utils/agent-workspace.js");
 const lifecycleModule = resolve(import.meta.dir, "../dist/src/utils/agent-lifecycle.js");
@@ -48,6 +48,68 @@ test("default child uses the parent's absolute workspace with a symlinked config
     expect(result.status).toBe(0);
     const workspace = join(launch, "worktree");
     expect(result.stdout).toBe(`${workspace}\n${workspace}\n`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("agentWorkspace refuses a workspace starting with ~", () => {
+  const script = `
+    import { agentWorkspace } from ${JSON.stringify(workspaceModule)};
+    try {
+      console.log("resolved " + agentWorkspace("/config/agent.yaml", "~/work"));
+    } catch (err) {
+      console.log(err.message);
+    }
+  `;
+  const result = spawnSync("node", ["--input-type=module", "-e", script], { encoding: "utf8", timeout: 20_000 });
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+  expect(result.stdout.trim()).toBe(
+    "workspace '~/work' starts with '~', which is not expanded: use an absolute path or a path relative to the config file",
+  );
+});
+
+test("parent and child in different directories resolve the same relative workspace", () => {
+  const root = mkdtempSync(join(tmpdir(), "workspace-anchor-"));
+  try {
+    const configDir = join(root, "config");
+    const launchCwd = join(root, "launch");
+    const childCwd = join(root, "child");
+    mkdirSync(configDir);
+    mkdirSync(launchCwd);
+    mkdirSync(childCwd);
+    const config = join(configDir, "agent.yaml");
+    writeFileSync(config, "agentId: probe\nworkspace: worktree\n");
+    const script = `
+      import { loadAgentConfig } from ${JSON.stringify(configModule)};
+      import { agentWorkspace } from ${JSON.stringify(workspaceModule)};
+      const config = loadAgentConfig(${JSON.stringify(config)});
+      const workspace = agentWorkspace(${JSON.stringify(config)}, config.workspace);
+      console.log(JSON.stringify({ workspace, mailDir: config.mailDir, memoryPath: config.memoryPath }));
+    `;
+    const env = { ...process.env };
+    delete env.TPS_AGENT_WORKSPACE;
+    const run = (cwd: string) => spawnSync("node", ["--input-type=module", "-e", script], {
+      cwd, encoding: "utf8", env, timeout: 20_000,
+    });
+    const parent = run(launchCwd);
+    const child = run(childCwd);
+    expect(parent.error).toBeUndefined();
+    expect(child.error).toBeUndefined();
+    expect(parent.stderr).toBe("");
+    expect(child.stderr).toBe("");
+    expect(parent.status).toBe(0);
+    expect(child.status).toBe(0);
+    const workspace = join(configDir, "worktree");
+    const resolvedPaths = {
+      workspace,
+      mailDir: join(workspace, "mail"),
+      memoryPath: join(workspace, ".openclaw", "agent.memory.jsonl"),
+    };
+    expect(JSON.parse(parent.stdout)).toEqual(resolvedPaths);
+    expect(JSON.parse(child.stdout)).toEqual(resolvedPaths);
+    expect(isAbsolute(JSON.parse(child.stdout).workspace)).toBe(true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
