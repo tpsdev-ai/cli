@@ -35,6 +35,7 @@ import {
   canonicalPath,
 } from "../utils/nono.js";
 import { grantCovers, launchAttested, resolveNonoBinary } from "../utils/launch-attestation.js";
+import { sweepStaleLaunchSnapshots, writeLaunchSnapshotOwner } from "../utils/launch-snapshots.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
@@ -1075,7 +1076,7 @@ export async function healthcheckAgent(args: AgentArgs): Promise<void> {
 
 export async function runAgent(
   args: AgentArgs,
-  testHooks?: { afterConfigSnapshot?: (path: string) => void },
+  testHooks?: { afterConfigSnapshot?: (path: string) => void; beforeSnapshotSweep?: (launchDir: string) => void },
 ): Promise<void> {
   const original = args.config ?? (args.id ? join(homedir(), ".tps", "agents", args.id, "agent.yaml") : undefined);
   if (args.action !== "start" || args.sandboxed || !original || !existsSync(original)) {
@@ -1084,7 +1085,19 @@ export async function runAgent(
   const workspaceConfigPath = resolvePathMod(original);
   const parent = canonicalPath(join(homedir(), ".tps", "launch"));
   const createdParent = mkdirSync(parent, { recursive: true, mode: 0o700 });
+  try {
+    testHooks?.beforeSnapshotSweep?.(parent);
+    sweepStaleLaunchSnapshots(parent);
+  } catch (error) {
+    // A snapshot sweep is housekeeping: log it and continue the launch.
+    console.error(
+      `warning: could not sweep stale launch snapshots in ${parent}: ${
+        error instanceof Error ? error.message : String(error)
+      }`,
+    );
+  }
   const snapshotRoot = mkdtempSync(join(parent, "config-"));
+  writeLaunchSnapshotOwner(snapshotRoot);
   const cleanup = () => {
     rmSync(snapshotRoot, { recursive: true, force: true });
     if (createdParent) {
