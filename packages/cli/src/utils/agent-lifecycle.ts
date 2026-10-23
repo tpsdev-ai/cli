@@ -274,8 +274,8 @@ export interface WorktreeIdentity {
  * The worktree entry this call created, recorded immediately after
  * `git worktree add` succeeds. `onStart` writes an ownership marker into the
  * worktree's admin git directory, reports this record through `onCreated`,
- * and only then reads the identity facts, so the caller always has a record
- * for a failure after the add. The setup-failure cleanup removes the worktree
+ * and only then reads the identity facts, so the caller has a record for a
+ * failure after the add. The setup-failure cleanup removes the worktree
  * when the admin directory still holds the recorded marker and any recorded
  * identity facts still match; a missing or different marker is refused with
  * the manual command. The add is detached, so no
@@ -619,8 +619,8 @@ export function onStart(
   }
 
   // Mark the worktree before any other step: a replacement removed and
-  // re-added at the same path gets a fresh admin directory, so it never
-  // carries this nonce (cli#660). Report the record before the identity read,
+  // re-added at the same path gets a fresh admin directory, so it does not
+  // carry this nonce (cli#660). Report the record before the identity read,
   // so a failure in that read still leaves the caller a record to clean up.
   const created: WorktreeCreation = { workspace, baseWorkingTree: baseRepo, ownerMarker: null };
   try {

@@ -4,9 +4,9 @@
  *
  * Right after a real `git worktree add`, setup writes a random nonce to
  * `<admin git dir>/tps-launch-owner` with exclusive create, reports the record
- * through `onCreated`, and only then reads the identity facts. Cleanup removes
- * a worktree only when its admin directory still holds that nonce; otherwise
- * it refuses, names the path and prints the manual command. The failure cases
+ * through `onCreated`, and only then reads the identity facts. The setup-failure
+ * cleanup removes a worktree only when its admin directory still holds that
+ * nonce; otherwise it refuses, names the path and prints the manual command. The failure cases
  * inject a metadata error after identity capture, at
  * `rev-parse --absolute-git-dir`.
  */
