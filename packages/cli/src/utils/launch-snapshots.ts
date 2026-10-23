@@ -16,7 +16,8 @@
  *
  * Each snapshot records its owning launcher: pid and, when one is readable, a
  * process start token. When the recorded and current tokens are both readable
- * from the same source, a reused pid is not mistaken for the owner. The next
+ * from the same source and differ, the sweep treats the pid as reused and the
+ * owner as gone; when they match, the snapshot is kept. The next
  * launch removes published entries whose recorded owner is dead, plus
  * published entries with no readable owner record past a grace period.
  */
