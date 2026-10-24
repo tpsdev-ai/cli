@@ -1,0 +1,1 @@
+- **A relay acceptance receipt that carries a digest field is read only as a digest receipt.** An invalid one is refused, never matched by its legacy `body`; a receipt with no digest field keeps the legacy path.

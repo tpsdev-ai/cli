@@ -256,19 +256,48 @@ describe("wire mail", () => {
     expect(decodeWireMessage(encodeWireMessage(frame(Number.MAX_SAFE_INTEGER))).seq).toBe(Number.MAX_SAFE_INTEGER);
   });
 
-  test("a digest receipt refuses a bodyLength beyond the safe integer range and accepts Number.MAX_SAFE_INTEGER", () => {
+  test("a digest receipt refuses a bodyLength beyond the safe integer range and compares Number.MAX_SAFE_INTEGER", () => {
     const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
     const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
     const marker = relayAcceptanceReceiptPath("remote", item.id);
     mkdirSync(dirname(marker), { recursive: true });
     const receipt = (bodyLength: number) => JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, bodySha256, bodyLength, body: item.content });
 
-    // 2^53 is refused as the digest receipt, so the legacy body shape answers the resend.
+    // 2^53 fails the digest receipt shape, so the marker is refused, not matched by its body.
     writeFileSync(marker, receipt(2 ** 53));
-    expect(deliverRelayedToLocal("remote", item)).toBe(false);
+    expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
 
     // Number.MAX_SAFE_INTEGER passes the digest receipt schema, whose bodyLength is then compared.
     writeFileSync(marker, receipt(Number.MAX_SAFE_INTEGER));
+    expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
+  });
+
+  test("a receipt carrying a valid digest is read as a digest receipt, not by its body", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, bodySha256, bodyLength: 1, body: "y" }));
+
+    expect(deliverRelayedToLocal("remote", item)).toBe(false);
+  });
+
+  test("a legacy-only receipt is still matched by its body digest", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, body: item.content }));
+
+    expect(deliverRelayedToLocal("remote", item)).toBe(false);
+  });
+
+  test("a digest-only receipt with a bodyLength beyond the safe integer range is refused", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, bodySha256, bodyLength: 2 ** 53 }));
+
     expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
   });
 

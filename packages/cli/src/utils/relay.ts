@@ -600,8 +600,18 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
 }
 
 /**
+ * Whether a parsed receipt carries a digest field. Such a receipt is read as a
+ * digest receipt, so a malformed one is refused rather than compared by body.
+ */
+function hasDigestField(parsed: unknown): boolean {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  return "bodySha256" in parsed || "bodyLength" in parsed;
+}
+
+/**
  * Whether a readable receipt matches the payload; legacy empty markers cannot be
- * compared; schema-valid pre-digest receipts are compared by payload digest.
+ * compared; schema-valid pre-digest receipts are compared by payload digest. A
+ * receipt that carries a digest field and fails the digest shape does not match.
  */
 function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
   const raw = readFileSync(path, "utf-8");
@@ -616,6 +626,7 @@ function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): b
     const r = receipt.data;
     return r.from === expected.from && r.to === expected.to && r.bodySha256 === expected.bodySha256 && r.bodyLength === expected.bodyLength && r.timestamp === expected.timestamp;
   }
+  if (hasDigestField(parsed)) return false;
   const legacy = LegacyRelayAcceptReceiptSchema.safeParse(parsed);
   if (!legacy.success) return false;
   const l = legacy.data;
