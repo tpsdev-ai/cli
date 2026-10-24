@@ -12,7 +12,7 @@ const WireMessageSchema = z.object({
   type: z.number().int().min(0).max(0xffff),
   seq: z.number().int().nonnegative(),
   ts: z.string().min(1),
-  body: z.unknown(),
+  body: z.unknown().optional(),
   sig: z.string().optional(),
 });
 

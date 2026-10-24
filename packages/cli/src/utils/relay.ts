@@ -376,7 +376,7 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
  * resend can be judged against it after the inbox record is gone without the
  * receipt holding the payload.
  */
-const RelayAcceptReceiptSchema = z.object({
+export const RelayAcceptReceiptSchema = z.object({
   from: MailDeliverBodySchema.shape.from,
   to: MailDeliverBodySchema.shape.to,
   timestamp: MailDeliverBodySchema.shape.timestamp,

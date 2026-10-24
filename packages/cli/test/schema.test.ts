@@ -175,6 +175,32 @@ describe("TPSReportSchema", () => {
     });
     expect(result.success).toBe(false);
   });
+
+  test("an empty identity.default_name reports the length message, not the type message", () => {
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: "" },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "identity.default_name");
+      expect(issue?.message).toBe("Too small: expected string to have >=1 characters");
+    }
+  });
+
+  test("a non-string identity.default_name reports the zod 3 type message", () => {
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: 42 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "identity.default_name");
+      expect(issue?.message).toBe("Expected string, received number");
+    }
+  });
 });
 
 describe("parseTPSReport guardrails", () => {

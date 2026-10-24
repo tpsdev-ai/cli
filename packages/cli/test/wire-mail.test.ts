@@ -14,7 +14,7 @@ import { PlainTcpTransport } from "../src/utils/plain-tcp-transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
 import { HttpRequestBodySchema, HttpResponseBodySchema, JoinCompleteBodySchema, MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
-import { deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
+import { deliverRelayedToLocal, relayAcceptanceReceiptPath, RelayAcceptReceiptSchema } from "../src/utils/relay.js";
 
 describe("wire mail", () => {
   let root: string;
@@ -254,6 +254,25 @@ describe("wire mail", () => {
     const frame = (seq: number) => ({ type: 1, seq, ts: "t1", body: {} });
     expect(() => encodeWireMessage(frame(2 ** 53))).toThrow();
     expect(decodeWireMessage(encodeWireMessage(frame(Number.MAX_SAFE_INTEGER))).seq).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  test("a wire frame with no body key is accepted, as zod 3 accepted it", () => {
+    const frame = encodeWireMessage({ type: 1, seq: 1, ts: "t1" } as unknown as Parameters<typeof encodeWireMessage>[0]);
+    const decoded = decodeWireMessage(frame);
+    expect(decoded.seq).toBe(1);
+    expect(decoded.body).toBeUndefined();
+  });
+
+  test("the receipt validator refuses a bodyLength beyond the safe integer range and accepts Number.MAX_SAFE_INTEGER", () => {
+    const receipt = (bodyLength: number) => ({
+      from: "remote",
+      to: "local",
+      timestamp: new Date().toISOString(),
+      bodySha256: createHash("sha256").update("x", "utf8").digest("hex"),
+      bodyLength,
+    });
+    expect(RelayAcceptReceiptSchema.safeParse(receipt(2 ** 53)).success).toBe(false);
+    expect(RelayAcceptReceiptSchema.safeParse(receipt(Number.MAX_SAFE_INTEGER)).success).toBe(true);
   });
 
   test("a digest receipt refuses a bodyLength beyond the safe integer range and compares Number.MAX_SAFE_INTEGER", () => {

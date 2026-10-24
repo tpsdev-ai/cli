@@ -38,8 +38,10 @@ function receivedType(value: unknown): string {
 }
 
 function requiredMessage(message: string) {
-  return (issue: { input?: unknown }) =>
-    issue.input === undefined ? message : `Expected string, received ${receivedType(issue.input)}`;
+  return (issue: { code?: string; input?: unknown }) => {
+    if (issue.code !== "invalid_type") return undefined;
+    return issue.input === undefined ? message : `Expected string, received ${receivedType(issue.input)}`;
+  };
 }
 
 export const TPSReportSchema = z.object({
