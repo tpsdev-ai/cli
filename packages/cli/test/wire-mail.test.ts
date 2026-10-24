@@ -310,6 +310,21 @@ describe("wire mail", () => {
     expect(deliverRelayedToLocal("remote", item)).toBe(false);
   });
 
+  test("a legacy-only receipt is matched when Object.prototype carries a digest field", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, body: item.content }));
+
+    Object.defineProperty(Object.prototype, "bodyLength", { value: 1, configurable: true, writable: true });
+    try {
+      expect(deliverRelayedToLocal("remote", item)).toBe(false);
+    } finally {
+      delete (Object.prototype as { bodyLength?: number }).bodyLength;
+    }
+    expect("bodyLength" in {}).toBe(false);
+  });
+
   test("a digest-only receipt with a bodyLength beyond the safe integer range is refused", () => {
     const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
     const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");

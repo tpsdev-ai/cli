@@ -605,7 +605,7 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
  */
 function hasDigestField(parsed: unknown): boolean {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
-  return "bodySha256" in parsed || "bodyLength" in parsed;
+  return Object.hasOwn(parsed, "bodySha256") || Object.hasOwn(parsed, "bodyLength");
 }
 
 /**
