@@ -20,7 +20,7 @@ RUN set -eux; \
 # in the SAME logical line as the pinned checkout+build — a later RUN cannot swap
 # the binary and recompute the baseline.
 
-FROM node:24-bookworm-slim AS base
+FROM node:24.22.1-bookworm-slim@sha256:55fb5f5a527ea2c5c4a95f963e48ef90aa38c7b346054fdc8ee9957a2b55d205 AS base
 ARG TPS_VERSION=0.5.4
 # The shipped path installs the PUBLISHED @tpsdev-ai/agent version supplied by
 # docker.yml's workflow dispatch input as TPS_VERSION. The workflow checks that
