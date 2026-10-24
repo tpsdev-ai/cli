@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -196,5 +196,118 @@ describe("tps office setup CLI integration", () => {
     const setup = run(["office", "setup", "test-agent", "--dry-run"]);
     expect(setup.status).toBe(0);
     expect(existsSync(join(ws, OFFICE_READY_MARKER))).toBe(false);
+  });
+});
+
+describe("curl url with surrounding whitespace (#687)", () => {
+  const URL = "https://host-a.example/x";
+  let root: string;
+  let home: string;
+  let agentWs: string;
+  let dest: string;
+  let argvFile: string;
+
+  // `tps office setup agent-a` loads the agent's real manifest file. A fake
+  // curl first on PATH records the argv it was given (NUL-separated) and exits
+  // 22, so one run reaches each place the command uses the URL: the download
+  // log line, curl's argv, and the failure log line.
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "tps-om-url-"));
+    home = join(root, "home");
+    agentWs = join(home, ".tps", "branch-office", "agent-a");
+    mkdirSync(agentWs, { recursive: true });
+    dest = join(root, "out", "tool-a");
+    argvFile = join(root, "curl.argv");
+    mkdirSync(join(root, "bin"));
+    const fakeCurl = join(root, "bin", "curl");
+    writeFileSync(fakeCurl, `#!/bin/sh\nprintf '%s\\0' "$@" > '${argvFile}'\nexit 22\n`);
+    chmodSync(fakeCurl, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeManifest(url: string): void {
+    writeFileSync(
+      join(agentWs, "workspace-manifest.json"),
+      JSON.stringify({ name: "om-url", tools: { curl: [{ url, dest }] } })
+    );
+  }
+
+  function setup() {
+    return spawnSync("bun", [TPS_BIN, "office", "setup", "agent-a"], {
+      encoding: "utf-8",
+      cwd: root,
+      timeout: 60_000,
+      env: {
+        ...process.env,
+        HOME: home,
+        PATH: `${join(root, "bin")}:${FAKE_NONO_BIN_DIR}:${process.env.PATH}`,
+        TPS_OFFICE_SKIP_RELAY: "1",
+        TPS_OFFICE_SKIP_VM: "1",
+      },
+    });
+  }
+
+  function curlArgv(): string[] | null {
+    try {
+      return readFileSync(argvFile, "utf-8").split("\0").slice(0, -1);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  const surrounding: Array<[string, string]> = [
+    ["ASCII spaces", `  ${URL}  `],
+    ["tab and newline", `\t${URL}\n`],
+    ["CRLF", `\r\n${URL}\r\n`],
+    ["U+000B and U+000C", `\u000B${URL}\u000C`],
+    ["U+00A0", ` ${URL} `],
+    ["U+1680", ` ${URL} `],
+    ["U+2003", ` ${URL} `],
+    ["U+2028", ` ${URL} `],
+    ["U+2029", ` ${URL} `],
+    ["U+202F", ` ${URL} `],
+    ["U+205F", ` ${URL} `],
+    ["U+3000", `　${URL}　`],
+    ["U+FEFF", `﻿${URL}﻿`],
+  ];
+
+  test.each(surrounding)("%s: the loader and tps office setup's use sites get the trimmed URL", (_name, raw) => {
+    writeManifest(raw);
+    expect(loadWorkspaceManifest(agentWs)!.tools.curl[0]!.url).toBe(URL);
+
+    const run = setup();
+    expect(run.status).toBe(1);
+    expect(curlArgv()).toEqual(["--fail", "--silent", "--location", "--output", dest, URL]);
+    expect(run.stdout).toContain(`  [curl] Downloading ${URL} → ${dest}...`);
+    expect(run.stderr).toContain(`  [curl] FAILED: ${URL}`);
+  });
+
+  test("a URL still invalid after trimming is refused with the URL message, and curl is not run", () => {
+    writeManifest("  not-a-url  ");
+    expect(() => loadWorkspaceManifest(agentWs)).toThrow("Invalid URL");
+
+    const run = setup();
+    expect(run.status).not.toBe(0);
+    expect(run.stderr).toContain("Invalid URL");
+    expect(curlArgv()).toBeNull();
+  });
+
+  test("a space inside the path is kept, with the whitespace around the URL trimmed", () => {
+    const inner = "https://host-a.example/a b";
+    writeManifest(inner);
+    expect(loadWorkspaceManifest(agentWs)!.tools.curl[0]!.url).toBe(inner);
+
+    writeManifest(`  ${inner}\t`);
+    expect(setup().status).toBe(1);
+    expect(curlArgv()!.at(-1)).toBe(inner);
+  });
+
+  test("a space inside the host is refused", () => {
+    writeManifest("https://host a.example/x");
+    expect(() => loadWorkspaceManifest(agentWs)).toThrow("Invalid URL");
   });
 });

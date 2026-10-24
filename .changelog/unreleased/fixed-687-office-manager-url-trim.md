@@ -1,0 +1,1 @@
+- **The Office Manager trims surrounding whitespace from a curl `url` in the workspace manifest.** Whitespace around the URL, including non-ASCII whitespace such as U+00A0 and U+3000, is removed before the URL is checked, and curl and the `[curl]` log lines get the URL without it; a URL that is still invalid after trimming is refused with `Invalid URL` (Closes #687).
