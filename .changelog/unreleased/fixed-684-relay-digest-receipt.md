@@ -1,1 +1,1 @@
-- **A relay acceptance receipt that carries a digest field is read only as a digest receipt.** An invalid one is refused, never matched by its legacy `body`; a receipt with no digest field keeps the legacy path.
+- **A relay acceptance receipt is classified and parsed from its own properties only.** A digest receipt needs both digest fields as own properties; a receipt with neither takes the legacy body-digest path, and an invalid digest receipt does not match.

@@ -310,7 +310,7 @@ describe("wire mail", () => {
     expect(deliverRelayedToLocal("remote", item)).toBe(false);
   });
 
-  test("a legacy-only receipt is matched when Object.prototype carries a digest field", () => {
+  test("a legacy-only receipt is matched when Object.prototype carries a bodyLength and the receipt has no own digest field", () => {
     const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
     const marker = relayAcceptanceReceiptPath("remote", item.id);
     mkdirSync(dirname(marker), { recursive: true });
@@ -322,6 +322,41 @@ describe("wire mail", () => {
     } finally {
       delete (Object.prototype as { bodyLength?: number }).bodyLength;
     }
+    expect("bodyLength" in {}).toBe(false);
+  });
+
+  test("a receipt with an own bodySha256 and an inherited bodyLength raises the conflict", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, bodySha256 }));
+
+    Object.defineProperty(Object.prototype, "bodyLength", { value: Buffer.byteLength(item.content, "utf8"), configurable: true, writable: true });
+    try {
+      expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
+    } finally {
+      delete (Object.prototype as { bodyLength?: number }).bodyLength;
+    }
+    expect("bodyLength" in {}).toBe(false);
+  });
+
+  test("a legacy-only receipt with both digest fields inherited is compared by its body and raises the conflict", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    writeFileSync(marker, JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, body: "y" }));
+
+    Object.defineProperty(Object.prototype, "bodySha256", { value: bodySha256, configurable: true, writable: true });
+    Object.defineProperty(Object.prototype, "bodyLength", { value: Buffer.byteLength(item.content, "utf8"), configurable: true, writable: true });
+    try {
+      expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
+    } finally {
+      delete (Object.prototype as { bodySha256?: string }).bodySha256;
+      delete (Object.prototype as { bodyLength?: number }).bodyLength;
+    }
+    expect("bodySha256" in {}).toBe(false);
     expect("bodyLength" in {}).toBe(false);
   });
 
