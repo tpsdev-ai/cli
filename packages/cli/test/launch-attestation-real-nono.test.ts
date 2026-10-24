@@ -3,8 +3,8 @@
  *
  * This file runs only where a real nono >= 0.70 is reachable by an ABSOLUTE path
  * (NONO_BIN, or one of the pinned locations). Everywhere else it skips, so the
- * unit lane stays green while the Docker lane (non-root, Linux/Landlock) and the
- * nono-profile-gate job (ubuntu + macos) run it for real.
+ * unit lane stays green while the Docker lane (non-root, Linux/Landlock) runs
+ * it for real.
  *
  * What it proves:
  *   1. the premise — this host's nono really enforces: a file under $HOME outside
