@@ -171,7 +171,7 @@ describe("relay acceptance leaves runtime-written records in place (cli#560)", (
     expect(errors).not.toHaveBeenCalled();
   });
 
-  test("a relay record with an unsafe integer counter is quarantined and logged", () => {
+  test("an unkeyed relay record with an unsafe integer counter in the recipient's own mailbox is quarantined and logged", () => {
     const errors = spyOn(console, "error").mockImplementation(() => {});
     const inbox = getInbox("bob");
     const invalid = JSON.stringify({

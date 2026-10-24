@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   fingerprint,
@@ -12,6 +13,8 @@ import {
 import { PlainTcpTransport } from "../src/utils/plain-tcp-transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
 import { HttpRequestBodySchema, HttpResponseBodySchema, JoinCompleteBodySchema, MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
+import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
+import { deliverRelayedToLocal, relayAcceptanceReceiptPath } from "../src/utils/relay.js";
 
 describe("wire mail", () => {
   let root: string;
@@ -245,6 +248,28 @@ describe("wire mail", () => {
       expect(JoinCompleteBodySchema.safeParse(joinBody(value)).success).toBe(true);
       expect(HttpResponseBodySchema.safeParse(responseBody(value)).success).toBe(true);
     }
+  });
+
+  test("the wire frame refuses a seq beyond the safe integer range and accepts Number.MAX_SAFE_INTEGER", () => {
+    const frame = (seq: number) => ({ type: 1, seq, ts: "t1", body: {} });
+    expect(() => encodeWireMessage(frame(2 ** 53))).toThrow();
+    expect(decodeWireMessage(encodeWireMessage(frame(Number.MAX_SAFE_INTEGER))).seq).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  test("a digest receipt refuses a bodyLength beyond the safe integer range and accepts Number.MAX_SAFE_INTEGER", () => {
+    const item = { id: randomUUID(), from: "remote", to: "local", content: "x", timestamp: new Date().toISOString() };
+    const bodySha256 = createHash("sha256").update(item.content, "utf8").digest("hex");
+    const marker = relayAcceptanceReceiptPath("remote", item.id);
+    mkdirSync(dirname(marker), { recursive: true });
+    const receipt = (bodyLength: number) => JSON.stringify({ from: item.from, to: item.to, timestamp: item.timestamp, bodySha256, bodyLength, body: item.content });
+
+    // 2^53 is refused as the digest receipt, so the legacy body shape answers the resend.
+    writeFileSync(marker, receipt(2 ** 53));
+    expect(deliverRelayedToLocal("remote", item)).toBe(false);
+
+    // Number.MAX_SAFE_INTEGER passes the digest receipt schema, whose bodyLength is then compared.
+    writeFileSync(marker, receipt(Number.MAX_SAFE_INTEGER));
+    expect(() => deliverRelayedToLocal("remote", item)).toThrow(/conflict/);
   });
 
   test("rejects malformed sender/recipient identifiers", () => {
