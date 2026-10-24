@@ -12,7 +12,8 @@ const ToolEntrySchema = z.union([
 
 /** curl-installed binary spec */
 const CurlBinarySchema = z.object({
-  url: z.string().url(),
+  // Trimmed before the URL check (#687).
+  url: z.string().trim().url(),
   dest: z.string().min(1),
   chmod: z.string().default("755"),
 });
@@ -21,6 +22,9 @@ const CurlBinarySchema = z.object({
  * Workspace Manifest — defines tools the Office Manager installs before
  * worker agents start. Place this file at `workspace/workspace-manifest.json`
  * (or `workspace-manifest.yaml`).
+ *
+ * A curl entry's `url` is trimmed of surrounding whitespace before it is
+ * validated and used.
  *
  * Example:
  * ```json
