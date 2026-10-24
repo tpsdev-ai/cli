@@ -376,7 +376,7 @@ export function handleIncomingMail(branchId: string, msg: TpsMessage): void {
  * resend can be judged against it after the inbox record is gone without the
  * receipt holding the payload.
  */
-const RelayAcceptReceiptSchema = z.object({
+export const RelayAcceptReceiptSchema = z.object({
   from: MailDeliverBodySchema.shape.from,
   to: MailDeliverBodySchema.shape.to,
   timestamp: MailDeliverBodySchema.shape.timestamp,
@@ -600,8 +600,11 @@ function existingAcceptanceMarker(acceptedDir: string, id: string, legacyMarker:
 }
 
 /**
- * Whether a readable receipt matches the payload; legacy empty markers cannot be
- * compared; schema-valid pre-digest receipts are compared by payload digest.
+ * Whether a readable receipt matches the payload. The receipt is classified and
+ * parsed from its own enumerable properties only, so an inherited field cannot
+ * change its class or its parse. Legacy empty markers cannot be compared;
+ * pre-digest receipts are compared by payload digest. A receipt with one digest
+ * field but not both, or with both and an invalid digest shape, does not match.
  */
 function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): boolean {
   const raw = readFileSync(path, "utf-8");
@@ -611,12 +614,19 @@ function acceptanceReceiptMatches(path: string, expected: RelayAcceptReceipt): b
   } catch {
     return false;
   }
-  const receipt = RelayAcceptReceiptSchema.safeParse(parsed);
-  if (receipt.success) {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  const own: Record<string, unknown> = Object.create(null);
+  for (const key of Object.keys(parsed)) own[key] = (parsed as Record<string, unknown>)[key];
+  const hasSha = Object.hasOwn(own, "bodySha256");
+  const hasLen = Object.hasOwn(own, "bodyLength");
+  if (hasSha || hasLen) {
+    if (!hasSha || !hasLen) return false;
+    const receipt = RelayAcceptReceiptSchema.safeParse(own);
+    if (!receipt.success) return false;
     const r = receipt.data;
     return r.from === expected.from && r.to === expected.to && r.bodySha256 === expected.bodySha256 && r.bodyLength === expected.bodyLength && r.timestamp === expected.timestamp;
   }
-  const legacy = LegacyRelayAcceptReceiptSchema.safeParse(parsed);
+  const legacy = LegacyRelayAcceptReceiptSchema.safeParse(own);
   if (!legacy.success) return false;
   const l = legacy.data;
   const digest = receiptDigest(l.body);

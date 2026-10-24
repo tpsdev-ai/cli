@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 import yaml from "js-yaml";
 import { createHash } from "node:crypto";
 import type { AgentConfig } from "./runtime/types.js";
@@ -23,7 +24,7 @@ export interface AgentRuntimeConfig {
   execAllowlist?: string[];
 }
 
-function interpolateEnvInString(raw: string): string {
+export function interpolateEnvInString(raw: string): string {
   return raw.replace(/\$\{([A-Z0-9_]+)\}/g, (_match, varName: string) => {
     const resolved = process.env[varName];
     if (resolved === undefined) {
@@ -53,12 +54,54 @@ function interpolateEnvVars<T>(value: T): T {
   return value;
 }
 
-export function loadAgentConfig(path: string): AgentConfig {
+export function refuseTildeWorkspace(configured: string, key = "workspace"): void {
+  if (configured.startsWith("~")) {
+    throw new Error(
+      `${key} '${configured}' starts with '~', which is not expanded: use an absolute path or a path relative to the config file`,
+    );
+  }
+}
+
+function readConfiguredPath(parsed: Record<string, unknown>, key: "workspace" | "repo"): string | undefined {
+  if (!Object.hasOwn(parsed, key)) return undefined;
+  const value = parsed[key];
+  if (value === null) {
+    throw new Error(
+      `${key} is set but has no value (in YAML, a bare ~ or nothing after '${key}:' is null): give an absolute path or a path relative to the config file, or remove the key`,
+    );
+  }
+  if (typeof value !== "string") throw new Error(`${key} must be a string path`);
+  if (value.trim() === "") {
+    throw new Error(
+      `${key} is set to an empty or blank string: give an absolute path or a path relative to the config file, or remove the key`,
+    );
+  }
+  refuseTildeWorkspace(value, key);
+  return value;
+}
+
+/** The `workspace` and `repo` values a parsed agent config sets; an absent key reads as undefined. */
+export function readConfiguredWorkspace(parsed: Record<string, unknown>): { workspace?: string; repo?: string } {
+  return { workspace: readConfiguredPath(parsed, "workspace"), repo: readConfiguredPath(parsed, "repo") };
+}
+
+/**
+ * A relative workspace is anchored at the config file's directory, so the
+ * launching process and a sandboxed child resolve the same absolute path. An
+ * absolute workspace remains absolute and is normalized.
+ */
+function resolveWorkspace(configured: string, configDir: string): string {
+  return isAbsolute(configured) ? resolve(configured) : resolve(configDir, configured);
+}
+
+export function loadAgentConfig(path: string, baseDir: string = dirname(path)): AgentConfig {
   const raw = readFileSync(path, "utf-8");
   const parsedRaw = (yaml.load(raw) ?? {}) as Record<string, any>;
   const parsed = interpolateEnvVars(parsedRaw);
 
-  const workspace = String(parsed.workspace || parsed.repo || process.cwd());
+  const configured = readConfiguredWorkspace(parsed);
+  const configuredWorkspace = configured.workspace ?? configured.repo;
+  const workspace = configuredWorkspace ? resolveWorkspace(configuredWorkspace, baseDir) : process.cwd();
   const memoryPath = parsed.memoryPath || `${workspace}/.openclaw/agent.memory.jsonl`;
 
   const agent: AgentConfig = {

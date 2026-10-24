@@ -20,7 +20,7 @@ import { createInterface as createPromptInterface } from "node:readline/promises
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
-import { basename, join, resolve as resolvePathMod } from "node:path";
+import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
 import {
   runCommandUnderNono,
   isNonoStrict,
@@ -1201,7 +1201,7 @@ async function runAgentCommand(
         process.exit(1);
       }
 
-      const config = loadAgentConfig(configPath);
+      const config = loadAgentConfig(configPath, snapshot ? dirname(snapshot.workspaceConfigPath) : undefined);
       config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
       if (snapshot) {
         const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
@@ -1347,23 +1347,46 @@ async function runAgentCommand(
               }
               return result;
             };
-            const { onStart, onStop } = await import("../utils/agent-lifecycle.js");
+            const { onStart, onStop, removeCreatedWorktree } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
+            let createdWorktree: import("../utils/agent-lifecycle.js").WorktreeCreation | undefined;
             let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
             let approval: ReturnType<typeof agentLaunchOptions>;
             try {
               approval = approveLaunch();
               const profileRefusal = sandboxProfileGrantRefusal(profile, process.env, selectedRuntime, nonoAvailable, snapshot?.snapshotRoot);
               if (profileRefusal) throw new Error(`refusing to launch profile '${profile}': ${profileRefusal}`);
-              const start = selectedRuntime ? onStart(launchId, config.workspace, { deferCheckout: true }) : undefined;
-              worktreeCreated = start?.changed ?? false;
+              // Setup attempts to write the ownership marker and reports a
+              // nullable marker through onCreated before it reads the identity
+              // facts (cli#660). A marker it cannot write is a setup failure.
+              // Every cleanup route for this launch's worktree attempts removal
+              // only when the admin directory still holds the recorded marker
+              // and refuses otherwise; the removal itself can fail.
+              const start = selectedRuntime
+                ? onStart(launchId, config.workspace, {
+                    deferCheckout: true,
+                    onCreated: (created) => {
+                      createdWorktree = created;
+                      worktreeCreated = true;
+                    },
+                  })
+                : undefined;
+              worktreeCreated = start?.changed ?? worktreeCreated;
               cleanupBinding = start?.cleanupBinding;
               approval = approveLaunch();
             } catch (err) {
               console.error(`❌ ${(err as Error).message}`);
               if (worktreeCreated) {
                 try {
-                  onStop(launchId, config.workspace, cleanupBinding);
+                  if (cleanupBinding) {
+                    onStop(launchId, config.workspace, cleanupBinding);
+                  } else if (createdWorktree) {
+                    // Cleanup already failed inside setup, or setup failed
+                    // before it returned a binding: try once from the record.
+                    if (!createdWorktree.removed) removeCreatedWorktree(createdWorktree);
+                  } else {
+                    onStop(launchId, config.workspace);
+                  }
                 } catch (cleanupErr) {
                   console.error(`❌ ${(cleanupErr as Error).message}`);
                 }

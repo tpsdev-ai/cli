@@ -38,7 +38,7 @@ export { BoundaryManager } from "./governance/boundary.js";
 export { ReviewGate } from "./governance/review-gate.js";
 
 // Config
-export { loadAgentConfig } from "./config.js";
+export { interpolateEnvInString, loadAgentConfig, readConfiguredWorkspace, refuseTildeWorkspace } from "./config.js";
 
 // Flair integration
 export { FlairContextProvider } from "./io/flair.js";
