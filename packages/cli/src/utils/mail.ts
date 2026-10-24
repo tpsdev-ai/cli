@@ -570,7 +570,7 @@ const MailRecordSchema = RelayPayloadSchema.extend({
   deliveryAttempts: z.number().int().nonnegative().optional(),
   retryAfter: z.string().optional(),
   prNumber: z.number().int().positive().optional(),
-  headers: z.record(z.string()).optional(),
+  headers: z.record(z.string(), z.string()).optional(),
   location: z.enum(["new", "cur", "dlq"]).optional(),
   envelopeId: z.string().optional(),
   envelope: z.custom<Envelope>((value) => parseSignedEnvelope(JSON.stringify(value)).ok).optional(),
