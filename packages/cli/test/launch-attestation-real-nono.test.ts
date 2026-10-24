@@ -3,8 +3,8 @@
  *
  * This file runs only where a real nono >= 0.70 is reachable by an ABSOLUTE path
  * (NONO_BIN, or one of the pinned locations). Everywhere else it skips, so the
- * unit lane stays green while the Docker lane (non-root, Linux/Landlock) and the
- * nono-profile-gate job (ubuntu + macos) run it for real.
+ * unit lane stays green while the Docker lane (non-root, Linux/Landlock) runs
+ * it for real.
  *
  * What it proves:
  *   1. the premise — this host's nono really enforces: a file under $HOME outside
@@ -19,8 +19,8 @@ import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { resolveNonoBinary, checkNonoPin } from "../src/utils/launch-attestation.js";
+import { realNonoHomeBase } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The runtime the shipped CLI uses: the re-exec child inherits it, and the
@@ -79,20 +79,6 @@ function realNono(): string | null {
 
 const NONO = realNono();
 
-/** Every ancestor of `p` (excluding the filesystem root). Bun resolves modules
- * by walking up from the entry script, so a script that lives under a
- * repo checkout needs its ancestor chain readable — the production layout does
- * not (the installed CLI sits under /usr/local, which the harness grants). */
-function ancestors(p: string): string[] {
-  const out: string[] = [];
-  let cur = resolve(p);
-  while (cur !== "/" && cur !== dirname(cur)) {
-    out.push(cur);
-    cur = dirname(cur);
-  }
-  return out;
-}
-
 const SYSTEM_READ = ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/opt", "/opt/homebrew", "/private/etc/ssl"];
 
 function seedHome(home: string, ws: string, nonoBin: string): void {
@@ -104,13 +90,17 @@ function seedHome(home: string, ws: string, nonoBin: string): void {
   // A minimal JSON profile: reads the toolchain, grants the workspace, and — the
   // point of this fixture — grants NOTHING under $HOME, so the launcher's OUTSIDE
   // canary is genuinely outside every grant.
-  const repoRoot = resolve(import.meta.dir, "..", "..");
+  // The checkout root (where the hoisted node_modules lives) and the
+  // interpreter's directory are granted as exact directories, as in
+  // sandboxed-launch-516.test.ts: a read grant is recursive, and on macOS an
+  // ancestor such as /Users covers the /Users/Shared fixture base.
+  const repoRoot = resolve(import.meta.dir, "..", "..", "..");
   const read = [
     ...new Set([
       ...SYSTEM_READ,
       join(home, ".bun"),
-      ...ancestors(repoRoot),
-      ...ancestors(dirname(process.execPath)),
+      repoRoot,
+      dirname(process.execPath),
     ]),
   ];
   const base = {
@@ -139,16 +129,16 @@ function seedHome(home: string, ws: string, nonoBin: string): void {
   void nonoBin;
 }
 
+let realNonoBase: string | undefined;
+
 /**
- * A fixture tree OUTSIDE /tmp: bun's own temp directory is /tmp regardless of
- * TMPDIR (measured: `os.tmpdir()` returns /tmp inside the sandbox even with
- * TMPDIR set), so the launch must keep granting /tmp — and a fixture HOME under
- * /tmp would then sit inside that grant, which the launcher's overlap assert
- * refuses (correctly). /var/tmp keeps HOME and the granted tmpdir disjoint.
+ * A fixture tree under the base realNonoHomeBase chooses: outside every fixed
+ * launcher grant, and denied to a sandboxed read under nono's built-in policy
+ * (cli#650).
  */
 function sandbox(): { root: string; home: string; tmp: string; ws: string } {
-  const base = existsSync("/var/tmp") ? "/var/tmp" : homedir();
-  const root = mkdtempSync(join(base, "tps-realnono-"));
+  realNonoBase ??= realNonoHomeBase(NONO as string);
+  const root = mkdtempSync(join(realNonoBase, "tps-realnono-"));
   const home = join(root, "home");
   const tmp = join(root, "tmp");
   const ws = join(root, "ws");
@@ -297,6 +287,10 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
     const child = spawn("script", argv, {
       cwd: sb.ws,
       detached: true,
+      // macOS script(1) exits at once when its stdin is a socket ("tcgetattr/ioctl:
+      // Operation not supported on socket"); with /dev/null it still opens a PTY
+      // for the command.
+      stdio: process.platform === "darwin" ? ["ignore", "pipe", "pipe"] : "pipe",
       env: {
         ...process.env,
         HOME: sb.home,
