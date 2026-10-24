@@ -18,7 +18,8 @@
  *  - a stranded claim requires operator recovery;
  *  - release checks the acquisition nonce;
  *  - nested (re)acquisition in one process fails loudly rather than deadlocking;
- *  - an unreadable owner can cause a contention timeout returning null; other filesystem errors may throw.
+ *  - an unreadable owner, or one whose pid is not an integer in 1..2147483647,
+ *    can cause a contention timeout returning null; other filesystem errors may throw.
  *
  * The critical section a holder runs must be SYNCHRONOUS (no await while held):
  * the in-process reentrancy guard tracks a plain set, and an await inside the
@@ -88,14 +89,33 @@ export function processStartToken(pid: number): string | null {
   return null;
 }
 
-function isPidAlive(pid: number): boolean {
+/** Error codes taken as process.kill rejecting its argument; Bun and Node raise ERR_INVALID_ARG_TYPE for a pid above 2147483647. */
+const PID_ARGUMENT_ERRORS = new Set(["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE", "EINVAL", "ERANGE"]);
+
+export type PidState = "alive" | "gone" | "invalid";
+
+/**
+ * Probe a recorded pid with `process.kill(pid, 0)`. "invalid": not an integer
+ * of at least 1 (0 and negative pids do not name one process), or a pid
+ * process.kill rejects as an argument. "gone": ESRCH. "alive": the probe
+ * succeeds or fails with any other error, EPERM (permission denied) included.
+ */
+export function pidState(pid: number): PidState {
+  if (!Number.isInteger(pid) || pid < 1) return "invalid";
   try {
     process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    // ESRCH: no such process. EPERM: exists but owned by someone else — alive.
-    return err?.code !== "ESRCH";
+    return "alive";
+  } catch (error) {
+    return pidStateFromProbeError(error);
   }
+}
+
+/** How pidState classifies an error thrown by `process.kill(pid, 0)`. */
+export function pidStateFromProbeError(error: unknown): PidState {
+  const code = typeof error === "object" && error !== null ? (error as { code?: unknown }).code : undefined;
+  if (code === "ESRCH") return "gone";
+  if (typeof code === "string" && PID_ARGUMENT_ERRORS.has(code)) return "invalid";
+  return "alive";
 }
 
 interface LockOwner {
@@ -133,10 +153,11 @@ function ownerState(
   owner: LockOwner | null,
   resolveToken: (pid: number) => string | null = processStartToken,
 ): OwnerState {
-  if (!owner || typeof owner.pid !== "number" || !Number.isInteger(owner.pid) || owner.pid <= 0) {
-    return "unverifiable";
-  }
-  if (!isPidAlive(owner.pid)) return "dead";
+  if (!owner || typeof owner.pid !== "number") return "unverifiable";
+  // An invalid pid is handled as an unreadable owner record is.
+  const pid = pidState(owner.pid);
+  if (pid === "invalid") return "unverifiable";
+  if (pid === "gone") return "dead";
   const token = resolveToken(owner.pid);
   if (token !== null && typeof owner.startToken === "string") {
     if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";

@@ -16,6 +16,7 @@ import { workspacePath as resolveWorkspacePath } from "../utils/workspace.js";
 import { createFlairClient, type OrgEvent } from "../utils/flair-client.js";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
 import { homeDir } from "../utils/home.js";
+import { pidState } from "@tpsdev-ai/agent";
 
 function statusDir(): string {
   return join(homeDir(), ".tps", "status");
@@ -135,16 +136,6 @@ function nowIso(): string {
 
 function defaultModel(): string {
   return process.env.npm_package_version || "unknown";
-}
-
-function isPidAlive(pid: number): boolean {
-  if (!pid || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function checkWorkspaceWritable(agentWorkspace: string): string[] {
@@ -373,7 +364,9 @@ function computeState(raw: NodeStatus, now: number, staleMs: number, offlineMs: 
   if (raw.status === "error") {
     return "error";
   }
-  if (raw.pid && raw.status === "online" && !isPidAlive(raw.pid)) {
+  // For an online record, every present pid, including 0, goes through
+  // pidState. A probe refused with EPERM (permission denied) is reported alive.
+  if (raw.pid !== undefined && raw.pid !== null && raw.status === "online" && pidState(raw.pid) !== "alive") {
     return "zombie";
   }
   if (now - hb >= offlineMs) return "offline";

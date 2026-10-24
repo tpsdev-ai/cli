@@ -1,0 +1,20 @@
+- **`tps agent start` sweeps pending launch snapshots, never attestation directories; the mailbox lock, outbox lock and `tps status` share one pid check (#677, #681).**
+
+  A forced kill while a launch snapshot is pending can leave a
+  `.pending-config-*` directory under `~/.tps/launch`. The next launch attempts
+  to remove one whose owner record names a dead launcher, by the same pid and
+  start-token rule as published snapshots, or that has no readable owner record
+  and a directory mtime at least 24 hours old; a removal that fails is logged
+  and the directory is kept. One whose recorded launcher is still running is
+  kept.
+
+  The sweep selects only entries named `config-` or `.pending-config-` followed
+  by exactly six letters or digits, so a launch's attestation directory in the
+  same place, named after its agent id, is never selected, including for an
+  agent whose id is `config` or starts with `config-`.
+
+  The `@tpsdev-ai/agent` mailbox lock, the cli's outbox lock and `tps status`
+  check a recorded pid with one rule: a pid that is not an integer from 1 to
+  2147483647 is never treated as a live process, and one whose probe is refused
+  with `EPERM` (permission denied) is. `tps status` reported a pid refused with
+  `EPERM` as a zombie, and did not check a recorded pid of 0.
