@@ -170,4 +170,40 @@ describe("relay acceptance leaves runtime-written records in place (cli#560)", (
     expect(existsSync(join(inbox.root, "quarantine"))).toBe(false);
     expect(errors).not.toHaveBeenCalled();
   });
+
+  test("an unkeyed relay record with an unsafe integer counter in the recipient's own mailbox is quarantined and logged", () => {
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const inbox = getInbox("bob");
+    const invalid = JSON.stringify({
+      id: randomUUID(),
+      from: "remote",
+      to: "bob",
+      body: "x",
+      timestamp: "2000-01-01T00:00:00.000Z",
+      read: false,
+      relayDelivery: { branchId: "remote", id: randomUUID() },
+      deliveryAttempts: 2 ** 53,
+    });
+    const source = join(inbox.fresh, "unsafe-counter.json");
+    writeFileSync(source, invalid);
+
+    const accepted = deliverRelayedToLocal("remote", {
+      id: randomUUID(),
+      from: "remote",
+      to: "bob",
+      content: "x",
+      timestamp: "2000-01-01T00:00:00.000Z",
+    });
+    expect(accepted).toBe(true);
+
+    expect(existsSync(source)).toBe(false);
+    const quarantine = join(inbox.root, "quarantine");
+    const quarantined = readdirSync(quarantine).find((file) => file.endsWith(".json"));
+    expect(quarantined).toBeDefined();
+    expect(readFileSync(join(quarantine, quarantined!), "utf8")).toBe(invalid);
+    const reason = readFileSync(join(quarantine, `${quarantined!}.reason`), "utf8");
+    expect(reason).toContain("class: invalid");
+    expect(reason).toContain("Too big: expected int to be <=9007199254740991");
+    expect(errors.mock.calls.flat().join("\n")).toContain(`unreadable record ${source}`);
+  });
 });

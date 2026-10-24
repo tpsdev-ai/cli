@@ -27,6 +27,19 @@ describe("TpsYamlSchema", () => {
     }
   });
 
+  test("refuses a non-finite number in a manifest field", () => {
+    // zod 3's z.number() accepted Infinity; this release refuses it. The field
+    // is a plain number, so values beyond Number.MAX_SAFE_INTEGER stay accepted.
+    const manifest = (priority: number) => ({
+      name: "agent-a",
+      capabilities: { mail_handler: { priority } },
+    });
+    expect(TpsYamlSchema.safeParse(manifest(Infinity)).success).toBe(false);
+    for (const priority of [Number.MAX_SAFE_INTEGER, 2 ** 53, 42]) {
+      expect(TpsYamlSchema.safeParse(manifest(priority)).success).toBe(true);
+    }
+  });
+
   test("fails on missing name", () => {
     const res = TpsYamlSchema.safeParse({ version: "1.0.0" });
     expect(res.success).toBe(false);

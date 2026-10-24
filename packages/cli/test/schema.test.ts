@@ -23,6 +23,102 @@ describe("TPSReportSchema", () => {
     expect(report.openclaw.thinking).toBe("off");
   });
 
+  test("applies the zod 3 default output for omitted blocks", () => {
+    // Expected object captured by parsing this input on main with zod 3.25.76.
+    const expected = {
+      version: "1",
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: {
+        default_name: "Agent A",
+        emoji: "📋",
+        personality: "Professional and helpful.",
+        communication_style: "Clear and direct.",
+      },
+      flair: [],
+      model: { default: "reasoning" },
+      tools: { required: [], optional: [] },
+      communication: { channels: ["direct"], handoff_targets: [] },
+      boundaries: { can_commit: false, can_send_external: false, can_spend: false },
+      memory: { private: true, shared_read: [], shared_write: [] },
+      openclaw: {
+        model: "anthropic/claude-sonnet-4-20250514",
+        thinking: "off",
+        channel: "discord",
+      },
+    };
+
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: "Agent A" },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data).toEqual(expected);
+  });
+
+  // Captured from zod 3.25.76 by parsing each value through
+  // z.string({ required_error: "I'm gonna need you to put a name on that TPS report." }).
+  // getParsedType's "unknown" arm is unreachable: typeof does not produce it.
+  const zod3ReceivedMessages: Record<string, string> = {
+    undefined: "I'm gonna need you to put a name on that TPS report.",
+    nan: "Expected string, received nan",
+    number: "Expected string, received number",
+    boolean: "Expected string, received boolean",
+    function: "Expected string, received function",
+    bigint: "Expected string, received bigint",
+    symbol: "Expected string, received symbol",
+    array: "Expected string, received array",
+    null: "Expected string, received null",
+    promise: "Expected string, received promise",
+    map: "Expected string, received map",
+    set: "Expected string, received set",
+    date: "Expected string, received date",
+    object: "Expected string, received object",
+  };
+  const zod3Samples: Record<string, unknown> = {
+    undefined,
+    nan: Number.NaN,
+    number: 42,
+    boolean: true,
+    function: function fixture() {},
+    bigint: 1n,
+    symbol: Symbol("fixture"),
+    array: [],
+    null: null,
+    promise: Promise.resolve(),
+    map: new Map(),
+    set: new Set(),
+    date: new Date(),
+    object: {},
+  };
+
+  for (const [parsedType, value] of Object.entries(zod3Samples)) {
+    test(`reports "${parsedType}" for a ${parsedType} value`, () => {
+      const result = TPSReportSchema.safeParse({
+        name: value,
+        description: "Fixture agent",
+        identity: { default_name: "Agent A" },
+      });
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "name");
+        expect(issue?.message).toBe(zod3ReceivedMessages[parsedType]);
+      }
+    });
+  }
+
+  test("accepts a string in a string field", () => {
+    expect(
+      TPSReportSchema.safeParse({
+        name: "Agent A",
+        description: "Fixture agent",
+        identity: { default_name: "Agent A" },
+      }).success
+    ).toBe(true);
+  });
+
   test("parses a fully-specified report", () => {
     const report = parseTPSReport(join(FIXTURES, "valid-full.tps"));
     expect(report.name).toBe("Full Test Agent");
@@ -78,6 +174,32 @@ describe("TPSReportSchema", () => {
       identity: {},
     });
     expect(result.success).toBe(false);
+  });
+
+  test("an empty identity.default_name reports the length message, not the type message", () => {
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: "" },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "identity.default_name");
+      expect(issue?.message).toBe("Too small: expected string to have >=1 characters");
+    }
+  });
+
+  test("a non-string identity.default_name reports the zod 3 type message", () => {
+    const result = TPSReportSchema.safeParse({
+      name: "Agent A",
+      description: "Fixture agent",
+      identity: { default_name: 42 },
+    });
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      const issue = result.error.issues.find((candidate) => candidate.path.join(".") === "identity.default_name");
+      expect(issue?.message).toBe("Expected string, received number");
+    }
   });
 });
 
