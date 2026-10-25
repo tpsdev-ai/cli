@@ -84,10 +84,15 @@ describe("A2 — requirement resolution", () => {
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
     const r = resolveRuntime({ table, manifest, runtimeFiles: {}, ciConstraints: plan.pins });
+    // engines.node "22.x || 24.x" admits more than one image; the test job's
+    // exact setup-node pin selects one. The expected image is read from the
+    // workflow and the table.
+    const nodePin = plan.pins.find((c: { tool: string }) => c.tool === "node")?.range;
+    const bunPin = plan.pins.find((c: { tool: string }) => c.tool === "bun")?.range;
+    const expected = table.images.filter((img: { node: string; bun: string }) => img.node === nodePin && img.bun === bunPin);
+    expect(expected.length).toBe(1);
     expect(r.ok).toBe(true);
-    // engines.node "22.x || 24.x" admits both images; the test job's exact
-    // setup-node 24.21.0 (for the github-review suite) selects one.
-    if (r.ok) expect(r.image.id).toBe("reviewer-node24-bun1310");
+    if (r.ok) expect(r.image.id).toBe(expected[0].id);
   });
 
   test("a runtime outside the matrix refuses and NAMES the missing image by its requirements", () => {

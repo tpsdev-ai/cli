@@ -35,13 +35,14 @@
       "enabled": false
     },
     {
+      "description": "Match the Node/Bun uses-with dependencies by depName; their datasource packageName can differ.",
       "matchManagers": [
         "github-actions"
       ],
       "matchDepTypes": [
         "uses-with"
       ],
-      "matchPackageNames": [
+      "matchDepNames": [
         "bun",
         "node"
       ],
