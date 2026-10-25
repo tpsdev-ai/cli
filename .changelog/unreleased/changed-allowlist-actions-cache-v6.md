@@ -1,0 +1,1 @@
+- **The reviewer's skip allowlist accepts `actions/cache` at v6.1.0, pinned to its release commit.** A workflow that pins that commit is no longer refused as an unreviewed ref.
