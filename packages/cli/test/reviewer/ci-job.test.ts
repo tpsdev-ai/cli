@@ -22,12 +22,62 @@ import yaml from "js-yaml";
 
 const SUITE_STEP = "Unit + integration tests, HOME-isolated (cli#430)";
 
+type WorkflowStep = { name?: string; uses?: string; with?: Record<string, unknown>; env?: unknown };
+
+/** The test job's steps, read with the planner's YAML schema. */
+function testJobSteps(workflowText: string): WorkflowStep[] {
+  const wf = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA }) as { jobs: { test: { steps: WorkflowStep[] } } };
+  const steps = wf.jobs.test?.steps;
+  if (!Array.isArray(steps)) throw new Error("no test job steps");
+  return steps;
+}
+
 /** Whether this repository's HOME-isolated suite step declares an env key, read with the planner's YAML schema. */
 function suiteStepDeclaresEnv(workflowText: string): boolean {
-  const wf = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA }) as { jobs: { test: { steps: Array<Record<string, unknown>> } } };
-  const step = wf.jobs.test.steps.find((s) => s.name === SUITE_STEP);
+  const step = testJobSteps(workflowText).find((s) => s.name === SUITE_STEP);
   if (!step) throw new Error(`no step named ${SUITE_STEP}`);
   return Object.hasOwn(step, "env");
+}
+
+/** Every uses step of the test job, named with the tag the reviewed allowlist gives its SHA. */
+function workflowSkipped(workflowText: string): string[] {
+  return testJobSteps(workflowText)
+    .map((s) => s.uses)
+    .filter((uses): uses is string => typeof uses === "string")
+    .map((uses) => {
+      const [name, sha] = uses.split("@");
+      const action = (SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>)[name.toLowerCase()];
+      if (!action) throw new Error(`${name} is not an action the launcher skips`);
+      const tag = action.refs[sha];
+      if (!tag) throw new Error(`${name}@${sha} is not in the reviewed allowlist`);
+      return `${name}@${tag}`;
+    });
+}
+
+/** The runtime pins the given planned jobs' setup actions declare, in job and step order. */
+function workflowPins(workflowText: string, jobIds: string[]): string[] {
+  const wf = yaml.load(workflowText, { schema: yaml.CORE_SCHEMA }) as { jobs: Record<string, { steps?: WorkflowStep[] }> };
+  const inputOf: Record<string, string> = { "actions/setup-node": "node-version", "oven-sh/setup-bun": "bun-version" };
+  return jobIds.flatMap((id) => {
+    const steps = wf.jobs[id]?.steps;
+    if (!Array.isArray(steps)) throw new Error(`no steps for job ${id}`);
+    return steps.flatMap((s) => {
+      if (typeof s.uses !== "string") return [];
+      const input = inputOf[s.uses.split("@")[0].toLowerCase()];
+      if (!input) return [];
+      const value = s.with?.[input];
+      if (value === undefined) throw new Error(`${s.uses} declares no ${input}`);
+      return [String(value)];
+    });
+  });
+}
+
+/** The Node version the test job's setup-node step pins. */
+function workflowNodePin(workflowText: string): string {
+  const step = testJobSteps(workflowText).find((s) => typeof s.uses === "string" && s.uses.split("@")[0].toLowerCase() === "actions/setup-node");
+  const value = step?.with?.["node-version"];
+  if (value === undefined) throw new Error("the test job declares no setup-node node-version");
+  return String(value);
 }
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -70,8 +120,9 @@ const extraJob = (id: string, body: string, runsOn = "ubuntu-latest") =>
   `  ${id}:\n    runs-on: ${runsOn}\n${body}`;
 
 describe("this repository's test job", () => {
+  const workflowText = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
   const p = planJob({
-    workflowText: readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"),
+    workflowText,
     workflowFile: ".github/workflows/test.yml",
     jobId: "test",
     baseBranch: "main",
@@ -137,28 +188,24 @@ describe("this repository's test job", () => {
 
   test("the setup actions are skipped by name at their reviewed tags, their pins kept, and sfw is shimmed", () => {
     const t = jobOf(p, "test");
-    expect(t.skipped.map((s: { uses: string; tag: string }) => `${s.uses.split("@")[0]}@${s.tag}`)).toEqual([
-      "actions/checkout@v4.2.2",
-      "actions/setup-node@v4.4.0",
-      "oven-sh/setup-bun@v2.0.2",
-      "socketdev/action@v1.3.2",
-    ]);
+    expect(t.skipped.map((s: { uses: string; tag: string }) => `${s.uses.split("@")[0]}@${s.tag}`)).toEqual(workflowSkipped(workflowText));
     if (!p.ok) return;
-    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(["24.21.0", "1.3.10", "24.21.0", "1.3.10"]);
+    expect(p.pins.map((x: { range: string }) => x.range)).toEqual(workflowPins(workflowText, p.jobs.map((j: { id: string }) => j.id)));
     expect(p.shims).toEqual(["sfw"]);
   });
 
-  test("every run: step of the test job is planned on Node 24.21.0", () => {
+  test("every run: step of the test job is planned on the Node the workflow pins", () => {
     const t = jobOf(p, "test");
+    const node = workflowNodePin(workflowText);
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
-      [4, "24.21.0"],
-      [6, "24.21.0"],
-      [7, "24.21.0"],
-      [8, "24.21.0"],
-      [9, "24.21.0"],
-      [10, "24.21.0"],
-      [11, "24.21.0"],
-      [12, "24.21.0"],
+      [4, node],
+      [6, node],
+      [7, node],
+      [8, node],
+      [9, node],
+      [10, node],
+      [11, node],
+      [12, node],
     ]);
   });
 

@@ -15,6 +15,8 @@ import { isSemverRange, resolveRuntime, satisfiesRange } from "../../../../scrip
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..", "..", "..", "..");
 const table = JSON.parse(readFileSync(resolve(repo, "docker", "reviewer", "runtime-matrix.json"), "utf8"));
+const node24 = table.images.find((i: { id: string }) => i.id === "reviewer-node24-bun1310");
+if (!node24) throw new Error("the runtime matrix has no reviewer-node24-bun1310 image");
 const dockerfile = readFileSync(resolve(repo, "docker", "reviewer", "Dockerfile"), "utf8");
 
 function refusal(r: ReturnType<typeof resolveRuntime>) {
@@ -84,10 +86,16 @@ describe("A2 — requirement resolution", () => {
     expect(plan.ok).toBe(true);
     if (!plan.ok) return;
     const r = resolveRuntime({ table, manifest, runtimeFiles: {}, ciConstraints: plan.pins });
+    // engines.node "22.x || 24.x" admits more than one image; the test job's
+    // exact setup-node pin selects one. The expected image is read from the
+    // workflow and the table, so a legitimate Node bump selects its own image
+    // instead of restating today's version here.
+    const nodePin = plan.pins.find((c: { tool: string }) => c.tool === "node")?.range;
+    const bunPin = plan.pins.find((c: { tool: string }) => c.tool === "bun")?.range;
+    const expected = table.images.filter((img: { node: string; bun: string }) => img.node === nodePin && img.bun === bunPin);
+    expect(expected.length).toBe(1);
     expect(r.ok).toBe(true);
-    // engines.node "22.x || 24.x" admits both images; the test job's exact
-    // setup-node 24.21.0 (for the github-review suite) selects one.
-    if (r.ok) expect(r.image.id).toBe("reviewer-node24-bun1310");
+    if (r.ok) expect(r.image.id).toBe(expected[0].id);
   });
 
   test("a runtime outside the matrix refuses and NAMES the missing image by its requirements", () => {
@@ -126,10 +134,11 @@ describe("A2 — requirement resolution", () => {
     expect(refusal(resolveRuntime({ table, manifest: { engines: { node: ">=22" } } })).kind).toBe("ambiguous");
   });
 
-  test("a bun-only repository matches both images: image-level ambiguity refuses", () => {
+  test("a bun-only repository matches more than one image: image-level ambiguity refuses", () => {
     const r = refusal(resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10" } }));
     expect(r.kind).toBe("ambiguous");
-    expect(r.message).toContain("matches more than one image (reviewer-node22-bun1310, reviewer-node24-bun1310)");
+    const ids = table.images.filter((img: { bun: string }) => img.bun === "1.3.10").map((img: { id: string }) => img.id);
+    expect(r.message).toContain(`matches more than one image (${ids.join(", ")})`);
   });
 
   test("mutually unsatisfiable requirements conflict", () => {
@@ -170,16 +179,16 @@ describe("A2 — requirement resolution", () => {
     expect(beta.kind).toBe("out-of-matrix");
   });
 
-  test("partial comparators follow npm semver: >22 excludes 22.x, <=24 includes 24.x", () => {
+  test("partial comparators follow npm semver: >22 excludes 22.x, an upper bound selects one image", () => {
     const gt = refusal(
       resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10", engines: { node: ">22" } }, runtimeFiles: { ".nvmrc": "22.22.1" } }),
     );
     expect(gt.kind).toBe("conflicting");
     const both = refusal(resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10", engines: { node: ">=22 <=24" } } }));
     expect(both.kind).toBe("ambiguous");
-    const r = resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10", engines: { node: ">22 <=24" } } });
+    const r = resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10", engines: { node: `>22 <=${node24.node}` } } });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.image.id).toBe("reviewer-node24-bun1310");
+    if (r.ok) expect(r.image.id).toBe(node24.id);
   });
 
   test(".tool-versions is read, with comments stripped", () => {
@@ -221,9 +230,9 @@ describe("A2 — requirement resolution", () => {
 
   test("a version file listing two versions refuses; a commented one is read", () => {
     expect(refusal(resolveRuntime({ table, manifest: {}, runtimeFiles: { ".nvmrc": "22\n24\n" } })).kind).toBe("ambiguous");
-    const r = resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10" }, runtimeFiles: { ".nvmrc": "# team pin\n24\n" } });
+    const r = resolveRuntime({ table, manifest: { packageManager: "bun@1.3.10" }, runtimeFiles: { ".nvmrc": `# team pin\n${node24.node}\n` } });
     expect(r.ok).toBe(true);
-    if (r.ok) expect(r.image.id).toBe("reviewer-node24-bun1310");
+    if (r.ok) expect(r.image.id).toBe(node24.id);
   });
 
   test("non-string engines / packageManager values refuse by name, never skipped", () => {

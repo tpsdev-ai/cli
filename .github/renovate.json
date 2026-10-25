@@ -35,13 +35,14 @@
       "enabled": false
     },
     {
+      "description": "A setup action's uses-with dependency is named bun or node while its package is the action (e.g. actions/node-versions), so match it by dep name.",
       "matchManagers": [
         "github-actions"
       ],
       "matchDepTypes": [
         "uses-with"
       ],
-      "matchPackageNames": [
+      "matchDepNames": [
         "bun",
         "node"
       ],
