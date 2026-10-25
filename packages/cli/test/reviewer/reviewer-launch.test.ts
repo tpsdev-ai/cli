@@ -57,8 +57,6 @@ const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..", "..", "..", "..");
 const table = loadTable(resolve(repo, "docker", "reviewer", "runtime-matrix.json"));
 const node22 = table.images.find((i: { id: string }) => i.id === "reviewer-node22-bun1310");
-const node24 = table.images.find((i: { id: string }) => i.id === "reviewer-node24-bun1310");
-if (!node24) throw new Error("the runtime matrix has no reviewer-node24-bun1310 image");
 const launcher = resolve(repo, "scripts", "reviewer", "reviewer-launch.mjs");
 
 const CHECKOUT = "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683";
@@ -513,12 +511,12 @@ describe("A2/A3 — the review build", () => {
   });
 
   test("a pin that resolves to ANOTHER matrix image refuses (wrong-image) before anything runs", async () => {
-    writeWorkspace(node24.node, "      - run: echo ran > review-marker\n");
+    writeWorkspace("24.x", "      - run: echo ran > review-marker\n");
     const r = await build();
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.refusal.kind).toBe("wrong-image");
-      expect(r.refusal.message).toContain(`resolves to ${node24.id}`);
+      expect(r.refusal.message).toContain("resolves to reviewer-node24-bun1310");
     }
     expect(existsSync(join(workspace, "review-marker"))).toBe(false);
   });
