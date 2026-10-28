@@ -1,4 +1,4 @@
-FROM rust:bookworm AS nono-builder
+FROM rust:bookworm@sha256:9181b56c2a21ab1d5e73cffe04fc762426d30aa7fac3c91141dd033f49a7fc8b AS nono-builder
 RUN apt-get update && apt-get install -y libdbus-1-dev pkg-config git ca-certificates
 # The nono pin lives in .nono-version at the repo root (single source of truth;
 # cli#341 S1's CI gate reads the same file). Clone the canonical repo, check out
