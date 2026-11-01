@@ -25,7 +25,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildArgsFor, loadTable } from "../../../../scripts/reviewer/build-reviewer-image.mjs";
 import {
@@ -417,6 +417,19 @@ function publish(depth: 0 | 1 = 1) {
   if (r.status !== 0) throw new Error(`clone failed: ${r.stderr}`);
 }
 
+/** A real linked worktree of a small repository under `root`, removed by the test that made it. */
+function realWorktree(name: string) {
+  const repo = join(root, `repo-${name}`);
+  const worktree = join(root, `wt-${name}`);
+  gitIn(root, "init", "-q", "-b", "main", repo);
+  writeFileSync(join(repo, "tracked"), "v1\n");
+  gitIn(repo, "add", "-A");
+  gitIn(repo, "-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "-q", "-m", "fixture");
+  const added = gitIn(repo, "worktree", "add", "-q", "--detach", worktree);
+  if (added.status !== 0) throw new Error(`worktree add failed: ${added.stderr}`);
+  return { repo, worktree };
+}
+
 function build(overrides: Record<string, unknown> & { afterPublish?: () => void; depth?: 0 | 1 } = {}) {
   const { afterPublish, depth = 1, ...rest } = overrides;
   publish(depth);
@@ -723,16 +736,62 @@ describe("A2/A3 — the review build", () => {
   });
 
   test("checkFreshClone cannot verify a worktree whose git metadata is unreachable, and refuses", () => {
-    writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
-    const r = checkFreshClone({ workspace, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+    const { repo, worktree } = realWorktree("missing-gitdir");
+    rmSync(join(repo, ".git", "worktrees", "wt-missing-gitdir"), { recursive: true, force: true });
+    const r = checkFreshClone({ workspace: worktree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.refusal.message).toContain("not reachable in the sandbox");
+    rmSync(worktree, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
   });
 
   test("a worktree whose git metadata is outside the sandbox is not an error", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
     const r = inspectNoSystem({ workspace, env: hermeticEnv({}, scratch) });
     expect(r.ok).toBe(true);
+  });
+
+  test("a healthy worktree's git metadata is reachable, and its checks are unchanged", () => {
+    const { repo, worktree } = realWorktree("healthy");
+    expect(inspectNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch) })).toEqual({ ok: true });
+    expect(freshNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch), fetchDepth: 0 })).toEqual({ ok: true });
+    rmSync(worktree, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test("a relative gitdir is resolved against the worktree", () => {
+    const { repo, worktree } = realWorktree("relative");
+    const gitdir = readFileSync(join(worktree, ".git"), "utf8").trim().slice("gitdir:".length).trim();
+    writeFileSync(join(worktree, ".git"), `gitdir: ${relative(worktree, gitdir)}\n`);
+    expect(inspectNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch) })).toEqual({ ok: true });
+    expect(freshNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch), fetchDepth: 0 })).toEqual({ ok: true });
+    rmSync(worktree, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  test("a .git that cannot be read as a gitfile, or names no gitdir, is never reported as unreachable", () => {
+    const asDirectory = join(root, "gitdir-is-a-directory");
+    mkdirSync(join(asDirectory, ".git", "objects"), { recursive: true });
+    const noGitdir = join(root, "gitfile-without-gitdir");
+    mkdirSync(noGitdir);
+    writeFileSync(join(noGitdir, ".git"), "not a gitfile\n");
+    for (const tree of [asDirectory, noGitdir]) {
+      const fresh = checkFreshClone({ workspace: tree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+      expect(fresh.ok).toBe(false);
+      if (!fresh.ok) {
+        expect(fresh.refusal.message).not.toContain("not reachable");
+        expect(fresh.refusal.message).toContain("no checked-out commit");
+      }
+      const config = inspectNoSystem({ workspace: tree, env: hermeticEnv({}, scratch) });
+      // inspectGitConfig reports unreachable as ok plus a note; neither tree may get that.
+      expect(JSON.stringify(config)).not.toContain("not reachable");
+      if (tree === noGitdir) {
+        expect(config.ok).toBe(false);
+        if (!config.ok) expect(config.refusal.kind).toBe("git-config-unreadable");
+      }
+    }
+    rmSync(asDirectory, { recursive: true, force: true });
+    rmSync(noGitdir, { recursive: true, force: true });
   });
 
   test("workflow env carrying a credential never reaches a step", async () => {

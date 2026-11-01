@@ -73,7 +73,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { BRANCH_RE, forbiddenEnvReason, JOB_ID_RE, MAX_WORKFLOW_BYTES, planJob, WORKFLOW_PATH_RE } from "./ci-job.mjs";
 import { resolveRuntime, satisfiesRange } from "./resolve-runtime.mjs";
 
@@ -526,7 +526,38 @@ function runGit(git, root, env, args) {
     maxBuffer: 16 * 1024 * 1024,
   });
 }
-const unreachable = (r) => /not a git repository/.test(r.stderr ?? "");
+/**
+ * True when a step's git cannot read the worktree's metadata, decided from the
+ * worktree's own `.git` gitfile instead of git's stderr text, which git 2.56
+ * reworded: a linked worktree names its gitdir there, and a target that cannot
+ * be listed is metadata the sandbox does not have. A `.git` directory (an
+ * ordinary clone) is reachable; a `.git` that cannot be read as a file, or that
+ * carries no gitdir line, is not evidence either way and reports false, leaving
+ * the caller's other refusal in place.
+ */
+function gitMetadataUnreachable(root) {
+  let gitfile;
+  try {
+    gitfile = readFileSync(join(root, ".git"), "utf8");
+  } catch {
+    return false;
+  }
+  const line = gitfile.split("\n").find((l) => l.startsWith("gitdir:"));
+  const named = line === undefined ? "" : line.slice("gitdir:".length).trim();
+  if (named === "") return false;
+  let target;
+  try {
+    target = resolve(root, named);
+  } catch {
+    return false;
+  }
+  try {
+    readdirSync(target);
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * What git would see in the worktree before a job runs: `git config --list
@@ -540,7 +571,7 @@ export function inspectGitConfig({ workspace, env, git = GIT }) {
   if (r.error) return refuse("git-config-unreadable", `git could not be run to inspect the worktree's configuration (${r.error.code ?? "error"})`);
   if (r.status !== 0) {
     // A worktree whose git metadata lives outside the sandbox: git in a step cannot read it either.
-    if (unreachable(r)) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
+    if (gitMetadataUnreachable(root)) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
     return refuse("git-config-unreadable", `git could not read the worktree's configuration: ${(r.stderr ?? "").split("\n")[0]}`);
   }
   const findings = gitConfigFindings(r.stdout);
@@ -585,7 +616,7 @@ export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
   if (head.error || head.status !== 0) {
     return refuse(
       "not-fresh",
-      unreachable(head)
+      gitMetadataUnreachable(root)
         ? "the worktree's git metadata is not reachable in the sandbox, so the clean checkout that actions/checkout gives CI cannot be verified"
         : "the worktree has no checked-out commit, so the clean checkout that actions/checkout gives CI cannot be verified",
     );
