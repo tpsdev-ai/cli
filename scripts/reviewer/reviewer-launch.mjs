@@ -530,17 +530,18 @@ function runGit(git, root, env, args) {
  * True when a step's git cannot read the worktree's metadata, decided from the
  * worktree's own `.git` gitfile instead of git's stderr text, which git 2.56
  * reworded: a linked worktree names its gitdir there, and a target that cannot
- * be listed is metadata the sandbox does not have. A `.git` directory (an
- * ordinary clone) is reachable; a `.git` that cannot be read as a file, or that
- * carries no gitdir line, is not evidence either way and reports false, leaving
- * the caller's other refusal in place.
+ * be listed is metadata the sandbox does not have. A tree with no `.git` entry
+ * at all reports unreachable, as this check did before. A `.git` directory (an
+ * ordinary clone) is reachable; a `.git` that exists but cannot be read as a
+ * file, or that carries no gitdir line, is not evidence either way and reports
+ * false, leaving the caller's other refusal in place.
  */
 function gitMetadataUnreachable(root) {
   let gitfile;
   try {
     gitfile = readFileSync(join(root, ".git"), "utf8");
-  } catch {
-    return false;
+  } catch (err) {
+    return err?.code === "ENOENT";
   }
   const line = gitfile.split("\n").find((l) => l.startsWith("gitdir:"));
   const named = line === undefined ? "" : line.slice("gitdir:".length).trim();

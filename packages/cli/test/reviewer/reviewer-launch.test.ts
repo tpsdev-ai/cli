@@ -722,6 +722,7 @@ describe("A2/A3 — the review build", () => {
   });
 
   test("a git configuration git cannot read, or a missing git, refuses rather than passes", () => {
+    publish();
     const bad = join(root, "bad-git");
     writeFileSync(bad, "#!/bin/sh\necho 'fatal: bad config line 1 in file .git/config' >&2\nexit 128\n", { mode: 0o755 });
     const unreadable = inspectGitConfig({ workspace, env: hermeticEnv({}, scratch), git: bad });
@@ -749,6 +750,19 @@ describe("A2/A3 — the review build", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
     const r = inspectNoSystem({ workspace, env: hermeticEnv({}, scratch) });
     expect(r.ok).toBe(true);
+  });
+
+  test("a directory with no .git at all: git config exits 0 and the fresh check reports metadata not reachable", () => {
+    const plain = join(root, "plain-copy");
+    mkdirSync(plain);
+    expect(inspectNoSystem({ workspace: plain, env: hermeticEnv({}, scratch) })).toEqual({ ok: true });
+    const fresh = freshNoSystem({ workspace: plain, env: hermeticEnv({}, scratch), fetchDepth: 1 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) {
+      expect(fresh.refusal.kind).toBe("not-fresh");
+      expect(fresh.refusal.message).toContain("the worktree's git metadata is not reachable in the sandbox");
+    }
+    rmSync(plain, { recursive: true, force: true });
   });
 
   test("a healthy worktree's git metadata is reachable, and its checks are unchanged", () => {
