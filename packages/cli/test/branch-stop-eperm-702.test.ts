@@ -11,7 +11,19 @@ import { tmpdir } from "node:os";
 import { runBranch, setBranchStopSignal } from "../src/commands/branch.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
-const isRoot = process.getuid?.() === 0;
+/** Whether this user is refused (EPERM) when signalling pid 1, probed with
+ *  signal 0, which sends nothing. Root, or a non-root user who owns pid 1 (as
+ *  in some containers), may signal it, so the real-signal cases below run only
+ *  when this probe is refused. */
+function pid1RefusesSignals(): boolean {
+  try {
+    process.kill(1, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+const pid1Refused = pid1RefusesSignals();
 const saved: Record<string, string | undefined> = {};
 
 let root: string;
@@ -39,16 +51,16 @@ afterEach(() => {
 });
 
 describe("branch stop signal classification", () => {
-  // pid 1 always exists; a non-root user's SIGTERM to it is refused with EPERM.
-  // Root may signal it, so the case is skipped there (as in cli#683).
-  test.skipIf(isRoot)("EPERM keeps the pid file and fails the stop", async () => {
+  // pid 1 always exists. These cases send a real SIGTERM to it, so they run
+  // only when a signal-0 probe of pid 1 is refused with EPERM (pid1Refused).
+  test.skipIf(!pid1Refused)("EPERM keeps the pid file and fails the stop", async () => {
     writeFileSync(pidFile, "1\n");
 
     await expect(runBranch({ action: "stop" })).rejects.toThrow(/could not be stopped \(pid 1\)/);
     expect(existsSync(pidFile)).toBe(true);
   });
 
-  test.skipIf(isRoot)("the stop command exits non-zero on EPERM and names the pid", () => {
+  test.skipIf(!pid1Refused)("the stop command exits non-zero on EPERM and names the pid", () => {
     writeFileSync(pidFile, "1\n");
 
     const result = spawnSync("node", [TPS_BIN, "branch", "stop"], {

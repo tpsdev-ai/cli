@@ -94,7 +94,9 @@ const PID_ARGUMENT_ERRORS = new Set(["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE",
 
 export type PidState = "alive" | "gone" | "invalid";
 
-/** The classifier's validity rule: an integer of at least 1. */
+/** The classifier's integer-and-positive precheck: an integer of at least 1.
+ *  pidState can still classify a larger integer as invalid after process.kill
+ *  rejects it as an argument (PID_ARGUMENT_ERRORS). */
 export function isValidPid(pid: number): boolean {
   return Number.isInteger(pid) && pid >= 1;
 }
