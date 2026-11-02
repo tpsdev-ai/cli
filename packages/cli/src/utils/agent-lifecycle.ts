@@ -304,7 +304,7 @@ const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
  * `testHooks.afterPendingSnapshot` (commands/agent.ts).
  */
 export interface WorktreeRemovalTestHooks {
-  /** Runs between the ownership check and the pin. */
+  /** Runs after the route's verification check and before the pin. */
   beforeRemoval?: (workspace: string) => void;
   /** Runs after the worktree is pinned, before Git removes it. */
   beforeGitRemoval?: (pinned: string) => void;
@@ -699,11 +699,13 @@ function worktreeAdminDir(workspace: string): string {
 }
 
 /**
- * The admin directory and the identity of the worktree directory whose marker
- * this call verified, or the reason the worktree at the recorded path is not
- * the one this call marked. The stat is taken in the same step as the marker
- * read, so the pin that follows can prove it moved that exact directory. A
- * marker that is absent or cannot be read is a mismatch, never a match.
+ * The admin directory observed for the worktree whose marker this call
+ * verified, plus a stat of the workspace path taken right after that marker
+ * read (not atomically with it, so it may describe a directory swapped in
+ * between), or the reason the worktree at the recorded path is not the one this
+ * call marked. The pin compares the moved directory's device and inode with
+ * this stat and re-checks its `.git` admin path and the marker after the move.
+ * A marker that is absent or cannot be read is a mismatch, never a match.
  */
 function verifiedCreatedWorktree(
   created: WorktreeCreation,
@@ -857,7 +859,8 @@ interface PinnedWorktree {
   recordedRegistry: string;
 }
 
-/** True when `path` exists; only ENOENT counts as absent. */
+/** True when nothing exists at `path`; only ENOENT counts as absent, and any
+ *  other lstat error is thrown. */
 function absent(path: string): boolean {
   try {
     lstatSync(path);
@@ -868,14 +871,17 @@ function absent(path: string): boolean {
   }
 }
 
-/** Move a pinned worktree back, or name where it is when that is not possible. */
+/** Move a pinned worktree back, or say why restoring it from the pinned path
+ *  did not happen; neither message asserts that anything remains there. */
 function restorePinnedWorktree(pin: { workspace: string; pinned: string }): { restored: boolean; detail: string } {
   try {
-    if (!absent(pin.workspace)) return { restored: false, detail: `; the worktree is at ${pin.pinned}` };
+    if (!absent(pin.workspace)) {
+      return { restored: false, detail: `; not restored from ${pin.pinned}: ${pin.workspace} is occupied` };
+    }
     renameSync(pin.pinned, pin.workspace);
     return { restored: true, detail: "" };
   } catch (err) {
-    return { restored: false, detail: `; the worktree is at ${pin.pinned}: ${(err as Error).message}` };
+    return { restored: false, detail: `; restoring from ${pin.pinned} failed: ${(err as Error).message}` };
   }
 }
 
@@ -1067,8 +1073,9 @@ function comparablePath(path: string): string {
  * directory named by the worktree's `.git` file to hold the recorded marker,
  * and any recorded identity facts to still match; a missing or different
  * marker is refused with the manual command. The verified directory is then
- * moved aside in one rename and removed through that copy, so a worktree
- * re-created at the workspace path between the check and the removal survives.
+ * moved aside in one rename, and Git is given that pinned pathname, so a
+ * worktree re-created at the workspace path between the check and the removal
+ * survives.
  * A change at the pinned path during removal is not covered. Throws
  * `WorktreeLifecycleError` naming the path when removal fails; a failed Git
  * removal also carries Git's error and the manual command.
