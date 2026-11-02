@@ -1,9 +1,10 @@
 /**
  * cli#683 — every pid probe in the cli goes through the shared pidState, so a
- * process this user may not signal (EPERM) is running and its pid file is kept.
+ * process this user may not signal (EPERM) counts as running.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { pidState } from "@tpsdev-ai/agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { processAlive } from "../src/commands/branch.js";
@@ -28,10 +29,12 @@ afterEach(() => {
 });
 
 describe("mail relay pid probe", () => {
-  // pid 1 always exists; a non-root user's kill(1, 0) fails with EPERM. Root
-  // can signal it, so the case is still true there but does not exercise EPERM
-  // (cli#692 tracks forcing EPERM when the suite runs as root).
-  test("keeps a pid file naming pid 1 and reports the relay running", () => {
+  // pid 1 always exists, so the probe reports it alive. When kill(1, 0) returns
+  // EPERM this exercises the EPERM branch; when it succeeds (the suite runs as
+  // root) the result is the same but EPERM is not exercised (cli#692 tracks
+  // forcing EPERM when the suite runs as root).
+  test("keeps a pid file naming pid 1 when kill(1, 0) returns EPERM", () => {
+    expect(pidState(1)).toBe("alive");
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
@@ -41,11 +44,31 @@ describe("mail relay pid probe", () => {
     expect(existsSync(pidPath)).toBe(true);
   });
 
-  test("removes a pid file whose process is gone", () => {
+  test("removes a pid file naming an invalid pid", () => {
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
     writeFileSync(pidPath, "2147483648\n");
+
+    expect(getRelayPid()).toBeNull();
+    expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("removes a pid file whose process has exited and been reaped", async () => {
+    const runDir = join(home, ".tps");
+    mkdirSync(runDir, { recursive: true });
+    const pidPath = join(runDir, "relay.pid");
+    const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
+    const pid = child.pid;
+    await child.exited;
+    writeFileSync(pidPath, `${pid}\n`);
+
+    // A reaped pid is gone unless the OS reused it in this window; in that case
+    // the probe names another process, so skip rather than assert on it.
+    if (pidState(pid) !== "gone") {
+      console.log(`skipping gone-pid case: pid ${pid} was reused`);
+      return;
+    }
 
     expect(getRelayPid()).toBeNull();
     expect(existsSync(pidPath)).toBe(false);
