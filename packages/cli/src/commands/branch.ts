@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmS
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn } from "node:child_process";
-import { pidState, pidStateFromProbeError, type PidState } from "@tpsdev-ai/agent";
+import { isValidPid, pidState, pidStateFromProbeError, type PidState } from "@tpsdev-ai/agent";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
@@ -138,9 +138,9 @@ export function processAlive(pid: number, probe: (pid: number) => PidState = pid
   return probe(pid) === "alive";
 }
 
-/** True when `kill(pid, 0)` was refused with an error pidState calls alive
- * (EPERM or another non-ESRCH error): the process exists, but its exit cannot
- * be observed from here. */
+/** True when `kill(pid, 0)` was refused with an error pidState calls alive.
+ * EPERM establishes that the process exists; an unrecognized error leaves its
+ * exit unconfirmed and is treated as alive. */
 function pidProbeRefused(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -528,6 +528,17 @@ async function runStart(): Promise<void> {
   await new Promise<void>(() => {});
 }
 
+type StopSignal = (pid: number) => void;
+let sendStopSignal: StopSignal = (pid) => process.kill(pid, "SIGTERM");
+
+/** Replace the stop signal sender; tests use it to assert an invalid pid is
+ * refused before any signal is sent. Returns the previous sender. */
+export function setBranchStopSignal(fn: StopSignal): StopSignal {
+  const previous = sendStopSignal;
+  sendStopSignal = fn;
+  return previous;
+}
+
 async function runStop(): Promise<void> {
   const p = pidPath();
   if (!existsSync(p)) {
@@ -535,13 +546,13 @@ async function runStop(): Promise<void> {
     return;
   }
   const pid = Number(readFileSync(p, "utf-8").trim());
-  if (!pid || Number.isNaN(pid)) {
+  if (!isValidPid(pid)) {
     rmSync(p, { force: true });
     console.log("Stale PID file removed.");
     return;
   }
   try {
-    process.kill(pid, "SIGTERM");
+    sendStopSignal(pid);
   } catch (error) {
     // Same classifier as pidState: EPERM means the process is alive and this
     // user may not signal it, so the pid file stays and the stop fails.

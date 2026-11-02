@@ -58,7 +58,7 @@ export {
   MAX_DELIVERY_PRESENTATIONS, DELIVERY_PRESENTATION_TTL_MS,
 } from "./lib/mailbox-policy.js";
 export type { MailboxPolicyRejectClass, MailboxPolicyResult, PlacementPhase, ReplayStore, FirstDelivery, PresentationAdvance, PresentationClaim, PlacementState, PlacementCompletion } from "./lib/mailbox-policy.js";
-export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, mailLockPath, pidState, pidStateFromProbeError, processIsGone, processStartToken } from "./lib/mail-lock.js";
+export { acquireMailLock, acquireMailLockSync, isValidPid, MAIL_LOCK_DIR, mailLockPath, pidState, pidStateFromProbeError, processIsGone, processStartToken } from "./lib/mail-lock.js";
 export type { MailLock, PidState } from "./lib/mail-lock.js";
 export {
   KeyFormatError, AgentKeyError, AgentKeyConflictError,

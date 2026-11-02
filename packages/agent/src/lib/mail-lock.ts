@@ -94,6 +94,11 @@ const PID_ARGUMENT_ERRORS = new Set(["ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE",
 
 export type PidState = "alive" | "gone" | "invalid";
 
+/** True when `pid` names one process: an integer of at least 1. */
+export function isValidPid(pid: number): boolean {
+  return Number.isInteger(pid) && pid >= 1;
+}
+
 /**
  * Probe a recorded pid with `process.kill(pid, 0)`. "invalid": not an integer
  * of at least 1 (0 and negative pids do not name one process), or a pid
@@ -101,7 +106,7 @@ export type PidState = "alive" | "gone" | "invalid";
  * succeeds or fails with any other error, EPERM (permission denied) included.
  */
 export function pidState(pid: number): PidState {
-  if (!Number.isInteger(pid) || pid < 1) return "invalid";
+  if (!isValidPid(pid)) return "invalid";
   try {
     process.kill(pid, 0);
     return "alive";

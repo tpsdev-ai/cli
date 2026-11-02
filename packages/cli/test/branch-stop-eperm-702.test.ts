@@ -3,12 +3,12 @@
  * pidState classifier: EPERM is a live process this user may not stop, so the
  * pid file stays and the command fails; ESRCH still clears a stale pid file.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { runBranch } from "../src/commands/branch.js";
+import { runBranch, setBranchStopSignal } from "../src/commands/branch.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const isRoot = process.getuid?.() === 0;
@@ -65,4 +65,30 @@ describe("branch stop signal classification", () => {
 
     expect(existsSync(pidFile)).toBe(false);
   });
+});
+
+describe("branch stop refuses an invalid pid without signalling", () => {
+  for (const pidText of ["-1", "1.5"]) {
+    test(`a pid file holding ${pidText} gets no SIGTERM and is removed as stale`, async () => {
+      writeFileSync(pidFile, `${pidText}\n`);
+      const signals: number[] = [];
+      const original = setBranchStopSignal((pid) => {
+        signals.push(pid);
+      });
+      const logs: string[] = [];
+      const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+        logs.push(args.join(" "));
+      });
+      try {
+        await runBranch({ action: "stop" });
+      } finally {
+        logSpy.mockRestore();
+        setBranchStopSignal(original);
+      }
+
+      expect(signals).toEqual([]);
+      expect(existsSync(pidFile)).toBe(false);
+      expect(logs.join("\n")).toMatch(/stale/i);
+    });
+  }
 });
