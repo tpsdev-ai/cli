@@ -808,6 +808,84 @@ describe("A2/A3 — the review build", () => {
     rmSync(noGitdir, { recursive: true, force: true });
   });
 
+  test("a dangling .git symlink is not reported as unreachable; a missing .git is", () => {
+    const dangling = join(root, "dangling-dotgit");
+    mkdirSync(dangling);
+    symlinkSync(join(root, "missing-gitdir"), join(dangling, ".git"));
+    const fresh = checkFreshClone({ workspace: dangling, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) {
+      expect(fresh.refusal.message).not.toContain("not reachable");
+      expect(fresh.refusal.message).toContain("no checked-out commit");
+    }
+    expect(JSON.stringify(inspectNoSystem({ workspace: dangling, env: hermeticEnv({}, scratch) }))).not.toContain("not reachable");
+    rmSync(dangling, { recursive: true, force: true });
+
+    const missing = join(root, "missing-dotgit");
+    mkdirSync(missing);
+    const absent = freshNoSystem({ workspace: missing, env: hermeticEnv({}, scratch), fetchDepth: 1 });
+    expect(absent.ok).toBe(false);
+    if (!absent.ok) expect(absent.refusal.message).toContain("not reachable in the sandbox");
+    rmSync(missing, { recursive: true, force: true });
+  });
+
+  test("a relative gitdir whose target is missing reports metadata not reachable", () => {
+    const { repo, worktree } = realWorktree("relative-missing");
+    writeFileSync(join(worktree, ".git"), "gitdir: gone\n");
+    const cwd = process.cwd();
+    const elsewhere = join(root, "relative-cwd");
+    mkdirSync(join(elsewhere, "gone"), { recursive: true });
+    try {
+      process.chdir(elsewhere);
+      const fresh = checkFreshClone({ workspace: worktree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+      expect(fresh.ok).toBe(false);
+      if (!fresh.ok) expect(fresh.refusal.message).toContain("not reachable in the sandbox");
+    } finally {
+      process.chdir(cwd);
+      rmSync(worktree, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
+
+  test("an oversized .git is not a gitfile and is never reported as unreachable", () => {
+    const tree = join(root, "oversize-gitfile");
+    const target = join(root, "oversize-target");
+    mkdirSync(tree);
+    mkdirSync(target);
+    writeFileSync(join(tree, ".git"), `gitdir: ${target}\n${"x".repeat(4096)}\n`);
+    const fresh = checkFreshClone({ workspace: tree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) {
+      expect(fresh.refusal.message).not.toContain("not reachable");
+      expect(fresh.refusal.message).toContain("no checked-out commit");
+    }
+    const config = inspectNoSystem({ workspace: tree, env: hermeticEnv({}, scratch) });
+    expect(JSON.stringify(config)).not.toContain("not reachable");
+    if (!config.ok) expect(config.refusal.kind).toBe("git-config-unreadable");
+    rmSync(tree, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  });
+
+  test("a multi-line .git whose first line is not a gitdir is not a gitfile", () => {
+    const tree = join(root, "multiline-gitfile");
+    const target = join(root, "multiline-target");
+    mkdirSync(tree);
+    mkdirSync(target);
+    writeFileSync(join(tree, ".git"), `not a gitfile\ngitdir: ${target}\n`);
+    const fresh = checkFreshClone({ workspace: tree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) {
+      expect(fresh.refusal.message).not.toContain("not reachable");
+      expect(fresh.refusal.message).toContain("no checked-out commit");
+    }
+    const config = inspectNoSystem({ workspace: tree, env: hermeticEnv({}, scratch) });
+    expect(JSON.stringify(config)).not.toContain("not reachable");
+    if (!config.ok) expect(config.refusal.kind).toBe("git-config-unreadable");
+    rmSync(tree, { recursive: true, force: true });
+    rmSync(target, { recursive: true, force: true });
+  });
+
   test("workflow env carrying a credential never reaches a step", async () => {
     writeWorkspace("22.x", "      - run: echo \"$GH_TOKEN\" > leaked\n", { env: "env:\n  GH_TOKEN: fake-token\n" });
     const r = await build();

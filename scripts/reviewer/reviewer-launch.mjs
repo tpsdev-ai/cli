@@ -526,34 +526,55 @@ function runGit(git, root, env, args) {
     maxBuffer: 16 * 1024 * 1024,
   });
 }
+const MAX_GITFILE_BYTES = 4096;
+
 /**
- * True when a step's git cannot read the worktree's metadata, decided from the
- * worktree's own `.git` gitfile instead of git's stderr text, which git 2.56
- * reworded: a linked worktree names its gitdir there, and a target that cannot
- * be listed is metadata the sandbox does not have. A tree with no `.git` entry
- * at all reports unreachable, as this check did before. A `.git` directory (an
- * ordinary clone) is reachable; a `.git` that exists but cannot be read as a
- * file, or that carries no gitdir line, is not evidence either way and reports
- * false, leaving the caller's other refusal in place.
+ * Whether the worktree's git metadata is unreachable in the sandbox, decided
+ * from the worktree's own `.git` entry instead of git's stderr text, which git
+ * 2.56 reworded. A linked worktree's `.git` is a gitfile: git accepts content
+ * that begins with `gitdir: ` and takes the rest of the file, with trailing
+ * CR/LF removed, as the path (a relative path is relative to the worktree). A
+ * target that cannot be listed is treated as metadata the sandbox does not
+ * have. A tree with no `.git` entry at all reports unreachable, as this check
+ * did before. A `.git` directory is not treated as unreachable. An entry that
+ * exists but is not a readable gitfile within MAX_GITFILE_BYTES (a dangling
+ * symlink, a directory in a symlink's place, a permission error) reports false:
+ * that is not evidence of unreachability, so the caller that reached this check
+ * keeps its other branch.
  */
 function gitMetadataUnreachable(root) {
-  let gitfile;
+  const dotGit = join(root, ".git");
   try {
-    gitfile = readFileSync(join(root, ".git"), "utf8");
+    lstatSync(dotGit);
   } catch (err) {
     return err?.code === "ENOENT";
   }
-  const line = gitfile.split("\n").find((l) => l.startsWith("gitdir:"));
-  const named = line === undefined ? "" : line.slice("gitdir:".length).trim();
-  if (named === "") return false;
-  let target;
+  let entry;
   try {
-    target = resolve(root, named);
+    entry = statSync(dotGit);
   } catch {
     return false;
   }
+  if (!entry.isFile() || entry.size > MAX_GITFILE_BYTES) return false;
+  let gitfile;
   try {
-    readdirSync(target);
+    const fd = openSync(dotGit, "r");
+    try {
+      const buffer = Buffer.alloc(MAX_GITFILE_BYTES + 1);
+      const read = readSync(fd, buffer, 0, buffer.length, 0);
+      if (read > MAX_GITFILE_BYTES) return false;
+      gitfile = buffer.subarray(0, read).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  if (!gitfile.startsWith("gitdir: ")) return false;
+  const named = gitfile.slice("gitdir: ".length).replace(/[\r\n]+$/, "");
+  if (named === "") return false;
+  try {
+    readdirSync(resolve(root, named));
     return false;
   } catch {
     return true;
