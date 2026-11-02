@@ -1,1 +1,1 @@
-- **The review launcher reads a worktree's gitfile to decide its git metadata is unreachable.** It no longer parses git's stderr, whose wording changed in git 2.56; a gitdir it cannot list keeps the "not reachable" result, and a `.git` that cannot be read as a gitfile is not treated as one.
+- **The review launcher reads a worktree's `.git` entry to classify unreachable metadata.**

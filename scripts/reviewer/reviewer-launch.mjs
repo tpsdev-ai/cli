@@ -533,9 +533,8 @@ const MAX_GITFILE_BYTES = 4096;
  * from the worktree's own `.git` entry instead of git's stderr text, which git
  * 2.56 reworded. A linked worktree's `.git` is a gitfile: git accepts content
  * that begins with `gitdir: ` and takes the rest of the file, with trailing
- * CR/LF removed, as the path (a relative path is relative to the worktree). A
- * target that cannot be listed is treated as metadata the sandbox does not
- * have. A tree with no `.git` entry at all reports unreachable, as this check
+ * CR/LF removed, as the path (a relative path is relative to the worktree).
+ * A tree with no `.git` entry at all reports unreachable, as this check
  * did before. A `.git` directory is not treated as unreachable. An entry that
  * exists but is not a readable gitfile within MAX_GITFILE_BYTES (a dangling
  * symlink, a directory in a symlink's place, a permission error) reports false:

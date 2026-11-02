@@ -848,7 +848,7 @@ describe("A2/A3 — the review build", () => {
     }
   });
 
-  test("an oversized .git is not a gitfile and is never reported as unreachable", () => {
+  test("an oversized .git is outside the helper's inspection limit; not classified as unreachable", () => {
     const tree = join(root, "oversize-gitfile");
     const target = join(root, "oversize-target");
     mkdirSync(tree);
@@ -867,11 +867,28 @@ describe("A2/A3 — the review build", () => {
     rmSync(target, { recursive: true, force: true });
   });
 
+  test("Git accepts a healthy gitfile padded beyond the helper's inspection limit", () => {
+    const { repo, worktree } = realWorktree("padded");
+    const dotGit = join(worktree, ".git");
+    writeFileSync(dotGit, `${readFileSync(dotGit, "utf8")}${"\r\n".repeat(4096)}`);
+    expect(gitIn(worktree, "rev-parse", "--verify", "HEAD").status).toBe(0);
+    expect(inspectNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch) })).toEqual({ ok: true });
+    expect(freshNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch), fetchDepth: 0 })).toEqual({ ok: true });
+    rmSync(join(repo, ".git", "worktrees", "wt-padded"), { recursive: true, force: true });
+    const fresh = freshNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch), fetchDepth: 0 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) expect(fresh.refusal.message).not.toContain("not reachable");
+    const config = inspectNoSystem({ workspace: worktree, env: hermeticEnv({}, scratch) });
+    expect(config.ok).toBe(false);
+    expect(JSON.stringify(config)).not.toContain("not reachable");
+    rmSync(worktree, { recursive: true, force: true });
+    rmSync(repo, { recursive: true, force: true });
+  });
+
   test("a multi-line .git whose first line is not a gitdir is not a gitfile", () => {
     const tree = join(root, "multiline-gitfile");
     const target = join(root, "multiline-target");
     mkdirSync(tree);
-    mkdirSync(target);
     writeFileSync(join(tree, ".git"), `not a gitfile\ngitdir: ${target}\n`);
     const fresh = checkFreshClone({ workspace: tree, env: { ...hermeticEnv({}, scratch), GIT_CONFIG_NOSYSTEM: "1" }, fetchDepth: 1 });
     expect(fresh.ok).toBe(false);
@@ -880,10 +897,10 @@ describe("A2/A3 — the review build", () => {
       expect(fresh.refusal.message).toContain("no checked-out commit");
     }
     const config = inspectNoSystem({ workspace: tree, env: hermeticEnv({}, scratch) });
+    expect(config.ok).toBe(false);
     expect(JSON.stringify(config)).not.toContain("not reachable");
     if (!config.ok) expect(config.refusal.kind).toBe("git-config-unreadable");
     rmSync(tree, { recursive: true, force: true });
-    rmSync(target, { recursive: true, force: true });
   });
 
   test("workflow env carrying a credential never reaches a step", async () => {
