@@ -1,0 +1,1 @@
+- **The review launcher reads a worktree's `.git` entry to classify unreachable metadata.**
