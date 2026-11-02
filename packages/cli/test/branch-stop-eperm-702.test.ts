@@ -3,7 +3,7 @@
  * pidState classifier: EPERM is a live process this user may not stop, so the
  * pid file stays and the command fails; ESRCH still clears a stale pid file.
  */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -16,6 +16,10 @@ const saved: Record<string, string | undefined> = {};
 
 let root: string;
 let pidFile: string;
+
+afterEach(() => {
+  mock.restore();
+});
 
 beforeEach(() => {
   for (const key of ["HOME", "TPS_ROOT"]) saved[key] = process.env[key];
