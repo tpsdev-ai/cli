@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -14,6 +14,10 @@ import {
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const FAKE_NONO_BIN_DIR = join(import.meta.dir, "fakes/nono/bin");
+
+afterEach(() => {
+  mock.restore();
+});
 
 describe("WorkspaceManifestSchema", () => {
   test("parses a minimal manifest with no tools", () => {
@@ -336,7 +340,6 @@ describe("curl url explicit trim (#691)", () => {
   let agentWs: string;
   let dest: string;
   let argvFile: string;
-  let originalPath: string | undefined;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-om-trim-"));
@@ -349,12 +352,9 @@ describe("curl url explicit trim (#691)", () => {
     const fakeCurl = join(bin, "curl");
     writeFileSync(fakeCurl, `#!/bin/sh\nprintf '%s\\0' "$@" > '${argvFile}'\nexit 22\n`);
     chmodSync(fakeCurl, 0o755);
-    originalPath = process.env.PATH;
-    process.env.PATH = `${bin}:${process.env.PATH}`;
   });
 
   afterEach(() => {
-    if (originalPath !== undefined) process.env.PATH = originalPath;
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -381,28 +381,44 @@ describe("curl url explicit trim (#691)", () => {
     expect(manifest!.tools.curl[0]!.url).toBe(TRIMMED);
   });
 
-  test("every use site receives the trimmed URL when the URL check does not trim", async () => {
+  /**
+   * Run the pipeline in a child whose PATH names the fake curl from startup.
+   * Bun 1.3.10 resolves an executable from the PATH the process started with,
+   * so a PATH assignment inside the test does not reach spawnSync's lookup.
+   * The child runs the real component; its stdio carries the real log lines.
+   */
+  function runPipeline(): { status: number | null; stdout: string; stderr: string } {
+    const script = join(root, "run-office-manager.ts");
+    const moduleUrl = new URL("../src/commands/office-manager.ts", import.meta.url).href;
+    writeFileSync(
+      script,
+      [
+        `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};`,
+        `import { runOfficeManager, createWorkspaceManifestSchema } from ${JSON.stringify(moduleUrl)};`,
+        "const nonTrimming = z.string().refine(",
+        "  (value) => { try { new URL(value.trim()); return true; } catch { return false; } },",
+        '  { message: "Invalid URL" },',
+        ");",
+        "const schema = createWorkspaceManifestSchema(nonTrimming);",
+        `const ok = await runOfficeManager(${JSON.stringify(agentWs)}, { manifestSchema: schema });`,
+        'process.stdout.write(`RESULT ${ok}\\n`);',
+        "",
+      ].join("\n")
+    );
+    return spawnSync(process.execPath, [script], {
+      encoding: "utf-8",
+      cwd: root,
+      env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH ?? ""}` },
+    });
+  }
+
+  test("every use site receives the trimmed URL when the URL check does not trim", () => {
     writeManifest(RAW);
-    const logs: string[] = [];
-    const errors: string[] = [];
-    const logSpy = spyOn(console, "log");
-    const errSpy = spyOn(console, "error");
-    let ok: boolean;
-    try {
-      logSpy.mockImplementation((...args: unknown[]) => {
-        logs.push(args.map(String).join(" "));
-      });
-      errSpy.mockImplementation((...args: unknown[]) => {
-        errors.push(args.map(String).join(" "));
-      });
-      ok = await runOfficeManager(agentWs, { manifestSchema: schema });
-    } finally {
-      logSpy.mockRestore();
-      errSpy.mockRestore();
-    }
-    expect(ok!).toBe(false);
+    const run = runPipeline();
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain("RESULT false");
     expect(curlArgv()).toEqual(["--fail", "--silent", "--location", "--output", dest, TRIMMED]);
-    expect(logs).toContain(`  [curl] Downloading ${TRIMMED} → ${dest}...`);
-    expect(errors).toContain(`  [curl] FAILED: ${TRIMMED}`);
+    expect(run.stdout).toContain(`  [curl] Downloading ${TRIMMED} → ${dest}...`);
+    expect(run.stderr).toContain(`  [curl] FAILED: ${TRIMMED}`);
   });
 });
