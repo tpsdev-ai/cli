@@ -5,8 +5,8 @@
  * the test run when teardown is skipped (a killed test process, a timed-out
  * lane). The child watches two things and exits on its own:
  *
- * - stdin closes: the spawner holds the write end of a pipe, so the kernel
- *   closes it the moment the spawner exits or is killed. This is immediate.
+ * - stdin closes: by default the spawner holds the write end of a pipe, so the
+ *   kernel closes it the moment the spawner exits or is killed. This is immediate.
  * - the spawner's pid: read from this process before the spawn and passed to
  *   the child, which probes it with process.kill(pid, 0) every 250 ms and exits
  *   when the probe reports ESRCH (gone) or EPERM (another user's process).

@@ -14,7 +14,7 @@ import { LIVE_PROCESS_READY, spawnLiveProcess } from "./helpers/live-process.js"
 /** Operational test allowance for the child to act on a parent death. */
 const EXIT_BOUND_MS = 15_000;
 
-/** Opens the FIFO for writing and holds it open: the child's stdin never ends. */
+/** Opens the FIFO for writing and holds it open while the fixture lives. */
 const HOLDER_SCRIPT = `require("node:fs").openSync(process.argv[1], "w"); setInterval(() => {}, 1000);`;
 
 const HELPER_URL = pathToFileURL(join(import.meta.dir, "helpers/live-process.ts")).href;
@@ -98,7 +98,7 @@ type ParentMode = "pipe" | "fifo-ready" | "fifo-immediate";
 /**
  * A short-lived intermediate parent: it starts the helper and reports its pid.
  * "fifo-ready" reports once the helper prints LIVE_PROCESS_READY; "fifo-immediate"
- * writes the pid and SIGKILLs itself before the helper has printed anything.
+ * writes the pid and SIGKILLs itself immediately after the spawn.
  */
 function writeParentScript(root: string, mode: ParentMode): string {
   const fifo = join(root, "stdin.fifo");
