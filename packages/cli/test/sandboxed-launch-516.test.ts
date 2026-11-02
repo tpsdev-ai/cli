@@ -1951,8 +1951,7 @@ exit 0
     return `git -C '${f.base}' worktree remove --force '${f.sb.ws}'`;
   }
 
-  /** True when a logged removal names the sibling the cleanup pins the
-   *  recorded worktree to, never the shared workspace path (cli#678). */
+  /** Check the removal command and cleanup pathname prefix (cli#678). */
   function isPinnedRemoval(f: LaunchFixture, call: string): boolean {
     const target = call.slice("worktree remove --force ".length);
     return call.startsWith("worktree remove --force ") &&
@@ -2059,7 +2058,7 @@ exit 0
       expect(readFileSync(join(neighbourAdmin, "gitdir"), "utf-8")).toBe(neighbourRegistry);
       expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: neighbour, encoding: "utf8" }).stdout.trim()).toBe(neighbourHead);
       expect(readdirSync(join(f.base, ".git", "worktrees")).sort()).toEqual(adminEntriesBefore);
-      // Every removal the launcher ran named a pinned copy of the recorded worktree.
+      // Removal targets match the cleanup pathname prefix.
       const removes = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"));
       expect(removes).toHaveLength(2);
       expect(removes.every((call) => isPinnedRemoval(f, call))).toBe(true);

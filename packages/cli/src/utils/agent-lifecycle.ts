@@ -847,9 +847,7 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
   return null;
 }
 
-/** A worktree directory moved to a sibling path, with the admin directory its
- *  marker was verified in and the registry entry that points Git at the
- *  worktree. */
+/** A worktree moved to a sibling path; `removePinnedWorktree` repoints its registry entry. */
 interface PinnedWorktree {
   workspace: string;
   pinned: string;
@@ -882,13 +880,11 @@ function restorePinnedWorktree(pin: { workspace: string; pinned: string }): { re
 }
 
 /**
- * Move the worktree at `workspace` to a sibling path in one rename, then
- * prove the directory moved is the one the caller verified: same device and
- * inode, its `.git` file naming the verified admin directory, and (when a
- * marker was recorded) that directory still holding the exact marker. A path
- * replaced after the check fails here and is moved back. Returns the pin, or
- * the reason the worktree could not be pinned; on any doubt nothing is
- * removed.
+ * Move the worktree at `workspace` to a sibling path, then check its device,
+ * inode and `.git` admin path against the caller's values, plus the ownership
+ * marker when supplied. Path-only `onStop` supplies a registry-derived admin
+ * path and no ownership marker. On a failed check, attempt restoration; if
+ * it fails, report the pinned path.
  */
 function pinVerifiedWorktree(
   workspace: string,
@@ -931,14 +927,6 @@ function pinVerifiedWorktree(
   }
 }
 
-/**
- * Remove a pinned worktree through the verified admin directory: the entry's
- * `gitdir` file is repointed at the pinned copy, so Git's removal argument
- * names the directory this call holds, never the shared workspace path. On a
- * failed removal the directory move back is attempted first, and the
- * registration is restored only when it succeeded. A directory Git leaves at
- * the pinned path after a successful removal is reported, never deleted.
- */
 function writeRegistryEntry(entry: string, content: string): void {
   const temp = join(dirname(entry), `.${basename(entry)}.cleanup-${randomUUID()}`);
   try {
@@ -950,6 +938,12 @@ function writeRegistryEntry(entry: string, content: string): void {
   }
 }
 
+/**
+ * Repoint the registry entry and give Git the pinned pathname. Changes at that
+ * pathname during removal are not covered (cli#706). On a failed removal,
+ * attempt the move back; restore registration only if that succeeds. A directory
+ * left at the pinned path after Git succeeds is reported without deleting it.
+ */
 function removePinnedWorktree(
   pin: PinnedWorktree,
   testHooks?: WorktreeRemovalTestHooks,
@@ -1025,9 +1019,7 @@ function tryRemoveCreatedWorktree(
   if (identityError) {
     return { ok: false, refused: true, detail: `${identityError}; ${guidance()}` };
   }
-  // Pin the checked directory before removing it: the removal acts on the
-  // directory whose marker was just verified, never on whatever sits at the
-  // workspace path when Git runs.
+  // Pin the checked directory; Git receives the pinned pathname (cli#706).
   testHooks?.beforeRemoval?.(created.workspace);
   const pin = pinVerifiedWorktree(created.workspace, created.baseWorkingTree, verified, created.ownerMarker);
   if ("error" in pin) {
