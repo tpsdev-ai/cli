@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmS
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn } from "node:child_process";
-import { pidState, type PidState } from "@tpsdev-ai/agent";
+import { pidState, pidStateFromProbeError, type PidState } from "@tpsdev-ai/agent";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
@@ -136,6 +136,18 @@ function sanitizeDeliveryError(raw: string): string {
 
 export function processAlive(pid: number, probe: (pid: number) => PidState = pidState): boolean {
   return probe(pid) === "alive";
+}
+
+/** True when `kill(pid, 0)` was refused with an error pidState calls alive
+ * (EPERM or another non-ESRCH error): the process exists, but its exit cannot
+ * be observed from here. */
+function pidProbeRefused(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return pidStateFromProbeError(error) === "alive";
+  }
 }
 
 export function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", agentsDir?: string, agentId?: string): void {
@@ -530,7 +542,12 @@ async function runStop(): Promise<void> {
   }
   try {
     process.kill(pid, "SIGTERM");
-  } catch {
+  } catch (error) {
+    // Same classifier as pidState: EPERM means the process is alive and this
+    // user may not signal it, so the pid file stays and the stop fails.
+    if (pidStateFromProbeError(error) === "alive") {
+      throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept.`);
+    }
     rmSync(p, { force: true });
     console.log("Branch daemon not running (stale PID removed).");
     return;
@@ -539,7 +556,13 @@ async function runStop(): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < 5000) {
     if (!processAlive(pid)) break;
+    // A probe refused with EPERM keeps returning "alive"; stop waiting and
+    // report rather than polling until the deadline.
+    if (pidProbeRefused(pid)) break;
     await new Promise((r) => setTimeout(r, 100));
+  }
+  if (processAlive(pid)) {
+    throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept.`);
   }
   rmSync(p, { force: true });
   console.log("Branch daemon stopped.");
