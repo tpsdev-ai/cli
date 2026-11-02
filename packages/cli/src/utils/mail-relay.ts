@@ -18,6 +18,7 @@ import {
   rmSync,
 } from "node:fs";
 import { join } from "node:path";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
@@ -124,15 +125,17 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
 }
 
 /** Get relay PID if running, else null. */
-export function getRelayPid(): number | null {
+export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
   if (!existsSync(relayPidPath())) return null;
+  let pid: number;
   try {
-    const pid = parseInt(readFileSync(relayPidPath(), "utf-8").trim(), 10);
-    // Verify process is alive
-    process.kill(pid, 0);
-    return pid;
+    pid = parseInt(readFileSync(relayPidPath(), "utf-8").trim(), 10);
   } catch {
-    rmSync(relayPidPath(), { force: true });
+    // Unreadable: no evidence the relay is gone, so keep its pid file.
     return null;
   }
+  // An invalid pid names no process: handle it as a missing one.
+  if (probe(pid) === "alive") return pid;
+  rmSync(relayPidPath(), { force: true });
+  return null;
 }

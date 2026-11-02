@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
 
@@ -82,13 +83,8 @@ export function listHostStates(): HostConnectionState[] {
     .filter((x): x is HostConnectionState => !!x);
 }
 
-export function connectionAlive(branch: string): boolean | null {
+export function connectionAlive(branch: string, probe: (pid: number) => PidState = pidState): boolean | null {
   const state = readHostState(branch);
   if (!state) return null;
-  try {
-    process.kill(state.pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return probe(state.pid) === "alive";
 }

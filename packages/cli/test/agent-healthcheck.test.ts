@@ -93,6 +93,30 @@ describe("tps agent healthcheck", () => {
     ]);
   });
 
+  test("reports pid 1 as running, a process a non-root user cannot signal", async () => {
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
+    writeFileSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), "1\n");
+
+    await expect(
+      healthcheckAgent({ action: "healthcheck", id: agentId }),
+    ).resolves.toBeUndefined();
+
+    expect(output).toContain("PASS  Process: PID 1 running");
+  });
+
+  test("reports a malformed pid file as invalid", async () => {
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
+    writeFileSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), "not-a-pid\n");
+
+    await expect(
+      healthcheckAgent({ action: "healthcheck", id: agentId }),
+    ).rejects.toThrow("exit:1");
+
+    expect(output).toContain(
+      `FAIL  Process: invalid PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
+    );
+  });
+
   test("json output reports failing checks", async () => {
     patchShared(globalThis, "fetch", mockFlairAuth(200));
     rmSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), { force: true });
