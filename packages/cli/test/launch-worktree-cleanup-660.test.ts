@@ -298,6 +298,72 @@ test("unit — a Git removal failure prints Git's error and the manual command, 
   }
 });
 
+test("unit — a directory left at the pinned path after Git succeeds survives and is named", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    let pinned = "";
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!, {
+        afterGitRemoval: (pinnedPath) => {
+          pinned = pinnedPath;
+          mkdirSync(pinned, { recursive: true });
+          writeFileSync(join(pinned, "sentinel.txt"), "sentinel\n");
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`${pinned} still exists after the worktree was removed`);
+    expect(readFileSync(join(pinned, "sentinel.txt"), "utf-8")).toBe("sentinel\n");
+    expect(created!.removed).toBeUndefined();
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a failed Git removal leaves the registration at the pinned worktree and names the pinned path", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    const gitDir = adminDir(f.workspace);
+    let pinned = "";
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!, {
+        beforeGitRemoval: (pinnedPath) => {
+          pinned = pinnedPath;
+          mkdirSync(f.workspace, { recursive: true });
+          writeFileSync(join(f.workspace, "occupier.txt"), "occupying directory\n");
+          const locked = spawnSync(GIT, ["worktree", "lock", pinnedPath], { cwd: f.base, encoding: "utf8" });
+          expect(locked.status, locked.stderr).toBe(0);
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain("cannot remove a locked working tree");
+    // The occupying directory is untouched.
+    expect(readFileSync(join(f.workspace, "occupier.txt"), "utf-8")).toBe("occupying directory\n");
+    // The registration still points at the pinned original.
+    expect(readFileSync(join(gitDir, "gitdir"), "utf-8")).toBe(`${join(pinned, ".git")}\n`);
+    // The printed command targets the pinned path, never the occupied workspace path.
+    expect(message).toContain(`remove it manually with: git -C '${f.base}' worktree remove --force '${pinned}'`);
+    expect(message).not.toContain(`--force '${f.workspace}'`);
+    expect(created!.removed).toBeUndefined();
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 /** A git wrapper that logs every invocation to `logPath`, then runs real Git. */
 function installLoggingWrapper(f: Fixture, logPath: string): { restore: () => void } {
   const bin = join(f.root, "bin-log");

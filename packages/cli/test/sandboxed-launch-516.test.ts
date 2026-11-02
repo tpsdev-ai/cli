@@ -1951,7 +1951,7 @@ exit 0
     return `git -C '${f.base}' worktree remove --force '${f.sb.ws}'`;
   }
 
-  /** True when a logged removal names the private sibling the cleanup pins the
+  /** True when a logged removal names the sibling the cleanup pins the
    *  recorded worktree to, never the shared workspace path (cli#678). */
   function isPinnedRemoval(f: LaunchFixture, call: string): boolean {
     const target = call.slice("worktree remove --force ".length);

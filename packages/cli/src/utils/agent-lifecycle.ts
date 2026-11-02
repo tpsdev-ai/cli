@@ -304,8 +304,12 @@ const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
  * `testHooks.afterPendingSnapshot` (commands/agent.ts).
  */
 export interface WorktreeRemovalTestHooks {
-  /** Runs between the ownership check and the removal. */
+  /** Runs between the ownership check and the pin. */
   beforeRemoval?: (workspace: string) => void;
+  /** Runs after the worktree is pinned, before Git removes it. */
+  beforeGitRemoval?: (pinned: string) => void;
+  /** Runs after Git reports the pinned worktree removed. */
+  afterGitRemoval?: (pinned: string) => void;
 }
 
 /**
@@ -843,9 +847,9 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
   return null;
 }
 
-/** A worktree directory moved to a private sibling path, with the admin
- *  directory its marker was verified in and the registry entry that points
- *  Git at the worktree. */
+/** A worktree directory moved to a sibling path, with the admin directory its
+ *  marker was verified in and the registry entry that points Git at the
+ *  worktree. */
 interface PinnedWorktree {
   workspace: string;
   pinned: string;
@@ -867,20 +871,20 @@ function absent(path: string): boolean {
 }
 
 /** Move a pinned worktree back, or name where it is when that is not possible. */
-function restorePinnedWorktree(pin: { workspace: string; pinned: string }): string {
+function restorePinnedWorktree(pin: { workspace: string; pinned: string }): { restored: boolean; detail: string } {
   try {
-    if (!absent(pin.workspace)) return `; the worktree is at ${pin.pinned}`;
+    if (!absent(pin.workspace)) return { restored: false, detail: `; the worktree is at ${pin.pinned}` };
     renameSync(pin.pinned, pin.workspace);
-    return "";
+    return { restored: true, detail: "" };
   } catch (err) {
-    return `; the worktree is at ${pin.pinned}: ${(err as Error).message}`;
+    return { restored: false, detail: `; the worktree is at ${pin.pinned}: ${(err as Error).message}` };
   }
 }
 
 /**
- * Move the worktree at `workspace` to a private sibling path in one rename,
- * then prove the directory moved is the one the caller verified: same device
- * and inode, its `.git` file naming the verified admin directory, and (when a
+ * Move the worktree at `workspace` to a sibling path in one rename, then
+ * prove the directory moved is the one the caller verified: same device and
+ * inode, its `.git` file naming the verified admin directory, and (when a
  * marker was recorded) that directory still holding the exact marker. A path
  * replaced after the check fails here and is moved back. Returns the pin, or
  * the reason the worktree could not be pinned; on any doubt nothing is
@@ -893,7 +897,7 @@ function pinVerifiedWorktree(
   ownerMarker: string | null,
 ): PinnedWorktree | { error: string } {
   const pinned = join(dirname(workspace), `.${basename(workspace)}.cleanup-${randomUUID()}`);
-  const restore = () => restorePinnedWorktree({ workspace, pinned });
+  const restore = () => restorePinnedWorktree({ workspace, pinned }).detail;
   try {
     renameSync(workspace, pinned);
   } catch (err) {
@@ -930,8 +934,10 @@ function pinVerifiedWorktree(
 /**
  * Remove a pinned worktree through the verified admin directory: the entry's
  * `gitdir` file is repointed at the pinned copy, so Git's removal argument
- * names the directory this call holds, never the shared workspace path. The
- * registration and the pinned directory are restored on failure.
+ * names the directory this call holds, never the shared workspace path. On a
+ * failed removal the directory move back is attempted first, and the
+ * registration is restored only when it succeeded. A directory Git leaves at
+ * the pinned path after a successful removal is reported, never deleted.
  */
 function writeRegistryEntry(entry: string, content: string): void {
   const temp = join(dirname(entry), `.${basename(entry)}.cleanup-${randomUUID()}`);
@@ -944,30 +950,59 @@ function writeRegistryEntry(entry: string, content: string): void {
   }
 }
 
-function removePinnedWorktree(pin: PinnedWorktree): { ok: true } | { ok: false; detail: string } {
+function removePinnedWorktree(
+  pin: PinnedWorktree,
+  testHooks?: WorktreeRemovalTestHooks,
+): { ok: true } | { ok: false; detail: string } {
   try {
     writeRegistryEntry(pin.registryEntry, `${join(pin.pinned, ".git")}\n`);
   } catch (err) {
+    const restore = restorePinnedWorktree(pin);
+    const guidance = restore.restored
+      ? `remove it manually with: ${manualRemovalCommand(pin)}`
+      : `inspect it at ${pin.pinned} and remove it yourself if it is yours`;
     return {
       ok: false,
-      detail: `the worktree registration could not be repointed at the verified directory: ${(err as Error).message}${restorePinnedWorktree(pin)}; remove it manually with: ${manualRemovalCommand(pin)}`,
+      detail: `the worktree registration could not be repointed at the verified directory: ${(err as Error).message}${restore.detail}; ${guidance}`,
     };
   }
+  testHooks?.beforeGitRemoval?.(pin.pinned);
   const remove = git(pin.baseWorkingTree, ["worktree", "remove", "--force", pin.pinned]);
   if (!remove.ok) {
-    let restore = "";
+    const restore = restorePinnedWorktree(pin);
+    const gitError = remove.stderr || remove.stdout || "git produced no output";
+    if (!restore.restored) {
+      return {
+        ok: false,
+        detail: `${gitError}${restore.detail}; inspect it and remove it manually with: ${manualRemovalCommand({ baseWorkingTree: pin.baseWorkingTree, workspace: pin.pinned })}`,
+      };
+    }
     try {
       writeRegistryEntry(pin.registryEntry, pin.recordedRegistry);
     } catch (err) {
-      restore += `; the worktree registration could not be restored: ${(err as Error).message}`;
+      return {
+        ok: false,
+        detail: `${gitError}; the worktree registration could not be restored: ${(err as Error).message}; inspect it and remove it yourself if it is yours`,
+      };
     }
-    restore += restorePinnedWorktree(pin);
+    return { ok: false, detail: `${gitError}; remove it manually with: ${manualRemovalCommand(pin)}` };
+  }
+  testHooks?.afterGitRemoval?.(pin.pinned);
+  let leftover: string | null;
+  try {
+    leftover = absent(pin.pinned) ? null : pin.pinned;
+  } catch (err) {
     return {
       ok: false,
-      detail: `${remove.stderr || remove.stdout || "git produced no output"}${restore}; remove it manually with: ${manualRemovalCommand(pin)}`,
+      detail: `${pin.pinned} could not be inspected after the worktree was removed: ${(err as Error).message}; inspect it yourself`,
     };
   }
-  rmSync(pin.pinned, { recursive: true, force: true });
+  if (leftover) {
+    return {
+      ok: false,
+      detail: `${leftover} still exists after the worktree was removed; inspect it and remove it yourself if it is yours`,
+    };
+  }
   return { ok: true };
 }
 
@@ -998,7 +1033,7 @@ function tryRemoveCreatedWorktree(
   if ("error" in pin) {
     return { ok: false, refused: true, detail: `${pin.error}; ${guidance()}` };
   }
-  const removal = removePinnedWorktree(pin);
+  const removal = removePinnedWorktree(pin, testHooks);
   if (!removal.ok) {
     return { ok: false, detail: removal.detail };
   }
@@ -1041,9 +1076,10 @@ function comparablePath(path: string): string {
  * and any recorded identity facts to still match; a missing or different
  * marker is refused with the manual command. The verified directory is then
  * moved aside in one rename and removed through that copy, so a worktree
- * swapped in at the path after the check survives and the cleanup refuses.
- * Throws `WorktreeLifecycleError` naming the path when removal fails; a
- * failed Git removal also carries Git's error and the manual command.
+ * re-created at the workspace path between the check and the removal survives.
+ * A change at the pinned path during removal is not covered. Throws
+ * `WorktreeLifecycleError` naming the path when removal fails; a failed Git
+ * removal also carries Git's error and the manual command.
  */
 export function removeCreatedWorktree(
   created: WorktreeCreation,
@@ -1190,7 +1226,7 @@ export function onStop(
         `worktree cleanup binding changed for ${binding.workspace}: ${pin.error}; ${refusalGuidance(binding)}`,
       );
     }
-    const removal = removePinnedWorktree(pin);
+    const removal = removePinnedWorktree(pin, testHooks);
     if (!removal.ok) {
       throw new WorktreeLifecycleError(
         `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${removal.detail}`,
@@ -1242,7 +1278,7 @@ export function onStop(
   if ("error" in pin) {
     throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${pin.error}`);
   }
-  const removal = removePinnedWorktree(pin);
+  const removal = removePinnedWorktree(pin, testHooks);
   if (!removal.ok) {
     throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
   }
