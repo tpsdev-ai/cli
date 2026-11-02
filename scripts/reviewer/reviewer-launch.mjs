@@ -73,7 +73,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, relative, sep } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { BRANCH_RE, forbiddenEnvReason, JOB_ID_RE, MAX_WORKFLOW_BYTES, planJob, WORKFLOW_PATH_RE } from "./ci-job.mjs";
 import { resolveRuntime, satisfiesRange } from "./resolve-runtime.mjs";
 
@@ -526,7 +526,59 @@ function runGit(git, root, env, args) {
     maxBuffer: 16 * 1024 * 1024,
   });
 }
-const unreachable = (r) => /not a git repository/.test(r.stderr ?? "");
+const MAX_GITFILE_BYTES = 4096;
+
+/**
+ * Whether the worktree's git metadata is unreachable in the sandbox, decided
+ * from the worktree's own `.git` entry instead of git's stderr text, which git
+ * 2.56 reworded. A linked worktree's `.git` is a gitfile: git accepts content
+ * that begins with `gitdir: ` and takes the rest of the file, with trailing
+ * CR/LF removed, as the path (a relative path is relative to the worktree).
+ * A tree with no `.git` entry at all reports unreachable, as this check
+ * did before. A `.git` directory is not treated as unreachable. An entry that
+ * exists but is not a readable gitfile within MAX_GITFILE_BYTES (a dangling
+ * symlink, a directory in a symlink's place, a permission error) reports false:
+ * that is not evidence of unreachability, so the caller that reached this check
+ * keeps its other branch.
+ */
+function gitMetadataUnreachable(root) {
+  const dotGit = join(root, ".git");
+  try {
+    lstatSync(dotGit);
+  } catch (err) {
+    return err?.code === "ENOENT";
+  }
+  let entry;
+  try {
+    entry = statSync(dotGit);
+  } catch {
+    return false;
+  }
+  if (!entry.isFile() || entry.size > MAX_GITFILE_BYTES) return false;
+  let gitfile;
+  try {
+    const fd = openSync(dotGit, "r");
+    try {
+      const buffer = Buffer.alloc(MAX_GITFILE_BYTES + 1);
+      const read = readSync(fd, buffer, 0, buffer.length, 0);
+      if (read > MAX_GITFILE_BYTES) return false;
+      gitfile = buffer.subarray(0, read).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+  if (!gitfile.startsWith("gitdir: ")) return false;
+  const named = gitfile.slice("gitdir: ".length).replace(/[\r\n]+$/, "");
+  if (named === "") return false;
+  try {
+    readdirSync(resolve(root, named));
+    return false;
+  } catch {
+    return true;
+  }
+}
 
 /**
  * What git would see in the worktree before a job runs: `git config --list
@@ -540,7 +592,7 @@ export function inspectGitConfig({ workspace, env, git = GIT }) {
   if (r.error) return refuse("git-config-unreadable", `git could not be run to inspect the worktree's configuration (${r.error.code ?? "error"})`);
   if (r.status !== 0) {
     // A worktree whose git metadata lives outside the sandbox: git in a step cannot read it either.
-    if (unreachable(r)) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
+    if (gitMetadataUnreachable(root)) return { ok: true, note: "the worktree's git metadata is not reachable in the sandbox" };
     return refuse("git-config-unreadable", `git could not read the worktree's configuration: ${(r.stderr ?? "").split("\n")[0]}`);
   }
   const findings = gitConfigFindings(r.stdout);
@@ -585,7 +637,7 @@ export function checkFreshClone({ workspace, env, fetchDepth, git = GIT }) {
   if (head.error || head.status !== 0) {
     return refuse(
       "not-fresh",
-      unreachable(head)
+      gitMetadataUnreachable(root)
         ? "the worktree's git metadata is not reachable in the sandbox, so the clean checkout that actions/checkout gives CI cannot be verified"
         : "the worktree has no checked-out commit, so the clean checkout that actions/checkout gives CI cannot be verified",
     );
