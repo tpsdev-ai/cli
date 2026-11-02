@@ -18,6 +18,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -750,6 +751,24 @@ describe("A2/A3 — the review build", () => {
     writeFileSync(join(workspace, ".git"), "gitdir: /nonexistent/host/.git/worktrees/x\n");
     const r = inspectNoSystem({ workspace, env: hermeticEnv({}, scratch) });
     expect(r.ok).toBe(true);
+  });
+
+  test("an existing gitdir target that is a file reports metadata not reachable", () => {
+    const target = join(outside, "gitdir-file");
+    writeFileSync(target, "");
+    writeFileSync(join(workspace, ".git"), `gitdir: ${target}\n`);
+    expect(existsSync(target)).toBe(true);
+    expect(() => readdirSync(target)).toThrow(/ENOTDIR/);
+    expect(inspectNoSystem({ workspace, env: hermeticEnv({}, scratch) })).toEqual({
+      ok: true,
+      note: "the worktree's git metadata is not reachable in the sandbox",
+    });
+    const fresh = freshNoSystem({ workspace, env: hermeticEnv({}, scratch), fetchDepth: 1 });
+    expect(fresh.ok).toBe(false);
+    if (!fresh.ok) {
+      expect(fresh.refusal.kind).toBe("not-fresh");
+      expect(fresh.refusal.message).toContain("the worktree's git metadata is not reachable in the sandbox");
+    }
   });
 
   test("a directory with no .git at all: git config exits 0 and the fresh check reports metadata not reachable", () => {
