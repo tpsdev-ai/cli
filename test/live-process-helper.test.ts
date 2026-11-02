@@ -151,6 +151,21 @@ function startFifoFixture(root: string): ChildProcess {
   return spawn(process.execPath, ["-e", HOLDER_SCRIPT, fifo], { stdio: ["ignore", "ignore", "inherit"] });
 }
 
+test("the helper exits when its stdin closes while its parent is alive", async () => {
+  const child = spawnLiveProcess();
+  const pid = child.pid as number;
+  const stdin = child.stdin;
+  if (!stdin) throw new Error("helper child has no stdin pipe");
+  try {
+    expect(pid).toBeGreaterThan(0);
+    expect(isRunning(pid)).toBe(true);
+    stdin.end();
+    expect(await waitForExit(pid)).toBe(true);
+  } finally {
+    kill(pid);
+  }
+}, 30_000);
+
 test("the helper exits after its parent is SIGKILLed without teardown", async () => {
   const root = mkdtempSync(join(tmpdir(), "live-process-helper-"));
   const parent = spawn(process.execPath, [writeParentScript(root, "pipe")], {
