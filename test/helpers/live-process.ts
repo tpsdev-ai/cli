@@ -16,7 +16,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 /** Printed by the child once its watches are installed. */
 export const LIVE_PROCESS_READY = "live-process-ready";
 
-/** The program the helper runs: exit when the spawner's stdin or pid is gone. */
+/** The program the helper runs: exit when its stdin closes or the spawner's pid is gone. */
 export const LIVE_PROCESS_SCRIPT = `
 const parentPid = Number(process.argv[1]);
 if (!Number.isInteger(parentPid) || parentPid <= 0) process.exit(2);
@@ -42,7 +42,7 @@ export interface SpawnLiveProcessOptions {
   stdout?: "ignore" | "pipe" | number;
 }
 
-/** Start a process that exits when its spawner's stdin closes or its pid is gone. */
+/** Start a process that exits when its stdin closes or its spawner's pid is gone. */
 export function spawnLiveProcess(options: SpawnLiveProcessOptions = {}): ChildProcess {
   const parentPid = process.pid;
   return spawn(process.execPath, ["-e", LIVE_PROCESS_SCRIPT, String(parentPid)], {
