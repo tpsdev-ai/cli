@@ -17,6 +17,7 @@ import {
   planJob,
   SKIPPED_ACTIONS,
 } from "../../../../scripts/reviewer/ci-job.mjs";
+import { REVIEWED_ACTION_REFS } from "./reviewed-action-refs.fixture.js";
 import { RESERVED_ENV_KEYS } from "../../../../scripts/reviewer/reviewer-launch.mjs";
 import yaml from "js-yaml";
 
@@ -39,17 +40,17 @@ function suiteStepDeclaresEnv(workflowText: string): boolean {
   return Object.hasOwn(step, "env");
 }
 
-/** Every uses step of the test job, named with the tag the reviewed allowlist gives its SHA. */
+/** Every uses step of the test job, named with the tag the reviewed fixture gives its SHA. */
 function workflowSkipped(workflowText: string): string[] {
   return testJobSteps(workflowText)
     .map((s) => s.uses)
     .filter((uses): uses is string => typeof uses === "string")
     .map((uses) => {
       const [name, sha] = uses.split("@");
-      const action = (SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>)[name.toLowerCase()];
-      if (!action) throw new Error(`${name} is not an action the launcher skips`);
-      const tag = action.refs[sha];
-      if (!tag) throw new Error(`${name}@${sha} is not in the reviewed allowlist`);
+      const refs = REVIEWED_ACTION_REFS[name.toLowerCase()];
+      if (!refs) throw new Error(`${name} is not an action in the reviewed fixture`);
+      const tag = refs[sha];
+      if (!tag) throw new Error(`${name}@${sha} is not in the reviewed fixture`);
       return `${name}@${tag}`;
     });
 }
@@ -221,7 +222,7 @@ describe("this repository's test job", () => {
 });
 
 describe("the reviewed allowlist of skipped-action refs", () => {
-  test("every ref is a full 40-hex commit SHA with its release tag", () => {
+  test("every ref is a full 40-hex commit SHA and a release-shaped tag label", () => {
     for (const [name, action] of Object.entries(SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>)) {
       expect(Object.keys(action.refs).length).toBeGreaterThan(0);
       for (const [sha, tag] of Object.entries(action.refs)) {
@@ -229,6 +230,13 @@ describe("the reviewed allowlist of skipped-action refs", () => {
         expect(tag).toMatch(/^v\d+\.\d+\.\d+$/);
       }
     }
+  });
+
+  test("the allowlist's SHA-to-tag pairs are exactly the reviewed fixture", () => {
+    const allowlist = Object.fromEntries(
+      Object.entries(SKIPPED_ACTIONS as Record<string, { refs: Record<string, string> }>).map(([name, action]) => [name, action.refs]),
+    );
+    expect(allowlist).toEqual(REVIEWED_ACTION_REFS);
   });
 
   test("the checkout allowlist accepts v4.4.0 at its release commit", () => {
