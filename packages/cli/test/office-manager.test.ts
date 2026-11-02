@@ -1,13 +1,15 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { z } from "zod";
 import {
   loadWorkspaceManifest,
   runOfficeManager,
   OFFICE_READY_MARKER,
   WorkspaceManifestSchema,
+  createWorkspaceManifestSchema,
 } from "../src/commands/office-manager.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -309,5 +311,98 @@ describe("curl url with surrounding whitespace (#687)", () => {
   test("a space inside the host is refused", () => {
     writeManifest("https://host a.example/x");
     expect(() => loadWorkspaceManifest(agentWs)).toThrow("Invalid URL");
+  });
+});
+
+describe("curl url explicit trim (#691)", () => {
+  const TRIMMED = "https://host-a.example/x";
+  const RAW = ` \t${TRIMMED}\r\n `;
+  // Checks a URL after trimming, but returns the value as given, so the
+  // explicit trim in the schema is the only thing that trims the result.
+  const nonTrimmingUrlCheck = z.string().refine(
+    (value) => {
+      try {
+        new URL(value.trim());
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "Invalid URL" }
+  );
+  const schema = createWorkspaceManifestSchema(nonTrimmingUrlCheck);
+
+  let root: string;
+  let agentWs: string;
+  let dest: string;
+  let argvFile: string;
+  let originalPath: string | undefined;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "tps-om-trim-"));
+    agentWs = join(root, "workspace");
+    mkdirSync(agentWs, { recursive: true });
+    dest = join(root, "out", "tool-a");
+    argvFile = join(root, "curl.argv");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const fakeCurl = join(bin, "curl");
+    writeFileSync(fakeCurl, `#!/bin/sh\nprintf '%s\\0' "$@" > '${argvFile}'\nexit 22\n`);
+    chmodSync(fakeCurl, 0o755);
+    originalPath = process.env.PATH;
+    process.env.PATH = `${bin}:${process.env.PATH}`;
+  });
+
+  afterEach(() => {
+    if (originalPath !== undefined) process.env.PATH = originalPath;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeManifest(url: string): void {
+    writeFileSync(
+      join(agentWs, "workspace-manifest.json"),
+      JSON.stringify({ name: "om-trim", tools: { curl: [{ url, dest }] } })
+    );
+  }
+
+  function curlArgv(): string[] | null {
+    try {
+      return readFileSync(argvFile, "utf-8").split("\0").slice(0, -1);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  test("the injected URL check does not trim, and the loader returns the trimmed URL", () => {
+    expect(nonTrimmingUrlCheck.parse(RAW)).toBe(RAW);
+    writeManifest(RAW);
+    const manifest = loadWorkspaceManifest(agentWs, schema);
+    expect(manifest!.tools.curl[0]!.url).toBe(TRIMMED);
+  });
+
+  test("every use site receives the trimmed URL when the URL check does not trim", async () => {
+    writeManifest(RAW);
+    const logs: string[] = [];
+    const errors: string[] = [];
+    const logSpy = spyOn(console, "log");
+    const errSpy = spyOn(console, "error");
+    let ok: boolean;
+    try {
+      logSpy.mockImplementation((...args: unknown[]) => {
+        logs.push(args.map(String).join(" "));
+      });
+      errSpy.mockImplementation((...args: unknown[]) => {
+        errors.push(args.map(String).join(" "));
+      });
+      ok = await runOfficeManager(agentWs, { manifestSchema: schema });
+    } finally {
+      logSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+    expect(ok!).toBe(false);
+    expect(curlArgv()).toEqual(["--fail", "--silent", "--location", "--output", dest, TRIMMED]);
+    expect(logs).toContain(`  [curl] Downloading ${TRIMMED} → ${dest}...`);
+    expect(errors).toContain(`  [curl] FAILED: ${TRIMMED}`);
   });
 });

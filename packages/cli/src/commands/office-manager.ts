@@ -10,13 +10,36 @@ const ToolEntrySchema = z.union([
   z.object({ name: z.string().min(1), version: z.string().optional() }),
 ]);
 
-/** curl-installed binary spec */
-const CurlBinarySchema = z.object({
-  // Trimmed before the URL check (#687).
-  url: z.string().trim().url(),
-  dest: z.string().min(1),
-  chmod: z.string().default("755"),
-});
+/**
+ * Build the manifest schema with the given check for curl `url` values.
+ *
+ * The explicit `.trim()` runs before the check, so the parsed value is
+ * trimmed whatever the check does. The check is injectable so a test can
+ * supply one that does not trim; the real zod URL check is the default.
+ */
+export function createWorkspaceManifestSchema(urlCheck: z.ZodType<string, string> = z.string().url()) {
+  const CurlBinarySchema = z.object({
+    // Trimmed before the URL check (#687).
+    url: z.string().trim().pipe(urlCheck),
+    dest: z.string().min(1),
+    chmod: z.string().default("755"),
+  });
+
+  return z.object({
+    name: z.string().min(1),
+    description: z.string().optional(),
+    tools: z.object({
+      /** Alpine (apk) packages */
+      apk: z.array(ToolEntrySchema).default([]),
+      /** npm global packages */
+      npm: z.array(ToolEntrySchema).default([]),
+      /** Binaries to download via curl */
+      curl: z.array(CurlBinarySchema).default([]),
+    }).default({ apk: [], npm: [], curl: [] }),
+  }).strict();
+}
+
+export type WorkspaceManifestSchemaType = ReturnType<typeof createWorkspaceManifestSchema>;
 
 /**
  * Workspace Manifest — defines tools the Office Manager installs before
@@ -38,18 +61,7 @@ const CurlBinarySchema = z.object({
  * }
  * ```
  */
-export const WorkspaceManifestSchema = z.object({
-  name: z.string().min(1),
-  description: z.string().optional(),
-  tools: z.object({
-    /** Alpine (apk) packages */
-    apk: z.array(ToolEntrySchema).default([]),
-    /** npm global packages */
-    npm: z.array(ToolEntrySchema).default([]),
-    /** Binaries to download via curl */
-    curl: z.array(CurlBinarySchema).default([]),
-  }).default({ apk: [], npm: [], curl: [] }),
-}).strict();
+export const WorkspaceManifestSchema = createWorkspaceManifestSchema();
 
 export type WorkspaceManifest = z.infer<typeof WorkspaceManifestSchema>;
 
@@ -67,14 +79,17 @@ export const OFFICE_READY_MARKER = ".office-ready";
  * Load and validate a workspace manifest from the given directory.
  * Returns null if no manifest is found.
  */
-export function loadWorkspaceManifest(workspaceDir: string): WorkspaceManifest | null {
+export function loadWorkspaceManifest(
+  workspaceDir: string,
+  schema: WorkspaceManifestSchemaType = WorkspaceManifestSchema
+): WorkspaceManifest | null {
   for (const filename of MANIFEST_CANDIDATES) {
     const fullPath = join(workspaceDir, filename);
     if (!existsSync(fullPath)) continue;
 
     const raw = readFileSync(fullPath, "utf-8");
     const parsed = fullPath.endsWith(".json") ? JSON.parse(raw) : yaml.load(raw);
-    return WorkspaceManifestSchema.parse(parsed);
+    return schema.parse(parsed);
   }
   return null;
 }
@@ -118,15 +133,16 @@ function commandExists(cmd: string): boolean {
  *
  * @param workspaceDir - path to the agent workspace
  * @param options.dryRun - print what would be done without executing
+ * @param options.manifestSchema - schema for the manifest (defaults to the real one)
  * @returns `true` if office is ready, `false` if any required install failed
  */
 export async function runOfficeManager(
   workspaceDir: string,
-  options: { dryRun?: boolean } = {}
+  options: { dryRun?: boolean; manifestSchema?: WorkspaceManifestSchemaType } = {}
 ): Promise<boolean> {
-  const { dryRun = false } = options;
+  const { dryRun = false, manifestSchema = WorkspaceManifestSchema } = options;
 
-  const manifest = loadWorkspaceManifest(workspaceDir);
+  const manifest = loadWorkspaceManifest(workspaceDir, manifestSchema);
   if (!manifest) {
     // No manifest — nothing to install. Mark ready immediately.
     console.log("No workspace-manifest found. Office ready (no dependencies required).");
