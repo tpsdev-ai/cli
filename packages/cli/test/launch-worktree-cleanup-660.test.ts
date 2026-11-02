@@ -384,6 +384,130 @@ test("unit — a same-path detached replacement at the same commit survives setu
   }
 });
 
+/** A real git replacement of the fixture's worktree at the same path, carrying
+ *  a file whose survival identifies it after the cleanup. */
+const REPLACEMENT_NOTE = "replacement worktree";
+
+function replaceWorktree(f: Fixture, commit: string): void {
+  const removed = spawnSync(GIT, ["worktree", "remove", "--force", f.workspace], { cwd: f.base, encoding: "utf8" });
+  expect(removed.status, removed.stderr).toBe(0);
+  const added = spawnSync(GIT, ["worktree", "add", "--detach", f.workspace, commit], { cwd: f.base, encoding: "utf8" });
+  expect(added.status, added.stderr).toBe(0);
+  writeFileSync(join(f.workspace, "replacement.txt"), `${REPLACEMENT_NOTE}\n`);
+}
+
+/** The replacement is still the worktree at the path, without the launch's marker. */
+function expectReplacementIntact(f: Fixture, commit: string): void {
+  expect(readFileSync(join(f.workspace, "replacement.txt"), "utf-8")).toBe(`${REPLACEMENT_NOTE}\n`);
+  const gitFile = readFileSync(join(f.workspace, ".git"), "utf-8");
+  expect(gitFile.trim().startsWith("gitdir: ")).toBe(true);
+  expect(existsSync(join(adminDir(f.workspace), "tps-launch-owner"))).toBe(false);
+  expect(headOf(f.workspace)).toBe(commit);
+  expect(worktreeList(f.base)).toContain(f.workspace);
+}
+
+test("unit — a worktree replaced between the ownership check and the removal survives setup cleanup", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  const { restore } = installWrapper(f);
+  try {
+    let created: WorktreeCreation | undefined;
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, {
+        deferCheckout: true,
+        onCreated: (record) => { created = record; },
+        testHooks: { beforeRemoval: () => replaceWorktree(f, commit) },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    const message = (error as Error).message;
+    expect(message).toContain("injected metadata failure");
+    expect(message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect(message).toContain(manualCommand(f));
+    expect(created).toBeDefined();
+    expect(created!.removed).toBeUndefined();
+    expectReplacementIntact(f, commit);
+  } finally {
+    restore();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — removeCreatedWorktree refuses a worktree replaced between the ownership check and the removal", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!, { beforeRemoval: () => replaceWorktree(f, commit) });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree cleanup refused for ${f.workspace}`);
+    expect((error as Error).message).toContain(manualCommand(f));
+    expect(created!.removed).toBeUndefined();
+    expectReplacementIntact(f, commit);
+
+    // The replacement is not this record's worktree, so a retry refuses too.
+    expect(() => removeCreatedWorktree(created!)).toThrow(`worktree cleanup refused for ${f.workspace}`);
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(worktreeList(f.base)).toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — bound onStop refuses a worktree replaced between the ownership check and the removal", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  try {
+    const started = onStart("agent-a", f.workspace, { deferCheckout: true });
+    expect(started.cleanupBinding).toBeDefined();
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, started.cleanupBinding, { beforeRemoval: () => replaceWorktree(f, commit) });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`worktree cleanup binding changed for ${f.workspace}`);
+    expect((error as Error).message).toContain(manualCommand(f));
+    expectReplacementIntact(f, commit);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — the pause hook alone leaves the ordinary removal intact", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    let paused = false;
+    const result = removeCreatedWorktree(created!, {
+      beforeRemoval: () => {
+        paused = true;
+        expect(existsSync(f.workspace)).toBe(true);
+      },
+    });
+    expect(paused).toBe(true);
+    expect(result).toEqual({ changed: true, reason: "worktree removed" });
+    expect(created!.removed).toBe(true);
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(worktreeList(f.base)).not.toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("unit — an identity-capture failure at rev-parse HEAD still removes the worktree it owns", () => {
   const f = fixture();
   const { restore } = installWrapper(f, { failHeadIn: f.workspace });

@@ -5,7 +5,7 @@
  * invoke the built CLI directly. Real-nono cases skip when unavailable.
  */
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
-import { resolve, join, dirname, relative } from "node:path";
+import { resolve, join, dirname, relative, basename } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
   chmodSync,
@@ -1951,6 +1951,14 @@ exit 0
     return `git -C '${f.base}' worktree remove --force '${f.sb.ws}'`;
   }
 
+  /** True when a logged removal names the private sibling the cleanup pins the
+   *  recorded worktree to, never the shared workspace path (cli#678). */
+  function isPinnedRemoval(f: LaunchFixture, call: string): boolean {
+    const target = call.slice("worktree remove --force ".length);
+    return call.startsWith("worktree remove --force ") &&
+      target.startsWith(join(dirname(f.sb.ws), `.${basename(f.sb.ws)}.cleanup-`));
+  }
+
   test("setup's own removal fails and the launcher's retry removes the worktree; the original error is reported", () => {
     const f = launchFixture();
     const wrapper = setupFailureWrapper(f, { failRemovals: 1 });
@@ -1968,11 +1976,10 @@ exit 0
       expect(worktreeListing(f.base)).not.toContain(`worktree ${f.sb.ws}\n`);
       // Setup removed once and failed; the retry checked the registration, then removed.
       const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
-      expect(calls).toEqual([
-        `worktree remove --force ${f.sb.ws}`,
-        "worktree list --porcelain",
-        `worktree remove --force ${f.sb.ws}`,
-      ]);
+      expect(calls).toHaveLength(3);
+      expect(isPinnedRemoval(f, calls[0])).toBe(true);
+      expect(calls[1]).toBe("worktree list --porcelain");
+      expect(isPinnedRemoval(f, calls[2])).toBe(true);
       expect(fakeNonoRuns(f.sb.root)).toEqual([]);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
@@ -1995,7 +2002,8 @@ exit 0
       expect(adminDirOf(f.sb.ws)).toBeTruthy();
       expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
       const removes = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"));
-      expect(removes).toEqual([`worktree remove --force ${f.sb.ws}`, `worktree remove --force ${f.sb.ws}`]);
+      expect(removes).toHaveLength(2);
+      expect(removes.every((call) => isPinnedRemoval(f, call))).toBe(true);
       expect(fakeNonoRuns(f.sb.root)).toEqual([]);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
@@ -2013,7 +2021,8 @@ exit 0
       expect(existsSync(f.sb.ws)).toBe(false);
       // Setup's removal is the only cleanup call: no registration read, no second removal.
       const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
-      expect(calls).toEqual([`worktree remove --force ${f.sb.ws}`]);
+      expect(calls).toHaveLength(1);
+      expect(isPinnedRemoval(f, calls[0])).toBe(true);
       expect(fakeNonoRuns(f.sb.root)).toEqual([]);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
@@ -2050,9 +2059,10 @@ exit 0
       expect(readFileSync(join(neighbourAdmin, "gitdir"), "utf-8")).toBe(neighbourRegistry);
       expect(spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: neighbour, encoding: "utf8" }).stdout.trim()).toBe(neighbourHead);
       expect(readdirSync(join(f.base, ".git", "worktrees")).sort()).toEqual(adminEntriesBefore);
-      // Every removal the launcher ran named the recorded worktree.
+      // Every removal the launcher ran named a pinned copy of the recorded worktree.
       const removes = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree remove"));
-      expect(removes).toEqual([`worktree remove --force ${f.sb.ws}`, `worktree remove --force ${f.sb.ws}`]);
+      expect(removes).toHaveLength(2);
+      expect(removes.every((call) => isPinnedRemoval(f, call))).toBe(true);
     } finally {
       rmSync(f.sb.root, { recursive: true, force: true });
     }
@@ -2120,7 +2130,9 @@ exit 0
       expect(text).not.toContain("is no longer a registered worktree");
       // The only removal attempt was setup's failed one.
       const calls = gitCalls(wrapper.log).filter((call) => call.startsWith("worktree "));
-      expect(calls).toEqual([`worktree remove --force ${f.sb.ws}`, "worktree list --porcelain"]);
+      expect(calls).toHaveLength(2);
+      expect(isPinnedRemoval(f, calls[0])).toBe(true);
+      expect(calls[1]).toBe("worktree list --porcelain");
       rmSync(lock, { recursive: true, force: true });
       expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
     } finally {

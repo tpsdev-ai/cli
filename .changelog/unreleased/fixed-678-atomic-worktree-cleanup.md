@@ -1,0 +1,1 @@
+- **A launch's worktree cleanup now removes the worktree whose ownership marker it verified, not whatever sits at the workspace path.** The verified directory is moved aside in one rename and removed through that copy; a worktree created at the same path after the check survives and cleanup refuses with the manual removal command.

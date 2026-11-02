@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -299,6 +299,16 @@ export interface WorktreeCreation {
 const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
 
 /**
+ * Test-only pause points for a worktree removal. They are inert unless a
+ * caller passes them, the way `runAgent` pauses a launch through
+ * `testHooks.afterPendingSnapshot` (commands/agent.ts).
+ */
+export interface WorktreeRemovalTestHooks {
+  /** Runs between the ownership check and the removal. */
+  beforeRemoval?: (workspace: string) => void;
+}
+
+/**
  * A worktree setup, checkout or cleanup operation failed (cli#516). Named so a
  * caller can tell a worktree failure from any other error and report it as one;
  * the message names the operation that failed.
@@ -574,7 +584,7 @@ function trustedBaseWorktreeGitDir(workspace: string, resolvedWorkspace: string,
 export function onStart(
   agentId: string,
   workspacePath?: string,
-  opts: { deferCheckout?: boolean; onCreated?: (creation: WorktreeCreation) => void } = {},
+  opts: { deferCheckout?: boolean; onCreated?: (creation: WorktreeCreation) => void; testHooks?: WorktreeRemovalTestHooks } = {},
 ): AgentLifecycleResult {
   if (!workspacePath) {
     return { changed: false, reason: "no workspace path configured" };
@@ -662,7 +672,7 @@ export function onStart(
       },
     };
   } catch (err) {
-    const removal = tryRemoveCreatedWorktree(created);
+    const removal = tryRemoveCreatedWorktree(created, false, opts.testHooks);
     if (!removal.ok) {
       throw new WorktreeLifecycleError(
         removal.refused
@@ -685,22 +695,27 @@ function worktreeAdminDir(workspace: string): string {
 }
 
 /**
- * The reason the worktree at the recorded path is not the one this call
- * marked, or null when its admin directory still holds the exact nonce. A
+ * The admin directory and the identity of the worktree directory whose marker
+ * this call verified, or the reason the worktree at the recorded path is not
+ * the one this call marked. The stat is taken in the same step as the marker
+ * read, so the pin that follows can prove it moved that exact directory. A
  * marker that is absent or cannot be read is a mismatch, never a match.
  */
-function createdWorktreeOwnershipError(created: WorktreeCreation): string | null {
-  if (created.ownerMarker === null) return "the worktree ownership marker was not recorded";
+function verifiedCreatedWorktree(
+  created: WorktreeCreation,
+): { gitDir: string; dev: number; ino: number } | { error: string } {
+  if (created.ownerMarker === null) return { error: "the worktree ownership marker was not recorded" };
   try {
     const gitDir = worktreeAdminDir(created.workspace);
     const recorded = readFileSync(join(gitDir, OWNERSHIP_MARKER_NAME));
     if (!recorded.equals(Buffer.from(created.ownerMarker, "utf-8"))) {
-      return `the worktree ownership marker changed in ${gitDir}`;
+      return { error: `the worktree ownership marker changed in ${gitDir}` };
     }
+    const stat = statSync(created.workspace);
+    return { gitDir, dev: stat.dev, ino: stat.ino };
   } catch (err) {
-    return `the worktree ownership marker could not be read: ${(err as Error).message}`;
+    return { error: `the worktree ownership marker could not be read: ${(err as Error).message}` };
   }
-  return null;
 }
 
 /** POSIX single-quote a path, including any embedded single quote. */
@@ -828,30 +843,164 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
   return null;
 }
 
+/** A worktree directory moved to a private sibling path, with the admin
+ *  directory its marker was verified in and the registry entry that points
+ *  Git at the worktree. */
+interface PinnedWorktree {
+  workspace: string;
+  pinned: string;
+  baseWorkingTree: string;
+  gitDir: string;
+  registryEntry: string;
+  recordedRegistry: string;
+}
+
+/** True when `path` exists; only ENOENT counts as absent. */
+function absent(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+    throw err;
+  }
+}
+
+/** Move a pinned worktree back, or name where it is when that is not possible. */
+function restorePinnedWorktree(pin: { workspace: string; pinned: string }): string {
+  try {
+    if (!absent(pin.workspace)) return `; the worktree is at ${pin.pinned}`;
+    renameSync(pin.pinned, pin.workspace);
+    return "";
+  } catch (err) {
+    return `; the worktree is at ${pin.pinned}: ${(err as Error).message}`;
+  }
+}
+
+/**
+ * Move the worktree at `workspace` to a private sibling path in one rename,
+ * then prove the directory moved is the one the caller verified: same device
+ * and inode, its `.git` file naming the verified admin directory, and (when a
+ * marker was recorded) that directory still holding the exact marker. A path
+ * replaced after the check fails here and is moved back. Returns the pin, or
+ * the reason the worktree could not be pinned; on any doubt nothing is
+ * removed.
+ */
+function pinVerifiedWorktree(
+  workspace: string,
+  baseWorkingTree: string,
+  verified: { gitDir: string; dev: number; ino: number },
+  ownerMarker: string | null,
+): PinnedWorktree | { error: string } {
+  const pinned = join(dirname(workspace), `.${basename(workspace)}.cleanup-${randomUUID()}`);
+  const restore = () => restorePinnedWorktree({ workspace, pinned });
+  try {
+    renameSync(workspace, pinned);
+  } catch (err) {
+    return { error: `the worktree could not be moved aside for removal: ${(err as Error).message}` };
+  }
+  try {
+    const moved = statSync(pinned);
+    if (moved.dev !== verified.dev || moved.ino !== verified.ino) {
+      return { error: `the worktree at ${workspace} was replaced after the ownership check${restore()}` };
+    }
+    if (worktreeAdminDir(pinned) !== verified.gitDir) {
+      return { error: `the worktree at ${workspace} no longer names the verified git directory${restore()}` };
+    }
+    if (ownerMarker !== null) {
+      const recorded = readFileSync(join(verified.gitDir, OWNERSHIP_MARKER_NAME));
+      if (!recorded.equals(Buffer.from(ownerMarker, "utf-8"))) {
+        return { error: `the worktree ownership marker changed in ${verified.gitDir}${restore()}` };
+      }
+    }
+    const registryEntry = join(verified.gitDir, "gitdir");
+    return {
+      workspace,
+      pinned,
+      baseWorkingTree,
+      gitDir: verified.gitDir,
+      registryEntry,
+      recordedRegistry: readFileSync(registryEntry, "utf-8"),
+    };
+  } catch (err) {
+    return { error: `the worktree could not be verified after it was moved aside: ${(err as Error).message}${restore()}` };
+  }
+}
+
+/**
+ * Remove a pinned worktree through the verified admin directory: the entry's
+ * `gitdir` file is repointed at the pinned copy, so Git's removal argument
+ * names the directory this call holds, never the shared workspace path. The
+ * registration and the pinned directory are restored on failure.
+ */
+function writeRegistryEntry(entry: string, content: string): void {
+  const temp = join(dirname(entry), `.${basename(entry)}.cleanup-${randomUUID()}`);
+  try {
+    writeFileSync(temp, content);
+    renameSync(temp, entry);
+  } catch (err) {
+    rmSync(temp, { force: true });
+    throw err;
+  }
+}
+
+function removePinnedWorktree(pin: PinnedWorktree): { ok: true } | { ok: false; detail: string } {
+  try {
+    writeRegistryEntry(pin.registryEntry, `${join(pin.pinned, ".git")}\n`);
+  } catch (err) {
+    return {
+      ok: false,
+      detail: `the worktree registration could not be repointed at the verified directory: ${(err as Error).message}${restorePinnedWorktree(pin)}; remove it manually with: ${manualRemovalCommand(pin)}`,
+    };
+  }
+  const remove = git(pin.baseWorkingTree, ["worktree", "remove", "--force", pin.pinned]);
+  if (!remove.ok) {
+    let restore = "";
+    try {
+      writeRegistryEntry(pin.registryEntry, pin.recordedRegistry);
+    } catch (err) {
+      restore += `; the worktree registration could not be restored: ${(err as Error).message}`;
+    }
+    restore += restorePinnedWorktree(pin);
+    return {
+      ok: false,
+      detail: `${remove.stderr || remove.stdout || "git produced no output"}${restore}; remove it manually with: ${manualRemovalCommand(pin)}`,
+    };
+  }
+  rmSync(pin.pinned, { recursive: true, force: true });
+  return { ok: true };
+}
+
 /** `registered` is true when the caller has just found the path in the base's worktree list. */
 function tryRemoveCreatedWorktree(
   created: WorktreeCreation,
   registered = false,
+  testHooks?: WorktreeRemovalTestHooks,
 ): { ok: true } | { ok: false; detail: string; refused?: boolean } {
   const guidance = () =>
     registered ? `remove it manually with: ${manualRemovalCommand(created)}` : refusalGuidance(created);
   // The marker decides ownership. The identity facts are supporting checks,
   // used when they were recorded: a detached replacement at the same commit
   // reproduces all of them, so they cannot refuse on their own.
-  const ownershipError = createdWorktreeOwnershipError(created);
-  if (ownershipError) {
-    return { ok: false, refused: true, detail: `${ownershipError}; ${guidance()}` };
+  const verified = verifiedCreatedWorktree(created);
+  if ("error" in verified) {
+    return { ok: false, refused: true, detail: `${verified.error}; ${guidance()}` };
   }
   const identityError = created.identity ? createdWorktreeIdentityError(created) : null;
   if (identityError) {
     return { ok: false, refused: true, detail: `${identityError}; ${guidance()}` };
   }
-  const remove = git(created.baseWorkingTree, ["worktree", "remove", "--force", created.workspace]);
-  if (!remove.ok) {
-    return {
-      ok: false,
-      detail: `${remove.stderr || remove.stdout || "git produced no output"}; remove it manually with: ${manualRemovalCommand(created)}`,
-    };
+  // Pin the checked directory before removing it: the removal acts on the
+  // directory whose marker was just verified, never on whatever sits at the
+  // workspace path when Git runs.
+  testHooks?.beforeRemoval?.(created.workspace);
+  const pin = pinVerifiedWorktree(created.workspace, created.baseWorkingTree, verified, created.ownerMarker);
+  if ("error" in pin) {
+    return { ok: false, refused: true, detail: `${pin.error}; ${guidance()}` };
+  }
+  const removal = removePinnedWorktree(pin);
+  if (!removal.ok) {
+    return { ok: false, detail: removal.detail };
   }
   created.removed = true;
   return { ok: true };
@@ -890,20 +1039,23 @@ function comparablePath(path: string): string {
  * guidance to inspect it, not a Git command. Removal requires the admin
  * directory named by the worktree's `.git` file to hold the recorded marker,
  * and any recorded identity facts to still match; a missing or different
- * marker is refused with the manual command. A worktree swapped in between that check
- * and the remove call is not covered: the verify-to-remove race is deferred
- * and filed separately. Throws `WorktreeLifecycleError` naming the path when
- * removal fails; a failed Git removal also carries Git's error and the manual
- * command.
+ * marker is refused with the manual command. The verified directory is then
+ * moved aside in one rename and removed through that copy, so a worktree
+ * swapped in at the path after the check survives and the cleanup refuses.
+ * Throws `WorktreeLifecycleError` naming the path when removal fails; a
+ * failed Git removal also carries Git's error and the manual command.
  */
-export function removeCreatedWorktree(created: WorktreeCreation): AgentLifecycleResult {
+export function removeCreatedWorktree(
+  created: WorktreeCreation,
+  testHooks?: WorktreeRemovalTestHooks,
+): AgentLifecycleResult {
   if (created.removed) {
     return { changed: false, reason: "worktree already removed" };
   }
   if (!worktreeRegisteredAt(created.baseWorkingTree, created.workspace)) {
     throw new WorktreeLifecycleError(`worktree cleanup refused for ${created.workspace}: ${unregisteredGuidance(created)}`);
   }
-  const removal = tryRemoveCreatedWorktree(created, true);
+  const removal = tryRemoveCreatedWorktree(created, true, testHooks);
   if (!removal.ok) {
     throw new WorktreeLifecycleError(
       removal.refused
@@ -987,7 +1139,12 @@ function pathExists(path: string): boolean {
   }
 }
 
-export function onStop(_agentId: string, workspacePath?: string, binding?: WorktreeCleanupBinding): AgentLifecycleResult {
+export function onStop(
+  _agentId: string,
+  workspacePath?: string,
+  binding?: WorktreeCleanupBinding,
+  testHooks?: WorktreeRemovalTestHooks,
+): AgentLifecycleResult {
   if (binding) {
     const probe = probeRepo(binding.baseWorkingTree);
     if (probe.kind !== "repo") {
@@ -999,6 +1156,7 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
     // runtime may move it during the run. A mismatch in the remaining facts
     // makes cleanup refuse; the registry entry can be rewritten while the
     // worktree exists.
+    let verified: { gitDir: string; dev: number; ino: number };
     try {
       if (binding.ownerMarker === null) throw new Error("the worktree ownership marker was not recorded");
       const gitDir = worktreeAdminDir(binding.workspace);
@@ -1018,16 +1176,24 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
       ) {
         throw new Error("setup binding changed");
       }
+      const stat = statSync(binding.workspace);
+      verified = { gitDir: binding.gitDir, dev: stat.dev, ino: stat.ino };
     } catch (err) {
       throw new WorktreeLifecycleError(
         `worktree cleanup binding changed for ${binding.workspace}: ${(err as Error).message}; ${refusalGuidance(binding)}`,
       );
     }
-    const remove = git(binding.baseWorkingTree, ["worktree", "remove", binding.workspace, "--force"]);
-    if (!remove.ok) {
+    testHooks?.beforeRemoval?.(binding.workspace);
+    const pin = pinVerifiedWorktree(binding.workspace, binding.baseWorkingTree, verified, binding.ownerMarker);
+    if ("error" in pin) {
       throw new WorktreeLifecycleError(
-        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${remove.stderr || remove.stdout}; ` +
-          `remove it manually with: ${manualRemovalCommand(binding)}`,
+        `worktree cleanup binding changed for ${binding.workspace}: ${pin.error}; ${refusalGuidance(binding)}`,
+      );
+    }
+    const removal = removePinnedWorktree(pin);
+    if (!removal.ok) {
+      throw new WorktreeLifecycleError(
+        `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${removal.detail}`,
       );
     }
     return { changed: true, reason: "worktree removed" };
@@ -1060,15 +1226,25 @@ export function onStop(_agentId: string, workspacePath?: string, binding?: Workt
   } catch (err) {
     throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
   }
-  if (!trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo)) {
+  const gitDir = trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo);
+  if (!gitDir) {
     return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
   }
 
-  const remove = git(baseRepo, ["worktree", "remove", workspace, "--force"]);
-  if (!remove.ok) {
-    throw new WorktreeLifecycleError(
-      `worktree cleanup failed for ${_agentId} (${workspace}): ${remove.stderr || remove.stdout}`,
-    );
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = statSync(workspace);
+  } catch (err) {
+    throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${(err as Error).message}`);
+  }
+  testHooks?.beforeRemoval?.(workspace);
+  const pin = pinVerifiedWorktree(workspace, baseRepo, { gitDir, dev: stat.dev, ino: stat.ino }, null);
+  if ("error" in pin) {
+    throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${pin.error}`);
+  }
+  const removal = removePinnedWorktree(pin);
+  if (!removal.ok) {
+    throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
   }
 
   return { changed: true, reason: "worktree removed" };
