@@ -44,6 +44,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, write
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { pidState } from "@tpsdev-ai/agent";
 import {
   buildNonoArgs,
   approveRuntimeNonoOptions,
@@ -664,17 +665,12 @@ export interface LaunchOutcome {
   log: string[];
 }
 
-/** Liveness of a pid, portable: `kill(pid, 0)`. Node/Bun expose no waitpid; the
+/** Liveness of a pid through the shared pidState (`kill(pid, 0)`); EPERM counts
+ * as alive because the process exists. Node/Bun expose no waitpid; the
  * design's `waitpid(WNOHANG)` is this check plus the ChildProcess handle's own
  * exitCode, which the launcher also watches. */
 export function pidAlive(pid: number): boolean {
-  if (!Number.isFinite(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
+  return pidState(pid) === "alive";
 }
 
 /** The nono session record the launcher requires, from `nono ps --all --json`. */

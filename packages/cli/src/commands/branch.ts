@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmS
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn } from "node:child_process";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
@@ -133,13 +134,8 @@ function sanitizeDeliveryError(raw: string): string {
   return "write-failed";
 }
 
-function processAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+export function processAlive(pid: number, probe: (pid: number) => PidState = pidState): boolean {
+  return probe(pid) === "alive";
 }
 
 export function writeBranchConf(port: number, host: string, transport: "ws" | "tcp", agentsDir?: string, agentId?: string): void {
@@ -556,7 +552,7 @@ function runStatus(): void {
     return;
   }
   const pid = Number(readFileSync(p, "utf-8").trim());
-  const alive = pid > 0 && processAlive(pid);
+  const alive = processAlive(pid);
   const confExists = existsSync(confPath());
   const hostExists = existsSync(hostPath(getIdentityDir()));
   console.log(`Branch daemon: ${alive ? "running" : "stopped"}`);

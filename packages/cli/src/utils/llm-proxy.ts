@@ -21,6 +21,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import crypto from "node:crypto";
 import { readFileSync, existsSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:llm");
@@ -531,13 +532,14 @@ export function startProxyDaemon(port = DEFAULT_PORT): void {
   });
 }
 
-export function proxyStatus(): { running: boolean; pid?: number; port?: number } {
+export function proxyStatus(probe: (pid: number) => PidState = pidState): { running: boolean; pid?: number; port?: number } {
   if (!existsSync(proxyPidPath())) return { running: false };
+  let pid: number;
   try {
-    const pid = parseInt(readFileSync(proxyPidPath(), "utf-8").trim(), 10);
-    process.kill(pid, 0);
-    return { running: true, pid, port: DEFAULT_PORT };
+    pid = parseInt(readFileSync(proxyPidPath(), "utf-8").trim(), 10);
   } catch {
     return { running: false };
   }
+  if (probe(pid) !== "alive") return { running: false };
+  return { running: true, pid, port: DEFAULT_PORT };
 }

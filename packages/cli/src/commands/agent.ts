@@ -10,7 +10,7 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
-import { AgentRuntime, loadAgentConfig } from "@tpsdev-ai/agent";
+import { AgentRuntime, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
 import { agentWorkspace } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
@@ -762,8 +762,7 @@ async function listAgents(args: AgentArgs): Promise<void> {
     if (existsSync(pidPath)) {
       try {
         const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
-        process.kill(pid, 0); // throws if not running
-        pidStatus = `running (pid ${pid})`;
+        pidStatus = pidState(pid) === "alive" ? `running (pid ${pid})` : "stopped (stale pid)";
       } catch {
         pidStatus = "stopped (stale pid)";
       }
@@ -827,8 +826,8 @@ async function agentStatus(args: AgentArgs): Promise<void> {
   if (existsSync(pidPath)) {
     try {
       const pid = parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
-      process.kill(pid, 0);
-      out.process = { running: true, pid };
+      if (pidState(pid) === "alive") out.process = { running: true, pid };
+      else out.process = { running: false, stalePid: true };
     } catch {
       out.process = { running: false, stalePid: true };
     }
@@ -1001,14 +1000,21 @@ function checkAgentProcess(agentId: string): AgentHealthcheckResult {
 
   try {
     const pid = Number.parseInt(readFileSync(pidPath, "utf-8").trim(), 10);
-    if (Number.isNaN(pid)) {
+    const state = pidState(pid);
+    if (state === "invalid") {
       return {
         label: "Process",
         pass: false,
         detail: `invalid PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
       };
     }
-    process.kill(pid, 0);
+    if (state !== "alive") {
+      return {
+        label: "Process",
+        pass: false,
+        detail: `stale PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
+      };
+    }
     return {
       label: "Process",
       pass: true,

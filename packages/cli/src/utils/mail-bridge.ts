@@ -13,6 +13,7 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -26,7 +27,7 @@ export interface BridgeConfig {
   defaultAgentId?: string;
 }
 
-export function bridgeStatus(): { running: boolean; pid?: number; port?: number } {
+export function bridgeStatus(probe: (pid: number) => PidState = pidState): { running: boolean; pid?: number; port?: number } {
   const { existsSync, readFileSync } = require("node:fs");
   const { homedir } = require("node:os");
   const { join } = require("node:path");
@@ -38,8 +39,9 @@ export function bridgeStatus(): { running: boolean; pid?: number; port?: number 
     if (!existsSync(pidPath)) continue;
     try {
       const raw = JSON.parse(readFileSync(pidPath, "utf-8"));
-      process.kill(raw.pid, 0);
-      return { running: true, pid: raw.pid, port: raw.port };
+      const pid = Number(raw.pid);
+      if (probe(pid) !== "alive") continue;
+      return { running: true, pid, port: raw.port };
     } catch {
       continue;
     }

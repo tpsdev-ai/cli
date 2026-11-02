@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { pidState } from "@tpsdev-ai/agent";
 import { healthcheckAgent } from "../src/commands/agent.js";
 
 let agentId: string;
@@ -91,6 +92,35 @@ describe("tps agent healthcheck", () => {
       "FAIL  Process: no PID file found",
       `FAIL  Mail dir: ~/.tps/mail/${agentId}/new missing`,
     ]);
+  });
+
+  test("reports pid 1 as running when kill(1, 0) returns EPERM", async () => {
+    // pid 1 always exists, so pidState(1) is alive whether the probe succeeds
+    // (root) or returns EPERM. When it returns EPERM this exercises the EPERM
+    // branch; as root the test still passes but does not exercise EPERM
+    // (cli#692 tracks forcing EPERM when the suite runs as root).
+    expect(pidState(1)).toBe("alive");
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
+    writeFileSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), "1\n");
+
+    await expect(
+      healthcheckAgent({ action: "healthcheck", id: agentId }),
+    ).resolves.toBeUndefined();
+
+    expect(output).toContain("PASS  Process: PID 1 running");
+  });
+
+  test("reports a malformed pid file as invalid", async () => {
+    patchShared(globalThis, "fetch", mockFlairAuth(200));
+    writeFileSync(join(tempHome, "ops", `tps-${agentId}`, ".tps-agent.pid"), "not-a-pid\n");
+
+    await expect(
+      healthcheckAgent({ action: "healthcheck", id: agentId }),
+    ).rejects.toThrow("exit:1");
+
+    expect(output).toContain(
+      `FAIL  Process: invalid PID file: ~/ops/tps-${agentId}/.tps-agent.pid`,
+    );
   });
 
   test("json output reports failing checks", async () => {
