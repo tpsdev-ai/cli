@@ -26,6 +26,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
+import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import { processStartToken } from "@tpsdev-ai/agent";
 import { createPrivateLaunchDir, launchDirLabel } from "../src/utils/launch-attestation.js";
 import {
@@ -88,7 +89,7 @@ function deadPid(): number {
 
 /** A running child process and its start token. */
 async function liveProcess(): Promise<{ child: ReturnType<typeof spawn>; pid: number; token: string }> {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const child = spawnLiveProcess();
   const pid = child.pid as number;
   expect(pid).toBeGreaterThan(0);
   let token: string | null = null;
@@ -412,7 +413,7 @@ function runLaunchChild(fixture: Fixture, script: string) {
 describe("launch integration", () => {
   test("the next launch removes a stale snapshot and keeps a published snapshot with a live owner record", async () => {
     const fixture = makeFixture();
-    const live = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const live = spawnLiveProcess();
     try {
       const livePid = live.pid;
       expect(livePid).toBeGreaterThan(0);

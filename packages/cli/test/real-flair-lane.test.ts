@@ -1,10 +1,11 @@
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 import { expect, test } from "bun:test";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import { load } from "js-yaml";
 import { assertRealFlairReport, EXPECTED_CASES, runRealFlairSuite } from "../../../scripts/real-flair-lane.js";
 import { assertListenerAddresses, initializeScratchFlair, provisionAgent, ScratchFlairBindError, waitForOk, withScratchFlair, type ScratchFlair, type ScratchProcess } from "./helpers/scratch-flair.js";
@@ -167,7 +168,7 @@ for (const stage of ["install", "setup", "seed", "test"] as const) {
       root = instance.root;
       expect(existsSync(root)).toBe(true);
       if (stage === "install" || stage === "setup") throw failure;
-      child = instance.proc = spawn("node", ["-e", "setInterval(() => {}, 1000)", root], { stdio: "ignore" });
+      child = instance.proc = spawnLiveProcess();
       await new Promise<void>((done, reject) => { child?.once("spawn", done); child?.once("error", reject); });
       if (stage === "seed") throw failure;
       return instance as ScratchFlair & ScratchProcess;
