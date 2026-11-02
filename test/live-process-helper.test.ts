@@ -208,7 +208,7 @@ test("the parent pid watch ends the helper when the parent dies after it starts"
   }
 }, 30_000);
 
-test("the parent pid watch ends the helper when the parent dies before it starts", async () => {
+test("the parent pid watch ends the helper when the parent dies at spawn", async () => {
   const root = mkdtempSync(join(tmpdir(), "live-process-fifo-early-"));
   const holder = startFifoFixture(root);
   const parent = spawn(process.execPath, [writeParentScript(root, "fifo-immediate")], {
