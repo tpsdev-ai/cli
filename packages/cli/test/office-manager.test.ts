@@ -383,8 +383,9 @@ describe("curl url explicit trim (#691)", () => {
 
   /**
    * Run the pipeline in a child whose PATH names the fake curl from startup.
-   * Bun 1.3.10 resolves an executable from the PATH the process started with,
-   * so a PATH assignment inside the test does not reach spawnSync's lookup.
+   * The child supplies the fake curl on startup PATH because the Bun 1.3.10
+   * probe ignored an in-process PATH reassignment when spawnSync inherited its
+   * environment.
    * The child runs the real component; its stdio carries the real log lines.
    */
   function runPipeline(): { status: number | null; stdout: string; stderr: string } {

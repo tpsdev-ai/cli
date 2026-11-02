@@ -13,9 +13,9 @@ const ToolEntrySchema = z.union([
 /**
  * Build the manifest schema with the given check for curl `url` values.
  *
- * The explicit `.trim()` runs before the check, so the parsed value is
- * trimmed whatever the check does. The check is injectable so a test can
- * supply one that does not trim; the real zod URL check is the default.
+ * The explicit `.trim()` runs before the check. The check is injectable so a
+ * test can supply one that does not trim; the real zod URL check is the
+ * default.
  */
 export function createWorkspaceManifestSchema(urlCheck: z.ZodType<string, string> = z.string().url()) {
   const CurlBinarySchema = z.object({
