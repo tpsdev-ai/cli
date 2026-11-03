@@ -29,6 +29,8 @@ setInterval(() => {
   try {
     process.kill(parentPid, 0);
   } catch (error) {
+    // EPERM means "parent gone, exit" here, because the question is "is my parent still mine".
+    // The agent package's pidState maps EPERM to "running" because its question is "is anything at this pid".
     if (error.code === "ESRCH" || error.code === "EPERM") stop();
   }
 }, 250);
