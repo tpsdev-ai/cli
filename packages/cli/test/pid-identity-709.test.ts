@@ -3,7 +3,7 @@
  * signals only a process whose identity matches the record. These tests use
  * real child processes and real pid files under a temp HOME.
  */
-import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -38,6 +38,10 @@ function captureLogs(): { logs: string[]; restore: () => void } {
   });
   return { logs, restore: () => spy.mockRestore() };
 }
+
+afterEach(() => {
+  mock.restore();
+});
 
 beforeEach(() => {
   savedHome = process.env.HOME;
