@@ -4,9 +4,9 @@
  * lane). The helper watches stdin close and its spawner's pid.
  *
  * Each process this file starts watches the pid that started it with the same
- * ESRCH/EPERM handling, and every FIFO open is asynchronous, so the watch keeps
- * running while an open waits. A hard kill can still leave the mkdtemp scratch
- * directory behind.
+ * gone check (a Linux zombie counts as exited), and every FIFO open is
+ * asynchronous, so the watch keeps running while an open waits. A hard kill can
+ * still leave the mkdtemp scratch directory behind.
  */
 import { expect, test } from "bun:test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -14,22 +14,19 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { LIVE_PROCESS_READY, spawnLiveProcess } from "./helpers/live-process.js";
+import { LIVE_PROCESS_READY, OWNER_GONE_SCRIPT, spawnLiveProcess } from "./helpers/live-process.js";
 
 /** Operational test allowance for a child to act on its owner's death. */
 const EXIT_BOUND_MS = 15_000;
 
 /**
- * Exits when `watchPid` is gone, with the helper's ESRCH/EPERM handling.
- * The script that includes it defines `watchPid` first.
+ * Exits when `watchPid` is gone, with the helper's gone check (a Linux zombie
+ * counts as exited). The script that includes it defines `watchPid` first.
  */
 const WATCH_PID = `
+${OWNER_GONE_SCRIPT}
 setInterval(function watchOwner() {
-  try {
-    process.kill(watchPid, 0);
-  } catch (error) {
-    if (error.code === "ESRCH" || error.code === "EPERM") process.exit(0);
-  }
+  if (ownerGone(watchPid)) process.exit(0);
 }, 250);
 `;
 
@@ -77,8 +74,9 @@ async function waitForExit(pid: number, timeoutMs = EXIT_BOUND_MS): Promise<bool
 }
 
 /**
- * Waits until every pid is gone or one absolute deadline passes, then reports
- * each pid's state. `alive`, `now` and `sleep` are injectable for a fake clock.
+ * Waits until every pid is gone, one absolute deadline passes, or the poll cap
+ * is reached, then reports each pid's state. `alive`, `now` and `sleep` are
+ * injectable for a fake clock.
  */
 async function waitForExitsBy(
   pids: Record<string, number>,
@@ -144,7 +142,7 @@ async function readPidFile(path: string): Promise<number> {
 type ParentMode = "pipe" | "fifo-ready" | "fifo-immediate";
 
 /**
- * A short-lived intermediate parent: it starts the helper and reports its pid.
+ * An intermediate parent: it starts the helper and reports its pid.
  * "fifo-ready" reports once the helper prints LIVE_PROCESS_READY; "fifo-immediate"
  * writes the pid and SIGKILLs itself immediately after the spawn. It watches the
  * pid passed in argv[2], and its FIFO open is asynchronous like the holder's.
@@ -213,8 +211,8 @@ function startFifoFixture(root: string, ownerPid: number, name = "stdin.fifo"): 
 type ProofMode = "ready" | "opening";
 
 /**
- * A parent-owned harness that builds the same holder/parent/helper fixtures and
- * records their pids, so the test can kill the owner and watch them exit.
+ * A harness that builds the same holder/parent/helper fixtures and records their
+ * pids, so the test can kill the owner and watch them exit.
  */
 function writeHarnessScript(root: string, parentScript: string, mode: ProofMode): string {
   const path = join(root, "harness.mjs");
@@ -289,8 +287,8 @@ setInterval(function park() {}, 1000);
 }
 
 /**
- * A short-lived runner that starts the harness and reports its pid, so the test
- * can kill the runner and watch the harness and its fixtures exit.
+ * A runner that starts the harness and reports its pid, so the test can kill the
+ * runner and watch the harness and its fixtures exit.
  */
 function writeRunnerScript(
   root: string,

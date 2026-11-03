@@ -8,13 +8,42 @@
  * - stdin closes: by default the spawner holds the write end of a pipe, so the
  *   kernel closes it the moment the spawner exits or is killed. This is immediate.
  * - the spawner's pid: read from this process before the spawn and passed to
- *   the child, which probes it with process.kill(pid, 0) every 250 ms and exits
- *   when the probe reports ESRCH (gone) or EPERM (another user's process).
+ *   the child, which probes it every 250 ms and exits when the probe reports
+ *   ESRCH (gone), EPERM (another user's process), or a Linux zombie's Z state.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 
 /** Printed by the child once its watches are installed. */
 export const LIVE_PROCESS_READY = "live-process-ready";
+
+/**
+ * Program text: defines `ownerGone(pid)`, true when the pid is gone. A Linux
+ * zombie counts as gone (/proc/<pid>/stat state Z): the pid probe alone reports
+ * a zombie as alive, and under a PID 1 that does not reap (a container without
+ * an init) an exited owner stays a zombie. Elsewhere the probe is the whole
+ * check.
+ */
+export const OWNER_GONE_SCRIPT = `
+function ownerGone(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    // EPERM means "owner gone, exit" here, because the question is "is my owner still mine".
+    // The agent package's pidState classifies EPERM as "alive" because its question is "is anything at this pid".
+    return error.code === "ESRCH" || error.code === "EPERM";
+  }
+  if (process.platform === "linux") {
+    try {
+      const stat = require("node:fs").readFileSync("/proc/" + pid + "/stat", "utf8");
+      const nameEnd = stat.lastIndexOf(")");
+      return stat.slice(nameEnd + 2, nameEnd + 3) === "Z";
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+`;
 
 /** The program the helper runs: exit when its stdin closes or the spawner's pid is gone. */
 export const LIVE_PROCESS_SCRIPT = `
@@ -24,15 +53,10 @@ const stop = () => process.exit(0);
 process.stdin.on("end", stop);
 process.stdin.on("close", stop);
 process.stdin.resume();
+${OWNER_GONE_SCRIPT}
 // A same-user process that reuses the pid within one poll interval keeps this alive.
 setInterval(() => {
-  try {
-    process.kill(parentPid, 0);
-  } catch (error) {
-    // EPERM means "parent gone, exit" here, because the question is "is my parent still mine".
-    // The agent package's pidState classifies EPERM as "alive" because its question is "is anything at this pid".
-    if (error.code === "ESRCH" || error.code === "EPERM") stop();
-  }
+  if (ownerGone(parentPid)) stop();
 }, 250);
 process.stdout.write("${LIVE_PROCESS_READY}\\n");
 `;
