@@ -19,8 +19,8 @@
  * top-level value: it must be a number, an integer, and within
  * 1..2147483647. Nested objects and text elsewhere in the file are ignored.
  *
- * Both readers classify through the same JSON.parse, so a duplicate key has
- * one interpretation: the last one.
+ * A JSON record is classified by one JSON.parse, so a duplicate key has one
+ * interpretation: the last one.
  */
 
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
