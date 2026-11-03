@@ -13,13 +13,17 @@
  * (the bridge used to write `{pid, adapter}`). It names a process but cannot
  * prove that process is the one that wrote the file.
  *
- * Readers accept only a trimmed whole positive decimal pid (`^[1-9]\d*$`):
+ * A text pid file must be a trimmed whole positive decimal pid (`^[1-9]\d*$`):
  * an integer prefix, an exponent form, a second line, an empty file and a
- * non-numeric value are all invalid. For JSON records the `pid` value must be
- * a bare decimal literal for the same reason.
+ * non-numeric value are all invalid. A JSON record's `pid` is the parsed
+ * top-level value: it must be a number, an integer, and within
+ * 1..2147483647. Nested objects and text elsewhere in the file are ignored.
+ *
+ * Both readers classify through the same JSON.parse, so a duplicate key has
+ * one interpretation: the last one.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { processIsGone, processStartToken } from "@tpsdev-ai/agent";
 
 export interface PidRecord {
@@ -52,13 +56,11 @@ function parseJsonRecord(text: string): ParsedPidFile {
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
     return invalid("not a JSON object");
   }
-  // JSON.parse accepts `1e3`, `0x10` and `true`; re-read the pid literal so a
-  // value that is not a bare decimal integer is refused, as in a text file.
-  const match = /"pid"\s*:\s*([^,}\s]+)/.exec(text);
-  if (!match || !WHOLE_PID.test(match[1]!)) {
-    return invalid("pid is not a whole positive decimal integer");
-  }
   const record = parsed as Record<string, unknown>;
+  const pid = record.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid < 1 || pid > 2147483647) {
+    return invalid("pid is not an integer in 1..2147483647");
+  }
   const token = record.startToken;
   if (token !== undefined && token !== null && typeof token !== "string") {
     return invalid("startToken is not a string");
@@ -66,7 +68,7 @@ function parseJsonRecord(text: string): ParsedPidFile {
   if (typeof token === "string" && token.length === 0) {
     return invalid("startToken is empty");
   }
-  return { kind: "record", pid: Number(match[1]), startToken: typeof token === "string" ? token : null };
+  return { kind: "record", pid, startToken: typeof token === "string" ? token : null };
 }
 
 /** Parse relay and bridge pid-file content. Nothing else is accepted. */
@@ -75,7 +77,26 @@ export function parsePidFile(raw: string): ParsedPidFile {
   if (text === "") return invalid("empty");
   if (text.startsWith("{")) return parseJsonRecord(text);
   if (!WHOLE_PID.test(text)) return invalid("pid is not a whole positive decimal integer");
-  return { kind: "record", pid: Number(text), startToken: null };
+  const pid = Number(text);
+  if (pid > 2147483647) return invalid("pid is not an integer in 1..2147483647");
+  return { kind: "record", pid, startToken: null };
+}
+
+export type PidFileRemoval = "removed" | "already gone";
+
+/**
+ * Remove a pid file and report what happened. "removed" means the unlink
+ * succeeded in this call; a file that was already absent is "already gone".
+ * Any other error (EACCES, EISDIR) propagates.
+ */
+export function removePidFile(path: string): PidFileRemoval {
+  try {
+    unlinkSync(path);
+    return "removed";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "already gone";
+    throw error;
+  }
 }
 
 export type PidFileState =
@@ -93,7 +114,8 @@ export type PidFileState =
  * start token from the same source (`processIsGone`). "running" — the pid is
  * alive and its current start token equals the recorded one. "unverified" —
  * the pid is live but its identity cannot be checked or does not match a token
- * from another source; a caller must not signal it.
+ * from another source; a caller must not signal it. A pid outside
+ * 1..2147483647 is "invalid", never "unverified".
  */
 export function readPidFile(
   path: string,

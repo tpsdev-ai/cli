@@ -4,7 +4,7 @@ import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, readdirSync, readFileSync, renameSync, rmSync, statSync, watch } from "node:fs";
+import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
@@ -14,6 +14,7 @@ import { parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
+import { removePidFile } from "../utils/pid-file.js";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -36,7 +37,7 @@ function relayProbeRefused(pid: number): boolean {
   }
 }
 
-/** Wait for a signalled relay to exit, with a hard 5 s bound. */
+/** Wait for a signalled relay to exit, polling for up to about 5 s. */
 async function waitForRelayExit(pid: number): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < 5000) {
@@ -663,13 +664,19 @@ export async function runMail(args: MailArgs): Promise<void> {
           );
         }
         if (state.kind === "invalid") {
-          rmSync(state.path, { force: true });
-          console.log("Mail relay is not running (invalid pid file removed).");
+          console.log(
+            removePidFile(state.path) === "removed"
+              ? "Mail relay is not running (invalid pid file removed)."
+              : "Mail relay is not running (pid file already gone).",
+          );
           break;
         }
         if (state.kind === "stale") {
-          rmSync(state.path, { force: true });
-          console.log("Mail relay is not running (stale pid file removed).");
+          console.log(
+            removePidFile(state.path) === "removed"
+              ? "Mail relay is not running (stale pid file removed)."
+              : "Mail relay is not running (pid file already gone).",
+          );
           break;
         }
         if (state.kind === "unverified") {
@@ -685,15 +692,21 @@ export async function runMail(args: MailArgs): Promise<void> {
           if (pidStateFromProbeError(error) === "alive") {
             throw new Error(`Mail relay could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
           }
-          rmSync(state.path, { force: true });
-          console.log("Mail relay is not running (stale pid file removed).");
+          console.log(
+            removePidFile(state.path) === "removed"
+              ? "Mail relay is not running (stale pid file removed)."
+              : "Mail relay is not running (pid file already gone).",
+          );
           break;
         }
         if (!(await waitForRelayExit(state.pid))) {
           throw new Error(`Mail relay could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
         }
-        rmSync(state.path, { force: true });
-        console.log(`Mail relay stopped (pid=${state.pid}).`);
+        console.log(
+          removePidFile(state.path) === "removed"
+            ? `Mail relay stopped (pid=${state.pid}); pid file removed.`
+            : `Mail relay stopped (pid=${state.pid}); pid file already gone.`,
+        );
         break;
       }
 

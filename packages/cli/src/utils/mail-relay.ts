@@ -15,13 +15,12 @@ import {
   readFileSync,
   renameSync,
   writeFileSync,
-  rmSync,
 } from "node:fs";
 import { join } from "node:path";
 import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
-import { readPidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
+import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
@@ -93,6 +92,15 @@ export function deliverPendingMail(mailDir: string): number {
   return delivered;
 }
 
+/** The relay's own pid file, best effort at exit. */
+function removeOwnPidFile(): void {
+  try {
+    removePidFile(relayPidPath());
+  } catch {
+    /* exit path: nothing left to report to */
+  }
+}
+
 /**
  * Run the relay daemon loop. Polls until SIGTERM/SIGINT.
  */
@@ -103,11 +111,11 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
   writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
 
   process.on("SIGTERM", () => {
-    rmSync(relayPidPath(), { force: true });
+    removeOwnPidFile();
     process.exit(0);
   });
   process.on("SIGINT", () => {
-    rmSync(relayPidPath(), { force: true });
+    removeOwnPidFile();
     process.exit(0);
   });
 
@@ -137,13 +145,13 @@ export function getRelayPid(probe: (pid: number) => PidState = pidState): number
   if (state.kind === "missing" || state.kind === "unreadable") return null;
   // Invalid and stale files name no live relay: remove them.
   if (state.kind === "invalid" || state.kind === "stale") {
-    rmSync(state.path, { force: true });
+    removePidFile(state.path);
     return null;
   }
   if (state.kind === "running") return state.pid;
   // A legacy record (no token) is live: report it for status/start, but stop
   // re-reads the file and refuses to signal an unverifiable identity.
   if (probe(state.pid) === "alive") return state.pid;
-  rmSync(state.path, { force: true });
+  removePidFile(state.path);
   return null;
 }

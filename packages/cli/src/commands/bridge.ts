@@ -12,7 +12,7 @@ import { bridgePidFiles, bridgeStatus, startBridgeDaemon } from "../utils/mail-b
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
-import { rmSync } from "node:fs";
+import { removePidFile } from "../utils/pid-file.js";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 
 /** The signal sender for `bridge stop`; replaceable in tests so they can
@@ -36,7 +36,7 @@ function bridgeProbeRefused(pid: number): boolean {
   }
 }
 
-/** Wait for a signalled bridge to exit, with a hard 5 s bound. */
+/** Wait for a signalled bridge to exit, polling for up to about 5 s. */
 async function waitForBridgeExit(pid: number): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < 5000) {
@@ -147,50 +147,76 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         console.log("Bridge is not running.");
         break;
       }
-      const active = files.find(
-        (e) => e.state.kind === "running" || e.state.kind === "unverified" || e.state.kind === "unreadable",
-      );
-      if (!active) {
-        // Only stale or invalid files: remove exactly those and say so once.
-        let removed = false;
-        for (const entry of files) {
-          if (entry.state.kind === "stale" || entry.state.kind === "invalid") {
-            rmSync(entry.path, { force: true });
-            removed = true;
-          }
+      // Classify every record before acting on any of them.
+      const kept: string[] = [];
+      const stopped = new Set<number>();
+      for (const entry of files) {
+        const state = entry.state;
+        if (state.kind === "missing") continue;
+        if (state.kind === "unreadable") {
+          kept.push(
+            `Bridge pid file ${state.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
+          );
+          continue;
         }
-        console.log(removed ? "Bridge is not running (stale pid file removed)." : "Bridge is not running.");
-        break;
-      }
-      const state = active.state;
-      if (state.kind === "unreadable") {
-        throw new Error(
-          `Bridge pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
-        );
-      }
-      if (state.kind === "unverified") {
-        throw new Error(
-          `Bridge pid file names pid ${state.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${state.path} if the bridge is not running.`,
-        );
-      }
-      if (state.kind !== "running") break;
-      try {
-        sendBridgeStopSignal(state.pid);
-      } catch (error) {
-        // EPERM means the process exists and this user may not signal it: keep
-        // the pid file and fail with the operator's recovery path.
-        if (pidStateFromProbeError(error) === "alive") {
+        if (state.kind === "unverified") {
+          kept.push(
+            `Bridge pid file ${state.path} names pid ${state.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${state.path} if the bridge is not running.`,
+          );
+          continue;
+        }
+        if (state.kind === "stale" || state.kind === "invalid") {
+          if (removePidFile(state.path) === "removed") {
+            console.log(`${state.kind === "stale" ? "Stale" : "Invalid"} pid file removed: ${state.path}.`);
+          } else {
+            console.log(`Pid file already gone: ${state.path}.`);
+          }
+          continue;
+        }
+        if (stopped.has(state.pid)) {
+          // The same process was already stopped through another record.
+          if (pidState(state.pid) !== "gone") {
+            kept.push(
+              `Bridge pid file ${state.path} names pid ${state.pid}, which is no longer proven gone; the pid file was kept.`,
+            );
+            continue;
+          }
+          if (removePidFile(state.path) === "removed") {
+            console.log(`Pid file removed: ${state.path}.`);
+          } else {
+            console.log(`Pid file already gone: ${state.path}.`);
+          }
+          continue;
+        }
+        try {
+          sendBridgeStopSignal(state.pid);
+        } catch (error) {
+          // EPERM means the process exists and this user may not signal it: keep
+          // the pid file and fail with the operator's recovery path.
+          if (pidStateFromProbeError(error) === "alive") {
+            throw new Error(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+          }
+          if (removePidFile(state.path) === "removed") {
+            console.log(`Stale pid file removed: ${state.path}.`);
+          } else {
+            console.log(`Pid file already gone: ${state.path}.`);
+          }
+          continue;
+        }
+        if (!(await waitForBridgeExit(state.pid))) {
           throw new Error(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
         }
-        rmSync(state.path, { force: true });
-        console.log("Bridge is not running (stale pid file removed).");
-        break;
+        stopped.add(state.pid);
+        if (removePidFile(state.path) === "removed") {
+          console.log(`Bridge (pid ${state.pid}) stopped; pid file removed: ${state.path}.`);
+        } else {
+          console.log(`Bridge (pid ${state.pid}) stopped; pid file already gone: ${state.path}.`);
+        }
       }
-      if (!(await waitForBridgeExit(state.pid))) {
-        throw new Error(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+      if (kept.length > 0) {
+        if (stopped.size === 0) throw new Error(kept.join(" "));
+        for (const line of kept) console.log(line);
       }
-      for (const entry of files) rmSync(entry.path, { force: true });
-      console.log(`Bridge (pid ${state.pid}) stopped.`);
       break;
     }
 

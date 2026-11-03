@@ -1,7 +1,9 @@
 /**
- * cli#709 — relay and bridge pid files carry the process start token, and stop
- * signals only a process whose identity matches the record. These tests use
- * real child processes and real pid files under a temp HOME.
+ * cli#709 — relay and bridge pid files carry the process start token. A stop
+ * checks the recorded token immediately before signalling and refuses on a
+ * mismatch; the pid can still be reused between that check and the signal, and
+ * the ps fallback compares start time only to the second. These tests use real
+ * child processes and real pid files under a temp HOME.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -18,6 +20,7 @@ const TIMEOUT = 20_000;
 let home: string;
 let relayPid: string;
 let bridgePid: string;
+let legacyBridgePid: string;
 let savedHome: string | undefined;
 const children: Bun.Subprocess[] = [];
 
@@ -25,6 +28,22 @@ function spawnChild(): Bun.Subprocess {
   const child = Bun.spawn(["sleep", "60"], { stdio: ["ignore", "ignore", "ignore"] });
   children.push(child);
   return child;
+}
+
+/** A pid that was live and is now reaped, or null when the OS reused it. */
+async function gonePid(): Promise<number | null> {
+  const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
+  await child.exited;
+  try {
+    process.kill(child.pid, 0);
+    return null;
+  } catch {
+    return child.pid;
+  }
+}
+
+function skipGonePid(): void {
+  console.warn("SKIP: the reaped pid was reused before the assertion; the gone-pid case was not exercised");
 }
 
 function relayRecord(pid: number, token: string | null): string {
@@ -50,6 +69,7 @@ beforeEach(() => {
   mkdirSync(join(home, ".tps", "run"), { recursive: true });
   relayPid = join(home, ".tps", "relay.pid");
   bridgePid = join(home, ".tps", "run", "bridge-openclaw.pid");
+  legacyBridgePid = join(home, ".tps", "run", "mail-bridge.pid");
 });
 
 afterEach(() => {
@@ -141,16 +161,12 @@ describe("relay stop identity", () => {
   test(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
-      await child.exited;
-      // A reaped pid is gone unless the OS reused it in this window.
-      try {
-        process.kill(child.pid, 0);
+      const gone = await gonePid();
+      if (gone === null) {
+        skipGonePid();
         return;
-      } catch {
-        /* gone, as expected */
       }
-      writeFileSync(relayPid, `${child.pid}\n`);
+      writeFileSync(relayPid, `${gone}\n`);
       const signals: number[] = [];
       const previous = setRelayStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -217,6 +233,118 @@ describe("relay stop identity", () => {
         setRelayStopSignal(previous);
       }
 
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("json pid interpretation", () => {
+  test(
+    "a nested pid is ignored and the top-level record decides",
+    async () => {
+      const nested = spawnChild();
+      const top = spawnChild();
+      const topToken = processStartToken(top.pid);
+      expect(topToken).not.toBeNull();
+      writeFileSync(
+        relayPid,
+        `${JSON.stringify({ nested: { pid: nested.pid, startToken: processStartToken(nested.pid) }, pid: top.pid, startToken: topToken })}\n`,
+      );
+      const signals: number[] = [];
+      const previous = setRelayStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        setRelayStopSignal(previous);
+      }
+
+      expect(signals).toEqual([top.pid]);
+      expect(existsSync(relayPid)).toBe(false);
+      expect(pidState(nested.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a duplicate top-level pid key uses the last value",
+    async () => {
+      const first = spawnChild();
+      const second = spawnChild();
+      const firstToken = processStartToken(first.pid);
+      const secondToken = processStartToken(second.pid);
+      expect(firstToken).not.toBeNull();
+      expect(secondToken).not.toBeNull();
+      writeFileSync(
+        relayPid,
+        `{"pid":${first.pid},"startToken":${JSON.stringify(firstToken)},"pid":${second.pid},"startToken":${JSON.stringify(secondToken)}}\n`,
+      );
+      const signals: number[] = [];
+      const previous = setRelayStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        setRelayStopSignal(previous);
+      }
+
+      expect(signals).toEqual([second.pid]);
+      expect(existsSync(relayPid)).toBe(false);
+      expect(pidState(first.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an out-of-range, fractional, string or boolean pid is invalid",
+    async () => {
+      const variants = [
+        `{"pid":2147483648,"startToken":null}`,
+        `{"pid":1.5}`,
+        `{"pid":"123"}`,
+        `{"pid":true}`,
+      ];
+      for (const content of variants) {
+        writeFileSync(relayPid, content);
+        const signals: number[] = [];
+        const previous = setRelayStopSignal((pid) => signals.push(pid));
+        const { logs, restore } = captureLogs();
+        try {
+          await runMail({ action: "relay", agent: "stop" });
+        } finally {
+          restore();
+          setRelayStopSignal(previous);
+        }
+        expect(signals).toEqual([]);
+        expect(existsSync(relayPid)).toBe(false);
+        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+      }
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an explicit null start token is unverified: no signal, file kept",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, `${JSON.stringify({ pid: child.pid, startToken: null })}\n`);
+      const signals: number[] = [];
+      const previous = setRelayStopSignal((pid) => signals.push(pid));
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          /identity cannot be verified/,
+        );
+      } finally {
+        setRelayStopSignal(previous);
+      }
+
+      expect(signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -298,15 +426,12 @@ describe("bridge stop identity", () => {
   test(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
-      await child.exited;
-      try {
-        process.kill(child.pid, 0);
+      const gone = await gonePid();
+      if (gone === null) {
+        skipGonePid();
         return;
-      } catch {
-        /* gone, as expected */
       }
-      writeFileSync(bridgePid, JSON.stringify({ pid: child.pid, port: 7891 }));
+      writeFileSync(bridgePid, JSON.stringify({ pid: gone, port: 7891 }));
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -348,9 +473,124 @@ describe("bridge stop identity", () => {
         }
         expect(signals).toEqual([]);
         expect(existsSync(bridgePid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
       }
       expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a verified stop keeps an unverifiable second record and reports it",
+    async () => {
+      const verified = spawnChild();
+      const unverified = spawnChild();
+      const token = processStartToken(verified.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(verified.pid, token));
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: unverified.pid, port: 7891 })}\n`);
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        restore();
+        setBridgeStopSignal(previous);
+      }
+
+      expect(signals).toEqual([verified.pid]);
+      expect(existsSync(bridgePid)).toBe(false);
+      expect(existsSync(legacyBridgePid)).toBe(true);
+      expect(logs.join("\n")).toContain(legacyBridgePid);
+      expect(logs.join("\n")).toMatch(/identity cannot be verified/i);
+      expect(pidState(unverified.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a verified record and a stale record are both removed",
+    async () => {
+      const verified = spawnChild();
+      const gone = await gonePid();
+      if (gone === null) {
+        skipGonePid();
+        return;
+      }
+      const token = processStartToken(verified.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(verified.pid, token));
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gone, port: 7891 })}\n`);
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+      }
+
+      expect(signals).toEqual([verified.pid]);
+      expect(existsSync(bridgePid)).toBe(false);
+      expect(existsSync(legacyBridgePid)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "two records naming the same verified process send one signal and remove both",
+    async () => {
+      const child = spawnChild();
+      const token = processStartToken(child.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(child.pid, token));
+      writeFileSync(legacyBridgePid, relayRecord(child.pid, token));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+      }
+
+      expect(signals).toEqual([child.pid]);
+      expect(existsSync(bridgePid)).toBe(false);
+      expect(existsSync(legacyBridgePid)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a pid file already gone after the stop reports already gone, not removed",
+    async () => {
+      const child = spawnChild();
+      const token = processStartToken(child.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(child.pid, token));
+      const previous = setBridgeStopSignal((pid) => {
+        // The daemon removes its own pid file on SIGTERM, as the real one does.
+        rmSync(bridgePid);
+        process.kill(pid, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        restore();
+        setBridgeStopSignal(previous);
+      }
+
+      expect(logs.join("\n")).toMatch(/already gone/);
+      expect(logs.join("\n")).not.toMatch(/removed/);
     },
     TIMEOUT,
   );
@@ -468,7 +708,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
       });
 
       expect(result.status).toBe(0);
-      expect(result.stdout).toMatch(/stale pid file removed/);
+      expect(result.stdout).toMatch(/stale pid file removed/i);
       expect(existsSync(bridgePid)).toBe(false);
       expect(pidState(child.pid)).toBe("alive");
     },
