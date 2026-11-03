@@ -3,10 +3,11 @@
  * against real processes.
  */
 import { describe, expect, test } from "bun:test";
-import { type ChildProcess, spawn, spawnSync } from "node:child_process";
+import { type ChildProcess, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import { MailLockOwnerError, processStartToken, tryAcquireMailLock } from "../src/utils/mail-lock.js";
 
 const STATUS_MODULE = resolve(import.meta.dir, "../src/commands/status.ts");
@@ -20,7 +21,7 @@ function reapedPid(): number {
 
 /** A running child process and its start token. */
 async function liveProcess(): Promise<{ child: ChildProcess; pid: number; token: string }> {
-  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const child = spawnLiveProcess();
   const pid = child.pid as number;
   expect(pid).toBeGreaterThan(0);
   let token: string | null = null;
