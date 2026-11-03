@@ -1,17 +1,23 @@
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync, readFileSync, chmodSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { z } from "zod";
 import {
   loadWorkspaceManifest,
   runOfficeManager,
   OFFICE_READY_MARKER,
   WorkspaceManifestSchema,
+  createWorkspaceManifestSchema,
 } from "../src/commands/office-manager.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const FAKE_NONO_BIN_DIR = join(import.meta.dir, "fakes/nono/bin");
+
+afterEach(() => {
+  mock.restore();
+});
 
 describe("WorkspaceManifestSchema", () => {
   test("parses a minimal manifest with no tools", () => {
@@ -309,5 +315,111 @@ describe("curl url with surrounding whitespace (#687)", () => {
   test("a space inside the host is refused", () => {
     writeManifest("https://host a.example/x");
     expect(() => loadWorkspaceManifest(agentWs)).toThrow("Invalid URL");
+  });
+});
+
+describe("curl url explicit trim (#691)", () => {
+  const TRIMMED = "https://host-a.example/x";
+  const RAW = ` \t${TRIMMED}\r\n `;
+  // Checks a URL after trimming, but returns the value as given, so the
+  // explicit trim in the schema is the only thing that trims the result.
+  const nonTrimmingUrlCheck = z.string().refine(
+    (value) => {
+      try {
+        new URL(value.trim());
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: "Invalid URL" }
+  );
+  const schema = createWorkspaceManifestSchema(nonTrimmingUrlCheck);
+
+  let root: string;
+  let agentWs: string;
+  let dest: string;
+  let argvFile: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "tps-om-trim-"));
+    agentWs = join(root, "workspace");
+    mkdirSync(agentWs, { recursive: true });
+    dest = join(root, "out", "tool-a");
+    argvFile = join(root, "curl.argv");
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const fakeCurl = join(bin, "curl");
+    writeFileSync(fakeCurl, `#!/bin/sh\nprintf '%s\\0' "$@" > '${argvFile}'\nexit 22\n`);
+    chmodSync(fakeCurl, 0o755);
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeManifest(url: string): void {
+    writeFileSync(
+      join(agentWs, "workspace-manifest.json"),
+      JSON.stringify({ name: "om-trim", tools: { curl: [{ url, dest }] } })
+    );
+  }
+
+  function curlArgv(): string[] | null {
+    try {
+      return readFileSync(argvFile, "utf-8").split("\0").slice(0, -1);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err;
+    }
+  }
+
+  test("the injected URL check does not trim, and the loader returns the trimmed URL", () => {
+    expect(nonTrimmingUrlCheck.parse(RAW)).toBe(RAW);
+    writeManifest(RAW);
+    const manifest = loadWorkspaceManifest(agentWs, schema);
+    expect(manifest!.tools.curl[0]!.url).toBe(TRIMMED);
+  });
+
+  /**
+   * Run the pipeline in a child whose PATH names the fake curl from startup.
+   * The child supplies the fake curl on startup PATH because the Bun 1.3.10
+   * probe ignored an in-process PATH reassignment when spawnSync inherited its
+   * environment.
+   * The child runs the real component; its stdio carries the real log lines.
+   */
+  function runPipeline(): { status: number | null; stdout: string; stderr: string } {
+    const script = join(root, "run-office-manager.ts");
+    const moduleUrl = new URL("../src/commands/office-manager.ts", import.meta.url).href;
+    writeFileSync(
+      script,
+      [
+        `import { z } from ${JSON.stringify(import.meta.resolve("zod"))};`,
+        `import { runOfficeManager, createWorkspaceManifestSchema } from ${JSON.stringify(moduleUrl)};`,
+        "const nonTrimming = z.string().refine(",
+        "  (value) => { try { new URL(value.trim()); return true; } catch { return false; } },",
+        '  { message: "Invalid URL" },',
+        ");",
+        "const schema = createWorkspaceManifestSchema(nonTrimming);",
+        `const ok = await runOfficeManager(${JSON.stringify(agentWs)}, { manifestSchema: schema });`,
+        'process.stdout.write(`RESULT ${ok}\\n`);',
+        "",
+      ].join("\n")
+    );
+    return spawnSync(process.execPath, [script], {
+      encoding: "utf-8",
+      cwd: root,
+      env: { ...process.env, PATH: `${join(root, "bin")}:${process.env.PATH ?? ""}` },
+    });
+  }
+
+  test("every use site receives the trimmed URL when the URL check does not trim", () => {
+    writeManifest(RAW);
+    const run = runPipeline();
+    expect(run.status).toBe(0);
+    expect(run.stdout).toContain("RESULT false");
+    expect(curlArgv()).toEqual(["--fail", "--silent", "--location", "--output", dest, TRIMMED]);
+    expect(run.stdout).toContain(`  [curl] Downloading ${TRIMMED} → ${dest}...`);
+    expect(run.stderr).toContain(`  [curl] FAILED: ${TRIMMED}`);
   });
 });
