@@ -107,7 +107,9 @@ function removeOwnPidFile(): void {
 export async function runRelayDaemon(mailDir: string): Promise<void> {
   // Write the pid file. The writer attempts to record a start token; the agent
   // API may return null or a token derived from ps, so the record can carry
-  // either and a later stop compares what was written.
+  // either. A stop compares a non-null token with the live process's token; a
+  // null token is never compared — with a live pid the record is unverified, so
+  // a stop refuses it.
   mkdirSync(join(homeDir(), ".tps"), { recursive: true });
   writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
 
@@ -144,8 +146,9 @@ export function readRelayPidFile(): PidFileState {
 export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
   const state = readRelayPidFile();
   if (state.kind === "missing" || state.kind === "unreadable") return null;
-  // Invalid content may name a live pid, and a stale record no longer matches
-  // the process holding its pid; remove the file, but report neither as running.
+  // Invalid content may name a live pid, and a stale record's pid is gone or
+  // its live pid carries a different token; remove the file, but report
+  // neither as running.
   if (state.kind === "invalid" || state.kind === "stale") {
     removePidFile(state.path);
     return null;

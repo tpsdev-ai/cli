@@ -654,6 +654,16 @@ export async function runMail(args: MailArgs): Promise<void> {
 
       if (relayAction === "stop") {
         const state = readRelayPidFile();
+        // A removal failure keeps the relay pid file, reports the path and the
+        // error code, and exits non-zero.
+        const removeRelayPid = (path: string): "removed" | "already gone" => {
+          try {
+            return removePidFile(path);
+          } catch (error) {
+            const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+            throw new Error(`Mail relay pid file ${path} could not be removed (${code}); the pid file was kept.`);
+          }
+        };
         if (state.kind === "missing") {
           console.log("Mail relay is not running.");
           break;
@@ -665,7 +675,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
         if (state.kind === "invalid") {
           console.log(
-            removePidFile(state.path) === "removed"
+            removeRelayPid(state.path) === "removed"
               ? "Mail relay is not running (invalid pid file removed)."
               : "Mail relay is not running (pid file already gone).",
           );
@@ -673,7 +683,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
         if (state.kind === "stale") {
           console.log(
-            removePidFile(state.path) === "removed"
+            removeRelayPid(state.path) === "removed"
               ? "Mail relay is not running (stale pid file removed)."
               : "Mail relay is not running (pid file already gone).",
           );
@@ -693,7 +703,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             throw new Error(`Mail relay could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
           }
           console.log(
-            removePidFile(state.path) === "removed"
+            removeRelayPid(state.path) === "removed"
               ? "Mail relay is not running (stale pid file removed)."
               : "Mail relay is not running (pid file already gone).",
           );
@@ -703,7 +713,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           throw new Error(`Mail relay could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
         }
         console.log(
-          removePidFile(state.path) === "removed"
+          removeRelayPid(state.path) === "removed"
             ? `Mail relay stopped (pid=${state.pid}); pid file removed.`
             : `Mail relay stopped (pid=${state.pid}); pid file already gone.`,
         );

@@ -115,12 +115,12 @@ export type PidFileState =
 /**
  * Classify a pid file.
  *
- * "stale" — the recorded process is gone, or its pid is alive with a different
- * start token from the same source (`processIsGone`). "running" — the pid is
- * alive and its current start token equals the recorded one. "unverified" —
- * the pid is not proven gone and its identity is not confirmed; a caller must
- * not signal it. A pid outside 1..2147483647 is "invalid", never
- * "unverified".
+ * "stale" — the recorded pid is gone, or the pid is alive and its current
+ * start token differs from the recorded token (same source, `processIsGone`).
+ * "running" — the pid is alive and its current start token equals the recorded
+ * one. "unverified" — the pid is not proven gone and its identity is not
+ * confirmed; a caller must not signal it. A pid outside 1..2147483647 is
+ * "invalid", never "unverified".
  */
 export function readPidFile(
   path: string,

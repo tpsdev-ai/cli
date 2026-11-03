@@ -12,7 +12,7 @@ import { bridgePidFiles, bridgeStatus, startBridgeDaemon } from "../utils/mail-b
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
-import { removePidFile } from "../utils/pid-file.js";
+import { readPidFile, removePidFile } from "../utils/pid-file.js";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 
 /** The signal sender for `bridge stop`; replaceable in tests so they can
@@ -147,10 +147,21 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         console.log("Bridge is not running.");
         break;
       }
-      // Classify every record before acting on any of them, then handle each
-      // one independently: one failure must not skip a later record.
+      // Classify every record up front for planning and reporting, then handle
+      // each one independently: one failure must not skip a later record.
       const failures: string[] = [];
       const stopped = new Set<number>();
+      // A removal failure keeps that file, reports the path and the error code,
+      // and leaves the remaining records to run.
+      const remove = (path: string): "removed" | "already gone" | "kept" => {
+        try {
+          return removePidFile(path);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+          failures.push(`Bridge pid file ${path} could not be removed (${code}); the pid file was kept.`);
+          return "kept";
+        }
+      };
       for (const entry of files) {
         const state = entry.state;
         if (state.kind === "missing") continue;
@@ -167,10 +178,40 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           continue;
         }
         if (state.kind === "stale" || state.kind === "invalid") {
-          if (removePidFile(state.path) === "removed") {
+          const removal = remove(state.path);
+          if (removal === "removed") {
             console.log(`${state.kind === "stale" ? "Stale" : "Invalid"} pid file removed: ${state.path}.`);
-          } else {
+          } else if (removal === "already gone") {
             console.log(`Pid file already gone: ${state.path}.`);
+          }
+          continue;
+        }
+        // The up-front classification is the plan, not the decision: re-read
+        // this file immediately before acting on it and signal only the same
+        // pid with the same token.
+        const fresh = readPidFile(state.path);
+        if (fresh.kind !== "running" || fresh.pid !== state.pid || fresh.startToken !== state.startToken) {
+          if (fresh.kind === "missing") {
+            console.log(`Pid file already gone: ${state.path}.`);
+          } else if (fresh.kind === "stale" || fresh.kind === "invalid") {
+            const removal = remove(fresh.path);
+            if (removal === "removed") {
+              console.log(`${fresh.kind === "stale" ? "Stale" : "Invalid"} pid file removed: ${fresh.path}.`);
+            } else if (removal === "already gone") {
+              console.log(`Pid file already gone: ${fresh.path}.`);
+            }
+          } else if (fresh.kind === "unreadable") {
+            failures.push(
+              `Bridge pid file ${fresh.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+            );
+          } else if (fresh.kind === "unverified") {
+            failures.push(
+              `Bridge pid file ${fresh.path} names pid ${fresh.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+            );
+          } else {
+            failures.push(
+              `Bridge pid file ${fresh.path} now names pid ${fresh.pid}, which is not the planned pid ${state.pid}; it was not signalled and the pid file was kept.`,
+            );
           }
           continue;
         }
@@ -182,7 +223,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             );
             continue;
           }
-          if (removePidFile(state.path) === "removed") {
+          if (remove(state.path) === "removed") {
             console.log(`Pid file removed: ${state.path}.`);
           } else {
             console.log(`Pid file already gone: ${state.path}.`);
@@ -198,9 +239,10 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             failures.push(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
             continue;
           }
-          if (removePidFile(state.path) === "removed") {
+          const removal = remove(state.path);
+          if (removal === "removed") {
             console.log(`Stale pid file removed: ${state.path}.`);
-          } else {
+          } else if (removal === "already gone") {
             console.log(`Pid file already gone: ${state.path}.`);
           }
           continue;
@@ -210,9 +252,10 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           continue;
         }
         stopped.add(state.pid);
-        if (removePidFile(state.path) === "removed") {
+        const removal = remove(state.path);
+        if (removal === "removed") {
           console.log(`Bridge (pid ${state.pid}) stopped; pid file removed: ${state.path}.`);
-        } else {
+        } else if (removal === "already gone") {
           console.log(`Bridge (pid ${state.pid}) stopped; pid file already gone: ${state.path}.`);
         }
       }
