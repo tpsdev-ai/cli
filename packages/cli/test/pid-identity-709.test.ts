@@ -18,6 +18,49 @@ import { readPidFile } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
+const PID_FILE_URL = new URL("../src/utils/pid-file.js", import.meta.url).href;
+const BRIDGE_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
+
+/**
+ * Runs bridge stop in a child process with readPidFile replaced, so the
+ * between-reads cases can be constructed deterministically. The real
+ * removePidFile and the real stop loop still run.
+ */
+const RECHECK_CHILD = `
+const pidPath = process.env.PID_PATH;
+const secondPath = process.env.SECOND_PATH || "";
+const pid = Number(process.env.PID_VALUE);
+const mode = process.env.MODE;
+const { mock } = await import("bun:test");
+const real = await import(${JSON.stringify(PID_FILE_URL)});
+let reads = 0;
+mock.module(${JSON.stringify(PID_FILE_URL)}, () => ({
+  ...real,
+  readPidFile(path) {
+    if (mode === "token") {
+      if (path !== pidPath) return { kind: "missing" };
+      reads += 1;
+      return { kind: "running", path, pid, startToken: reads === 1 ? "token-a" : "token-b" };
+    }
+    if (path !== pidPath && path !== secondPath) return { kind: "missing" };
+    return { kind: "running", path, pid, startToken: "token-a" };
+  },
+}));
+const { runBridge, setBridgeStopSignal } = await import(${JSON.stringify(BRIDGE_URL)});
+const signals = [];
+const logs = [];
+console.log = (...args) => logs.push(args.join(" "));
+console.error = (...args) => logs.push(args.join(" "));
+setBridgeStopSignal((signalled) => signals.push(signalled));
+let message = null;
+try {
+  await runBridge({ action: "stop" });
+} catch (error) {
+  message = error.message;
+}
+process.stdout.write("RESULT:" + JSON.stringify({ message, signals, logs }) + "\\n");
+process.exit(message === null ? 0 : 1);
+`;
 
 let home: string;
 let relayPid: string;
@@ -32,7 +75,8 @@ function spawnChild(): Bun.Subprocess {
   return child;
 }
 
-/** A pid that was live and is now reaped, or null when the OS reused it. */
+/** A pid that was live and is now reaped, or null when the spawn failed or the
+ *  pid was already reused at registration. */
 function reapedPid(): number | null {
   const child = spawnSync("true", []);
   if (child.pid === undefined) return null;
@@ -44,8 +88,20 @@ function reapedPid(): number | null {
   }
 }
 
-/** Resolved once at registration so a reused pid registers a visible skip. */
+/** Resolved once at registration: a pid reused by then registers a visible
+ *  skip; a pid reused later fails the test body in requireGonePid. */
 const gonePid = reapedPid();
+
+/** Re-probe a registration-time gone pid. A pid reused after registration makes
+ *  a stale-record test prove nothing, so fail and ask for a rerun; never signal
+ *  that pid. */
+function requireGonePid(pid: number | null): number {
+  if (pid === null) throw new Error("no reaped pid was registered; rerun the test");
+  if (pidState(pid) !== "gone") {
+    throw new Error(`pid ${pid} was reused after registration; rerun the test`);
+  }
+  return pid;
+}
 
 function relayRecord(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
@@ -71,6 +127,24 @@ function captureLogs(): { logs: string[]; restore: () => void } {
 afterEach(() => {
   mock.restore();
 });
+
+function runRecheckChild(
+  mode: "token" | "duplicate",
+  env: Record<string, string>,
+): { status: number | null; result: { message: string | null; signals: number[]; logs: string[] } } {
+  const script = join(home, `recheck-${mode}.ts`);
+  writeFileSync(script, RECHECK_CHILD);
+  const run = spawnSync("bun", [script], {
+    env: { ...process.env, HOME: home, MODE: mode, ...env },
+    encoding: "utf8",
+    timeout: TIMEOUT,
+  });
+  const line = (run.stdout ?? "").split("\n").find((entry) => entry.startsWith("RESULT:"));
+  if (line === undefined) {
+    throw new Error(`recheck child printed no result (exit ${run.status}): ${run.stderr}`);
+  }
+  return { status: run.status, result: JSON.parse(line.slice("RESULT:".length)) };
+}
 
 beforeEach(() => {
   savedHome = process.env.HOME;
@@ -171,7 +245,8 @@ describe("relay stop identity", () => {
   test.skipIf(gonePid === null)(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      writeFileSync(relayPid, `${gonePid}\n`);
+      const pid = requireGonePid(gonePid);
+      writeFileSync(relayPid, `${pid}\n`);
       const signals: number[] = [];
       const previous = setRelayStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -467,7 +542,8 @@ describe("bridge stop identity", () => {
   test.skipIf(gonePid === null)(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      writeFileSync(bridgePid, JSON.stringify({ pid: gonePid, port: 7891 }));
+      const pid = requireGonePid(gonePid);
+      writeFileSync(bridgePid, JSON.stringify({ pid, port: 7891 }));
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -557,7 +633,8 @@ describe("bridge stop identity", () => {
       const token = processStartToken(verified.pid);
       expect(token).not.toBeNull();
       writeFileSync(bridgePid, relayRecord(verified.pid, token));
-      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gonePid, port: 7891 })}\n`);
+      const pid = requireGonePid(gonePid);
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid, port: 7891 })}\n`);
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => {
         signals.push(pid);
@@ -583,7 +660,8 @@ describe("bridge stop identity", () => {
       const token = processStartToken(child.pid);
       expect(token).not.toBeNull();
       writeFileSync(bridgePid, relayRecord(child.pid, token));
-      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gonePid, port: 7891 })}\n`);
+      const pid = requireGonePid(gonePid);
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid, port: 7891 })}\n`);
       // Same construction as the single-record EPERM case: a signal sender that
       // raises EPERM, which is deterministic on every uid.
       const previous = setBridgeStopSignal(() => {
@@ -822,6 +900,52 @@ describe("bridge stop identity", () => {
 
       expect(logs.join("\n")).toMatch(/not running/i);
       expect(logs.join("\n")).not.toMatch(/stale/i);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a same-pid record whose start token changed is refused as a changed identity, not a changed pid",
+    () => {
+      const plannedPid = 400001;
+      writeFileSync(bridgePid, relayRecord(plannedPid, "token-a"));
+      const { status, result } = runRecheckChild("token", {
+        PID_PATH: bridgePid,
+        PID_VALUE: String(plannedPid),
+      });
+
+      expect(status).toBe(1);
+      expect(result.signals).toEqual([]);
+      expect(result.message).toMatch(/process identity changed/i);
+      expect(result.message).not.toMatch(/not the planned pid/i);
+      expect(result.message).not.toContain("token-a");
+      expect(result.message).not.toContain("token-b");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(gonePid === null)(
+    "a kept removal on the duplicate-pid branch is reported kept and exits non-zero",
+    () => {
+      const pid = requireGonePid(gonePid);
+      writeFileSync(bridgePid, relayRecord(pid, "token-a"));
+      writeFileSync(legacyBridgePid, relayRecord(pid, "token-a"));
+      rmSync(legacyBridgePid);
+      mkdirSync(legacyBridgePid);
+      writeFileSync(join(legacyBridgePid, "keep"), "x");
+      const { status, result } = runRecheckChild("duplicate", {
+        PID_PATH: bridgePid,
+        SECOND_PATH: legacyBridgePid,
+        PID_VALUE: String(pid),
+      });
+
+      expect(status).toBe(1);
+      expect(result.message).toContain(legacyBridgePid);
+      expect(result.message).toMatch(/could not be removed/);
+      expect(result.message).toMatch(/kept/);
+      expect(result.message).toMatch(/EISDIR|EPERM/);
+      expect(result.logs.join("\n")).not.toMatch(/already gone/i);
+      expect(result.message).not.toMatch(/\n\s+at /);
     },
     TIMEOUT,
   );

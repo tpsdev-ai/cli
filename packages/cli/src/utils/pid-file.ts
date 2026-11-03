@@ -14,8 +14,9 @@
  * prove that process is the one that wrote the file.
  *
  * Accepted forms: surrounding whitespace is trimmed; the content is either a
- * bare decimal integer 1..2147483647, or a JSON object whose top-level `pid` is
- * such an integer and whose `startToken` is a non-empty string, null or absent.
+ * decimal integer without leading zeroes, 1..2147483647, or a JSON object whose
+ * top-level `pid` is such an integer and whose `startToken` is a non-empty
+ * string, null or absent.
  * Other JSON fields are ignored. Anything else is invalid.
  *
  * A JSON record is classified by one JSON.parse, so a duplicate key has one
@@ -72,10 +73,10 @@ function parseJsonRecord(text: string): ParsedPidFile {
 
 /**
  * Parse relay and bridge pid-file content. Accepted: after trimming surrounding
- * whitespace, a bare decimal integer 1..2147483647, or a JSON object whose
- * top-level `pid` is such an integer and whose `startToken` is a non-empty
- * string, null or absent. Other JSON fields are ignored; anything else is
- * invalid.
+ * whitespace, a decimal integer without leading zeroes, 1..2147483647, or a
+ * JSON object whose top-level `pid` is such an integer and whose `startToken`
+ * is a non-empty string, null or absent. Other JSON fields are ignored;
+ * anything else is invalid.
  */
 export function parsePidFile(raw: string): ParsedPidFile {
   const text = raw.trim();

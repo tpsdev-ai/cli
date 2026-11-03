@@ -208,9 +208,13 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             failures.push(
               `Bridge pid file ${fresh.path} names pid ${fresh.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
             );
-          } else {
+          } else if (fresh.pid !== state.pid) {
             failures.push(
               `Bridge pid file ${fresh.path} now names pid ${fresh.pid}, which is not the planned pid ${state.pid}; it was not signalled and the pid file was kept.`,
+            );
+          } else {
+            failures.push(
+              `Bridge pid file ${fresh.path} still names pid ${fresh.pid}, but the process identity changed since it was planned; it was not signalled and the pid file was kept.`,
             );
           }
           continue;
@@ -223,9 +227,10 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             );
             continue;
           }
-          if (remove(state.path) === "removed") {
+          const removal = remove(state.path);
+          if (removal === "removed") {
             console.log(`Pid file removed: ${state.path}.`);
-          } else {
+          } else if (removal === "already gone") {
             console.log(`Pid file already gone: ${state.path}.`);
           }
           continue;

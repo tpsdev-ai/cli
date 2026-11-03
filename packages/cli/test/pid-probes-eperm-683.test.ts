@@ -15,7 +15,8 @@ import { proxyStatus } from "../src/utils/llm-proxy.js";
 import { bridgeStatus } from "../src/utils/mail-bridge.js";
 import { getRelayPid } from "../src/utils/mail-relay.js";
 
-/** A pid that was live and is now reaped, or null when the OS reused it. */
+/** A pid that was live and is now reaped, or null when the spawn failed or the
+ *  pid was already reused at registration. */
 function reapedPid(): number | null {
   const child = spawnSync("true", []);
   if (child.pid === undefined) return null;
@@ -27,8 +28,20 @@ function reapedPid(): number | null {
   }
 }
 
-/** Resolved once at registration so a reused pid registers a visible skip. */
+/** Resolved once at registration: a pid reused by then registers a visible
+ *  skip; a pid reused later fails the test body in requireGonePid. */
 const gonePid = reapedPid();
+
+/** Re-probe a registration-time gone pid. A pid reused after registration makes
+ *  a stale-record test prove nothing, so fail and ask for a rerun; never signal
+ *  that pid. */
+function requireGonePid(pid: number | null): number {
+  if (pid === null) throw new Error("no reaped pid was registered; rerun the test");
+  if (pidState(pid) !== "gone") {
+    throw new Error(`pid ${pid} was reused after registration; rerun the test`);
+  }
+  return pid;
+}
 
 let home: string;
 const originalHome = process.env.HOME;
@@ -74,7 +87,8 @@ describe("mail relay pid probe", () => {
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
-    writeFileSync(pidPath, `${gonePid}\n`);
+    const pid = requireGonePid(gonePid);
+    writeFileSync(pidPath, `${pid}\n`);
 
     expect(getRelayPid()).toBeNull();
     expect(existsSync(pidPath)).toBe(false);
