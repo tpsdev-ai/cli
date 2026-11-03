@@ -3,9 +3,10 @@
  * that started it when teardown is skipped (a killed test process, a timed-out
  * lane). The helper watches stdin close and its spawner's pid.
  *
- * The fixture processes in this file watch the pid that started them the same
- * way, and every FIFO open is asynchronous, so the watch keeps running while an
- * open waits. A hard kill can still leave the mkdtemp scratch directory behind.
+ * Each process this file starts watches the pid that started it with the same
+ * ESRCH/EPERM handling, and every FIFO open is asynchronous, so the watch keeps
+ * running while an open waits. A hard kill can still leave the mkdtemp scratch
+ * directory behind.
  */
 import { expect, test } from "bun:test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
@@ -19,15 +20,13 @@ import { LIVE_PROCESS_READY, spawnLiveProcess } from "./helpers/live-process.js"
 const EXIT_BOUND_MS = 15_000;
 
 /**
- * Exits when the pid that spawned the fixture is gone, with the helper's
- * ESRCH/EPERM handling. The script that includes it reads the pid from argv[2].
+ * Exits when `watchPid` is gone, with the helper's ESRCH/EPERM handling.
+ * The script that includes it defines `watchPid` first.
  */
-const WATCH_OWNER = `
-const ownerPid = Number(process.argv[2]);
-if (!Number.isInteger(ownerPid) || ownerPid <= 0) process.exit(2);
+const WATCH_PID = `
 setInterval(function watchOwner() {
   try {
-    process.kill(ownerPid, 0);
+    process.kill(watchPid, 0);
   } catch (error) {
     if (error.code === "ESRCH" || error.code === "EPERM") process.exit(0);
   }
@@ -37,7 +36,9 @@ setInterval(function watchOwner() {
 /** Opens the FIFO for writing and holds it open while the fixture lives. */
 const HOLDER_SCRIPT = `
 const { open } = require("node:fs/promises");
-${WATCH_OWNER}
+const watchPid = Number(process.argv[2]);
+if (!Number.isInteger(watchPid) || watchPid <= 0) process.exit(2);
+${WATCH_PID}
 if (process.argv[3]) require("node:fs").writeFileSync(process.argv[3], "");
 open(process.argv[1], "w").then(function onOpen(handle) {
   globalThis.fifo = handle;
@@ -75,6 +76,25 @@ async function waitForExit(pid: number, timeoutMs = EXIT_BOUND_MS): Promise<bool
   return !isRunning(pid);
 }
 
+/**
+ * Waits until every pid is gone or one absolute deadline passes, then reports
+ * each pid's state. `alive`, `now` and `sleep` are injectable for a fake clock.
+ */
+async function waitForExitsBy(
+  pids: Record<string, number>,
+  deadline: number,
+  alive: (pid: number) => boolean = isRunning,
+  now: () => number = Date.now,
+  sleep: (ms: number) => Promise<void> = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+): Promise<Array<{ name: string; pid: number; exited: boolean }>> {
+  const maxPolls = 10_000;
+  for (let poll = 0; now() < deadline && poll < maxPolls; poll += 1) {
+    if (Object.values(pids).every((pid) => !alive(pid))) break;
+    await sleep(50);
+  }
+  return Object.entries(pids).map(([name, pid]) => ({ name, pid, exited: !alive(pid) }));
+}
+
 function kill(pid: number | undefined): void {
   if (pid === undefined) return;
   try {
@@ -106,7 +126,7 @@ async function readPid(parent: ChildProcess): Promise<number> {
   });
 }
 
-/** Read the pid a parent that dies immediately writes before killing itself. */
+/** Read a pid a process writes to a file. */
 async function readPidFile(path: string): Promise<number> {
   const deadline = Date.now() + EXIT_BOUND_MS;
   while (Date.now() < deadline) {
@@ -118,7 +138,7 @@ async function readPidFile(path: string): Promise<number> {
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
-  throw new Error("parent did not write the helper pid");
+  throw new Error(`no pid written to ${path}`);
 }
 
 type ParentMode = "pipe" | "fifo-ready" | "fifo-immediate";
@@ -141,7 +161,9 @@ import { open } from "node:fs/promises";
 import { writeFileSync } from "node:fs";
 import { LIVE_PROCESS_READY, spawnLiveProcess } from ${JSON.stringify(HELPER_URL)};
 
-${WATCH_OWNER}
+const watchPid = Number(process.argv[2]);
+if (!Number.isInteger(watchPid) || watchPid <= 0) process.exit(2);
+${WATCH_PID}
 const mode = ${JSON.stringify(mode)};
 const handles = [];
 
@@ -206,6 +228,9 @@ import { join } from "node:path";
 const root = process.argv[2];
 const parentScript = process.argv[3];
 const mode = process.argv[4];
+const watchPid = Number(process.argv[5]);
+if (!Number.isInteger(watchPid) || watchPid <= 0) process.exit(2);
+${WATCH_PID}
 const ownerPid = process.pid;
 const HOLDER_SCRIPT = ${JSON.stringify(HOLDER_SCRIPT)};
 
@@ -257,6 +282,41 @@ if (mode === "opening") {
   pids.waiting = waiting.pid;
 }
 writeFileSync(join(root, "pids.json"), JSON.stringify(pids));
+setInterval(function park() {}, 1000);
+`,
+  );
+  return path;
+}
+
+/**
+ * A short-lived runner that starts the harness and reports its pid, so the test
+ * can kill the runner and watch the harness and its fixtures exit.
+ */
+function writeRunnerScript(
+  root: string,
+  harnessScript: string,
+  parentScript: string,
+  mode: ProofMode,
+): string {
+  const path = join(root, "runner.mjs");
+  const harnessPidFile = join(root, "harness.pid");
+  writeFileSync(
+    path,
+    `
+import { spawn } from "node:child_process";
+import { writeFileSync } from "node:fs";
+
+const root = process.argv[2];
+const harnessScript = process.argv[3];
+const parentScript = process.argv[4];
+const mode = process.argv[5];
+const watchPid = Number(process.argv[6]);
+if (!Number.isInteger(watchPid) || watchPid <= 0) process.exit(2);
+${WATCH_PID}
+const harness = spawn(process.execPath, [harnessScript, root, parentScript, mode, String(process.pid)], {
+  stdio: ["ignore", "ignore", "inherit"],
+});
+writeFileSync(${JSON.stringify(harnessPidFile)}, String(harness.pid));
 setInterval(function park() {}, 1000);
 `,
   );
@@ -367,24 +427,82 @@ test("a normal teardown still stops the helper", async () => {
   expect(isRunning(pid)).toBe(false);
 }, 30_000);
 
+test("the shared deadline fails a pid that exits after it", async () => {
+  let clock = 0;
+  const exitsAt: Record<number, number> = { 11: 900, 22: 1_100 };
+  const exits = await waitForExitsBy(
+    { early: 11, late: 22 },
+    1_000,
+    (pid) => clock < exitsAt[pid],
+    () => clock,
+    async (ms) => {
+      clock += ms;
+    },
+  );
+  expect(exits).toEqual([
+    { name: "early", pid: 11, exited: true },
+    { name: "late", pid: 22, exited: false },
+  ]);
+}, 5_000);
+
 for (const mode of ["ready", "opening"] as const) {
   test(`a SIGKILLed fixture owner takes every fixture with it (${mode})`, async () => {
     const root = mkdtempSync(join(tmpdir(), "live-process-proof-"));
     const parentScript = writeParentScript(root, "fifo-ready");
-    const harness = spawn(process.execPath, [writeHarnessScript(root, parentScript, mode), root, parentScript, mode], {
+    const harness = spawn(process.execPath, [writeHarnessScript(root, parentScript, mode), root, parentScript, mode, String(process.pid)], {
       stdio: ["ignore", "ignore", "inherit"],
     });
     let pids: FixturePids | undefined;
     try {
       pids = await readPidsFile(join(root, "pids.json"));
       for (const pid of Object.values(pids)) expect(isRunning(pid)).toBe(true);
+      const deadline = Date.now() + EXIT_BOUND_MS;
       harness.kill("SIGKILL");
       await waitForParentExit(harness);
-      for (const [name, pid] of Object.entries(pids)) {
-        expect({ name, exited: await waitForExit(pid) }).toEqual({ name, exited: true });
-      }
+      const exits = await waitForExitsBy(pids, deadline);
+      expect(exits.filter((exit) => !exit.exited)).toEqual([]);
     } finally {
       kill(harness.pid);
+      for (const pid of Object.values(pids ?? {})) kill(pid);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+}
+
+for (const mode of ["ready", "opening"] as const) {
+  test(`a SIGKILLed runner takes the harness and its fixtures with it (${mode})`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "live-process-runner-"));
+    const parentScript = writeParentScript(root, "fifo-ready");
+    const harnessScript = writeHarnessScript(root, parentScript, mode);
+    const runner = spawn(
+      process.execPath,
+      [
+        writeRunnerScript(root, harnessScript, parentScript, mode),
+        root,
+        harnessScript,
+        parentScript,
+        mode,
+        String(process.pid),
+      ],
+      { stdio: ["ignore", "ignore", "inherit"] },
+    );
+    let pids: FixturePids | undefined;
+    let harnessPid: number | undefined;
+    try {
+      pids = await readPidsFile(join(root, "pids.json"));
+      const reportedHarnessPid = await readPidFile(join(root, "harness.pid"));
+      harnessPid = reportedHarnessPid;
+      expect(reportedHarnessPid).toBeGreaterThan(0);
+      expect(isRunning(reportedHarnessPid)).toBe(true);
+      for (const pid of Object.values(pids)) expect(isRunning(pid)).toBe(true);
+      const deadline = Date.now() + EXIT_BOUND_MS;
+      runner.kill("SIGKILL");
+      await waitForParentExit(runner);
+      const exits = await waitForExitsBy({ harness: reportedHarnessPid, ...pids }, deadline);
+      expect(exits.filter((exit) => !exit.exited)).toEqual([]);
+    } finally {
+      kill(runner.pid);
+      kill(harnessPid);
       for (const pid of Object.values(pids ?? {})) kill(pid);
       rmSync(root, { recursive: true, force: true });
     }
