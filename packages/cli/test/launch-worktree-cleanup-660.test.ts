@@ -16,12 +16,16 @@
  * fails `rev-parse HEAD` during capture, and the marker test fails only the
  * marker write.
  */
-import { expect, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
+  statSync,
+  symlinkSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -39,6 +43,8 @@ import {
   WorktreeLifecycleError,
   type WorktreeCreation,
 } from "../src/utils/agent-lifecycle.js";
+
+afterEach(() => mock.restore());
 
 const GIT = spawnSync("which", ["git"], { encoding: "utf8" }).stdout.trim();
 
@@ -551,7 +557,35 @@ test("unit — bound onStop refuses a worktree replaced between the ownership ch
   }
 });
 
-test("unit — path-only onStop refuses a worktree replaced between the registry check and the removal", () => {
+test("unit — path-only onStop pins and removes a symlinked workspace directory", () => {
+  const f = fixture();
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    const alias = join(f.root, "workspace-link");
+    symlinkSync(f.workspace, alias, "dir");
+    const original = statSync(f.workspace);
+    let pinnedPath: string | undefined;
+    expect(onStop("agent-a", alias, undefined, {
+      beforeGitRemoval: (pinned) => {
+        pinnedPath = pinned;
+        expect(lstatSync(pinned).isDirectory()).toBe(true);
+        expect(statSync(pinned).dev).toBe(original.dev);
+        expect(statSync(pinned).ino).toBe(original.ino);
+        expect(existsSync(f.workspace)).toBe(false);
+        expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+      },
+    })).toEqual({ changed: true, reason: "worktree removed" });
+    expect(pinnedPath).toBeDefined();
+    expect(existsSync(pinnedPath!)).toBe(false);
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(lstatSync(alias).isSymbolicLink()).toBe(true);
+    expect(worktreeList(f.base)).not.toContain(f.workspace);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — path-only onStop detects the beforeRemoval fixture replacement", () => {
   const f = fixture();
   const commit = headOf(f.base);
   try {
@@ -571,7 +605,7 @@ test("unit — path-only onStop refuses a worktree replaced between the registry
   }
 });
 
-test("unit — path-only onStop refuses a worktree replaced after the registry check and before the pin", () => {
+test("unit — path-only onStop detects the afterRegistryCheck fixture replacement", () => {
   const f = fixture();
   const commit = headOf(f.base);
   try {
@@ -590,6 +624,89 @@ test("unit — path-only onStop refuses a worktree replaced after the registry c
     rmSync(f.root, { recursive: true, force: true });
   }
 });
+
+for (const outcome of ["success", "unmanaged", "snapshot error", "registry error", "hook error", "pin error", "replacement", "removal error"] as const) {
+  test(`unit — path-only onStop closes its directory descriptor: ${outcome}`, () => {
+    const f = fixture();
+    let descriptor: number | undefined;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+      const commit = headOf(f.base);
+      const original = statSync(f.workspace);
+      if (outcome === "unmanaged") {
+        writeFileSync(join(adminDir(f.workspace), "gitdir"), `${join(f.root, "other", ".git")}\n`);
+      }
+      if (outcome === "registry error") {
+        const registry = join(f.base, ".git", "worktrees");
+        rmSync(registry, { recursive: true });
+        writeFileSync(registry, "not a directory");
+      }
+      const open = fs.openSync;
+      const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+      spyOn(fs, "openSync").mockImplementation((...args: Parameters<typeof fs.openSync>) => {
+        const fd = open(...args);
+        if (args[0] === f.workspace && args[1] === flags) descriptor = fd;
+        return fd;
+      });
+      const fstat = fs.fstatSync;
+      const readdir = fs.readdirSync;
+      let registryRead = false;
+      spyOn(fs, "readdirSync").mockImplementation((...args: Parameters<typeof fs.readdirSync>) => {
+        if (args[0] === join(f.base, ".git", "worktrees")) {
+          registryRead = true;
+          expect(descriptor).toBeDefined();
+          expect(fstat(descriptor!).ino).toBe(original.ino);
+        }
+        return readdir(...args);
+      });
+      if (outcome === "snapshot error") {
+        spyOn(fs, "fstatSync").mockImplementation(() => { throw new Error("snapshot error"); });
+      }
+      let checked = false;
+      const run = () => onStop("agent-a", f.workspace, undefined, {
+        afterRegistryCheck: () => {
+          checked = true;
+          expect(descriptor).toBeDefined();
+          expect(fstat(descriptor!).dev).toBe(original.dev);
+          expect(fstat(descriptor!).ino).toBe(original.ino);
+          if (outcome === "hook error") throw new Error("hook error");
+          if (outcome === "pin error") rmSync(f.workspace, { recursive: true });
+          if (outcome === "replacement") {
+            replaceWorktree(f, commit);
+            expect(fstat(descriptor!).ino).toBe(original.ino);
+            expect(statSync(f.workspace).ino).not.toBe(original.ino);
+          }
+        },
+        beforeGitRemoval: (pinned) => {
+          expect(fstat(descriptor!).ino).toBe(statSync(pinned).ino);
+          if (outcome === "removal error") writeFileSync(join(adminDir(pinned), "locked"), "fixture lock");
+        },
+      });
+      if (outcome === "success") {
+        expect(run()).toEqual({ changed: true, reason: "worktree removed" });
+      } else if (outcome === "unmanaged") {
+        expect(run()).toEqual({ changed: false, reason: "workspace is not a managed worktree; leaving untouched" });
+      } else {
+        const message = {
+          "snapshot error": "snapshot error",
+          "registry error": "worktree registry could not be read",
+          "hook error": "hook error",
+          "pin error": "could not be moved aside",
+          "replacement": "was replaced after the identity snapshot",
+          "removal error": "locked",
+        }[outcome];
+        expect(run).toThrow(message);
+      }
+      expect(registryRead).toBe(outcome !== "snapshot error");
+      expect(checked).toBe(!["unmanaged", "snapshot error", "registry error"].includes(outcome));
+      expect(descriptor).toBeDefined();
+      expect(() => fstat(descriptor!)).toThrow("EBADF");
+      if (outcome === "replacement") expectReplacementIntact(f, commit);
+    } finally {
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+}
 
 test("unit — the pause hook alone leaves the ordinary removal intact", () => {
   const f = fixture();

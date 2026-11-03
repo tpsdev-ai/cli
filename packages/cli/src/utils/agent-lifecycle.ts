@@ -9,7 +9,7 @@
  * agentId, etc.) rather than holding global state.
  */
 
-import { existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
+import { constants, openSync, closeSync, fstatSync, existsSync, lstatSync, statSync, realpathSync, readlinkSync, readdirSync, readFileSync, mkdirSync, writeFileSync, renameSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
@@ -705,8 +705,7 @@ function worktreeAdminDir(workspace: string): string {
  * verified, plus a stat of the workspace path taken right after that marker
  * read (not atomically with it, so it may describe a directory swapped in
  * between), or the reason the worktree at the recorded path is not the one this
- * call marked. The pin compares the moved directory's device and inode with
- * this stat and re-checks its `.git` admin path and the marker after the move.
+ * call marked.
  * A marker that is absent or cannot be read is a mismatch, never a match.
  */
 function verifiedCreatedWorktree(
@@ -851,7 +850,6 @@ function createdWorktreeIdentityError(created: WorktreeCreation): string | null 
   return null;
 }
 
-/** A worktree moved to a sibling path; `removePinnedWorktree` repoints its registry entry. */
 interface PinnedWorktree {
   workspace: string;
   pinned: string;
@@ -873,8 +871,6 @@ function absent(path: string): boolean {
   }
 }
 
-/** Move a pinned worktree back, or say why restoring it from the pinned path
- *  did not happen; neither message asserts that anything remains there. */
 function restorePinnedWorktree(pin: { workspace: string; pinned: string }): { restored: boolean; detail: string } {
   try {
     if (!absent(pin.workspace)) {
@@ -887,13 +883,6 @@ function restorePinnedWorktree(pin: { workspace: string; pinned: string }): { re
   }
 }
 
-/**
- * Move the worktree at `workspace` to a sibling path, then check its device,
- * inode and `.git` admin path against the caller's values, plus the ownership
- * marker when supplied. Path-only `onStop` supplies a registry-derived admin
- * path and no ownership marker. On a failed check, attempt restoration; if
- * it fails, report the pinned path.
- */
 function pinVerifiedWorktree(
   workspace: string,
   baseWorkingTree: string,
@@ -1027,7 +1016,6 @@ function tryRemoveCreatedWorktree(
   if (identityError) {
     return { ok: false, refused: true, detail: `${identityError}; ${guidance()}` };
   }
-  // Pin the checked directory; Git receives the pinned pathname (cli#706).
   testHooks?.beforeRemoval?.(created.workspace);
   const pin = pinVerifiedWorktree(created.workspace, created.baseWorkingTree, verified, created.ownerMarker);
   if ("error" in pin) {
@@ -1074,8 +1062,7 @@ function comparablePath(path: string): string {
  * guidance to inspect it, not a Git command. Removal requires the admin
  * directory named by the worktree's `.git` file to hold the recorded marker,
  * and any recorded identity facts to still match; a missing or different
- * marker is refused with the manual command. The verified directory is then
- * moved aside in one rename, and Git is given that pinned pathname.
+ * marker is refused with the manual command.
  * A change at the pinned path during removal is not covered. Throws
  * `WorktreeLifecycleError` naming the path when removal fails; a failed Git
  * removal also carries Git's error, with a manual command only when registration
@@ -1262,29 +1249,39 @@ export function onStop(
   } catch (err) {
     throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
   }
-  let stat: ReturnType<typeof statSync>;
+  let directoryFd: number;
   try {
-    stat = statSync(workspace);
+    directoryFd = openSync(resolvedWorkspace, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
   } catch (err) {
     throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${(err as Error).message}`);
   }
-  const gitDir = trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo);
-  if (!gitDir) {
-    return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
-  }
+  try {
+    let stat: ReturnType<typeof fstatSync>;
+    try {
+      stat = fstatSync(directoryFd);
+    } catch (err) {
+      throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${(err as Error).message}`);
+    }
+    const gitDir = trustedBaseWorktreeGitDir(resolvedWorkspace, resolvedWorkspace, baseRepo);
+    if (!gitDir) {
+      return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
+    }
 
-  testHooks?.afterRegistryCheck?.(workspace);
-  testHooks?.beforeRemoval?.(workspace);
-  const pin = pinVerifiedWorktree(workspace, baseRepo, { gitDir, dev: stat.dev, ino: stat.ino }, null);
-  if ("error" in pin) {
-    throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${pin.error}`);
-  }
-  const removal = removePinnedWorktree(pin, testHooks);
-  if (!removal.ok) {
-    throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
-  }
+    testHooks?.afterRegistryCheck?.(resolvedWorkspace);
+    testHooks?.beforeRemoval?.(resolvedWorkspace);
+    const pin = pinVerifiedWorktree(resolvedWorkspace, baseRepo, { gitDir, dev: stat.dev, ino: stat.ino }, null);
+    if ("error" in pin) {
+      throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${pin.error}`);
+    }
+    const removal = removePinnedWorktree(pin, testHooks);
+    if (!removal.ok) {
+      throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
+    }
 
-  return { changed: true, reason: "worktree removed" };
+    return { changed: true, reason: "worktree removed" };
+  } finally {
+    closeSync(directoryFd);
+  }
 }
 // ── Workspace lifecycle hooks (OPS-47 Phase 2) ─────────────────────────────
 
