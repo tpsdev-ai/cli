@@ -551,7 +551,7 @@ test("unit — bound onStop refuses a worktree replaced between the ownership ch
   }
 });
 
-test("unit — path-only onStop refuses a worktree replaced between the ownership check and the removal", () => {
+test("unit — path-only onStop refuses a worktree replaced between the registry check and the removal", () => {
   const f = fixture();
   const commit = headOf(f.base);
   try {
@@ -563,7 +563,27 @@ test("unit — path-only onStop refuses a worktree replaced between the ownershi
       error = err;
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
-    expect((error as Error).message).toContain("was replaced after the ownership check");
+    expect((error as Error).message).toContain("was replaced after the identity snapshot");
+    expect(existsSync(f.workspace)).toBe(true);
+    expectReplacementIntact(f, commit);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — path-only onStop refuses a worktree replaced after the registry check and before the pin", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, undefined, { afterRegistryCheck: () => replaceWorktree(f, commit) });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("was replaced after the identity snapshot");
     expect(existsSync(f.workspace)).toBe(true);
     expectReplacementIntact(f, commit);
   } finally {

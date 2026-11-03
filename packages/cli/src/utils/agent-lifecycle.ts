@@ -306,6 +306,8 @@ const OWNERSHIP_MARKER_NAME = "tps-launch-owner";
 export interface WorktreeRemovalTestHooks {
   /** Runs after the route's verification check and before the pin. */
   beforeRemoval?: (workspace: string) => void;
+  /** Runs after path-only onStop checks the registry, before the pin. */
+  afterRegistryCheck?: (workspace: string) => void;
   /** Runs after the worktree is pinned, before Git removes it. */
   beforeGitRemoval?: (pinned: string) => void;
   /** Runs after Git reports the pinned worktree removed. */
@@ -908,7 +910,7 @@ function pinVerifiedWorktree(
   try {
     const moved = statSync(pinned);
     if (moved.dev !== verified.dev || moved.ino !== verified.ino) {
-      return { error: `the worktree at ${workspace} was replaced after the ownership check${restore()}` };
+      return { error: `the worktree at ${workspace} was replaced after the identity snapshot${restore()}` };
     }
     if (worktreeAdminDir(pinned) !== verified.gitDir) {
       return { error: `the worktree at ${workspace} no longer names the verified git directory${restore()}` };
@@ -1073,12 +1075,11 @@ function comparablePath(path: string): string {
  * directory named by the worktree's `.git` file to hold the recorded marker,
  * and any recorded identity facts to still match; a missing or different
  * marker is refused with the manual command. The verified directory is then
- * moved aside in one rename, and Git is given that pinned pathname, so a
- * worktree re-created at the workspace path between the check and the removal
- * survives.
+ * moved aside in one rename, and Git is given that pinned pathname.
  * A change at the pinned path during removal is not covered. Throws
  * `WorktreeLifecycleError` naming the path when removal fails; a failed Git
- * removal also carries Git's error and the manual command.
+ * removal also carries Git's error, with a manual command only when registration
+ * is restored or the pinned path remains the registered target.
  */
 export function removeCreatedWorktree(
   created: WorktreeCreation,
@@ -1261,17 +1262,18 @@ export function onStop(
   } catch (err) {
     throw new WorktreeLifecycleError(`worktree path could not be resolved for ${workspace}: ${(err as Error).message}`);
   }
-  const gitDir = trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo);
-  if (!gitDir) {
-    return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
-  }
-
   let stat: ReturnType<typeof statSync>;
   try {
     stat = statSync(workspace);
   } catch (err) {
     throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${(err as Error).message}`);
   }
+  const gitDir = trustedBaseWorktreeGitDir(workspace, resolvedWorkspace, baseRepo);
+  if (!gitDir) {
+    return { changed: false, reason: "workspace is not a managed worktree; leaving untouched" };
+  }
+
+  testHooks?.afterRegistryCheck?.(workspace);
   testHooks?.beforeRemoval?.(workspace);
   const pin = pinVerifiedWorktree(workspace, baseRepo, { gitDir, dev: stat.dev, ino: stat.ino }, null);
   if ("error" in pin) {
