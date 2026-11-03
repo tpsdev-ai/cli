@@ -75,21 +75,19 @@ function spawnChild(): Bun.Subprocess {
   return child;
 }
 
-/** A pid that was live and is now reaped, or null when the spawn failed or the
- *  pid was already reused at registration. */
+/** A pid that was live and is now reaped, or null when the spawn failed or
+ *  pidState(child.pid) is not "gone" at registration. */
 function reapedPid(): number | null {
   const child = spawnSync("true", []);
   if (child.pid === undefined) return null;
-  try {
-    process.kill(child.pid, 0);
-    return null;
-  } catch {
-    return child.pid;
-  }
+  return pidState(child.pid) === "gone" ? child.pid : null;
 }
 
-/** Resolved once at registration: a pid reused by then registers a visible
- *  skip; a pid reused later fails the test body in requireGonePid. */
+/** Resolved once at registration: a pid that pidState does not report as gone
+ *  registers a visible skip; a pid reused after registration fails the test
+ *  body in requireGonePid. Reuse is detected only when it is observable at one
+ *  of those two probes; a reuse that begins and ends between them is not
+ *  detected. */
 const gonePid = reapedPid();
 
 /** Re-probe a registration-time gone pid. A pid reused after registration makes
