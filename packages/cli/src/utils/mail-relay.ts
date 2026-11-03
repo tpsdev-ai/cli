@@ -18,9 +18,10 @@ import {
   rmSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, type PidState } from "@tpsdev-ai/agent";
+import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
+import { readPidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
@@ -96,9 +97,10 @@ export function deliverPendingMail(mailDir: string): number {
  * Run the relay daemon loop. Polls until SIGTERM/SIGINT.
  */
 export async function runRelayDaemon(mailDir: string): Promise<void> {
-  // Write PID file
+  // Write PID file. The record carries the kernel start token so a later stop
+  // can tell this process from an unrelated one that reused the pid.
   mkdirSync(join(homeDir(), ".tps"), { recursive: true });
-  writeFileSync(relayPidPath(), `${process.pid}\n`, "utf-8");
+  writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
 
   process.on("SIGTERM", () => {
     rmSync(relayPidPath(), { force: true });
@@ -124,18 +126,24 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
   }
 }
 
+/** Classify the relay pid file. */
+export function readRelayPidFile(): PidFileState {
+  return readPidFile(relayPidPath());
+}
+
 /** Get relay PID if running, else null. */
 export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
-  if (!existsSync(relayPidPath())) return null;
-  let pid: number;
-  try {
-    pid = parseInt(readFileSync(relayPidPath(), "utf-8").trim(), 10);
-  } catch {
-    // Unreadable: no evidence the relay is gone, so keep its pid file.
+  const state = readRelayPidFile();
+  if (state.kind === "missing" || state.kind === "unreadable") return null;
+  // Invalid and stale files name no live relay: remove them.
+  if (state.kind === "invalid" || state.kind === "stale") {
+    rmSync(state.path, { force: true });
     return null;
   }
-  // An invalid pid names no process: handle it as a missing one.
-  if (probe(pid) === "alive") return pid;
-  rmSync(relayPidPath(), { force: true });
+  if (state.kind === "running") return state.pid;
+  // A legacy record (no token) is live: report it for status/start, but stop
+  // re-reads the file and refuses to signal an unverifiable identity.
+  if (probe(state.pid) === "alive") return state.pid;
+  rmSync(state.path, { force: true });
   return null;
 }

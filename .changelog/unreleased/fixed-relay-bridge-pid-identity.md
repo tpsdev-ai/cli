@@ -1,0 +1,1 @@
+- **Relay and bridge pid files record the process start token, so a stop never signals a reused pid.** A stale record is removed; a legacy record whose identity cannot be verified is refused with the pid file named, and an EPERM from the stop signal keeps the file and exits non-zero.

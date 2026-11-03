@@ -461,7 +461,9 @@ await Promise.race([daemon, new Promise((resolve) => setTimeout(resolve, 50))]);
     );
 
     expectCleanExit(r);
-    expect(readFileSync(join(r.homeB, ".tps", "relay.pid"), "utf-8")).toBe(`${r.pid}\n`);
+    const record = JSON.parse(readFileSync(join(r.homeB, ".tps", "relay.pid"), "utf-8"));
+    expect(record.pid).toBe(r.pid);
+    expect(typeof record.startToken).toBe("string");
     expect(existsSync(join(r.startHome, ".tps"))).toBe(false);
   }, 40_000);
 });
