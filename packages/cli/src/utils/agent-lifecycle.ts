@@ -897,6 +897,9 @@ function pinVerifiedWorktree(
     return { error: `the worktree could not be moved aside for removal: ${(err as Error).message}` };
   }
   try {
+    if (!lstatSync(pinned).isDirectory()) {
+      return { error: `the worktree at ${workspace} is not a directory after it was moved aside${restore()}` };
+    }
     const moved = statSync(pinned);
     if (moved.dev !== verified.dev || moved.ino !== verified.ino) {
       return { error: `the worktree at ${workspace} was replaced after the identity snapshot${restore()}` };
@@ -1064,9 +1067,7 @@ function comparablePath(path: string): string {
  * and any recorded identity facts to still match; a missing or different
  * marker is refused with the manual command.
  * A change at the pinned path during removal is not covered. Throws
- * `WorktreeLifecycleError` naming the path when removal fails; a failed Git
- * removal also carries Git's error, with a manual command only when registration
- * is restored or the pinned path remains the registered target.
+ * `WorktreeLifecycleError` naming the path when removal fails.
  */
 export function removeCreatedWorktree(
   created: WorktreeCreation,

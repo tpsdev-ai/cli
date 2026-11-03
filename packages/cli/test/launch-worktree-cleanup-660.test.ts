@@ -31,6 +31,7 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -552,6 +553,43 @@ test("unit — bound onStop refuses a worktree replaced between the ownership ch
     expect((error as Error).message).toContain(`worktree cleanup binding changed for ${f.workspace}`);
     expect((error as Error).message).toContain(manualCommand(f));
     expectReplacementIntact(f, commit);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — path-only onStop refuses a symlink substituted after the snapshot and preserves the verified worktree", () => {
+  const f = fixture();
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    const verified = join(f.root, "verified");
+    const gitFile = readFileSync(join(f.workspace, ".git"), "utf-8");
+    const gitDir = adminDir(f.workspace);
+    const registryEntry = join(gitDir, "gitdir");
+    const registry = readFileSync(registryEntry, "utf-8");
+    const listed = worktreeList(f.base);
+    writeFileSync(join(f.workspace, "keep.txt"), "verified worktree\n");
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, undefined, {
+        beforeRemoval: () => {
+          renameSync(f.workspace, verified);
+          symlinkSync(verified, f.workspace, "dir");
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(lstatSync(verified).isDirectory()).toBe(true);
+    expect(readFileSync(join(verified, "keep.txt"), "utf-8")).toBe("verified worktree\n");
+    expect(readFileSync(join(verified, ".git"), "utf-8")).toBe(gitFile);
+    expect(existsSync(gitDir)).toBe(true);
+    expect(readFileSync(registryEntry, "utf-8")).toBe(registry);
+    expect(worktreeList(f.base)).toBe(listed);
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("is not a directory after it was moved aside");
+    expect(lstatSync(f.workspace).isSymbolicLink()).toBe(true);
+    expect(realpathSync(f.workspace)).toBe(verified);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
