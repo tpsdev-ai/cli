@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -31,9 +31,9 @@ function spawnChild(): Bun.Subprocess {
 }
 
 /** A pid that was live and is now reaped, or null when the OS reused it. */
-async function gonePid(): Promise<number | null> {
-  const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
-  await child.exited;
+function reapedPid(): number | null {
+  const child = spawnSync("true", []);
+  if (child.pid === undefined) return null;
   try {
     process.kill(child.pid, 0);
     return null;
@@ -42,9 +42,8 @@ async function gonePid(): Promise<number | null> {
   }
 }
 
-function skipGonePid(): void {
-  console.warn("SKIP: the reaped pid was reused before the assertion; the gone-pid case was not exercised");
-}
+/** Resolved once at registration so a reused pid registers a visible skip. */
+const gonePid = reapedPid();
 
 function relayRecord(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
@@ -52,10 +51,19 @@ function relayRecord(pid: number, token: string | null): string {
 
 function captureLogs(): { logs: string[]; restore: () => void } {
   const logs: string[] = [];
-  const spy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+  const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
     logs.push(args.join(" "));
   });
-  return { logs, restore: () => spy.mockRestore() };
+  const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    logs.push(args.join(" "));
+  });
+  return {
+    logs,
+    restore: () => {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    },
+  };
 }
 
 afterEach(() => {
@@ -158,15 +166,10 @@ describe("relay stop identity", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(gonePid === null)(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      const gone = await gonePid();
-      if (gone === null) {
-        skipGonePid();
-        return;
-      }
-      writeFileSync(relayPid, `${gone}\n`);
+      writeFileSync(relayPid, `${gonePid}\n`);
       const signals: number[] = [];
       const previous = setRelayStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -423,15 +426,10 @@ describe("bridge stop identity", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(gonePid === null)(
     "a legacy file whose pid is gone is removed as stale",
     async () => {
-      const gone = await gonePid();
-      if (gone === null) {
-        skipGonePid();
-        return;
-      }
-      writeFileSync(bridgePid, JSON.stringify({ pid: gone, port: 7891 }));
+      writeFileSync(bridgePid, JSON.stringify({ pid: gonePid, port: 7891 }));
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -481,7 +479,7 @@ describe("bridge stop identity", () => {
   );
 
   test(
-    "a verified stop keeps an unverifiable second record and reports it",
+    "a verified stop keeps an unverifiable second record, reports it, and exits non-zero",
     async () => {
       const verified = spawnChild();
       const unverified = spawnChild();
@@ -496,7 +494,9 @@ describe("bridge stop identity", () => {
       });
       const { logs, restore } = captureLogs();
       try {
-        await runBridge({ action: "stop" });
+        await expect(runBridge({ action: "stop" })).rejects.toThrow(
+          /identity cannot be verified/,
+        );
       } finally {
         restore();
         setBridgeStopSignal(previous);
@@ -512,19 +512,14 @@ describe("bridge stop identity", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(gonePid === null)(
     "a verified record and a stale record are both removed",
     async () => {
       const verified = spawnChild();
-      const gone = await gonePid();
-      if (gone === null) {
-        skipGonePid();
-        return;
-      }
       const token = processStartToken(verified.pid);
       expect(token).not.toBeNull();
       writeFileSync(bridgePid, relayRecord(verified.pid, token));
-      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gone, port: 7891 })}\n`);
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gonePid, port: 7891 })}\n`);
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => {
         signals.push(pid);
@@ -539,6 +534,72 @@ describe("bridge stop identity", () => {
       expect(signals).toEqual([verified.pid]);
       expect(existsSync(bridgePid)).toBe(false);
       expect(existsSync(legacyBridgePid)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(gonePid === null)(
+    "an EPERM on the first record still removes a later stale record and reports both",
+    async () => {
+      const child = spawnChild();
+      const token = processStartToken(child.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(child.pid, token));
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: gonePid, port: 7891 })}\n`);
+      // Same construction as the single-record EPERM case: a signal sender that
+      // raises EPERM, which is deterministic on every uid.
+      const previous = setBridgeStopSignal(() => {
+        throw Object.assign(new Error("EPERM"), { code: "EPERM" });
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await expect(runBridge({ action: "stop" })).rejects.toThrow(
+          new RegExp(`could not be stopped \\(pid ${child.pid}\\)`),
+        );
+      } finally {
+        restore();
+        setBridgeStopSignal(previous);
+      }
+
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(existsSync(legacyBridgePid)).toBe(false);
+      expect(logs.join("\n")).toContain(`could not be stopped (pid ${child.pid})`);
+      expect(logs.join("\n")).toContain(legacyBridgePid);
+      expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an exit timeout on the first record still keeps and reports a later unverified record",
+    async () => {
+      const first = spawnChild();
+      const token = processStartToken(first.pid);
+      expect(token).not.toBeNull();
+      writeFileSync(bridgePid, relayRecord(first.pid, token));
+      const second = spawnChild();
+      writeFileSync(legacyBridgePid, `${JSON.stringify({ pid: second.pid, port: 7891 })}\n`);
+      // The signal is accepted, but this sender does not terminate the process,
+      // so the stop's exit wait times out.
+      const previous = setBridgeStopSignal(() => {});
+      const { logs, restore } = captureLogs();
+      try {
+        await expect(runBridge({ action: "stop" })).rejects.toThrow(
+          new RegExp(`could not be stopped \\(pid ${first.pid}\\)`),
+        );
+      } finally {
+        restore();
+        setBridgeStopSignal(previous);
+      }
+
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(existsSync(legacyBridgePid)).toBe(true);
+      expect(logs.join("\n")).toContain(`could not be stopped (pid ${first.pid})`);
+      expect(logs.join("\n")).toContain(legacyBridgePid);
+      expect(logs.join("\n")).toMatch(/identity cannot be verified/i);
+      expect(pidState(first.pid)).toBe("alive");
+      expect(pidState(second.pid)).toBe("alive");
     },
     TIMEOUT,
   );
@@ -711,6 +772,96 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
       expect(result.stdout).toMatch(/stale pid file removed/i);
       expect(existsSync(bridgePid)).toBe(false);
       expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("unreadable pid files", () => {
+  test(
+    "relay stop with a directory at the pid path exits non-zero, names it, and keeps it",
+    () => {
+      mkdirSync(relayPid);
+      const result = spawnSync("node", [TPS_BIN, "mail", "relay", "stop"], {
+        env: { ...process.env, HOME: home },
+        encoding: "utf8",
+        timeout: TIMEOUT,
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(relayPid);
+      expect(result.stderr).toMatch(/could not be read/);
+      expect(existsSync(relayPid)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "bridge stop with a directory at the pid path exits non-zero, names it, and keeps it",
+    () => {
+      mkdirSync(bridgePid);
+      const result = spawnSync("node", [TPS_BIN, "bridge", "stop"], {
+        env: { ...process.env, HOME: home },
+        encoding: "utf8",
+        timeout: TIMEOUT,
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(bridgePid);
+      expect(result.stderr).toMatch(/could not be read/);
+      expect(existsSync(bridgePid)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  // Root ignores mode 000, so this case registers a visible skip rather than
+  // asserting a read failure that cannot happen for uid 0.
+  test.skipIf(process.getuid?.() === 0)(
+    "relay stop with an unsearchable parent directory exits non-zero and names the file",
+    () => {
+      writeFileSync(relayPid, "1\n");
+      const runDir = join(home, ".tps");
+      let result: ReturnType<typeof spawnSync>;
+      chmodSync(runDir, 0o000);
+      try {
+        result = spawnSync("node", [TPS_BIN, "mail", "relay", "stop"], {
+          env: { ...process.env, HOME: home },
+          encoding: "utf8",
+          timeout: TIMEOUT,
+        });
+      } finally {
+        chmodSync(runDir, 0o700);
+      }
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(relayPid);
+      expect(result.stderr).toMatch(/could not be read/);
+      expect(existsSync(relayPid)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(process.getuid?.() === 0)(
+    "bridge stop with an unsearchable parent directory exits non-zero and names the file",
+    () => {
+      writeFileSync(bridgePid, JSON.stringify({ pid: 1, port: 7891 }));
+      const runDir = join(home, ".tps", "run");
+      let result: ReturnType<typeof spawnSync>;
+      chmodSync(runDir, 0o000);
+      try {
+        result = spawnSync("node", [TPS_BIN, "bridge", "stop"], {
+          env: { ...process.env, HOME: home },
+          encoding: "utf8",
+          timeout: TIMEOUT,
+        });
+      } finally {
+        chmodSync(runDir, 0o700);
+      }
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(bridgePid);
+      expect(result.stderr).toMatch(/could not be read/);
+      expect(existsSync(bridgePid)).toBe(true);
     },
     TIMEOUT,
   );

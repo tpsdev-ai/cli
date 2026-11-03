@@ -13,17 +13,16 @@
  * (the bridge used to write `{pid, adapter}`). It names a process but cannot
  * prove that process is the one that wrote the file.
  *
- * A text pid file must be a trimmed whole positive decimal pid (`^[1-9]\d*$`):
- * an integer prefix, an exponent form, a second line, an empty file and a
- * non-numeric value are all invalid. A JSON record's `pid` is the parsed
- * top-level value: it must be a number, an integer, and within
- * 1..2147483647. Nested objects and text elsewhere in the file are ignored.
+ * Accepted forms: surrounding whitespace is trimmed; the content is either a
+ * bare decimal integer 1..2147483647, or a JSON object whose top-level `pid` is
+ * such an integer and whose `startToken` is a non-empty string, null or absent.
+ * Other JSON fields are ignored. Anything else is invalid.
  *
  * A JSON record is classified by one JSON.parse, so a duplicate key has one
  * interpretation: the last one.
  */
 
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync } from "node:fs";
 import { processIsGone, processStartToken } from "@tpsdev-ai/agent";
 
 export interface PidRecord {
@@ -71,7 +70,13 @@ function parseJsonRecord(text: string): ParsedPidFile {
   return { kind: "record", pid, startToken: typeof token === "string" ? token : null };
 }
 
-/** Parse relay and bridge pid-file content. Nothing else is accepted. */
+/**
+ * Parse relay and bridge pid-file content. Accepted: after trimming surrounding
+ * whitespace, a bare decimal integer 1..2147483647, or a JSON object whose
+ * top-level `pid` is such an integer and whose `startToken` is a non-empty
+ * string, null or absent. Other JSON fields are ignored; anything else is
+ * invalid.
+ */
 export function parsePidFile(raw: string): ParsedPidFile {
   const text = raw.trim();
   if (text === "") return invalid("empty");
@@ -113,19 +118,19 @@ export type PidFileState =
  * "stale" — the recorded process is gone, or its pid is alive with a different
  * start token from the same source (`processIsGone`). "running" — the pid is
  * alive and its current start token equals the recorded one. "unverified" —
- * the pid is live but its identity cannot be checked or does not match a token
- * from another source; a caller must not signal it. A pid outside
- * 1..2147483647 is "invalid", never "unverified".
+ * the pid is not proven gone and its identity is not confirmed; a caller must
+ * not signal it. A pid outside 1..2147483647 is "invalid", never
+ * "unverified".
  */
 export function readPidFile(
   path: string,
   resolveToken: (pid: number) => string | null = processStartToken,
 ): PidFileState {
-  if (!existsSync(path)) return { kind: "missing" };
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
     // No evidence the process is gone: keep the file and refuse to signal.
     return { kind: "unreadable", path };
   }

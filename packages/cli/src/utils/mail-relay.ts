@@ -105,8 +105,9 @@ function removeOwnPidFile(): void {
  * Run the relay daemon loop. Polls until SIGTERM/SIGINT.
  */
 export async function runRelayDaemon(mailDir: string): Promise<void> {
-  // Write PID file. The record carries the kernel start token so a later stop
-  // can tell this process from an unrelated one that reused the pid.
+  // Write the pid file. The writer attempts to record a start token; the agent
+  // API may return null or a token derived from ps, so the record can carry
+  // either and a later stop compares what was written.
   mkdirSync(join(homeDir(), ".tps"), { recursive: true });
   writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
 
@@ -143,14 +144,16 @@ export function readRelayPidFile(): PidFileState {
 export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
   const state = readRelayPidFile();
   if (state.kind === "missing" || state.kind === "unreadable") return null;
-  // Invalid and stale files name no live relay: remove them.
+  // Invalid content may name a live pid, and a stale record no longer matches
+  // the process holding its pid; remove the file, but report neither as running.
   if (state.kind === "invalid" || state.kind === "stale") {
     removePidFile(state.path);
     return null;
   }
   if (state.kind === "running") return state.pid;
-  // A legacy record (no token) is live: report it for status/start, but stop
-  // re-reads the file and refuses to signal an unverifiable identity.
+  // An unverified record is not proven gone and its identity is not confirmed:
+  // it may carry a non-null token that does not match. Report it for
+  // status/start; stop re-reads the file and refuses to signal it.
   if (probe(state.pid) === "alive") return state.pid;
   removePidFile(state.path);
   return null;

@@ -147,20 +147,21 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         console.log("Bridge is not running.");
         break;
       }
-      // Classify every record before acting on any of them.
-      const kept: string[] = [];
+      // Classify every record before acting on any of them, then handle each
+      // one independently: one failure must not skip a later record.
+      const failures: string[] = [];
       const stopped = new Set<number>();
       for (const entry of files) {
         const state = entry.state;
         if (state.kind === "missing") continue;
         if (state.kind === "unreadable") {
-          kept.push(
+          failures.push(
             `Bridge pid file ${state.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
           );
           continue;
         }
         if (state.kind === "unverified") {
-          kept.push(
+          failures.push(
             `Bridge pid file ${state.path} names pid ${state.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${state.path} if the bridge is not running.`,
           );
           continue;
@@ -176,7 +177,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         if (stopped.has(state.pid)) {
           // The same process was already stopped through another record.
           if (pidState(state.pid) !== "gone") {
-            kept.push(
+            failures.push(
               `Bridge pid file ${state.path} names pid ${state.pid}, which is no longer proven gone; the pid file was kept.`,
             );
             continue;
@@ -194,7 +195,8 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           // EPERM means the process exists and this user may not signal it: keep
           // the pid file and fail with the operator's recovery path.
           if (pidStateFromProbeError(error) === "alive") {
-            throw new Error(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+            failures.push(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+            continue;
           }
           if (removePidFile(state.path) === "removed") {
             console.log(`Stale pid file removed: ${state.path}.`);
@@ -204,7 +206,8 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           continue;
         }
         if (!(await waitForBridgeExit(state.pid))) {
-          throw new Error(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+          failures.push(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
+          continue;
         }
         stopped.add(state.pid);
         if (removePidFile(state.path) === "removed") {
@@ -213,9 +216,11 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           console.log(`Bridge (pid ${state.pid}) stopped; pid file already gone: ${state.path}.`);
         }
       }
-      if (kept.length > 0) {
-        if (stopped.size === 0) throw new Error(kept.join(" "));
-        for (const line of kept) console.log(line);
+      if (failures.length > 0) {
+        // Print every outcome; the aggregate error makes the command exit
+        // non-zero after all records have been handled.
+        for (const line of failures) console.error(line);
+        throw new Error(failures.join(" "));
       }
       break;
     }
