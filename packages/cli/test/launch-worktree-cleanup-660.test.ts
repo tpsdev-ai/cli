@@ -551,6 +551,26 @@ test("unit — bound onStop refuses a worktree replaced between the ownership ch
   }
 });
 
+test("unit — path-only onStop refuses a worktree replaced between the ownership check and the removal", () => {
+  const f = fixture();
+  const commit = headOf(f.base);
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    let error: unknown;
+    try {
+      onStop("agent-a", f.workspace, undefined, { beforeRemoval: () => replaceWorktree(f, commit) });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("was replaced after the ownership check");
+    expect(existsSync(f.workspace)).toBe(true);
+    expectReplacementIntact(f, commit);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("unit — the pause hook alone leaves the ordinary removal intact", () => {
   const f = fixture();
   try {
