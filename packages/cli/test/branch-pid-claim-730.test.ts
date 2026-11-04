@@ -1,7 +1,8 @@
 /**
  * cli#730 — the branch pid record is claimed and removed only while the
- * branch pid lock is held. These tests drive the real CLI and real daemons
- * under a temp HOME; the pause seam is enabled by TPS_BRANCH_TEST_PAUSE_DIR.
+ * branch pid lock is held, including by `tps office kill`. These tests drive
+ * the real CLI and real daemons under a temp HOME; the pause seam is enabled
+ * by TPS_BRANCH_TEST_PAUSE_DIR.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -73,6 +74,21 @@ function launcherEnv(phase: string): NodeJS.ProcessEnv {
   delete env.NODE_ENV;
   delete env.TPS_BRANCH_DAEMON;
   delete env.TPS_BRANCH_NO_DAEMON;
+  return env;
+}
+
+/** All pause phases, no launcher/daemon overrides. */
+function allPhasesEnv(): NodeJS.ProcessEnv {
+  const env = launcherEnv("unused");
+  delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+  return env;
+}
+
+/** No pause and no launcher/daemon overrides. */
+function plainEnv(): NodeJS.ProcessEnv {
+  const env = launcherEnv("unused");
+  delete env.TPS_BRANCH_TEST_PAUSE_DIR;
+  delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
   return env;
 }
 
@@ -356,5 +372,60 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(newer.pid);
     expect(pidState(newer.pid!)).toBe("alive");
+  }, 40_000);
+
+  test("office kill preserves a launcher's replacement of a stale record it decided on", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const stale = reapedPid();
+    writeFileSync(pidFile, serializePidRecord(stale, null));
+
+    const kill = spawn("node", [TPS_BIN, "office", "kill"], {
+      env: allPhasesEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(kill);
+    let stderr = "";
+    kill.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const exited = waitForExit(kill);
+
+    await waitForReady("office-kill-branch-before-decision");
+    const decisionProbe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (decisionProbe !== null) decisionProbe.release();
+    expect(decisionProbe).toBeNull();
+    release("office-kill-branch-before-decision");
+
+    await waitForReady("office-kill-branch-before-unlink");
+    const waitProbe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (waitProbe !== null) waitProbe.release();
+    expect(waitProbe).not.toBeNull();
+
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env: plainEnv(),
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    children.push(launcher);
+    const launched = await waitForRunningRecord();
+    daemons.push(launched.pid);
+    const replacement = readFileSync(pidFile, "utf8");
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    release("office-kill-branch-before-unlink");
+
+    await waitForReady("office-kill-branch-before-removal");
+    const removalProbe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (removalProbe !== null) removalProbe.release();
+    expect(removalProbe).toBeNull();
+    release("office-kill-branch-before-removal");
+
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr).toContain(`Branch pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
+    expect(readFileSync(pidFile, "utf8")).toBe(replacement);
+    const state = readPidFile(pidFile);
+    expect(state.kind).toBe("running");
+    if (state.kind === "running") expect(state.pid).toBe(launched.pid);
+    expect(pidState(launched.pid)).toBe("alive");
   }, 40_000);
 });

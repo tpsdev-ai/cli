@@ -155,12 +155,12 @@ export function branchPidLockRoot(path: string = pidPath()): string {
  * `acquireMailLockSync` refuses nested acquisition and reclaims a dead owner;
  * a timeout is a refusal, never a proceed.
  */
-function withBranchPidLock<T>(path: string, action: string, fn: () => T): T {
+export function withBranchPidLock<T>(path: string, action: string, fn: () => T): T {
   const lockDir = mailLockPath(branchPidLockRoot(path));
   const lock = acquireMailLockSync(branchPidLockRoot(path), { timeoutMs: BRANCH_PID_LOCK_TIMEOUT_MS });
   if (lock === null) {
     throw new Error(
-      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. Confirm no branch launcher or daemon is running, then remove ${lockDir} and retry.`,
+      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. The lock is held by another tps command; retry after it finishes.`,
     );
   }
   try {
@@ -175,7 +175,7 @@ function withBranchPidLock<T>(path: string, action: string, fn: () => T): T {
  * phase's `go` file. Set TPS_BRANCH_TEST_PAUSE_DIR to enable; set
  * TPS_BRANCH_TEST_PAUSE_PHASE to pause at one phase only.
  */
-function branchTestPause(phase: string, path: string): void {
+export function branchTestPause(phase: string, path: string): void {
   const dir = process.env.TPS_BRANCH_TEST_PAUSE_DIR;
   if (dir === undefined) return;
   const wanted = process.env.TPS_BRANCH_TEST_PAUSE_PHASE;
@@ -192,12 +192,12 @@ function branchTestPause(phase: string, path: string): void {
   }
 }
 
-interface PidRecordSnapshot {
+export interface PidRecordSnapshot {
   state: PidFileState;
   raw: string | null;
 }
 
-function snapshotPidRecord(path: string): PidRecordSnapshot {
+export function snapshotPidRecord(path: string): PidRecordSnapshot {
   let raw: string | null = null;
   const state = readPidFile(path, processStartToken, (text) => {
     raw = text;

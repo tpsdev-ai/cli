@@ -6,7 +6,7 @@ import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { connectionAlive, listHostStatePaths, listHostStates } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
-import { pidPath as branchPidPath } from "./branch.js";
+import { branchTestPause, pidPath as branchPidPath, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -1037,10 +1037,102 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
       };
 
+      const stopBranchRecord = async (path: string): Promise<void> => {
+        type BranchDecision =
+          | { kind: "done" }
+          | { kind: "remove"; pid: number; snapshot: PidRecordSnapshot }
+          | { kind: "signal"; pid: number; snapshot: PidRecordSnapshot };
+
+        const decision: BranchDecision = withBranchPidLock(path, "stop the branch daemon", () => {
+          branchTestPause("office-kill-branch-before-decision", path);
+          const current = snapshotPidRecord(path);
+          const state = current.state;
+          if (state.kind === "missing") return { kind: "done" };
+          if (state.kind === "unreadable") {
+            failures.push(
+              `Branch pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if that process is not running.`,
+            );
+            return { kind: "done" };
+          }
+          if (state.kind === "invalid") {
+            failures.push(`Branch pid file ${state.path} could not be parsed (${state.reason}); the record was kept.`);
+            return { kind: "done" };
+          }
+          if (state.kind === "unverified") {
+            failures.push(refusal("Branch pid file", state.pid, state.path));
+            return { kind: "done" };
+          }
+          if (state.kind === "stale") return { kind: "remove", pid: state.pid, snapshot: current };
+          return { kind: "signal", pid: state.pid, snapshot: current };
+        });
+
+        if (decision.kind === "done") return;
+
+        const removeIfUnchanged = (snapshot: PidRecordSnapshot, pid: number, removed: string, gone: string): void => {
+          branchTestPause("office-kill-branch-before-unlink", path);
+          const removal = withBranchPidLock(path, "remove the branch pid record", () => {
+            branchTestPause("office-kill-branch-before-removal", path);
+            const current = snapshotPidRecord(path);
+            // Missing is not a replacement: a stopped daemon's own shutdown
+            // removes the record. Only a record that is still there and
+            // differs is a replacement.
+            if (current.raw !== null && current.raw !== snapshot.raw) return "changed" as const;
+            return removeRecord(path);
+          });
+          if (removal === "changed") {
+            failures.push(`Branch pid file ${path} changed (replaced or removed); this command removed nothing.`);
+          } else if (removal === "removed") {
+            console.log(removed);
+          } else if (removal === "already gone") {
+            console.log(gone);
+          }
+        };
+
+        if (decision.kind === "remove") {
+          removeIfUnchanged(
+            decision.snapshot,
+            decision.pid,
+            `Stale branch pid file removed: ${path}; pid ${decision.pid} was not signalled.`,
+            `Pid record already gone: ${path}; pid ${decision.pid} was not signalled.`,
+          );
+          return;
+        }
+
+        try {
+          sendOfficeKillSignal(decision.pid);
+        } catch (error) {
+          // Classify the SIGTERM error itself (ESRCH means the process is gone);
+          // this is not a fresh probe. EPERM ("alive") and any other result
+          // keep the record and report it.
+          if (pidStateFromProbeError(error) !== "gone") {
+            failures.push(`Branch pid file could not be stopped (pid ${decision.pid}); record kept at ${path}.`);
+            return;
+          }
+          removeIfUnchanged(
+            decision.snapshot,
+            decision.pid,
+            `Stale branch pid file removed: ${path}; pid ${decision.pid} was not signalled.`,
+            `Pid record already gone: ${path}; pid ${decision.pid} was not signalled.`,
+          );
+          return;
+        }
+        if (!(await waitForKillExit(decision.pid))) {
+          failures.push(`Branch pid file could not be stopped (pid ${decision.pid}); record kept at ${path}.`);
+          return;
+        }
+        killed++;
+        removeIfUnchanged(
+          decision.snapshot,
+          decision.pid,
+          `Branch pid file (pid ${decision.pid}) stopped; record removed: ${path}.`,
+          `Branch pid file (pid ${decision.pid}) stopped; record already gone: ${path}.`,
+        );
+      };
+
       for (const path of listing.paths) {
         await stopRecord("Host state record", path);
       }
-      await stopRecord("Branch pid file", branchPidPath());
+      await stopBranchRecord(branchPidPath());
 
       if (failures.length > 0) {
         // Print every failure; the aggregate error makes the command exit
