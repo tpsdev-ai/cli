@@ -14,7 +14,7 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
-import { readFileSync, readdirSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homeDir } from "./home.js";
 import { readPidFile, type PidFileState } from "./pid-file.js";
@@ -31,9 +31,11 @@ export interface BridgeConfig {
   defaultAgentId?: string;
 }
 
+export type BridgePidEntryState = PidFileState | { kind: "not-regular"; path: string };
+
 export interface BridgePidFileEntry {
   path: string;
-  state: PidFileState;
+  state: BridgePidEntryState;
   port?: number;
   adapter: string;
 }
@@ -43,6 +45,34 @@ export interface BridgePidFileEntry {
  *  `mail-bridge.pid` is treated as the OpenClaw bridge. */
 const BRIDGE_PID_NAME = /^(?:bridge-([a-z]+)|mail-bridge)\.pid$/;
 const LEGACY_ADAPTER = "openclaw";
+/** The OpenClaw records, in the order the start check reads them. */
+const OPENCLAW_PID_NAMES = ["bridge-openclaw.pid", "mail-bridge.pid"] as const;
+
+/** Classify one record path. A non-regular entry is never read: reading a
+ *  FIFO blocks until a writer opens it. */
+function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntry | null {
+  let isFile: boolean;
+  try {
+    isFile = lstatSync(path).isFile();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return null;
+    throw new Error(
+      `Bridge pid file ${path} could not be inspected (${code}); no bridge pid record can be checked.`,
+    );
+  }
+  if (!isFile) return { path, state: { kind: "not-regular", path }, adapter };
+  const state = readPidFile(path);
+  if (state.kind === "missing") return null;
+  let port: number | undefined;
+  try {
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    if (typeof raw.port === "number") port = raw.port;
+  } catch {
+    /* not JSON, or unreadable — the pid state is what this reader decides on */
+  }
+  return { path, state, port, adapter };
+}
 
 /** The bridge pid records discovery accepts, with their strict classification. */
 export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
@@ -61,17 +91,20 @@ export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   for (const name of names.filter((entry) => BRIDGE_PID_NAME.test(entry)).sort()) {
     const recordAdapter = BRIDGE_PID_NAME.exec(name)?.[1] ?? LEGACY_ADAPTER;
     if (adapter !== undefined && recordAdapter !== adapter) continue;
-    const path = join(pidDir, name);
-    const state = readPidFile(path);
-    if (state.kind === "missing") continue;
-    let port: number | undefined;
-    try {
-      const raw = JSON.parse(readFileSync(path, "utf-8"));
-      if (typeof raw.port === "number") port = raw.port;
-    } catch {
-      /* not JSON, or unreadable — the pid state is what this reader decides on */
-    }
-    entries.push({ path, state, port, adapter: recordAdapter });
+    const entry = classifyBridgePidFile(join(pidDir, name), recordAdapter);
+    if (entry) entries.push(entry);
+  }
+  return entries;
+}
+
+/** The two OpenClaw records, read by name. This does not list the run
+ *  directory, so a directory that cannot be listed does not affect it. */
+export function openClawBridgePidFiles(): BridgePidFileEntry[] {
+  const pidDir = join(homeDir(), ".tps", "run");
+  const entries: BridgePidFileEntry[] = [];
+  for (const name of OPENCLAW_PID_NAMES) {
+    const entry = classifyBridgePidFile(join(pidDir, name), LEGACY_ADAPTER);
+    if (entry) entries.push(entry);
   }
   return entries;
 }
@@ -82,13 +115,12 @@ export interface BridgeRunningRecord {
   port?: number;
 }
 
-/** Every running bridge record discovery accepts, optionally for one adapter. */
-export function bridgeRunningRecords(
-  probe: (pid: number) => PidState = pidState,
-  adapter?: string,
+function runningRecordsFrom(
+  entries: BridgePidFileEntry[],
+  probe: (pid: number) => PidState,
 ): BridgeRunningRecord[] {
   const running: BridgeRunningRecord[] = [];
-  for (const entry of bridgePidFiles(adapter)) {
+  for (const entry of entries) {
     const { state, port } = entry;
     let pid: number | undefined;
     if (state.kind === "running") pid = state.pid;
@@ -99,11 +131,10 @@ export function bridgeRunningRecords(
   return running;
 }
 
-export function bridgeStatus(
-  probe: (pid: number) => PidState = pidState,
-  adapter?: string,
+function statusOf(
+  records: BridgeRunningRecord[],
 ): { running: boolean; pid?: number; port?: number; adapter?: string } {
-  const [first] = bridgeRunningRecords(probe, adapter);
+  const [first] = records;
   if (!first) return { running: false };
   const status: { running: boolean; pid?: number; port?: number; adapter?: string } = {
     running: true,
@@ -112,6 +143,37 @@ export function bridgeStatus(
   };
   if (first.port !== undefined) status.port = first.port;
   return status;
+}
+
+/** Every running bridge record discovery accepts, optionally for one adapter. */
+export function bridgeRunningRecords(
+  probe: (pid: number) => PidState = pidState,
+  adapter?: string,
+): BridgeRunningRecord[] {
+  return runningRecordsFrom(bridgePidFiles(adapter), probe);
+}
+
+/** Status for one adapter's records. `adapter` is required so the result never
+ *  describes an arbitrary record discovered for another adapter. */
+export function bridgeStatus(
+  adapter: string,
+  probe: (pid: number) => PidState = pidState,
+): { running: boolean; pid?: number; port?: number; adapter?: string } {
+  return statusOf(runningRecordsFrom(bridgePidFiles(adapter), probe));
+}
+
+/** Status of the OpenClaw records, read by name. Throws when either path
+ *  exists but is not a regular file: an unreadable record never licenses a
+ *  start. */
+export function openClawBridgeStatus(
+  probe: (pid: number) => PidState = pidState,
+): { running: boolean; pid?: number; port?: number; adapter?: string } {
+  const entries = openClawBridgePidFiles();
+  const notRegular = entries.find((entry) => entry.state.kind === "not-regular");
+  if (notRegular) {
+    throw new Error(`Bridge pid file ${notRegular.path} is not a regular file; refusing to start.`);
+  }
+  return statusOf(runningRecordsFrom(entries, probe));
 }
 
 export function startBridgeDaemon(config: BridgeConfig = {}): void {

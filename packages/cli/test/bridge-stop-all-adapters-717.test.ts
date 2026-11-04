@@ -7,12 +7,12 @@
  * per-record reporting as the openclaw record.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
-import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
+import { bridgePidFiles, bridgeRunningRecords, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
@@ -50,8 +50,13 @@ mock.module(${JSON.stringify(MAIL_BRIDGE_URL)}, () => ({
   startBridgeDaemon: () => { started += 1; },
 }));
 const { runBridge } = await import(${JSON.stringify(COMMANDS_URL)});
-await runBridge({ action: "start" });
-console.log(JSON.stringify({ started }));
+try {
+  await runBridge({ action: "start" });
+  console.log(JSON.stringify({ started }));
+} catch (error) {
+  console.log(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }));
+  process.exitCode = 1;
+}
 `;
 
 let home: string;
@@ -99,13 +104,13 @@ async function startStdioBridge(): Promise<Bun.Subprocess> {
   return child;
 }
 
-/** Run the openclaw start path and return what it printed. */
-async function runStartDecision(): Promise<string> {
+/** Run the openclaw start path and return what it printed and its exit code. */
+async function runStartDecision(): Promise<{ stdout: string; exitCode: number }> {
   const script = join(home, "start-openclaw.mts");
   writeFileSync(script, START_CHILD);
   const child = spawnScript(script, {});
-  await child.exited;
-  return new Response(child.stdout).text();
+  const exitCode = await child.exited;
+  return { stdout: await new Response(child.stdout).text(), exitCode };
 }
 
 function record(pid: number, token: string | null): string {
@@ -148,7 +153,7 @@ describe("bridge stop finds the discovered bridge pid records", () => {
       const child = await startStdioBridge();
       expect(basename(stdioPid)).toBe("bridge-stdio.pid");
       expect(readPidFile(stdioPid).kind).toBe("running");
-      expect(bridgeStatus()).toEqual({ running: true, pid: child.pid, adapter: "stdio" });
+      expect(bridgeStatus("stdio", pidState)).toEqual({ running: true, pid: child.pid, adapter: "stdio" });
 
       await runBridge({ action: "stop" });
       await child.exited;
@@ -209,7 +214,7 @@ describe("bridge stop finds the discovered bridge pid records", () => {
         (error: Error) => error,
       );
       expect(stopError?.message).toContain(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
-      expect(() => bridgeStatus()).toThrow(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
+      expect(() => bridgeStatus("openclaw")).toThrow(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
     },
     TIMEOUT,
   );
@@ -256,12 +261,30 @@ describe("bridge start checks only the OpenClaw records", () => {
     async () => {
       await startStdioBridge();
 
-      const stdout = await runStartDecision();
+      const { stdout, exitCode } = await runStartDecision();
 
+      expect(exitCode).toBe(0);
       expect(stdout).toContain('"started":1');
       expect(stdout).not.toContain("Bridge already running");
     },
     TIMEOUT,
+  );
+
+  test(
+    "a run directory that cannot be listed does not refuse the openclaw start path",
+    async () => {
+      chmodSync(runDir, 0o300);
+      try {
+        const { stdout, exitCode } = await runStartDecision();
+
+        expect(exitCode).toBe(0);
+        expect(stdout).toContain('"started":1');
+        expect(stdout).not.toContain("Bridge already running");
+      } finally {
+        chmodSync(runDir, 0o700);
+      }
+    },
+    10_000,
   );
 
   for (const name of ["bridge-openclaw.pid", "mail-bridge.pid"]) {
@@ -271,23 +294,44 @@ describe("bridge start checks only the OpenClaw records", () => {
         const child = spawnSleep();
         writeFileSync(join(runDir, name), record(child.pid, tokenOf(child.pid)));
 
-        const stdout = await runStartDecision();
+        const { stdout, exitCode } = await runStartDecision();
 
+        expect(exitCode).toBe(0);
         expect(stdout).toContain("Bridge already running");
         expect(stdout).not.toContain('"started"');
       },
       TIMEOUT,
     );
   }
+
+  test(
+    "a non-regular OpenClaw record refuses the start and names the path",
+    async () => {
+      const openclawPid = join(runDir, "bridge-openclaw.pid");
+      mkdirSync(openclawPid);
+
+      const { stdout, exitCode } = await runStartDecision();
+
+      expect(exitCode).toBe(1);
+      expect(stdout).toContain(
+        JSON.stringify({ error: `Bridge pid file ${openclawPid} is not a regular file; refusing to start.` }),
+      );
+      expect(stdout).not.toContain('"started"');
+    },
+    TIMEOUT,
+  );
 });
 
 describe("bridge status names the adapter of each running record", () => {
   test(
-    "human output names the running adapters",
+    "human output names the running adapters and omits a port the record does not have",
     async () => {
       const stdio = await startStdioBridge();
       const openclaw = spawnSleep();
-      writeFileSync(join(runDir, "bridge-openclaw.pid"), record(openclaw.pid, tokenOf(openclaw.pid)));
+      writeFileSync(
+        join(runDir, "bridge-openclaw.pid"),
+        `${JSON.stringify({ pid: openclaw.pid, startToken: tokenOf(openclaw.pid), port: 7891 })}\n`,
+      );
 
       const lines: string[] = [];
       const restore = patchShared(console, "log", (...args: unknown[]) => {
@@ -300,8 +344,8 @@ describe("bridge status names the adapter of each running record", () => {
       }
 
       expect(lines).toEqual([
-        `Bridge running: adapter=openclaw, pid=${openclaw.pid}, port=undefined`,
-        `Bridge running: adapter=stdio, pid=${stdio.pid}, port=undefined`,
+        `Bridge running: adapter=openclaw, pid=${openclaw.pid}, port=7891`,
+        `Bridge running: adapter=stdio, pid=${stdio.pid}`,
       ]);
     },
     TIMEOUT,
@@ -338,7 +382,7 @@ describe("bridge status names the adapter of each running record", () => {
   );
 
   test(
-    "json lists each running adapter",
+    "json lists each running adapter under the OpenClaw fields",
     async () => {
       const discord = spawnSleep();
       const openclaw = spawnSleep();
@@ -357,11 +401,64 @@ describe("bridge status names the adapter of each running record", () => {
 
       const status = JSON.parse(lines[0]);
       expect(status.running).toBe(true);
+      expect(status.pid).toBe(openclaw.pid);
+      expect(status.adapter).toBe("openclaw");
       expect(status.bridges).toEqual([
         { adapter: "discord", pid: discord.pid },
         { adapter: "openclaw", pid: openclaw.pid },
       ]);
     },
     TIMEOUT,
+  );
+
+  test(
+    "json reports running false when only another adapter runs",
+    async () => {
+      const discord = spawnSleep();
+      writeFileSync(join(runDir, "bridge-discord.pid"), record(discord.pid, tokenOf(discord.pid)));
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      });
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+      }
+
+      expect(JSON.parse(lines[0])).toEqual({
+        running: false,
+        bridges: [{ adapter: "discord", pid: discord.pid }],
+      });
+    },
+    TIMEOUT,
+  );
+});
+
+describe("bridge stop does not read a non-regular record", () => {
+  test(
+    "a FIFO record is reported as kept while the other records are stopped",
+    async () => {
+      const child = await startStdioBridge();
+      const fifo = join(runDir, "bridge-fifo.pid");
+      const made = Bun.spawnSync(["mkfifo", fifo]);
+      expect(made.exitCode).toBe(0);
+
+      expect(bridgeRunningRecords().map((entry) => entry.adapter)).toEqual(["stdio"]);
+
+      const stopError = await runBridge({ action: "stop" }).then(
+        () => null,
+        (error: Error) => error,
+      );
+
+      expect(stopError?.message).toContain(`Bridge pid file ${fifo} is not a regular file`);
+      expect(stopError?.message).toContain("the pid file was kept");
+      await child.exited;
+      expect(pidState(child.pid)).toBe("gone");
+      expect(existsSync(stdioPid)).toBe(false);
+      expect(existsSync(fifo)).toBe(true);
+    },
+    10_000,
   );
 });
