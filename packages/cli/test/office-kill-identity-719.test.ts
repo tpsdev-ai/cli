@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -20,6 +20,7 @@ import { serializePidRecord } from "../src/utils/pid-file.js";
 const TIMEOUT = 30_000;
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const children: Bun.Subprocess[] = [];
+const writerChildren: number[] = [];
 
 function spawnChild(): Bun.Subprocess {
   const child = Bun.spawn(["sleep", "60"], { stdio: ["ignore", "ignore", "ignore"] });
@@ -127,8 +128,63 @@ afterEach(() => {
       /* already gone */
     }
   }
+  for (const pid of writerChildren.splice(0)) {
+    if (pidState(pid) !== "alive") continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already exited */
+    }
+  }
   rmSync(home, { recursive: true, force: true });
 });
+
+/** Write a branch pid record through the real launcher (`branch start`),
+ *  replacing only the daemon spawn and the join listener, as the writer test
+ *  in branch-stop-identity-718 does. Returns the child it recorded. */
+async function launchBranchWriter(): Promise<{ pid: number; branchPath: string }> {
+  const root = join(home, "tps-root");
+  mkdirSync(root, { recursive: true });
+  process.env.TPS_ROOT = root;
+  writeFileSync(join(root, "branch.conf.json"), JSON.stringify({
+    port: 6458, transport: "ws", agentId: "writer-agent",
+  }));
+  const marker = join(home, "child.pid");
+  const script = join(home, "writer.ts");
+  const transportPath = resolve(import.meta.dir, "../src/utils/ws-noise-transport.ts");
+  const branchModulePath = resolve(import.meta.dir, "../src/commands/branch.ts");
+  writeFileSync(script, `
+    import { mock } from "bun:test";
+    import * as childProcess from "node:child_process";
+    import { writeFileSync } from "node:fs";
+    const realSpawn = childProcess.spawn;
+    mock.module("node:child_process", () => ({ ...childProcess, spawn() {
+      const child = realSpawn("sleep", ["60"], { stdio: "ignore" });
+      writeFileSync(${JSON.stringify(marker)}, String(child.pid));
+      return child;
+    }}));
+    const transport = await import(${JSON.stringify(transportPath)});
+    mock.module(${JSON.stringify(transportPath)}, () => ({ ...transport,
+      listenForJoinWs: async () => ({ hostId: "host", hostPubkey: new Uint8Array(32),
+        hostFingerprint: "fixture", channel: { async close() {} }, server: { async close() {} } }),
+    }));
+    const { runBranch } = await import(${JSON.stringify(branchModulePath)});
+    await runBranch({ action: "start", agent: "writer-agent" });
+  `);
+  const env = { ...process.env, NODE_ENV: "production" };
+  delete env.TPS_BRANCH_DAEMON;
+  delete env.TPS_BRANCH_NO_DAEMON;
+  const writer = Bun.spawn([process.execPath, script], { env, stdio: ["ignore", "ignore", "pipe"] });
+  try {
+    const exit = await writer.exited;
+    if (exit !== 0) throw new Error(await new Response(writer.stderr).text());
+    const pid = Number(readFileSync(marker, "utf8"));
+    writerChildren.push(pid);
+    return { pid, branchPath: branchPidPath() };
+  } finally {
+    if (writer.exitCode === null) writer.kill("SIGKILL");
+  }
+}
 
 describe("office kill identity", () => {
   test(
@@ -314,7 +370,7 @@ describe("office kill identity", () => {
   );
 
   test(
-    "a live bare-pid branch record at the writer's path is classified as unverified",
+    "a legacy bare-pid branch record is classified as unverified",
     async () => {
       const root = join(home, "tps-root");
       mkdirSync(root, { recursive: true });
@@ -322,7 +378,7 @@ describe("office kill identity", () => {
       const branch = spawnChild();
       const branchPath = branchPidPath();
       expect(branchPath).toBe(join(root, "branch.pid"));
-      // The current branch launcher writes a bare decimal pid.
+      // A record written before the launcher recorded a start token.
       writeFileSync(branchPath, `${branch.pid}\n`);
 
       const signals: number[] = [];
@@ -369,6 +425,108 @@ describe("office kill identity", () => {
       expect(output).toContain(`remove ${hostPath} if that process is not running`);
       expect(existsSync(hostPath)).toBe(true);
       expect(pidState(host.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the branch launcher records a start token office kill can verify",
+    async () => {
+      const { pid, branchPath } = await launchBranchWriter();
+      expect(pidState(pid)).toBe("alive");
+      const token = processStartToken(pid);
+      expect(token).not.toBeNull();
+      expect(JSON.parse(readFileSync(branchPath, "utf8"))).toEqual({ pid, startToken: token });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "office kill verifies, signals and removes the branch launcher's record",
+    async () => {
+      const { pid, branchPath } = await launchBranchWriter();
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((signalled) => {
+        signals.push(signalled);
+        process.kill(signalled, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runOffice({ action: "kill" });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+      }
+
+      expect(signals).toEqual([pid]);
+      expect(logs.join("\n")).toContain(`Branch pid file (pid ${pid}) stopped; record removed: ${branchPath}`);
+      expect(existsSync(branchPath)).toBe(false);
+      expect(pidState(pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an unlistable connections directory is named, the branch record is still handled and the command exits non-zero",
+    async () => {
+      const dir = join(home, ".tps", "connections");
+      // A 0300 directory cannot be listed by its owner, but root ignores mode
+      // bits, so under root a regular file takes the directory's place; both
+      // make readdirSync fail for every uid.
+      if (typeof process.getuid === "function" && process.getuid() === 0) {
+        rmSync(dir, { recursive: true, force: true });
+        writeFileSync(dir, "");
+      } else {
+        chmodSync(dir, 0o300);
+      }
+      const branch = spawnChild();
+      const branchPath = branchPidPath();
+      writeFileSync(branchPath, serializePidRecord(branch.pid, childToken(branch.pid)));
+
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((signalled) => {
+        signals.push(signalled);
+        process.kill(signalled, "SIGTERM");
+      });
+      const { restore } = captureLogs();
+      let message = "";
+      try {
+        await runOffice({ action: "kill" }).catch((error) => {
+          message = (error as Error).message;
+        });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+        chmodSync(dir, 0o700);
+      }
+
+      expect(message).toContain(dir);
+      expect(message).toContain("could not be listed");
+      expect(signals).toEqual([branch.pid]);
+      expect(existsSync(branchPath)).toBe(false);
+      expect(pidState(branch.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "host.json with a branch key and no pid is reported as invalid and kept",
+    () => {
+      const hostPath = hostStatePath("host");
+      const content = JSON.stringify({ branch: "host" });
+      writeFileSync(hostPath, content);
+
+      const result = spawnSync(process.execPath, [TPS_BIN, "office", "kill"], {
+        encoding: "utf8",
+        timeout: TIMEOUT - 5_000,
+        env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+      });
+
+      expect(result.status).toBe(1);
+      const output = `${result.stdout}${result.stderr}`;
+      expect(output).toContain(hostPath);
+      expect(output).toContain("could not be parsed");
+      expect(readFileSync(hostPath, "utf8")).toBe(content);
     },
     TIMEOUT,
   );

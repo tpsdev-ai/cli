@@ -928,7 +928,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "kill": {
       let killed = 0;
       const failures: string[] = [];
-      const recordPaths = listHostStatePaths();
+      const listing = listHostStatePaths();
+      if (listing.failure) {
+        failures.push(
+          `Connections directory ${listing.failure.path} could not be listed (${listing.failure.code}), so its records were not checked; check them yourself.`,
+        );
+      }
 
       const removeRecord = (path: string): "removed" | "already gone" | "kept" => {
         try {
@@ -1000,7 +1005,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
       };
 
-      for (const path of recordPaths) {
+      for (const path of listing.paths) {
         await stopRecord("Host state record", path);
       }
       await stopRecord("Branch pid file", branchPidPath());

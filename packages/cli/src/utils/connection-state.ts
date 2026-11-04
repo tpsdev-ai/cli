@@ -40,23 +40,42 @@ export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
+export interface HostStatePathListing {
+  paths: string[];
+  /** Set when the connections directory exists but its entries cannot be read. */
+  failure?: { path: string; code: string };
+}
+
 /** Paths of host state records in the connections directory, taken from
- *  directory entries, never from file content. */
-export function listHostStatePaths(): string[] {
+ *  directory entries, never from file content. `host.json` holds the branch
+ *  connection state, which has no `pid`; it is a host record when it has a
+ *  `pid` or `branch` key, or is not a JSON object. A directory that cannot be
+ *  listed is reported instead of yielding an empty list. */
+export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => {
-      if (!f.endsWith(".json")) return false;
-      if (f !== "host.json") return true;
-      try {
-        const state: unknown = JSON.parse(readFileSync(join(dir, f), "utf-8"));
-        return typeof state !== "object" || state === null || Array.isArray(state) || "pid" in state;
-      } catch {
-        return true;
-      }
-    })
-    .map((f) => join(dir, f));
+  if (!existsSync(dir)) return { paths: [] };
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    return { paths: [], failure: { path: dir, code } };
+  }
+  return {
+    paths: entries
+      .filter((f) => {
+        if (!f.endsWith(".json")) return false;
+        if (f !== "host.json") return true;
+        try {
+          const state: unknown = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+          return typeof state !== "object" || state === null || Array.isArray(state)
+            || "pid" in state || "branch" in state;
+        } catch {
+          return true;
+        }
+      })
+      .map((f) => join(dir, f)),
+  };
 }
 
 function branchStatePath(): string {
