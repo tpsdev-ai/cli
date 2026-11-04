@@ -471,8 +471,8 @@ describe("office kill identity", () => {
     async () => {
       const dir = join(home, ".tps", "connections");
       // A 0300 directory cannot be listed by its owner, but root ignores mode
-      // bits, so under root a regular file takes the directory's place; both
-      // make readdirSync fail for every uid.
+      // bits, so under root a regular file takes the directory's place; whichever
+      // runs, the listing fails for this process.
       if (typeof process.getuid === "function" && process.getuid() === 0) {
         rmSync(dir, { recursive: true, force: true });
         writeFileSync(dir, "");
