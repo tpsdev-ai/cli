@@ -1,0 +1,360 @@
+/**
+ * cli#730 — the branch pid record is claimed and removed only while the
+ * branch pid lock is held. These tests drive the real CLI and real daemons
+ * under a temp HOME; the pause seam is enabled by TPS_BRANCH_TEST_PAUSE_DIR.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { branchPidLockRoot, writeBranchConf } from "../src/commands/branch.js";
+import { acquireMailLockSync } from "../src/utils/mail-lock.js";
+import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
+
+const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+const WAIT_MS = 20_000;
+const EXIT_MS = 30_000;
+
+let root: string;
+let pidFile: string;
+let logFile: string;
+let pauseDir: string;
+let savedEnv: Record<string, string | undefined>;
+const daemons: number[] = [];
+const children: ChildProcess[] = [];
+
+async function freePort(): Promise<number> {
+  const net = await import("node:net");
+  return new Promise((resolvePort, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close(() => reject(new Error("no address")));
+        return;
+      }
+      server.close(() => resolvePort(address.port));
+    });
+  });
+}
+
+function prepareBranch(port: number): void {
+  const branch = generateKeyPair();
+  const host = generateKeyPair();
+  saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
+  writeFileSync(
+    join(process.env.TPS_IDENTITY_DIR!, "host.json"),
+    JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
+  );
+  writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+}
+
+function startToken(pid: number): string {
+  const token = processStartToken(pid);
+  if (token === null) throw new Error(`no start token for pid ${pid}`);
+  return token;
+}
+
+function pauseEnv(phase: string): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    TPS_BRANCH_TEST_PAUSE_DIR: pauseDir,
+    TPS_BRANCH_TEST_PAUSE_PHASE: phase,
+  };
+}
+
+function launcherEnv(phase: string): NodeJS.ProcessEnv {
+  const env = pauseEnv(phase);
+  delete env.NODE_ENV;
+  delete env.TPS_BRANCH_DAEMON;
+  delete env.TPS_BRANCH_NO_DAEMON;
+  return env;
+}
+
+async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_MS): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = read();
+    if (value !== null) return value;
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+}
+
+async function waitForReady(phase: string): Promise<string> {
+  return waitFor(
+    () => {
+      const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
+      return name === undefined ? null : join(pauseDir, name);
+    },
+    `pause ${phase}`,
+  );
+}
+
+function release(phase: string): void {
+  writeFileSync(join(pauseDir, `go-${phase}`), "", "utf-8");
+}
+
+async function waitForExit(child: ChildProcess, timeoutMs = EXIT_MS): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
+  return new Promise((resolveExit, reject) => {
+    const timer = setTimeout(() => reject(new Error("child did not exit within the bound")), timeoutMs);
+    child.once("exit", (code, signal) => {
+      clearTimeout(timer);
+      resolveExit({ code, signal });
+    });
+  });
+}
+
+async function waitForLogStarted(): Promise<void> {
+  await waitFor(
+    () => {
+      try {
+        return readFileSync(logFile, "utf8").includes("STARTED") ? true : null;
+      } catch {
+        return null;
+      }
+    },
+    "daemon STARTED log line",
+  );
+}
+
+async function waitForListening(port: number): Promise<void> {
+  const net = await import("node:net");
+  const deadline = Date.now() + WAIT_MS;
+  for (;;) {
+    const connected = await new Promise<boolean>((resolveConnect) => {
+      const socket = net.connect({ host: "127.0.0.1", port });
+      const finish = (value: boolean) => {
+        socket.destroy();
+        resolveConnect(value);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+    });
+    if (connected) return;
+    if (Date.now() >= deadline) throw new Error(`daemon did not listen on 127.0.0.1:${port}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+}
+
+async function waitForRunningRecord(): Promise<{ pid: number; startToken: string }> {
+  return waitFor(
+    () => {
+      const state = readPidFile(pidFile);
+      return state.kind === "running" ? { pid: state.pid, startToken: state.startToken } : null;
+    },
+    "a running pid record",
+  );
+}
+
+async function waitForPidGone(pid: number): Promise<void> {
+  await waitFor(() => {
+    if (pidState(pid) === "gone") return true;
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z") return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+      }
+    }
+    return null;
+  }, `pid ${pid} to exit`);
+}
+
+function spawnDaemon(phase: string): ChildProcess {
+  const env = pauseEnv(phase);
+  env.TPS_BRANCH_NO_DAEMON = "1";
+  delete env.TPS_BRANCH_DAEMON;
+  const child = spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  children.push(child);
+  return child;
+}
+
+function reapedPid(): number {
+  const child = spawnSync("true", []);
+  if (child.pid === undefined) throw new Error("could not spawn a helper process");
+  if (pidState(child.pid) !== "gone") throw new Error("helper pid was reused; rerun the test");
+  return child.pid;
+}
+
+beforeEach(() => {
+  savedEnv = {};
+  for (const key of [
+    "HOME",
+    "TPS_ROOT",
+    "TPS_IDENTITY_DIR",
+    "TPS_REGISTRY_DIR",
+    "TPS_AGENT_ID",
+    "TPS_VAULT_KEY",
+    "TPS_BRANCH_TEST_PAUSE_DIR",
+    "TPS_BRANCH_TEST_PAUSE_PHASE",
+  ]) {
+    savedEnv[key] = process.env[key];
+  }
+  root = mkdtempSync(join(tmpdir(), "tps-branch-730-"));
+  process.env.HOME = root;
+  process.env.TPS_ROOT = join(root, ".tps");
+  process.env.TPS_IDENTITY_DIR = join(root, ".tps", "identity");
+  process.env.TPS_REGISTRY_DIR = join(root, ".tps", "registry");
+  process.env.TPS_AGENT_ID = "agent-a";
+  process.env.TPS_VAULT_KEY = "branch-730-test";
+  pidFile = join(root, ".tps", "branch.pid");
+  logFile = join(root, ".tps", "branch.log");
+  pauseDir = mkdtempSync(join(root, "pause-"));
+  mkdirSync(join(root, ".tps"), { recursive: true });
+});
+
+afterEach(async () => {
+  for (const pid of daemons.splice(0)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  for (const child of children.splice(0)) {
+    try {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  rmSync(root, { recursive: true, force: true });
+  for (const [key, value] of Object.entries(savedEnv)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+});
+
+describe("branch pid record ownership (cli#730)", () => {
+  test("two launchers started together spawn exactly one daemon and leave one record", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const phase = "launch-before-spawn";
+
+    const launchers = [0, 1].map(() => {
+      const child = spawn("node", [TPS_BIN, "branch", "start"], {
+        env: launcherEnv(phase),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      children.push(child);
+      let stdout = "";
+      let stderr = "";
+      child.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      child.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      return { child, stdout: () => stdout, stderr: () => stderr };
+    });
+
+    await waitForReady(phase);
+    const probe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (probe !== null) probe.release();
+    expect(probe).toBeNull();
+    release(phase);
+    const exits = await Promise.all(launchers.map(({ child }) => waitForExit(child)));
+
+    const announced = launchers.flatMap(({ stdout }) =>
+      [...stdout().matchAll(/Branch daemon started \(pid (\d+)\)/g)].map((match) => Number(match[1])),
+    );
+    expect(announced.length).toBe(1);
+
+    const refused = exits.filter((exit) => exit.code !== 0);
+    expect(refused.length).toBe(1);
+    expect(launchers.map(({ stderr }) => stderr()).join("\n")).toContain("refusing to spawn");
+
+    const running = await waitForRunningRecord();
+    daemons.push(running.pid);
+    expect(running.pid).toBe(announced[0]!);
+    expect(pidState(running.pid)).toBe("alive");
+    expect(readPidFile(pidFile).kind).toBe("running");
+
+    process.kill(running.pid, "SIGTERM");
+    await waitForPidGone(running.pid);
+  }, 40_000);
+
+  test("a shutdown holds the record lock while it decides, and a replacement is left in place", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const phase = "shutdown-before-unlink";
+    const daemon = spawnDaemon(phase);
+    await waitForLogStarted();
+    await waitForListening(port);
+    expect(daemon.pid).toBeDefined();
+    writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+    expect(readPidFile(pidFile).kind).toBe("running");
+
+    const exited = waitForExit(daemon);
+    daemon.kill("SIGTERM");
+    await waitForReady(phase);
+
+    const probe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (probe !== null) probe.release();
+    expect(probe).toBeNull();
+
+    const newer = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
+    children.push(newer);
+    expect(newer.pid).toBeDefined();
+    const replacement = serializePidRecord(newer.pid!, startToken(newer.pid!));
+    writeFileSync(pidFile, replacement);
+    release(phase);
+
+    expect(await exited).toEqual({ code: 0, signal: null });
+    expect(readFileSync(pidFile, "utf8")).toBe(replacement);
+    const state = readPidFile(pidFile);
+    expect(state.kind).toBe("running");
+    if (state.kind === "running") expect(state.pid).toBe(newer.pid);
+    expect(readFileSync(logFile, "utf8")).toContain("changed while it was being removed");
+  }, 40_000);
+
+  test("runStop leaves a record replaced between its read and its unlink", async () => {
+    prepareBranch(await freePort());
+    const stale = reapedPid();
+    writeFileSync(pidFile, serializePidRecord(stale, null));
+    const phase = "stop-before-unlink";
+
+    const stop = spawn("node", [TPS_BIN, "branch", "stop"], {
+      env: pauseEnv(phase),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(stop);
+    let stderr = "";
+    stop.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const exited = waitForExit(stop);
+    await waitForReady(phase);
+
+    const probe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (probe !== null) probe.release();
+    expect(probe).toBeNull();
+
+    const newer = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
+    children.push(newer);
+    expect(newer.pid).toBeDefined();
+    const replacement = serializePidRecord(newer.pid!, startToken(newer.pid!));
+    writeFileSync(pidFile, replacement);
+    release(phase);
+
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr).toContain("changed while \"tps branch stop\" was in progress");
+    expect(readFileSync(pidFile, "utf8")).toBe(replacement);
+    const state = readPidFile(pidFile);
+    expect(state.kind).toBe("running");
+    if (state.kind === "running") expect(state.pid).toBe(newer.pid);
+    expect(pidState(newer.pid!)).toBe("alive");
+  }, 40_000);
+});
