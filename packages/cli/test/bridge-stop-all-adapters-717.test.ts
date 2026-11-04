@@ -1,10 +1,10 @@
 /**
- * cli#717 — `bridge stop` stops every adapter's bridge.
+ * cli#717 — `bridge stop` stops the bridges whose pid records it discovers.
  *
- * `BridgeCore.start` writes `bridge-<adapter>.pid` for every adapter. These
- * tests use the real writer for a non-openclaw adapter under a temp HOME, plus
- * records that name real child processes, so the stop path exercises the same
- * identity check and per-record reporting as the openclaw record.
+ * `BridgeCore.start` writes `bridge-<adapter>.pid`. These tests use the real
+ * writer for a non-openclaw adapter under a temp HOME, plus records that name
+ * real child processes, so the stop path exercises the same identity check and
+ * per-record reporting as the openclaw record.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -14,10 +14,13 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
+import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
 const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
+const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
+const MAIL_BRIDGE_URL = new URL("../src/utils/mail-bridge.js", import.meta.url).href;
 
 /** A child that starts a real BridgeCore with the stdio adapter and stays
  *  alive on its stdin pipe until SIGTERM, when it runs the real stop path. */
@@ -34,6 +37,21 @@ const shutdown = () => { void core.stop().then(() => process.exit(0)); };
 process.once("SIGTERM", shutdown);
 process.once("SIGINT", shutdown);
 console.log("READY");
+`;
+
+/** Runs `bridge start` with the real start check and a recording stand-in for
+ *  the daemon, so the decision is observable without binding a port. */
+const START_CHILD = `
+const { mock } = await import("bun:test");
+const actual = await import(${JSON.stringify(MAIL_BRIDGE_URL)});
+let started = 0;
+mock.module(${JSON.stringify(MAIL_BRIDGE_URL)}, () => ({
+  ...actual,
+  startBridgeDaemon: () => { started += 1; },
+}));
+const { runBridge } = await import(${JSON.stringify(COMMANDS_URL)});
+await runBridge({ action: "start" });
+console.log(JSON.stringify({ started }));
 `;
 
 let home: string;
@@ -81,6 +99,15 @@ async function startStdioBridge(): Promise<Bun.Subprocess> {
   return child;
 }
 
+/** Run the openclaw start path and return what it printed. */
+async function runStartDecision(): Promise<string> {
+  const script = join(home, "start-openclaw.mts");
+  writeFileSync(script, START_CHILD);
+  const child = spawnScript(script, {});
+  await child.exited;
+  return new Response(child.stdout).text();
+}
+
 function record(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
 }
@@ -114,14 +141,14 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-describe("bridge stop finds every adapter", () => {
+describe("bridge stop finds the discovered bridge pid records", () => {
   test(
     "a bridge started by BridgeCore.start for the stdio adapter is stopped and its record removed",
     async () => {
       const child = await startStdioBridge();
       expect(basename(stdioPid)).toBe("bridge-stdio.pid");
       expect(readPidFile(stdioPid).kind).toBe("running");
-      expect(bridgeStatus()).toEqual({ running: true, pid: child.pid });
+      expect(bridgeStatus()).toEqual({ running: true, pid: child.pid, adapter: "stdio" });
 
       await runBridge({ action: "stop" });
       await child.exited;
@@ -218,6 +245,122 @@ describe("bridge stop timeout", () => {
       expect(pidState(timedOut.pid)).toBe("alive");
       await next.exited;
       expect(pidState(next.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("bridge start checks only the OpenClaw records", () => {
+  test(
+    "a running stdio bridge does not refuse the openclaw start path",
+    async () => {
+      await startStdioBridge();
+
+      const stdout = await runStartDecision();
+
+      expect(stdout).toContain('"started":1');
+      expect(stdout).not.toContain("Bridge already running");
+    },
+    TIMEOUT,
+  );
+
+  for (const name of ["bridge-openclaw.pid", "mail-bridge.pid"]) {
+    test(
+      `a live ${name} record still refuses the openclaw start path`,
+      async () => {
+        const child = spawnSleep();
+        writeFileSync(join(runDir, name), record(child.pid, tokenOf(child.pid)));
+
+        const stdout = await runStartDecision();
+
+        expect(stdout).toContain("Bridge already running");
+        expect(stdout).not.toContain('"started"');
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe("bridge status names the adapter of each running record", () => {
+  test(
+    "human output names the running adapters",
+    async () => {
+      const stdio = await startStdioBridge();
+      const openclaw = spawnSleep();
+      writeFileSync(join(runDir, "bridge-openclaw.pid"), record(openclaw.pid, tokenOf(openclaw.pid)));
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      });
+      try {
+        await runBridge({ action: "status" });
+      } finally {
+        restore();
+      }
+
+      expect(lines).toEqual([
+        `Bridge running: adapter=openclaw, pid=${openclaw.pid}, port=undefined`,
+        `Bridge running: adapter=stdio, pid=${stdio.pid}, port=undefined`,
+      ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "json keeps the single OpenClaw fields and names the adapter",
+    async () => {
+      const child = spawnSleep();
+      writeFileSync(
+        join(runDir, "bridge-openclaw.pid"),
+        `${JSON.stringify({ pid: child.pid, startToken: tokenOf(child.pid), port: 7891 })}\n`,
+      );
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      });
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+      }
+
+      expect(JSON.parse(lines[0])).toEqual({
+        running: true,
+        pid: child.pid,
+        port: 7891,
+        adapter: "openclaw",
+        bridges: [{ adapter: "openclaw", pid: child.pid, port: 7891 }],
+      });
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "json lists each running adapter",
+    async () => {
+      const discord = spawnSleep();
+      const openclaw = spawnSleep();
+      writeFileSync(join(runDir, "bridge-discord.pid"), record(discord.pid, tokenOf(discord.pid)));
+      writeFileSync(join(runDir, "bridge-openclaw.pid"), record(openclaw.pid, tokenOf(openclaw.pid)));
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => {
+        lines.push(args.map(String).join(" "));
+      });
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+      }
+
+      const status = JSON.parse(lines[0]);
+      expect(status.running).toBe(true);
+      expect(status.bridges).toEqual([
+        { adapter: "discord", pid: discord.pid },
+        { adapter: "openclaw", pid: openclaw.pid },
+      ]);
     },
     TIMEOUT,
   );

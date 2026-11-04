@@ -101,7 +101,7 @@ describe("other pid probes take pidState's answer", () => {
     mkdirSync(runDir, { recursive: true });
     writeFileSync(join(runDir, "mail-bridge.pid"), JSON.stringify({ pid: 1, port: 7000 }));
 
-    expect(bridgeStatus(alive)).toEqual({ running: true, pid: 1, port: 7000 });
+    expect(bridgeStatus(alive)).toEqual({ running: true, pid: 1, port: 7000, adapter: "openclaw" });
   });
 
   test("llm proxy status reports a process pidState calls alive", () => {

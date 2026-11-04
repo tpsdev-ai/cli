@@ -8,7 +8,7 @@
  */
 
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { bridgePidFiles, bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
+import { bridgePidFiles, bridgeRunningRecords, bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
@@ -125,8 +125,9 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         return;
       }
 
-      // Default: OpenClaw adapter (legacy path)
-      const st = bridgeStatus();
+      // Default: OpenClaw adapter (legacy path). Only the OpenClaw records
+      // (bridge-openclaw.pid and the legacy mail-bridge.pid) can refuse it.
+      const st = bridgeStatus(pidState, "openclaw");
       if (st.running) {
         console.log(`Bridge already running (pid ${st.pid}, port ${st.port})`);
         process.exit(0);
@@ -275,11 +276,17 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
     }
 
     case "status": {
-      const st = bridgeStatus();
+      const running = bridgeRunningRecords();
       if (args.json) {
-        console.log(JSON.stringify(st));
-      } else if (st.running) {
-        console.log(`Bridge running: pid=${st.pid}, port=${st.port}`);
+        const [first] = running;
+        const status = first
+          ? { running: true, pid: first.pid, ...(first.port === undefined ? {} : { port: first.port }), adapter: first.adapter, bridges: running }
+          : { running: false };
+        console.log(JSON.stringify(status));
+      } else if (running.length > 0) {
+        for (const entry of running) {
+          console.log(`Bridge running: adapter=${entry.adapter}, pid=${entry.pid}, port=${entry.port}`);
+        }
       } else {
         console.log("Bridge is not running.");
       }

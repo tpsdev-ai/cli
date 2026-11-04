@@ -35,15 +35,17 @@ export interface BridgePidFileEntry {
   path: string;
   state: PidFileState;
   port?: number;
+  adapter: string;
 }
 
-/** `BridgeCore.start` writes `bridge-<adapter>.pid`; every adapter name in
- *  the agent registry (`openclaw`, `discord`, `stdio`) uses lowercase ASCII
- *  letters only. The legacy name is `mail-bridge.pid`. */
-const BRIDGE_PID_NAME = /^(?:bridge-[a-z]+|mail-bridge)\.pid$/;
+/** `BridgeCore.start` writes `bridge-<adapter>.pid`. Discovery accepts an
+ *  adapter part of lowercase ASCII letters only. The legacy name
+ *  `mail-bridge.pid` is treated as the OpenClaw bridge. */
+const BRIDGE_PID_NAME = /^(?:bridge-([a-z]+)|mail-bridge)\.pid$/;
+const LEGACY_ADAPTER = "openclaw";
 
-/** The bridge pid files that exist, with their strict classification. */
-export function bridgePidFiles(): BridgePidFileEntry[] {
+/** The bridge pid records discovery accepts, with their strict classification. */
+export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
   let names: string[];
   try {
@@ -57,6 +59,8 @@ export function bridgePidFiles(): BridgePidFileEntry[] {
   }
   const entries: BridgePidFileEntry[] = [];
   for (const name of names.filter((entry) => BRIDGE_PID_NAME.test(entry)).sort()) {
+    const recordAdapter = BRIDGE_PID_NAME.exec(name)?.[1] ?? LEGACY_ADAPTER;
+    if (adapter !== undefined && recordAdapter !== adapter) continue;
     const path = join(pidDir, name);
     const state = readPidFile(path);
     if (state.kind === "missing") continue;
@@ -67,21 +71,47 @@ export function bridgePidFiles(): BridgePidFileEntry[] {
     } catch {
       /* not JSON, or unreadable — the pid state is what this reader decides on */
     }
-    entries.push({ path, state, port });
+    entries.push({ path, state, port, adapter: recordAdapter });
   }
   return entries;
 }
 
-export function bridgeStatus(probe: (pid: number) => PidState = pidState): { running: boolean; pid?: number; port?: number } {
-  for (const entry of bridgePidFiles()) {
+export interface BridgeRunningRecord {
+  adapter: string;
+  pid: number;
+  port?: number;
+}
+
+/** Every running bridge record discovery accepts, optionally for one adapter. */
+export function bridgeRunningRecords(
+  probe: (pid: number) => PidState = pidState,
+  adapter?: string,
+): BridgeRunningRecord[] {
+  const running: BridgeRunningRecord[] = [];
+  for (const entry of bridgePidFiles(adapter)) {
     const { state, port } = entry;
     let pid: number | undefined;
     if (state.kind === "running") pid = state.pid;
     else if (state.kind === "unverified" && probe(state.pid) === "alive") pid = state.pid;
     if (pid === undefined) continue;
-    return port === undefined ? { running: true, pid } : { running: true, pid, port };
+    running.push(port === undefined ? { adapter: entry.adapter, pid } : { adapter: entry.adapter, pid, port });
   }
-  return { running: false };
+  return running;
+}
+
+export function bridgeStatus(
+  probe: (pid: number) => PidState = pidState,
+  adapter?: string,
+): { running: boolean; pid?: number; port?: number; adapter?: string } {
+  const [first] = bridgeRunningRecords(probe, adapter);
+  if (!first) return { running: false };
+  const status: { running: boolean; pid?: number; port?: number; adapter?: string } = {
+    running: true,
+    pid: first.pid,
+    adapter: first.adapter,
+  };
+  if (first.port !== undefined) status.port = first.port;
+  return status;
 }
 
 export function startBridgeDaemon(config: BridgeConfig = {}): void {
