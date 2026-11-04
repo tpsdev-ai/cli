@@ -1,20 +1,20 @@
 /**
  * cli#719 — `office kill` enumerates the host state record files and the
  * branch pid file and classifies each at its actual path with the shared
- * pid-file check immediately before signalling. A record whose process identity
- * cannot be verified is not signalled, is kept and named, and the command exits
- * non-zero. A record whose recorded process is proven gone is removed without a
- * signal. These tests use real child processes and real files under a temp HOME.
+ * pid-file check immediately before signalling. A record classified as unverified
+ * is not signalled, is kept and named, and the command exits non-zero. Stale-record
+ * removal is attempted without signalling; a removal failure keeps the record and
+ * is reported. These tests use real child processes and real files under a temp HOME.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { pidPath as branchPidPath } from "../src/commands/branch.js";
 import { runOffice, setOfficeKillSignal } from "../src/commands/office.js";
-import { hostStatePath, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
+import { hostStatePath, writeBranchState, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
 
 const TIMEOUT = 30_000;
@@ -132,7 +132,77 @@ afterEach(() => {
 
 describe("office kill identity", () => {
   test(
-    "live records whose start token names another process are not signalled and are removed",
+    "host.json with a matching live host record is signalled and reported",
+    async () => {
+      const host = spawnChild();
+      const hostPath = hostStatePath("host");
+      writeHostState(hostState("host", host.pid, childToken(host.pid)));
+
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runOffice({ action: "kill" });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+      }
+
+      expect(signals).toEqual([host.pid]);
+      expect(logs.join("\n")).toContain(`Host state record (pid ${host.pid}) stopped; record removed: ${hostPath}`);
+      expect(existsSync(hostPath)).toBe(false);
+      expect(pidState(host.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "host.json with branch connection state is kept and office kill exits zero",
+    () => {
+      const branchState = { connectedAt: "", lastSeen: "", messagesReceived: 0, messagesPushed: 0 };
+      writeBranchState(branchState);
+      const branchPath = hostStatePath("host");
+
+      const result = spawnSync(process.execPath, [TPS_BIN, "office", "kill"], {
+        encoding: "utf8",
+        timeout: TIMEOUT - 5_000,
+        env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+      });
+
+      expect(result.status).toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("Terminated 0 TPS process(es)");
+      expect(JSON.parse(readFileSync(branchPath, "utf8"))).toEqual(branchState);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "unparseable host.json is kept and office kill exits non-zero naming its path",
+    () => {
+      const hostPath = hostStatePath("host");
+      const content = "{ this is not json";
+      writeFileSync(hostPath, content);
+
+      const result = spawnSync(process.execPath, [TPS_BIN, "office", "kill"], {
+        encoding: "utf8",
+        timeout: TIMEOUT - 5_000,
+        env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+      });
+
+      expect(result.status).toBe(1);
+      const output = `${result.stdout}${result.stderr}`;
+      expect(output).toContain(hostPath);
+      expect(output).toContain("could not be parsed");
+      expect(readFileSync(hostPath, "utf8")).toBe(content);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "office kill attempts stale-record removal without signalling the live pids",
     async () => {
       const host = spawnChild();
       const branch = spawnChild();
@@ -193,10 +263,10 @@ describe("office kill identity", () => {
     TIMEOUT,
   );
 
-  test(
-    "a record file that cannot be read is named and kept",
-    async () => {
-      const hostPath = hostStatePath("host-a");
+  test.each(["host-a", "host"])(
+    "an unreadable %s record is named and kept",
+    async (branch) => {
+      const hostPath = hostStatePath(branch);
       // A directory in the record's place makes readFileSync fail for every
       // uid, including root in the container jobs.
       mkdirSync(hostPath);
@@ -244,7 +314,7 @@ describe("office kill identity", () => {
   );
 
   test(
-    "the branch pid file is read at the writer's path and its real bare-pid format is unverified",
+    "a live bare-pid branch record at the writer's path is classified as unverified",
     async () => {
       const root = join(home, "tps-root");
       mkdirSync(root, { recursive: true });
@@ -304,7 +374,7 @@ describe("office kill identity", () => {
   );
 
   test(
-    "a matching host and branch record are signalled and cleared, and a dead pid's record is cleared",
+    "a matching host and branch record are signalled and cleared",
     async () => {
       const dead = requireGonePid(gonePid);
       const host = spawnChild();
@@ -313,7 +383,6 @@ describe("office kill identity", () => {
       const deadPath = hostStatePath("host-b");
       const branchPath = branchPidPath();
       writeHostState(hostState("host-a", host.pid, childToken(host.pid)));
-      // A legacy record without a token whose pid is gone is removed as stale.
       writeHostState(hostState("host-b", dead, null));
       writeFileSync(branchPath, serializePidRecord(branch.pid, childToken(branch.pid)));
       expect(existsSync(deadPath)).toBe(true);

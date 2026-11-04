@@ -967,10 +967,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           return;
         }
         if (state.kind === "stale") {
-          // readPidFile calls a record stale only when the recorded process is
-          // proven gone: its pid is gone, or the pid is alive with a different
-          // same-source start token and so belongs to another process. Remove
-          // the record; never signal a pid the record no longer identifies.
+          // Attempt stale-record removal without signalling; a removal failure
+          // keeps the record and is reported.
           const removal = removeRecord(state.path);
           if (removal === "removed") {
             console.log(`Stale ${label.toLowerCase()} removed: ${state.path}; pid ${state.pid} was not signalled.`);

@@ -40,13 +40,22 @@ export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
-/** Paths of the host state records present in the connections directory. The
- *  path comes from the directory entry, never from file content. */
+/** Paths of host state records in the connections directory, taken from
+ *  directory entries, never from file content. */
 export function listHostStatePaths(): string[] {
   const dir = connectionsDir();
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
-    .filter((f) => f.endsWith(".json") && f !== "host.json")
+    .filter((f) => {
+      if (!f.endsWith(".json")) return false;
+      if (f !== "host.json") return true;
+      try {
+        const state: unknown = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+        return typeof state !== "object" || state === null || Array.isArray(state) || "pid" in state;
+      } catch {
+        return true;
+      }
+    })
     .map((f) => join(dir, f));
 }
 
