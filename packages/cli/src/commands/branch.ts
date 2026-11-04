@@ -122,7 +122,7 @@ function refuseSecondBranchStart(): void {
   switch (state.kind) {
     case "running":
       throw new Error(
-        `Recorded process (pid ${state.pid}, start token matches) is still running; refusing to spawn (pid file ${state.path}). Stop it with "tps branch stop" first.`,
+        `Recorded process (pid ${state.pid}, start token matches) is still running; refusing to spawn (pid file ${state.path}). If pid ${state.pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${state.path} only after confirming no branch daemon is running.`,
       );
     case "unverified":
       throw new Error(branchPidRefusal(state.pid, state.path));
@@ -243,10 +243,7 @@ async function runInit(args: BranchArgs): Promise<void> {
   const port = args.port ?? 6458;
   const advertiseHost = args.host ?? hostname();
   const transport = args.transport ?? "ws";
-  // agentId resolves the maildir for branch-delivered messages. Default to
-  // the value at runBranch start time (TPS_AGENT_ID env → conf.agentId →
-  // hostname). Persisting at init time lets `tps branch start` pick it up
-  // without re-setting TPS_AGENT_ID in the environment.
+  // Persist --agent; start requires TPS_AGENT_ID or the persisted agentId.
   writeBranchConf(port, advertiseHost, transport, undefined, args.agent);
 
   const pubkeyB64 = Buffer.from(kp.encryption.publicKey).toString("base64url");

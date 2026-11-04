@@ -207,6 +207,9 @@ describe("branch start single-daemon guard (cli#726)", () => {
     expect(second.status).not.toBe(0);
     expect(second.stderr).toContain(`pid ${running.pid}`);
     expect(second.stderr).toContain(pidFile);
+    expect(second.stderr).toContain(
+      `If pid ${running.pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${pidFile} only after confirming no branch daemon is running.`,
+    );
     expect(second.stdout).not.toContain("Branch daemon started");
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
