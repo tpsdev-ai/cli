@@ -24,6 +24,8 @@ export interface HostConnectionState {
   messagesSent: number;
   messagesReceived: number;
   pid: number;
+  /** Process start token; absent from records written before it was captured. */
+  startToken?: string | null;
   services?: ServiceHealth[];
 }
 
@@ -34,8 +36,44 @@ export interface BranchConnectionState {
   messagesPushed: number;
 }
 
-function hostStatePath(branch: string): string {
+export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
+}
+
+export interface HostStatePathListing {
+  paths: string[];
+  /** Set for a listing error other than ENOENT. */
+  failure?: { path: string; code: string };
+}
+
+/** Connections directory `*.json` paths. A `host.json` object with neither
+ *  `pid` nor `branch` is treated as branch state and skipped. A listing
+ *  error other than ENOENT is reported. */
+export function listHostStatePaths(): HostStatePathListing {
+  const dir = connectionsDir();
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { paths: [] };
+    return { paths: [], failure: { path: dir, code } };
+  }
+  return {
+    paths: entries
+      .filter((f) => {
+        if (!f.endsWith(".json")) return false;
+        if (f !== "host.json") return true;
+        try {
+          const state: unknown = JSON.parse(readFileSync(join(dir, f), "utf-8"));
+          return typeof state !== "object" || state === null || Array.isArray(state)
+            || "pid" in state || "branch" in state;
+        } catch {
+          return true;
+        }
+      })
+      .map((f) => join(dir, f)),
+  };
 }
 
 function branchStatePath(): string {

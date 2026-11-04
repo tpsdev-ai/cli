@@ -1,10 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectionAlive, listHostStates } from "../utils/connection-state.js";
+import { connectionAlive, listHostStatePaths, listHostStates } from "../utils/connection-state.js";
+import { readPidFile, removePidFile } from "../utils/pid-file.js";
+import { pidPath as branchPidPath } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -40,6 +42,70 @@ export interface OfficeArgs {
 
 function branchRoot(): string {
   return sharedBranchRoot();
+}
+
+/** The signal sender for `office kill`; replaceable in tests so they can
+ *  assert that an unverified or stale record sends nothing. */
+type OfficeKillSignal = (pid: number) => void;
+let sendOfficeKillSignal: OfficeKillSignal = (pid) => process.kill(pid, "SIGTERM");
+
+export function setOfficeKillSignal(fn: OfficeKillSignal): OfficeKillSignal {
+  const previous = sendOfficeKillSignal;
+  sendOfficeKillSignal = fn;
+  return previous;
+}
+
+/** Reads `/proc/<pid>/stat`; replaceable in tests so they can exercise a read
+ *  that fails for a live pid. */
+type ProcStatReader = (pid: number) => string;
+let readProcStat: ProcStatReader = (pid) => readFileSync(`/proc/${pid}/stat`, "utf-8");
+
+export function setProcStatReader(fn: ProcStatReader): ProcStatReader {
+  const previous = readProcStat;
+  readProcStat = fn;
+  return previous;
+}
+
+/** True when `kill(pid, 0)` was refused with an error pidState calls alive. */
+function killProbeRefused(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return pidStateFromProbeError(error) === "alive";
+  }
+}
+
+/** True when Linux reports the pid in state `Z`: it has exited but still
+ *  answers `kill(pid, 0)` until its parent reaps it. Null when this platform or
+ *  this read cannot say. A missing `/proc` entry is not proof of exit
+ *  (hidepid, another pid namespace), so absence is left to the
+ *  `pidState === "gone"` path. */
+export function linuxProcessExited(pid: number): boolean | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = readProcStat(pid);
+    // Field 2 (comm) may contain spaces and parentheses, so field 3 (state)
+    // follows the space after the last ")".
+    const rparen = stat.lastIndexOf(")");
+    const state = stat[rparen + 2];
+    if (rparen === -1 || stat[rparen + 1] !== " " || !state || !"RSDZTtWXxKPI".includes(state)) return null;
+    return state === "Z";
+  } catch {
+    return null;
+  }
+}
+
+/** Wait for a signalled process to exit, polling for up to about 5 s. */
+async function waitForKillExit(pid: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    if (pidState(pid) === "gone") return true;
+    if (linuxProcessExited(pid) === true) return true;
+    if (killProbeRefused(pid)) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return pidState(pid) === "gone" || linuxProcessExited(pid) === true;
 }
 
 function workspacePath(agentId: string): string {
@@ -893,28 +959,94 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
     case "kill": {
       let killed = 0;
-      const { listHostStates, clearHostState } = await import("../utils/connection-state.js");
-      const states = listHostStates();
-      for (const s of states) {
-        try {
-          process.kill(s.pid, "SIGTERM");
-          clearHostState(s.branch);
-          killed++;
-        } catch {
-          clearHostState(s.branch);
-        }
+      const failures: string[] = [];
+      const listing = listHostStatePaths();
+      if (listing.failure) {
+        failures.push(
+          `Connections directory ${listing.failure.path} could not be listed (${listing.failure.code}), so its records were not checked; check them yourself.`,
+        );
       }
 
-      const pidPath = join(process.env.HOME || homedir(), ".tps", "branch", "branch.pid");
-      if (existsSync(pidPath)) {
+      const removeRecord = (path: string): "removed" | "already gone" | "kept" => {
         try {
-          const pid = Number(readFileSync(pidPath, "utf-8").trim());
-          if (pid) {
-            process.kill(pid, "SIGTERM");
-            killed++;
+          return removePidFile(path);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+          failures.push(`Pid record ${path} could not be removed (${code}); the record was kept.`);
+          return "kept";
+        }
+      };
+      const refusal = (label: string, pid: number, path: string): string =>
+        `${label} ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if that process is not running.`;
+      const reportRemoval = (what: string, path: string): void => {
+        const removal = removeRecord(path);
+        if (removal === "removed") console.log(`${what} removed: ${path}.`);
+        else if (removal === "already gone") console.log(`Pid record already gone: ${path}.`);
+      };
+
+      const stopRecord = async (label: string, path: string): Promise<void> => {
+        // The path is the caller's: it names a directory entry or the branch
+        // writer's own path, never a name parsed out of the record.
+        const state = readPidFile(path);
+        if (state.kind === "missing") return;
+        if (state.kind === "unreadable") {
+          failures.push(
+            `${label} ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if that process is not running.`,
+          );
+          return;
+        }
+        if (state.kind === "invalid") {
+          failures.push(`${label} ${state.path} could not be parsed (${state.reason}); the record was kept.`);
+          return;
+        }
+        if (state.kind === "unverified") {
+          failures.push(refusal(label, state.pid, state.path));
+          return;
+        }
+        if (state.kind === "stale") {
+          // Attempt stale-record removal without signalling; a removal failure
+          // keeps the record and is reported.
+          const removal = removeRecord(state.path);
+          if (removal === "removed") {
+            console.log(`Stale ${label.toLowerCase()} removed: ${state.path}; pid ${state.pid} was not signalled.`);
+          } else if (removal === "already gone") {
+            console.log(`Pid record already gone: ${state.path}; pid ${state.pid} was not signalled.`);
           }
-        } catch {}
-        try { rmSync(pidPath, { force: true }); } catch {}
+          return;
+        }
+        try {
+          sendOfficeKillSignal(state.pid);
+        } catch (error) {
+          // Classify the SIGTERM error itself (ESRCH means the process is gone);
+          // this is not a fresh probe. EPERM ("alive") and any other result
+          // keep the record and report it.
+          if (pidStateFromProbeError(error) !== "gone") {
+            failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
+            return;
+          }
+          reportRemoval(`Stale ${label.toLowerCase()}`, state.path);
+          return;
+        }
+        if (!(await waitForKillExit(state.pid))) {
+          failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
+          return;
+        }
+        killed++;
+        const removal = removeRecord(state.path);
+        if (removal === "removed") console.log(`${label} (pid ${state.pid}) stopped; record removed: ${state.path}.`);
+        else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
+      };
+
+      for (const path of listing.paths) {
+        await stopRecord("Host state record", path);
+      }
+      await stopRecord("Branch pid file", branchPidPath());
+
+      if (failures.length > 0) {
+        // Print every failure; the aggregate error makes the command exit
+        // non-zero after all records have been handled.
+        for (const line of failures) console.error(line);
+        throw new Error(failures.join(" "));
       }
 
       console.log(`Kill switch engaged. Terminated ${killed} TPS process(es).`);
