@@ -8,6 +8,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { processStartToken } from "@tpsdev-ai/agent";
 import { runBranch, setBranchStopSignal } from "../src/commands/branch.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -24,6 +25,8 @@ function pid1RefusesSignals(): boolean {
   }
 }
 const pid1Refused = pid1RefusesSignals();
+const pid1Token = processStartToken(1);
+const pid1Record = pid1Token === null ? null : `${JSON.stringify({ pid: 1, startToken: pid1Token })}\n`;
 const saved: Record<string, string | undefined> = {};
 
 let root: string;
@@ -53,15 +56,15 @@ afterEach(() => {
 describe("branch stop signal classification", () => {
   // pid 1 always exists. These cases send a real SIGTERM to it, so they run
   // only when a signal-0 probe of pid 1 is refused with EPERM (pid1Refused).
-  test.skipIf(!pid1Refused)("EPERM keeps the pid file and fails the stop", async () => {
-    writeFileSync(pidFile, "1\n");
+  test.skipIf(!pid1Refused || pid1Record === null)("EPERM keeps the pid file and fails the stop", async () => {
+    writeFileSync(pidFile, pid1Record!);
 
     await expect(runBranch({ action: "stop" })).rejects.toThrow(/could not be stopped \(pid 1\)/);
     expect(existsSync(pidFile)).toBe(true);
   });
 
-  test.skipIf(!pid1Refused)("the stop command exits non-zero on EPERM and names the pid", () => {
-    writeFileSync(pidFile, "1\n");
+  test.skipIf(!pid1Refused || pid1Record === null)("the stop command exits non-zero on EPERM and names the pid", () => {
+    writeFileSync(pidFile, pid1Record!);
 
     const result = spawnSync("node", [TPS_BIN, "branch", "stop"], {
       env: process.env,
@@ -85,7 +88,7 @@ describe("branch stop signal classification", () => {
 
 describe("branch stop refuses an invalid pid without signalling", () => {
   for (const pidText of ["-1", "1.5"]) {
-    test(`a pid file holding ${pidText} gets no SIGTERM and is removed as stale`, async () => {
+    test(`a pid file holding ${pidText} gets no SIGTERM; successful unlink removes it as invalid`, async () => {
       writeFileSync(pidFile, `${pidText}\n`);
       const signals: number[] = [];
       const original = setBranchStopSignal((pid) => {
@@ -104,7 +107,7 @@ describe("branch stop refuses an invalid pid without signalling", () => {
 
       expect(signals).toEqual([]);
       expect(existsSync(pidFile)).toBe(false);
-      expect(logs.join("\n")).toMatch(/stale/i);
+      expect(logs.join("\n")).toMatch(/removed/i);
     });
   }
 });
