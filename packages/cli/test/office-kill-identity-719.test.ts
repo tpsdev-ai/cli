@@ -575,7 +575,7 @@ describe("office kill identity", () => {
   );
 
   test(
-    "an unlistable connections directory is named, the branch record is still handled and the command exits non-zero",
+    "a regular file at the connections directory path is named, the branch record is still handled and the command exits non-zero",
     async () => {
       const dir = join(home, ".tps", "connections");
       rmSync(dir, { recursive: true, force: true });
