@@ -155,8 +155,8 @@ export function getRelayPid(probe: (pid: number) => PidState = pidState): number
   }
   if (state.kind === "running") return state.pid;
   // An unverified record is not proven gone and its identity is not confirmed:
-  // it may carry a non-null token that does not match. Report it for
-  // status/start; stop re-reads the file and refuses to signal it.
+  // it may carry a non-null token that does not match. Stop reads the record
+  // once and refuses to signal an unverified one.
   if (probe(state.pid) === "alive") return state.pid;
   removePidFile(state.path);
   return null;

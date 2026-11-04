@@ -643,7 +643,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       const mailDir = join(homedir(), ".tps", "mail");
 
       if (relayAction === "status") {
-        // Read-only: report the state and its path without removing anything.
+        // Read-only: unverified, stale, invalid and unreadable states name the pid file.
         const state = readRelayPidFile();
         if (state.kind === "running") {
           console.log(`Mail relay running: pid=${state.pid}`);
