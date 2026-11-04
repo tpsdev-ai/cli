@@ -55,6 +55,22 @@ function childToken(pid: number): string {
   return token;
 }
 
+/** Assert a pid is no longer running, accepting a Linux zombie: it has exited
+ *  but still answers `kill(pid, 0)` until its parent reaps it. */
+function expectStopped(pid: number): void {
+  if (pidState(pid) === "gone") return;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const rparen = stat.lastIndexOf(")");
+      if (rparen !== -1 && stat[rparen + 2] === "Z") return;
+    } catch {
+      /* not a zombie */
+    }
+  }
+  throw new Error(`pid ${pid} is still running`);
+}
+
 /**
  * A token from the same source as `real` whose value the child cannot carry,
  * so the record names another process by construction on Linux and macOS.
@@ -210,6 +226,7 @@ describe("office kill identity", () => {
       expect(signals).toEqual([host.pid]);
       expect(logs.join("\n")).toContain(`Host state record (pid ${host.pid}) stopped; record removed: ${hostPath}`);
       expect(existsSync(hostPath)).toBe(false);
+      await host.exited;
       expect(pidState(host.pid)).toBe("gone");
     },
     TIMEOUT,
@@ -314,6 +331,7 @@ describe("office kill identity", () => {
       expect(signals).toEqual([host.pid]);
       expect(logs.join("\n")).toContain(`Host state record (pid ${host.pid}) stopped; record removed: ${hostPath}`);
       expect(existsSync(hostPath)).toBe(false);
+      await host.exited;
       expect(pidState(host.pid)).toBe("gone");
     },
     TIMEOUT,
@@ -461,7 +479,43 @@ describe("office kill identity", () => {
       expect(signals).toEqual([pid]);
       expect(logs.join("\n")).toContain(`Branch pid file (pid ${pid}) stopped; record removed: ${branchPath}`);
       expect(existsSync(branchPath)).toBe(false);
-      expect(pidState(pid)).toBe("gone");
+      expectStopped(pid);
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "a child left by an exited launcher is reported stopped and its record removed",
+    async () => {
+      const root = join(home, "tps-root");
+      mkdirSync(root, { recursive: true });
+      process.env.TPS_ROOT = root;
+      // The shell exits without waiting for `sleep`; on Linux the signalled
+      // pid can therefore be a zombie when `office kill` probes it.
+      const launched = spawnSync("sh", ["-c", "sleep 60 </dev/null >/dev/null 2>&1 & echo $!"], { encoding: "utf8" });
+      expect(launched.status).toBe(0);
+      const pid = Number(launched.stdout.trim());
+      expect(Number.isInteger(pid)).toBe(true);
+      writerChildren.push(pid);
+      const branchPath = branchPidPath();
+      writeFileSync(branchPath, serializePidRecord(pid, childToken(pid)));
+
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((signalled) => {
+        signals.push(signalled);
+        process.kill(signalled, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runOffice({ action: "kill" });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+      }
+
+      expect(signals).toEqual([pid]);
+      expect(logs.join("\n")).toContain(`Branch pid file (pid ${pid}) stopped; record removed: ${branchPath}`);
+      expect(existsSync(branchPath)).toBe(false);
     },
     TIMEOUT,
   );
@@ -504,6 +558,7 @@ describe("office kill identity", () => {
       expect(message).toContain("could not be listed");
       expect(signals).toEqual([branch.pid]);
       expect(existsSync(branchPath)).toBe(false);
+      await branch.exited;
       expect(pidState(branch.pid)).toBe("gone");
     },
     TIMEOUT,
@@ -563,6 +618,8 @@ describe("office kill identity", () => {
       expect(existsSync(hostPath)).toBe(false);
       expect(existsSync(deadPath)).toBe(false);
       expect(existsSync(branchPath)).toBe(false);
+      await host.exited;
+      await branch.exited;
       expect(pidState(host.pid)).toBe("gone");
       expect(pidState(branch.pid)).toBe("gone");
     },

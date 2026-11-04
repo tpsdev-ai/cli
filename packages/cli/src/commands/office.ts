@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
@@ -65,15 +65,34 @@ function killProbeRefused(pid: number): boolean {
   }
 }
 
+/** True when Linux reports the pid as exited. A zombie has exited but still
+ *  answers `kill(pid, 0)` until its parent reaps it, so it is reported as
+ *  exited. Null when this platform or this read cannot say. */
+function linuxProcessExited(pid: number): boolean | null {
+  if (process.platform !== "linux") return null;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    // Field 2 (comm) may contain spaces and parentheses, so field 3 (state)
+    // is the first character after the last ")".
+    const rparen = stat.lastIndexOf(")");
+    if (rparen === -1) return null;
+    return stat[rparen + 2] === "Z";
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+    return null;
+  }
+}
+
 /** Wait for a signalled process to exit, polling for up to about 5 s. */
 async function waitForKillExit(pid: number): Promise<boolean> {
   const start = Date.now();
   while (Date.now() - start < 5000) {
     if (pidState(pid) === "gone") return true;
+    if (linuxProcessExited(pid) === true) return true;
     if (killProbeRefused(pid)) return false;
     await new Promise((r) => setTimeout(r, 100));
   }
-  return pidState(pid) === "gone";
+  return pidState(pid) === "gone" || linuxProcessExited(pid) === true;
 }
 
 function workspacePath(agentId: string): string {
