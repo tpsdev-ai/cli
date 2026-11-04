@@ -55,6 +55,17 @@ export function setOfficeKillSignal(fn: OfficeKillSignal): OfficeKillSignal {
   return previous;
 }
 
+/** Reads `/proc/<pid>/stat`; replaceable in tests so they can exercise a read
+ *  that fails for a live pid. */
+type ProcStatReader = (pid: number) => string;
+let readProcStat: ProcStatReader = (pid) => readFileSync(`/proc/${pid}/stat`, "utf-8");
+
+export function setProcStatReader(fn: ProcStatReader): ProcStatReader {
+  const previous = readProcStat;
+  readProcStat = fn;
+  return previous;
+}
+
 /** True when `kill(pid, 0)` was refused with an error pidState calls alive. */
 function killProbeRefused(pid: number): boolean {
   try {
@@ -65,20 +76,21 @@ function killProbeRefused(pid: number): boolean {
   }
 }
 
-/** True when Linux reports the pid as exited. A zombie has exited but still
- *  answers `kill(pid, 0)` until its parent reaps it, so it is reported as
- *  exited. Null when this platform or this read cannot say. */
+/** True when Linux reports the pid in state `Z`: it has exited but still
+ *  answers `kill(pid, 0)` until its parent reaps it. Null when this platform or
+ *  this read cannot say. A missing `/proc` entry is not proof of exit
+ *  (hidepid, another pid namespace), so absence is left to the
+ *  `pidState === "gone"` path. */
 function linuxProcessExited(pid: number): boolean | null {
   if (process.platform !== "linux") return null;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const stat = readProcStat(pid);
     // Field 2 (comm) may contain spaces and parentheses, so field 3 (state)
     // is the first character after the last ")".
     const rparen = stat.lastIndexOf(")");
     if (rparen === -1) return null;
     return stat[rparen + 2] === "Z";
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
+  } catch {
     return null;
   }
 }

@@ -47,18 +47,18 @@ export interface HostStatePathListing {
 }
 
 /** Paths of host state records in the connections directory, taken from
- *  directory entries, never from file content. `host.json` holds the branch
- *  connection state, which has no `pid`; it is a host record when it has a
- *  `pid` or `branch` key, or is not a JSON object. A directory that cannot be
- *  listed is reported instead of yielding an empty list. */
+ *  directory entries, never from file content. `host.json` is branch
+ *  connection state unless it has a `pid` or `branch` key or is not a JSON
+ *  object (a host named `host` writes its record there). A read error other
+ *  than ENOENT is reported instead of yielding an empty list. */
 export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
-  if (!existsSync(dir)) return { paths: [] };
   let entries: string[];
   try {
     entries = readdirSync(dir);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { paths: [] };
     return { paths: [], failure: { path: dir, code } };
   }
   return {

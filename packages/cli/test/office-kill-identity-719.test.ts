@@ -1,5 +1,5 @@
 /**
- * cli#719 — `office kill` enumerates the host state record files and the
+ * cli#719 — `office kill` enumerates the connections directory entries and the
  * branch pid file and classifies each at its actual path with the shared
  * pid-file check immediately before signalling. A record classified as unverified
  * is not signalled, is kept and named, and the command exits non-zero. Stale-record
@@ -8,12 +8,12 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { pidPath as branchPidPath } from "../src/commands/branch.js";
-import { runOffice, setOfficeKillSignal } from "../src/commands/office.js";
+import { runOffice, setOfficeKillSignal, setProcStatReader } from "../src/commands/office.js";
 import { hostStatePath, writeBranchState, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
 
@@ -560,6 +560,65 @@ describe("office kill identity", () => {
       expect(existsSync(branchPath)).toBe(false);
       await branch.exited;
       expect(pidState(branch.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a connections directory whose path cannot be resolved is reported and office kill exits non-zero",
+    () => {
+      const dir = join(home, ".tps", "connections");
+      // A symlink that points to itself fails with ELOOP for every uid, root
+      // included, so the listing is exercised in the container jobs too.
+      rmSync(dir, { recursive: true, force: true });
+      symlinkSync("connections", dir);
+
+      const result = spawnSync(process.execPath, [TPS_BIN, "office", "kill"], {
+        encoding: "utf8",
+        timeout: TIMEOUT - 5_000,
+        env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+      });
+
+      expect(result.status).toBe(1);
+      const output = `${result.stdout}${result.stderr}`;
+      expect(output).toContain(dir);
+      expect(output).toContain("could not be listed");
+      expect(output).toContain("ELOOP");
+    },
+    TIMEOUT,
+  );
+
+  test.skipIf(process.platform !== "linux")(
+    "a live pid whose process state cannot be read is kept and the command fails",
+    async () => {
+      const host = spawnChild();
+      const hostPath = hostStatePath("host-a");
+      writeHostState(hostState("host-a", host.pid, childToken(host.pid)));
+
+      // The signal does not stop this pid, and the process-state read fails
+      // with ENOENT although the pid is live (hidepid, another pid namespace).
+      const previousSignal = setOfficeKillSignal(() => {});
+      const previousReader = setProcStatReader(() => {
+        const error = new Error("no such file or directory") as NodeJS.ErrnoException;
+        error.code = "ENOENT";
+        throw error;
+      });
+      const { restore } = captureLogs();
+      let message = "";
+      try {
+        await runOffice({ action: "kill" }).catch((error) => {
+          message = (error as Error).message;
+        });
+      } finally {
+        restore();
+        setProcStatReader(previousReader);
+        setOfficeKillSignal(previousSignal);
+      }
+
+      expect(message).toContain(hostPath);
+      expect(message).toContain("could not be stopped");
+      expect(existsSync(hostPath)).toBe(true);
+      expect(pidState(host.pid)).toBe("alive");
     },
     TIMEOUT,
   );
