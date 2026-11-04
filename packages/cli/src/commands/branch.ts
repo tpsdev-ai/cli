@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmS
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn } from "node:child_process";
-import { isValidPid, pidState, pidStateFromProbeError, type PidState } from "@tpsdev-ai/agent";
+import { pidState, pidStateFromProbeError, processStartToken, type PidState } from "@tpsdev-ai/agent";
 import { generateKeyPair, loadKeyPair, saveKeyPair } from "../utils/identity.js";
 import { listenForHost, listenForJoin } from "../utils/noise-ik-transport.js";
 import { listenForHostWs, listenForJoinWs } from "../utils/ws-noise-transport.js";
@@ -16,6 +16,7 @@ import { clearBranchState, writeBranchState } from "../utils/connection-state.js
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
+import { readPidFile, removePidFile, serializePidRecord } from "../utils/pid-file.js";
 
 let activeHostChannel: TransportChannel | null = null;
 
@@ -268,7 +269,7 @@ async function runInit(args: BranchArgs): Promise<void> {
   if (!child.pid) {
     throw new Error("Failed to spawn branch daemon");
   }
-  writeFileSync(pidPath(), `${child.pid}\n`, "utf-8");
+  writeFileSync(pidPath(), serializePidRecord(child.pid, processStartToken(child.pid)), "utf-8");
 
   console.log(`Branch daemon running (pid ${child.pid}). Listening on 0.0.0.0:${port}.`);
   console.log(`Log: ${logPath()}`);
@@ -294,7 +295,7 @@ async function runStart(): Promise<void> {
     child.unref();
     try { closeSync(outFd); } catch {}
     if (!child.pid) throw new Error("Failed to spawn branch daemon");
-    writeFileSync(pidPath(), `${child.pid}\n`, "utf-8");
+    writeFileSync(pidPath(), serializePidRecord(child.pid, processStartToken(child.pid)), "utf-8");
     console.log(`Branch daemon started (pid ${child.pid}). Log: ${logPath()}`);
     process.exit(0);
   }
@@ -542,26 +543,67 @@ export function setBranchStopSignal(fn: StopSignal): StopSignal {
 
 async function runStop(): Promise<void> {
   const p = pidPath();
-  if (!existsSync(p)) {
-    console.log("Branch daemon is not running.");
+  // Checks the recorded token immediately before signalling. ps tokens have
+  // one-second precision; PID reuse between the check and signal remains possible.
+  const state = readPidFile(p);
+
+  // A removal failure keeps the pid file, reports the path and the error code,
+  // and exits non-zero.
+  const removeBranchPid = (path: string): "removed" | "already gone" => {
+    try {
+      return removePidFile(path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      throw new Error(`Branch pid file ${path} could not be removed (${code}); the pid file was kept.`);
+    }
+  };
+  const refusal = (pid: number, path: string): Error =>
+    new Error(
+      `Branch pid file ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if the branch daemon is not running.`,
+    );
+
+  if (state.kind === "missing") {
+    console.log(`No branch PID file at ${p}; nothing was signalled.`);
     return;
   }
-  const pid = Number(readFileSync(p, "utf-8").trim());
-  if (!isValidPid(pid)) {
-    rmSync(p, { force: true });
-    console.log("Stale PID file removed.");
+  if (state.kind === "unreadable") {
+    throw new Error(
+      `Branch pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if the branch daemon is not running.`,
+    );
+  }
+  if (state.kind === "invalid") {
+    console.log(
+      removeBranchPid(state.path) === "removed"
+        ? `Branch PID file ${state.path} was invalid and was removed; the branch daemon's state is unknown.`
+        : `Branch PID file ${state.path} was invalid and is already gone; the branch daemon's state is unknown.`,
+    );
     return;
   }
+  if (state.kind === "stale") {
+    console.log(
+      removeBranchPid(state.path) === "removed"
+        ? `Branch PID file ${state.path} was stale and was removed; this command signalled no process.`
+        : `Branch PID file ${state.path} was stale and is already gone; this command signalled no process.`,
+    );
+    return;
+  }
+  if (state.kind === "unverified") {
+    throw refusal(state.pid, state.path);
+  }
+
+  const pid = state.pid;
   try {
     sendStopSignal(pid);
   } catch (error) {
-    // Same classifier as pidState: EPERM means the process is alive and this
-    // user may not signal it, so the pid file stays and the stop fails.
-    if (pidStateFromProbeError(error) === "alive") {
-      throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept.`);
+    // ESRCH from the signal permits removal; other signal errors keep the file.
+    if (pidStateFromProbeError(error) !== "gone") {
+      throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept at ${state.path}.`);
     }
-    rmSync(p, { force: true });
-    console.log("Branch daemon not running (stale PID removed).");
+    console.log(
+      removeBranchPid(state.path) === "removed"
+        ? `Recorded branch process (pid ${pid}) is gone (stale PID file removed).`
+        : `Recorded branch process (pid ${pid}) is gone (PID file already gone).`,
+    );
     return;
   }
 
@@ -571,27 +613,37 @@ async function runStop(): Promise<void> {
     // A probe refused with EPERM keeps returning "alive"; stop waiting and
     // report rather than polling until the deadline.
     if (pidProbeRefused(pid)) break;
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise<void>((r) => setTimeout(r, 100));
   }
   if (processAlive(pid)) {
     throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept.`);
   }
-  rmSync(p, { force: true });
-  console.log("Branch daemon stopped.");
+  console.log(
+    removeBranchPid(state.path) === "removed"
+      ? `Recorded branch process (pid ${pid}) stopped (PID file removed).`
+      : `Recorded branch process (pid ${pid}) stopped (PID file already gone).`,
+  );
 }
 
 function runStatus(): void {
   const p = pidPath();
-  if (!existsSync(p)) {
-    console.log("Branch daemon: stopped");
-    return;
+  const state = readPidFile(p);
+  if (state.kind === "running") {
+    console.log("Recorded branch process: running");
+    console.log(`PID: ${state.pid}`);
+  } else if (state.kind === "unverified") {
+    console.log(`Branch daemon: unverified (pid ${state.pid}, pid file ${state.path})`);
+  } else if (state.kind === "stale") {
+    console.log(`Branch daemon: unknown (stale pid file ${state.path})`);
+  } else if (state.kind === "invalid") {
+    console.log(`Branch daemon: unknown (invalid pid file ${state.path})`);
+  } else if (state.kind === "unreadable") {
+    console.log(`Branch daemon: unknown (pid file ${state.path} could not be read)`);
+  } else {
+    console.log(`Branch daemon: unknown (no pid file at ${p})`);
   }
-  const pid = Number(readFileSync(p, "utf-8").trim());
-  const alive = processAlive(pid);
   const confExists = existsSync(confPath());
   const hostExists = existsSync(hostPath(getIdentityDir()));
-  console.log(`Branch daemon: ${alive ? "running" : "stopped"}`);
-  if (pid) console.log(`PID: ${pid}`);
   if (confExists) {
     const conf = readBranchConf();
     console.log(`Listen: 0.0.0.0:${conf.port}`);
