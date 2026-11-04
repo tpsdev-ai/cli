@@ -542,8 +542,8 @@ export function setBranchStopSignal(fn: StopSignal): StopSignal {
 
 async function runStop(): Promise<void> {
   const p = pidPath();
-  // Read the record immediately before deciding: the start token is checked
-  // against the live process, never a cached classification.
+  // Checks the recorded token immediately before signalling. ps tokens have
+  // one-second precision; PID reuse between the check and signal remains possible.
   const state = readPidFile(p);
 
   // A removal failure keeps the pid file, reports the path and the error code,
@@ -573,19 +573,16 @@ async function runStop(): Promise<void> {
   if (state.kind === "invalid") {
     console.log(
       removeBranchPid(state.path) === "removed"
-        ? "Branch daemon is not running (invalid PID file removed)."
-        : "Branch daemon is not running (PID file already gone).",
+        ? `Branch PID file ${state.path} was invalid and was removed; the branch daemon's state is unknown.`
+        : `Branch PID file ${state.path} was invalid and is already gone; the branch daemon's state is unknown.`,
     );
     return;
   }
   if (state.kind === "stale") {
-    // A live pid whose token differs belongs to another process: keep the
-    // record and refuse rather than signal it. Only a dead pid is removed.
-    if (pidState(state.pid) === "alive") throw refusal(state.pid, state.path);
     console.log(
       removeBranchPid(state.path) === "removed"
-        ? "Branch daemon is not running (stale PID file removed)."
-        : "Branch daemon is not running (PID file already gone).",
+        ? `Branch daemon is not running (stale PID file removed; pid ${state.pid} was not signalled).`
+        : `Branch daemon is not running (PID file already gone; pid ${state.pid} was not signalled).`,
     );
     return;
   }
@@ -597,16 +594,14 @@ async function runStop(): Promise<void> {
   try {
     sendStopSignal(pid);
   } catch (error) {
-    // Same classifier as pidState: EPERM means the process is alive and this
-    // user may not signal it, so the pid file stays and the stop fails. Only a
-    // gone classification proves the process is gone and lets us remove it.
+    // ESRCH from the signal permits removal; other signal errors keep the file.
     if (pidStateFromProbeError(error) !== "gone") {
       throw new Error(`Branch daemon could not be stopped (pid ${pid}); PID file kept at ${state.path}.`);
     }
     console.log(
       removeBranchPid(state.path) === "removed"
-        ? "Branch daemon not running (stale PID removed)."
-        : "Branch daemon not running (PID file already gone).",
+        ? `Recorded branch process (pid ${pid}) is gone (stale PID file removed).`
+        : `Recorded branch process (pid ${pid}) is gone (PID file already gone).`,
     );
     return;
   }
@@ -624,8 +619,8 @@ async function runStop(): Promise<void> {
   }
   console.log(
     removeBranchPid(state.path) === "removed"
-      ? "Branch daemon stopped."
-      : "Branch daemon stopped (PID file already gone).",
+      ? `Recorded branch process (pid ${pid}) stopped (PID file removed).`
+      : `Recorded branch process (pid ${pid}) stopped (PID file already gone).`,
   );
 }
 
@@ -633,14 +628,14 @@ function runStatus(): void {
   const p = pidPath();
   const state = readPidFile(p);
   if (state.kind === "running") {
-    console.log("Branch daemon: running");
+    console.log("Recorded branch process: running");
     console.log(`PID: ${state.pid}`);
   } else if (state.kind === "unverified") {
     console.log(`Branch daemon: unverified (pid ${state.pid}, pid file ${state.path})`);
   } else if (state.kind === "stale") {
-    console.log(`Branch daemon: stopped (stale pid file ${state.path})`);
+    console.log(`Branch daemon: not running (stale pid file ${state.path}; pid ${state.pid} was not signalled)`);
   } else if (state.kind === "invalid") {
-    console.log(`Branch daemon: stopped (invalid pid file ${state.path})`);
+    console.log(`Branch daemon: unknown (invalid pid file ${state.path})`);
   } else if (state.kind === "unreadable") {
     console.log(`Branch daemon: unknown (pid file ${state.path} could not be read)`);
   } else {

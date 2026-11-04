@@ -88,7 +88,7 @@ describe("branch stop signal classification", () => {
 
 describe("branch stop refuses an invalid pid without signalling", () => {
   for (const pidText of ["-1", "1.5"]) {
-    test(`a pid file holding ${pidText} gets no SIGTERM and is removed as invalid`, async () => {
+    test(`a pid file holding ${pidText} gets no SIGTERM; successful unlink removes it as invalid`, async () => {
       writeFileSync(pidFile, `${pidText}\n`);
       const signals: number[] = [];
       const original = setBranchStopSignal((pid) => {
