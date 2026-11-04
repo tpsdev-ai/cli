@@ -409,7 +409,7 @@ async function runInit(args: BranchArgs): Promise<void> {
   console.log("Starting branch daemon...");
   const daemonPid = spawnBranchDaemon();
 
-  console.log(`Branch daemon running (pid ${daemonPid}). Listening on 0.0.0.0:${port}.`);
+  console.log(`Branch daemon spawned (pid ${daemonPid}). Configured port: ${port}.`);
   console.log(`Log: ${logPath()}`);
 }
 
@@ -424,7 +424,7 @@ async function runStart(): Promise<void> {
     process.env.NODE_ENV !== "test"
   ) {
     const daemonPid = spawnBranchDaemon();
-    console.log(`Branch daemon started (pid ${daemonPid}). Log: ${logPath()}`);
+    console.log(`Branch daemon spawned (pid ${daemonPid}). Log: ${logPath()}`);
     process.exit(0);
   }
 
@@ -655,7 +655,7 @@ async function runStart(): Promise<void> {
       } else if (outcome === "unverified") {
         logLine("STOPPED", `Pid record ${p} does not verify as this process; leaving it in place.`);
       } else if (outcome === "changed") {
-        logLine("STOPPED", `Pid record ${p} changed while it was being removed; leaving the new record in place.`);
+        logLine("STOPPED", `Pid file ${p} changed (replaced or removed); this command removed nothing.`);
       } else if (outcome === "other") {
         logLine("STOPPED", `Pid record ${p} could not be read as this process's record; leaving it in place.`);
       }
@@ -702,7 +702,7 @@ async function runStop(): Promise<void> {
   const refusal = (pid: number, path: string): Error => new Error(branchPidRefusal(pid, path));
   const changed = (path: string): Error =>
     new Error(
-      `Branch pid file ${path} changed while "tps branch stop" was in progress; refusing to remove the new record. Re-run "tps branch stop".`,
+      `Branch pid file ${path} changed (replaced or removed); this command removed nothing. Re-run "tps branch stop".`,
     );
   const removeAfterRecheck = (path: string, before: PidRecordSnapshot): "removed" | "already gone" => {
     branchTestPause("stop-before-unlink", path);

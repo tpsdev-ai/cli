@@ -267,7 +267,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const exits = await Promise.all(launchers.map(({ child }) => waitForExit(child)));
 
     const announced = launchers.flatMap(({ stdout }) =>
-      [...stdout().matchAll(/Branch daemon started \(pid (\d+)\)/g)].map((match) => Number(match[1])),
+      [...stdout().matchAll(/Branch daemon spawned \(pid (\d+)\)/g)].map((match) => Number(match[1])),
     );
     expect(announced.length).toBe(1);
 
@@ -285,7 +285,7 @@ describe("branch pid record ownership (cli#730)", () => {
     await waitForPidGone(running.pid);
   }, 40_000);
 
-  test("a shutdown holds the record lock while it decides, and a replacement is left in place", async () => {
+  test("shutdown holds the record lock and preserves a replacement visible at its final read", async () => {
     const port = await freePort();
     prepareBranch(port);
     const phase = "shutdown-before-unlink";
@@ -316,10 +316,10 @@ describe("branch pid record ownership (cli#730)", () => {
     const state = readPidFile(pidFile);
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(newer.pid);
-    expect(readFileSync(logFile, "utf8")).toContain("changed while it was being removed");
+    expect(readFileSync(logFile, "utf8")).toContain(`Pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
   }, 40_000);
 
-  test("runStop leaves a record replaced between its read and its unlink", async () => {
+  test("runStop preserves a replacement visible at its final locked read", async () => {
     prepareBranch(await freePort());
     const stale = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stale, null));
@@ -350,7 +350,7 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exit = await exited;
     expect(exit.code).not.toBe(0);
-    expect(stderr).toContain("changed while \"tps branch stop\" was in progress");
+    expect(stderr).toContain(`Branch pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
     expect(readFileSync(pidFile, "utf8")).toBe(replacement);
     const state = readPidFile(pidFile);
     expect(state.kind).toBe("running");
