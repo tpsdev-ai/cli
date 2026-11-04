@@ -8,7 +8,7 @@
  */
 
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { bridgePidFiles, bridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
+import { bridgePidFiles, bridgeRunningRecords, openClawBridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
@@ -125,8 +125,10 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         return;
       }
 
-      // Default: OpenClaw adapter (legacy path)
-      const st = bridgeStatus();
+      // Default: OpenClaw adapter (legacy path). Only the OpenClaw records
+      // (bridge-openclaw.pid and the legacy mail-bridge.pid) can refuse it, and
+      // they are read by name so an unlistable run directory does not refuse it.
+      const st = openClawBridgeStatus(pidState);
       if (st.running) {
         console.log(`Bridge already running (pid ${st.pid}, port ${st.port})`);
         process.exit(0);
@@ -167,7 +169,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         if (state.kind === "missing") continue;
         if (state.kind === "unreadable") {
           failures.push(
-            `Bridge pid file ${state.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
+            `Bridge pid file ${state.path} ${state.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
           );
           continue;
         }
@@ -202,7 +204,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             }
           } else if (fresh.kind === "unreadable") {
             failures.push(
-              `Bridge pid file ${fresh.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+              `Bridge pid file ${fresh.path} ${fresh.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
             );
           } else if (fresh.kind === "unverified") {
             failures.push(
@@ -275,11 +277,24 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
     }
 
     case "status": {
-      const st = bridgeStatus();
+      const running = bridgeRunningRecords();
       if (args.json) {
-        console.log(JSON.stringify(st));
-      } else if (st.running) {
-        console.log(`Bridge running: pid=${st.pid}, port=${st.port}`);
+        // The top-level `running`, `pid` and `port` describe the OpenClaw
+        // record only; `bridges` lists every running record.
+        const openclaw = running.find((entry) => entry.adapter === "openclaw");
+        const status = {
+          running: openclaw !== undefined,
+          ...(openclaw === undefined ? {} : { pid: openclaw.pid }),
+          ...(openclaw?.port === undefined ? {} : { port: openclaw.port }),
+          ...(openclaw === undefined ? {} : { adapter: openclaw.adapter }),
+          ...(running.length === 0 ? {} : { bridges: running }),
+        };
+        console.log(JSON.stringify(status));
+      } else if (running.length > 0) {
+        for (const entry of running) {
+          const port = entry.port === undefined ? "" : `, port=${entry.port}`;
+          console.log(`Bridge running: adapter=${entry.adapter}, pid=${entry.pid}${port}`);
+        }
       } else {
         console.log("Bridge is not running.");
       }

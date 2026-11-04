@@ -29,6 +29,7 @@ const BRIDGE_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
 const RECHECK_CHILD = `
 const pidPath = process.env.PID_PATH;
 const secondPath = process.env.SECOND_PATH || "";
+const removeFailPath = process.env.REMOVE_FAIL_PATH || "";
 const pid = Number(process.env.PID_VALUE);
 const mode = process.env.MODE;
 const { mock } = await import("bun:test");
@@ -44,6 +45,14 @@ mock.module(${JSON.stringify(PID_FILE_URL)}, () => ({
     }
     if (path !== pidPath && path !== secondPath) return { kind: "missing" };
     return { kind: "running", path, pid, startToken: "token-a" };
+  },
+  removePidFile(path) {
+    if (removeFailPath !== "" && path === removeFailPath) {
+      const error = new Error("EISDIR: illegal operation on a directory, unlink") as NodeJS.ErrnoException;
+      error.code = "EISDIR";
+      throw error;
+    }
+    return real.removePidFile(path);
   },
 }));
 const { runBridge, setBridgeStopSignal } = await import(${JSON.stringify(BRIDGE_URL)});
@@ -1084,12 +1093,10 @@ describe("bridge stop identity", () => {
       const pid = requireGonePid(gonePid);
       writeFileSync(bridgePid, relayRecord(pid, "token-a"));
       writeFileSync(legacyBridgePid, relayRecord(pid, "token-a"));
-      rmSync(legacyBridgePid);
-      mkdirSync(legacyBridgePid);
-      writeFileSync(join(legacyBridgePid, "keep"), "x");
       const { status, result } = runRecheckChild("duplicate", {
         PID_PATH: bridgePid,
         SECOND_PATH: legacyBridgePid,
+        REMOVE_FAIL_PATH: legacyBridgePid,
         PID_VALUE: String(pid),
       });
 
@@ -1216,7 +1223,7 @@ describe("unreadable pid files", () => {
 
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(bridgePid);
-      expect(result.stderr).toMatch(/could not be read/);
+      expect(result.stderr).toMatch(/is not a regular file/);
       expect(existsSync(bridgePid)).toBe(true);
     },
     TIMEOUT,
@@ -1250,7 +1257,7 @@ describe("unreadable pid files", () => {
   );
 
   test.skipIf(process.getuid?.() === 0)(
-    "bridge stop with an unsearchable parent directory exits non-zero and names the file",
+    "bridge stop with an unsearchable run directory exits non-zero and names the directory",
     () => {
       writeFileSync(bridgePid, JSON.stringify({ pid: 1, port: 7891 }));
       const runDir = join(home, ".tps", "run");
@@ -1267,8 +1274,9 @@ describe("unreadable pid files", () => {
       }
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain(bridgePid);
+      expect(result.stderr).toContain(runDir);
       expect(result.stderr).toMatch(/could not be read/);
+      expect(result.stderr).toMatch(/EACCES/);
       expect(existsSync(bridgePid)).toBe(true);
     },
     TIMEOUT,

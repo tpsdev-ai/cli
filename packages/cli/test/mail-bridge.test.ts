@@ -220,7 +220,7 @@ describe("ops-36p2: inbound HTTP security", () => {
 describe("ops-36p2: bridgeStatus", () => {
   test("returns correct shape", async () => {
     const { bridgeStatus } = await import("../src/utils/mail-bridge.js");
-    const st = bridgeStatus();
+    const st = bridgeStatus("openclaw");
     expect(typeof st.running).toBe("boolean");
   });
 });
