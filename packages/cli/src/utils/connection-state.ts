@@ -40,6 +40,16 @@ export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
+/** Paths of the host state records present in the connections directory. The
+ *  path comes from the directory entry, never from file content. */
+export function listHostStatePaths(): string[] {
+  const dir = connectionsDir();
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".json") && f !== "host.json")
+    .map((f) => join(dir, f));
+}
+
 function branchStatePath(): string {
   return join(connectionsDir(), "host.json");
 }

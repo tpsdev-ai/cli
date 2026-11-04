@@ -99,7 +99,8 @@ function getIdentityDir(): string {
   return process.env.TPS_IDENTITY_DIR || join(tpsRoot(), "identity");
 }
 
-function pidPath(): string {
+/** Path of the branch daemon pid file, under `TPS_ROOT` when it is set. */
+export function pidPath(): string {
   return join(tpsRoot(), "branch.pid");
 }
 

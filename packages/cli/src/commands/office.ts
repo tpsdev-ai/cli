@@ -1,12 +1,12 @@
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectionAlive, hostStatePath, listHostStates } from "../utils/connection-state.js";
+import { connectionAlive, listHostStatePaths, listHostStates } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
+import { pidPath as branchPidPath } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -45,7 +45,7 @@ function branchRoot(): string {
 }
 
 /** The signal sender for `office kill`; replaceable in tests so they can
- *  assert that an unverified or mismatched record sends nothing. */
+ *  assert that an unverified or stale record sends nothing. */
 type OfficeKillSignal = (pid: number) => void;
 let sendOfficeKillSignal: OfficeKillSignal = (pid) => process.kill(pid, "SIGTERM");
 
@@ -928,7 +928,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "kill": {
       let killed = 0;
       const failures: string[] = [];
-      const states = listHostStates();
+      const recordPaths = listHostStatePaths();
 
       const removeRecord = (path: string): "removed" | "already gone" | "kept" => {
         try {
@@ -941,8 +941,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       };
       const refusal = (label: string, pid: number, path: string): string =>
         `${label} ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if that process is not running.`;
-      const mismatch = (label: string, pid: number, path: string): string =>
-        `${label} ${path} names pid ${pid}, but the live process's start token does not match the record. Check that pid and stop it yourself, or remove ${path} if that process is not running.`;
       const reportRemoval = (what: string, path: string): void => {
         const removal = removeRecord(path);
         if (removal === "removed") console.log(`${what} removed: ${path}.`);
@@ -950,7 +948,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       };
 
       const stopRecord = async (label: string, path: string): Promise<void> => {
-        // Classify the record immediately before deciding to signal it.
+        // The path is the caller's: it names a directory entry or the branch
+        // writer's own path, never a name parsed out of the record.
         const state = readPidFile(path);
         if (state.kind === "missing") return;
         if (state.kind === "unreadable") {
@@ -960,7 +959,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           return;
         }
         if (state.kind === "invalid") {
-          reportRemoval(`Invalid ${label.toLowerCase()}`, state.path);
+          failures.push(`${label} ${state.path} could not be parsed (${state.reason}); the record was kept.`);
           return;
         }
         if (state.kind === "unverified") {
@@ -968,22 +967,24 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           return;
         }
         if (state.kind === "stale") {
-          // A live pid with a different start token belongs to another process:
-          // keep the record and report it. In this branch, remove a stale record
-          // only when its pid is proved gone.
-          if (pidState(state.pid) !== "gone") {
-            failures.push(mismatch(label, state.pid, state.path));
-            return;
+          // readPidFile calls a record stale only when the recorded process is
+          // proven gone: its pid is gone, or the pid is alive with a different
+          // same-source start token and so belongs to another process. Remove
+          // the record; never signal a pid the record no longer identifies.
+          const removal = removeRecord(state.path);
+          if (removal === "removed") {
+            console.log(`Stale ${label.toLowerCase()} removed: ${state.path}; pid ${state.pid} was not signalled.`);
+          } else if (removal === "already gone") {
+            console.log(`Pid record already gone: ${state.path}; pid ${state.pid} was not signalled.`);
           }
-          reportRemoval(`Stale ${label.toLowerCase()}`, state.path);
           return;
         }
         try {
           sendOfficeKillSignal(state.pid);
         } catch (error) {
-          // Only a probe that classifies the pid "gone" proves the process is
-          // gone: remove the record in that case. EPERM ("alive") and any other
-          // result keep the record and report it.
+          // Classify the SIGTERM error itself (ESRCH means the process is gone);
+          // this is not a fresh probe. EPERM ("alive") and any other result
+          // keep the record and report it.
           if (pidStateFromProbeError(error) !== "gone") {
             failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
             return;
@@ -1001,16 +1002,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
       };
 
-      for (const state of states) {
-        await stopRecord("Host state record", hostStatePath(state.branch));
+      for (const path of recordPaths) {
+        await stopRecord("Host state record", path);
       }
-      await stopRecord(
-        "Branch pid file",
-        join(process.env.HOME || homedir(), ".tps", "branch", "branch.pid"),
-      );
+      await stopRecord("Branch pid file", branchPidPath());
 
       if (failures.length > 0) {
-        // Print every outcome; the aggregate error makes the command exit
+        // Print every failure; the aggregate error makes the command exit
         // non-zero after all records have been handled.
         for (const line of failures) console.error(line);
         throw new Error(failures.join(" "));

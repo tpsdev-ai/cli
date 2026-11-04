@@ -1,21 +1,24 @@
 /**
- * cli#719 — `office kill` classifies each host state record and the branch pid
- * file through the shared pid-file identity check immediately before signalling.
- * A live pid whose recorded start token does not match is neither signalled nor
- * removed; the command exits non-zero naming every record it kept. These tests
- * use real child processes and real state files under a temp HOME.
+ * cli#719 — `office kill` enumerates the host state record files and the
+ * branch pid file and classifies each at its actual path with the shared
+ * pid-file check immediately before signalling. A record whose process identity
+ * cannot be verified is not signalled, is kept and named, and the command exits
+ * non-zero. A record whose recorded process is proven gone is removed without a
+ * signal. These tests use real child processes and real files under a temp HOME.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { pidPath as branchPidPath } from "../src/commands/branch.js";
 import { runOffice, setOfficeKillSignal } from "../src/commands/office.js";
 import { hostStatePath, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
 
-const TIMEOUT = 20_000;
+const TIMEOUT = 30_000;
+const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const children: Bun.Subprocess[] = [];
 
 function spawnChild(): Bun.Subprocess {
@@ -53,9 +56,8 @@ function childToken(pid: number): string {
 
 /**
  * A token from the same source as `real` whose value the child cannot carry,
- * so the record is a mismatch by construction on Linux and macOS. Keeping the
- * source prefix makes the classifier call the record stale rather than
- * unverified.
+ * so the record names another process by construction on Linux and macOS.
+ * Keeping the source prefix makes the classifier call the record stale.
  */
 function foreignStartToken(real: string): string {
   if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
@@ -101,21 +103,23 @@ afterEach(() => {
 });
 
 let home: string;
-let branchPid: string;
 let savedHome: string | undefined;
+let savedRoot: string | undefined;
 
 beforeEach(() => {
   savedHome = process.env.HOME;
+  savedRoot = process.env.TPS_ROOT;
   home = mkdtempSync(join(tmpdir(), "tps-office-kill-719-"));
   process.env.HOME = home;
+  delete process.env.TPS_ROOT;
   mkdirSync(join(home, ".tps", "connections"), { recursive: true });
-  mkdirSync(join(home, ".tps", "branch"), { recursive: true });
-  branchPid = join(home, ".tps", "branch", "branch.pid");
 });
 
 afterEach(() => {
   if (savedHome === undefined) delete process.env.HOME;
   else process.env.HOME = savedHome;
+  if (savedRoot === undefined) delete process.env.TPS_ROOT;
+  else process.env.TPS_ROOT = savedRoot;
   for (const child of children.splice(0)) {
     try {
       child.kill("SIGKILL");
@@ -128,13 +132,128 @@ afterEach(() => {
 
 describe("office kill identity", () => {
   test(
-    "live mismatched records get no signal, are kept, and fail naming both files",
+    "live records whose start token names another process are not signalled and are removed",
     async () => {
       const host = spawnChild();
       const branch = spawnChild();
       const hostPath = hostStatePath("host-a");
+      const branchPath = branchPidPath();
       writeHostState(hostState("host-a", host.pid, foreignStartToken(childToken(host.pid))));
-      writeFileSync(branchPid, serializePidRecord(branch.pid, foreignStartToken(childToken(branch.pid))));
+      writeFileSync(branchPath, serializePidRecord(branch.pid, foreignStartToken(childToken(branch.pid))));
+
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((pid) => signals.push(pid));
+      const { logs, restore } = captureLogs();
+      try {
+        await runOffice({ action: "kill" });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+      }
+
+      expect(signals).toEqual([]);
+      const output = logs.join("\n");
+      expect(output).toContain(`${hostPath}; pid ${host.pid} was not signalled`);
+      expect(output).toContain(`${branchPath}; pid ${branch.pid} was not signalled`);
+      expect(output).not.toContain("Check that pid and stop it yourself");
+      expect(existsSync(hostPath)).toBe(false);
+      expect(existsSync(branchPath)).toBe(false);
+      expect(pidState(host.pid)).toBe("alive");
+      expect(pidState(branch.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record is classified at the path it was found at, not the branch field in it",
+    async () => {
+      const host = spawnChild();
+      const hostPath = hostStatePath("host-a");
+      // The branch field names host-b; nothing is written at host-b.json.
+      writeFileSync(hostPath, JSON.stringify(hostState("host-b", host.pid, childToken(host.pid))));
+
+      const signals: number[] = [];
+      const previous = setOfficeKillSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGTERM");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runOffice({ action: "kill" });
+      } finally {
+        restore();
+        setOfficeKillSignal(previous);
+      }
+
+      expect(signals).toEqual([host.pid]);
+      expect(logs.join("\n")).toContain(`Host state record (pid ${host.pid}) stopped; record removed: ${hostPath}`);
+      expect(existsSync(hostPath)).toBe(false);
+      expect(pidState(host.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record file that cannot be read is named and kept",
+    async () => {
+      const hostPath = hostStatePath("host-a");
+      // A directory in the record's place makes readFileSync fail for every
+      // uid, including root in the container jobs.
+      mkdirSync(hostPath);
+
+      const { logs, restore } = captureLogs();
+      let message = "";
+      try {
+        await runOffice({ action: "kill" }).catch((error) => {
+          message = (error as Error).message;
+        });
+      } finally {
+        restore();
+      }
+
+      expect(message).toContain(hostPath);
+      expect(message).toContain("could not be read");
+      expect(logs.join("\n")).toContain(hostPath);
+      expect(existsSync(hostPath)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record file that cannot be parsed is named and kept",
+    async () => {
+      const hostPath = hostStatePath("host-a");
+      writeFileSync(hostPath, "{ this is not json");
+
+      const { logs, restore } = captureLogs();
+      let message = "";
+      try {
+        await runOffice({ action: "kill" }).catch((error) => {
+          message = (error as Error).message;
+        });
+      } finally {
+        restore();
+      }
+
+      expect(message).toContain(hostPath);
+      expect(message).toContain("could not be parsed");
+      expect(logs.join("\n")).toContain(hostPath);
+      expect(existsSync(hostPath)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "the branch pid file is read at the writer's path and its real bare-pid format is unverified",
+    async () => {
+      const root = join(home, "tps-root");
+      mkdirSync(root, { recursive: true });
+      process.env.TPS_ROOT = root;
+      const branch = spawnChild();
+      const branchPath = branchPidPath();
+      expect(branchPath).toBe(join(root, "branch.pid"));
+      // The current branch launcher writes a bare decimal pid.
+      writeFileSync(branchPath, `${branch.pid}\n`);
 
       const signals: number[] = [];
       const previous = setOfficeKillSignal((pid) => signals.push(pid));
@@ -150,21 +269,41 @@ describe("office kill identity", () => {
       }
 
       expect(signals).toEqual([]);
-      expect(message).toContain(hostPath);
-      expect(message).toContain(branchPid);
-      expect(message).toMatch(/start token does not match/);
-      expect(message).toContain(`remove ${hostPath}`);
-      expect(message).toContain(`remove ${branchPid}`);
-      expect(logs.join("\n")).not.toMatch(/Terminated/);
-      expect(existsSync(hostPath)).toBe(true);
-      expect(existsSync(branchPid)).toBe(true);
-      expect(pidState(host.pid)).toBe("alive");
+      expect(message).toContain(branchPath);
+      expect(message).toContain("identity cannot be verified");
+      expect(message).toContain(`remove ${branchPath}`);
+      expect(logs.join("\n")).toContain(branchPath);
+      expect(existsSync(branchPath)).toBe(true);
       expect(pidState(branch.pid)).toBe("alive");
     },
     TIMEOUT,
   );
 
-  test.skipIf(gonePid === null)(
+  test(
+    "the tps office kill process exits non-zero, naming the path and the remedy",
+    async () => {
+      const host = spawnChild();
+      const hostPath = hostStatePath("host-a");
+      // A live pid with no token cannot be verified; the record is a refusal.
+      writeHostState(hostState("host-a", host.pid, null));
+
+      const result = spawnSync(process.execPath, [TPS_BIN, "office", "kill"], {
+        encoding: "utf8",
+        timeout: TIMEOUT - 5_000,
+        env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+      });
+
+      expect(result.status).toBe(1);
+      const output = `${result.stdout}${result.stderr}`;
+      expect(output).toContain(hostPath);
+      expect(output).toContain(`remove ${hostPath} if that process is not running`);
+      expect(existsSync(hostPath)).toBe(true);
+      expect(pidState(host.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a matching host and branch record are signalled and cleared, and a dead pid's record is cleared",
     async () => {
       const dead = requireGonePid(gonePid);
@@ -172,10 +311,11 @@ describe("office kill identity", () => {
       const branch = spawnChild();
       const hostPath = hostStatePath("host-a");
       const deadPath = hostStatePath("host-b");
+      const branchPath = branchPidPath();
       writeHostState(hostState("host-a", host.pid, childToken(host.pid)));
       // A legacy record without a token whose pid is gone is removed as stale.
       writeHostState(hostState("host-b", dead, null));
-      writeFileSync(branchPid, serializePidRecord(branch.pid, childToken(branch.pid)));
+      writeFileSync(branchPath, serializePidRecord(branch.pid, childToken(branch.pid)));
       expect(existsSync(deadPath)).toBe(true);
 
       const signals: number[] = [];
@@ -195,7 +335,7 @@ describe("office kill identity", () => {
       expect(logs.join("\n")).toMatch(/Terminated 2 TPS process/);
       expect(existsSync(hostPath)).toBe(false);
       expect(existsSync(deadPath)).toBe(false);
-      expect(existsSync(branchPid)).toBe(false);
+      expect(existsSync(branchPath)).toBe(false);
       expect(pidState(host.pid)).toBe("gone");
       expect(pidState(branch.pid)).toBe("gone");
     },

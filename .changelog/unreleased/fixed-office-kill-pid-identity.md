@@ -1,5 +1,6 @@
-- **`tps office kill` signals only a process whose recorded start token matches.** Host
-  state records written by the relay now carry the token, and the branch pid file
-  is read through the shared pid-file check. A live pid whose token is missing or
-  different is not signalled: its record is kept and named, and the command exits
-  non-zero.
+- **`tps office kill` checks each record's start token immediately before signalling it.** Host
+  state records written by the relay carry the process start token when it is available, and the
+  branch pid file is read at the path its writer uses. A record whose process identity cannot be
+  verified is not signalled: it is kept and named, and the command exits non-zero. A pid reused
+  after the check and before the signal is not detected, and the `ps` fallback token has one-second
+  precision.
