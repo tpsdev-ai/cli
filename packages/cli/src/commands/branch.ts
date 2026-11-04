@@ -562,7 +562,7 @@ async function runStop(): Promise<void> {
     );
 
   if (state.kind === "missing") {
-    console.log("Branch daemon is not running.");
+    console.log(`No branch PID file at ${p}; nothing was signalled.`);
     return;
   }
   if (state.kind === "unreadable") {
@@ -581,8 +581,8 @@ async function runStop(): Promise<void> {
   if (state.kind === "stale") {
     console.log(
       removeBranchPid(state.path) === "removed"
-        ? `Branch daemon is not running (stale PID file removed; pid ${state.pid} was not signalled).`
-        : `Branch daemon is not running (PID file already gone; pid ${state.pid} was not signalled).`,
+        ? `Branch PID file ${state.path} was stale and was removed; this command signalled no process.`
+        : `Branch PID file ${state.path} was stale and is already gone; this command signalled no process.`,
     );
     return;
   }
@@ -633,13 +633,13 @@ function runStatus(): void {
   } else if (state.kind === "unverified") {
     console.log(`Branch daemon: unverified (pid ${state.pid}, pid file ${state.path})`);
   } else if (state.kind === "stale") {
-    console.log(`Branch daemon: not running (stale pid file ${state.path}; pid ${state.pid} was not signalled)`);
+    console.log(`Branch daemon: unknown (stale pid file ${state.path})`);
   } else if (state.kind === "invalid") {
     console.log(`Branch daemon: unknown (invalid pid file ${state.path})`);
   } else if (state.kind === "unreadable") {
     console.log(`Branch daemon: unknown (pid file ${state.path} could not be read)`);
   } else {
-    console.log("Branch daemon: stopped");
+    console.log(`Branch daemon: unknown (no pid file at ${p})`);
   }
   const confExists = existsSync(confPath());
   const hostExists = existsSync(hostPath(getIdentityDir()));

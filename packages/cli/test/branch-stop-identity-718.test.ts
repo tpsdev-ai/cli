@@ -128,7 +128,7 @@ describe("branch stop PID record classification", () => {
     });
     try {
       await runBranch({ action: "status" });
-      expect(logs.join("\n")).toContain(`Branch daemon: not running (stale pid file ${pidFile}; pid ${child.pid} was not signalled)`);
+      expect(logs.join("\n")).toContain(`Branch daemon: unknown (stale pid file ${pidFile})`);
       expect(existsSync(pidFile)).toBe(true);
       logs.length = 0;
       await runBranch({ action: "stop" });
@@ -139,7 +139,7 @@ describe("branch stop PID record classification", () => {
     expect(signals).toEqual([]);
     expect(existsSync(pidFile)).toBe(false);
     expect(pidState(child.pid)).toBe("alive");
-    expect(logs).toEqual([`Branch daemon is not running (stale PID file removed; pid ${child.pid} was not signalled).`]);
+    expect(logs).toEqual([`Branch PID file ${pidFile} was stale and was removed; this command signalled no process.`]);
     expect(logs.join("\n")).not.toMatch(/stop it yourself|check that pid|remove .* if/i);
   });
 
