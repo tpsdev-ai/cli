@@ -1,18 +1,16 @@
 /**
- * cli#717 — `bridge stop` stops the bridges whose pid records it discovers.
- *
  * `BridgeCore.start` writes `bridge-<adapter>.pid`. These tests use the real
  * writer for a non-openclaw adapter under a temp HOME, plus records that name
  * real child processes, so the stop path exercises the same identity check and
  * per-record reporting as the openclaw record.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
-import { bridgePidFiles, bridgeRunningRecords, bridgeStatus } from "../src/utils/mail-bridge.js";
+import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
@@ -21,6 +19,29 @@ const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
 const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
 const MAIL_BRIDGE_URL = new URL("../src/utils/mail-bridge.js", import.meta.url).href;
+const BUILT_PID_FILE_URL = new URL("../dist/src/utils/pid-file.js", import.meta.url).href;
+const BUILT_MAIL_BRIDGE_URL = new URL("../dist/src/utils/mail-bridge.js", import.meta.url).href;
+const BUILT_COMMANDS_URL = new URL("../dist/src/commands/bridge.js", import.meta.url).href;
+const FIFO_DEADLINE = 2_000;
+
+function cannotListRestrictedDirectory(): boolean {
+  const directory = mkdtempSync(join(tmpdir(), "tps-bridge-717-mode-"));
+  try {
+    chmodSync(directory, 0o300);
+    try {
+      readdirSync(directory);
+      return false;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EACCES") throw error;
+      return true;
+    }
+  } finally {
+    chmodSync(directory, 0o700);
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+const cannotList = cannotListRestrictedDirectory();
 
 /** A child that starts a real BridgeCore with the stdio adapter and stays
  *  alive on its stdin pipe until SIGTERM, when it runs the real stop path. */
@@ -111,6 +132,29 @@ async function runStartDecision(): Promise<{ stdout: string; exitCode: number }>
   const child = spawnScript(script, {});
   const exitCode = await child.exited;
   return { stdout: await new Response(child.stdout).text(), exitCode };
+}
+
+async function runFifoRead(script: string): Promise<Record<string, unknown>> {
+  const path = join(home, "fifo-read.mts");
+  writeFileSync(path, script);
+  const child = spawnScript(path, {});
+  let expired = false;
+  const timer = setTimeout(() => {
+    expired = true;
+    child.kill("SIGKILL");
+  }, FIFO_DEADLINE);
+  try {
+    const exitCode = await child.exited;
+    if (expired) throw new Error(`FIFO child deadline exceeded (${FIFO_DEADLINE} ms)`);
+    const stdout = await new Response(child.stdout).text();
+    const stderr = await new Response(child.stderr).text();
+    if (exitCode !== 0) throw new Error(`FIFO child exited ${exitCode}: ${stderr}`);
+    const line = stdout.split("\n").find((entry) => entry.startsWith("RESULT:"));
+    if (line === undefined) throw new Error(`FIFO child printed no result: ${stdout}`);
+    return JSON.parse(line.slice("RESULT:".length));
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function record(pid: number, token: string | null): string {
@@ -270,7 +314,7 @@ describe("bridge start checks only the OpenClaw records", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(!cannotList)(
     "a run directory that cannot be listed does not refuse the openclaw start path",
     async () => {
       chmodSync(runDir, 0o300);
@@ -436,7 +480,84 @@ describe("bridge status names the adapter of each running record", () => {
   );
 });
 
-describe("bridge stop does not read a non-regular record", () => {
+describe("guarded pid-file reads", () => {
+  test(
+    "a discovered regular record replaced by a FIFO is classified without being read and kept",
+    async () => {
+      const fifo = join(runDir, "bridge-fifo.pid");
+      writeFileSync(fifo, "");
+      expect(bridgePidFiles().map((entry) => entry.path)).toEqual([fifo]);
+      rmSync(fifo);
+      expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+
+      const result = await runFifoRead(`
+const { readPidFile } = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
+console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
+`);
+
+      expect(result).toEqual({ kind: "unreadable", path: fifo, reason: "is not a regular file" });
+      expect(existsSync(fifo)).toBe(true);
+    },
+    10_000,
+  );
+
+  test("a final-component symlink is classified without reading its target and kept", async () => {
+    const target = join(runDir, "target");
+    const path = join(runDir, "bridge-openclaw.pid");
+    expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
+    symlinkSync(target, path);
+
+    const result = await runFifoRead(`
+const { readPidFile } = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
+console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(path)})));
+`);
+
+    expect(result).toEqual({ kind: "unreadable", path, reason: "could not be opened (ELOOP: symlink resolution refused)" });
+    expect(existsSync(path)).toBe(true);
+  }, 10_000);
+
+  test("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
+    const path = join(runDir, "bridge-fifo.pid");
+    writeFileSync(path, "");
+
+    const result = await runFifoRead(`
+const { mock } = await import("bun:test");
+const { rmSync } = await import("node:fs");
+const real = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
+const read = real.readPidFile;
+const path = ${JSON.stringify(path)};
+let reads = 0;
+let fresh;
+mock.module(${JSON.stringify(BUILT_PID_FILE_URL)}, () => ({
+  ...real,
+  readPidFile(file, ...args) {
+    const state = read(file, ...args);
+    if (file !== path) return state;
+    reads += 1;
+    if (reads === 1) {
+      rmSync(path);
+      if (Bun.spawnSync(["mkfifo", path]).exitCode !== 0) throw new Error("mkfifo failed");
+      return { kind: "running", path, pid: process.pid, startToken: "planned-token" };
+    }
+    fresh = state;
+    return state;
+  },
+}));
+const { runBridge, setBridgeStopSignal } = await import(${JSON.stringify(BUILT_COMMANDS_URL)});
+const signals = [];
+setBridgeStopSignal((pid) => signals.push(pid));
+let message;
+try { await runBridge({ action: "stop" }); } catch (error) { message = error.message; }
+console.log("RESULT:" + JSON.stringify({ fresh, signals, message, reads }));
+`);
+
+    expect(result).toMatchObject({ reads: 2 });
+    expect(result.fresh).toEqual({ kind: "unreadable", path, reason: "is not a regular file" });
+    expect(result.signals).toEqual([]);
+    expect(result.message).toContain("the pid file was kept");
+    expect(existsSync(path)).toBe(true);
+  }, 10_000);
+
   test(
     "a FIFO record is reported as kept while the other records are stopped",
     async () => {
@@ -445,15 +566,18 @@ describe("bridge stop does not read a non-regular record", () => {
       const made = Bun.spawnSync(["mkfifo", fifo]);
       expect(made.exitCode).toBe(0);
 
-      expect(bridgeRunningRecords().map((entry) => entry.adapter)).toEqual(["stdio"]);
+      const result = await runFifoRead(`
+const { bridgeRunningRecords } = await import(${JSON.stringify(BUILT_MAIL_BRIDGE_URL)});
+const { runBridge } = await import(${JSON.stringify(BUILT_COMMANDS_URL)});
+const adapters = bridgeRunningRecords().map((entry) => entry.adapter);
+let message;
+try { await runBridge({ action: "stop" }); } catch (error) { message = error.message; }
+console.log("RESULT:" + JSON.stringify({ adapters, message }));
+`);
 
-      const stopError = await runBridge({ action: "stop" }).then(
-        () => null,
-        (error: Error) => error,
-      );
-
-      expect(stopError?.message).toContain(`Bridge pid file ${fifo} is not a regular file`);
-      expect(stopError?.message).toContain("the pid file was kept");
+      expect(result.adapters).toEqual(["stdio"]);
+      expect(result.message).toContain(`Bridge pid file ${fifo} is not a regular file`);
+      expect(result.message).toContain("the pid file was kept");
       await child.exited;
       expect(pidState(child.pid)).toBe("gone");
       expect(existsSync(stdioPid)).toBe(false);

@@ -14,7 +14,7 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homeDir } from "./home.js";
 import { readPidFile, type PidFileState } from "./pid-file.js";
@@ -31,11 +31,9 @@ export interface BridgeConfig {
   defaultAgentId?: string;
 }
 
-export type BridgePidEntryState = PidFileState | { kind: "not-regular"; path: string };
-
 export interface BridgePidFileEntry {
   path: string;
-  state: BridgePidEntryState;
+  state: PidFileState;
   port?: number;
   adapter: string;
 }
@@ -48,29 +46,17 @@ const LEGACY_ADAPTER = "openclaw";
 /** The OpenClaw records, in the order the start check reads them. */
 const OPENCLAW_PID_NAMES = ["bridge-openclaw.pid", "mail-bridge.pid"] as const;
 
-/** Classify one record path. A non-regular entry is never read: reading a
- *  FIFO blocks until a writer opens it. */
 function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntry | null {
-  let isFile: boolean;
-  try {
-    isFile = lstatSync(path).isFile();
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
-    if (code === "ENOENT") return null;
-    throw new Error(
-      `Bridge pid file ${path} could not be inspected (${code}); no bridge pid record can be checked.`,
-    );
-  }
-  if (!isFile) return { path, state: { kind: "not-regular", path }, adapter };
-  const state = readPidFile(path);
-  if (state.kind === "missing") return null;
   let port: number | undefined;
-  try {
-    const raw = JSON.parse(readFileSync(path, "utf-8"));
-    if (typeof raw.port === "number") port = raw.port;
-  } catch {
-    /* not JSON, or unreadable — the pid state is what this reader decides on */
-  }
+  const state = readPidFile(path, undefined, (content) => {
+    try {
+      const raw = JSON.parse(content);
+      if (typeof raw.port === "number") port = raw.port;
+    } catch {
+      /* not JSON */
+    }
+  });
+  if (state.kind === "missing") return null;
   return { path, state, port, adapter };
 }
 
@@ -97,8 +83,7 @@ export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   return entries;
 }
 
-/** The two OpenClaw records, read by name. This does not list the run
- *  directory, so a directory that cannot be listed does not affect it. */
+/** The two OpenClaw records, read by name without listing the run directory. */
 export function openClawBridgePidFiles(): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
   const entries: BridgePidFileEntry[] = [];
@@ -162,16 +147,15 @@ export function bridgeStatus(
   return statusOf(runningRecordsFrom(bridgePidFiles(adapter), probe));
 }
 
-/** Status of the OpenClaw records, read by name. Throws when either path
- *  exists but is not a regular file: a non-regular record never licenses a
- *  start. */
+/** Status of the OpenClaw records, read by name. */
 export function openClawBridgeStatus(
   probe: (pid: number) => PidState = pidState,
 ): { running: boolean; pid?: number; port?: number; adapter?: string } {
   const entries = openClawBridgePidFiles();
-  const notRegular = entries.find((entry) => entry.state.kind === "not-regular");
-  if (notRegular) {
-    throw new Error(`Bridge pid file ${notRegular.path} is not a regular file; refusing to start.`);
+  for (const { state } of entries) {
+    if (state.kind === "unreadable") {
+      throw new Error(`Bridge pid file ${state.path} ${state.reason ?? "could not be read"}; refusing to start.`);
+    }
   }
   return statusOf(runningRecordsFrom(entries, probe));
 }

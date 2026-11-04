@@ -24,7 +24,7 @@
  * interpretation: the last one.
  */
 
-import { readFileSync, unlinkSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, unlinkSync } from "node:fs";
 import { processIsGone, processStartToken } from "@tpsdev-ai/agent";
 
 export interface PidRecord {
@@ -108,14 +108,14 @@ export function removePidFile(path: string): PidFileRemoval {
 
 export type PidFileState =
   | { kind: "missing" }
-  | { kind: "unreadable"; path: string }
+  | { kind: "unreadable"; path: string; reason?: string }
   | { kind: "invalid"; path: string; reason: string }
   | { kind: "stale"; path: string; pid: number }
   | { kind: "running"; path: string; pid: number; startToken: string }
   | { kind: "unverified"; path: string; pid: number; startToken: string | null };
 
 /**
- * Classify a pid file.
+ * Classify a pid file, reading only a regular file from its opened descriptor.
  *
  * "stale" — the recorded pid is gone, or the pid is alive and its current
  * start token differs from the recorded token (same source, `processIsGone`).
@@ -127,15 +127,33 @@ export type PidFileState =
 export function readPidFile(
   path: string,
   resolveToken: (pid: number) => string | null = processStartToken,
+  onRead?: (raw: string) => void,
 ): PidFileState {
+  let fd: number;
+  try {
+    // Platforms without O_NONBLOCK or O_NOFOLLOW use the available flags.
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { kind: "missing" };
+    const reason = code === "ELOOP" ? "could not be opened (ELOOP: symlink resolution refused)" : `could not be opened (${code})`;
+    return { kind: "unreadable", path, reason };
+  }
   let raw: string;
   try {
-    raw = readFileSync(path, "utf-8");
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "missing" };
-    // No evidence the process is gone: keep the file and refuse to signal.
+    try {
+      if (!fstatSync(fd).isFile()) return { kind: "unreadable", path, reason: "is not a regular file" };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      return { kind: "unreadable", path, reason: `could not be inspected (${code})` };
+    }
+    raw = readFileSync(fd, "utf-8");
+  } catch {
     return { kind: "unreadable", path };
+  } finally {
+    closeSync(fd);
   }
+  onRead?.(raw);
   const parsed = parsePidFile(raw);
   if (parsed.kind === "invalid") return { kind: "invalid", path, reason: parsed.reason };
   if (processIsGone(parsed.pid, parsed.startToken)) {

@@ -169,19 +169,13 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         if (state.kind === "missing") continue;
         if (state.kind === "unreadable") {
           failures.push(
-            `Bridge pid file ${state.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
+            `Bridge pid file ${state.path} ${state.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${state.path} if the bridge is not running.`,
           );
           continue;
         }
         if (state.kind === "unverified") {
           failures.push(
             `Bridge pid file ${state.path} names pid ${state.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${state.path} if the bridge is not running.`,
-          );
-          continue;
-        }
-        if (state.kind === "not-regular") {
-          failures.push(
-            `Bridge pid file ${state.path} is not a regular file, so it was not read and its process identity cannot be verified; the pid file was kept.`,
           );
           continue;
         }
@@ -210,7 +204,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             }
           } else if (fresh.kind === "unreadable") {
             failures.push(
-              `Bridge pid file ${fresh.path} could not be read, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+              `Bridge pid file ${fresh.path} ${fresh.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
             );
           } else if (fresh.kind === "unverified") {
             failures.push(
