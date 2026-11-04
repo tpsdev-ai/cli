@@ -81,15 +81,16 @@ function killProbeRefused(pid: number): boolean {
  *  this read cannot say. A missing `/proc` entry is not proof of exit
  *  (hidepid, another pid namespace), so absence is left to the
  *  `pidState === "gone"` path. */
-function linuxProcessExited(pid: number): boolean | null {
+export function linuxProcessExited(pid: number): boolean | null {
   if (process.platform !== "linux") return null;
   try {
     const stat = readProcStat(pid);
     // Field 2 (comm) may contain spaces and parentheses, so field 3 (state)
-    // is the first character after the last ")".
+    // follows the space after the last ")".
     const rparen = stat.lastIndexOf(")");
-    if (rparen === -1) return null;
-    return stat[rparen + 2] === "Z";
+    const state = stat[rparen + 2];
+    if (rparen === -1 || stat[rparen + 1] !== " " || !state || !"RSDZTtWXxKPI".includes(state)) return null;
+    return state === "Z";
   } catch {
     return null;
   }

@@ -42,15 +42,13 @@ export function hostStatePath(branch: string): string {
 
 export interface HostStatePathListing {
   paths: string[];
-  /** Set when the connections directory exists but its entries cannot be read. */
+  /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
 }
 
-/** Paths of host state records in the connections directory, taken from
- *  directory entries, never from file content. `host.json` is branch
- *  connection state unless it has a `pid` or `branch` key or is not a JSON
- *  object (a host named `host` writes its record there). A read error other
- *  than ENOENT is reported instead of yielding an empty list. */
+/** Connections directory `*.json` paths. A `host.json` object with neither
+ *  `pid` nor `branch` is treated as branch state and skipped. A listing
+ *  error other than ENOENT is reported. */
 export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
   let entries: string[];

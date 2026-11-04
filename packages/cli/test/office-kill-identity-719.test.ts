@@ -1,19 +1,19 @@
 /**
- * cli#719 — `office kill` enumerates the connections directory entries and the
- * branch pid file and classifies each at its actual path with the shared
- * pid-file check immediately before signalling. A record classified as unverified
+ * cli#719 — `office kill` examines the connections directory's `*.json` entries,
+ * skipping a `host.json` object with neither `pid` nor `branch` (treated as
+ * branch state), and separately checks the branch pid path. A record classified as unverified
  * is not signalled, is kept and named, and the command exits non-zero. Stale-record
  * removal is attempted without signalling; a removal failure keeps the record and
- * is reported. These tests use real child processes and real files under a temp HOME.
+ * is reported.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { pidPath as branchPidPath } from "../src/commands/branch.js";
-import { runOffice, setOfficeKillSignal, setProcStatReader } from "../src/commands/office.js";
+import { linuxProcessExited, runOffice, setOfficeKillSignal, setProcStatReader } from "../src/commands/office.js";
 import { hostStatePath, writeBranchState, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
 
@@ -203,6 +203,60 @@ async function launchBranchWriter(): Promise<{ pid: number; branchPath: string }
 }
 
 describe("office kill identity", () => {
+  test.each([
+    ["123 (sleep)", null],
+    ["123 (sleep) ", null],
+    ["123 (sleep) ?", null],
+    ["123 (sleep)xZ", null],
+    ...Array.from("RSDTtWXxKPI", (state) => [`123 (sleep) ${state}`, false]),
+    ["123 (sleep) Z", true],
+  ] as const)("Linux process state from %j is %j", (stat, expected) => {
+    const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
+    const previous = setProcStatReader(() => stat);
+    try {
+      Object.defineProperty(process, "platform", { ...platform, value: "linux" });
+      expect(linuxProcessExited(123)).toBe(expected);
+    } finally {
+      Object.defineProperty(process, "platform", platform);
+      setProcStatReader(previous);
+    }
+  });
+
+  test.skipIf(process.platform !== "linux").each([
+    ["123 (sleep)xZ", 1],
+    ["123 (sleep) S", 1],
+    ["123 (sleep) Z", 0],
+  ] as const)("office kill with process state %j exits %i", (stat, status) => {
+    const host = spawnChild();
+    const hostPath = hostStatePath("host-a");
+    writeHostState(hostState("host-a", host.pid, childToken(host.pid)));
+    const script = join(home, "proc-state.ts");
+    writeFileSync(script, `
+      import { runOffice, setOfficeKillSignal, setProcStatReader } from ${JSON.stringify(resolve(import.meta.dir, "../src/commands/office.ts"))};
+      setOfficeKillSignal(() => {});
+      setProcStatReader(() => ${JSON.stringify(stat)});
+      runOffice({ action: "kill" }).catch((error) => {
+        console.error(error.message);
+        process.exitCode = 1;
+      });
+    `);
+    const result = spawnSync(process.execPath, [script], {
+      encoding: "utf8",
+      timeout: TIMEOUT - 5_000,
+      env: { ...process.env, TPS_ROOT: join(home, "tps-root") },
+    });
+    expect(result.status).toBe(status);
+    expect(existsSync(hostPath)).toBe(status !== 0);
+    const output = `${result.stdout}${result.stderr}`;
+    if (status !== 0) {
+      expect(output).toContain(`could not be stopped (pid ${host.pid}); record kept at ${hostPath}`);
+      expect(output).not.toContain("stopped; record removed");
+    } else {
+      expect(output).toContain(`stopped; record removed: ${hostPath}`);
+    }
+    expect(pidState(host.pid)).toBe("alive");
+  }, TIMEOUT);
+
   test(
     "host.json with a matching live host record is signalled and reported",
     async () => {
@@ -338,7 +392,7 @@ describe("office kill identity", () => {
   );
 
   test.each(["host-a", "host"])(
-    "an unreadable %s record is named and kept",
+    "a directory at the %s record path is named and kept",
     async (branch) => {
       const hostPath = hostStatePath(branch);
       // A directory in the record's place makes readFileSync fail for every
@@ -524,15 +578,8 @@ describe("office kill identity", () => {
     "an unlistable connections directory is named, the branch record is still handled and the command exits non-zero",
     async () => {
       const dir = join(home, ".tps", "connections");
-      // A 0300 directory cannot be listed by its owner, but root ignores mode
-      // bits, so under root a regular file takes the directory's place; whichever
-      // runs, the listing fails for this process.
-      if (typeof process.getuid === "function" && process.getuid() === 0) {
-        rmSync(dir, { recursive: true, force: true });
-        writeFileSync(dir, "");
-      } else {
-        chmodSync(dir, 0o300);
-      }
+      rmSync(dir, { recursive: true, force: true });
+      writeFileSync(dir, "");
       const branch = spawnChild();
       const branchPath = branchPidPath();
       writeFileSync(branchPath, serializePidRecord(branch.pid, childToken(branch.pid)));
@@ -551,7 +598,6 @@ describe("office kill identity", () => {
       } finally {
         restore();
         setOfficeKillSignal(previous);
-        chmodSync(dir, 0o700);
       }
 
       expect(message).toContain(dir);
