@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rmSync, openSync, closeSync, watch, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn } from "node:child_process";
@@ -110,6 +110,34 @@ function logPath(): string {
 
 function confPath(): string {
   return join(tpsRoot(), "branch.conf.json");
+}
+
+function branchPidRefusal(pid: number, path: string): string {
+  return `Branch pid file ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if the branch daemon is not running.`;
+}
+
+/** Refuse a second branch daemon before either launcher spawns one. */
+function refuseSecondBranchStart(): void {
+  const state = readPidFile(pidPath());
+  switch (state.kind) {
+    case "running":
+      throw new Error(
+        `Branch daemon already running (pid ${state.pid}); refusing to start a second daemon (pid file ${state.path}).`,
+      );
+    case "unverified":
+      throw new Error(branchPidRefusal(state.pid, state.path));
+    case "unreadable":
+      throw new Error(
+        `Branch pid file ${state.path} could not be read (${state.reason ?? "read failed"}); refusing to start a second daemon because the existing process identity is unknown.`,
+      );
+    case "invalid":
+      throw new Error(
+        `Branch pid file ${state.path} is invalid (${state.reason}); refusing to start a second daemon because the existing process identity is unknown.`,
+      );
+    case "stale":
+    case "missing":
+      return;
+  }
 }
 
 function hostPath(identityDir: string): string {
@@ -257,6 +285,7 @@ async function runInit(args: BranchArgs): Promise<void> {
   }
 
   console.log("Starting branch daemon...");
+  refuseSecondBranchStart();
   const outFd = openSync(logPath(), "a");
   const child = spawn(process.execPath, [process.argv[1]!, "branch", "start"], {
     detached: true,
@@ -284,6 +313,7 @@ async function runStart(): Promise<void> {
     process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
     process.env.NODE_ENV !== "test"
   ) {
+    refuseSecondBranchStart();
     mkdirSync(tpsRoot(), { recursive: true });
     const outFd = openSync(logPath(), "a");
     const child = spawn(process.execPath, [process.argv[1]!, "branch", "start"], {
@@ -516,7 +546,25 @@ async function runStart(): Promise<void> {
     activeHostChannel = null;
     clearBranchState();
     try { await server.close(); } catch {}
-    try { rmSync(pidPath()); } catch {}
+    const p = pidPath();
+    try {
+      const state = readPidFile(p);
+      const ownToken = processStartToken(process.pid);
+      if (state.kind === "running" && state.pid === process.pid && state.startToken === ownToken) {
+        removePidFile(p);
+      } else if (state.kind === "missing") {
+        logLine("STOPPED", `No pid record at ${p}; nothing was removed.`);
+      } else if (state.kind === "running") {
+        logLine("STOPPED", `Pid record ${p} now names another process; leaving it in place.`);
+      } else if (state.kind === "unverified") {
+        logLine("STOPPED", `Pid record ${p} does not verify as this process; leaving it in place.`);
+      } else {
+        logLine("STOPPED", `Pid record ${p} could not be read as this process's record; leaving it in place.`);
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      logLine("STOPPED", `Pid record ${p} could not be removed or verified (${code}); leaving it in place.`);
+    }
     process.exit(0);
   };
 
@@ -556,10 +604,7 @@ async function runStop(): Promise<void> {
       throw new Error(`Branch pid file ${path} could not be removed (${code}); the pid file was kept.`);
     }
   };
-  const refusal = (pid: number, path: string): Error =>
-    new Error(
-      `Branch pid file ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if the branch daemon is not running.`,
-    );
+  const refusal = (pid: number, path: string): Error => new Error(branchPidRefusal(pid, path));
 
   if (state.kind === "missing") {
     console.log(`No branch PID file at ${p}; nothing was signalled.`);

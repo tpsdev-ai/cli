@@ -1,0 +1,1 @@
+- **`tps branch start` refuses a second daemon from a verified, unverified, unreadable or invalid pid record; stale records are replaced (Closes #726).** A daemon removes the pid file on shutdown only when a fresh read still names its own pid and start token.
