@@ -14,7 +14,7 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { homeDir } from "./home.js";
 import { readPidFile, type PidFileState } from "./pid-file.js";
@@ -37,11 +37,26 @@ export interface BridgePidFileEntry {
   port?: number;
 }
 
-/** The known bridge pid files that exist, with their strict classification. */
+/** `BridgeCore.start` writes `bridge-<adapter>.pid`; every adapter name in
+ *  the agent registry (`openclaw`, `discord`, `stdio`) uses lowercase ASCII
+ *  letters only. The legacy name is `mail-bridge.pid`. */
+const BRIDGE_PID_NAME = /^(?:bridge-[a-z]+|mail-bridge)\.pid$/;
+
+/** The bridge pid files that exist, with their strict classification. */
 export function bridgePidFiles(): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
+  let names: string[];
+  try {
+    names = readdirSync(pidDir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return [];
+    throw new Error(
+      `Bridge run directory ${pidDir} could not be read (${code}); no bridge pid records can be checked.`,
+    );
+  }
   const entries: BridgePidFileEntry[] = [];
-  for (const name of ["bridge-openclaw.pid", "mail-bridge.pid"]) {
+  for (const name of names.filter((entry) => BRIDGE_PID_NAME.test(entry)).sort()) {
     const path = join(pidDir, name);
     const state = readPidFile(path);
     if (state.kind === "missing") continue;

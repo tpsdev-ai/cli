@@ -1250,7 +1250,7 @@ describe("unreadable pid files", () => {
   );
 
   test.skipIf(process.getuid?.() === 0)(
-    "bridge stop with an unsearchable parent directory exits non-zero and names the file",
+    "bridge stop with an unsearchable run directory exits non-zero and names the directory",
     () => {
       writeFileSync(bridgePid, JSON.stringify({ pid: 1, port: 7891 }));
       const runDir = join(home, ".tps", "run");
@@ -1267,8 +1267,9 @@ describe("unreadable pid files", () => {
       }
 
       expect(result.status).toBe(1);
-      expect(result.stderr).toContain(bridgePid);
+      expect(result.stderr).toContain(runDir);
       expect(result.stderr).toMatch(/could not be read/);
+      expect(result.stderr).toMatch(/EACCES/);
       expect(existsSync(bridgePid)).toBe(true);
     },
     TIMEOUT,
