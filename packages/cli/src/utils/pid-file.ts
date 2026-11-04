@@ -6,7 +6,8 @@
  *   {"pid":12345,"startToken":"proc:1234567"}
  *
  * `startToken` is `processStartToken(pid)` from `@tpsdev-ai/agent` — the same
- * per-process birth identity the mail lock uses. A record whose token is null
+ * per-process birth identity the mail lock uses (on macOS that identity
+ * resolves to one second). A record whose token is null
  * cannot verify the process later.
  *
  * A legacy file is a bare decimal pid or a JSON object without `startToken`

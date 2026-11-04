@@ -637,15 +637,24 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { getRelayPid, readRelayPidFile, runRelayDaemon } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, runRelayDaemon } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
       const mailDir = join(homedir(), ".tps", "mail");
 
       if (relayAction === "status") {
-        const pid = getRelayPid();
-        if (pid) {
-          console.log(`Mail relay running: pid=${pid}`);
+        // Read-only: report the state and its path without removing anything.
+        const state = readRelayPidFile();
+        if (state.kind === "running") {
+          console.log(`Mail relay running: pid=${state.pid}`);
+        } else if (state.kind === "unverified") {
+          console.log(`Mail relay unverified: pid=${state.pid}, pid file ${state.path}.`);
+        } else if (state.kind === "stale") {
+          console.log(`Mail relay is not running: stale pid file ${state.path}.`);
+        } else if (state.kind === "invalid") {
+          console.log(`Mail relay is not running: invalid pid file ${state.path}.`);
+        } else if (state.kind === "unreadable") {
+          console.log(`Mail relay state unknown: pid file ${state.path} could not be read.`);
         } else {
           console.log("Mail relay is not running.");
         }
@@ -697,9 +706,10 @@ export async function runMail(args: MailArgs): Promise<void> {
         try {
           sendRelayStopSignal(state.pid);
         } catch (error) {
-          // EPERM means the process exists and this user may not signal it: keep
-          // the pid file and fail with the operator's recovery path.
-          if (pidStateFromProbeError(error) === "alive") {
+          // Only a probe that classifies the pid "gone" proves the process is
+          // gone: remove the file in that case. EPERM ("alive") and any other
+          // result keep the file and fail with the operator's recovery path.
+          if (pidStateFromProbeError(error) !== "gone") {
             throw new Error(`Mail relay could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
           }
           console.log(
@@ -721,9 +731,22 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
 
       if (relayAction === "start") {
-        const existingPid = getRelayPid();
-        if (existingPid) {
-          throw new Error(`Mail relay already running (pid=${existingPid}).`);
+        const existing = readRelayPidFile();
+        if (existing.kind === "running") {
+          throw new Error(`Mail relay already running (pid=${existing.pid}).`);
+        }
+        if (existing.kind === "unverified") {
+          throw new Error(
+            `Mail relay pid file ${existing.path} names pid ${existing.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${existing.path} if the relay is not running.`,
+          );
+        }
+        if (existing.kind === "unreadable") {
+          throw new Error(
+            `Mail relay pid file ${existing.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${existing.path} if the relay is not running.`,
+          );
+        }
+        if (existing.kind === "invalid" || existing.kind === "stale") {
+          removePidFile(existing.path);
         }
         // Spawn relay as detached background process
         const { spawn } = await import("node:child_process");
@@ -738,7 +761,9 @@ export async function runMail(args: MailArgs): Promise<void> {
         );
         daemon.unref();
         await new Promise((r) => setTimeout(r, 500));
-        const newPid = getRelayPid();
+        const started = readRelayPidFile();
+        const newPid =
+          started.kind === "running" || started.kind === "unverified" ? started.pid : null;
         console.log(newPid ? `Mail relay started: pid=${newPid}` : "Mail relay started (pid pending).");
         break;
       }

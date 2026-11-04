@@ -238,9 +238,10 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         try {
           sendBridgeStopSignal(state.pid);
         } catch (error) {
-          // EPERM means the process exists and this user may not signal it: keep
-          // the pid file and fail with the operator's recovery path.
-          if (pidStateFromProbeError(error) === "alive") {
+          // Only a probe that classifies the pid "gone" proves the process is
+          // gone: remove the file in that case. EPERM ("alive") and any other
+          // result keep the file and report it.
+          if (pidStateFromProbeError(error) !== "gone") {
             failures.push(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
             continue;
           }

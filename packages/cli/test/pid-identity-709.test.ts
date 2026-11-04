@@ -105,6 +105,33 @@ function relayRecord(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
 }
 
+/** The child's real start token, or a failure. */
+function childToken(pid: number): string {
+  const token = processStartToken(pid);
+  if (token === null) throw new Error(`no start token for pid ${pid}`);
+  return token;
+}
+
+/**
+ * A token from the same source as `real` whose value the child cannot carry,
+ * so the record is a mismatch by construction on Linux and macOS. A token
+ * from a different source is "unverified", not "stale", so the source
+ * prefix is kept.
+ */
+function foreignStartToken(real: string): string {
+  if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
+  if (real.startsWith("proc:")) return "proc:1";
+  throw new Error(`unexpected start token source: ${real}`);
+}
+
+/** The same `ps:` token with a different seconds value. */
+function psTokenWithDifferentSeconds(token: string): string {
+  const match = /^(ps:.*\d{2}:\d{2}:)(\d{2})( \d{4})$/.exec(token);
+  if (match === null) throw new Error(`unexpected ps start token: ${token}`);
+  const seconds = (Number(match[2]) + 1) % 60;
+  return `${match[1]}${String(seconds).padStart(2, "0")}${match[3]}`;
+}
+
 function captureLogs(): { logs: string[]; restore: () => void } {
   const logs: string[] = [];
   const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
@@ -172,9 +199,14 @@ describe("relay stop identity", () => {
     "a mismatched token gets no signal, the stale file is removed, and the stop succeeds",
     async () => {
       const child = spawnChild();
-      // A token from another process stands for a pid that has since been
-      // reused: the recorded identity is not the process now holding the pid.
-      writeFileSync(relayPid, relayRecord(child.pid, processStartToken(process.pid)));
+      // A token from the child's own source whose value cannot be current
+      // stands for a pid that has since been reused: the recorded identity is
+      // not the process now holding the pid.
+      const token = foreignStartToken(childToken(child.pid));
+      writeFileSync(relayPid, relayRecord(child.pid, token));
+      // Classified directly, so a same-second ps token (macOS) cannot turn the
+      // fixture into a match.
+      expect(readPidFile(relayPid).kind).toBe("stale");
       const signals: number[] = [];
       const previous = setRelayStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -318,6 +350,43 @@ describe("relay stop identity", () => {
   );
 
   test(
+    "a signal failure the probe calls invalid keeps the pid file and fails",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, relayRecord(child.pid, childToken(child.pid)));
+      const previous = setRelayStopSignal(() => {
+        throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+      });
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          new RegExp(`could not be stopped \\(pid ${child.pid}\\)`),
+        );
+      } finally {
+        setRelayStopSignal(previous);
+      }
+
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  // The macOS ps token resolves to one second: a token for the same pid that
+  // differs only in its seconds field is a different identity.
+  test.skipIf(!(processStartToken(process.pid) ?? "").startsWith("ps:"))(
+    "two ps tokens that differ only in the seconds field classify stale",
+    () => {
+      const child = spawnChild();
+      const real = childToken(child.pid);
+      const shifted = psTokenWithDifferentSeconds(real);
+      expect(shifted).not.toBe(real);
+      writeFileSync(relayPid, relayRecord(child.pid, shifted));
+      expect(readPidFile(relayPid).kind).toBe("stale");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a pid file that cannot be removed is reported kept and the stop exits non-zero",
     async () => {
       const child = spawnChild();
@@ -349,6 +418,70 @@ describe("relay stop identity", () => {
       expect(message).toMatch(/EISDIR|EPERM/);
       expect(message).not.toMatch(/\n\s+at /);
       expect(pidState(child.pid)).toBe("gone");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("relay start and status classification", () => {
+  test(
+    "relay start refuses an unverified record, naming the pid, the file and the remedy",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, `${JSON.stringify({ pid: child.pid, startToken: null })}\n`);
+      let message = "";
+      try {
+        await runMail({ action: "relay", agent: "start" });
+      } catch (error) {
+        message = (error as Error).message;
+      }
+
+      expect(message).toContain(String(child.pid));
+      expect(message).toContain(relayPid);
+      expect(message).toMatch(/identity cannot be verified/);
+      expect(message).toContain(`remove ${relayPid} if the relay is not running`);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relay status reports an unverified record as unverified, never running",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, `${JSON.stringify({ pid: child.pid, startToken: null })}\n`);
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "status" });
+      } finally {
+        restore();
+      }
+
+      const out = logs.join("\n");
+      expect(out).toMatch(/unverified/i);
+      expect(out).toContain(String(child.pid));
+      expect(out).toContain(relayPid);
+      expect(out).not.toMatch(/running/i);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "relay status on a stale record reports it, removes nothing and exits 0",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "status" });
+      } finally {
+        restore();
+      }
+
+      expect(existsSync(relayPid)).toBe(true);
+      expect(logs.join("\n")).toMatch(/stale/i);
+      expect(logs.join("\n")).toContain(relayPid);
     },
     TIMEOUT,
   );
@@ -471,7 +604,8 @@ describe("bridge stop identity", () => {
     "a mismatched token gets no signal and the stale file is removed",
     async () => {
       const child = spawnChild();
-      writeFileSync(bridgePid, relayRecord(child.pid, processStartToken(process.pid)));
+      writeFileSync(bridgePid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
+      expect(readPidFile(bridgePid).kind).toBe("stale");
       const signals: number[] = [];
       const previous = setBridgeStopSignal((pid) => signals.push(pid));
       const { logs, restore } = captureLogs();
@@ -887,6 +1021,28 @@ describe("bridge stop identity", () => {
   );
 
   test(
+    "a signal failure the probe calls invalid keeps the pid file and fails",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(bridgePid, relayRecord(child.pid, childToken(child.pid)));
+      const previous = setBridgeStopSignal(() => {
+        throw Object.assign(new Error("EINVAL"), { code: "EINVAL" });
+      });
+      try {
+        await expect(runBridge({ action: "stop" })).rejects.toThrow(
+          new RegExp(`could not be stopped \\(pid ${child.pid}\\)`),
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+      }
+
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
     "stop with no pid file says the bridge is not running and never mentions stale",
     async () => {
       const { logs, restore } = captureLogs();
@@ -994,7 +1150,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     "relay stop with a stale mismatched token exits 0 and removes the file",
     () => {
       const child = spawnChild();
-      writeFileSync(relayPid, relayRecord(child.pid, processStartToken(process.pid)));
+      writeFileSync(relayPid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
       const result = spawnSync("node", [TPS_BIN, "mail", "relay", "stop"], {
         env: { ...process.env, HOME: home },
         encoding: "utf8",
@@ -1013,7 +1169,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     "bridge stop with a stale mismatched token exits 0 and removes the file",
     () => {
       const child = spawnChild();
-      writeFileSync(bridgePid, relayRecord(child.pid, processStartToken(process.pid)));
+      writeFileSync(bridgePid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
       const result = spawnSync("node", [TPS_BIN, "bridge", "stop"], {
         env: { ...process.env, HOME: home },
         encoding: "utf8",
