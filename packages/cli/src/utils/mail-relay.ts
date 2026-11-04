@@ -15,12 +15,12 @@ import {
   readFileSync,
   renameSync,
   writeFileSync,
-  rmSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, type PidState } from "@tpsdev-ai/agent";
+import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
+import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
@@ -92,20 +92,33 @@ export function deliverPendingMail(mailDir: string): number {
   return delivered;
 }
 
+/** The relay's own pid file, best effort at exit. */
+function removeOwnPidFile(): void {
+  try {
+    removePidFile(relayPidPath());
+  } catch {
+    /* exit path: nothing left to report to */
+  }
+}
+
 /**
  * Run the relay daemon loop. Polls until SIGTERM/SIGINT.
  */
 export async function runRelayDaemon(mailDir: string): Promise<void> {
-  // Write PID file
+  // Write the pid file. The writer attempts to record a start token; the agent
+  // API may return null or a token derived from ps, so the record can carry
+  // either. A stop compares a non-null token with the live process's token; a
+  // null token is never compared — with a live pid the record is unverified, so
+  // a stop refuses it.
   mkdirSync(join(homeDir(), ".tps"), { recursive: true });
-  writeFileSync(relayPidPath(), `${process.pid}\n`, "utf-8");
+  writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
 
   process.on("SIGTERM", () => {
-    rmSync(relayPidPath(), { force: true });
+    removeOwnPidFile();
     process.exit(0);
   });
   process.on("SIGINT", () => {
-    rmSync(relayPidPath(), { force: true });
+    removeOwnPidFile();
     process.exit(0);
   });
 
@@ -124,18 +137,27 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
   }
 }
 
+/** Classify the relay pid file. */
+export function readRelayPidFile(): PidFileState {
+  return readPidFile(relayPidPath());
+}
+
 /** Get relay PID if running, else null. */
 export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
-  if (!existsSync(relayPidPath())) return null;
-  let pid: number;
-  try {
-    pid = parseInt(readFileSync(relayPidPath(), "utf-8").trim(), 10);
-  } catch {
-    // Unreadable: no evidence the relay is gone, so keep its pid file.
+  const state = readRelayPidFile();
+  if (state.kind === "missing" || state.kind === "unreadable") return null;
+  // Invalid content may name a live pid, and a stale record's pid is gone or
+  // its live pid carries a different token; remove the file, but report
+  // neither as running.
+  if (state.kind === "invalid" || state.kind === "stale") {
+    removePidFile(state.path);
     return null;
   }
-  // An invalid pid names no process: handle it as a missing one.
-  if (probe(pid) === "alive") return pid;
-  rmSync(relayPidPath(), { force: true });
+  if (state.kind === "running") return state.pid;
+  // An unverified record is not proven gone and its identity is not confirmed:
+  // it may carry a non-null token that does not match. Stop reads the record
+  // once and refuses to signal an unverified one.
+  if (probe(state.pid) === "alive") return state.pid;
+  removePidFile(state.path);
   return null;
 }

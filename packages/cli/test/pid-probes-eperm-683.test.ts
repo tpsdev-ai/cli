@@ -3,6 +3,7 @@
  * process this user may not signal (EPERM) counts as running.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { pidState } from "@tpsdev-ai/agent";
 import { tmpdir } from "node:os";
@@ -13,6 +14,32 @@ import { pidAlive } from "../src/utils/launch-attestation.js";
 import { proxyStatus } from "../src/utils/llm-proxy.js";
 import { bridgeStatus } from "../src/utils/mail-bridge.js";
 import { getRelayPid } from "../src/utils/mail-relay.js";
+
+/** A pid that was live and is now reaped, or null when the spawn failed or
+ *  pidState(child.pid) is not "gone" at registration. */
+function reapedPid(): number | null {
+  const child = spawnSync("true", []);
+  if (child.pid === undefined) return null;
+  return pidState(child.pid) === "gone" ? child.pid : null;
+}
+
+/** Resolved once at registration: a pid that pidState does not report as gone
+ *  registers a visible skip; a pid reused after registration fails the test
+ *  body in requireGonePid. Reuse is detected only when it is observable at one
+ *  of those two probes; a reuse that begins and ends between them is not
+ *  detected. */
+const gonePid = reapedPid();
+
+/** Re-probe a registration-time gone pid. A pid reused after registration makes
+ *  a stale-record test prove nothing, so fail and ask for a rerun; never signal
+ *  that pid. */
+function requireGonePid(pid: number | null): number {
+  if (pid === null) throw new Error("no reaped pid was registered; rerun the test");
+  if (pidState(pid) !== "gone") {
+    throw new Error(`pid ${pid} was reused after registration; rerun the test`);
+  }
+  return pid;
+}
 
 let home: string;
 const originalHome = process.env.HOME;
@@ -54,21 +81,12 @@ describe("mail relay pid probe", () => {
     expect(existsSync(pidPath)).toBe(false);
   });
 
-  test("removes a pid file whose process has exited and been reaped", async () => {
+  test.skipIf(gonePid === null)("removes a pid file whose process has exited and been reaped", () => {
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
-    const child = Bun.spawn(["true"], { stdio: ["ignore", "ignore", "ignore"] });
-    const pid = child.pid;
-    await child.exited;
+    const pid = requireGonePid(gonePid);
     writeFileSync(pidPath, `${pid}\n`);
-
-    // A reaped pid is gone unless the OS reused it in this window; in that case
-    // the probe names another process, so skip rather than assert on it.
-    if (pidState(pid) !== "gone") {
-      console.log(`skipping gone-pid case: pid ${pid} was reused`);
-      return;
-    }
 
     expect(getRelayPid()).toBeNull();
     expect(existsSync(pidPath)).toBe(false);

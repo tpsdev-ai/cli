@@ -14,6 +14,10 @@ export { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { BridgeCore } from "../bridge/core.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { homeDir } from "./home.js";
+import { readPidFile, type PidFileState } from "./pid-file.js";
 import snooplogg from "snooplogg";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
@@ -27,24 +31,40 @@ export interface BridgeConfig {
   defaultAgentId?: string;
 }
 
-export function bridgeStatus(probe: (pid: number) => PidState = pidState): { running: boolean; pid?: number; port?: number } {
-  const { existsSync, readFileSync } = require("node:fs");
-  const { homedir } = require("node:os");
-  const { join } = require("node:path");
-  const home = process.env.HOME ?? homedir();
-  const pidDir = join(home, ".tps", "run");
-  // Check both new and legacy PID paths
+export interface BridgePidFileEntry {
+  path: string;
+  state: PidFileState;
+  port?: number;
+}
+
+/** The known bridge pid files that exist, with their strict classification. */
+export function bridgePidFiles(): BridgePidFileEntry[] {
+  const pidDir = join(homeDir(), ".tps", "run");
+  const entries: BridgePidFileEntry[] = [];
   for (const name of ["bridge-openclaw.pid", "mail-bridge.pid"]) {
-    const pidPath = join(pidDir, name);
-    if (!existsSync(pidPath)) continue;
+    const path = join(pidDir, name);
+    const state = readPidFile(path);
+    if (state.kind === "missing") continue;
+    let port: number | undefined;
     try {
-      const raw = JSON.parse(readFileSync(pidPath, "utf-8"));
-      const pid = Number(raw.pid);
-      if (probe(pid) !== "alive") continue;
-      return { running: true, pid, port: raw.port };
+      const raw = JSON.parse(readFileSync(path, "utf-8"));
+      if (typeof raw.port === "number") port = raw.port;
     } catch {
-      continue;
+      /* not JSON, or unreadable — the pid state is what this reader decides on */
     }
+    entries.push({ path, state, port });
+  }
+  return entries;
+}
+
+export function bridgeStatus(probe: (pid: number) => PidState = pidState): { running: boolean; pid?: number; port?: number } {
+  for (const entry of bridgePidFiles()) {
+    const { state, port } = entry;
+    let pid: number | undefined;
+    if (state.kind === "running") pid = state.pid;
+    else if (state.kind === "unverified" && probe(state.pid) === "alive") pid = state.pid;
+    if (pid === undefined) continue;
+    return port === undefined ? { running: true, pid } : { running: true, pid, port };
   }
   return { running: false };
 }

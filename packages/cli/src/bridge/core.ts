@@ -29,7 +29,7 @@ export function validateAgentId(id: string): boolean {
 }
 
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
-import { configureBridgeIdentity } from "@tpsdev-ai/agent";
+import { configureBridgeIdentity, processStartToken } from "@tpsdev-ai/agent";
 
 export interface BridgeCoreConfig {
   bridgeAgentId?: string;
@@ -78,7 +78,7 @@ export class BridgeCore {
     mkdirSync(pidDir, { recursive: true });
     writeFileSync(
       join(pidDir, `bridge-${this.adapter.name}.pid`),
-      JSON.stringify({ pid: process.pid, adapter: this.adapter.name }),
+      `${JSON.stringify({ pid: process.pid, startToken: processStartToken(process.pid), adapter: this.adapter.name })}\n`,
       "utf-8",
     );
 
