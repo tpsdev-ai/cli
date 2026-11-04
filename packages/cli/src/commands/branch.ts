@@ -116,23 +116,23 @@ function branchPidRefusal(pid: number, path: string): string {
   return `Branch pid file ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if the branch daemon is not running.`;
 }
 
-/** Refuse a second branch daemon before either launcher spawns one. */
+/** Refuse to spawn when the pid record is running, unverified, unreadable or invalid. */
 function refuseSecondBranchStart(): void {
   const state = readPidFile(pidPath());
   switch (state.kind) {
     case "running":
       throw new Error(
-        `Branch daemon already running (pid ${state.pid}); refusing to start a second daemon (pid file ${state.path}).`,
+        `Recorded process (pid ${state.pid}, start token matches) is still running; refusing to spawn (pid file ${state.path}). Stop it with "tps branch stop" first.`,
       );
     case "unverified":
       throw new Error(branchPidRefusal(state.pid, state.path));
     case "unreadable":
       throw new Error(
-        `Branch pid file ${state.path} could not be read (${state.reason ?? "read failed"}); refusing to start a second daemon because the existing process identity is unknown.`,
+        `Branch pid file ${state.path} could not be read (${state.reason ?? "read failed"}); refusing to spawn. Make it readable, or remove it if no branch daemon is running.`,
       );
     case "invalid":
       throw new Error(
-        `Branch pid file ${state.path} is invalid (${state.reason}); refusing to start a second daemon because the existing process identity is unknown.`,
+        `Branch pid file ${state.path} is invalid (${state.reason}); refusing to spawn. Remove it if no branch daemon is running.`,
       );
     case "stale":
     case "missing":
@@ -555,7 +555,7 @@ async function runStart(): Promise<void> {
       } else if (state.kind === "missing") {
         logLine("STOPPED", `No pid record at ${p}; nothing was removed.`);
       } else if (state.kind === "running") {
-        logLine("STOPPED", `Pid record ${p} now names another process; leaving it in place.`);
+        logLine("STOPPED", `Pid record ${p} does not match this process's pid and start token; leaving it in place.`);
       } else if (state.kind === "unverified") {
         logLine("STOPPED", `Pid record ${p} does not verify as this process; leaving it in place.`);
       } else {

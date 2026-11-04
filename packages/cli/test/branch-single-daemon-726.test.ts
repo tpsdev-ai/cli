@@ -185,7 +185,7 @@ afterEach(async () => {
 });
 
 describe("branch start single-daemon guard (cli#726)", () => {
-  test("a second start is refused while a verified daemon runs and spawns nothing", async () => {
+  test("a second start is refused while the recorded process runs and spawns nothing", async () => {
     const port = await freePort();
     prepareBranch(port);
     const first = spawnSync("node", [TPS_BIN, "branch", "start"], {
@@ -215,7 +215,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     await waitForPidGone(running.pid);
   }, 30_000);
 
-  test("a stale record is replaced and the start proceeds", async () => {
+  test("a stale record is replaced on a successful launch", async () => {
     const port = await freePort();
     prepareBranch(port);
     const stalePid = reapedPid();
@@ -317,7 +317,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     const state = readPidFile(pidFile);
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(newer.pid);
-    expect(readFileSync(logFile, "utf8")).toContain("now names another process");
+    expect(readFileSync(logFile, "utf8")).toContain("does not match this process's pid and start token");
   }, 30_000);
 
   test("a daemon removes its own record on shutdown", async () => {
