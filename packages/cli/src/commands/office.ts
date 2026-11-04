@@ -3,8 +3,10 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readdirSync, 
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectionAlive, listHostStates } from "../utils/connection-state.js";
+import { connectionAlive, hostStatePath, listHostStates } from "../utils/connection-state.js";
+import { readPidFile, removePidFile } from "../utils/pid-file.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -40,6 +42,38 @@ export interface OfficeArgs {
 
 function branchRoot(): string {
   return sharedBranchRoot();
+}
+
+/** The signal sender for `office kill`; replaceable in tests so they can
+ *  assert that an unverified or mismatched record sends nothing. */
+type OfficeKillSignal = (pid: number) => void;
+let sendOfficeKillSignal: OfficeKillSignal = (pid) => process.kill(pid, "SIGTERM");
+
+export function setOfficeKillSignal(fn: OfficeKillSignal): OfficeKillSignal {
+  const previous = sendOfficeKillSignal;
+  sendOfficeKillSignal = fn;
+  return previous;
+}
+
+/** True when `kill(pid, 0)` was refused with an error pidState calls alive. */
+function killProbeRefused(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return pidStateFromProbeError(error) === "alive";
+  }
+}
+
+/** Wait for a signalled process to exit, polling for up to about 5 s. */
+async function waitForKillExit(pid: number): Promise<boolean> {
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    if (pidState(pid) === "gone") return true;
+    if (killProbeRefused(pid)) return false;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return pidState(pid) === "gone";
 }
 
 function workspacePath(agentId: string): string {
@@ -893,28 +927,92 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
     case "kill": {
       let killed = 0;
-      const { listHostStates, clearHostState } = await import("../utils/connection-state.js");
+      const failures: string[] = [];
       const states = listHostStates();
-      for (const s of states) {
-        try {
-          process.kill(s.pid, "SIGTERM");
-          clearHostState(s.branch);
-          killed++;
-        } catch {
-          clearHostState(s.branch);
-        }
-      }
 
-      const pidPath = join(process.env.HOME || homedir(), ".tps", "branch", "branch.pid");
-      if (existsSync(pidPath)) {
+      const removeRecord = (path: string): "removed" | "already gone" | "kept" => {
         try {
-          const pid = Number(readFileSync(pidPath, "utf-8").trim());
-          if (pid) {
-            process.kill(pid, "SIGTERM");
-            killed++;
+          return removePidFile(path);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+          failures.push(`Pid record ${path} could not be removed (${code}); the record was kept.`);
+          return "kept";
+        }
+      };
+      const refusal = (label: string, pid: number, path: string): string =>
+        `${label} ${path} names pid ${pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${path} if that process is not running.`;
+      const mismatch = (label: string, pid: number, path: string): string =>
+        `${label} ${path} names pid ${pid}, but the live process's start token does not match the record. Check that pid and stop it yourself, or remove ${path} if that process is not running.`;
+      const reportRemoval = (what: string, path: string): void => {
+        const removal = removeRecord(path);
+        if (removal === "removed") console.log(`${what} removed: ${path}.`);
+        else if (removal === "already gone") console.log(`Pid record already gone: ${path}.`);
+      };
+
+      const stopRecord = async (label: string, path: string): Promise<void> => {
+        // Classify the record immediately before deciding to signal it.
+        const state = readPidFile(path);
+        if (state.kind === "missing") return;
+        if (state.kind === "unreadable") {
+          failures.push(
+            `${label} ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if that process is not running.`,
+          );
+          return;
+        }
+        if (state.kind === "invalid") {
+          reportRemoval(`Invalid ${label.toLowerCase()}`, state.path);
+          return;
+        }
+        if (state.kind === "unverified") {
+          failures.push(refusal(label, state.pid, state.path));
+          return;
+        }
+        if (state.kind === "stale") {
+          // A live pid with a different start token belongs to another process:
+          // keep the record and report it. Only a pid proved gone is removed.
+          if (pidState(state.pid) !== "gone") {
+            failures.push(mismatch(label, state.pid, state.path));
+            return;
           }
-        } catch {}
-        try { rmSync(pidPath, { force: true }); } catch {}
+          reportRemoval(`Stale ${label.toLowerCase()}`, state.path);
+          return;
+        }
+        try {
+          sendOfficeKillSignal(state.pid);
+        } catch (error) {
+          // Only a probe that classifies the pid "gone" proves the process is
+          // gone: remove the record in that case. EPERM ("alive") and any other
+          // result keep the record and report it.
+          if (pidStateFromProbeError(error) !== "gone") {
+            failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
+            return;
+          }
+          reportRemoval(`Stale ${label.toLowerCase()}`, state.path);
+          return;
+        }
+        if (!(await waitForKillExit(state.pid))) {
+          failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
+          return;
+        }
+        killed++;
+        const removal = removeRecord(state.path);
+        if (removal === "removed") console.log(`${label} (pid ${state.pid}) stopped; record removed: ${state.path}.`);
+        else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
+      };
+
+      for (const state of states) {
+        await stopRecord("Host state record", hostStatePath(state.branch));
+      }
+      await stopRecord(
+        "Branch pid file",
+        join(process.env.HOME || homedir(), ".tps", "branch", "branch.pid"),
+      );
+
+      if (failures.length > 0) {
+        // Print every outcome; the aggregate error makes the command exit
+        // non-zero after all records have been handled.
+        for (const line of failures) console.error(line);
+        throw new Error(failures.join(" "));
       }
 
       console.log(`Kill switch engaged. Terminated ${killed} TPS process(es).`);

@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { countInboxMessages, DeadLetterCleanupError, deadLetterUndelivered, findRelayedRecord, relayScanRoots, relayConflictRoots, removeMailFileConfirmed, getMailDir, mkdirMailDirectory, MailInboxFullError, MailSendInputError, relayAcceptRoot, syncMailFile, syncMailDirectory, inboxFullMessage, MAX_INBOX_MESSAGES, sendMessage, type PromoteRejectClass } from "./mail.js";
-import { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES, canonicalMailboxRoot } from "@tpsdev-ai/agent";
+import { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES, canonicalMailboxRoot, processStartToken } from "@tpsdev-ai/agent";
 export { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES };
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
@@ -1197,6 +1197,7 @@ export async function connectAndKeepAlive(
           messagesSent: 0,
           messagesReceived: 0,
           pid: process.pid,
+          startToken: processStartToken(process.pid),
         };
         writeHostState(state);
 

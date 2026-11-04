@@ -24,6 +24,8 @@ export interface HostConnectionState {
   messagesSent: number;
   messagesReceived: number;
   pid: number;
+  /** Process start token; absent from records written before it was captured. */
+  startToken?: string | null;
   services?: ServiceHealth[];
 }
 
@@ -34,7 +36,7 @@ export interface BranchConnectionState {
   messagesPushed: number;
 }
 
-function hostStatePath(branch: string): string {
+export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
