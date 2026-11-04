@@ -85,6 +85,14 @@ async function waitForExit(child: ChildProcess): Promise<{ code: number | null; 
 async function waitForPidGone(pid: number): Promise<void> {
   const deadline = Date.now() + WAIT_MS;
   while (pidState(pid) !== "gone") {
+    if (process.platform === "linux") {
+      try {
+        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+        if (stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z") return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      }
+    }
     if (Date.now() >= deadline) throw new Error(`pid ${pid} was still alive after the wait bound`);
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
