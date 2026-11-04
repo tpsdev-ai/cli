@@ -163,7 +163,7 @@ export function bridgeStatus(
 }
 
 /** Status of the OpenClaw records, read by name. Throws when either path
- *  exists but is not a regular file: an unreadable record never licenses a
+ *  exists but is not a regular file: a non-regular record never licenses a
  *  start. */
 export function openClawBridgeStatus(
   probe: (pid: number) => PidState = pidState,
