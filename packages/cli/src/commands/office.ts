@@ -969,7 +969,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         }
         if (state.kind === "stale") {
           // A live pid with a different start token belongs to another process:
-          // keep the record and report it. Only a pid proved gone is removed.
+          // keep the record and report it. In this branch, remove a stale record
+          // only when its pid is proved gone.
           if (pidState(state.pid) !== "gone") {
             failures.push(mismatch(label, state.pid, state.path));
             return;
