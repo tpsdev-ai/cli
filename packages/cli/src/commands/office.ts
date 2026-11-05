@@ -1073,14 +1073,11 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           const removal = withBranchPidLock(path, "remove the branch pid record", () => {
             branchTestPause("office-kill-branch-before-removal", path);
             const current = snapshotPidRecord(path);
-            // Missing is not a replacement: a stopped daemon's own shutdown
-            // removes the record. Only a record that is still there and
-            // differs is a replacement.
             if (current.raw !== null && current.raw !== snapshot.raw) return "changed" as const;
             return removeRecord(path);
           });
           if (removal === "changed") {
-            failures.push(`Branch pid file ${path} changed (replaced or removed); this command removed nothing.`);
+            failures.push(`Branch pid file ${path} was replaced; this command removed nothing.`);
           } else if (removal === "removed") {
             console.log(removed);
           } else if (removal === "already gone") {

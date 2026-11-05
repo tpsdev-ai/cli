@@ -421,7 +421,7 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exit = await exited;
     expect(exit.code).not.toBe(0);
-    expect(stderr).toContain(`Branch pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
+    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; this command removed nothing.`);
     expect(readFileSync(pidFile, "utf8")).toBe(replacement);
     const state = readPidFile(pidFile);
     expect(state.kind).toBe("running");

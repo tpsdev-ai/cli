@@ -160,7 +160,7 @@ export function withBranchPidLock<T>(path: string, action: string, fn: () => T):
   const lock = acquireMailLockSync(branchPidLockRoot(path), { timeoutMs: BRANCH_PID_LOCK_TIMEOUT_MS });
   if (lock === null) {
     throw new Error(
-      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. The lock is held by another tps command; retry after it finishes.`,
+      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. Its owner is a live process or could not be verified. Retry after any running tps command finishes; if none is running, remove ${branchPidLockRoot(path)} and retry.`,
     );
   }
   try {
