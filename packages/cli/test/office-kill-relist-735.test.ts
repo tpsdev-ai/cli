@@ -39,14 +39,21 @@ beforeEach(() => {
   mkdirSync(join(home, ".tps", "connections"), { recursive: true });
 });
 
-function killProcessGroups(): void {
-  for (const pgid of processGroups) {
+/** SIGKILL every tracked process group. A group that no longer exists
+ *  (ESRCH) is dropped from tracking; any other error keeps the group tracked
+ *  for the next attempt and is returned. */
+function killProcessGroups(): string[] {
+  const problems: string[] = [];
+  for (const pgid of [...processGroups]) {
     try {
       process.kill(-pgid, "SIGKILL");
-    } catch {
-      /* the group is already empty */
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ESRCH") processGroups.delete(pgid);
+      else problems.push(`process group ${pgid}: ${code ?? String(error)}`);
     }
   }
+  return problems;
 }
 
 afterEach(
@@ -56,9 +63,11 @@ afterEach(
       // A host may fork its replacement while the first signal is being
       // delivered; a second pass catches a child that joined the group after it.
       await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-      killProcessGroups();
+      const problems = killProcessGroups();
+      // Groups that were signalled stay tracked until a later attempt finds
+      // them gone; afterAll makes the final attempt and asserts no survivor.
+      if (problems.length > 0) throw new Error(`could not signal: ${problems.join("; ")}`);
     } finally {
-      processGroups.clear();
       if (savedHome === undefined) delete process.env.HOME;
       else process.env.HOME = savedHome;
       if (savedRoot === undefined) delete process.env.TPS_ROOT;
@@ -86,7 +95,8 @@ function markedProcesses(): string[] {
 }
 
 afterAll(async () => {
-  killProcessGroups();
+  const problems = killProcessGroups();
+  expect(problems).toEqual([]);
   const deadline = Date.now() + 10_000;
   let survivors = markedProcesses();
   while (survivors.length > 0 && Date.now() < deadline) {
