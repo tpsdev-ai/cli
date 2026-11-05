@@ -1,0 +1,1 @@
+- **office kill re-lists host records after each signalling pass and again after the branch step, within a bounded number of passes.** A record first seen at a pass limit is named, not stopped in that pass; a new record path created after the last listing is not seen. A listing failure or an unprocessed record at either bound makes the command exit non-zero.
