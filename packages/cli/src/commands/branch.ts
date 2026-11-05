@@ -365,6 +365,12 @@ async function runInit(args: BranchArgs): Promise<void> {
     process.exit(1);
   }
 
+  // Check the recorded process before the keypair, conf and join (cli#734).
+  const launchDaemon = process.env.TPS_BRANCH_NO_DAEMON !== "1" && process.env.NODE_ENV !== "test";
+  if (launchDaemon) {
+    refuseSecondBranchStart();
+  }
+
   const kp = existsSync(seedPath) && !args.force
     ? loadKeyPair(identityDir, "branch")
     : (() => {
@@ -409,7 +415,7 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   console.log(`✓ Joined to host '${joined.hostId}' (sha256:${joined.hostFingerprint})`);
 
-  if (process.env.TPS_BRANCH_NO_DAEMON === "1" || process.env.NODE_ENV === "test") {
+  if (!launchDaemon) {
     console.log("Branch office ready.");
     return;
   }
@@ -423,14 +429,19 @@ async function runInit(args: BranchArgs): Promise<void> {
 
 async function runStart(): Promise<void> {
   const conf = existsSync(confPath()) ? readBranchConf() : undefined;
+  const spawnsDaemon =
+    process.env.TPS_BRANCH_DAEMON !== "1" &&
+    process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
+    process.env.NODE_ENV !== "test";
+  // The launcher checks the recorded process after reading the conf and before
+  // resolving the agent id: a running daemon refuses the start before any agent
+  // id is resolved, and `spawnBranchDaemon` re-checks it under the pid record
+  // lock (cli#734).
+  if (spawnsDaemon) refuseSecondBranchStart();
   const localAgentId = branchAgentId(conf?.agentId);
   if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
 
-  if (
-    process.env.TPS_BRANCH_DAEMON !== "1" &&
-    process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
-    process.env.NODE_ENV !== "test"
-  ) {
+  if (spawnsDaemon) {
     const daemonPid = spawnBranchDaemon();
     console.log(`Branch daemon spawned (pid ${daemonPid}). Log: ${logPath()}`);
     process.exit(0);
