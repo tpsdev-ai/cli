@@ -404,6 +404,8 @@ describe("branch pid record ownership (cli#730)", () => {
     const announced = launchers.flatMap(({ stdout }) =>
       [...stdout().matchAll(/Branch daemon spawned \(pid (\d+)\)/g)].map((match) => Number(match[1])),
     );
+    // Register before any assertion: a failed assertion must not leak the daemon.
+    daemons.push(...announced);
     expect(announced.length).toBe(1);
 
     const refused = exits.filter((exit) => exit.code !== 0);
@@ -677,6 +679,28 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(stderr()).toContain(`Branch pid file ${pidFile} could not be read at the final check`);
     expect(stderr()).toContain("Inspect it and remove it yourself if the branch daemon is not running");
     expect(readlinkSync(pidFile)).toBe(target);
+  }, 40_000);
+
+  test("office kill reports a branch lock timeout alongside a host-record failure and exits non-zero", () => {
+    const connectionsDir = join(root, ".tps", "connections");
+    const hostPath = join(connectionsDir, "host-a.json");
+    mkdirSync(connectionsDir, { recursive: true });
+    writeFileSync(hostPath, '{"pid":"not-a-number"}\n');
+    const lockRoot = branchPidLockRoot(pidFile);
+    mkdirSync(join(lockRoot, ".mail-lock.claim"), { recursive: true });
+
+    const result = spawnSync("node", [TPS_BIN, "office", "kill"], {
+      encoding: "utf8",
+      timeout: 20_000,
+      env: plainEnv(),
+    });
+
+    expect(result.status).toBe(1);
+    const output = `${result.stdout}${result.stderr}`;
+    expect(output).toContain(hostPath);
+    expect(output).toContain("could not be parsed");
+    expect(output).toContain(`Branch pid record lock ${join(lockRoot, ".mail-lock")} could not be acquired`);
+    expect(readFileSync(hostPath, "utf8")).toBe('{"pid":"not-a-number"}\n');
   }, 40_000);
 
   test("a claim-directory-only lock times out with the lock-or-claim message and the remedy succeeds", () => {

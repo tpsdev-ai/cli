@@ -1139,7 +1139,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       for (const path of listing.paths) {
         await stopRecord("Host state record", path);
       }
-      await stopBranchRecord(branchPidPath());
+      try {
+        await stopBranchRecord(branchPidPath());
+      } catch (error) {
+        // Keep the host-record failures collected above; the aggregate report
+        // below prints this one with them and still exits non-zero.
+        failures.push(error instanceof Error ? error.message : String(error));
+      }
 
       if (failures.length > 0) {
         // Print every failure; the aggregate error makes the command exit
