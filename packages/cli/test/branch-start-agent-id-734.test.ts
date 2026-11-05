@@ -1,8 +1,8 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
@@ -19,6 +19,7 @@ let savedEnv: Record<string, string | undefined>;
 const spawnedPids: number[] = [];
 const allSpawnedPids: number[] = [];
 const leakCheckPids: number[] = [];
+const unverifiedIdentityPids = new Set<number>();
 const spawnedChildren: ChildProcess[] = [];
 
 async function freePort(): Promise<number> {
@@ -186,10 +187,6 @@ function recordFilesUnder(dir: string): string[] {
   return files;
 }
 
-/** True when the recorded process is this test root's branch daemon. The CLI
- *  sets its process title to the package bin name (meow), so the command line
- *  is `tps`; the daemon marker and HOME in its environment tie it to this
- *  root. */
 function runsTestDaemon(pid: number): boolean {
   let command: string | null;
   let environ: string | null = null;
@@ -207,7 +204,19 @@ function runsTestDaemon(pid: number): boolean {
     return false;
   }
   if (command === null) return false;
-  if (process.platform !== "linux") return command.includes(TPS_BIN) && command.includes("branch");
+  if (process.platform !== "linux") {
+    if (command.trim() !== "tps" && !command.includes(TPS_BIN)) return false;
+    try {
+      const stdout = spawnSync("lsof", ["-a", "-p", String(pid), "-d", "1", "-Fn"], { encoding: "utf8" });
+      if (stdout.status !== 0) return false;
+      const name = stdout.stdout.split("\n").find((line) => line.startsWith("n"));
+      if (name === undefined) return false;
+      const stdoutPath = realpathSync(name.slice(1));
+      return stdoutPath.startsWith(`${realpathSync(root)}${sep}`) && statSync(stdoutPath).isFile();
+    } catch {
+      return false;
+    }
+  }
   const entries = environ!.split("\0");
   if (!entries.includes(`HOME=${root}`) || !entries.includes("TPS_BRANCH_DAEMON=1")) return false;
   return command === "tps" || command.includes(TPS_BIN);
@@ -221,8 +230,12 @@ async function stopRecordedDaemons(): Promise<void> {
   const failures: string[] = [];
   for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
     const state = readPidFile(path);
-    if (state.kind !== "running" || !runsTestDaemon(state.pid)) continue;
+    if (state.kind !== "running") continue;
     if (!leakCheckPids.includes(state.pid)) leakCheckPids.push(state.pid);
+    if (!runsTestDaemon(state.pid)) {
+      unverifiedIdentityPids.add(state.pid);
+      continue;
+    }
     try {
       process.kill(state.pid, "SIGKILL");
     } catch (error) {
@@ -413,5 +426,8 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
 
 afterAll(() => {
   const leaked = [...new Set([...allSpawnedPids, ...leakCheckPids])].filter((pid) => !pidGone(pid));
-  expect(leaked).toEqual([]);
+  const diagnostic = leaked.map((pid) =>
+    unverifiedIdentityPids.has(pid) ? `identity could not be verified for pid ${pid}` : `pid ${pid} is still alive`,
+  ).join("; ");
+  expect(leaked, diagnostic).toEqual([]);
 });
