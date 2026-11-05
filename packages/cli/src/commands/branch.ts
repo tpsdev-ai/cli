@@ -433,9 +433,10 @@ async function runStart(): Promise<void> {
     process.env.TPS_BRANCH_DAEMON !== "1" &&
     process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
     process.env.NODE_ENV !== "test";
-  // The launcher checks the recorded process before resolving the agent id: a
-  // running daemon refuses the start whatever the agent configuration, and
-  // `spawnBranchDaemon` re-checks it under the pid record lock (cli#734).
+  // The launcher checks the recorded process after reading the conf and before
+  // resolving the agent id: a running daemon refuses the start before any agent
+  // id is resolved, and `spawnBranchDaemon` re-checks it under the pid record
+  // lock (cli#734).
   if (spawnsDaemon) refuseSecondBranchStart();
   const localAgentId = branchAgentId(conf?.agentId);
   if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");

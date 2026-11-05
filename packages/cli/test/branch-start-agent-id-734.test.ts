@@ -16,8 +16,12 @@ let root: string;
 let tpsRoot: string;
 let pidFile: string;
 let savedEnv: Record<string, string | undefined>;
+// Pids of processes this test spawned directly (launcher children, sleeps).
 const spawnedPids: number[] = [];
 const allSpawnedPids: number[] = [];
+// Pids read from a pid record. Only stopRecordedDaemons may signal them, and
+// only after the record's start token and the process identity verify them.
+const recordedDaemons: { pid: number; startToken: string }[] = [];
 const leakCheckPids: number[] = [];
 const unverifiedIdentityPids = new Set<number>();
 const spawnedChildren: ChildProcess[] = [];
@@ -71,10 +75,14 @@ function track(child: ChildProcess): ChildProcess {
   return child;
 }
 
+function rememberRecordedDaemon(pid: number, token: string): void {
+  if (!recordedDaemons.some((record) => record.pid === pid)) recordedDaemons.push({ pid, startToken: token });
+}
+
 /** Register the pid the launcher recorded, before the launcher-result assertion. */
 function registerRecordedPid(): void {
   const state = readPidFile(pidFile);
-  if (state.kind === "running" || state.kind === "unverified") rememberPid(state.pid);
+  if (state.kind === "running") rememberRecordedDaemon(state.pid, state.startToken);
 }
 
 async function runCli(
@@ -152,6 +160,12 @@ async function waitForLogStarted(): Promise<void> {
   }
 }
 
+function leakDiagnostic(pids: number[]): string {
+  return pids
+    .map((pid) => unverifiedIdentityPids.has(pid) ? `identity could not be verified for pid ${pid}` : `pid ${pid} is still alive`)
+    .join("; ");
+}
+
 function pidGone(pid: number): boolean {
   if (pidState(pid) === "gone") return true;
   if (process.platform !== "linux") return false;
@@ -222,32 +236,47 @@ function runsTestDaemon(pid: number): boolean {
   return command === "tps" || command.includes(TPS_BIN);
 }
 
-/** Stop each process named by a pid record in the test root after the record's
- *  start token and the process's identity verify it as this root's branch
- *  daemon. Cleanup does not read launcher stdout, so a daemon whose
- *  announcement was missing or discarded is still stopped. */
+/** Stop a recorded pid only after the record's start token and the process's
+ *  identity verify it as this root's branch daemon. A pid that fails either
+ *  check is left running and reported as unverified. Cleanup does not read
+ *  launcher stdout, so a daemon whose announcement was missing or discarded is
+ *  still stopped. */
 async function stopRecordedDaemons(): Promise<void> {
   const failures: string[] = [];
-  for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
-    const state = readPidFile(path);
-    if (state.kind !== "running") continue;
-    if (!leakCheckPids.includes(state.pid)) leakCheckPids.push(state.pid);
-    if (!runsTestDaemon(state.pid)) {
-      unverifiedIdentityPids.add(state.pid);
-      continue;
-    }
+  const seen = new Set<number>();
+  const stopVerified = async (pid: number): Promise<void> => {
     try {
-      process.kill(state.pid, "SIGKILL");
+      process.kill(pid, "SIGKILL");
     } catch (error) {
-      if (pidState(state.pid) !== "gone") {
-        failures.push(`could not kill pid ${state.pid}: ${(error as Error).message}`);
+      if (pidState(pid) !== "gone") {
+        failures.push(`could not kill pid ${pid}: ${(error as Error).message}`);
       }
     }
     try {
-      await waitForPidGone(state.pid);
+      await waitForPidGone(pid);
     } catch (error) {
       failures.push((error as Error).message);
     }
+  };
+  for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
+    const state = readPidFile(path);
+    if (state.kind === "missing" || state.kind === "unreadable" || state.kind === "invalid" || state.kind === "stale") continue;
+    seen.add(state.pid);
+    if (!leakCheckPids.includes(state.pid)) leakCheckPids.push(state.pid);
+    if (state.kind === "unverified" || !runsTestDaemon(state.pid)) {
+      unverifiedIdentityPids.add(state.pid);
+      continue;
+    }
+    await stopVerified(state.pid);
+  }
+  for (const record of recordedDaemons) {
+    if (seen.has(record.pid) || pidGone(record.pid)) continue;
+    if (!leakCheckPids.includes(record.pid)) leakCheckPids.push(record.pid);
+    if (processStartToken(record.pid) !== record.startToken || !runsTestDaemon(record.pid)) {
+      unverifiedIdentityPids.add(record.pid);
+      continue;
+    }
+    await stopVerified(record.pid);
   }
   if (failures.length > 0) throw new Error(`recorded-daemon cleanup failed: ${failures.join("; ")}`);
 }
@@ -316,7 +345,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     registerRecordedPid();
     expect(first.code).toBe(0);
     const running = await waitForRunningRecord();
-    rememberPid(running.pid);
+    rememberRecordedDaemon(running.pid, running.startToken);
     await waitForLogStarted();
 
     writeBranchConf(port, "127.0.0.1", "tcp", undefined, undefined);
@@ -387,7 +416,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     registerRecordedPid();
     expect(first.code).toBe(0);
     const running = await waitForRunningRecord();
-    rememberPid(running.pid);
+    rememberRecordedDaemon(running.pid, running.startToken);
     await waitForLogStarted();
     const recordBefore = readFileSync(pidFile, "utf8");
 
@@ -400,6 +429,34 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
+
+  test("cleanup does not signal a recorded pid that is not this root's daemon and reports it unverified", async () => {
+    const foreignHome = join(root, "other-home");
+    mkdirSync(foreignHome);
+    const foreign = spawn("sleep", ["60"], {
+      env: { ...process.env, HOME: foreignHome },
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const pid = foreign.pid;
+    if (pid === undefined) throw new Error("sleep has no pid");
+    try {
+      writeFileSync(pidFile, serializePidRecord(pid, startToken(pid)));
+      registerRecordedPid();
+
+      await stopTracked();
+      await stopRecordedDaemons();
+
+      expect(pidGone(pid)).toBe(false);
+      expect(leakDiagnostic([pid])).toBe(`identity could not be verified for pid ${pid}`);
+    } finally {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      await waitForPidGone(pid).catch(() => {});
+    }
+  }, 20_000);
 
   test("a start whose launcher announcement is discarded is still stopped by record-based cleanup", async () => {
     const port = await freePort();
@@ -425,9 +482,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
 });
 
 afterAll(() => {
-  const leaked = [...new Set([...allSpawnedPids, ...leakCheckPids])].filter((pid) => !pidGone(pid));
-  const diagnostic = leaked.map((pid) =>
-    unverifiedIdentityPids.has(pid) ? `identity could not be verified for pid ${pid}` : `pid ${pid} is still alive`,
-  ).join("; ");
-  expect(leaked, diagnostic).toEqual([]);
+  const leaked = [...new Set([...allSpawnedPids, ...recordedDaemons.map((record) => record.pid), ...leakCheckPids])]
+    .filter((pid) => !pidGone(pid));
+  expect(leaked, leakDiagnostic(leaked)).toEqual([]);
 });
