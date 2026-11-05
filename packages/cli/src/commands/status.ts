@@ -462,6 +462,9 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 
   if (resolvedState === "error") {
     console.log(`⚠️  Heartbeat for ${agentId}: error (${checks.join("; ")})`);
+    // cli#750: a heartbeat that recorded a failed check is a failed command;
+    // a script watching the exit status must not read it as healthy.
+    process.exitCode = 1;
   } else {
     console.log(`✅ Heartbeat for ${agentId}: ${resolvedState}`);
   }
