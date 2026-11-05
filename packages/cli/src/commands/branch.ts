@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -171,17 +171,32 @@ export function withBranchPidLock<T>(path: string, action: string, fn: () => T):
 }
 
 /**
+ * The pause seam requires the isolated test launcher's TPS_TEST_ROOT marker,
+ * which scripts/test-suite.mjs sets for its child through isolatedChildEnv.
+ * Without it, a TPS_BRANCH_TEST_PAUSE_DIR from a real environment is ignored:
+ * no wait and no file write.
+ */
+function branchTestPauseEnabled(phase: string): boolean {
+  if (process.env.TPS_TEST_ROOT === undefined) return false;
+  if (process.env.TPS_BRANCH_TEST_PAUSE_DIR === undefined) return false;
+  const wanted = process.env.TPS_BRANCH_TEST_PAUSE_PHASE;
+  return wanted === undefined || wanted === phase;
+}
+
+function announceBranchTestPause(phase: string, path: string): string {
+  const dir = process.env.TPS_BRANCH_TEST_PAUSE_DIR!;
+  writeFileSync(join(dir, `ready-${phase}-${process.pid}`), path, "utf-8");
+  return join(dir, `go-${phase}`);
+}
+
+/**
  * Test seam: announce this process for `phase` and wait, bounded, for the
- * phase's `go` file. Set TPS_BRANCH_TEST_PAUSE_DIR to enable; set
- * TPS_BRANCH_TEST_PAUSE_PHASE to pause at one phase only.
+ * phase's `go` file. Requires the isolated test launcher's TPS_TEST_ROOT
+ * marker; see branchTestPauseEnabled.
  */
 export function branchTestPause(phase: string, path: string): void {
-  const dir = process.env.TPS_BRANCH_TEST_PAUSE_DIR;
-  if (dir === undefined) return;
-  const wanted = process.env.TPS_BRANCH_TEST_PAUSE_PHASE;
-  if (wanted !== undefined && wanted !== phase) return;
-  writeFileSync(join(dir, `ready-${phase}-${process.pid}`), path, "utf-8");
-  const go = join(dir, `go-${phase}`);
+  if (!branchTestPauseEnabled(phase)) return;
+  const go = announceBranchTestPause(phase, path);
   const deadline = Date.now() + BRANCH_TEST_PAUSE_TIMEOUT_MS;
   const wait = new Int32Array(new SharedArrayBuffer(4));
   while (!existsSync(go)) {
@@ -189,6 +204,23 @@ export function branchTestPause(phase: string, path: string): void {
       throw new Error(`branch test pause ${phase} timed out waiting for ${go}`);
     }
     Atomics.wait(wait, 0, 0, 5);
+  }
+}
+
+/**
+ * The `startup-before-listener`, `listening-before-steady-state`, and
+ * `shutdown-after-signal` pauses use `await`, allowing signal dispatch
+ * during those pauses.
+ */
+async function branchTestPauseAsync(phase: string, path: string): Promise<void> {
+  if (!branchTestPauseEnabled(phase)) return;
+  const go = announceBranchTestPause(phase, path);
+  const deadline = Date.now() + BRANCH_TEST_PAUSE_TIMEOUT_MS;
+  while (!existsSync(go)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`branch test pause ${phase} timed out waiting for ${go}`);
+    }
+    await new Promise<void>((resolveWait) => setTimeout(resolveWait, 5));
   }
 }
 
@@ -626,44 +658,23 @@ async function runStart(): Promise<void> {
     }
   };
 
-  logLine("STARTED", `Listening on 0.0.0.0:${conf.port} (${conf.transport})`);
+  let server: TransportServer | null = null;
+  let outboxWatcher: FSWatcher | null = null;
 
-  const server: TransportServer =
-    conf.transport === "ws"
-      ? await listenForHostWs(kp, hostPub, conf.port, onMessage)
-      : await listenForHost(kp, hostPub, conf.port, (msg: TpsMessage, channel: TransportChannel) => {
-          return onMessage(msg, channel);
-        });
-
-  server.onConnection((channel) => {
-    activeHostChannel = channel;
-    // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)
-    try { serviceProxies?.close(); } catch {}
-    serviceProxies = null;
-  });
-
-  const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
-  mkdirSync(outboxNewDir, { recursive: true });
-  const outboxWatcher = watch(outboxNewDir, async () => {
-    if (!activeHostChannel || !activeHostChannel.isAlive()) return;
-    for (const item of outboxSends.due()) {
-      await activeHostChannel.send({
-        type: MSG_MAIL_DELIVER,
-        seq: 0,
-        ts: new Date().toISOString(),
-        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => outboxSends.sendFailed(item.id));
-    }
-  });
-
+  let shuttingDown = false;
   const onShutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     logLine("STOPPED", "Signal received");
-    try { outboxWatcher.close(); } catch {}
+    if (branchTestPauseEnabled("shutdown-after-signal")) {
+      await branchTestPauseAsync("shutdown-after-signal", pidPath());
+    }
+    try { outboxWatcher?.close(); } catch {}
     try { serviceProxies?.close(); } catch {}
     serviceProxies = null;
     activeHostChannel = null;
     clearBranchState();
-    try { await server.close(); } catch {}
+    try { await server?.close(); } catch {}
     const p = pidPath();
     try {
       const outcome = removeOwnBranchPidRecord(p);
@@ -685,8 +696,54 @@ async function runStart(): Promise<void> {
     process.exit(0);
   };
 
+  // Install the shutdown handlers before the listener opens: a SIGTERM that
+  // arrives once the socket accepts connections must reach this handler, not
+  // the runtime's default handler, which exits without the shutdown path.
   process.on("SIGTERM", onShutdown);
   process.on("SIGINT", onShutdown);
+
+  // Test seam: pause with the event loop free, after the handlers are
+  // installed and before the listener opens (server and outboxWatcher null).
+  // No await when the seam is off: callers and tests that start the daemon in
+  // one tick keep reaching the listener synchronously.
+  if (branchTestPauseEnabled("startup-before-listener")) {
+    await branchTestPauseAsync("startup-before-listener", pidPath());
+  }
+
+  logLine("STARTED", `Listening on 0.0.0.0:${conf.port} (${conf.transport})`);
+
+  server = conf.transport === "ws"
+    ? await listenForHostWs(kp, hostPub, conf.port, onMessage)
+    : await listenForHost(kp, hostPub, conf.port, (msg: TpsMessage, channel: TransportChannel) => {
+        return onMessage(msg, channel);
+      });
+
+  // Test seam: pause after the listener accepts connections, before the
+  // outbox watcher is created (server set, outboxWatcher null).
+  if (branchTestPauseEnabled("listening-before-steady-state")) {
+    await branchTestPauseAsync("listening-before-steady-state", pidPath());
+  }
+
+  server.onConnection((channel) => {
+    activeHostChannel = channel;
+    // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)
+    try { serviceProxies?.close(); } catch {}
+    serviceProxies = null;
+  });
+
+  const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
+  mkdirSync(outboxNewDir, { recursive: true });
+  outboxWatcher = watch(outboxNewDir, async () => {
+    if (!activeHostChannel || !activeHostChannel.isAlive()) return;
+    for (const item of outboxSends.due()) {
+      await activeHostChannel.send({
+        type: MSG_MAIL_DELIVER,
+        seq: 0,
+        ts: new Date().toISOString(),
+        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
+      }).catch(() => outboxSends.sendFailed(item.id));
+    }
+  });
 
   // Keep alive — bun does not treat a no-op interval as a ref'd handle, so the
   // event loop drains and the daemon exits ~150ms after listen(). A
