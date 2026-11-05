@@ -19,8 +19,7 @@ let savedEnv: Record<string, string | undefined>;
 // Pids of processes this test spawned directly (launcher children, sleeps).
 const spawnedPids: number[] = [];
 const allSpawnedPids: number[] = [];
-// Pids read from a pid record. Only stopRecordedDaemons may signal them, and
-// only after the record's start token and the process identity verify them.
+// Pids read from a pid record, verified by stopRecordedDaemons before it signals them.
 const recordedDaemons: { pid: number; startToken: string }[] = [];
 const leakCheckPids: number[] = [];
 const unverifiedIdentityPids = new Set<number>();
@@ -236,11 +235,9 @@ function runsTestDaemon(pid: number): boolean {
   return command === "tps" || command.includes(TPS_BIN);
 }
 
-/** Stop a recorded pid only after the record's start token and the process's
- *  identity verify it as this root's branch daemon. Unverified survivors are
- *  not signalled and are reported by the leak assertion. Cleanup does not read
- *  launcher stdout, so a daemon whose announcement was missing or discarded is
- *  still stopped. */
+/** stopRecordedDaemons verifies a recorded pid's start token and identity as this
+ *  root's daemon before signalling it. It leaves unverified pids unsignalled and
+ *  records them for leakDiagnostic. */
 async function stopRecordedDaemons(): Promise<void> {
   const failures: string[] = [];
   const seen = new Set<number>();
@@ -430,7 +427,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
 
-  test("cleanup does not signal a recorded pid that is not this root's daemon and reports it unverified", async () => {
+  test("stopRecordedDaemons leaves a foreign recorded pid unsignalled and marks its identity unverified", async () => {
     const foreignHome = join(root, "other-home");
     mkdirSync(foreignHome);
     const foreign = spawn("sleep", ["60"], {
@@ -458,7 +455,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     }
   }, 20_000);
 
-  test("a start whose launcher announcement is discarded is still stopped by record-based cleanup", async () => {
+  test("stopRecordedDaemons stops the recorded daemon when the launcher announcement is discarded", async () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
@@ -473,7 +470,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     if (state.kind !== "running" && state.kind !== "unverified") {
       throw new Error(`pid file did not name the launched daemon; state=${JSON.stringify(state)}`);
     }
-    // Not registered for cleanup: the record-based stop must find it from the pid file.
+    // stopRecordedDaemons must find this pid from the pid file.
     leakCheckPids.push(state.pid);
     await waitForLogStarted();
     expect(state.kind).toBe("running");
