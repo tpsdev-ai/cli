@@ -742,15 +742,28 @@ describe("branch pid record ownership (cli#730)", () => {
     const stale = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stale, null));
 
-    const result = spawnSync("node", [TPS_BIN, "office", "kill", "--quiet-nono-check"], {
-      encoding: "utf8",
-      timeout: EXIT_MS,
+    // Run office kill asynchronously: it waits for the host it signals, and
+    // that host is this test process's child. Keeping the event loop free lets
+    // Node reap the child; spawnSync blocks it, leaving a zombie that still
+    // answers kill -0 on platforms without a zombie-state read.
+    const kill = spawn("node", [TPS_BIN, "office", "kill", "--quiet-nono-check"], {
       env: plainEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
     });
+    children.push(kill);
+    let stdout = "";
+    let stderr = "";
+    kill.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    kill.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const exit = await waitForExit(kill);
 
-    expect(result.status).toBe(0);
-    expect(result.stderr).toBe("");
-    expect(result.stdout.split(/\r?\n/).filter((line) => line !== "")).toEqual([
+    expect(exit.code).toBe(0);
+    expect(stderr).toBe("");
+    expect(stdout.split(/\r?\n/).filter((line) => line !== "")).toEqual([
       `Host state record (pid ${hostPid}) stopped; record removed: ${hostPath}.`,
       `Stale branch pid file removed: ${pidFile}; branch-record handling signalled no process.`,
       "Kill switch engaged. Terminated 1 TPS process(es).",
