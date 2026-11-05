@@ -1,8 +1,8 @@
 /**
  * cli#734 — the branch start launcher and a production branch init resolve the
- * branch agent id before the pid-record check, so a launch that cannot run
- * names the missing id instead of a running recorded process. These tests
- * drive the real CLI with real files.
+ * branch agent id before the pid-record check, so a branch start or production
+ * init with no configured id names the missing id instead of a running
+ * recorded process. These tests drive the real CLI with real files.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
