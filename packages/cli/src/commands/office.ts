@@ -1070,13 +1070,23 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
         const removeIfUnchanged = (snapshot: PidRecordSnapshot, pid: number, removed: string, gone: string): void => {
           branchTestPause("office-kill-branch-before-unlink", path);
+          let unreadableReason: string | undefined;
           const removal = withBranchPidLock(path, "remove the branch pid record", () => {
             branchTestPause("office-kill-branch-before-removal", path);
             const current = snapshotPidRecord(path);
-            if (current.raw !== null && current.raw !== snapshot.raw) return "changed" as const;
+            if (current.state.kind === "missing") return "already gone" as const;
+            if (current.state.kind === "unreadable") {
+              unreadableReason = current.state.reason;
+              return "unreadable" as const;
+            }
+            if (current.raw !== snapshot.raw) return "changed" as const;
             return removeRecord(path);
           });
-          if (removal === "changed") {
+          if (removal === "unreadable") {
+            failures.push(
+              `Branch pid file ${path} could not be read at the final check${unreadableReason === undefined ? "" : ` (${unreadableReason})`}; the pid file was kept. Inspect it and remove it yourself if the branch daemon is not running.`,
+            );
+          } else if (removal === "changed") {
             failures.push(`Branch pid file ${path} was replaced; this command removed nothing.`);
           } else if (removal === "removed") {
             console.log(removed);

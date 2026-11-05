@@ -160,7 +160,7 @@ export function withBranchPidLock<T>(path: string, action: string, fn: () => T):
   const lock = acquireMailLockSync(branchPidLockRoot(path), { timeoutMs: BRANCH_PID_LOCK_TIMEOUT_MS });
   if (lock === null) {
     throw new Error(
-      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. Its owner is a live process or could not be verified. Retry after any running tps command finishes; if none is running, remove ${branchPidLockRoot(path)} and retry.`,
+      `Branch pid record lock ${lockDir} could not be acquired within ${BRANCH_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${branchPidLockRoot(path)} and retry.`,
     );
   }
   try {
@@ -255,6 +255,7 @@ function removeOwnBranchPidRecord(path: string): PidRecordRemoval {
     if (current.raw !== before.raw) return "changed";
     const state = current.state;
     if (state.kind === "missing") return "missing";
+    if (state.kind === "unreadable") return "other";
     if (state.kind === "running" && state.pid === process.pid && state.startToken === ownToken) {
       removePidFile(path);
       return "removed";
@@ -704,9 +705,15 @@ async function runStop(): Promise<void> {
     new Error(
       `Branch pid file ${path} changed (replaced or removed); this command removed nothing. Re-run "tps branch stop".`,
     );
+  const unreadableAtFinalRead = (path: string, reason?: string): Error =>
+    new Error(
+      `Branch pid file ${path} could not be read at the final check${reason === undefined ? "" : ` (${reason})`}; the pid file was kept. Inspect it and remove it yourself if the branch daemon is not running.`,
+    );
   const removeAfterRecheck = (path: string, before: PidRecordSnapshot): "removed" | "already gone" => {
     branchTestPause("stop-before-unlink", path);
     const current = snapshotPidRecord(path);
+    if (current.state.kind === "missing") return "already gone";
+    if (current.state.kind === "unreadable") throw unreadableAtFinalRead(path, current.state.reason);
     if (current.raw !== before.raw) throw changed(path);
     return removeBranchPid(path);
   };
@@ -792,8 +799,10 @@ async function runStop(): Promise<void> {
     const opened = snapshotPidRecord(decision.path);
     branchTestPause("stop-before-unlink", decision.path);
     const current = snapshotPidRecord(decision.path);
+    if (current.state.kind === "missing") return "already gone" as const;
+    if (current.state.kind === "unreadable") throw unreadableAtFinalRead(decision.path, current.state.reason);
     if (current.raw !== opened.raw) throw changed(decision.path);
-    if (current.raw !== null && current.raw !== decision.snapshot.raw) throw changed(decision.path);
+    if (current.raw !== decision.snapshot.raw) throw changed(decision.path);
     return removeBranchPid(decision.path);
   });
 

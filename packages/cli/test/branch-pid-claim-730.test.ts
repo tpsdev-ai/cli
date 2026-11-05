@@ -6,13 +6,13 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
-import { branchPidLockRoot, writeBranchConf } from "../src/commands/branch.js";
+import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 
@@ -202,6 +202,90 @@ function reapedPid(): number {
   return child.pid;
 }
 
+/** Replace the pid record with a symlink to `target`. */
+function replaceWithSymlink(target: string): void {
+  rmSync(pidFile, { force: true });
+  symlinkSync(target, pidFile);
+}
+
+interface PausedStop {
+  daemon: ChildProcess;
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  stdout: () => string;
+  stderr: () => string;
+}
+
+/** Start a daemon, record it, run `branch stop` and wait until the daemon is
+ *  paused in shutdown (stop is then in its unlocked post-signal wait). */
+async function stopWhileDaemonPausesInShutdown(): Promise<PausedStop> {
+  const port = await freePort();
+  prepareBranch(port);
+  const daemon = spawnDaemon("shutdown-before-unlink");
+  await waitForLogStarted();
+  await waitForListening(port);
+  writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+  expect(readPidFile(pidFile).kind).toBe("running");
+
+  const stop = spawn("node", [TPS_BIN, "branch", "stop"], {
+    env: plainEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(stop);
+  let stdout = "";
+  let stderr = "";
+  stop.stdout?.on("data", (chunk) => {
+    stdout += String(chunk);
+  });
+  stop.stderr?.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+  const exited = waitForExit(stop);
+  await waitForReady("shutdown-before-unlink");
+  return { daemon, exited, stdout: () => stdout, stderr: () => stderr };
+}
+
+interface PausedOfficeKill {
+  exited: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+  stderr: () => string;
+}
+
+/** Run `office kill` against a stale record and replace that record with a
+ *  symlink during the unlocked interval before removal. */
+async function replaceBranchRecordDuringOfficeKill(target: string | null): Promise<PausedOfficeKill> {
+  prepareBranch(await freePort());
+  const stale = reapedPid();
+  writeFileSync(pidFile, serializePidRecord(stale, null));
+
+  const kill = spawn("node", [TPS_BIN, "office", "kill"], {
+    env: allPhasesEnv(),
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  children.push(kill);
+  let stderr = "";
+  kill.stderr?.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+  const exited = waitForExit(kill);
+
+  await waitForReady("office-kill-branch-before-decision");
+  release("office-kill-branch-before-decision");
+
+  await waitForReady("office-kill-branch-before-unlink");
+  const waitProbe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+  if (waitProbe !== null) waitProbe.release();
+  expect(waitProbe).not.toBeNull();
+
+  const linkTarget = target ?? join(root, "missing-target");
+  if (target !== null) writeFileSync(target, "not a pid record\n");
+  replaceWithSymlink(linkTarget);
+  release("office-kill-branch-before-unlink");
+
+  await waitForReady("office-kill-branch-before-removal");
+  release("office-kill-branch-before-removal");
+
+  return { exited, stderr: () => stderr };
+}
+
 beforeEach(() => {
   savedEnv = {};
   for (const key of [
@@ -335,7 +419,7 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(readFileSync(logFile, "utf8")).toContain(`Pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
   }, 40_000);
 
-  test("runStop preserves a replacement visible at its final locked read", async () => {
+  test("runStop's final locked read preserves a readable replacement and exits non-zero", async () => {
     prepareBranch(await freePort());
     const stale = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stale, null));
@@ -372,6 +456,64 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(newer.pid);
     expect(pidState(newer.pid!)).toBe("alive");
+  }, 40_000);
+
+  test("runStop's unlocked post-signal wait preserves a readable replacement and exits non-zero", async () => {
+    const { daemon, exited, stderr } = await stopWhileDaemonPausesInShutdown();
+    const newer = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
+    children.push(newer);
+    expect(newer.pid).toBeDefined();
+    const replacement = serializePidRecord(newer.pid!, startToken(newer.pid!));
+    writeFileSync(pidFile, replacement);
+    release("shutdown-before-unlink");
+
+    expect(await waitForExit(daemon)).toEqual({ code: 0, signal: null });
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
+    expect(readFileSync(pidFile, "utf8")).toBe(replacement);
+    expect(readPidFile(pidFile).kind).toBe("running");
+    expect(pidState(newer.pid!)).toBe("alive");
+  }, 40_000);
+
+  test("runStop's unlocked post-signal wait keeps a symlink to a readable file and exits non-zero", async () => {
+    const { daemon, exited, stderr } = await stopWhileDaemonPausesInShutdown();
+    const target = join(root, "decoy.txt");
+    writeFileSync(target, "not a pid record\n");
+    replaceWithSymlink(target);
+    release("shutdown-before-unlink");
+
+    expect(await waitForExit(daemon)).toEqual({ code: 0, signal: null });
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} could not be read at the final check`);
+    expect(stderr()).toContain("Inspect it and remove it yourself if the branch daemon is not running");
+    expect(readlinkSync(pidFile)).toBe(target);
+  }, 40_000);
+
+  test("runStop's unlocked post-signal wait keeps a dangling symlink and exits non-zero", async () => {
+    const { daemon, exited, stderr } = await stopWhileDaemonPausesInShutdown();
+    const target = join(root, "missing-target");
+    replaceWithSymlink(target);
+    release("shutdown-before-unlink");
+
+    expect(await waitForExit(daemon)).toEqual({ code: 0, signal: null });
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} could not be read at the final check`);
+    expect(stderr()).toContain("Inspect it and remove it yourself if the branch daemon is not running");
+    expect(readlinkSync(pidFile)).toBe(target);
+  }, 40_000);
+
+  test("runStop's unlocked post-signal wait reports an already-gone record and exits zero", async () => {
+    const { daemon, exited, stdout } = await stopWhileDaemonPausesInShutdown();
+    rmSync(pidFile, { force: true });
+    release("shutdown-before-unlink");
+
+    expect(await waitForExit(daemon)).toEqual({ code: 0, signal: null });
+    expect(await exited).toEqual({ code: 0, signal: null });
+    expect(stdout()).toContain("PID file already gone");
+    expect(readPidFile(pidFile).kind).toBe("missing");
   }, 40_000);
 
   test("office kill preserves a launcher's replacement of a stale record it decided on", async () => {
@@ -428,4 +570,41 @@ describe("branch pid record ownership (cli#730)", () => {
     if (state.kind === "running") expect(state.pid).toBe(launched.pid);
     expect(pidState(launched.pid)).toBe("alive");
   }, 40_000);
+
+  test("office kill keeps a symlink to a readable file at its final read and exits non-zero", async () => {
+    const target = join(root, "decoy.txt");
+    const { exited, stderr } = await replaceBranchRecordDuringOfficeKill(target);
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} could not be read at the final check`);
+    expect(stderr()).toContain("Inspect it and remove it yourself if the branch daemon is not running");
+    expect(readlinkSync(pidFile)).toBe(target);
+  }, 40_000);
+
+  test("office kill keeps a dangling symlink at its final read and exits non-zero", async () => {
+    const target = join(root, "missing-target");
+    const { exited, stderr } = await replaceBranchRecordDuringOfficeKill(null);
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} could not be read at the final check`);
+    expect(stderr()).toContain("Inspect it and remove it yourself if the branch daemon is not running");
+    expect(readlinkSync(pidFile)).toBe(target);
+  }, 40_000);
+
+  test("a claim-directory-only lock times out with the lock-or-claim message and the remedy succeeds", () => {
+    const lockRoot = branchPidLockRoot(pidFile);
+    mkdirSync(join(lockRoot, ".mail-lock.claim"), { recursive: true });
+    let message = "";
+    try {
+      withBranchPidLock(pidFile, "test the lock", () => "held");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("The lock or its reclamation claim is held, or its owner could not be verified.");
+    expect(message).toContain(`remove ${lockRoot} and retry`);
+    expect(message).not.toContain("Its owner is a live process");
+
+    rmSync(lockRoot, { recursive: true, force: true });
+    expect(withBranchPidLock(pidFile, "test the lock", () => "held")).toBe("held");
+  }, 20_000);
 });
