@@ -365,14 +365,10 @@ async function runInit(args: BranchArgs): Promise<void> {
     process.exit(1);
   }
 
-  // A production init starts a daemon, so check the recorded process before
-  // the agent id and before the join: a running daemon refuses the init before
-  // the keypair, the conf or the join. The pid path is `TPS_ROOT/branch.pid`,
-  // which does not depend on the join's result (cli#734).
+  // Check the recorded process before the keypair, conf and join (cli#734).
   const launchDaemon = process.env.TPS_BRANCH_NO_DAEMON !== "1" && process.env.NODE_ENV !== "test";
   if (launchDaemon) {
     refuseSecondBranchStart();
-    branchAgentId(args.agent);
   }
 
   const kp = existsSync(seedPath) && !args.force

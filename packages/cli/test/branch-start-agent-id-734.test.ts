@@ -1,10 +1,3 @@
-/**
- * cli#734 — the branch launchers check the pid record before they resolve the
- * branch agent id, so a branch start or a production branch init with a
- * recorded running process and no configured id names the running pid, the pid
- * file and the stop remedy instead of a missing agent id. These tests drive the
- * real CLI with real files.
- */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -77,12 +70,14 @@ function track(child: ChildProcess): ChildProcess {
 async function runCli(
   args: string[],
   env: NodeJS.ProcessEnv,
+  stopAfterIdentity = false,
 ): Promise<{ code: number | null; signal: NodeJS.Signals | null; stdout: string; stderr: string }> {
   const child = track(spawn("node", [TPS_BIN, ...args], { env, stdio: ["ignore", "pipe", "pipe"] }));
   let stdout = "";
   let stderr = "";
   child.stdout!.on("data", (chunk) => {
     stdout += chunk;
+    if (stopAfterIdentity && stdout.includes("Branch identity created")) child.kill("SIGKILL");
   });
   child.stderr!.on("data", (chunk) => {
     stderr += chunk;
@@ -210,7 +205,7 @@ afterEach(async () => {
   }
 });
 
-describe("branch launchers check the pid record before the agent id (cli#734)", () => {
+describe("branch start and init recorded-process refusals (cli#734)", () => {
   test("a start with a running recorded process and both agent-id sources cleared names the running pid and the pid file", async () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
@@ -234,20 +229,19 @@ describe("branch launchers check the pid record before the agent id (cli#734)", 
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
 
-  test("a production init with a running recorded process and no agent id names the running pid and starts no join", async () => {
+  test.each([false, true])("a production init with a running recorded process names the pid and pid file before joining (agent id configured: %s)", async (configured) => {
     const port = await freePort();
-    prepareBranch(port, "agent-a");
+    const agentId = configured ? "agent-a" : undefined;
+    prepareBranch(port, agentId);
     const live = startSleep();
     writeFileSync(pidFile, serializePidRecord(live.pid!, startToken(live.pid!)));
     const recordBefore = readFileSync(pidFile, "utf8");
     const confBefore = readFileSync(join(tpsRoot, "branch.conf.json"), "utf8");
+    const seedBefore = readFileSync(join(process.env.TPS_IDENTITY_DIR!, "branch.seed"));
 
-    // --force is required because an existing join and conf are what an
-    // operator re-initialising a live branch presents. The pid path does not
-    // depend on the join's result, so this refusal comes before the join.
     const result = await runCli(
       ["branch", "init", "--force", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
-      launcherEnv(),
+      launcherEnv(agentId ? { TPS_AGENT_ID: agentId } : {}),
     );
 
     expect(result.code).not.toBe(0);
@@ -256,9 +250,20 @@ describe("branch launchers check the pid record before the agent id (cli#734)", 
     expect(result.stdout).not.toContain("Waiting for host to connect");
     expect(result.stdout).not.toContain("Branch identity created");
     expect(readFileSync(join(tpsRoot, "branch.conf.json"), "utf8")).toBe(confBefore);
+    expect(readFileSync(join(process.env.TPS_IDENTITY_DIR!, "branch.seed"))).toEqual(seedBefore);
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(live.pid!)).toBe("alive");
   }, 20_000);
+
+  test("a production init with no agent id or recorded process creates the branch identity", async () => {
+    const result = await runCli(["branch", "init", "--name", "smoke-test"], launcherEnv(), true);
+
+    expect(result.stdout).toContain("Branch identity created");
+    expect(result.stderr).not.toContain("no branch agent id");
+    expect(existsSync(join(process.env.TPS_IDENTITY_DIR!, "branch.seed"))).toBe(true);
+    expect(JSON.parse(readFileSync(join(tpsRoot, "branch.conf.json"), "utf8")).agentId).toBeUndefined();
+    expect(existsSync(pidFile)).toBe(false);
+  }, 25_000);
 
   test("a start with no recorded process and no agent id names the missing id", async () => {
     const port = await freePort();
