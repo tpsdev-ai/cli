@@ -117,12 +117,18 @@ function release(phase: string): void {
 }
 
 async function waitForExit(child: ChildProcess, timeoutMs = EXIT_MS): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
-  if (child.exitCode !== null || child.signalCode !== null) {
+  // Resolve on "close", not "exit": "close" fires only after the child's piped
+  // stdout and stderr have drained, so the captured output is complete when
+  // the caller inspects it.
+  const drained = (stream: NodeJS.ReadableStream | null): boolean =>
+    stream === null || (stream as { readableEnded?: boolean }).readableEnded === true ||
+    (stream as { destroyed?: boolean }).destroyed === true;
+  if ((child.exitCode !== null || child.signalCode !== null) && drained(child.stdout) && drained(child.stderr)) {
     return { code: child.exitCode, signal: child.signalCode };
   }
   return new Promise((resolveExit, reject) => {
     const timer = setTimeout(() => reject(new Error("child did not exit within the bound")), timeoutMs);
-    child.once("exit", (code, signal) => {
+    child.once("close", (code, signal) => {
       clearTimeout(timer);
       resolveExit({ code, signal });
     });
