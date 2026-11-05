@@ -1,7 +1,8 @@
 /**
- * cli#734 — both branch launchers resolve the branch agent id before the
- * pid-record check, so a start that cannot run names the missing id instead of
- * a running recorded process. These tests drive the real CLI with real files.
+ * cli#734 — the branch start launcher and a production branch init resolve the
+ * branch agent id before the pid-record check, so a launch that cannot run
+ * names the missing id instead of a running recorded process. These tests
+ * drive the real CLI with real files.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -264,7 +265,7 @@ describe("branch launchers resolve the agent id before the pid record (cli#734)"
     expect(existsSync(pidFile)).toBe(false);
   }, 20_000);
 
-  test("a production init with no agent id names it before the pid record and writes nothing", async () => {
+  test("a production init with no agent id names it before the pid record and writes no conf", async () => {
     const port = await freePort();
     const live = startSleep();
     writeFileSync(pidFile, serializePidRecord(live.pid!, startToken(live.pid!)));
