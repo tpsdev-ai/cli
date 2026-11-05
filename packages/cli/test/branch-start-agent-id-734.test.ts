@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -18,6 +18,7 @@ let pidFile: string;
 let savedEnv: Record<string, string | undefined>;
 const spawnedPids: number[] = [];
 const allSpawnedPids: number[] = [];
+const leakCheckPids: number[] = [];
 const spawnedChildren: ChildProcess[] = [];
 
 async function freePort(): Promise<number> {
@@ -58,13 +59,21 @@ function launcherEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
   return Object.assign(env, extra);
 }
 
+function rememberPid(pid: number): void {
+  if (!spawnedPids.includes(pid)) spawnedPids.push(pid);
+  if (!allSpawnedPids.includes(pid)) allSpawnedPids.push(pid);
+}
+
 function track(child: ChildProcess): ChildProcess {
-  if (child.pid !== undefined) {
-    spawnedPids.push(child.pid);
-    allSpawnedPids.push(child.pid);
-  }
+  if (child.pid !== undefined) rememberPid(child.pid);
   spawnedChildren.push(child);
   return child;
+}
+
+/** Register the pid the launcher recorded, before the launcher-result assertion. */
+function registerRecordedPid(): void {
+  const state = readPidFile(pidFile);
+  if (state.kind === "running" || state.kind === "unverified") rememberPid(state.pid);
 }
 
 async function runCli(
@@ -89,8 +98,12 @@ async function runCli(
       /* already gone */
     }
   }, CLI_MS);
+  // Resolve on "close", not "exit": "exit" can fire while the piped stdout and
+  // stderr are still open, so the captured output could be short. The daemon
+  // spawns with its own stdio (packages/cli/src/commands/branch.ts:225), so
+  // "close" does not wait for the daemon.
   const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
-    child.once("exit", (code, signal) => resolveExit({ code, signal }));
+    child.once("close", (code, signal) => resolveExit({ code, signal }));
   });
   clearTimeout(timer);
   return { ...exit, stdout, stderr };
@@ -157,6 +170,75 @@ async function waitForPidGone(pid: number): Promise<void> {
   }
 }
 
+function recordFilesUnder(dir: string): string[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...recordFilesUnder(full));
+    else if (entry.isFile() && entry.name.endsWith(".pid")) files.push(full);
+  }
+  return files;
+}
+
+/** True when the recorded process is this test root's branch daemon. The CLI
+ *  sets its process title to the package bin name (meow), so the command line
+ *  is `tps`; the daemon marker and HOME in its environment tie it to this
+ *  root. */
+function runsTestDaemon(pid: number): boolean {
+  let command: string | null;
+  let environ: string | null = null;
+  try {
+    if (process.platform === "linux") {
+      command = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ").trim();
+      environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+    } else {
+      command = (() => {
+        const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+        return ps.status === 0 ? ps.stdout : null;
+      })();
+    }
+  } catch {
+    return false;
+  }
+  if (command === null) return false;
+  if (process.platform !== "linux") return command.includes(TPS_BIN) && command.includes("branch");
+  const entries = environ!.split("\0");
+  if (!entries.includes(`HOME=${root}`) || !entries.includes("TPS_BRANCH_DAEMON=1")) return false;
+  return command === "tps" || command.includes(TPS_BIN);
+}
+
+/** Stop each process named by a pid record in the test root after the record's
+ *  start token and the process's identity verify it as this root's branch
+ *  daemon. Cleanup does not read launcher stdout, so a daemon whose
+ *  announcement was missing or discarded is still stopped. */
+async function stopRecordedDaemons(): Promise<void> {
+  const failures: string[] = [];
+  for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
+    const state = readPidFile(path);
+    if (state.kind !== "running" || !runsTestDaemon(state.pid)) continue;
+    if (!leakCheckPids.includes(state.pid)) leakCheckPids.push(state.pid);
+    try {
+      process.kill(state.pid, "SIGKILL");
+    } catch (error) {
+      if (pidState(state.pid) !== "gone") {
+        failures.push(`could not kill pid ${state.pid}: ${(error as Error).message}`);
+      }
+    }
+    try {
+      await waitForPidGone(state.pid);
+    } catch (error) {
+      failures.push((error as Error).message);
+    }
+  }
+  if (failures.length > 0) throw new Error(`recorded-daemon cleanup failed: ${failures.join("; ")}`);
+}
+
 async function stopTracked(): Promise<void> {
   const pids = spawnedPids.splice(0);
   for (const pid of pids) {
@@ -197,12 +279,20 @@ beforeEach(() => {
 
 afterEach(async () => {
   await stopTracked();
-  await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  rmSync(root, { recursive: true, force: true });
-  for (const [key, value] of Object.entries(savedEnv)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+  let cleanupError: unknown;
+  try {
+    await stopRecordedDaemons();
+  } catch (error) {
+    cleanupError = error;
+  } finally {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    rmSync(root, { recursive: true, force: true });
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
+  if (cleanupError !== undefined) throw cleanupError;
 });
 
 describe("branch start and init recorded-process refusals (cli#734)", () => {
@@ -210,10 +300,10 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
+    registerRecordedPid();
     expect(first.code).toBe(0);
     const running = await waitForRunningRecord();
-    spawnedPids.push(running.pid);
-    allSpawnedPids.push(running.pid);
+    rememberPid(running.pid);
     await waitForLogStarted();
 
     writeBranchConf(port, "127.0.0.1", "tcp", undefined, undefined);
@@ -281,10 +371,10 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
+    registerRecordedPid();
     expect(first.code).toBe(0);
     const running = await waitForRunningRecord();
-    spawnedPids.push(running.pid);
-    allSpawnedPids.push(running.pid);
+    rememberPid(running.pid);
     await waitForLogStarted();
     const recordBefore = readFileSync(pidFile, "utf8");
 
@@ -297,9 +387,31 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
+
+  test("a start whose launcher announcement is discarded is still stopped by record-based cleanup", async () => {
+    const port = await freePort();
+    prepareBranch(port, "agent-a");
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env: launcherEnv(),
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    const exited = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+      launcher.once("close", (code, signal) => resolveExit({ code, signal }));
+    });
+    expect(exited.code).toBe(0);
+    const state = readPidFile(pidFile);
+    if (state.kind !== "running" && state.kind !== "unverified") {
+      throw new Error(`pid file did not name the launched daemon; state=${JSON.stringify(state)}`);
+    }
+    // Not registered for cleanup: the record-based stop must find it from the pid file.
+    leakCheckPids.push(state.pid);
+    await waitForLogStarted();
+    expect(state.kind).toBe("running");
+    expect(pidState(state.pid)).toBe("alive");
+  }, 40_000);
 });
 
 afterAll(() => {
-  const leaked = allSpawnedPids.filter((pid) => !pidGone(pid));
+  const leaked = [...new Set([...allSpawnedPids, ...leakCheckPids])].filter((pid) => !pidGone(pid));
   expect(leaked).toEqual([]);
 });
