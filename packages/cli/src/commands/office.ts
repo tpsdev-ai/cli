@@ -960,12 +960,26 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "kill": {
       let killed = 0;
       const failures: string[] = [];
-      const listing = listHostStatePaths();
-      if (listing.failure) {
-        failures.push(
-          `Connections directory ${listing.failure.path} could not be listed (${listing.failure.code}), so its records were not checked; check them yourself.`,
-        );
-      }
+      // A host record can be created while this command is running. Bound the
+      // re-list passes so a writer that never stops cannot keep it running.
+      const MAX_HOST_RECORD_PASSES = 5;
+      const processedHostRecords = new Set<string>();
+      const recordKey = (path: string, state: ReturnType<typeof readPidFile>): string | null => {
+        switch (state.kind) {
+          case "missing":
+            return null;
+          case "unreadable":
+            return `${path}\0unreadable`;
+          case "invalid":
+            return `${path}\0invalid:${state.reason}`;
+          case "stale":
+            return `${path}\0stale:${state.pid}`;
+          case "running":
+            return `${path}\0running:${state.pid}:${state.startToken}`;
+          case "unverified":
+            return `${path}\0unverified:${state.pid}:${state.startToken ?? ""}`;
+        }
+      };
 
       const removeRecord = (path: string): "removed" | "already gone" | "kept" => {
         try {
@@ -984,24 +998,31 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         else if (removal === "already gone") console.log(`Pid record already gone: ${path}.`);
       };
 
-      const stopRecord = async (label: string, path: string): Promise<void> => {
+      const stopRecord = async (label: string, path: string): Promise<boolean> => {
         // The path is the caller's: it names a directory entry or the branch
         // writer's own path, never a name parsed out of the record.
         const state = readPidFile(path);
-        if (state.kind === "missing") return;
+        if (state.kind === "missing") return false;
+        const key = recordKey(path, state);
+        if (key !== null) {
+          // A record handled in an earlier pass is not handled again; a new
+          // record at the same path has a different identity and is handled.
+          if (processedHostRecords.has(key)) return false;
+          processedHostRecords.add(key);
+        }
         if (state.kind === "unreadable") {
           failures.push(
             `${label} ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if that process is not running.`,
           );
-          return;
+          return true;
         }
         if (state.kind === "invalid") {
           failures.push(`${label} ${state.path} could not be parsed (${state.reason}); the record was kept.`);
-          return;
+          return true;
         }
         if (state.kind === "unverified") {
           failures.push(refusal(label, state.pid, state.path));
-          return;
+          return true;
         }
         if (state.kind === "stale") {
           // Attempt stale-record removal without signalling; a removal failure
@@ -1012,7 +1033,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           } else if (removal === "already gone") {
             console.log(`Pid record already gone: ${state.path}; pid ${state.pid} was not signalled.`);
           }
-          return;
+          return true;
         }
         try {
           sendOfficeKillSignal(state.pid);
@@ -1022,19 +1043,20 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           // keep the record and report it.
           if (pidStateFromProbeError(error) !== "gone") {
             failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
-            return;
+            return true;
           }
           reportRemoval(`Stale ${label.toLowerCase()}`, state.path);
-          return;
+          return true;
         }
         if (!(await waitForKillExit(state.pid))) {
           failures.push(`${label} could not be stopped (pid ${state.pid}); record kept at ${state.path}.`);
-          return;
+          return true;
         }
         killed++;
         const removal = removeRecord(state.path);
         if (removal === "removed") console.log(`${label} (pid ${state.pid}) stopped; record removed: ${state.path}.`);
         else if (removal === "already gone") console.log(`${label} (pid ${state.pid}) stopped; record already gone: ${state.path}.`);
+        return true;
       };
 
       const stopBranchRecord = async (path: string): Promise<void> => {
@@ -1136,8 +1158,50 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         );
       };
 
-      for (const path of listing.paths) {
-        await stopRecord("Host state record", path);
+      // Re-list after signalling: a host record created while this command was
+      // running is checked in a later pass. Stop after the fixed bound, and
+      // report the records that are still appearing rather than success.
+      let hostPasses = 0;
+      let hostRecordsSettled = false;
+      let listingFailure: { path: string; code: string } | undefined;
+      while (hostPasses < MAX_HOST_RECORD_PASSES) {
+        const listing = listHostStatePaths();
+        if (listing.failure) {
+          listingFailure = listing.failure;
+          break;
+        }
+        hostPasses++;
+        let sawUnprocessed = false;
+        for (const path of listing.paths) {
+          if (await stopRecord("Host state record", path)) sawUnprocessed = true;
+        }
+        if (!sawUnprocessed) {
+          hostRecordsSettled = true;
+          break;
+        }
+      }
+      if (!hostRecordsSettled && listingFailure === undefined) {
+        const listing = listHostStatePaths();
+        if (listing.failure) {
+          listingFailure = listing.failure;
+        } else {
+          const remaining = listing.paths.filter((path) => {
+            const state = readPidFile(path);
+            if (state.kind === "missing") return false;
+            const key = recordKey(path, state);
+            return key !== null && !processedHostRecords.has(key);
+          });
+          if (remaining.length > 0) {
+            failures.push(
+              `Host state records were still appearing after ${MAX_HOST_RECORD_PASSES} passes: ${remaining.join(", ")}. Re-run the command, or stop whatever keeps creating them.`,
+            );
+          }
+        }
+      }
+      if (listingFailure) {
+        failures.push(
+          `Connections directory ${listingFailure.path} could not be listed (${listingFailure.code}), so its records were not checked; check them yourself.`,
+        );
       }
       try {
         await stopBranchRecord(branchPidPath());

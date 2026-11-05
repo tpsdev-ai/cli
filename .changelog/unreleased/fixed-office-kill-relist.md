@@ -1,0 +1,1 @@
+- **office kill re-lists host records after signalling.** A record created mid-kill is checked in a later pass; after five passes with records still appearing, the command exits non-zero and names them instead of reporting success.
