@@ -661,6 +661,10 @@ async function runStart(): Promise<void> {
         return onMessage(msg, channel);
       });
 
+  // Test seam: pause after the listener accepts connections, before the
+  // daemon reaches its steady state.
+  branchTestPause("listening-before-steady-state", pidPath());
+
   server.onConnection((channel) => {
     activeHostChannel = channel;
     // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)

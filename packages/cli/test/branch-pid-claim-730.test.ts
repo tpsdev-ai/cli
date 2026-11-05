@@ -531,6 +531,27 @@ describe("branch pid record ownership (cli#730)", () => {
     await waitForPidGone(running.pid);
   }, 40_000);
 
+  test("a SIGTERM sent once the listener opens runs the daemon's shutdown path", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const phase = "listening-before-steady-state";
+    const daemon = spawnDaemon(phase);
+    daemons.push(daemon.pid!);
+    await waitForReady(phase, daemon.pid);
+    await waitForListening(port);
+    writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+    expect(readPidFile(pidFile).kind).toBe("running");
+
+    const exited = waitForExit(daemon);
+    daemon.kill("SIGTERM");
+    release(phase);
+
+    expect(await exited).toEqual({ code: 0, signal: null });
+    expect(readPidFile(pidFile).kind).toBe("missing");
+    expect(readFileSync(logFile, "utf8")).toContain("STOPPED");
+    expect(pidExited(daemon.pid!)).toBe(true);
+  }, 40_000);
+
   test("shutdown holds the record lock and preserves a replacement visible at its final read", async () => {
     const port = await freePort();
     prepareBranch(port);
