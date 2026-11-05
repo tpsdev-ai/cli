@@ -127,7 +127,7 @@ export type PidFileState =
 export function readPidFile(
   path: string,
   resolveToken: (pid: number) => string | null = processStartToken,
-  onRead?: (raw: string) => void,
+  onRead?: (raw: string, bytes: Buffer) => void,
 ): PidFileState {
   let fd: number;
   try {
@@ -140,6 +140,7 @@ export function readPidFile(
     return { kind: "unreadable", path, reason };
   }
   let raw: string;
+  let bytes: Buffer;
   try {
     try {
       if (!fstatSync(fd).isFile()) return { kind: "unreadable", path, reason: "is not a regular file" };
@@ -147,13 +148,14 @@ export function readPidFile(
       const code = (error as NodeJS.ErrnoException).code ?? "unknown";
       return { kind: "unreadable", path, reason: `could not be inspected (${code})` };
     }
-    raw = readFileSync(fd, "utf-8");
+    bytes = readFileSync(fd);
+    raw = bytes.toString("utf-8");
   } catch {
     return { kind: "unreadable", path };
   } finally {
     closeSync(fd);
   }
-  onRead?.(raw);
+  onRead?.(raw, bytes);
   const parsed = parsePidFile(raw);
   if (parsed.kind === "invalid") return { kind: "invalid", path, reason: parsed.reason };
   if (processIsGone(parsed.pid, parsed.startToken)) {

@@ -210,7 +210,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     expect(second.stderr).toContain(
       `If pid ${running.pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${pidFile} only after confirming no branch daemon is running.`,
     );
-    expect(second.stdout).not.toContain("Branch daemon started");
+    expect(second.stdout).not.toContain("Branch daemon spawned");
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
 
@@ -231,7 +231,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     });
 
     expect(started.status).toBe(0);
-    expect(started.stdout).toContain("Branch daemon started");
+    expect(started.stdout).toContain("Branch daemon spawned");
     const running = await waitForRunningRecord();
     daemons.push(running.pid);
     expect(running.pid).not.toBe(stalePid);
@@ -259,7 +259,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     expect(refused.stderr).toContain(`names pid ${live.pid}`);
     expect(refused.stderr).toContain("Check that pid and stop it yourself, or remove");
     expect(refused.stderr).toContain(pidFile);
-    expect(refused.stdout).not.toContain("Branch daemon started");
+    expect(refused.stdout).not.toContain("Branch daemon spawned");
     expect(readFileSync(pidFile, "utf8")).toBe(contents);
   }, 30_000);
 
@@ -277,7 +277,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     expect(refused.status).not.toBe(0);
     expect(refused.stderr).toContain(pidFile);
     expect(refused.stderr).toContain("pid is not a whole positive decimal integer");
-    expect(refused.stdout).not.toContain("Branch daemon started");
+    expect(refused.stdout).not.toContain("Branch daemon spawned");
   }, 30_000);
 
   test("an unreadable record is refused naming the path and reason", async () => {
@@ -294,7 +294,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
     expect(refused.status).not.toBe(0);
     expect(refused.stderr).toContain(pidFile);
     expect(refused.stderr).toContain("is not a regular file");
-    expect(refused.stdout).not.toContain("Branch daemon started");
+    expect(refused.stdout).not.toContain("Branch daemon spawned");
   }, 30_000);
 
   test("a daemon leaves a replacement record in place on shutdown", async () => {

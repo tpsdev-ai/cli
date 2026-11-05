@@ -351,7 +351,7 @@ describe("office kill identity", () => {
       expect(signals).toEqual([]);
       const output = logs.join("\n");
       expect(output).toContain(`${hostPath}; pid ${host.pid} was not signalled`);
-      expect(output).toContain(`${branchPath}; pid ${branch.pid} was not signalled`);
+      expect(output).toContain(`${branchPath}; branch-record handling signalled no process.`);
       expect(output).not.toContain("Check that pid and stop it yourself");
       expect(existsSync(hostPath)).toBe(false);
       expect(existsSync(branchPath)).toBe(false);

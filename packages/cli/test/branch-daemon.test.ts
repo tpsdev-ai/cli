@@ -41,7 +41,7 @@ describe("branch start self-daemonization", () => {
     const result = startBranch(undefined, undefined, false);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("no branch agent id");
-    expect(result.stdout).not.toContain("started");
+    expect(result.stdout).not.toContain("spawned");
     expect(result.spawned).toBe(false);
     expect(result.pidWritten).toBe(false);
     expect(result.logWritten).toBe(false);
@@ -51,7 +51,7 @@ describe("branch start self-daemonization", () => {
       const result = startBranch(id);
       expect(result.status).toBe(1);
       expect(result.stderr).toContain("no branch agent id");
-      expect(result.stdout).not.toContain("started");
+      expect(result.stdout).not.toContain("spawned");
       expect(result.spawned).toBe(false);
       expect(result.pidWritten).toBe(false);
       expect(result.logWritten).toBe(false);
@@ -61,7 +61,7 @@ describe("branch start self-daemonization", () => {
     test(`starts with ${envId ? "environment" : "persisted"} identity`, () => {
       const result = startBranch(envId, configuredId);
       expect(result.status).toBe(0);
-      expect(result.stdout).toContain("Branch daemon started");
+      expect(result.stdout).toContain("Branch daemon spawned");
       expect(result.spawned).toBe(true);
       expect(result.pidWritten).toBe(true);
     });
