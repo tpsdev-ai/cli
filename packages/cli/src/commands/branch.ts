@@ -172,9 +172,9 @@ export function withBranchPidLock<T>(path: string, action: string, fn: () => T):
   }
 }
 
-/** The launcher's marker token matches the one in `root`, the same check
- *  testRootRefusal makes in scripts/test-home-guard.mjs. */
-function branchTestRootVouched(root: string, token: string | undefined): boolean {
+/** The marker file in `root` contains `token`. This compares against the
+ *  marker file; it does not check which caller wrote the marker or the token. */
+function branchTestRootTokenMatches(root: string, token: string | undefined): boolean {
   if (token === undefined || token === "") return false;
   try {
     return readFileSync(join(root, BRANCH_TEST_ROOT_MARKER), "utf8") === token;
@@ -195,10 +195,10 @@ function pauseDirInsideTestRoot(dir: string, root: string): boolean {
 }
 
 /**
- * The pause seam requires the isolated test launcher's TPS_TEST_ROOT marker,
- * which scripts/test-suite.mjs sets for its child through isolatedChildEnv.
- * A pause is honoured only when TPS_TEST_ROOT_TOKEN matches the marker token
- * and TPS_BRANCH_TEST_PAUSE_DIR resolves inside that root. Without both, a
+ * The pause seam requires TPS_TEST_ROOT_TOKEN to match the root's marker file,
+ * which scripts/test-home-guard.mjs writes and passes to its child through
+ * isolatedChildEnv. A pause is honoured only when that token matches and
+ * TPS_BRANCH_TEST_PAUSE_DIR resolves inside that root. Without both, a
  * TPS_BRANCH_TEST_PAUSE_DIR from a real environment is ignored: no wait and
  * no file write.
  */
@@ -206,7 +206,7 @@ function branchTestPauseEnabled(phase: string): boolean {
   const root = process.env.TPS_TEST_ROOT;
   const dir = process.env.TPS_BRANCH_TEST_PAUSE_DIR;
   if (root === undefined || dir === undefined) return false;
-  if (!branchTestRootVouched(root, process.env.TPS_TEST_ROOT_TOKEN)) return false;
+  if (!branchTestRootTokenMatches(root, process.env.TPS_TEST_ROOT_TOKEN)) return false;
   if (!pauseDirInsideTestRoot(dir, root)) return false;
   const wanted = process.env.TPS_BRANCH_TEST_PAUSE_PHASE;
   return wanted === undefined || wanted === phase;

@@ -7,14 +7,15 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runBounded, stdoutUnderRoot } from "./helpers/branch-daemon-identity.js";
+import { probeStdoutUnderRoot, runBounded, stdoutUnderRoot } from "./helpers/branch-daemon-identity.js";
 
 describe("branch daemon identity probe (cli#752)", () => {
-  test("a timed-out probe is not a verified identity", () => {
-    expect(stdoutUnderRoot(1, tmpdir(), () => ({ status: null, stdout: "" }))).toBe(false);
+  test("a timed-out or failed probe is not a verified identity", () => {
+    expect(probeStdoutUnderRoot(1, tmpdir(), () => ({ status: null, stdout: "" }))).toBe("unverified");
+    expect(probeStdoutUnderRoot(1, tmpdir(), () => ({ status: 1, stdout: "" }))).toBe("unverified");
   });
 
-  test("a bounded probe returns instead of waiting for a command that never exits", () => {
+  test("a bounded probe returns after its deadline instead of waiting for a command that outlives it", () => {
     const started = Date.now();
     const result = runBounded("sleep", ["60"], 100);
     expect(result.status).toBeNull();
@@ -31,6 +32,7 @@ describe("branch daemon identity probe (cli#752)", () => {
       writeFileSync(elsewhere, "");
       expect(stdoutUnderRoot(1, root, () => ({ status: 0, stdout: `p1\nn${inside}\n` }))).toBe(true);
       expect(stdoutUnderRoot(1, root, () => ({ status: 0, stdout: `p1\nn${elsewhere}\n` }))).toBe(false);
+      expect(probeStdoutUnderRoot(1, root, () => ({ status: 0, stdout: `p1\nn${elsewhere}\n` }))).toBe("other");
       expect(stdoutUnderRoot(1, root, () => ({ status: 1, stdout: "" }))).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
