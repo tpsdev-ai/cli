@@ -46,14 +46,10 @@ completion tail in `packages/cli/bin/tps.ts` calls `process.exit` once after the
 command returns, with the code the command set, so scripts and CI see failures
 as failures.
 
-Do not call `process.exit(0)` from a command: it bypasses the entry point and
-can replace a failure code the command already set. Daemon shutdown handlers,
-the npm launcher's version fast path, and the remaining in-frame success exits
-(including an unreachable tail after a never-resolving wait) are the deliberate
-exceptions; they are listed with a reason in
-`packages/cli/test/exit-status-discipline-750.test.ts`, and a new zero-status
-exit outside that list fails the test. A non-zero `process.exit(<code>)` remains
-legal for an in-frame refusal.
+Do not call `process.exit(0)` or `process.exit()` from a command. Approved
+exceptions are identified by AST context in
+`packages/cli/test/exit-status-discipline-750.test.ts`. A non-zero
+`process.exit(<code>)` remains legal for an in-frame refusal.
 
 ## Changelog
 
