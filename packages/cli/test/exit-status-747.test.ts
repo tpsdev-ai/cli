@@ -33,9 +33,7 @@ function run(entry: string, args: string[]) {
   return { status: result.status, stdout: result.stdout, stderr: result.stderr };
 }
 
-// The launcher prefers a platform native binary when one resolves. Run it on
-// its source-install JS fallback so the assertions cover the built entry, not
-// whichever binary a host or image happens to have installed.
+// The failing-command launcher case forces JS fallback; `--version` exercises the launcher's own fast path.
 function runLauncher(args: string[]) {
   const preload = join(home, "no-platform-package.cjs");
   writeFileSync(
