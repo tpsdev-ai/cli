@@ -194,15 +194,22 @@ export function branchTestPause(phase: string, path: string): void {
 
 export interface PidRecordSnapshot {
   state: PidFileState;
-  raw: string | null;
+  raw: Buffer | null;
 }
 
 export function snapshotPidRecord(path: string): PidRecordSnapshot {
-  let raw: string | null = null;
-  const state = readPidFile(path, processStartToken, (text) => {
-    raw = text;
+  let bytes: Buffer | null = null;
+  const state = readPidFile(path, processStartToken, (_text, raw) => {
+    bytes = raw;
   });
-  return { state, raw };
+  return { state, raw: bytes };
+}
+
+/** Byte equality for two snapshots' raw file contents; a failed read is only
+ *  equal to another failed read. */
+export function pidRecordBytesEqual(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.equals(b);
 }
 
 /** Spawn the branch daemon with its pid record claimed under the branch lock. */
@@ -252,7 +259,7 @@ function removeOwnBranchPidRecord(path: string): PidRecordRemoval {
     const before = snapshotPidRecord(path);
     branchTestPause("shutdown-before-unlink", path);
     const current = snapshotPidRecord(path);
-    if (current.raw !== before.raw) return "changed";
+    if (!pidRecordBytesEqual(current.raw, before.raw)) return "changed";
     const state = current.state;
     if (state.kind === "missing") return "missing";
     if (state.kind === "unreadable") return "other";
@@ -714,7 +721,7 @@ async function runStop(): Promise<void> {
     const current = snapshotPidRecord(path);
     if (current.state.kind === "missing") return "already gone";
     if (current.state.kind === "unreadable") throw unreadableAtFinalRead(path, current.state.reason);
-    if (current.raw !== before.raw) throw changed(path);
+    if (!pidRecordBytesEqual(current.raw, before.raw)) throw changed(path);
     return removeBranchPid(path);
   };
 
@@ -726,7 +733,7 @@ async function runStop(): Promise<void> {
     const opened = snapshotPidRecord(p);
     branchTestPause("stop-before-decision", p);
     const current = snapshotPidRecord(p);
-    if (current.raw !== opened.raw) throw changed(p);
+    if (!pidRecordBytesEqual(current.raw, opened.raw)) throw changed(p);
     const state = current.state;
 
     if (state.kind === "missing") {
@@ -801,8 +808,8 @@ async function runStop(): Promise<void> {
     const current = snapshotPidRecord(decision.path);
     if (current.state.kind === "missing") return "already gone" as const;
     if (current.state.kind === "unreadable") throw unreadableAtFinalRead(decision.path, current.state.reason);
-    if (current.raw !== opened.raw) throw changed(decision.path);
-    if (current.raw !== decision.snapshot.raw) throw changed(decision.path);
+    if (!pidRecordBytesEqual(current.raw, opened.raw)) throw changed(decision.path);
+    if (!pidRecordBytesEqual(current.raw, decision.snapshot.raw)) throw changed(decision.path);
     return removeBranchPid(decision.path);
   });
 

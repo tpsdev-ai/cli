@@ -224,6 +224,16 @@ function reapedPid(): number {
   return child.pid;
 }
 
+/** A parseable record whose ignored field carries `byte` (invalid UTF-8 alone). */
+function recordWithIgnoredByte(pid: number, token: string | null, byte: number): Buffer {
+  const tokenJson = token === null ? "null" : JSON.stringify(token);
+  return Buffer.concat([
+    Buffer.from(`{"pid":${pid},"startToken":${tokenJson},"note":"`, "utf-8"),
+    Buffer.from([byte]),
+    Buffer.from('"}\n', "utf-8"),
+  ]);
+}
+
 /** Replace the pid record with a symlink to `target`. */
 function replaceWithSymlink(target: string): void {
   rmSync(pidFile, { force: true });
@@ -239,14 +249,16 @@ interface PausedStop {
 
 /** Start a daemon, record it, run `branch stop` and wait until the daemon is
  *  paused in shutdown (stop is then in its unlocked post-signal wait). */
-async function stopWhileDaemonPausesInShutdown(): Promise<PausedStop> {
+async function stopWhileDaemonPausesInShutdown(
+  record: (pid: number, token: string) => string | Buffer = (pid, token) => serializePidRecord(pid, token),
+): Promise<PausedStop> {
   const port = await freePort();
   prepareBranch(port);
   const daemon = spawnDaemon("shutdown-before-unlink");
   await waitForLogStarted();
   await waitForListening(port);
   await waitForSignalHandlers(daemon.pid!);
-  writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+  writeFileSync(pidFile, record(daemon.pid!, startToken(daemon.pid!)));
   expect(readPidFile(pidFile).kind).toBe("running");
 
   const stop = spawn("node", [TPS_BIN, "branch", "stop"], {
@@ -500,6 +512,21 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(pidState(newer.pid!)).toBe("alive");
   }, 40_000);
 
+  test("runStop's post-signal wait compares raw bytes and preserves a byte-only replacement", async () => {
+    const { daemon, exited, stderr } = await stopWhileDaemonPausesInShutdown((pid, token) =>
+      recordWithIgnoredByte(pid, token, 0x80),
+    );
+    const replacement = recordWithIgnoredByte(daemon.pid!, startToken(daemon.pid!), 0x81);
+    writeFileSync(pidFile, replacement);
+    release("shutdown-before-unlink");
+
+    expect(await waitForExit(daemon)).toEqual({ code: 0, signal: null });
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr()).toContain(`Branch pid file ${pidFile} changed (replaced or removed); this command removed nothing.`);
+    expect(readFileSync(pidFile).equals(replacement)).toBe(true);
+  }, 40_000);
+
   test("runStop's unlocked post-signal wait keeps a symlink to a readable file and exits non-zero", async () => {
     const { daemon, exited, stderr } = await stopWhileDaemonPausesInShutdown();
     const target = join(root, "decoy.txt");
@@ -593,6 +620,43 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(launched.pid);
     expect(pidState(launched.pid)).toBe("alive");
+  }, 40_000);
+
+  test("office kill's final read compares raw bytes and preserves a byte-only replacement", async () => {
+    prepareBranch(await freePort());
+    const stale = reapedPid();
+    writeFileSync(pidFile, recordWithIgnoredByte(stale, null, 0x80));
+
+    const kill = spawn("node", [TPS_BIN, "office", "kill"], {
+      env: allPhasesEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(kill);
+    let stderr = "";
+    kill.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const exited = waitForExit(kill);
+
+    await waitForReady("office-kill-branch-before-decision");
+    release("office-kill-branch-before-decision");
+
+    await waitForReady("office-kill-branch-before-unlink");
+    const waitProbe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
+    if (waitProbe !== null) waitProbe.release();
+    expect(waitProbe).not.toBeNull();
+
+    const replacement = recordWithIgnoredByte(stale, null, 0x81);
+    writeFileSync(pidFile, replacement);
+    release("office-kill-branch-before-unlink");
+
+    await waitForReady("office-kill-branch-before-removal");
+    release("office-kill-branch-before-removal");
+
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; this command removed nothing.`);
+    expect(readFileSync(pidFile).equals(replacement)).toBe(true);
   }, 40_000);
 
   test("office kill keeps a symlink to a readable file at its final read and exits non-zero", async () => {

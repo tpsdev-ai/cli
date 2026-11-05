@@ -6,7 +6,7 @@ import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { connectionAlive, listHostStatePaths, listHostStates } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
-import { branchTestPause, pidPath as branchPidPath, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
+import { branchTestPause, pidPath as branchPidPath, pidRecordBytesEqual, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -1079,7 +1079,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
               unreadableReason = current.state.reason;
               return "unreadable" as const;
             }
-            if (current.raw !== snapshot.raw) return "changed" as const;
+            if (!pidRecordBytesEqual(current.raw, snapshot.raw)) return "changed" as const;
             return removeRecord(path);
           });
           if (removal === "unreadable") {
