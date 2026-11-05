@@ -237,8 +237,8 @@ function runsTestDaemon(pid: number): boolean {
 }
 
 /** Stop a recorded pid only after the record's start token and the process's
- *  identity verify it as this root's branch daemon. A pid that fails either
- *  check is left running and reported as unverified. Cleanup does not read
+ *  identity verify it as this root's branch daemon. Unverified survivors are
+ *  not signalled and are reported by the leak assertion. Cleanup does not read
  *  launcher stdout, so a daemon whose announcement was missing or discarded is
  *  still stopped. */
 async function stopRecordedDaemons(): Promise<void> {
