@@ -1087,7 +1087,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
               `Branch pid file ${path} could not be read at the final check${unreadableReason === undefined ? "" : ` (${unreadableReason})`}; the pid file was kept. Inspect it and remove it yourself if the branch daemon is not running.`,
             );
           } else if (removal === "changed") {
-            failures.push(`Branch pid file ${path} was replaced; this command removed nothing.`);
+            failures.push(`Branch pid file ${path} was replaced; the branch pid file was not removed.`);
           } else if (removal === "removed") {
             console.log(removed);
           } else if (removal === "already gone") {
@@ -1099,8 +1099,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           removeIfUnchanged(
             decision.snapshot,
             decision.pid,
-            `Stale branch pid file removed: ${path}; pid ${decision.pid} was not signalled.`,
-            `Pid record already gone: ${path}; pid ${decision.pid} was not signalled.`,
+            `Stale branch pid file removed: ${path}; branch-record handling signalled no process.`,
+            `Pid record already gone: ${path}; branch-record handling signalled no process.`,
           );
           return;
         }
@@ -1118,8 +1118,8 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           removeIfUnchanged(
             decision.snapshot,
             decision.pid,
-            `Stale branch pid file removed: ${path}; pid ${decision.pid} was not signalled.`,
-            `Pid record already gone: ${path}; pid ${decision.pid} was not signalled.`,
+            `Stale branch pid file removed: ${path}; branch-record handling signalled no process.`,
+            `Pid record already gone: ${path}; branch-record handling signalled no process.`,
           );
           return;
         }

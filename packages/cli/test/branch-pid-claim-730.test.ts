@@ -6,12 +6,13 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { type Dirent, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { hostStatePath, writeHostState } from "../src/utils/connection-state.js";
 import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
@@ -284,6 +285,33 @@ async function stopWhileDaemonPausesInShutdown(
   const exited = waitForExit(stop);
   await waitForReady("shutdown-before-unlink");
   return { daemon, exited, stdout: () => stdout, stderr: () => stderr };
+}
+
+
+/** A live process a host state record can name; office kill signals it. */
+function spawnLiveHost(): number {
+  const child = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
+  children.push(child);
+  if (child.pid === undefined) throw new Error("could not spawn host process");
+  return child.pid;
+}
+
+/** Write a verified host state record for `pid` and return its path. */
+function writeHostRecord(branch: string, pid: number): string {
+  writeHostState({
+    branch,
+    connectedAt: "",
+    lastHeartbeatSent: "",
+    lastHeartbeatAck: null,
+    reconnectCount: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    messagesSent: 0,
+    messagesReceived: 0,
+    pid,
+    startToken: startToken(pid),
+  });
+  return hostStatePath(branch);
 }
 
 interface PausedOfficeKill {
@@ -699,12 +727,82 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exit = await exited;
     expect(exit.code).not.toBe(0);
-    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; this command removed nothing.`);
+    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`);
     expect(readFileSync(pidFile, "utf8")).toBe(replacement);
     const state = readPidFile(pidFile);
     expect(state.kind).toBe("running");
     if (state.kind === "running") expect(state.pid).toBe(launched.pid);
     expect(pidState(launched.pid)).toBe("alive");
+  }, 40_000);
+
+  test("office kill reports a handled host record before a stale branch record, in order", async () => {
+    prepareBranch(await freePort());
+    const hostPid = spawnLiveHost();
+    const hostPath = writeHostRecord("host-a", hostPid);
+    const stale = reapedPid();
+    writeFileSync(pidFile, serializePidRecord(stale, null));
+
+    const result = spawnSync("node", [TPS_BIN, "office", "kill", "--quiet-nono-check"], {
+      encoding: "utf8",
+      timeout: EXIT_MS,
+      env: plainEnv(),
+    });
+
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(result.stdout.split(/\r?\n/).filter((line) => line !== "")).toEqual([
+      `Host state record (pid ${hostPid}) stopped; record removed: ${hostPath}.`,
+      `Stale branch pid file removed: ${pidFile}; branch-record handling signalled no process.`,
+      "Kill switch engaged. Terminated 1 TPS process(es).",
+    ]);
+    expect(existsSync(hostPath)).toBe(false);
+    expect(existsSync(pidFile)).toBe(false);
+  }, 40_000);
+
+  test("office kill reports a handled host record before a replaced branch record, in order", async () => {
+    prepareBranch(await freePort());
+    const hostPid = spawnLiveHost();
+    const hostPath = writeHostRecord("host-a", hostPid);
+    const stale = reapedPid();
+    writeFileSync(pidFile, serializePidRecord(stale, null));
+
+    const kill = spawn("node", [TPS_BIN, "office", "kill", "--quiet-nono-check"], {
+      env: allPhasesEnv(),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(kill);
+    let stdout = "";
+    let stderr = "";
+    kill.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    kill.stderr?.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const exited = waitForExit(kill);
+
+    await waitForReady("office-kill-branch-before-decision");
+    release("office-kill-branch-before-decision");
+
+    await waitForReady("office-kill-branch-before-unlink");
+    const replacement = serializePidRecord(process.pid, startToken(process.pid));
+    writeFileSync(pidFile, replacement);
+    release("office-kill-branch-before-unlink");
+
+    await waitForReady("office-kill-branch-before-removal");
+    release("office-kill-branch-before-removal");
+
+    const exit = await exited;
+    expect(exit.code).not.toBe(0);
+    expect(stdout.split(/\r?\n/).filter((line) => line !== "")).toEqual([
+      `Host state record (pid ${hostPid}) stopped; record removed: ${hostPath}.`,
+    ]);
+    expect(stderr.split(/\r?\n/).filter((line) => line !== "")).toEqual([
+      `Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`,
+      `Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`,
+    ]);
+    expect(existsSync(hostPath)).toBe(false);
+    expect(readFileSync(pidFile, "utf8")).toBe(replacement);
   }, 40_000);
 
   test("office kill's final read compares raw bytes and preserves a byte-only replacement", async () => {
@@ -740,7 +838,7 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exit = await exited;
     expect(exit.code).not.toBe(0);
-    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; this command removed nothing.`);
+    expect(stderr).toContain(`Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`);
     expect(readFileSync(pidFile).equals(replacement)).toBe(true);
   }, 40_000);
 
