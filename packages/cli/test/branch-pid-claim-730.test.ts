@@ -4,9 +4,9 @@
  * the real CLI and real daemons under a temp HOME; the pause seam is enabled
  * by TPS_BRANCH_TEST_PAUSE_DIR.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -177,19 +177,20 @@ async function waitForRunningRecord(): Promise<{ pid: number; startToken: string
   );
 }
 
+/** True when the pid is gone or a zombie; a container's PID 1 may not reap. */
+function pidExited(pid: number): boolean {
+  if (pidState(pid) === "gone") return true;
+  if (process.platform !== "linux") return false;
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z";
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
 async function waitForPidGone(pid: number): Promise<void> {
-  await waitFor(() => {
-    if (pidState(pid) === "gone") return true;
-    if (process.platform === "linux") {
-      try {
-        const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-        if (stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z") return true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-      }
-    }
-    return null;
-  }, `pid ${pid} to exit`);
+  await waitFor(() => (pidExited(pid) ? true : null), `pid ${pid} to exit`);
 }
 
 function spawnDaemon(phase: string): ChildProcess {
@@ -327,6 +328,72 @@ async function replaceBranchRecordDuringOfficeKill(target: string | null): Promi
   return { exited, stderr: () => stderr };
 }
 
+/** Pid record files under the test root, including the branch record. */
+function recordFilesUnder(dir: string): string[] {
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const entry of entries) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...recordFilesUnder(full));
+    else if (entry.isFile() && entry.name.endsWith(".pid")) files.push(full);
+  }
+  return files;
+}
+
+/** True when `pid` runs this build's tps binary and, on Linux, its
+ *  environment names this test root. */
+function runsTestDaemon(pid: number): boolean {
+  let command: string | null;
+  try {
+    command =
+      process.platform === "linux"
+        ? readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ")
+        : (() => {
+            const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+            return ps.status === 0 ? ps.stdout : null;
+          })();
+  } catch {
+    return false;
+  }
+  if (command === null || !command.includes(TPS_BIN) || !command.includes("branch")) return false;
+  if (process.platform !== "linux") return true;
+  try {
+    return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`HOME=${root}`);
+  } catch {
+    return false;
+  }
+}
+
+/** Stop each process named by a pid record in the test root, after the
+ *  record's start token and the process's command line verify it as this test
+ *  build's daemon. Cleanup does not read launcher stdout, so a daemon whose
+ *  announcement was missing or changed is still stopped. */
+async function stopRecordedDaemons(): Promise<void> {
+  const failures: string[] = [];
+  for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
+    const state = readPidFile(path);
+    if (state.kind !== "running" || !runsTestDaemon(state.pid)) continue;
+    try {
+      process.kill(state.pid, "SIGKILL");
+    } catch (error) {
+      if (pidState(state.pid) !== "gone") {
+        failures.push(`could not kill pid ${state.pid}: ${(error as Error).message}`);
+      }
+    }
+    try {
+      await waitForPidGone(state.pid);
+    } catch (error) {
+      failures.push((error as Error).message);
+    }
+  }
+  if (failures.length > 0) throw new Error(`recorded-daemon cleanup failed: ${failures.join("; ")}`);
+}
+
 beforeEach(() => {
   savedEnv = {};
   for (const key of [
@@ -355,6 +422,7 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
+  let cleanupError: unknown;
   for (const pid of daemons.splice(0)) {
     try {
       process.kill(pid, "SIGKILL");
@@ -369,12 +437,19 @@ afterEach(async () => {
       /* already gone */
     }
   }
-  await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  rmSync(root, { recursive: true, force: true });
-  for (const [key, value] of Object.entries(savedEnv)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
+  try {
+    await stopRecordedDaemons();
+  } catch (error) {
+    cleanupError = error;
+  } finally {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    rmSync(root, { recursive: true, force: true });
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
+  if (cleanupError !== undefined) throw cleanupError;
 });
 
 describe("branch pid record ownership (cli#730)", () => {
@@ -410,7 +485,9 @@ describe("branch pid record ownership (cli#730)", () => {
     const announced = launchers.flatMap(({ stdout }) =>
       [...stdout().matchAll(/Branch daemon spawned \(pid (\d+)\)/g)].map((match) => Number(match[1])),
     );
-    // Register before any assertion: a failed assertion must not leak the daemon.
+    // Register before any assertion. afterEach also stops each running daemon
+    // named by a verified record in this test root, so cleanup does not depend
+    // on this announcement to find one.
     daemons.push(...announced);
     expect(announced.length).toBe(1);
 
@@ -725,4 +802,26 @@ describe("branch pid record ownership (cli#730)", () => {
     rmSync(lockRoot, { recursive: true, force: true });
     expect(withBranchPidLock(pidFile, "test the lock", () => "held")).toBe("held");
   }, 20_000);
+
+  let unannouncedDaemon: { pid: number; startToken: string } | undefined;
+
+  test("afterEach stops a launcher's daemon when its announcement is not read", async () => {
+    prepareBranch(await freePort());
+    // The launcher's stdout is discarded, so no announcement is parsed and the
+    // daemon is never registered in `daemons`. Only the pid record names it.
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env: plainEnv(),
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    children.push(launcher);
+    const running = await waitForRunningRecord();
+    unannouncedDaemon = running;
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    expect(pidState(running.pid)).toBe("alive");
+  }, 40_000);
+
+  afterAll(() => {
+    if (unannouncedDaemon === undefined) throw new Error("the launcher recorded no daemon");
+    expect(pidExited(unannouncedDaemon.pid)).toBe(true);
+  });
 });
