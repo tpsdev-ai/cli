@@ -462,8 +462,8 @@ async function stopRegisteredDaemons(
  *  record's start token and the process's command line verify it as this test
  *  build's daemon. Cleanup does not read launcher stdout, so a daemon whose
  *  announcement was missing or changed is still stopped when the identity
- *  probe answers for it; a pid whose start token changed or whose probe cannot
- *  be read is left alone and reported. */
+ *  probe answers for it. A token mismatch at the final pre-signal re-read
+ *  prevents signalling and records an identity diagnostic. */
 async function stopRecordedDaemons(
   identity: (pid: number) => IdentityVerdict = runsTestDaemon,
   readToken: (pid: number) => string | null = processStartToken,
