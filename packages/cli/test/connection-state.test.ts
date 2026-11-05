@@ -7,7 +7,6 @@ import {
   readHostState,
   clearHostState,
   connectionAlive,
-  listHostStates,
 } from "../src/utils/connection-state.js";
 
 describe("connection-state", () => {
@@ -74,13 +73,5 @@ describe("connection-state", () => {
       pid: process.pid,
     });
     expect(connectionAlive("live")).toBe(true);
-  });
-
-  test("list returns branches", () => {
-    home = mkdtempSync(join(tmpdir(), "conn-state-"));
-    process.env.HOME = home;
-    writeHostState({ branch: "a", connectedAt: "", lastHeartbeatSent: "", lastHeartbeatAck: null, reconnectCount: 0, bytesSent: 0, bytesReceived: 0, messagesSent: 0, messagesReceived: 0, pid: 1 });
-    writeHostState({ branch: "b", connectedAt: "", lastHeartbeatSent: "", lastHeartbeatAck: null, reconnectCount: 0, bytesSent: 0, bytesReceived: 0, messagesSent: 0, messagesReceived: 0, pid: 2 });
-    expect(listHostStates().map((s) => s.branch).sort()).toEqual(["a", "b"]);
   });
 });

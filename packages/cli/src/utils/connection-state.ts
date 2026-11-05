@@ -110,17 +110,6 @@ export function clearBranchState(): void {
   try { rmSync(branchStatePath(), { force: true }); } catch {}
 }
 
-export function listHostStates(): HostConnectionState[] {
-  const dir = connectionsDir();
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir)
-    .filter((f) => f.endsWith(".json") && f !== "host.json")
-    .map((f) => {
-      try { return JSON.parse(readFileSync(join(dir, f), "utf-8")) as HostConnectionState; } catch { return null; }
-    })
-    .filter((x): x is HostConnectionState => !!x);
-}
-
 export function connectionAlive(branch: string, probe: (pid: number) => PidState = pidState): boolean | null {
   const state = readHostState(branch);
   if (!state) return null;
