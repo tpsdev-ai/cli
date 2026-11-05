@@ -365,6 +365,12 @@ async function runInit(args: BranchArgs): Promise<void> {
     process.exit(1);
   }
 
+  // A production init starts a daemon, so resolve the agent id before the
+  // pid-record check: a misconfigured init names the missing id and spawns
+  // nothing (cli#734). An init that starts no daemon is unchanged.
+  const launchDaemon = process.env.TPS_BRANCH_NO_DAEMON !== "1" && process.env.NODE_ENV !== "test";
+  if (launchDaemon) branchAgentId(args.agent);
+
   const kp = existsSync(seedPath) && !args.force
     ? loadKeyPair(identityDir, "branch")
     : (() => {
@@ -409,7 +415,7 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   console.log(`✓ Joined to host '${joined.hostId}' (sha256:${joined.hostFingerprint})`);
 
-  if (process.env.TPS_BRANCH_NO_DAEMON === "1" || process.env.NODE_ENV === "test") {
+  if (!launchDaemon) {
     console.log("Branch office ready.");
     return;
   }
@@ -423,6 +429,8 @@ async function runInit(args: BranchArgs): Promise<void> {
 
 async function runStart(): Promise<void> {
   const conf = existsSync(confPath()) ? readBranchConf() : undefined;
+  // Resolve the agent id before the pid-record check in `spawnBranchDaemon`:
+  // a start with no agent id names that cause and spawns nothing (cli#734).
   const localAgentId = branchAgentId(conf?.agentId);
   if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
 
