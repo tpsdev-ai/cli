@@ -208,8 +208,9 @@ export function branchTestPause(phase: string, path: string): void {
 }
 
 /**
- * The daemon's pause points: wait on the event loop, not the thread, so a
- * signal is dispatched while the daemon is paused.
+ * The `startup-before-listener`, `listening-before-steady-state`, and
+ * `shutdown-after-signal` pauses use `await`, allowing signal dispatch
+ * during those pauses.
  */
 async function branchTestPauseAsync(phase: string, path: string): Promise<void> {
   if (!branchTestPauseEnabled(phase)) return;
