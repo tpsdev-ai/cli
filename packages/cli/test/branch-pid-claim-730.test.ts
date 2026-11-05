@@ -195,6 +195,28 @@ function spawnDaemon(phase: string): ChildProcess {
   return child;
 }
 
+/** Wait until a listening daemon has installed its signal handlers (Linux). */
+async function waitForSignalHandlers(pid: number): Promise<void> {
+  if (process.platform !== "linux") {
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    return;
+  }
+  const sigterm = 1n << 14n;
+  const sigint = 1n << 1n;
+  await waitFor(() => {
+    let status: string;
+    try {
+      status = readFileSync(`/proc/${pid}/status`, "utf8");
+    } catch {
+      return null;
+    }
+    const line = status.split("\n").find((entry) => entry.startsWith("SigCgt:"));
+    if (line === undefined) return null;
+    const mask = BigInt(`0x${line.slice("SigCgt:".length).trim()}`);
+    return (mask & sigterm) !== 0n && (mask & sigint) !== 0n ? true : null;
+  }, `pid ${pid} to install signal handlers`);
+}
+
 function reapedPid(): number {
   const child = spawnSync("true", []);
   if (child.pid === undefined) throw new Error("could not spawn a helper process");
@@ -223,6 +245,7 @@ async function stopWhileDaemonPausesInShutdown(): Promise<PausedStop> {
   const daemon = spawnDaemon("shutdown-before-unlink");
   await waitForLogStarted();
   await waitForListening(port);
+  await waitForSignalHandlers(daemon.pid!);
   writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
   expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -392,6 +415,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const daemon = spawnDaemon(phase);
     await waitForLogStarted();
     await waitForListening(port);
+    await waitForSignalHandlers(daemon.pid!);
     expect(daemon.pid).toBeDefined();
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
