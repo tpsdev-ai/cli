@@ -1519,7 +1519,12 @@ async function main() {
 }
 
 main()
-  .then(() => process.exit(0))
+  .then(() => {
+    // Exit with the status the command set (cli#740). A command reports a
+    // failure by setting process.exitCode and returning; exiting 0 here would
+    // replace it, so scripts and CI would read success.
+    process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
+  })
   .catch((err) => {
     console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
     process.exit(1);
