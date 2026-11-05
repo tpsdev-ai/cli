@@ -16,6 +16,7 @@ import { hostStatePath, writeHostState } from "../src/utils/connection-state.js"
 import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
+import { stdoutUnderRoot } from "./helpers/branch-daemon-identity.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -413,8 +414,12 @@ function runsTestDaemon(pid: number): boolean {
   } catch {
     return false;
   }
-  if (command === null || !command.includes(TPS_BIN) || !command.includes("branch")) return false;
-  if (process.platform !== "linux") return true;
+  if (command === null) return false;
+  if (process.platform !== "linux") {
+    if (command.trim() !== "tps" && !command.includes(TPS_BIN)) return false;
+    return stdoutUnderRoot(pid, root);
+  }
+  if (!command.includes(TPS_BIN) || !command.includes("branch")) return false;
   try {
     return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`HOME=${root}`);
   } catch {
@@ -428,9 +433,14 @@ function runsTestDaemon(pid: number): boolean {
  *  announcement was missing or changed is still stopped. */
 async function stopRecordedDaemons(): Promise<void> {
   const failures: string[] = [];
+  const unverifiedIdentityPids = new Set<number>();
   for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
     const state = readPidFile(path);
     if (state.kind !== "running" || !runsTestDaemon(state.pid)) continue;
+    if (processStartToken(state.pid) !== state.startToken) {
+      unverifiedIdentityPids.add(state.pid);
+      continue;
+    }
     try {
       process.kill(state.pid, "SIGKILL");
     } catch (error) {
@@ -443,6 +453,9 @@ async function stopRecordedDaemons(): Promise<void> {
     } catch (error) {
       failures.push((error as Error).message);
     }
+  }
+  if (unverifiedIdentityPids.size > 0) {
+    failures.push(`identity could not be verified for pid ${[...unverifiedIdentityPids].join(", ")}; not signalled`);
   }
   if (failures.length > 0) throw new Error(`recorded-daemon cleanup failed: ${failures.join("; ")}`);
 }
@@ -632,6 +645,36 @@ describe("branch pid record ownership (cli#730)", () => {
     delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
     delete env.TPS_TEST_ROOT;
     delete env.TPS_TEST_ROOT_TOKEN;
+
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    children.push(launcher);
+    let stdout = "";
+    launcher.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    expect(stdout).toContain("Branch daemon spawned");
+    const running = await waitForRunningRecord();
+    daemons.push(running.pid);
+    await waitForLogStarted();
+    expect(pidState(running.pid)).toBe("alive");
+    expect(readdirSync(pauseDir)).toEqual([]);
+
+    process.kill(running.pid, "SIGTERM");
+    await waitForPidGone(running.pid);
+  }, 40_000);
+
+  test("a hand-set TPS_TEST_ROOT without a valid marker token ignores the pause", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const env = launcherEnv("unused");
+    delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+    env.TPS_TEST_ROOT = root;
+    env.TPS_TEST_ROOT_TOKEN = "hand-set-token";
 
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
       env,

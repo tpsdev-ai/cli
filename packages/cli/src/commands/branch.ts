@@ -1,5 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
+import { join, resolve, sep } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
 import { pidState, pidStateFromProbeError, processStartToken, type PidState } from "@tpsdev-ai/agent";
@@ -144,6 +144,8 @@ function refuseSecondBranchStart(): void {
 
 const BRANCH_PID_LOCK_TIMEOUT_MS = 5000;
 const BRANCH_TEST_PAUSE_TIMEOUT_MS = 15_000;
+/** The marker a launcher writes in the root it created (scripts/test-home-guard.mjs). */
+const BRANCH_TEST_ROOT_MARKER = ".tps-test-root";
 
 /** Root of the inter-process lock that owns the branch pid record. */
 export function branchPidLockRoot(path: string = pidPath()): string {
@@ -170,15 +172,42 @@ export function withBranchPidLock<T>(path: string, action: string, fn: () => T):
   }
 }
 
+/** The launcher's marker token matches the one in `root`, the same check
+ *  testRootRefusal makes in scripts/test-home-guard.mjs. */
+function branchTestRootVouched(root: string, token: string | undefined): boolean {
+  if (token === undefined || token === "") return false;
+  try {
+    return readFileSync(join(root, BRANCH_TEST_ROOT_MARKER), "utf8") === token;
+  } catch {
+    return false;
+  }
+}
+
+/** The pause directory resolves to `root` or a path under it. */
+function pauseDirInsideTestRoot(dir: string, root: string): boolean {
+  try {
+    const realDir = realpathSync(dir);
+    const realRoot = realpathSync(root);
+    return realDir === realRoot || realDir.startsWith(`${realRoot}${sep}`);
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The pause seam requires the isolated test launcher's TPS_TEST_ROOT marker,
  * which scripts/test-suite.mjs sets for its child through isolatedChildEnv.
- * Without it, a TPS_BRANCH_TEST_PAUSE_DIR from a real environment is ignored:
- * no wait and no file write.
+ * A pause is honoured only when TPS_TEST_ROOT_TOKEN matches the marker token
+ * and TPS_BRANCH_TEST_PAUSE_DIR resolves inside that root. Without both, a
+ * TPS_BRANCH_TEST_PAUSE_DIR from a real environment is ignored: no wait and
+ * no file write.
  */
 function branchTestPauseEnabled(phase: string): boolean {
-  if (process.env.TPS_TEST_ROOT === undefined) return false;
-  if (process.env.TPS_BRANCH_TEST_PAUSE_DIR === undefined) return false;
+  const root = process.env.TPS_TEST_ROOT;
+  const dir = process.env.TPS_BRANCH_TEST_PAUSE_DIR;
+  if (root === undefined || dir === undefined) return false;
+  if (!branchTestRootVouched(root, process.env.TPS_TEST_ROOT_TOKEN)) return false;
+  if (!pauseDirInsideTestRoot(dir, root)) return false;
   const wanted = process.env.TPS_BRANCH_TEST_PAUSE_PHASE;
   return wanted === undefined || wanted === phase;
 }
@@ -666,6 +695,9 @@ async function runStart(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     logLine("STOPPED", "Signal received");
+    // This pause sits after the flag: a second signal that arrives while
+    // shutdown is paused returns at the guard above, so the shutdown path runs
+    // once.
     if (branchTestPauseEnabled("shutdown-after-signal")) {
       await branchTestPauseAsync("shutdown-after-signal", pidPath());
     }
