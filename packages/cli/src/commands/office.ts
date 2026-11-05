@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectionAlive, ConnectionsDirectoryError, listHostStatePaths, listHostStates, type HostStateListing, type HostStateProblem } from "../utils/connection-state.js";
+import { listHostStatePaths } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
 import { branchTestPause, pidPath as branchPidPath, pidRecordBytesEqual, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
@@ -598,83 +598,6 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
     case "status": {
       const timestamp = new Date().toISOString();
-      if (!args.agent) {
-        let listing: HostStateListing;
-        try {
-          listing = listHostStates();
-        } catch (error) {
-          if (!(error instanceof ConnectionsDirectoryError)) throw error;
-          if (args.json) {
-            const body = {
-              agents: [],
-              timestamp,
-              error: { path: error.path, code: error.code, message: error.message },
-            };
-            console.log(JSON.stringify(body, null, 2));
-          } else {
-            console.error(error.message);
-          }
-          process.exitCode = 1;
-          return;
-        }
-
-        const states = listing.states;
-        const problems = listing.problems;
-        if (args.json) {
-          const agents = states.map((state) => ({
-            id: state.branch,
-            status: connectionAlive(state.branch) ? "connected" : "STALE",
-            lastSeen: state.lastHeartbeatAck ?? state.connectedAt,
-          }));
-          const body: { agents: unknown[]; timestamp: string; problems?: HostStateProblem[] } = { agents, timestamp };
-          if (problems.length > 0) body.problems = problems;
-          console.log(JSON.stringify(body, null, 2));
-          if (problems.length > 0) process.exitCode = 1;
-          return;
-        }
-
-        for (const problem of problems) {
-          console.error(problem.reason === "unparseable"
-            ? `Connection record ${problem.path} could not be parsed, so it is not listed. Fix or remove it, then try again.`
-            : `Connection record ${problem.path} could not be read (${problem.code ?? "unknown"}), so it is not listed. Fix or remove it, then try again.`);
-        }
-        if (states.length === 0) {
-          console.log(problems.length > 0 ? "No readable branch connections." : "No active branch connections.");
-          if (problems.length > 0) process.exitCode = 1;
-          return;
-        }
-        for (const s of states) {
-          const alive = connectionAlive(s.branch);
-          const ageSec = Math.round((Date.now() - new Date(s.connectedAt).getTime()) / 1000);
-          const uptime = ageSec < 60 ? `${ageSec}s` : ageSec < 3600 ? `${Math.floor(ageSec / 60)}m` : `${Math.floor(ageSec / 3600)}h ${Math.floor((ageSec % 3600) / 60)}m`;
-          const lastHb = s.lastHeartbeatSent
-            ? Math.round((Date.now() - new Date(s.lastHeartbeatSent).getTime()) / 1000)
-            : null;
-          const hbStr = lastHb !== null ? `${lastHb}s ago` : "never";
-          const lastAck = s.lastHeartbeatAck
-            ? Math.round((Date.now() - new Date(s.lastHeartbeatAck).getTime()) / 1000) + "s ago"
-            : "never";
-          const status = !alive ? "🔴 STALE" : "🟢 connected";
-          const anomaly = !alive ? " (PID dead)" : s.reconnectCount > 3 ? ` (${s.reconnectCount} reconnects)` : "";
-          console.log(`${s.branch}:`);
-          console.log(`  Status:     ${status}${anomaly}`);
-          console.log(`  Uptime:     ${uptime} (since ${s.connectedAt})`);
-          console.log(`  Heartbeat:  sent ${hbStr}, ack ${lastAck}`);
-          console.log(`  Reconnects: ${s.reconnectCount}`);
-          console.log(`  Messages:   ↑${s.messagesSent} sent / ↓${s.messagesReceived} received`);
-          if (s.services && s.services.length > 0) {
-            console.log(`  Services:`);
-            for (const svc of s.services) {
-              const icon = svc.status === "healthy" ? "✅" : svc.status === "unhealthy" ? "❌" : "❓";
-              const lastCheck = svc.lastCheck ? `, checked ${Math.round((Date.now() - new Date(svc.lastCheck).getTime()) / 1000)}s ago` : "";
-              console.log(`    ${icon} ${svc.name} (${svc.status}${lastCheck}${svc.error ? `, error: ${svc.error}` : ""})`);
-            }
-          }
-          console.log();
-        }
-        if (problems.length > 0) process.exitCode = 1;
-        return;
-      }
       const agent = validateAgent(args.agent);
       const ws = workspacePath(agent);
       const relayRunning = existsSync(relayPidFile(agent));
