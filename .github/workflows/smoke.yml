@@ -96,25 +96,89 @@ jobs:
             exit 1
           fi
           echo "✅ identity init OK (fingerprint: $FP)"
-      - name: Acceptance — Noise handshake (branch init)
+      - name: Acceptance — Noise handshake (real join on loopback)
         run: |
           BIN="packages/cli/dist/tps-${{ matrix.target }}"
+          chmod +x "$BIN"
           export HOME=$(mktemp -d)
           export TPS_VAULT_KEY="ci-smoke-test-key"
-          # branch init exercises the full noise-handshake → sodium-javascript path
-          # portable timeout: GNU `timeout` does not exist on stock macOS runners (this exact line
-          # failed with "timeout: command not found" on darwin-arm64 while every linux lane passed)
-          perl -e 'alarm shift; exec @ARGV' 15 $ARCH_PREFIX "$BIN" branch init --name smoke-test 2>&1 | tee /tmp/tps-branch.log || true
-          if grep -q "Branch identity created" /tmp/tps-branch.log; then
-            echo "✅ Noise handshake OK"
-          elif grep -q "Listening on" /tmp/tps-branch.log; then
-            echo "✅ Noise handshake OK (listening)"
-          else
-            echo "Branch init output:"
-            cat /tmp/tps-branch.log
-            echo "❌ Noise handshake failed"
+          # Leave the branch side after the join returns; the daemon is not part of this check.
+          export TPS_BRANCH_NO_DAEMON=1
+
+          BRANCH_PID=""
+          cleanup() {
+            if [ -n "$BRANCH_PID" ] && kill -0 "$BRANCH_PID" 2>/dev/null; then
+              kill "$BRANCH_PID" 2>/dev/null || true
+              wait "$BRANCH_PID" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          PORT=$(node -e 'const s=require("net").createServer();s.listen(0,"127.0.0.1",()=>{console.log(s.address().port);s.close()})')
+
+          if ! $ARCH_PREFIX "$BIN" identity init --json > "$HOME/identity.json" 2>&1; then
+            echo "❌ identity init failed"
+            cat "$HOME/identity.json" 2>/dev/null || true
             exit 1
           fi
+
+          # Branch side: creates its identity and listens for a host.
+          $ARCH_PREFIX "$BIN" branch init --listen "$PORT" --host 127.0.0.1 --transport tcp > "$HOME/branch.log" 2>&1 &
+          BRANCH_PID=$!
+
+          # Wait, bounded, for the join token the branch prints.
+          TOKEN=""
+          i=0
+          while [ "$i" -lt 60 ]; do
+            TOKEN=$(sed -n 's/.*\(tps:\/\/join?[^" ]*\).*/\1/p' "$HOME/branch.log" 2>/dev/null | head -1)
+            [ -n "$TOKEN" ] && break
+            i=$((i + 1))
+            sleep 0.5
+          done
+          if [ -z "$TOKEN" ]; then
+            echo "❌ branch side never printed a join token"
+            echo "--- branch output ---"
+            cat "$HOME/branch.log" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Host side: performs the Noise_IK handshake and sends JOIN_COMPLETE.
+          # portable timeout: GNU `timeout` does not exist on stock macOS runners.
+          JOIN_RC=0
+          if ! perl -e 'alarm shift; exec @ARGV' 25 $ARCH_PREFIX "$BIN" office join smoke-host "$TOKEN" > "$HOME/host.log" 2>&1; then
+            JOIN_RC=1
+          fi
+
+          if [ "$JOIN_RC" -eq 0 ]; then
+            # Wait, bounded, for the branch side to accept the join and exit.
+            i=0
+            while [ "$i" -lt 60 ]; do
+              kill -0 "$BRANCH_PID" 2>/dev/null || break
+              i=$((i + 1))
+              sleep 0.5
+            done
+          fi
+
+          BRANCH_RC=0
+          if kill -0 "$BRANCH_PID" 2>/dev/null; then
+            kill "$BRANCH_PID" 2>/dev/null || true
+            wait "$BRANCH_PID" 2>/dev/null || true
+            BRANCH_RC=124
+          else
+            if wait "$BRANCH_PID" 2>/dev/null; then BRANCH_RC=0; else BRANCH_RC=$?; fi
+          fi
+          BRANCH_PID=""
+
+          if [ "$JOIN_RC" -ne 0 ] || [ "$BRANCH_RC" -ne 0 ] || ! grep -q "Noise_IK handshake OK" "$HOME/host.log" || ! grep -q "Joined to host" "$HOME/branch.log"; then
+            echo "❌ Noise handshake did not complete"
+            echo "--- host side (exit $JOIN_RC) ---"
+            cat "$HOME/host.log" 2>/dev/null || true
+            echo "--- branch side (exit $BRANCH_RC) ---"
+            cat "$HOME/branch.log" 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "✅ Noise handshake OK (host ↔ branch on loopback)"
       - name: Acceptance — no baked paths
         run: |
           BIN="packages/cli/dist/tps-${{ matrix.target }}"
