@@ -266,8 +266,8 @@ function safeAgentId(agentId: string): string {
   return id || "unknown";
 }
 
-function resolveConfigModel(agentId: string): string | null {
-  const cfgPath = resolveConfigPath();
+function resolveConfigModel(agentId: string, configPath?: string): string | null {
+  const cfgPath = resolveConfigPath(configPath);
   if (!cfgPath) return null;
   try {
     const cfg: OpenClawConfig = readOpenClawConfig(cfgPath);
@@ -344,11 +344,11 @@ function resolveWorkspaceModel(agentId: string, workspace?: string): string | nu
   return null;
 }
 
-async function resolveModel(agentId: string, workspace?: string): Promise<string> {
+async function resolveModel(agentId: string, workspace?: string, configPath?: string): Promise<string> {
   return (
     await resolveModelFromHeartbeat(agentId) ??
     resolveWorkspaceModel(agentId, workspace) ??
-    resolveConfigModel(agentId) ??
+    resolveConfigModel(agentId, configPath) ??
     "unknown-model"
   );
 }
@@ -414,10 +414,7 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 
   const checks: string[] = [];
   checks.push(...checkWorkspaceWritable(workspace));
-  const configPath = resolveConfigPath(args.configPath);
-  if (configPath && getAgentList(readOpenClawConfig(configPath)).some((agent) => agent.id === agentId)) {
-    checks.push(...checkGatewayHealth());
-  }
+  checks.push(...checkGatewayHealth());
   checks.push(...checkQueueAge(workspace));
 
   const now = nowIso();
@@ -443,7 +440,7 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
   const status: NodeStatus = {
     agentId,
     host: hostFingerprint(),
-    model: await resolveModel(agentId, workspace),
+    model: await resolveModel(agentId, workspace, args.configPath),
     status: resolvedState,
     lastHeartbeat: lastHeartbeat,
     lastActivity: now,

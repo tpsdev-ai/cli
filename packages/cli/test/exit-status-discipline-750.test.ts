@@ -228,7 +228,7 @@ function violations(found: (ExitSite & { file: string })[]): string[] {
   return offenders;
 }
 
-describe("cli#750 — no-argument and explicit-zero process.exit contexts", () => {
+describe("cli#750 — no-argument and explicit-zero direct process.exit(...) contexts", () => {
   test("bin/ and src/ match the approved AST contexts", () => {
     for (const entry of ALLOWLIST) expect(entry.reason.trim()).not.toBe("");
     expect(violations(scanTree())).toEqual([]);
