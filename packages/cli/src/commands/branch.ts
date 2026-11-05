@@ -365,11 +365,15 @@ async function runInit(args: BranchArgs): Promise<void> {
     process.exit(1);
   }
 
-  // A production init starts a daemon, so resolve the agent id before the
-  // pid-record check: a misconfigured init names the missing id and spawns
-  // nothing (cli#734). An init that starts no daemon is unchanged.
+  // A production init starts a daemon, so check the recorded process before
+  // the agent id and before the join: a running daemon refuses the init before
+  // the keypair, the conf or the join. The pid path is `TPS_ROOT/branch.pid`,
+  // which does not depend on the join's result (cli#734).
   const launchDaemon = process.env.TPS_BRANCH_NO_DAEMON !== "1" && process.env.NODE_ENV !== "test";
-  if (launchDaemon) branchAgentId(args.agent);
+  if (launchDaemon) {
+    refuseSecondBranchStart();
+    branchAgentId(args.agent);
+  }
 
   const kp = existsSync(seedPath) && !args.force
     ? loadKeyPair(identityDir, "branch")
@@ -429,16 +433,18 @@ async function runInit(args: BranchArgs): Promise<void> {
 
 async function runStart(): Promise<void> {
   const conf = existsSync(confPath()) ? readBranchConf() : undefined;
-  // Resolve the agent id before the pid-record check in `spawnBranchDaemon`:
-  // a start with no agent id names that cause and spawns nothing (cli#734).
+  const spawnsDaemon =
+    process.env.TPS_BRANCH_DAEMON !== "1" &&
+    process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
+    process.env.NODE_ENV !== "test";
+  // The launcher checks the recorded process before resolving the agent id: a
+  // running daemon refuses the start whatever the agent configuration, and
+  // `spawnBranchDaemon` re-checks it under the pid record lock (cli#734).
+  if (spawnsDaemon) refuseSecondBranchStart();
   const localAgentId = branchAgentId(conf?.agentId);
   if (!conf) throw new Error("branch.conf.json not found. Run `tps branch init` first.");
 
-  if (
-    process.env.TPS_BRANCH_DAEMON !== "1" &&
-    process.env.TPS_BRANCH_NO_DAEMON !== "1" &&
-    process.env.NODE_ENV !== "test"
-  ) {
+  if (spawnsDaemon) {
     const daemonPid = spawnBranchDaemon();
     console.log(`Branch daemon spawned (pid ${daemonPid}). Log: ${logPath()}`);
     process.exit(0);

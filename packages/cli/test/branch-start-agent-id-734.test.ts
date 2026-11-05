@@ -1,8 +1,9 @@
 /**
- * cli#734 — the branch start launcher and a production branch init resolve the
- * branch agent id before the pid-record check, so a branch start or production
- * init with no configured id names the missing id instead of a running
- * recorded process. These tests drive the real CLI with real files.
+ * cli#734 — the branch launchers check the pid record before they resolve the
+ * branch agent id, so a branch start or a production branch init with a
+ * recorded running process and no configured id names the running pid, the pid
+ * file and the stop remedy instead of a missing agent id. These tests drive the
+ * real CLI with real files.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -112,6 +113,10 @@ function startSleep(): ChildProcess {
   return child;
 }
 
+function runningRefusal(pid: number): string {
+  return `Recorded process (pid ${pid}, start token matches) is still running; refusing to spawn (pid file ${pidFile}). If pid ${pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${pidFile} only after confirming no branch daemon is running.`;
+}
+
 async function waitForRunningRecord(): Promise<{ pid: number; startToken: string }> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
@@ -205,8 +210,8 @@ afterEach(async () => {
   }
 });
 
-describe("branch launchers resolve the agent id before the pid record (cli#734)", () => {
-  test("a start with both agent-id sources cleared names the missing id, not the running pid", async () => {
+describe("branch launchers check the pid record before the agent id (cli#734)", () => {
+  test("a start with a running recorded process and both agent-id sources cleared names the running pid and the pid file", async () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
@@ -222,14 +227,52 @@ describe("branch launchers resolve the agent id before the pid record (cli#734)"
     const second = await runCli(["branch", "start"], launcherEnv());
 
     expect(second.code).not.toBe(0);
-    expect(second.stderr).toContain("no branch agent id");
-    expect(second.stderr).not.toContain(`Recorded process (pid ${running.pid}`);
+    expect(second.stderr).toContain(runningRefusal(running.pid));
+    expect(second.stderr).not.toContain("no branch agent id");
     expect(second.stdout).not.toContain("Branch daemon spawned");
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
 
-  test("a start with the agent id configured still refuses naming the pid, pid file and stop remedy", async () => {
+  test("a production init with a running recorded process and no agent id names the running pid and starts no join", async () => {
+    const port = await freePort();
+    prepareBranch(port, "agent-a");
+    const live = startSleep();
+    writeFileSync(pidFile, serializePidRecord(live.pid!, startToken(live.pid!)));
+    const recordBefore = readFileSync(pidFile, "utf8");
+    const confBefore = readFileSync(join(tpsRoot, "branch.conf.json"), "utf8");
+
+    // --force is required because an existing join and conf are what an
+    // operator re-initialising a live branch presents. The pid path does not
+    // depend on the join's result, so this refusal comes before the join.
+    const result = await runCli(
+      ["branch", "init", "--force", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
+      launcherEnv(),
+    );
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain(runningRefusal(live.pid!));
+    expect(result.stderr).not.toContain("no branch agent id");
+    expect(result.stdout).not.toContain("Waiting for host to connect");
+    expect(result.stdout).not.toContain("Branch identity created");
+    expect(readFileSync(join(tpsRoot, "branch.conf.json"), "utf8")).toBe(confBefore);
+    expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
+    expect(pidState(live.pid!)).toBe("alive");
+  }, 20_000);
+
+  test("a start with no recorded process and no agent id names the missing id", async () => {
+    const port = await freePort();
+    prepareBranch(port, undefined);
+
+    const result = await runCli(["branch", "start"], launcherEnv());
+
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toContain("no branch agent id");
+    expect(result.stdout).not.toContain("Branch daemon spawned");
+    expect(existsSync(pidFile)).toBe(false);
+  }, 20_000);
+
+  test("a start with a running recorded process and the agent id configured names the running pid", async () => {
     const port = await freePort();
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
@@ -243,47 +286,12 @@ describe("branch launchers resolve the agent id before the pid record (cli#734)"
     const second = await runCli(["branch", "start"], launcherEnv());
 
     expect(second.code).not.toBe(0);
-    expect(second.stderr).toContain(`pid ${running.pid}`);
-    expect(second.stderr).toContain(pidFile);
-    expect(second.stderr).toContain(
-      `If pid ${running.pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${pidFile} only after confirming no branch daemon is running.`,
-    );
+    expect(second.stderr).toContain(runningRefusal(running.pid));
+    expect(second.stderr).not.toContain("no branch agent id");
     expect(second.stdout).not.toContain("Branch daemon spawned");
     expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
-
-  test("a start with no record and no agent id names the missing id", async () => {
-    const port = await freePort();
-    prepareBranch(port, undefined);
-
-    const result = await runCli(["branch", "start"], launcherEnv());
-
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("no branch agent id");
-    expect(result.stdout).not.toContain("Branch daemon spawned");
-    expect(existsSync(pidFile)).toBe(false);
-  }, 20_000);
-
-  test("a production init with no agent id names it before the pid record and writes no conf", async () => {
-    const port = await freePort();
-    const live = startSleep();
-    writeFileSync(pidFile, serializePidRecord(live.pid!, startToken(live.pid!)));
-    const recordBefore = readFileSync(pidFile, "utf8");
-
-    const result = await runCli(
-      ["branch", "init", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
-      launcherEnv(),
-    );
-
-    expect(result.code).not.toBe(0);
-    expect(result.stderr).toContain("no branch agent id");
-    expect(result.stdout).not.toContain("Waiting for host to connect");
-    expect(result.stdout).not.toContain("Branch daemon spawned");
-    expect(existsSync(join(tpsRoot, "branch.conf.json"))).toBe(false);
-    expect(readFileSync(pidFile, "utf8")).toBe(recordBefore);
-    expect(pidState(live.pid!)).toBe("alive");
-  }, 20_000);
 });
 
 afterAll(() => {
