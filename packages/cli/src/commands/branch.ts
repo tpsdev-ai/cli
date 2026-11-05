@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -615,44 +615,17 @@ async function runStart(): Promise<void> {
     }
   };
 
-  logLine("STARTED", `Listening on 0.0.0.0:${conf.port} (${conf.transport})`);
-
-  const server: TransportServer =
-    conf.transport === "ws"
-      ? await listenForHostWs(kp, hostPub, conf.port, onMessage)
-      : await listenForHost(kp, hostPub, conf.port, (msg: TpsMessage, channel: TransportChannel) => {
-          return onMessage(msg, channel);
-        });
-
-  server.onConnection((channel) => {
-    activeHostChannel = channel;
-    // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)
-    try { serviceProxies?.close(); } catch {}
-    serviceProxies = null;
-  });
-
-  const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
-  mkdirSync(outboxNewDir, { recursive: true });
-  const outboxWatcher = watch(outboxNewDir, async () => {
-    if (!activeHostChannel || !activeHostChannel.isAlive()) return;
-    for (const item of outboxSends.due()) {
-      await activeHostChannel.send({
-        type: MSG_MAIL_DELIVER,
-        seq: 0,
-        ts: new Date().toISOString(),
-        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => outboxSends.sendFailed(item.id));
-    }
-  });
+  let server: TransportServer | null = null;
+  let outboxWatcher: FSWatcher | null = null;
 
   const onShutdown = async () => {
     logLine("STOPPED", "Signal received");
-    try { outboxWatcher.close(); } catch {}
+    try { outboxWatcher?.close(); } catch {}
     try { serviceProxies?.close(); } catch {}
     serviceProxies = null;
     activeHostChannel = null;
     clearBranchState();
-    try { await server.close(); } catch {}
+    try { await server?.close(); } catch {}
     const p = pidPath();
     try {
       const outcome = removeOwnBranchPidRecord(p);
@@ -674,8 +647,40 @@ async function runStart(): Promise<void> {
     process.exit(0);
   };
 
+  // Install the shutdown handlers before the listener opens: a SIGTERM that
+  // arrives once the socket accepts connections must reach this handler, not
+  // the runtime's default handler, which exits without the shutdown path.
   process.on("SIGTERM", onShutdown);
   process.on("SIGINT", onShutdown);
+
+  logLine("STARTED", `Listening on 0.0.0.0:${conf.port} (${conf.transport})`);
+
+  server = conf.transport === "ws"
+    ? await listenForHostWs(kp, hostPub, conf.port, onMessage)
+    : await listenForHost(kp, hostPub, conf.port, (msg: TpsMessage, channel: TransportChannel) => {
+        return onMessage(msg, channel);
+      });
+
+  server.onConnection((channel) => {
+    activeHostChannel = channel;
+    // Close any previous proxies — new connection, new proxies (host will resend MSG_JOIN_COMPLETE)
+    try { serviceProxies?.close(); } catch {}
+    serviceProxies = null;
+  });
+
+  const outboxNewDir = join(process.env.HOME || homedir(), ".tps", "outbox", "new");
+  mkdirSync(outboxNewDir, { recursive: true });
+  outboxWatcher = watch(outboxNewDir, async () => {
+    if (!activeHostChannel || !activeHostChannel.isAlive()) return;
+    for (const item of outboxSends.due()) {
+      await activeHostChannel.send({
+        type: MSG_MAIL_DELIVER,
+        seq: 0,
+        ts: new Date().toISOString(),
+        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
+      }).catch(() => outboxSends.sendFailed(item.id));
+    }
+  });
 
   // Keep alive — bun does not treat a no-op interval as a ref'd handle, so the
   // event loop drains and the daemon exits ~150ms after listen(). A

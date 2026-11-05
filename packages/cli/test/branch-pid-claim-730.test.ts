@@ -103,14 +103,35 @@ async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_M
   }
 }
 
-async function waitForReady(phase: string): Promise<string> {
-  return waitFor(
-    () => {
-      const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
-      return name === undefined ? null : join(pauseDir, name);
-    },
-    `pause ${phase}`,
-  );
+async function waitForReady(phase: string, daemonPid?: number): Promise<string> {
+  try {
+    return await waitFor(
+      () => {
+        const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
+        return name === undefined ? null : join(pauseDir, name);
+      },
+      `pause ${phase}`,
+    );
+  } catch (error) {
+    throw new Error(`${(error as Error).message}; ${daemonState(daemonPid)}`);
+  }
+}
+
+/** The daemon's last recorded output and process state, for a failed wait. */
+function daemonState(pid: number | undefined): string {
+  const parts: string[] = [pid === undefined ? "daemon pid unknown" : `daemon pid ${pid}: ${pidState(pid)}`];
+  try {
+    const lines = readFileSync(logFile, "utf8").trimEnd().split("\n").slice(-10);
+    parts.push(`branch.log: ${lines.length === 0 ? "(empty)" : lines.join(" | ")}`);
+  } catch (error) {
+    parts.push(`branch.log: unreadable (${(error as NodeJS.ErrnoException).code ?? "unknown"})`);
+  }
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(pauseDir);
+  } catch {}
+  parts.push(`pause dir: ${entries.length === 0 ? "(empty)" : entries.join(", ")}`);
+  return parts.join("; ");
 }
 
 function release(phase: string): void {
@@ -203,28 +224,6 @@ function spawnDaemon(phase: string): ChildProcess {
   return child;
 }
 
-/** Wait until a listening daemon has installed its signal handlers (Linux). */
-async function waitForSignalHandlers(pid: number): Promise<void> {
-  if (process.platform !== "linux") {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-    return;
-  }
-  const sigterm = 1n << 14n;
-  const sigint = 1n << 1n;
-  await waitFor(() => {
-    let status: string;
-    try {
-      status = readFileSync(`/proc/${pid}/status`, "utf8");
-    } catch {
-      return null;
-    }
-    const line = status.split("\n").find((entry) => entry.startsWith("SigCgt:"));
-    if (line === undefined) return null;
-    const mask = BigInt(`0x${line.slice("SigCgt:".length).trim()}`);
-    return (mask & sigterm) !== 0n && (mask & sigint) !== 0n ? true : null;
-  }, `pid ${pid} to install signal handlers`);
-}
-
 function reapedPid(): number {
   const child = spawnSync("true", []);
   if (child.pid === undefined) throw new Error("could not spawn a helper process");
@@ -265,7 +264,6 @@ async function stopWhileDaemonPausesInShutdown(
   const daemon = spawnDaemon("shutdown-before-unlink");
   await waitForLogStarted();
   await waitForListening(port);
-  await waitForSignalHandlers(daemon.pid!);
   writeFileSync(pidFile, record(daemon.pid!, startToken(daemon.pid!)));
   expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -283,7 +281,7 @@ async function stopWhileDaemonPausesInShutdown(
     stderr += String(chunk);
   });
   const exited = waitForExit(stop);
-  await waitForReady("shutdown-before-unlink");
+  await waitForReady("shutdown-before-unlink", daemon.pid);
   return { daemon, exited, stdout: () => stdout, stderr: () => stderr };
 }
 
@@ -540,14 +538,15 @@ describe("branch pid record ownership (cli#730)", () => {
     const daemon = spawnDaemon(phase);
     await waitForLogStarted();
     await waitForListening(port);
-    await waitForSignalHandlers(daemon.pid!);
     expect(daemon.pid).toBeDefined();
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
 
     const exited = waitForExit(daemon);
+    // The daemon installs its shutdown handlers before it opens the listener,
+    // so a SIGTERM sent now reaches its shutdown path (cli#744).
     daemon.kill("SIGTERM");
-    await waitForReady(phase);
+    await waitForReady(phase, daemon.pid);
 
     const probe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
     if (probe !== null) probe.release();
