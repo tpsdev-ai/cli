@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { connectionAlive, listHostStatePaths, listHostStates } from "../utils/connection-state.js";
+import { connectionAlive, ConnectionsDirectoryError, listHostStatePaths, listHostStates, type HostStateListing, type HostStateProblem } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
 import { branchTestPause, pidPath as branchPidPath, pidRecordBytesEqual, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
@@ -599,18 +599,48 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "status": {
       const timestamp = new Date().toISOString();
       if (!args.agent) {
-        const states = listHostStates();
+        let listing: HostStateListing;
+        try {
+          listing = listHostStates();
+        } catch (error) {
+          if (!(error instanceof ConnectionsDirectoryError)) throw error;
+          if (args.json) {
+            const body = {
+              agents: [],
+              timestamp,
+              error: { path: error.path, code: error.code, message: error.message },
+            };
+            console.log(JSON.stringify(body, null, 2));
+          } else {
+            console.error(error.message);
+          }
+          process.exitCode = 1;
+          return;
+        }
+
+        const states = listing.states;
+        const problems = listing.problems;
         if (args.json) {
           const agents = states.map((state) => ({
             id: state.branch,
             status: connectionAlive(state.branch) ? "connected" : "STALE",
             lastSeen: state.lastHeartbeatAck ?? state.connectedAt,
           }));
-          console.log(JSON.stringify({ agents, timestamp }, null, 2));
+          const body: { agents: unknown[]; timestamp: string; problems?: HostStateProblem[] } = { agents, timestamp };
+          if (problems.length > 0) body.problems = problems;
+          console.log(JSON.stringify(body, null, 2));
+          if (problems.length > 0) process.exitCode = 1;
           return;
         }
+
+        for (const problem of problems) {
+          console.error(problem.reason === "unparseable"
+            ? `Connection record ${problem.path} could not be parsed, so it is not listed. Fix or remove it, then try again.`
+            : `Connection record ${problem.path} could not be read (${problem.code ?? "unknown"}), so it is not listed. Fix or remove it, then try again.`);
+        }
         if (states.length === 0) {
-          console.log("No active branch connections.");
+          console.log(problems.length > 0 ? "No readable branch connections." : "No active branch connections.");
+          if (problems.length > 0) process.exitCode = 1;
           return;
         }
         for (const s of states) {
@@ -642,6 +672,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           }
           console.log();
         }
+        if (problems.length > 0) process.exitCode = 1;
         return;
       }
       const agent = validateAgent(args.agent);
