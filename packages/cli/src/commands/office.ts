@@ -960,8 +960,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
     case "kill": {
       let killed = 0;
       const failures: string[] = [];
-      // A host record can be created while this command is running. Bound the
-      // re-list passes so a writer that never stops cannot keep it running.
+      // Limit host-record handling to a bounded number of passes.
       const MAX_HOST_RECORD_PASSES = 5;
       const processedHostRecords = new Set<string>();
       const recordKey = (path: string, state: ReturnType<typeof readPidFile>): string | null => {
@@ -1001,11 +1000,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         removed: string,
         gone: string,
       ): UnchangedRemoval => {
-        // Re-read and compare bytes before unlinking: the host writer uses the
-        // same path, so a successor record written while this process was
-        // stopping must survive. The compare and the unlink are not atomic;
-        // writeHostState is the only writer in this codebase and takes no lock
-        // on the path, so that window remains.
+        // Compare the record's bytes before unlinking; the operations are not atomic.
         const current = snapshotPidRecord(path);
         if (current.state.kind === "missing") {
           console.log(gone);
@@ -1025,15 +1020,13 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       };
 
       const stopRecord = async (label: string, path: string): Promise<boolean> => {
-        // The path is the caller's: it names a directory entry or the branch
-        // writer's own path, never a name parsed out of the record.
+        // The path comes from the directory listing.
         const decision = snapshotPidRecord(path);
         const state = decision.state;
         if (state.kind === "missing") return false;
         const key = recordKey(path, state);
         if (key !== null) {
-          // A record handled in an earlier pass is not handled again; a new
-          // record at the same path has a different identity and is handled.
+          // Retry changed bytes at the removal check or a changed identity in a later pass, if one remains.
           if (processedHostRecords.has(key)) return false;
           processedHostRecords.add(key);
         }
@@ -1199,11 +1192,9 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         );
       };
 
-      // Re-list after each signalling pass and once more after the branch
-      // step: a host record created while this command was running, including
-      // one created while the branch daemon is stopped, is checked in a later
-      // pass. The number of passes is bounded; at the bound the command reports
-      // the records that are still appearing instead of success.
+      // Re-list after each signalling pass and again after the branch step.
+      // Records first seen at a pass limit are named, not stopped in that pass;
+      // new record paths created after the last listing are not seen.
       type HostPassResult =
         | { kind: "settled" }
         | { kind: "bound"; remaining: string[] }
@@ -1232,7 +1223,7 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         return remaining.length === 0 ? { kind: "settled" } : { kind: "bound", remaining };
       };
 
-      await runHostRecordPasses();
+      const firstHostPass = await runHostRecordPasses();
       try {
         await stopBranchRecord(branchPidPath());
       } catch (error) {
@@ -1241,19 +1232,23 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         failures.push(error instanceof Error ? error.message : String(error));
       }
       const finalHostPass = await runHostRecordPasses();
-      if (finalHostPass.kind === "listing") {
-        failures.push(
-          `Connections directory ${finalHostPass.failure.path} could not be listed (${finalHostPass.failure.code}), so its records were not checked; check them yourself.`,
-        );
-      } else if (finalHostPass.kind === "bound") {
-        failures.push(
-          `Host state records were still appearing after ${MAX_HOST_RECORD_PASSES} passes: ${finalHostPass.remaining.join(", ")}. Re-run the command, or stop whatever keeps creating them.`,
-        );
+      for (const [pass, result] of [
+        ["First host pass", firstHostPass],
+        ["Post-branch host pass", finalHostPass],
+      ] as const) {
+        if (result.kind === "listing") {
+          failures.push(
+            `${pass}: connections directory ${result.failure.path} could not be listed (${result.failure.code}) at that point; records observed before the failure were handled. Check the directory and its records, then re-run the command.`,
+          );
+        } else if (result.kind === "bound") {
+          failures.push(
+            `${pass}: host state records were still appearing after ${MAX_HOST_RECORD_PASSES} passes: ${result.remaining.join(", ")}. Re-run the command, or stop whatever keeps creating them.`,
+          );
+        }
       }
 
       if (failures.length > 0) {
-        // Print every failure; the aggregate error makes the command exit
-        // non-zero after all records have been handled.
+        // Print collected failures before exiting non-zero.
         for (const line of failures) console.error(line);
         throw new Error(failures.join(" "));
       }

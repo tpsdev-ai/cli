@@ -1,15 +1,8 @@
 /**
- * cli#735 — `office kill` re-lists the connections directory after each
- * signalling pass and once more after the branch step, so a host record created
- * while the kill is running is checked in a later pass. A writer that keeps
- * creating records past the fixed bound makes the command exit non-zero without
- * reporting success, naming the records.
- *
- * Every process tree the tests start is owned by a recorded process group:
- * each root is spawned as a group leader (`detached`) and its children inherit
- * the group, so cleanup can kill a writer and its children together. The
- * record chain is bounded: each host creates one replacement on SIGTERM and
- * the chain depth stops it.
+ * cli#735 — host records are re-listed after each signalling pass and again
+ * after the branch step, within a bounded number of passes. Records first
+ * seen at a pass limit are named, not stopped in that pass; new record paths
+ * created after the last listing are not seen.
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -26,9 +19,6 @@ const HOOK_TIMEOUT = 60_000;
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const AGENT_INDEX = resolve(import.meta.dir, "../../agent/src/index.ts");
 const MAX_PASSES = 5;
-// Each pass stops the two live records and each host creates one replacement
-// before it exits. Two chains bounded at 13 records each make 26 records,
-// more than the five passes plus the final listing consume.
 const CHAIN_DEPTH = 12;
 
 const MARKER = `tps735-${randomUUID()}`;
@@ -241,6 +231,38 @@ function spawnDetached(command: string, args: string[], stdio: ("ignore" | "pipe
 
 describe("office kill re-lists host records", () => {
   test(
+    "a first-pass listing failure is reported after the post-branch pass settles",
+    async () => {
+      const dir = join(home, ".tps", "connections");
+      const pauseDir = join(home, "pause");
+      mkdirSync(pauseDir);
+      mkdirSync(join(home, "tps-root"));
+      rmSync(dir, { recursive: true });
+      writeFileSync(dir, "not a directory");
+      try {
+        const resultPromise = runKill({
+          TPS_BRANCH_TEST_PAUSE_DIR: pauseDir,
+          TPS_BRANCH_TEST_PAUSE_PHASE: "office-kill-branch-before-decision",
+        });
+        await waitForPauseReady(pauseDir);
+        rmSync(dir);
+        mkdirSync(dir);
+        writeFileSync(join(pauseDir, "go-office-kill-branch-before-decision"), "");
+        const result = await resultPromise;
+        expect(result.status).toBe(1);
+        expect(result.output).toContain(`First host pass: connections directory ${dir} could not be listed (ENOTDIR)`);
+        expect(result.output).toContain("records observed before the failure were handled.");
+        expect(result.output).toContain("Check the directory and its records, then re-run the command.");
+        expect(result.output).not.toContain("Post-branch host pass:");
+        expect(result.output).not.toContain("Kill switch engaged");
+      } finally {
+        killProcessGroups();
+      }
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
     "a host that starts a new host on SIGTERM is checked in a later pass",
     async () => {
       const hostAPath = hostStatePath("host-a");
@@ -321,9 +343,7 @@ describe("office kill re-lists host records", () => {
           process.on("SIGTERM", () => {
             if (index === 0) {
               const child = spawn(process.execPath, [process.argv[1], marker, "1"], { stdio: "ignore" });
-              // The successor must have its SIGTERM handler installed before
-              // this record names it, or the next pass would signal a process
-              // that still exits by default and writes no marker.
+              // Wait for the successor's SIGTERM handler before writing its record.
               const deadline = Date.now() + 5000;
               const wait = new Int32Array(new SharedArrayBuffer(4));
               while (!existsSync(ready(1))) {
@@ -362,8 +382,7 @@ describe("office kill re-lists host records", () => {
         seen = readFileSync(seenFile, "utf8");
       } catch {}
 
-      // The successor read a record naming itself right before it exited, so
-      // its record survived while it was alive; and the command stopped both.
+
       expect(seen).toMatch(/^\d+:\d+$/);
       const [pidBText, selfBText] = seen.split(":");
       expect(selfBText).toBe(pidBText);
@@ -431,9 +450,6 @@ describe("office kill re-lists host records", () => {
           };
           if (role === "predecessor") {
             process.on("SIGTERM", () => {
-              // The kill command removes this record only after this process
-              // exits, so a launcher waits for the removal and starts the
-              // successor after it.
               spawn(process.execPath, [process.argv[1], marker, "launcher"], { stdio: "ignore" });
               process.exit(0);
             });
@@ -488,9 +504,7 @@ describe("office kill re-lists host records", () => {
       expect(result.output).toContain(lineB);
       expect(result.output).toContain("Kill switch engaged. Terminated 2 TPS process(es).");
       expect(result.output.indexOf(lineB)).toBeLessThan(result.output.indexOf("Kill switch engaged."));
-      // The successor was written after the kill command had already handled
-      // the predecessor's record at the same path; it must be stopped, never
-      // reported as engaged while still alive.
+
       expect(pidExited(pidB)).toBe(true);
       expect(existsSync(hostAPath)).toBe(false);
       expect(readFileSync(successorSeen, "utf8")).toBe(String(pidB));
@@ -556,9 +570,12 @@ describe("office kill re-lists host records", () => {
     TEST_TIMEOUT,
   );
 
-  test(
-    "a writer that keeps creating records past the bound makes the kill fail and name them",
-    async () => {
+  test.each([
+    ["First host pass", MAX_PASSES],
+    ["Post-branch host pass", CHAIN_DEPTH],
+  ] as const)(
+    "%s bound is reported with the remaining records",
+    async (pass, depth) => {
       const dir = join(home, ".tps", "connections");
       const script = join(home, "record-chain.ts");
       writeFileSync(
@@ -582,8 +599,7 @@ describe("office kill re-lists host records", () => {
             if (depth > 0) {
               const at = index + 2;
               const next = spawn(process.execPath, [script, dir, marker, String(depth - 1), String(at)], { stdio: "ignore" });
-              // Wait for the replacement to install its handler before the
-              // record names it, so every generation is a live writer.
+              // Wait for the replacement's handler before writing its record.
               const ready = join(dir, "ready-" + at);
               const deadline = Date.now() + 5000;
               const wait = new Int32Array(new SharedArrayBuffer(4));
@@ -601,32 +617,43 @@ describe("office kill re-lists host records", () => {
         "utf8",
       );
 
-      // Two chains; each host writes one replacement record before it exits.
-      // The chain depth (12) bounds each at 13 records.
-      for (const index of [0, 1]) {
-        const host = spawnDetached(
-          process.execPath,
-          [script, dir, MARKER, String(CHAIN_DEPTH), String(index)],
-          ["ignore", "ignore", "pipe"],
-        );
-        const pid = host.pid;
-        if (pid === undefined) throw new Error("chain host has no pid");
-        const token = processStartToken(pid);
-        if (token === null) throw new Error("no start token for chain host");
-        writeFileSync(join(dir, `host-${index}.json`), serializePidRecord(pid, token), "utf8");
-      }
-      await Promise.all([waitForFile(join(dir, "ready-0")), waitForFile(join(dir, "ready-1"))]);
+      try {
+        for (const index of [0, 1]) {
+          const host = spawnDetached(
+            process.execPath,
+            [script, dir, MARKER, String(depth), String(index)],
+            ["ignore", "ignore", "pipe"],
+          );
+          const pid = host.pid;
+          if (pid === undefined) throw new Error("chain host has no pid");
+          const token = processStartToken(pid);
+          if (token === null) throw new Error("no start token for chain host");
+          writeFileSync(join(dir, `host-${index}.json`), serializePidRecord(pid, token), "utf8");
+        }
+        await Promise.all([waitForFile(join(dir, "ready-0")), waitForFile(join(dir, "ready-1"))]);
 
-      const result = await runKill();
+        const result = await runKill();
 
-      expect(result.status).toBe(1);
-      expect(result.output).not.toContain("Kill switch engaged");
-      expect(result.output).toContain(`still appearing after ${MAX_PASSES} passes: `);
-      expect(result.output).toContain("Re-run the command, or stop whatever keeps creating them.");
-      const named = (result.output.split(`still appearing after ${MAX_PASSES} passes: `)[1] ?? "").split(". Re-run")[0] ?? "";
-      expect(named).toMatch(/host-\d+\.json/);
-      for (const entry of named.split(", ")) {
-        expect(entry.endsWith(".json")).toBe(true);
+        expect(result.status).toBe(1);
+        expect(result.output).not.toContain("Kill switch engaged");
+        expect(result.output).toContain(`${pass}: host state records were still appearing after ${MAX_PASSES} passes: `);
+        expect(result.output).toContain("Re-run the command, or stop whatever keeps creating them.");
+        const named = (result.output.split(`still appearing after ${MAX_PASSES} passes: `)[1] ?? "").split(". Re-run")[0] ?? "";
+        expect(named).toMatch(/host-\d+\.json/);
+        for (const entry of named.split(", ")) {
+          expect(entry.endsWith(".json")).toBe(true);
+        }
+        if (pass === "First host pass") {
+          expect(result.output).not.toContain("Post-branch host pass:");
+          for (const index of [MAX_PASSES * 2, MAX_PASSES * 2 + 1]) {
+            const path = join(dir, `host-${index}.json`);
+            expect(named.split(", ")).toContain(path);
+            expect(result.output).toContain(`record removed: ${path}.`);
+            expect(existsSync(path)).toBe(false);
+          }
+        }
+      } finally {
+        killProcessGroups();
       }
     },
     TEST_TIMEOUT,
