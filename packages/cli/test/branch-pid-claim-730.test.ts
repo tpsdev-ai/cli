@@ -2,7 +2,7 @@
  * cli#730 — the branch pid record is claimed and removed only while the
  * branch pid lock is held, including by `tps office kill`. These tests drive
  * the real CLI and real daemons under a temp HOME; the pause seam is enabled
- * by TPS_BRANCH_TEST_PAUSE_DIR.
+ * by TPS_BRANCH_TEST_PAUSE_DIR inside the isolated test root (TPS_TEST_ROOT).
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
@@ -186,6 +186,33 @@ async function waitForListening(port: number): Promise<void> {
     if (connected) return;
     if (Date.now() >= deadline) throw new Error(`daemon did not listen on 127.0.0.1:${port}`);
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+}
+
+async function waitForNotListening(port: number): Promise<void> {
+  const net = await import("node:net");
+  const deadline = Date.now() + WAIT_MS;
+  for (;;) {
+    const connected = await new Promise<boolean>((resolveConnect) => {
+      const socket = net.connect({ host: "127.0.0.1", port });
+      const finish = (value: boolean) => {
+        socket.destroy();
+        resolveConnect(value);
+      };
+      socket.once("connect", () => finish(true));
+      socket.once("error", () => finish(false));
+    });
+    if (!connected) return;
+    if (Date.now() >= deadline) throw new Error(`daemon still listens on 127.0.0.1:${port}`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+}
+
+function stoppedCount(): number {
+  try {
+    return (readFileSync(logFile, "utf8").match(/STOPPED:/g) ?? []).length;
+  } catch {
+    return 0;
   }
 }
 
@@ -531,7 +558,27 @@ describe("branch pid record ownership (cli#730)", () => {
     await waitForPidGone(running.pid);
   }, 40_000);
 
-  test("a SIGTERM sent once the listener opens runs the daemon's shutdown path", async () => {
+  test("a SIGTERM before the listener opens runs shutdown with no server", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const phase = "startup-before-listener";
+    const daemon = spawnDaemon(phase);
+    daemons.push(daemon.pid!);
+    await waitForReady(phase, daemon.pid);
+    writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+    expect(readPidFile(pidFile).kind).toBe("running");
+
+    const exited = waitForExit(daemon);
+    daemon.kill("SIGTERM");
+
+    expect(await exited).toEqual({ code: 0, signal: null });
+    expect(stoppedCount()).toBe(1);
+    expect(readPidFile(pidFile).kind).toBe("missing");
+    expect(pidExited(daemon.pid!)).toBe(true);
+    await waitForNotListening(port);
+  }, 40_000);
+
+  test("a SIGTERM while the listener is open and before the outbox watcher runs shutdown", async () => {
     const port = await freePort();
     prepareBranch(port);
     const phase = "listening-before-steady-state";
@@ -544,12 +591,68 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exited = waitForExit(daemon);
     daemon.kill("SIGTERM");
-    release(phase);
 
     expect(await exited).toEqual({ code: 0, signal: null });
+    expect(stoppedCount()).toBe(1);
     expect(readPidFile(pidFile).kind).toBe("missing");
-    expect(readFileSync(logFile, "utf8")).toContain("STOPPED");
     expect(pidExited(daemon.pid!)).toBe(true);
+    await waitForNotListening(port);
+  }, 40_000);
+
+  test("a second signal during shutdown does not run the shutdown path twice", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const phase = "shutdown-after-signal";
+    const daemon = spawnDaemon(phase);
+    daemons.push(daemon.pid!);
+    await waitForLogStarted();
+    await waitForListening(port);
+    writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+    expect(readPidFile(pidFile).kind).toBe("running");
+
+    const exited = waitForExit(daemon);
+    daemon.kill("SIGTERM");
+    await waitForReady(phase, daemon.pid);
+    daemon.kill("SIGINT");
+    await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+    expect(stoppedCount()).toBe(1);
+
+    release(phase);
+    expect(await exited).toEqual({ code: 0, signal: null });
+    expect(stoppedCount()).toBe(1);
+    expect(readFileSync(logFile, "utf8")).not.toContain("No pid record at");
+    expect(readPidFile(pidFile).kind).toBe("missing");
+    expect(pidExited(daemon.pid!)).toBe(true);
+  }, 40_000);
+
+  test("a pause dir inherited without the isolated test root is ignored", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const env = launcherEnv("unused");
+    delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+    delete env.TPS_TEST_ROOT;
+    delete env.TPS_TEST_ROOT_TOKEN;
+
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    children.push(launcher);
+    let stdout = "";
+    launcher.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    expect(stdout).toContain("Branch daemon spawned");
+    const running = await waitForRunningRecord();
+    daemons.push(running.pid);
+    await waitForLogStarted();
+    expect(pidState(running.pid)).toBe("alive");
+    expect(readdirSync(pauseDir)).toEqual([]);
+
+    process.kill(running.pid, "SIGTERM");
+    await waitForPidGone(running.pid);
   }, 40_000);
 
   test("shutdown holds the record lock and preserves a replacement visible at its final read", async () => {
