@@ -1,7 +1,7 @@
 // cli#750 — command failure paths that print an error must also set a
 // non-zero status. Each test spawns the built CLI with an empty HOME.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -31,7 +31,7 @@ async function runTps(args: string[], env: Record<string, string> = {}): Promise
   stdout: string;
   stderr: string;
 }> {
-  const proc = Bun.spawn(["bun", TPS_BIN, ...args], {
+  const proc = Bun.spawn([process.execPath, TPS_BIN, ...args], {
     env: {
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       HOME: home,
@@ -68,9 +68,51 @@ describe("cli#750 — command failure paths exit non-zero", () => {
     const agent = "agent-b";
     const workspace = join(home, ".tps", "branch-office", agent);
     mkdirSync(join(workspace, "mail", "inbox", "new"), { recursive: true });
+    mkdirSync(join(home, ".openclaw"), { recursive: true });
+    writeFileSync(join(home, ".openclaw", "openclaw.json"), JSON.stringify({ agents: { list: [{ id: agent }] } }));
 
     const result = await runTps(["heartbeat", agent]);
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`Heartbeat for ${agent}: online`);
+  });
+
+  test("a native agent heartbeat skips a failing gateway for another OpenClaw agent", async () => {
+    const agent = "native-agent";
+    const workspace = join(home, ".tps", "branch-office", agent);
+    mkdirSync(workspace, { recursive: true });
+    const nativeDir = join(home, ".tps", "agents", agent);
+    mkdirSync(nativeDir, { recursive: true });
+    writeFileSync(join(nativeDir, "agent.yaml"), `agentId: ${agent}\nworkspace: ${workspace}\n`);
+    mkdirSync(join(home, ".openclaw"), { recursive: true });
+    writeFileSync(join(home, ".openclaw", "openclaw.json"), JSON.stringify({ agents: { list: [{ id: "other-agent" }] } }));
+    const probe = join(home, "gateway-probed");
+    writeFileSync(join(fakeBin, "openclaw"), `#!/bin/sh\ntouch '${probe}'\nexit 1\n`);
+
+    const result = await runTps(["heartbeat", agent]);
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Heartbeat for ${agent}: online`);
+    expect(() => readFileSync(probe)).toThrow();
+  });
+
+  test("a heartbeat without OpenClaw configuration or executable exits 0", async () => {
+    const agent = "no-openclaw";
+    mkdirSync(join(home, ".tps", "branch-office", agent), { recursive: true });
+    rmSync(join(fakeBin, "openclaw"));
+
+    const result = await runTps(["heartbeat", agent], { PATH: fakeBin });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toContain(`Heartbeat for ${agent}: online`);
+  });
+
+  test("an OpenClaw agent heartbeat exits 1 for a failed gateway check", async () => {
+    const agent = "openclaw-agent";
+    mkdirSync(join(home, ".tps", "branch-office", agent), { recursive: true });
+    mkdirSync(join(home, ".openclaw"), { recursive: true });
+    writeFileSync(join(home, ".openclaw", "openclaw.json"), JSON.stringify({ agents: { list: [{ id: agent }] } }));
+    writeFileSync(join(fakeBin, "openclaw"), "#!/bin/sh\nexit 1\n");
+
+    const result = await runTps(["heartbeat", agent]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("gateway unreachable");
   });
 });

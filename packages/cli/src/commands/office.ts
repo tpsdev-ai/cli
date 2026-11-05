@@ -312,7 +312,7 @@ function injectSecrets(containerName: string, secrets: Array<{ key: string; valu
  * ops-209a: Conditionally provision Flair spoke on the remote branch.
  * Called from join when --tunnel-via is given and --no-flair is not set.
  */
-async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promise<void> {
+export async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promise<void> {
   if (args.noFlair) {
     console.log("ℹ️  --no-flair: skipping Flair spoke provisioning.");
     return;
@@ -365,7 +365,8 @@ async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promi
         const fed = configureFederation(args.tunnelVia!, agent, plan);
         if (fed.lastSync) {
           console.log(`   ✅ Fed-sync configured + validated (timer ${fed.timerName})`);
-        } else {
+        } else if (state.os === "linux") {
+          process.exitCode = 1;
           console.log(`   ⚠️  Fed-sync partially configured: initial sync failed.`);
           console.log(`       Branch is hub-less until the sync is working.`);
         }

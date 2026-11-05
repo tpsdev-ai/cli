@@ -414,7 +414,10 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 
   const checks: string[] = [];
   checks.push(...checkWorkspaceWritable(workspace));
-  checks.push(...checkGatewayHealth());
+  const configPath = resolveConfigPath(args.configPath);
+  if (configPath && getAgentList(readOpenClawConfig(configPath)).some((agent) => agent.id === agentId)) {
+    checks.push(...checkGatewayHealth());
+  }
   checks.push(...checkQueueAge(workspace));
 
   const now = nowIso();

@@ -128,7 +128,41 @@ function exitContext(node: ts.Node, sf: ts.SourceFile): string {
   return chain.join(" > ") || "<module>";
 }
 
-/** No-argument or explicit-zero exit calls. */
+function constantNumber(node: ts.Expression): number | undefined {
+  if (ts.isParenthesizedExpression(node) || ts.isAsExpression(node) || ts.isTypeAssertionExpression(node) ||
+      ts.isNonNullExpression(node) || ts.isSatisfiesExpression(node)) return constantNumber(node.expression);
+  if (ts.isNumericLiteral(node)) return Number(node.text.replace(/_/g, ""));
+  if (ts.isPrefixUnaryExpression(node)) {
+    const value = constantNumber(node.operand);
+    if (value === undefined) return undefined;
+    switch (node.operator) {
+      case ts.SyntaxKind.PlusToken: return +value;
+      case ts.SyntaxKind.MinusToken: return -value;
+      case ts.SyntaxKind.TildeToken: return ~value;
+      default: return undefined;
+    }
+  }
+  if (!ts.isBinaryExpression(node)) return undefined;
+  const left = constantNumber(node.left);
+  const right = constantNumber(node.right);
+  if (left === undefined || right === undefined) return undefined;
+  switch (node.operatorToken.kind) {
+    case ts.SyntaxKind.PlusToken: return left + right;
+    case ts.SyntaxKind.MinusToken: return left - right;
+    case ts.SyntaxKind.AsteriskToken: return left * right;
+    case ts.SyntaxKind.AsteriskAsteriskToken: return left ** right;
+    case ts.SyntaxKind.SlashToken: return left / right;
+    case ts.SyntaxKind.PercentToken: return left % right;
+    case ts.SyntaxKind.LessThanLessThanToken: return left << right;
+    case ts.SyntaxKind.GreaterThanGreaterThanToken: return left >> right;
+    case ts.SyntaxKind.GreaterThanGreaterThanGreaterThanToken: return left >>> right;
+    case ts.SyntaxKind.AmpersandToken: return left & right;
+    case ts.SyntaxKind.BarToken: return left | right;
+    case ts.SyntaxKind.CaretToken: return left ^ right;
+    default: return undefined;
+  }
+}
+
 function zeroExitSites(src: string, file = "sample.ts"): ExitSite[] {
   const sf = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true);
   const sites: ExitSite[] = [];
@@ -144,7 +178,7 @@ function zeroExitSites(src: string, file = "sample.ts"): ExitSite[] {
       const arg = node.arguments[0];
       const isZero =
         arg === undefined ||
-        (ts.isNumericLiteral(arg) && Number(arg.text.replace(/_/g, "")) === 0);
+        constantNumber(arg) === 0;
       if (isZero) {
         const context = exitContext(node, sf);
         const ordinal = (ordinals.get(context) ?? 0) + 1;
@@ -234,6 +268,20 @@ describe("cli#750 — no-argument and explicit-zero process.exit contexts", () =
     expect(zeroExitLines("export function runThing() { process.exit(); }")).toEqual([1]);
     expect(zeroExitLines("export function runThing() { process.exit(0x0); }")).toEqual([1]);
   });
+
+  test.each([
+    "((0))", "-0", "+0", "-(+(-0x0))", "0b0", "0o0", "0.0e3",
+    "1 - 1", "0 * 12", "0 / 2", "2 % 2", "0 ** 2", "1 >> 1", "0 << 1",
+    "1 >>> 1", "1 & 0", "0 | 0", "1 ^ 1", "~-1", "(0 as number)!", "0 satisfies number",
+  ])("the scanner records numeric constant zero: %s", (expression) => {
+    expect(zeroExitLines(`process.exit(${expression});`)).toEqual([1]);
+  });
+
+  test.each(["-1", "+1", "1 + 1", "0 / 0", "1 / 0", "0 ** 0", "1 << 1", "~0"])(
+    "the scanner ignores a nonzero or nonfinite numeric constant: %s", (expression) => {
+      expect(zeroExitLines(`process.exit(${expression});`)).toEqual([]);
+    },
+  );
 
   test("the scanner ignores refusals, the completion tail, comments and strings", () => {
     expect(zeroExitLines("export function runThing() { process.exit(1); }")).toEqual([]);
