@@ -14,7 +14,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -150,9 +150,9 @@ interface KillResult {
 }
 
 /** Spawn the real CLI in its own process group and wait for it to be reaped. */
-function runKill(): Promise<KillResult> {
+function runKill(extraEnv: Record<string, string> = {}): Promise<KillResult> {
   const child = spawn(process.execPath, [TPS_BIN, "office", "kill"], {
-    env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root") },
+    env: { ...process.env, HOME: home, TPS_ROOT: join(home, "tps-root"), ...extraEnv },
     stdio: ["ignore", "pipe", "pipe"],
     detached: true,
   });
@@ -178,6 +178,58 @@ function recordPid(path: string): number {
   const pid = Number(readFileSync(path, "utf8").trim());
   if (!Number.isInteger(pid) || pid < 1) throw new Error(`no pid in ${path}`);
   return pid;
+}
+
+/** Wait for the kill command to announce its branch-step test pause. */
+function waitForPauseReady(dir: string, timeoutMs = 15_000): Promise<void> {
+  return new Promise((resolveWait, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      let names: string[] = [];
+      try {
+        names = readdirSync(dir);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          reject(error);
+          return;
+        }
+      }
+      if (names.some((name) => name.startsWith("ready-office-kill-branch-before-decision-"))) {
+        resolveWait();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`timed out waiting for the branch-step pause in ${dir}`));
+        return;
+      }
+      setTimeout(poll, 5);
+    };
+    poll();
+  });
+}
+
+/** Wait for a pid record at `path` that names a pid other than `notPid`. */
+function waitForRecordPidOtherThan(path: string, notPid: number, timeoutMs = 10_000): Promise<number> {
+  return new Promise((resolveWait, reject) => {
+    const deadline = Date.now() + timeoutMs;
+    const poll = (): void => {
+      try {
+        const pid = Number(JSON.parse(readFileSync(path, "utf8")).pid);
+        if (Number.isInteger(pid) && pid > 0 && pid !== notPid) {
+          resolveWait(pid);
+          return;
+        }
+      } catch {
+        /* not written yet, or caught mid-write */
+      }
+      if (Date.now() >= deadline) {
+        reject(new Error(`timed out waiting for a new pid record at ${path}`));
+        return;
+      }
+      setTimeout(poll, 5);
+    };
+    poll();
+  });
 }
 
 function spawnDetached(command: string, args: string[], stdio: ("ignore" | "pipe")[]): ChildProcess {
@@ -326,6 +378,123 @@ describe("office kill re-lists host records", () => {
       expect(existsSync(hostAPath)).toBe(false);
       await waitForPidExited(pidA);
       if (Number.isInteger(pidB)) await waitForPidExited(pidB);
+    },
+    TEST_TIMEOUT,
+  );
+
+  test(
+    "a successor record written after the predecessor's record is removed is stopped in the final pass",
+    async () => {
+      const hostAPath = hostStatePath("host-a");
+      const pauseDir = join(home, "pause");
+      const successorSeen = join(home, "successor-seen.txt");
+      const script = join(home, "removed-then-successor.ts");
+      mkdirSync(pauseDir, { recursive: true });
+      mkdirSync(join(home, "tps-root"), { recursive: true });
+      writeFileSync(
+        script,
+        `
+          import { spawn } from "node:child_process";
+          import { existsSync, readdirSync, writeFileSync } from "node:fs";
+          import { processStartToken } from ${JSON.stringify(AGENT_INDEX)};
+          const marker = process.argv[2];
+          const role = process.argv[3];
+          const record = ${JSON.stringify(hostAPath)};
+          const pauseDir = ${JSON.stringify(pauseDir)};
+          const ready = (name) => ${JSON.stringify(home)} + "/ready-" + name;
+          const wait = new Int32Array(new SharedArrayBuffer(4));
+          const waitFor = (path, timeoutMs) => {
+            const deadline = Date.now() + timeoutMs;
+            while (!existsSync(path)) {
+              if (Date.now() >= deadline) throw new Error("timed out waiting for " + path);
+              Atomics.wait(wait, 0, 0, 5);
+            }
+          };
+          const waitForAbsent = (path, timeoutMs) => {
+            const deadline = Date.now() + timeoutMs;
+            while (existsSync(path)) {
+              if (Date.now() >= deadline) throw new Error("timed out waiting for " + path + " to be removed");
+              Atomics.wait(wait, 0, 0, 5);
+            }
+          };
+          const waitForPause = (timeoutMs) => {
+            const deadline = Date.now() + timeoutMs;
+            while (true) {
+              let names = [];
+              try { names = readdirSync(pauseDir); } catch (error) {
+                if (error.code !== "ENOENT") throw error;
+              }
+              if (names.some((name) => name.startsWith("ready-office-kill-branch-before-decision-"))) return;
+              if (Date.now() >= deadline) throw new Error("timed out waiting for the branch-step pause");
+              Atomics.wait(wait, 0, 0, 5);
+            }
+          };
+          if (role === "predecessor") {
+            process.on("SIGTERM", () => {
+              // The kill command removes this record only after this process
+              // exits, so a launcher waits for the removal and starts the
+              // successor after it.
+              spawn(process.execPath, [process.argv[1], marker, "launcher"], { stdio: "ignore" });
+              process.exit(0);
+            });
+            writeFileSync(ready("predecessor"), "");
+            setInterval(() => {}, 1000);
+          } else if (role === "launcher") {
+            waitForAbsent(record, 30000);
+            // Write the successor record while the kill command is held at its
+            // branch-step pause, so the record exists before the final pass.
+            waitForPause(15000);
+            const successor = spawn(process.execPath, [process.argv[1], marker, "successor"], { stdio: "ignore" });
+            waitFor(ready("successor"), 10000);
+            const token = processStartToken(successor.pid);
+            if (token === null) throw new Error("no start token for the successor");
+            writeFileSync(record, JSON.stringify({ pid: successor.pid, startToken: token }));
+            process.exit(0);
+          } else {
+            process.on("SIGTERM", () => {
+              writeFileSync(${JSON.stringify(successorSeen)}, String(process.pid));
+              process.exit(0);
+            });
+            writeFileSync(ready("successor"), "");
+            setInterval(() => {}, 1000);
+          }
+        `,
+        "utf8",
+      );
+
+      const hostA = spawnDetached(process.execPath, [script, MARKER, "predecessor"], ["ignore", "ignore", "pipe"]);
+      await waitForFile(join(home, "ready-predecessor"));
+      const pidA = hostA.pid;
+      if (pidA === undefined) throw new Error("host-a has no pid");
+      const tokenA = processStartToken(pidA);
+      if (tokenA === null) throw new Error("no start token for host-a");
+      writeFileSync(hostAPath, serializePidRecord(pidA, tokenA), "utf8");
+
+      const resultPromise = runKill({
+        TPS_BRANCH_TEST_PAUSE_DIR: pauseDir,
+        TPS_BRANCH_TEST_PAUSE_PHASE: "office-kill-branch-before-decision",
+      });
+      await waitForPauseReady(pauseDir);
+      const pidB = await waitForRecordPidOtherThan(hostAPath, pidA);
+      writeFileSync(join(pauseDir, "go-office-kill-branch-before-decision"), "");
+      const result = await resultPromise;
+
+      expect(result.status).toBe(0);
+      expect(result.output).not.toContain("could not be stopped");
+      expect(result.output).not.toContain("still appearing after");
+      const lineA = `Host state record (pid ${pidA}) stopped; record removed: ${hostAPath}.`;
+      const lineB = `Host state record (pid ${pidB}) stopped; record removed: ${hostAPath}.`;
+      expect(result.output).toContain(lineA);
+      expect(result.output).toContain(lineB);
+      expect(result.output).toContain("Kill switch engaged. Terminated 2 TPS process(es).");
+      expect(result.output.indexOf(lineB)).toBeLessThan(result.output.indexOf("Kill switch engaged."));
+      // The successor was written after the kill command had already handled
+      // the predecessor's record at the same path; it must be stopped, never
+      // reported as engaged while still alive.
+      expect(pidExited(pidB)).toBe(true);
+      expect(existsSync(hostAPath)).toBe(false);
+      expect(readFileSync(successorSeen, "utf8")).toBe(String(pidB));
+      await waitForPidExited(pidA);
     },
     TEST_TIMEOUT,
   );
