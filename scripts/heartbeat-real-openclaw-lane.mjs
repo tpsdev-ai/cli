@@ -34,11 +34,8 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TPS_BIN = resolve(process.env.TPS_HEARTBEAT_BIN ?? join(REPO, "packages", "cli", "dist", "bin", "tps.js"));
 const KEEP = process.env.TPS_HEARTBEAT_KEEP === "1";
 const READY_TIMEOUT_MS = 90_000;
-
-if (process.argv.includes("--pin")) {
-  process.stdout.write(`${OPENCLAW_VERSION}\n`);
-  process.exit(0);
-}
+/** The only connect failure that means "nothing is listening". */
+const PORT_CLOSED_CODES = new Set(["ECONNREFUSED"]);
 
 function delay(ms) {
   return new Promise((resolveDelay) => setTimeout(resolveDelay, ms));
@@ -55,19 +52,41 @@ async function freePort() {
   return port;
 }
 
-async function assertPortClosed(port) {
-  const outcome = await new Promise((resolveProbe) => {
-    const socket = net.connect({ host: "127.0.0.1", port });
-    const done = (kind) => {
+/**
+ * Probe a loopback port once. Resolves "open" when a connection is accepted and
+ * "closed" only on ECONNREFUSED; a timeout or any other error rejects with that
+ * error named, because neither proves the port refuses connections.
+ */
+export function probePort(port, { host = "127.0.0.1", timeoutMs = 1000, connect = net.connect } = {}) {
+  return new Promise((resolveProbe, rejectProbe) => {
+    const socket = connect({ host, port });
+    let settled = false;
+    const finish = (outcome, error) => {
+      if (settled) return;
+      settled = true;
       socket.destroy();
-      resolveProbe(kind);
+      if (error) rejectProbe(error);
+      else resolveProbe(outcome);
     };
-    socket.setTimeout(1000);
-    socket.once("connect", () => done("open"));
-    socket.once("error", () => done("closed"));
-    socket.once("timeout", () => done("closed"));
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => finish("open"));
+    socket.once("timeout", () =>
+      finish("timeout", new Error(`probe of ${host}:${port} timed out after ${timeoutMs}ms`)),
+    );
+    socket.once("error", (error) => {
+      if (PORT_CLOSED_CODES.has(error.code)) finish("closed");
+      else finish("error", new Error(`probe of ${host}:${port} failed: ${error.code ?? error.message}`));
+    });
   });
-  assert.equal(outcome, "closed", `port ${port} is listening; the dead-gateway case needs a closed port`);
+}
+
+export async function assertPortClosed(port, options = {}) {
+  const outcome = await probePort(port, options);
+  assert.equal(
+    outcome,
+    "closed",
+    `port ${port} is listening; the dead-gateway case needs a port that refuses connections`,
+  );
 }
 
 function installOpenClaw(root) {
@@ -140,8 +159,29 @@ function describeRun(result) {
   return `status=${result.status} signal=${result.signal ?? "none"}\nstdout:\n${result.stdout ?? ""}\nstderr:\n${result.stderr ?? ""}`;
 }
 
-async function waitForRpc(testCase, port, binDir, gateway, logPath) {
-  const deadline = Date.now() + READY_TIMEOUT_MS;
+function defaultStatusProbe({ binDir, testCase, port, timeout, rpcTimeout }) {
+  return spawnSync(join(binDir, "openclaw"), ["gateway", "status", "--require-rpc", "--timeout", String(rpcTimeout)], {
+    env: laneEnv(testCase, port, binDir),
+    encoding: "utf-8",
+    timeout,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+}
+
+/**
+ * Poll `gateway status --require-rpc` until it succeeds or the readiness
+ * deadline passes. Each probe's timeout and each sleep are capped by the time
+ * left, and a success observed after the deadline is rejected.
+ */
+export async function waitForRpc(testCase, port, binDir, gateway, logPath, options = {}) {
+  const {
+    timeoutMs = READY_TIMEOUT_MS,
+    pollMs = 1000,
+    probeTimeoutMs = 5000,
+    rpcTimeoutMs = 2000,
+    runStatus = defaultStatusProbe,
+  } = options;
+  const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
     if (gateway.exitCode !== null) {
@@ -149,21 +189,24 @@ async function waitForRpc(testCase, port, binDir, gateway, logPath) {
         `gateway exited with ${gateway.exitCode} before RPC readiness\n${readLogTail(logPath)}`,
       );
     }
-    last = spawnSync(
-      join(binDir, "openclaw"),
-      ["gateway", "status", "--require-rpc", "--timeout", "2000"],
-      {
-        env: laneEnv(testCase, port, binDir),
-        encoding: "utf-8",
-        timeout: 5000,
-        maxBuffer: 10 * 1024 * 1024,
-      },
-    );
-    if (last.status === 0) return;
-    await delay(1000);
+    const remaining = Math.max(1, deadline - Date.now());
+    last = runStatus({
+      binDir,
+      testCase,
+      port,
+      timeout: Math.min(probeTimeoutMs, remaining),
+      rpcTimeout: Math.max(1, Math.min(rpcTimeoutMs, remaining)),
+    });
+    if (last.status === 0) {
+      if (Date.now() > deadline) {
+        throw new Error(`gateway answered --require-rpc after the ${timeoutMs / 1000}s readiness deadline`);
+      }
+      return;
+    }
+    await delay(Math.min(pollMs, Math.max(0, deadline - Date.now())));
   }
   throw new Error(
-    `gateway did not answer --require-rpc within ${READY_TIMEOUT_MS / 1000}s\n${describeRun(last)}\n${readLogTail(logPath)}`,
+    `gateway did not answer --require-rpc within ${timeoutMs / 1000}s\n${describeRun(last)}\n${readLogTail(logPath)}`,
   );
 }
 
@@ -175,23 +218,36 @@ function readLogTail(path) {
   }
 }
 
-async function stopGateway(child) {
-  if (!child.pid) return;
-  const signalGroup = (signal) => {
+function defaultSignalGroup(pid) {
+  return (signal) => {
     try {
-      process.kill(-child.pid, signal);
+      process.kill(-pid, signal);
     } catch (error) {
       if (error.code !== "ESRCH") throw error;
     }
   };
+}
+
+/**
+ * Stop the gateway process group and confirm it exits. Throws when the exit is
+ * not confirmed after SIGKILL: an unconfirmed stop must fail the lane, not warn.
+ */
+export async function stopGateway(child, options = {}) {
+  if (!child.pid) return;
+  const { graceMs = 10_000, killMs = 5_000, pollMs = 100, signalGroup = defaultSignalGroup(child.pid) } = options;
+  // A child killed by a signal keeps exitCode null and reports the signal instead.
+  const exited = () => child.exitCode !== null || (child.signalCode ?? null) !== null;
   signalGroup("SIGTERM");
-  const deadline = Date.now() + 10_000;
-  while (child.exitCode === null && Date.now() < deadline) await delay(100);
-  if (child.exitCode === null) {
-    signalGroup("SIGKILL");
-    const killDeadline = Date.now() + 5_000;
-    while (child.exitCode === null && Date.now() < killDeadline) await delay(100);
-    if (child.exitCode === null) console.error(`[lane] warning: gateway process ${child.pid} did not exit after SIGKILL`);
+  const deadline = Date.now() + graceMs;
+  while (!exited() && Date.now() < deadline) await delay(Math.min(pollMs, Math.max(1, deadline - Date.now())));
+  if (exited()) return;
+  signalGroup("SIGKILL");
+  const killDeadline = Date.now() + killMs;
+  while (!exited() && Date.now() < killDeadline) {
+    await delay(Math.min(pollMs, Math.max(1, killDeadline - Date.now())));
+  }
+  if (!exited()) {
+    throw new Error(`gateway process ${child.pid} did not exit after SIGKILL within ${killMs / 1000}s`);
   }
 }
 
@@ -237,27 +293,40 @@ async function runLiveCase(root, binDir) {
     assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
     console.log("PASS live gateway: exit 0, persisted online with no errors");
   } finally {
-    await stopGateway(gateway);
-    closeSync(logFd);
+    try {
+      await stopGateway(gateway);
+    } finally {
+      closeSync(logFd);
+    }
   }
 }
 
-const root = mkdtempSync(join(tmpdir(), "tps-heartbeat-lane-"));
-let binDir;
-try {
-  assert.ok(existsSync(TPS_BIN), `built tps entry point not found: ${TPS_BIN}`);
-  binDir = process.env.OPENCLAW_BIN_DIR ? resolve(process.env.OPENCLAW_BIN_DIR) : installOpenClaw(root);
-  const openclawBin = join(binDir, "openclaw");
-  assert.ok(existsSync(openclawBin), `openclaw not found in ${binDir}`);
-  const version = spawnSync(openclawBin, ["--version"], { encoding: "utf-8", timeout: 30_000 });
-  assert.equal(version.status, 0, `openclaw --version failed: ${version.stderr ?? ""}`);
-  assert.match(version.stdout, new RegExp(OPENCLAW_VERSION.replaceAll(".", "\\.")), `expected OpenClaw ${OPENCLAW_VERSION}, got: ${version.stdout.trim()}`);
-  console.log(`[lane] using ${openclawBin} (${version.stdout.trim()})`);
+export async function main() {
+  if (process.argv.includes("--pin")) {
+    process.stdout.write(`${OPENCLAW_VERSION}\n`);
+    return;
+  }
+  const root = mkdtempSync(join(tmpdir(), "tps-heartbeat-lane-"));
+  let binDir;
+  try {
+    assert.ok(existsSync(TPS_BIN), `built tps entry point not found: ${TPS_BIN}`);
+    binDir = process.env.OPENCLAW_BIN_DIR ? resolve(process.env.OPENCLAW_BIN_DIR) : installOpenClaw(root);
+    const openclawBin = join(binDir, "openclaw");
+    assert.ok(existsSync(openclawBin), `openclaw not found in ${binDir}`);
+    const version = spawnSync(openclawBin, ["--version"], { encoding: "utf-8", timeout: 30_000 });
+    assert.equal(version.status, 0, `openclaw --version failed: ${version.stderr ?? ""}`);
+    assert.match(version.stdout, new RegExp(OPENCLAW_VERSION.replaceAll(".", "\\.")), `expected OpenClaw ${OPENCLAW_VERSION}, got: ${version.stdout.trim()}`);
+    console.log(`[lane] using ${openclawBin} (${version.stdout.trim()})`);
 
-  await runDeadCase(root, binDir);
-  await runLiveCase(root, binDir);
-  console.log("[lane] both cases passed");
-} finally {
-  if (KEEP) console.log(`[lane] kept ${root}`);
-  else rmSync(root, { recursive: true, force: true });
+    await runDeadCase(root, binDir);
+    await runLiveCase(root, binDir);
+    console.log("[lane] both cases passed");
+  } finally {
+    if (KEEP) console.log(`[lane] kept ${root}`);
+    else rmSync(root, { recursive: true, force: true });
+  }
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
 }
