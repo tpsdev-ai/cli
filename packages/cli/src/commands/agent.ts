@@ -17,8 +17,8 @@ import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/iden
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
-import { sign as cryptoSign } from "node:crypto";
+import { accessSync, chmodSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
+import { randomUUID, sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
 import {
@@ -44,7 +44,7 @@ import {
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | "set-runtime";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -74,9 +74,11 @@ export interface AgentArgs {
   /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
   sandboxRequired?: boolean;
   /**
-   * The selected agent runtime (`--runtime claude-code|codex|gemini`). Carried
-   * into the attested re-exec so the sandboxed child runs the runtime runner
-   * (cli#363 slice B); undefined for the default AgentRuntime path.
+   * For create/set-runtime: heartbeat's recorded runtime (`openclaw` or
+   * `native`). For start: the selected runtime (`--runtime
+   * claude-code|codex|gemini`), carried into the attested re-exec so the
+   * sandboxed child runs the runtime runner (cli#363 slice B); undefined for
+   * the default AgentRuntime path.
    */
   runtime?: string;
   lines?: number;
@@ -93,6 +95,81 @@ interface AgentHealthcheckResult {
 
 function healthcheckHomeDir(): string {
   return process.env.TPS_HOME ?? homedir();
+}
+
+const AGENT_RUNTIME_VALUES = ["openclaw", "native"] as const;
+type RecordedAgentRuntime = (typeof AGENT_RUNTIME_VALUES)[number];
+
+function parseRecordedRuntime(value: string | undefined): RecordedAgentRuntime | null {
+  return value === "openclaw" || value === "native" ? value : null;
+}
+
+function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime): string {
+  const refuse = (): never => { throw new Error("Unsupported runtime YAML; edit the file by hand."); };
+  const lines = configText.split(/\r\n|\r|\n/);
+  if (lines.filter((line) => /^---(?:[ \t]|$)/.test(line)).length > 1
+    || lines.some((line) => /^\.\.\.(?:[ \t]|$)/.test(line))) refuse();
+  type Node = { start: number; end: number; kind: string; value: unknown; children: Node[] };
+  const stack: Node[] = [];
+  let root: Node | undefined;
+  const parsed = yaml.load(configText, {
+    listener(event, state) {
+      if (event === "open") {
+        stack.push({ start: state.position, end: 0, kind: "", value: undefined, children: [] });
+      } else {
+        const node = stack.pop()!;
+        Object.assign(node, { end: state.position, kind: state.kind, value: state.result });
+        if (stack.length) stack[stack.length - 1].children.push(node);
+        else root = node;
+      }
+    },
+  });
+  if (!root || root.kind !== "mapping" || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) refuse();
+  const mapping = root!;
+  if (configText.slice(mapping.start).trimStart().startsWith("{")) refuse();
+  const hasRuntimeKey = (node: Node): boolean =>
+    (node.kind === "mapping" && node.children.some((child, index) => index % 2 === 0 && child.value === "runtime"))
+    || node.children.some(hasRuntimeKey);
+  if (mapping.children.some(hasRuntimeKey)) refuse();
+  for (let i = 0; i < mapping.children.length; i += 2) {
+    const key = mapping.children[i];
+    if (key.value !== "runtime") continue;
+    const value = mapping.children[i + 1];
+    const raw = value && configText.slice(value.start, value.end);
+    const keyStart = Math.max(configText.lastIndexOf("\n", key.start - 1), configText.lastIndexOf("\r", key.start - 1)) + 1;
+    if (key.start !== keyStart || configText.slice(key.start, key.end) !== "runtime"
+      || !value || value.kind !== "scalar" || !raw?.trim() || /[\r\n\u0085\u2028\u2029]/.test(raw)
+      || /^[!&*|>\[\]{},'"%@`]/.test(raw.trimStart())
+      || !/^:[ \t]*$/.test(configText.slice(key.end, value.start))) refuse();
+    const lineBreak = configText.slice(value.end).search(/[\r\n]/);
+    const end = lineBreak < 0 ? configText.length : value.end + lineBreak;
+    return `${configText.slice(0, key.start)}runtime: ${runtime}${configText.slice(end)}`;
+  }
+  if (Object.hasOwn(parsed as object, "runtime")) refuse();
+  let insertion = 0;
+  for (const line of lines) {
+    const marker = /^---[ \t]*(?:#.*)?$/.test(line);
+    if (!marker && !/^(?:%.*|[ \t]*(?:#.*)?)$/.test(line)) break;
+    const end = insertion + line.length;
+    insertion = end + (configText.slice(end).match(/^(?:\r\n|\r|\n)/)?.[0].length ?? 0);
+    if (marker) break;
+  }
+  const newline = configText.match(/\r\n|\r|\n/)?.[0] ?? "\n";
+  return `${configText.slice(0, insertion)}runtime: ${runtime}${newline}${configText.slice(insertion)}`;
+}
+
+function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number, expected: Buffer): void {
+  const temporary = join(dirname(configPath), `.agent-runtime-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, contents, { flag: "wx", mode });
+    chmodSync(temporary, mode);
+    if (!readFileSync(configPath).equals(expected)) {
+      throw new Error("Config changed since it was read; leaving it unchanged.");
+    }
+    renameSync(temporary, configPath);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
 }
 
 function agentHomeDir(): string {
@@ -468,6 +545,19 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const name = args.name ?? id;
   const model = args.model ?? "anthropic/claude-sonnet-4-6";
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
+  const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
+  const configExists = existsSync(configPath);
+  if (configExists && args.runtime !== undefined) {
+    console.error(`❌ Config already exists at ${configPath}. Run: tps agent set-runtime --id ${id} --runtime ${args.runtime}`);
+    process.exit(1);
+  }
+  const requestedRuntime = args.runtime ?? (configExists ? undefined : "native");
+  const runtime = requestedRuntime === undefined ? undefined : parseRecordedRuntime(requestedRuntime);
+  if (requestedRuntime !== undefined && !runtime) {
+    console.error(`❌ Refusing runtime '${requestedRuntime}': only 'openclaw' and 'native' are accepted.`);
+    console.error(`   Run: tps agent create --id ${id} --runtime <openclaw|native>`);
+    process.exit(1);
+  }
   const identityDir = join(homedir(), ".tps", "identity");
   const keyPrefix = id;
 
@@ -671,7 +761,6 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const agentsDir = join(homedir(), ".tps", "agents", id);
   mkdirSync(agentsDir, { recursive: true });
 
-  const configPath = join(agentsDir, "agent.yaml");
   const mailDir = join(homedir(), ".tps", "mail");
   const memoryPath = join(agentsDir, "memory.jsonl");
   const workspace = join(homedir(), "ops");
@@ -679,8 +768,10 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const [provider, ...modelParts] = model.split("/");
   const modelName = modelParts.join("/");
 
-  const config = `# TPS Agent config for ${id}
+  if (runtime !== undefined) {
+    const config = `# TPS Agent config for ${id}
 agentId: ${id}
+runtime: ${runtime}
 name: ${name}
 workspace: ${workspace}
 mailDir: ${mailDir}
@@ -702,12 +793,89 @@ tools:
   - mail
 `;
 
-  writeFileSync(configPath, config, "utf-8");
-  console.log(`  Config written to ${configPath}`);
+    writeFileSync(configPath, config, "utf-8");
+    console.log(`  Config written to ${configPath}`);
+  } else {
+    console.log(`  Config preserved at ${configPath}`);
+  }
 
   console.log(`\n✅ Agent '${id}' is ready.`);
   console.log(`   Run:  tps agent start --id ${id}`);
   console.log(`   Or:   tps agent run --id ${id} --message "hello"`);
+}
+
+// ─── set-runtime ─────────────────────────────────────────────────────────────
+
+function setAgentRuntime(args: AgentArgs): void {
+  const id = args.id;
+  if (!id) {
+    console.error("Usage: tps agent set-runtime --id <agent-id> --runtime <openclaw|native>");
+    process.exit(1);
+  }
+  // Prevent path traversal via crafted agent IDs (e.g. "../../foo").
+  if (id.includes("/") || id.includes("\\") || id.includes("..")) {
+    console.error(`Invalid agent id: ${id}`);
+    process.exit(1);
+  }
+  const runtime = parseRecordedRuntime(args.runtime);
+  if (!runtime) {
+    console.error(`❌ Refusing runtime '${args.runtime ?? ""}': only 'openclaw' and 'native' are accepted.`);
+    console.error(`   Run: tps agent set-runtime --id ${id} --runtime <openclaw|native>`);
+    process.exit(1);
+  }
+
+  const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
+  let original: Buffer;
+  let mode: number;
+  try {
+    const stat = lstatSync(configPath);
+    if (!stat.isFile()) throw new Error("Config must be a regular file; edit the file by hand.");
+    mode = stat.mode;
+    original = readFileSync(configPath);
+  } catch (e) {
+    const code = (e as { code?: string } | null)?.code;
+    if (code === "ENOENT") {
+      console.error(`❌ Agent '${id}' has no config at ${configPath}. Run: tps agent create --id ${id}`);
+    } else {
+      console.error(`❌ Cannot read ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    process.exit(1);
+  }
+
+  let updated: string;
+  try {
+    const configText = original.toString("utf-8");
+    if (!Buffer.from(configText, "utf-8").equals(original)) throw new Error("Config must be UTF-8; edit the file by hand.");
+    updated = withRecordedRuntime(configText, runtime);
+    const candidate = yaml.load(updated) as Record<string, unknown> | null;
+    if (candidate?.runtime !== runtime) throw new Error("Runtime candidate verification failed; edit the file by hand.");
+  } catch (e) {
+    console.error(`❌ Cannot update ${configPath}: ${e instanceof Error ? e.message : String(e)} Edit the file by hand.`);
+    process.exit(1);
+  }
+  let written = false;
+  try {
+    writeRuntimeConfig(configPath, updated, mode, original);
+    written = true;
+    const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+    if (parsed?.runtime !== runtime) throw new Error("Runtime verification failed; edit the file by hand.");
+  } catch (e) {
+    if (written) {
+      try {
+        const writtenBytes = Buffer.from(updated, "utf-8");
+        if (readFileSync(configPath).equals(writtenBytes)) {
+          writeRuntimeConfig(configPath, original, mode, writtenBytes);
+        } else {
+          console.error(`❌ Config changed after writing ${configPath}; leaving it unchanged.`);
+        }
+      } catch (restoreError) {
+        console.error(`❌ Cannot restore ${configPath}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+      }
+    }
+    console.error(`❌ Cannot write ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  console.log(`✓ Agent '${id}' runtime recorded as '${runtime}' in ${configPath}`);
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────
@@ -1164,6 +1332,9 @@ async function runAgentCommand(
   switch (args.action) {
     case "create":
       return createAgent(args);
+
+    case "set-runtime":
+      return setAgentRuntime(args);
 
     case "list":
       return listAgents(args);
