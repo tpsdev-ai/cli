@@ -808,13 +808,23 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   const stopHeartbeat = startPresenceHeartbeat(flair, agentId);
   const stopHandles: Array<() => void | Promise<void>> = [];
   let shutdownRequested = false;
-  const shutdown = shutdownHandler(flair, agentId, stopHeartbeat, undefined, undefined, stopHandles);
+  const removeSignalListeners = () => {
+    process.off("SIGINT", onSignal);
+    process.off("SIGTERM", onSignal);
+  };
+  let finishShutdown!: () => void;
+  const shutdownComplete = new Promise<void>((resolve) => { finishShutdown = resolve; });
+  const shutdown = shutdownHandler(flair, agentId, stopHeartbeat, (code) => {
+    removeSignalListeners();
+    finishShutdown();
+    process.exit(code);
+  }, undefined, stopHandles);
   const onSignal = () => {
     shutdownRequested = true;
     shutdown();
   };
-  process.once("SIGINT", onSignal);
-  process.once("SIGTERM", onSignal);
+  process.on("SIGINT", onSignal);
+  process.on("SIGTERM", onSignal);
 
   try {
     const flairOnline = await runtimeBootPreflight(flair, agentId);
@@ -848,200 +858,202 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         throw err;
       }
     }
-  } catch (err) {
-    stopHeartbeat();
-    process.off("SIGINT", onSignal);
-    process.off("SIGTERM", onSignal);
-    throw err;
-  }
-
-  if (shutdownRequested) return;
-
-  // Start Flair task loop (runs in parallel with mail loop)
-  stopHandles.push(startTaskLoop(flair, agentId, async (event) => {
-    const taskBody = event.detail ?? event.summary;
-    const taskId = event.refId ?? event.id;
-    let preTaskState: WorkspaceState | undefined;
-    if (workspaceProvider) {
-      try { preTaskState = await onTaskStart(workspaceProvider, flair, taskId); } catch (e) {
-        console.warn(`[${agentId}] Pre-task lifecycle failed: ${(e as Error).message}`);
-      }
+    if (shutdownRequested) {
+      await shutdownComplete;
+      return;
     }
-    try {
-      const msg: MailMessage = { id: taskId, from: event.authorId, to: agentId, body: taskBody, timestamp: new Date().toISOString() };
-      const flairPub1 = { publishEvent: async (ev: Record<string, unknown>) => {
-        try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
-      }};
-      const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
-        flairPublisher: flairPub1,
-        onStall: () => { notify(event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
-      });
-      const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
-      console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
-      if (shouldSendTaskCompletion(event.authorId, config.autoCommit?.reviewNotify)) {
-        notify(event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
-      }
-      try {
-        await (flair as any).request("POST", "/OrgEvent", {
-          kind: "task.completed", authorId: agentId, targetIds: [event.authorId],
-          summary: `Completed: ${event.summary}`, refId: taskId, scope: event.scope,
-        });
-      } catch { /* non-fatal */ }
-      if (workspaceProvider && preTaskState) {
-        try { await onTaskComplete(workspaceProvider, flair, taskId, preTaskState); } catch (e) {
-          console.warn(`[${agentId}] Post-task lifecycle failed: ${(e as Error).message}`);
-        }
-      } else {
-        await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
-      }
-      // Auto-commit if configured — _runAutoCommitLegacy handles detached HEAD + blocker on exit 2
-      if (config.autoCommit) {
-        const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
-          try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
-        }};
-        const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
-        await publishPrResult(flair, agentId, taskId, prUrl);
-      }
-    } catch (e) {
-      const err = e as Error;
-      console.error(`[${agentId}] Flair task failed:`, err.message);
-      notify(event.authorId, `Task failed (via Flair): ${err.message}`);
-      await publishTaskOutcomeEvent(flair, agentId, {
-        kind: "task.failed",
-        summary: `Task ${taskId} failed: ${err.message.slice(0, 200)}`,
-        refId: taskId,
-      });
-      if (workspaceProvider && preTaskState) {
-        try { await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message); } catch { /* */ }
-      } else {
-        await writeTaskMemory(flair, agentId, "failure", { task: taskBody, error: err.message });
-      }
-    }
-  }).stop);
 
-  // Review trigger — polls the agent's own feed using a different cursor filename from the task loop.
-  if (config.reviewTrigger) {
-    stopHandles.push(startReviewTriggerLoop(flair, agentId, config.reviewTrigger).stop);
-    console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
-  }
-
-  let lastSnapshot = Date.now();
-  let lastTokenRefresh = Date.now();
-  const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
-  while (true) {
-    if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
-      await ensureFreshOpenAIToken(agentId);
-      lastTokenRefresh = Date.now();
-    }
-    if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS && await flair.ping()) {
-      await snapshotSoulToDisk(flair, agentId);
-      lastSnapshot = Date.now();
-    }
-    for (const msg of await pollRuntimeMail(mailCfg)) {
-      console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
-      const refusal = codexDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
-      if (refusal) {
-        console.warn(`[${agentId}] ${refusal}; not dispatched`);
-        continue;
-      }
-      let preTaskState;
+    // Start Flair task loop (runs in parallel with mail loop)
+    stopHandles.push(startTaskLoop(flair, agentId, async (event) => {
+      const taskBody = event.detail ?? event.summary;
+      const taskId = event.refId ?? event.id;
+      let preTaskState: WorkspaceState | undefined;
       if (workspaceProvider) {
-        try { preTaskState = await onTaskStart(workspaceProvider, flair, msg.id); } catch (err: any) {
-          console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
+        try { preTaskState = await onTaskStart(workspaceProvider, flair, taskId); } catch (e) {
+          console.warn(`[${agentId}] Pre-task lifecycle failed: ${(e as Error).message}`);
         }
       }
       try {
-        const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
+        const msg: MailMessage = { id: taskId, from: event.authorId, to: agentId, body: taskBody, timestamp: new Date().toISOString() };
+        const flairPub1 = { publishEvent: async (ev: Record<string, unknown>) => {
           try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
         }};
-        const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
         const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
-          flairPublisher: flairPub2,
-          onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+          flairPublisher: flairPub1,
+          onStall: () => { notify(event.authorId, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
         });
         const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
-        console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
-        if (shouldSendTaskCompletion(msg.from, config.autoCommit?.reviewNotify)) {
-          notify(msg.from, formatTaskCompleteMailBody(summary));
+        console.log(`[${agentId}] Flair task complete. Result: ${result.length} chars`);
+        if (shouldSendTaskCompletion(event.authorId, config.autoCommit?.reviewNotify)) {
+          notify(event.authorId, formatTaskCompleteMailBody(summary, "Task complete (via Flair)"));
         }
-        await publishTaskOutcomeEvent(flair, agentId, {
-          kind: "task.completed",
-          summary: `Task ${msg.id} completed by ${agentId}`,
-          refId: msg.id,
-        });
+        try {
+          await (flair as any).request("POST", "/OrgEvent", {
+            kind: "task.completed", authorId: agentId, targetIds: [event.authorId],
+            summary: `Completed: ${event.summary}`, refId: taskId, scope: event.scope,
+          });
+        } catch { /* non-fatal */ }
         if (workspaceProvider && preTaskState) {
-          try { await onTaskComplete(workspaceProvider, flair, msg.id, preTaskState); } catch (err: any) {
-            console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
+          try { await onTaskComplete(workspaceProvider, flair, taskId, preTaskState); } catch (e) {
+            console.warn(`[${agentId}] Post-task lifecycle failed: ${(e as Error).message}`);
           }
         } else {
-          await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
+          await writeTaskMemory(flair, agentId, "completion", { task: taskBody, summary });
         }
-        // Auto-commit after mail task (same as Flair task path)
+        // Auto-commit if configured — _runAutoCommitLegacy handles detached HEAD + blocker on exit 2
         if (config.autoCommit) {
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          // Detect stale rebase state before attempting autoCommit
-          const rebaseMergeDir = join(config.workspace, ".git", "rebase-merge");
-          const rebaseApplyDir = join(config.workspace, ".git", "rebase-apply");
-          // Also check worktree .git file reference
-          // Resolve worktree git dir (workspace may use a .git file pointer)
-          let wtGitDir: string | null = null;
-          try {
-            const gitFile = join(config.workspace, ".git");
-            if (existsSync(gitFile)) {
-              const stat = require("node:fs").statSync(gitFile);
-              if (!stat.isDirectory()) {
-                const content2 = readFileSync(gitFile, "utf-8").trim();
-                const match = content2.match(/^gitdir:\s*(.+)$/);
-                if (match?.[1]) wtGitDir = match[1].trim();
-              }
-            }
-          } catch { /* ignore */ }
-          const rebaseMergeDirWt = wtGitDir ? join(wtGitDir, "rebase-merge") : null;
-          const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
-            (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
-          if (hasStaleRebase) {
-            console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
-            spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
-          }
-          // Check for file changes or Codex-created commits before attempting autoCommit
-          const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
-          const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
-          const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
-          if (!hasChanges) {
-            console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
-            notify(msg.from,
-              `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
-            );
-          } else {
-            const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-            const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
-            await publishPrResult(flair, agentId, msg.id, prUrl);
-          }
+          const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
+          await publishPrResult(flair, agentId, taskId, prUrl);
         }
-      } catch (err: any) {
-        console.error(`[${agentId}] Task failed:`, err.message);
-        notify(msg.from, `Task failed: ${err.message}`);
+      } catch (e) {
+        const err = e as Error;
+        console.error(`[${agentId}] Flair task failed:`, err.message);
+        notify(event.authorId, `Task failed (via Flair): ${err.message}`);
         await publishTaskOutcomeEvent(flair, agentId, {
           kind: "task.failed",
-          summary: `Task ${msg.id} failed: ${String(err.message ?? err).slice(0, 200)}`,
-          refId: msg.id,
+          summary: `Task ${taskId} failed: ${err.message.slice(0, 200)}`,
+          refId: taskId,
         });
         if (workspaceProvider && preTaskState) {
-          try { await onTaskFailure(workspaceProvider, flair, msg.id, preTaskState, err.message); } catch {}
+          try { await onTaskFailure(workspaceProvider, flair, taskId, preTaskState, err.message); } catch { /* */ }
         } else {
-          await writeTaskMemory(flair, agentId, "failure", { task: msg.body, error: err.message });
+          await writeTaskMemory(flair, agentId, "failure", { task: taskBody, error: err.message });
         }
-      } finally {
-        // Completion boundary end — AFTER the reply is persisted and the
-        // auto-commit (above, which reads the newest cur/ body for its scope
-        // guard) has finished. Acking here is what stops cli#377's lease sweep
-        // re-presenting — and re-dispatching — a finished task forever.
-        completeRuntimeMail(mailCfg, msg.id);
       }
+    }).stop);
+
+    // Review trigger — polls the agent's own feed using a different cursor filename from the task loop.
+    if (config.reviewTrigger) {
+      stopHandles.push(startReviewTriggerLoop(flair, agentId, config.reviewTrigger).stop);
+      console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
     }
 
-    await new Promise(r => setTimeout(r, 5000));
+    let lastSnapshot = Date.now();
+    let lastTokenRefresh = Date.now();
+    const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
+    while (true) {
+      if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
+        await ensureFreshOpenAIToken(agentId);
+        lastTokenRefresh = Date.now();
+      }
+      if (Date.now() - lastSnapshot > FLAIR_SNAPSHOT_INTERVAL_MS && await flair.ping()) {
+        await snapshotSoulToDisk(flair, agentId);
+        lastSnapshot = Date.now();
+      }
+      for (const msg of await pollRuntimeMail(mailCfg)) {
+        console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
+        const refusal = codexDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
+        if (refusal) {
+          console.warn(`[${agentId}] ${refusal}; not dispatched`);
+          continue;
+        }
+        let preTaskState;
+        if (workspaceProvider) {
+          try { preTaskState = await onTaskStart(workspaceProvider, flair, msg.id); } catch (err: any) {
+            console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
+          }
+        }
+        try {
+          const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
+            try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+          }};
+          const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+          const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
+            flairPublisher: flairPub2,
+            onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
+          });
+          const summary = result.length > 500 ? result.slice(0, 500) + "..." : result;
+          console.log(`[${agentId}] Task complete. Result length: ${result.length}`);
+          if (shouldSendTaskCompletion(msg.from, config.autoCommit?.reviewNotify)) {
+            notify(msg.from, formatTaskCompleteMailBody(summary));
+          }
+          await publishTaskOutcomeEvent(flair, agentId, {
+            kind: "task.completed",
+            summary: `Task ${msg.id} completed by ${agentId}`,
+            refId: msg.id,
+          });
+          if (workspaceProvider && preTaskState) {
+            try { await onTaskComplete(workspaceProvider, flair, msg.id, preTaskState); } catch (err: any) {
+              console.warn(`[${agentId}] Post-task lifecycle failed: ${err.message}`);
+            }
+          } else {
+            await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
+          }
+          // Auto-commit after mail task (same as Flair task path)
+          if (config.autoCommit) {
+            const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
+              try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
+            }};
+            // Detect stale rebase state before attempting autoCommit
+            const rebaseMergeDir = join(config.workspace, ".git", "rebase-merge");
+            const rebaseApplyDir = join(config.workspace, ".git", "rebase-apply");
+            // Also check worktree .git file reference
+            // Resolve worktree git dir (workspace may use a .git file pointer)
+            let wtGitDir: string | null = null;
+            try {
+              const gitFile = join(config.workspace, ".git");
+              if (existsSync(gitFile)) {
+                const stat = require("node:fs").statSync(gitFile);
+                if (!stat.isDirectory()) {
+                  const content2 = readFileSync(gitFile, "utf-8").trim();
+                  const match = content2.match(/^gitdir:\s*(.+)$/);
+                  if (match?.[1]) wtGitDir = match[1].trim();
+                }
+              }
+            } catch { /* ignore */ }
+            const rebaseMergeDirWt = wtGitDir ? join(wtGitDir, "rebase-merge") : null;
+            const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
+              (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
+            if (hasStaleRebase) {
+              console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
+              spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
+            }
+            // Check for file changes or Codex-created commits before attempting autoCommit
+            const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
+            const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+            const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
+            if (!hasChanges) {
+              console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
+              notify(msg.from,
+                `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
+              );
+            } else {
+              const mailSubject = msg.body.split("\n")[0].slice(0, 72);
+              const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+              await publishPrResult(flair, agentId, msg.id, prUrl);
+            }
+          }
+        } catch (err: any) {
+          console.error(`[${agentId}] Task failed:`, err.message);
+          notify(msg.from, `Task failed: ${err.message}`);
+          await publishTaskOutcomeEvent(flair, agentId, {
+            kind: "task.failed",
+            summary: `Task ${msg.id} failed: ${String(err.message ?? err).slice(0, 200)}`,
+            refId: msg.id,
+          });
+          if (workspaceProvider && preTaskState) {
+            try { await onTaskFailure(workspaceProvider, flair, msg.id, preTaskState, err.message); } catch {}
+          } else {
+            await writeTaskMemory(flair, agentId, "failure", { task: msg.body, error: err.message });
+          }
+        } finally {
+          // Completion boundary end — AFTER the reply is persisted and the
+          // auto-commit (above, which reads the newest cur/ body for its scope
+          // guard) has finished. Acking here is what stops cli#377's lease sweep
+          // re-presenting — and re-dispatching — a finished task forever.
+          completeRuntimeMail(mailCfg, msg.id);
+        }
+      }
+
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  } catch (err) {
+    stopHeartbeat();
+    throw err;
+  } finally {
+    removeSignalListeners();
   }
 }

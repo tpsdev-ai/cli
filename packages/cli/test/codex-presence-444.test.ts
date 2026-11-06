@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   HEARTBEAT_INTERVAL_MS,
+  SHUTDOWN_DRAIN_TIMEOUT_MS,
   publishRuntimePresence,
   resolveRuntimeKeyPath,
   runCodexRuntime,
@@ -60,7 +61,7 @@ async function driveRuntime(
   opts: {
     reviewTrigger?: { reviewers: string[]; repo: string };
     signalDuringPreflight?: boolean;
-    secondSignal?: "SIGTERM";
+    secondSignal?: "SIGTERM" | "SIGINT";
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
@@ -82,6 +83,7 @@ async function driveRuntime(
 
   const savedFetch = globalThis.fetch;
   const savedExit = process.exit;
+  const savedSetTimeout = globalThis.setTimeout;
   const savedRead = FlairClient.prototype.getEventsSince;
   const savedMailDir = process.env.TPS_MAIL_DIR;
   const savedSigterm = process.listeners("SIGTERM");
@@ -89,6 +91,9 @@ async function driveRuntime(
   const http: string[] = [];
   const presenceBodies: string[] = [];
   let exitCode: number | undefined;
+  let exits = 0;
+  let drains = 0;
+  const signalResults: boolean[] = [];
   let rejected: Error | undefined;
   let runtimeFinished = false;
   let ticked = false;
@@ -123,6 +128,7 @@ async function driveRuntime(
   }) as typeof globalThis.fetch);
   patchShared(process, "exit", ((code?: number) => {
     exitCode = code;
+    exits++;
   }) as never);
 
   try {
@@ -146,18 +152,26 @@ async function driveRuntime(
       ticked = true;
       await waitFor(() => successfulReads >= (opts.reviewTrigger ? 2 : 1));
     }
-    process.emit(signal);
-    if (opts.secondSignal) process.emit(opts.secondSignal);
+    patchShared(globalThis, "setTimeout", ((...args: Parameters<typeof setTimeout>) => {
+      if (args[1] === SHUTDOWN_DRAIN_TIMEOUT_MS) drains++;
+      return savedSetTimeout(...args);
+    }) as typeof setTimeout);
+    signalResults.push(process.emit(signal));
+    if (opts.secondSignal) signalResults.push(process.emit(opts.secondSignal));
+    patchShared(globalThis, "setTimeout", savedSetTimeout);
     releasePreflight?.();
     await waitFor(() => exitCode !== undefined, 5000); // signal handler ran
     await waitFor(() => presenceBodies.some((b) => b.includes("idle")), 5000);
     if (opts.signalDuringPreflight) {
       await waitFor(() => runtimeFinished || http.some((c) => c.startsWith("GET /OrgEventCatchup")));
     }
+    expect(process.listenerCount("SIGTERM")).toBe(savedSigterm.length);
+    expect(process.listenerCount("SIGINT")).toBe(savedSigint.length);
     if (afterShutdown) await afterShutdown(http);
   } finally {
     patchShared(globalThis, "fetch", savedFetch);
     patchShared(process, "exit", savedExit);
+    patchShared(globalThis, "setTimeout", savedSetTimeout);
     patchShared(FlairClient.prototype, "getEventsSince", savedRead);
     if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
     else process.env.TPS_MAIL_DIR = savedMailDir;
@@ -165,7 +179,7 @@ async function driveRuntime(
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
 
-  return { http, presenceBodies, exitCode, rejected, ticked, successfulReads };
+  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads };
 }
 
 async function withLoopClient(
@@ -565,12 +579,21 @@ describe("codex runtime presence (cli#444)", () => {
     expect(r.http.filter((c) => c.startsWith("GET /OrgEventCatchup"))).toEqual([]);
   }, 10_000);
 
-  it("SIGINT then SIGTERM sends one final beat", async () => {
-    const r = await driveRuntime("SIGINT", undefined, { secondSignal: "SIGTERM" });
-    expect(r.rejected).toBeUndefined();
-    expect(r.exitCode).toBe(0);
-    expect(r.presenceBodies.filter((b) => b.includes('"idle"'))).toHaveLength(1);
-  }, 10_000);
+  for (const [first, second] of [
+    ["SIGINT", "SIGINT"],
+    ["SIGTERM", "SIGTERM"],
+    ["SIGINT", "SIGTERM"],
+  ] as const) {
+    it(`${first} then ${second} drains, beats, and exits once`, async () => {
+      const r = await driveRuntime(first, undefined, { secondSignal: second });
+      expect(r.signalResults, "both signals reach a registered listener").toEqual([true, true]);
+      expect(r.rejected).toBeUndefined();
+      expect(r.drains).toBe(1);
+      expect(r.presenceBodies.filter((b) => b.includes('"idle"'))).toHaveLength(1);
+      expect(r.exits).toBe(1);
+      expect(r.exitCode).toBe(0);
+    }, 10_000);
+  }
 
   it("bounds a pending read and handler together, stops both loops, and sends the final beat", async () => {
     const agentId = "agent-drain";
