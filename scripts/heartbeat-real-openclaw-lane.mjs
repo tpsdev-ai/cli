@@ -183,9 +183,9 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
-    if (gateway.exitCode !== null) {
+    if (gateway.exitCode !== null || (gateway.signalCode ?? null) !== null) {
       throw new Error(
-        `gateway exited with ${gateway.exitCode} before RPC readiness\n${readLogTail(logPath)}`,
+        `gateway exited with ${gateway.exitCode !== null ? `code ${gateway.exitCode}` : `signal ${gateway.signalCode}`} before RPC readiness\n${readLogTail(logPath)}`,
       );
     }
     const remaining = Math.max(1, deadline - Date.now());

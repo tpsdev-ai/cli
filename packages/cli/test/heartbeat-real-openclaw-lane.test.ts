@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { EventEmitter } from "node:events";
+import { spawn } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
@@ -75,6 +76,50 @@ describe("the dead-gateway precondition accepts only a refused connection", () =
 });
 
 describe("the readiness deadline bounds each probe", () => {
+  test("an exited gateway rejects with its exit code before probing", async () => {
+    let probes = 0;
+    await expect(
+      waitForRpc(CASE_STUB, 9, "/nonexistent/bin", { exitCode: 17, signalCode: null }, "/nonexistent/log", {
+        runStatus: () => {
+          probes++;
+          return { status: 0 };
+        },
+      }),
+    ).rejects.toThrow(/gateway exited with code 17 before RPC readiness/);
+    expect(probes).toBe(0);
+  });
+
+  test("a real child's SIGTERM exit rejects readiness before probing", async () => {
+    const child = spawn("node", ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    try {
+      await once(child, "spawn");
+      const exited = once(child, "exit");
+      expect(child.kill("SIGTERM")).toBe(true);
+      await exited;
+      expect(child.exitCode).toBeNull();
+      expect(child.signalCode).toBe("SIGTERM");
+      let probes = 0;
+      const started = performance.now();
+      await expect(
+        waitForRpc(CASE_STUB, 9, "/nonexistent/bin", child, "/nonexistent/log", {
+          timeoutMs: 1000,
+          runStatus: () => {
+            probes++;
+            return { status: 0 };
+          },
+        }),
+      ).rejects.toThrow(/gateway exited with signal SIGTERM before RPC readiness/);
+      expect(performance.now() - started).toBeLessThan(500);
+      expect(probes).toBe(0);
+    } finally {
+      if (child.pid && child.exitCode === null && child.signalCode === null) {
+        const exited = once(child, "exit");
+        child.kill("SIGKILL");
+        await exited;
+      }
+    }
+  });
+
   test("a success observed after the deadline is rejected", async () => {
     const runStatus = () => {
       blockedFor(150);
