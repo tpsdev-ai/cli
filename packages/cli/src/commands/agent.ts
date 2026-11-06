@@ -17,7 +17,7 @@ import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/iden
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { randomUUID, sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
@@ -158,10 +158,14 @@ function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime):
   return `${configText.slice(0, insertion)}runtime: ${runtime}${newline}${configText.slice(insertion)}`;
 }
 
-function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number): void {
+function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number, expected: Buffer): void {
   const temporary = join(dirname(configPath), `.agent-runtime-${randomUUID()}.tmp`);
   try {
     writeFileSync(temporary, contents, { flag: "wx", mode });
+    chmodSync(temporary, mode);
+    if (!readFileSync(configPath).equals(expected)) {
+      throw new Error("Config changed since it was read; leaving it unchanged.");
+    }
     renameSync(temporary, configPath);
   } finally {
     rmSync(temporary, { force: true });
@@ -542,7 +546,12 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const model = args.model ?? "anthropic/claude-sonnet-4-6";
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
   const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
-  const requestedRuntime = args.runtime ?? (existsSync(configPath) ? undefined : "native");
+  const configExists = existsSync(configPath);
+  if (configExists && args.runtime !== undefined) {
+    console.error(`❌ Config already exists at ${configPath}. Run: tps agent set-runtime --id ${id} --runtime ${args.runtime}`);
+    process.exit(1);
+  }
+  const requestedRuntime = args.runtime ?? (configExists ? undefined : "native");
   const runtime = requestedRuntime === undefined ? undefined : parseRecordedRuntime(requestedRuntime);
   if (requestedRuntime !== undefined && !runtime) {
     console.error(`❌ Refusing runtime '${requestedRuntime}': only 'openclaw' and 'native' are accepted.`);
@@ -846,14 +855,19 @@ function setAgentRuntime(args: AgentArgs): void {
   }
   let written = false;
   try {
-    writeRuntimeConfig(configPath, updated, mode);
+    writeRuntimeConfig(configPath, updated, mode, original);
     written = true;
     const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
     if (parsed?.runtime !== runtime) throw new Error("Runtime verification failed; edit the file by hand.");
   } catch (e) {
     if (written) {
       try {
-        writeRuntimeConfig(configPath, original, mode);
+        const writtenBytes = Buffer.from(updated, "utf-8");
+        if (readFileSync(configPath).equals(writtenBytes)) {
+          writeRuntimeConfig(configPath, original, mode, writtenBytes);
+        } else {
+          console.error(`❌ Config changed after writing ${configPath}; leaving it unchanged.`);
+        }
       } catch (restoreError) {
         console.error(`❌ Cannot restore ${configPath}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
       }

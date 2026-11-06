@@ -1,6 +1,6 @@
 // cli#757 — built CLI with temporary HOME; the native case removes the fake OpenClaw.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import yaml from "js-yaml";
@@ -284,6 +284,17 @@ describe("cli#757 — recording the runtime", () => {
     expect(readFileSync(probe, "utf-8")).toBe("probed\n");
   }, 30000);
 
+  test("create with an explicit runtime refuses an existing custom config", async () => {
+    const agent = "create-custom";
+    const configPath = writeAgentConfig(agent, "native");
+    writeFileSync(configPath, `${readFileSync(configPath, "utf-8")}llm:\n  provider: custom\n  model: custom-model\ntools: [read]\n`);
+    const before = readFileSync(configPath);
+    const result = await runTps(["agent", "create", "--id", agent, "--runtime", "openclaw"]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`tps agent set-runtime --id ${agent} --runtime openclaw`);
+    expect(readFileSync(configPath)).toEqual(before);
+  }, 20000);
+
   test("a fresh unflagged create records native", async () => {
     const agent = "create-default";
     expect((await runTps(["agent", "create", "--id", agent])).status).toBe(0);
@@ -316,6 +327,57 @@ describe("cli#757 — recording the runtime", () => {
         expect(statSync(configPath).ino).not.toBe(inode);
       }
     }
+  }, 20000);
+
+  test("set-runtime preserves a 0644 config under a 0077 umask", async () => {
+    const agent = "runtime-mode";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    chmodSync(configPath, 0o644);
+    const preload = join(home, "umask.mjs");
+    writeFileSync(preload, "process.umask(0o077);\n");
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(0);
+    expect(statSync(configPath).mode & 0o7777).toBe(0o644);
+  }, 20000);
+
+  test("set-runtime refuses a failed temp chmod before replacing the config", async () => {
+    const agent = "runtime-chmod";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const preload = join(home, "fail-chmod.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+fs.chmodSync = () => { throw new Error("injected chmod failure"); };
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("injected chmod failure");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  test("set-runtime refuses bytes changed before its pre-rename read", async () => {
+    const agent = "runtime-concurrent";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const newer = `${readFileSync(configPath, "utf-8")}# newer edit\n`;
+    const preload = join(home, "edit-before-rename.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const chmod = fs.chmodSync;
+fs.chmodSync = (...args) => {
+  chmod(...args);
+  fs.writeFileSync(${JSON.stringify(configPath)}, ${JSON.stringify(newer)});
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Config changed since it was read");
+    expect(readFileSync(configPath, "utf-8")).toBe(newer);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
 
   test("set-runtime inserts an absent field in a plain mapping", async () => {
@@ -435,10 +497,9 @@ describe("cli#757 — recording the runtime", () => {
     expect(readFileSync(configPath)).toEqual(before);
   }, 20000);
 
-  test("set-runtime restores the original bytes after an injected runtime mismatch", async () => {
+  test("set-runtime keeps a newer edit after a post-write runtime mismatch", async () => {
     const agent = "runtime-verification";
     const configPath = writeAgentConfig(agent, "openclaw");
-    const before = readFileSync(configPath);
     const preload = join(home, "corrupt-after-rename.mjs");
     writeFileSync(preload, `
 import fs from "node:fs";
@@ -458,6 +519,37 @@ syncBuiltinESMExports();
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("Runtime verification failed");
     expect(result.stdout).not.toContain("runtime recorded as");
+    expect(readFileSync(configPath, "utf-8")).toBe("runtime: mismatched\n");
+    expect(result.stderr).toContain("Config changed after writing");
+  }, 20000);
+
+  test("set-runtime restores original bytes when verification fails and its write remains", async () => {
+    const agent = "runtime-restore";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const preload = join(home, "fail-verification.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.renameSync;
+const read = fs.readFileSync;
+let failRead = false;
+fs.renameSync = (from, to) => {
+  rename(from, to);
+  if (to === ${JSON.stringify(configPath)}) failRead = true;
+};
+fs.readFileSync = (...args) => {
+  if (failRead && args[0] === ${JSON.stringify(configPath)}) {
+    failRead = false;
+    throw new Error("injected verification read failure");
+  }
+  return read(...args);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("injected verification read failure");
     expect(readFileSync(configPath)).toEqual(before);
   }, 20000);
 
