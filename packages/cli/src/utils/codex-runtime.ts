@@ -1054,6 +1054,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     stopHeartbeat();
     throw err;
   } finally {
+    if (shutdownRequested) await shutdownComplete;
     removeSignalListeners();
   }
 }

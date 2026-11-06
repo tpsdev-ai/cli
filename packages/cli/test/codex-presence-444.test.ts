@@ -62,6 +62,7 @@ async function driveRuntime(
     reviewTrigger?: { reviewers: string[]; repo: string };
     signalDuringPreflight?: boolean;
     secondSignal?: "SIGTERM" | "SIGINT";
+    preflightError?: Error;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
@@ -85,6 +86,7 @@ async function driveRuntime(
   const savedExit = process.exit;
   const savedSetTimeout = globalThis.setTimeout;
   const savedRead = FlairClient.prototype.getEventsSince;
+  const savedPing = FlairClient.prototype.ping;
   const savedMailDir = process.env.TPS_MAIL_DIR;
   const savedSigterm = process.listeners("SIGTERM");
   const savedSigint = process.listeners("SIGINT");
@@ -99,9 +101,16 @@ async function driveRuntime(
   let ticked = false;
   let successfulReads = 0;
   let releasePreflight: (() => void) | undefined;
+  let releaseFinalBeat: (() => void) | undefined;
   const inboxCur = join(mailRoot, "testbot", "cur");
 
   process.env.TPS_MAIL_DIR = mailRoot;
+  if (opts.preflightError) {
+    patchShared(FlairClient.prototype, "ping", async () => {
+      await new Promise<void>((resolve) => { releasePreflight = resolve; });
+      throw opts.preflightError;
+    });
+  }
   patchShared(FlairClient.prototype, "getEventsSince", async function (...args) {
     const read = await savedRead.apply(this, args);
     if (read.status === "ok") successfulReads++;
@@ -112,7 +121,13 @@ async function driveRuntime(
     const method = init?.method ?? "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     http.push(`${method} ${path}`);
-    if (method === "POST" && path === "/Presence") presenceBodies.push(String(init?.body ?? ""));
+    if (method === "POST" && path === "/Presence") {
+      const body = String(init?.body ?? "");
+      presenceBodies.push(body);
+      if (opts.preflightError && body.includes('"idle"')) {
+        await new Promise<void>((resolve) => { releaseFinalBeat = resolve; });
+      }
+    }
     if (path === "/Health") {
       if (opts.signalDuringPreflight) await new Promise<void>((resolve) => { releasePreflight = resolve; });
       return new Response("ok", { status: 200 });
@@ -152,27 +167,49 @@ async function driveRuntime(
       ticked = true;
       await waitFor(() => successfulReads >= (opts.reviewTrigger ? 2 : 1));
     }
-    patchShared(globalThis, "setTimeout", ((...args: Parameters<typeof setTimeout>) => {
+    const countDrainTimeout = ((...args: Parameters<typeof setTimeout>) => {
       if (args[1] === SHUTDOWN_DRAIN_TIMEOUT_MS) drains++;
       return savedSetTimeout(...args);
-    }) as typeof setTimeout);
+    }) as typeof setTimeout;
+    patchShared(globalThis, "setTimeout", countDrainTimeout);
     signalResults.push(process.emit(signal));
-    if (opts.secondSignal) signalResults.push(process.emit(opts.secondSignal));
     patchShared(globalThis, "setTimeout", savedSetTimeout);
+    if (opts.preflightError) {
+      await waitFor(() => releaseFinalBeat !== undefined);
+      releasePreflight?.();
+      await sleep(0);
+    }
+    if (opts.secondSignal) {
+      patchShared(globalThis, "setTimeout", countDrainTimeout);
+      signalResults.push(process.emit(opts.secondSignal));
+      patchShared(globalThis, "setTimeout", savedSetTimeout);
+    }
+    if (opts.preflightError) {
+      expect(signalResults, "both signals reach a registered listener during the final beat").toEqual([true, true]);
+      expect(rejected, "runtime rejection waits for the final beat").toBeUndefined();
+      expect(exits).toBe(0);
+      releaseFinalBeat?.();
+    }
     releasePreflight?.();
     await waitFor(() => exitCode !== undefined, 5000); // signal handler ran
     await waitFor(() => presenceBodies.some((b) => b.includes("idle")), 5000);
-    if (opts.signalDuringPreflight) {
+    if (opts.preflightError) {
+      await waitFor(() => rejected !== undefined);
+    } else if (opts.signalDuringPreflight) {
       await waitFor(() => runtimeFinished || http.some((c) => c.startsWith("GET /OrgEventCatchup")));
     }
     expect(process.listenerCount("SIGTERM")).toBe(savedSigterm.length);
     expect(process.listenerCount("SIGINT")).toBe(savedSigint.length);
     if (afterShutdown) await afterShutdown(http);
   } finally {
+    releasePreflight?.();
+    releaseFinalBeat?.();
+    if (releaseFinalBeat) await waitFor(() => exitCode !== undefined);
     patchShared(globalThis, "fetch", savedFetch);
     patchShared(process, "exit", savedExit);
     patchShared(globalThis, "setTimeout", savedSetTimeout);
     patchShared(FlairClient.prototype, "getEventsSince", savedRead);
+    patchShared(FlairClient.prototype, "ping", savedPing);
     if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
     else process.env.TPS_MAIL_DIR = savedMailDir;
     for (const l of process.listeners("SIGTERM")) if (!savedSigterm.includes(l)) process.off("SIGTERM", l);
@@ -577,6 +614,20 @@ describe("codex runtime presence (cli#444)", () => {
     expect(r.rejected).toBeUndefined();
     expect(r.exitCode).toBe(0);
     expect(r.http.filter((c) => c.startsWith("GET /OrgEventCatchup"))).toEqual([]);
+  }, 10_000);
+
+  it("a preflight rejection retains the signal guard until the final beat settles", async () => {
+    const preflightError = new Error("preflight failed");
+    const r = await driveRuntime("SIGTERM", undefined, {
+      signalDuringPreflight: true,
+      secondSignal: "SIGTERM",
+      preflightError,
+    });
+    expect(r.rejected).toBe(preflightError);
+    expect(r.drains).toBe(1);
+    expect(r.presenceBodies.filter((b) => b.includes('"idle"'))).toHaveLength(1);
+    expect(r.exits).toBe(1);
+    expect(r.exitCode).toBe(0);
   }, 10_000);
 
   for (const [first, second] of [
