@@ -1188,13 +1188,18 @@ export async function connectAndKeepAlive(
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
+  // A channel whose reference was dropped without a confirmed close keeps the
+  // host record on stop(), even when every other retained channel closes.
+  let unconfirmedChannelClose = false;
   const retainFailedChannel = (channel: TransportChannel) => {
-    // Bound what a persistent close failure can hold: drop the oldest retained
-    // channel when the set is full, so stop() makes at most this many close
-    // attempts instead of one per reconnect during a long outage.
+    // Bound the retained references and the close attempts stop() makes. This
+    // does not close anything.
     if (failedChannels.size >= MAX_RETAINED_FAILED_CHANNELS) {
       const oldest = failedChannels.values().next().value;
-      if (oldest !== undefined) failedChannels.delete(oldest);
+      if (oldest !== undefined) {
+        failedChannels.delete(oldest);
+        unconfirmedChannelClose = true;
+      }
     }
     failedChannels.add(channel);
   };
@@ -1337,13 +1342,12 @@ export async function connectAndKeepAlive(
         cancelInboundPersist();
         if (currentChannel !== null) {
           const failedChannel = currentChannel;
-          retainFailedChannel(failedChannel);
           currentChannel = null;
           try {
             await failedChannel.close();
-            failedChannels.delete(failedChannel);
           } catch (error) {
             console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+            retainFailedChannel(failedChannel);
           }
         }
       }
@@ -1367,7 +1371,7 @@ export async function connectAndKeepAlive(
         console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    if (failedChannels.size > 0) {
+    if (unconfirmedChannelClose || failedChannels.size > 0) {
       const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
       error.name = "HostChannelCloseError";
       throw error;
