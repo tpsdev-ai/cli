@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import yaml from "js-yaml";
 import { loadAgentConfig } from "@tpsdev-ai/agent";
 
@@ -72,9 +72,9 @@ async function runTps(args: string[], env: Record<string, string> = {}, preload?
   return { status, stdout, stderr };
 }
 
-function readableByAnotherUser(file: string): boolean {
+function traversableByAnotherUser(file: string): boolean {
   let current = "/";
-  for (const part of resolve(file).split("/").filter(Boolean)) {
+  for (const part of dirname(resolve(file)).split("/").filter(Boolean)) {
     current = join(current, part);
     try {
       if ((statSync(current).mode & 0o001) === 0) return false;
@@ -82,22 +82,34 @@ function readableByAnotherUser(file: string): boolean {
       return false;
     }
   }
+  return true;
+}
+
+function readableByAnotherUser(file: string): boolean {
   try {
-    return (statSync(file).mode & 0o004) !== 0;
+    return traversableByAnotherUser(file) && (statSync(file).mode & 0o004) !== 0;
   } catch {
     return false;
   }
 }
 
-function writeAgentConfig(agent: string, runtime?: string): string {
-  const dir = join(home, ".tps", "agents", agent);
+function executableByAnotherUser(file: string): boolean {
+  try {
+    return traversableByAnotherUser(file) && (statSync(file).mode & 0o001) !== 0;
+  } catch {
+    return false;
+  }
+}
+
+function writeAgentConfig(agent: string, runtime?: string, root = home): string {
+  const dir = join(root, ".tps", "agents", agent);
   mkdirSync(dir, { recursive: true });
-  mkdirSync(join(home, ".tps", "branch-office", agent), { recursive: true });
+  mkdirSync(join(root, ".tps", "branch-office", agent), { recursive: true });
   const lines = [
     `agentId: ${agent}`,
     `name: ${agent}`,
-    `workspace: ${join(home, ".tps", "branch-office", agent)}`,
-    `mailDir: ${join(home, ".tps", "mail")}`,
+    `workspace: ${join(root, ".tps", "branch-office", agent)}`,
+    `mailDir: ${join(root, ".tps", "mail")}`,
   ];
   if (runtime !== undefined) lines.push(`runtime: ${runtime}`);
   const configPath = join(dir, "agent.yaml");
@@ -801,7 +813,7 @@ syncBuiltinESMExports();
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
 
-  test("set-runtime warns once after the rename when another owner's config keeps only its group", async () => {
+  test("set-runtime warns once after the rename when a simulated other owner's config keeps only its group", async () => {
     const agent = "runtime-owner-warning";
     const configPath = writeAgentConfig(agent, "openclaw");
     const preload = join(home, "other-owner.mjs");
@@ -879,36 +891,56 @@ syncBuiltinESMExports();
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
 
+  const NODE_BIN = "/usr/bin/node";
+  const SETPRIV_BIN = "/usr/bin/setpriv";
   const canOwnAnotherUid =
     typeof process.getuid === "function" &&
     process.getuid() === 0 &&
-    [process.execPath, TPS_BIN].every(readableByAnotherUser);
+    executableByAnotherUser(NODE_BIN) &&
+    executableByAnotherUser(SETPRIV_BIN) &&
+    readableByAnotherUser(TPS_BIN);
   if (!canOwnAnotherUid) {
-    test.skip("set-runtime warns after a real replacement keeps only the group (skipped: requires root and a CLI readable by another uid)", () => {});
+    test.skip("set-runtime warns after a real replacement keeps only the group (skipped: requires root, a node runtime, setpriv and the CLI readable by another uid)", () => {});
   } else {
     test("set-runtime warns after a real replacement keeps only the group", async () => {
       const agent = "runtime-real-owner";
-      const configPath = writeAgentConfig(agent, "openclaw");
-      chmodSync(configPath, 0o644);
-      chownSync(configPath, 0, 65534);
-      chownSync(join(configPath, ".."), 65534, 65534);
-      chmodSync(home, 0o755);
-      chmodSync(join(home, ".tps"), 0o755);
-      chmodSync(join(home, ".tps", "agents"), 0o755);
-      const result = spawnSync(process.execPath, [TPS_BIN, "agent", "set-runtime", "--id", agent, "--runtime", "native"], {
-        cwd: home,
-        encoding: "utf-8",
-        env: { HOME: home, TMPDIR: home, FLAIR_URL: DEAD_FLAIR, PATH: "/usr/bin:/bin" },
-        uid: 65534,
-        gid: 65534,
-        timeout: 20000,
-      });
-      expect(result.status).toBe(0);
-      const warnings = (result.stderr ?? "").split("\n").filter((line) => line.includes(configPath) && line.includes("Cannot preserve the owner"));
-      expect(warnings).toHaveLength(1);
-      expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
-      expect(statSync(configPath).uid).toBe(0);
-      expect(statSync(configPath).gid).toBe(65534);
+      const ownerHome = mkdtempSync(join("/tmp", "tps-runtime-owner-"));
+      try {
+        const configPath = writeAgentConfig(agent, "openclaw", ownerHome);
+        chmodSync(configPath, 0o644);
+        chownSync(configPath, 0, 65534);
+        chownSync(join(configPath, ".."), 65534, 65534);
+        chownSync(ownerHome, 65534, 65534);
+        chmodSync(ownerHome, 0o755);
+        chmodSync(join(ownerHome, ".tps"), 0o755);
+        chmodSync(join(ownerHome, ".tps", "agents"), 0o755);
+        const result = spawnSync(SETPRIV_BIN, [
+          "--reuid=65534",
+          "--regid=65534",
+          "--clear-groups",
+          NODE_BIN,
+          TPS_BIN,
+          "agent",
+          "set-runtime",
+          "--id",
+          agent,
+          "--runtime",
+          "native",
+        ], {
+          cwd: ownerHome,
+          encoding: "utf-8",
+          env: { HOME: ownerHome, TMPDIR: ownerHome, FLAIR_URL: DEAD_FLAIR, PATH: "/usr/bin:/bin" },
+          timeout: 20000,
+        });
+        expect(result.status).toBe(0);
+        const warnings = (result.stderr ?? "").split("\n").filter((line) => line.includes(configPath) && line.includes("Cannot preserve the owner"));
+        expect(warnings).toHaveLength(1);
+        expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
+        expect(statSync(configPath).uid).toBe(65534);
+        expect(statSync(configPath).gid).toBe(65534);
+      } finally {
+        rmSync(ownerHome, { recursive: true, force: true });
+      }
     }, 20000);
   }
 
