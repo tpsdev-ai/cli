@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:
 import { MailClient, hasCommittedMessageId } from "@tpsdev-ai/agent";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath, relayRecordFileName } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
@@ -816,7 +816,11 @@ for (const entry of ["sync", "connect"] as const) {
         // parent; a delivery that finds the bucket already there makes one fewer
         // fsync. Remove it before each delivery below so the fsync order is the
         // same from one delivery to the next.
-        const removeReceiptBucket = () => fs.rmSync(dirname(relayAcceptanceReceiptPath("remote", "bucket")), { recursive: true, force: true });
+        const removeReceiptBucket = () => {
+          const bucket = dirname(relayAcceptanceReceiptPath("remote", "bucket"));
+          expect(basename(bucket)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+          fs.rmSync(bucket, { recursive: true, force: true });
+        };
         const initial = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "sync trace", SEEDS)));
         try {
           await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: initial });
