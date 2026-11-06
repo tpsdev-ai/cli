@@ -391,31 +391,57 @@ syncBuiltinESMExports();
     }
   }, 30000);
 
-  const alternateGroup = (() => {
-    let probeRoot: string | undefined;
+  function probeAlternateGroup(
+    groups = process.getgroups(),
+    primary = process.getgid(),
+    chown = chownSync,
+  ): { group: number; skipReason?: never } | { group?: never; skipReason: string } {
+    const candidates = groups.filter((group) => group !== primary);
+    if (candidates.length === 0) return { skipReason: "this process has no second group" };
+    const probeRoot = mkdtempSync(join(tmpdir(), "tps-runtime-757-"));
     try {
-      probeRoot = mkdtempSync(join(tmpdir(), "tps-runtime-757-"));
       const probePath = join(probeRoot, "chown-probe");
       writeFileSync(probePath, "");
-      for (const group of process.getgroups()) {
-        if (group === process.getgid()) continue;
+      for (const group of candidates) {
         try {
-          chownSync(probePath, -1, group);
-          return group;
-        } catch {
-          continue;
+          chown(probePath, -1, group);
+          return { group };
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "EPERM" && code !== "EACCES") throw error;
         }
       }
-    } catch {
-      return undefined;
+      return { skipReason: "chown to a second group is not permitted for this process here" };
     } finally {
-      if (probeRoot !== undefined) rmSync(probeRoot, { recursive: true, force: true });
+      rmSync(probeRoot, { recursive: true, force: true });
     }
-    return undefined;
-  })();
-  if (alternateGroup === undefined) {
-    test.skip("set-runtime keeps the config's group (skipped: chown to a second group is not permitted for this process here)", () => {});
+  }
+
+  test("group probe fails on EIO", () => {
+    const error = Object.assign(new Error("EIO: injected chown failure"), { code: "EIO" });
+    expect(() => probeAlternateGroup([10, 20], 10, () => { throw error; })).toThrow(error);
+  });
+
+  test("group probe skips when every candidate chown returns EPERM or EACCES", () => {
+    for (const code of ["EPERM", "EACCES"]) {
+      const error = Object.assign(new Error(`${code}: injected chown refusal`), { code });
+      expect(probeAlternateGroup([10, 20], 10, () => { throw error; })).toEqual({
+        skipReason: "chown to a second group is not permitted for this process here",
+      });
+    }
+  });
+
+  test("group probe skips when this process has no second group", () => {
+    expect(probeAlternateGroup([10], 10, () => { throw new Error("unexpected chown"); })).toEqual({
+      skipReason: "this process has no second group",
+    });
+  });
+
+  const groupProbe = probeAlternateGroup();
+  if (groupProbe.skipReason !== undefined) {
+    test.skip(`set-runtime keeps the config's group (skipped: ${groupProbe.skipReason})`, () => {});
   } else {
+    const alternateGroup = groupProbe.group;
     test("set-runtime keeps the config's group", async () => {
       const agent = "runtime-group";
       const configPath = writeAgentConfig(agent, "openclaw");
@@ -428,7 +454,7 @@ syncBuiltinESMExports();
     }, 20000);
   }
 
-  test("set-runtime refuses a failed chown before replacing the config", async () => {
+  test("set-runtime refuses the write when both ownership attempts fail", async () => {
     const agent = "runtime-chown";
     const configPath = writeAgentConfig(agent, "openclaw");
     const before = readFileSync(configPath);
