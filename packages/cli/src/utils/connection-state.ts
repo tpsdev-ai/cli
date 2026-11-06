@@ -2,6 +2,7 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, wr
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
+import { isPidRecordPid, isPidRecordStartToken } from "./pid-file.js";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
 
@@ -181,8 +182,8 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
     || typeof state.bytesReceived !== "number"
     || typeof state.messagesSent !== "number"
     || typeof state.messagesReceived !== "number"
-    || typeof state.pid !== "number"
-    || (state.startToken !== undefined && state.startToken !== null && typeof state.startToken !== "string")
+    || !isPidRecordPid(state.pid)
+    || !isPidRecordStartToken(state.startToken)
     || (state.services !== undefined && (!Array.isArray(state.services) || !state.services.every((service: unknown) => {
       if (typeof service !== "object" || service === null || Array.isArray(service)) return false;
       const health = service as Record<string, unknown>;

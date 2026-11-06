@@ -107,6 +107,14 @@ describe("connection-state", () => {
     expectInvalidKept({ pid: process.pid });
   });
 
+  test.each([0, -1, 1.5, 2147483648])("clearHostState reports and keeps a record with pid %j", (pid) => {
+    expectInvalidKept({ ...completeState(), pid });
+  });
+
+  test("clearHostState reports and keeps a record with an empty startToken", () => {
+    expectInvalidKept({ ...completeState(), startToken: "" });
+  });
+
   for (const field of Object.keys(completeState())) {
     test(`clearHostState reports and keeps a record missing ${field}`, () => {
       const state: Record<string, unknown> = { ...completeState() };
