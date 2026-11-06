@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
-import { listHostStatePaths } from "../utils/connection-state.js";
+import { listHostStatePaths, withHostStateRecordLock } from "../utils/connection-state.js";
 import { readPidFile, removePidFile } from "../utils/pid-file.js";
 import { branchTestPause, pidPath as branchPidPath, pidRecordBytesEqual, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
@@ -953,8 +953,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         snapshot: PidRecordSnapshot,
         removed: string,
         gone: string,
-      ): UnchangedRemoval => {
-        // Compare the record's bytes before unlinking; the operations are not atomic.
+      ): UnchangedRemoval => withHostStateRecordLock(path, "remove the host state record", () => {
+        // Compare the record's bytes before unlinking under the writer's lock,
+        // so the host connection writer cannot replace it between this read and
+        // the removal.
         const current = snapshotPidRecord(path);
         if (current.state.kind === "missing") {
           console.log(gone);
@@ -967,11 +969,15 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           return "unreadable";
         }
         if (!pidRecordBytesEqual(current.raw, snapshot.raw)) return "changed";
+        // Host-only pause seam; gated so other pause users do not stop here.
+        if (process.env.TPS_OFFICE_KILL_HOST_PAUSE === "1") {
+          branchTestPause("office-kill-host-before-removal", path);
+        }
         const removal = removeRecord(path);
         if (removal === "removed") console.log(removed);
         else if (removal === "already gone") console.log(gone);
         return removal;
-      };
+      });
 
       const stopRecord = async (label: string, path: string): Promise<boolean> => {
         // The path comes from the directory listing.
