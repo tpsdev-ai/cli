@@ -3,6 +3,7 @@ import { processStartToken } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { runOffice } from "../src/commands/office.js";
 import { hostStateLockRoot, hostStatePath } from "../src/utils/connection-state.js";
 import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/identity.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
@@ -228,7 +229,7 @@ function holdHostLock(path: string): string {
   return root;
 }
 
-test.each([false, true])("a host lock timeout attempts channel close before retry and retains a failed close for stop (%s)", async (closeFails) => {
+test.each([false, true])("a host lock timeout attempts channel close before retry and retains a rejected close for stop (%s)", async (closeFails) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-retry-lock-748-"));
   const savedEnv = savedRelayEnv();
   let stop: (() => Promise<void>) | undefined;
@@ -280,6 +281,68 @@ test.each([false, true])("a host lock timeout attempts channel close before retr
   }
 }, 30_000);
 
+test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejects keeps the record and fails %s", async (mode) => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-stop-close-748-"));
+  const savedEnv = savedRelayEnv();
+  const listeners = new Set(process.listeners("SIGINT"));
+  let stop: (() => Promise<void>) | undefined;
+  let sigint: (() => Promise<void>) | undefined;
+  let closes = 0;
+  let rejectClose = true;
+  const channel: TransportChannel = {
+    async send() { throw new Error("initial heartbeat refused"); },
+    onMessage() {},
+    offMessage() {},
+    async close() {
+      closes++;
+      if (rejectClose) throw new Error("close refused persistently");
+    },
+    isAlive() { return true; },
+    peerFingerprint() { return "remote"; },
+  };
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  const output = spyOn(console, "log").mockImplementation(() => {});
+  const exited = new Error("test intercepted process.exit");
+  const exit = spyOn(process, "exit").mockImplementation(() => { throw exited; });
+  try {
+    const branch = await prepareBranch(root);
+    if (mode === "stop") stop = await connectAndKeepAlive(branch);
+    else void runOffice({ action: "connect", agent: branch });
+    const path = hostStatePath(branch);
+    for (let i = 0; closes === 0 && i < 200; i++) await Bun.sleep(5);
+    sigint = process.listeners("SIGINT").find((listener) => !listeners.has(listener)) as (() => Promise<void>) | undefined;
+    expect(closes).toBe(1);
+    const record = readFileSync(path, "utf8");
+
+    if (mode === "stop") {
+      await expect(stop!()).rejects.toMatchObject({ name: "HostChannelCloseError", message: expect.stringContaining(path) });
+    } else {
+      expect(sigint).toBeDefined();
+      await expect(sigint!()).rejects.toBe(exited);
+      expect(exit).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining(`Disconnect failed: Channel close rejected; host state record ${path} retained`));
+    }
+    expect(closes).toBe(2);
+    expect(readFileSync(path, "utf8")).toBe(record);
+    expect(diagnostic).toHaveBeenCalledWith(expect.stringContaining("close refused persistently"));
+  } finally {
+    rejectClose = false;
+    await stop?.();
+    await sigint?.().catch((error) => { if (error !== exited) throw error; });
+    for (const listener of process.listeners("SIGINT")) {
+      if (!listeners.has(listener)) process.off("SIGINT", listener);
+    }
+    exit.mockRestore();
+    output.mockRestore();
+    diagnostic.mockRestore();
+    connect.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("an inbound host lock timeout reports the record and still delivers the message without closing the channel", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-inbound-lock-748-"));
   const savedEnv = savedRelayEnv();
@@ -315,7 +378,7 @@ test("an inbound host lock timeout reports the record and still delivers the mes
     expect(alive).toBe(true);
     expect(closes).toBe(0);
     expect(diagnostic).toHaveBeenCalledTimes(1);
-    expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} could not be persisted; message still delivered`);
+    expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} update failed; message handling continues`);
     expect(diagnostic.mock.calls[0][0]).toContain("could not be acquired");
   } finally {
     if (lockRoot) rmSync(lockRoot, { recursive: true, force: true });

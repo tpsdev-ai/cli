@@ -76,7 +76,7 @@ test("a real WS channel delivers an inbound message through a host lock timeout 
     expect(received[0]).toEqual(message);
     expect(peer!.isAlive()).toBe(true);
     expect(diagnostic).toHaveBeenCalledTimes(1);
-    expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} could not be persisted; message still delivered`);
+    expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} update failed; message handling continues`);
     rmSync(lockRoot, { recursive: true, force: true });
     lockRoot = undefined;
     await peer!.send({ ...message, seq: 10 });

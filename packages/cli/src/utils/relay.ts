@@ -1259,7 +1259,7 @@ export async function connectAndKeepAlive(
           try {
             persist();
           } catch (error) {
-            console.error(`[relay] Host state record ${hostStatePath(branchId)} could not be persisted; message still delivered: ${error instanceof Error ? error.message : String(error)}`);
+            console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
           }
           opts.onMessage?.(msg);
         };
@@ -1304,6 +1304,11 @@ export async function connectAndKeepAlive(
       try { await channel.close(); failedChannels.delete(channel); } catch (error) {
         console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
       }
+    }
+    if (failedChannels.size > 0) {
+      const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
+      error.name = "HostChannelCloseError";
+      throw error;
     }
     clearHostState(branchId);
   };

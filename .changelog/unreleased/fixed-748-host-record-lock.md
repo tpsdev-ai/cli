@@ -5,8 +5,10 @@
   The lock wait is bounded by its 5 s deadline plus the probes' own timeouts; a timeout names the lock
   path and a removal remedy. `office kill` collects host-record lock failures and continues shutdown before
   exiting non-zero. After a connection attempt fails, the relay tries to close its channel before retry;
-  failed closes are reported and retained for `stop()`. Inbound persistence failures report the record path
-  and still call `onMessage`. Lock release is best effort: lock-directory removal errors are ignored, and the next
+  a close that rejects is reported and retained for `stop()`. If a close still rejects at `stop()`, the record
+  is kept and `stop()` rejects with its path. Stalled closes are not detected: the transports resolve after
+  their own timeout (cli#774). Inbound host-record update failures report the record path and that message
+  handling continues. Lock release is best effort: lock-directory removal errors are ignored, and the next
   acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps unreadable or invalid records
   and reports their path, instructing the operator to inspect the record and remove it if no connector
   for that host is running. Other removal failures except a missing file are rethrown.
