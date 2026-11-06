@@ -226,6 +226,44 @@ jobs:
           entry="$PWD/plugins/openclaw-tps-mail/dist/src/index.js"
           node -e "try{require('$entry');console.log('REQUIRE_OK')}catch(e){console.error(e.code||'',String(e.message).split('\n')[0]);process.exit(2)}"
 
+  # cli#758 — the heartbeat gateway probe must run against the real OpenClaw
+  # command, not only the PATH fake in the unit suite. The lane script prints
+  # the exact pin; this job installs that release into a throwaway prefix with
+  # install scripts disabled (the repo lockfile is untouched), then runs the
+  # built tps heartbeat with an isolated HOME and OpenClaw state: a dead port
+  # (exit 1, persisted error) and a gateway the lane starts (exit 0, online).
+  heartbeat-real-openclaw:
+    name: Heartbeat against real OpenClaw
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false # the checkout credential is not persisted into .git/config for the steps below
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24.21.0'
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+      - run: sfw bun install --frozen-lockfile
+      - run: bun run build
+      - name: Install the pinned OpenClaw into a temp prefix
+        run: |
+          set -euo pipefail
+          pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"
+          prefix="$RUNNER_TEMP/openclaw-$pin"
+          sfw npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "openclaw@$pin"
+          echo "OPENCLAW_BIN_DIR=$prefix/node_modules/.bin" >> "$GITHUB_ENV"
+      - name: Run heartbeat against the pinned OpenClaw
+        run: node scripts/heartbeat-real-openclaw-lane.mjs
+
   # Section E — the permanent gateway-boundary lane for github_review. It runs
   # the BUILT plugin in a node process against the pinned OpenClaw release
   # (2026.8.1, the reviewer hosts' release): registration through OpenClaw's
