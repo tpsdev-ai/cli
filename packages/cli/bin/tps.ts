@@ -409,6 +409,13 @@ async function main() {
       const { runAgent } = await import("../src/commands/agent.js");
 
       if (action === "create") {
+        const runtimeToken = helpArgs.argv.indexOf("--runtime");
+        const nextToken = runtimeToken >= 0 ? helpArgs.argv[runtimeToken + 1] : undefined;
+        if (runtimeToken >= 0 && (nextToken === undefined || nextToken.startsWith("-"))) {
+          console.error("❌ Refusing --runtime: it requires a value; only 'openclaw' and 'native' are accepted.");
+          console.error("   Run: tps agent create --id <agent-id> --runtime <openclaw|native>");
+          process.exit(1);
+        }
         await runAgent({
           action: "create",
           id: getFlag("id") ?? rest[1],
