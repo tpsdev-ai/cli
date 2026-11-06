@@ -30,6 +30,7 @@ const getRuntimeFlag = (action: "create" | "set-runtime"): string | undefined =>
   const values: (string | undefined)[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
+    if (arg === "--") break;
     if (arg === "--runtime") {
       const next = args[index + 1];
       values.push(next?.startsWith("-") ? undefined : next);

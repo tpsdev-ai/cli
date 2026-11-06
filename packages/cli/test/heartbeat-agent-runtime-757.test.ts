@@ -45,12 +45,12 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-async function runTps(args: string[], env: Record<string, string> = {}, preload?: string): Promise<{
+async function runTps(args: string[], env: Record<string, string> = {}, preload?: string, execPath = process.execPath): Promise<{
   status: number;
   stdout: string;
   stderr: string;
 }> {
-  const command = preload ? ["node", "--import", preload, TPS_BIN, ...args] : [process.execPath, TPS_BIN, ...args];
+  const command = preload ? ["node", "--import", preload, TPS_BIN, ...args] : [execPath, TPS_BIN, ...args];
   const proc = Bun.spawn(command, {
     env: {
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
@@ -321,6 +321,59 @@ describe("cli#757 — recording the runtime", () => {
   }, 20000);
 
   for (const action of ["create", "set-runtime"]) {
+    test(`${action} ignores runtime tokens after -- with an existing config`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath);
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["agent", action, "--id", "x", "--", "--runtime", "native"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Refusing runtime ''");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime <openclaw|native>");
+      } else {
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("Config preserved at");
+      }
+      expect(readFileSync(configPath)).toEqual(before);
+      expect(statSync(configPath).ino).toBe(inode);
+    }, 20000);
+
+    test(`${action} reads the runtime before -- with an existing config`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath, "utf-8");
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["agent", action, "--id", "x", "--runtime", "native", "--", "--runtime", "openclaw"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(0);
+        expect(result.stdout.match(/runtime recorded as 'native'/g)).toHaveLength(1);
+        expect(readFileSync(configPath, "utf-8")).toBe(before.replace("runtime: openclaw", "runtime: native"));
+        expect(statSync(configPath).ino).not.toBe(inode);
+      } else {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Config already exists at");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime native");
+        expect(readFileSync(configPath, "utf-8")).toBe(before);
+        expect(statSync(configPath).ino).toBe(inode);
+      }
+    }, 20000);
+
+    test(`${action} dispatches after a leading -- as meow positional input`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath);
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["--", "agent", action, "--id", "x", "--runtime", "native"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Refusing runtime ''");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime <openclaw|native>");
+      } else {
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("Config preserved at");
+      }
+      expect(readFileSync(configPath)).toEqual(before);
+      expect(statSync(configPath).ino).toBe(inode);
+    }, 20000);
+
     for (const args of [
       ["--runtime"],
       ["--runtime", "--name", "Ignored"],
