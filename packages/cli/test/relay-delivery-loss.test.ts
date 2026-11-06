@@ -47,6 +47,7 @@ const watchMailFsyncs = (mailRoot: string, onDeliverySync?: (index: number) => v
   const openHandleSpy = spyOn(fs.promises, "open").mockImplementation(async (...args) => {
     const handle = await openHandle(...args);
     if (!watching) return handle;
+    openPaths.set(handle.fd, String(args[0]));
     const closeHandle = handle.close.bind(handle);
     handleCloseSpies.push(spyOn(handle, "close").mockImplementation(() => {
       openPaths.delete(handle.fd);
@@ -81,7 +82,7 @@ const watchMailFsyncs = (mailRoot: string, onDeliverySync?: (index: number) => v
   };
 };
 
-for (const closeMode of ["sync", "callback"] as const) {
+for (const closeMode of ["sync", "callback", "handle"] as const) {
   test(`fsync watcher excludes an async foreign open after ${closeMode} close reuses a tracked fd`, async () => {
     const root = fs.mkdtempSync(join(tmpdir(), "tps-fsync-reuse-"));
     const mailRoot = join(root, "mail");
@@ -96,17 +97,19 @@ for (const closeMode of ["sync", "callback"] as const) {
       throw new Error("injected delivery fsync failure");
     });
     try {
-      const fd = fs.openSync(inside, "r");
-      if (closeMode === "sync") fs.closeSync(fd);
+      const handle = closeMode === "handle" ? await fs.promises.open(inside, "r") : undefined;
+      const fd = handle?.fd ?? fs.openSync(inside, "r");
+      if (handle) await handle.close();
+      else if (closeMode === "sync") fs.closeSync(fd);
       else await new Promise<void>((resolve, reject) => fs.close(fd, (error) => error ? reject(error) : resolve()));
-      const foreign = await fs.promises.open(outside, "r");
+      const foreign = await new Promise<number>((resolve, reject) => fs.open(outside, "r", (error, fd) => error ? reject(error) : resolve(fd)));
       try {
-        expect(foreign.fd).toBe(fd);
-        expect(() => fs.fsyncSync(foreign.fd)).not.toThrow();
+        expect(foreign).toBe(fd);
+        expect(() => fs.fsyncSync(foreign)).not.toThrow();
         expect(watch.delivery).toEqual([]);
         expect(indexes).toEqual([]);
         expect(watch.all).toHaveLength(1);
-      } finally { await foreign.close(); }
+      } finally { fs.closeSync(foreign); }
     } finally {
       watch.restore();
       fs.rmSync(root, { recursive: true, force: true });
