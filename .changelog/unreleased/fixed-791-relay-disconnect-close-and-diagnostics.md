@@ -1,0 +1,1 @@
+- **A relay disconnect whose close rejects keeps the host record and reports the failure.** The graceful-disconnect path now treats a rejected `close()` like the reconnect path, so `stop()` keeps the record and rejects instead of swallowing the error. Connect-time host-record write failures are reported before the connection reconnects.
