@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:
 import { MailClient, hasCommittedMessageId } from "@tpsdev-ai/agent";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath, relayRecordFileName } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
@@ -816,10 +816,15 @@ for (const entry of ["sync", "connect"] as const) {
         // parent; a delivery that finds the bucket already there makes one fewer
         // fsync. Remove it before each delivery below so the fsync order is the
         // same from one delivery to the next.
+        // Removes every UTC-day bucket for the branch, not only today's: a run that
+        // crosses midnight wrote its receipt under yesterday's bucket.
         const removeReceiptBucket = () => {
-          const bucket = dirname(relayAcceptanceReceiptPath("remote", "bucket"));
-          expect(basename(bucket)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-          fs.rmSync(bucket, { recursive: true, force: true });
+          const branchDir = dirname(dirname(relayAcceptanceReceiptPath("remote", "bucket")));
+          expect(branchDir.endsWith(join(".relay-accepted", "by-branch", "remote"))).toBe(true);
+          if (!fs.existsSync(branchDir)) return;
+          for (const name of fs.readdirSync(branchDir)) {
+            if (/^\d{4}-\d{2}-\d{2}$/.test(name)) fs.rmSync(join(branchDir, name), { recursive: true, force: true });
+          }
         };
         const initial = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "sync trace", SEEDS)));
         try {
