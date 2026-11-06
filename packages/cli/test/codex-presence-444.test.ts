@@ -4,11 +4,6 @@ const patchShared = createPatchShared();
 // NEVER writes the agent's own Agent row: in Flair `Agent.status` is the
 // principal's lifecycle state, so a value other than `active` deactivates the
 // agent.
-//
-// The last two tests drive the
-// REAL `runCodexRuntime` — startup, a mail tick, and a delivered SIGTERM/SIGINT
-// — with the Flair client's `fetch` recorded, so an Agent write at the runtime's
-// startup site or signal handler makes them fail.
 import { describe, expect, it } from "bun:test";
 import { generateKeyPairSync, verify as edVerify } from "node:crypto";
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -25,6 +20,8 @@ import {
   startPresenceHeartbeat,
 } from "../src/utils/codex-runtime.js";
 import { FlairClient } from "../src/utils/flair-client.js";
+import { startTaskLoop } from "../src/utils/flair-task-loop.js";
+import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import { homeDir } from "../src/utils/home.js";
 import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
 
@@ -33,7 +30,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** The review-trigger loop's pre-seeded cursor, so its polls are identifiable. */
 const REVIEW_CURSOR_POSITION = "2026-01-01T00:00:00.000Z";
 
-/** How many feed reads the review-trigger loop made (its cursor names them). */
+/** Count reads carrying the seeded review cursor. */
 function reviewTriggerPolls(http: string[]): number {
   return http.filter((c) => {
     const q = c.indexOf("?");
@@ -55,13 +52,16 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000, stepMs = 5): Promi
  * Drive the REAL `runCodexRuntime` — its startup, mail loop and signal handler —
  * with the Flair client's `fetch` recorded, the mailbox redirected to a temp
  * root, and `process.exit` captured so the test process survives the shutdown
- * handler. Bounded waits only; the runtime's loop keeps running after the signal
- * (bun ends the file) and the signal listeners this run added are removed.
+ * handler. The signal listeners this run added are removed.
  */
 async function driveRuntime(
   signal: "SIGTERM" | "SIGINT",
   afterShutdown?: (http: string[]) => Promise<void>,
-  opts: { reviewTrigger?: { reviewers: string[]; repo: string } } = {},
+  opts: {
+    reviewTrigger?: { reviewers: string[]; repo: string };
+    signalDuringPreflight?: boolean;
+    secondSignal?: "SIGTERM";
+  } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
   const workspace = join(dir, "workspace");
@@ -82,6 +82,7 @@ async function driveRuntime(
 
   const savedFetch = globalThis.fetch;
   const savedExit = process.exit;
+  const savedRead = FlairClient.prototype.getEventsSince;
   const savedMailDir = process.env.TPS_MAIL_DIR;
   const savedSigterm = process.listeners("SIGTERM");
   const savedSigint = process.listeners("SIGINT");
@@ -89,18 +90,33 @@ async function driveRuntime(
   const presenceBodies: string[] = [];
   let exitCode: number | undefined;
   let rejected: Error | undefined;
+  let runtimeFinished = false;
   let ticked = false;
+  let successfulReads = 0;
+  let releasePreflight: (() => void) | undefined;
   const inboxCur = join(mailRoot, "testbot", "cur");
 
   process.env.TPS_MAIL_DIR = mailRoot;
+  patchShared(FlairClient.prototype, "getEventsSince", async function (...args) {
+    const read = await savedRead.apply(this, args);
+    if (read.status === "ok") successfulReads++;
+    return read;
+  });
   patchShared(globalThis, "fetch", (async (input: string | URL | Request, init?: RequestInit) => {
     const url = String(input);
     const method = init?.method ?? "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     http.push(`${method} ${path}`);
     if (method === "POST" && path === "/Presence") presenceBodies.push(String(init?.body ?? ""));
-    if (path === "/Health") return new Response("ok", { status: 200 });
-    if (method === "GET" && (path.startsWith("/Soul") || path.startsWith("/OrgEventCatchup"))) {
+    if (path === "/Health") {
+      if (opts.signalDuringPreflight) await new Promise<void>((resolve) => { releasePreflight = resolve; });
+      return new Response("ok", { status: 200 });
+    }
+    if (method === "GET" && path.startsWith("/OrgEventCatchup")) {
+      const after = new URL(url).searchParams.get("after") ?? new URL(url).searchParams.get("since");
+      return Response.json({ events: [], nextAfter: after, hasMore: false });
+    }
+    if (method === "GET" && path.startsWith("/Soul")) {
       return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
     }
     return new Response("", { status: 204 });
@@ -116,29 +132,80 @@ async function driveRuntime(
       mailDir: join(mailRoot, "testbot"),
       flairUrl: "http://127.0.0.1:9931",
       flairKeyPath: keyPath,
-      supervisorId: "flint",
+      supervisorId: "agent-supervisor",
       reviewTrigger: opts.reviewTrigger,
-    }).catch((e: Error) => {
+    }).then(() => { runtimeFinished = true; }).catch((e: Error) => {
       rejected = e;
     });
 
     await waitFor(() => presenceBodies.length >= 1, 5000); // startup beat
-    await waitFor(() => existsSync(inboxCur), 5000); // one mail tick
-    ticked = true;
+    if (opts.signalDuringPreflight) {
+      await waitFor(() => releasePreflight !== undefined);
+    } else {
+      await waitFor(() => existsSync(inboxCur), 5000); // one mail tick
+      ticked = true;
+      await waitFor(() => successfulReads >= (opts.reviewTrigger ? 2 : 1));
+    }
     process.emit(signal);
+    if (opts.secondSignal) process.emit(opts.secondSignal);
+    releasePreflight?.();
     await waitFor(() => exitCode !== undefined, 5000); // signal handler ran
     await waitFor(() => presenceBodies.some((b) => b.includes("idle")), 5000);
+    if (opts.signalDuringPreflight) {
+      await waitFor(() => runtimeFinished || http.some((c) => c.startsWith("GET /OrgEventCatchup")));
+    }
     if (afterShutdown) await afterShutdown(http);
   } finally {
     patchShared(globalThis, "fetch", savedFetch);
     patchShared(process, "exit", savedExit);
+    patchShared(FlairClient.prototype, "getEventsSince", savedRead);
     if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
     else process.env.TPS_MAIL_DIR = savedMailDir;
     for (const l of process.listeners("SIGTERM")) if (!savedSigterm.includes(l)) process.off("SIGTERM", l);
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
 
-  return { http, presenceBodies, exitCode, rejected, ticked };
+  return { http, presenceBodies, exitCode, rejected, ticked, successfulReads };
+}
+
+async function withLoopClient(
+  agentId: string,
+  respond: (url: URL) => Promise<Response>,
+  run: (client: FlairClient, reads: string[]) => Promise<void>,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "cli781-loops-"));
+  const keyPath = join(dir, "agent.key");
+  writeFileSync(keyPath, keySeed().seed);
+  const client = new FlairClient({ baseUrl: "http://127.0.0.1:9", agentId, keyPath });
+  const read = client.getEventsSince.bind(client);
+  const reads: string[] = [];
+  client.getEventsSince = async (...args) => {
+    const result = await read(...args);
+    reads.push(result.status);
+    return result;
+  };
+  const savedFetch = globalThis.fetch;
+  patchShared(globalThis, "fetch", (async (input: string | URL | Request) => {
+    const url = new URL(String(input));
+    expect(url.origin).toBe("http://127.0.0.1:9");
+    expect(url.pathname).toBe(`/OrgEventCatchup/${agentId}`);
+    return respond(url);
+  }) as typeof fetch);
+  try {
+    await run(client, reads);
+  } finally {
+    patchShared(globalThis, "fetch", savedFetch);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function shutdownEvent(id: string, kind: string, agentId: string) {
+  const createdAt = new Date().toISOString();
+  return {
+    id, kind, authorId: agentId, targetIds: [agentId], summary: "fixture",
+    detail: "https://github.com/example/repo/pull/1", createdAt,
+    position: `${createdAt}\t${id}`,
+  };
 }
 
 /** A fake Flair client that records every call it receives. */
@@ -375,7 +442,10 @@ describe("codex runtime presence (cli#444)", () => {
         const path = String(input).replace(/^https?:\/\/[^/]+/, "");
         if (init?.method === "POST" && path === "/Presence") presenceBodies.push(String(init.body ?? ""));
         if (path === "/Health") return new Response("ok", { status: 200 });
-        if (init?.method === "GET" && (path.startsWith("/Soul") || path.startsWith("/OrgEventCatchup"))) {
+        if (path.startsWith("/OrgEventCatchup")) {
+          return Response.json({ events: [], nextAfter: new URL(String(input)).searchParams.get("after") ?? new URL(String(input)).searchParams.get("since"), hasMore: false });
+        }
+        if (init?.method === "GET" && path.startsWith("/Soul")) {
           return new Response("[]", { status: 200, headers: { "Content-Type": "application/json" } });
         }
         return new Response("", { status: 204 });
@@ -423,6 +493,7 @@ describe("codex runtime presence (cli#444)", () => {
     async () => {
       const r = await driveRuntime("SIGTERM");
       expect(r.rejected).toBeUndefined();
+      expect(r.successfulReads).toBeGreaterThanOrEqual(1);
       expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
       // Startup beat (activity omitted), then the bounded final "idle" beat.
       expect(r.presenceBodies[0]).toBe("{}");
@@ -435,7 +506,7 @@ describe("codex runtime presence (cli#444)", () => {
   );
 
   it(
-    "runCodexRuntime stops the task loop on SIGTERM: no catch-up request after the shutdown handler runs",
+    "runCodexRuntime sends no task-loop read during the observation after SIGTERM",
     async () => {
       let catchUpsAtExit = 0;
       const r = await driveRuntime("SIGTERM", async (http) => {
@@ -448,13 +519,14 @@ describe("codex runtime presence (cli#444)", () => {
         expect(catchUps(), "no catch-up request after shutdown").toBe(catchUpsAtExit);
       });
       expect(r.rejected).toBeUndefined();
+      expect(r.successfulReads).toBeGreaterThanOrEqual(1);
       expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
     },
     40_000,
   );
 
   it(
-    "runCodexRuntime stops the review-trigger loop on SIGTERM: no review-trigger poll after the shutdown handler runs",
+    "runCodexRuntime sends no seeded-cursor read during the observation after SIGTERM",
     async () => {
       let pollsAtExit = 0;
       const r = await driveRuntime("SIGTERM", async (http) => {
@@ -466,6 +538,7 @@ describe("codex runtime presence (cli#444)", () => {
         expect(reviewTriggerPolls(http), "no review-trigger poll after shutdown").toBe(pollsAtExit);
       }, { reviewTrigger: { reviewers: ["reviewer-1"], repo: "example/repo" } });
       expect(r.rejected).toBeUndefined();
+      expect(r.successfulReads).toBeGreaterThanOrEqual(1);
       expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
     },
     40_000,
@@ -482,4 +555,105 @@ describe("codex runtime presence (cli#444)", () => {
     },
     20_000,
   );
+  it("a signal during preflight prevents loop reads", async () => {
+    const r = await driveRuntime("SIGTERM", undefined, {
+      signalDuringPreflight: true,
+      reviewTrigger: { reviewers: ["reviewer-1"], repo: "example/repo" },
+    });
+    expect(r.rejected).toBeUndefined();
+    expect(r.exitCode).toBe(0);
+    expect(r.http.filter((c) => c.startsWith("GET /OrgEventCatchup"))).toEqual([]);
+  }, 10_000);
+
+  it("SIGINT then SIGTERM sends one final beat", async () => {
+    const r = await driveRuntime("SIGINT", undefined, { secondSignal: "SIGTERM" });
+    expect(r.rejected).toBeUndefined();
+    expect(r.exitCode).toBe(0);
+    expect(r.presenceBodies.filter((b) => b.includes('"idle"'))).toHaveLength(1);
+  }, 10_000);
+
+  it("bounds a pending read and handler together, stops both loops, and sends the final beat", async () => {
+    const agentId = "agent-drain";
+    const task = shutdownEvent("task-a", "task.assigned", agentId);
+    const nextTask = { ...task, id: "task-b", position: `${task.createdAt}\ttask-b` };
+    let requests = 0;
+    let releaseHandler: (() => void) | undefined;
+    let handled = 0;
+    await withLoopClient(agentId, async () => {
+      requests++;
+      if (requests === 1) return Response.json({ events: [task, nextTask], nextAfter: nextTask.position, hasMore: false });
+      return new Promise<Response>(() => {});
+    }, async (client, reads) => {
+      const taskLoop = startTaskLoop(client, agentId, async () => {
+        handled++;
+        if (handled === 1) await new Promise<void>((resolve) => { releaseHandler = resolve; });
+      }, { pollIntervalMs: 20 });
+      const reviewLoop = startReviewTriggerLoop(client, agentId, { reviewers: ["reviewer-1"], repo: "example/repo" }, { pollIntervalMs: 20 });
+      const stopped: string[] = [];
+      const { calls, client: presence } = fakeClient();
+      let exited = false;
+      const onSignal = shutdownHandler(presence as never, agentId, () => {}, () => { exited = true; }, 80, [
+        () => { stopped.push("task"); return taskLoop.stop(); },
+        () => { throw new Error("stop failed"); },
+        () => Promise.reject(new Error("stop rejected")),
+        () => { stopped.push("review"); return reviewLoop.stop(); },
+      ], 200);
+      try {
+        await waitFor(() => requests === 2 && releaseHandler !== undefined);
+        expect(reads).toEqual(["ok"]);
+        const started = performance.now();
+        onSignal();
+        expect(stopped, "both stops called before waiting for either").toEqual(["task", "review"]);
+        await waitFor(() => exited, 350);
+        expect(performance.now() - started).toBeLessThan(350);
+        expect(calls).toEqual(["PRESENCE idle"]);
+        releaseHandler?.();
+        await taskLoop.stop();
+        await sleep(60);
+        expect(handled, "no next handler after stop").toBe(1);
+        expect(requests, "no further read after stop").toBe(2);
+      } finally {
+        releaseHandler?.();
+        void taskLoop.stop();
+        void reviewLoop.stop();
+      }
+    });
+  }, 5000);
+
+  it("valid pages delivered after SIGTERM dispatch no task or review request", async () => {
+    const agentId = "agent-late";
+    const release: Array<() => void> = [];
+    let handled = 0;
+    let reviewRequests = 0;
+    await withLoopClient(agentId, async () => {
+      const kind = release.length === 0 ? "task.assigned" : "pr.opened";
+      await new Promise<void>((resolve) => { release.push(resolve); });
+      const event = shutdownEvent("event-a", kind, agentId);
+      return Response.json({ events: [event], nextAfter: event.position, hasMore: false });
+    }, async (client, reads) => {
+      const taskLoop = startTaskLoop(client, agentId, async () => { handled++; }, { pollIntervalMs: 20 });
+      const reviewLoop = startReviewTriggerLoop(client, agentId, { reviewers: ["reviewer-1"], repo: "example/repo" }, {
+        pollIntervalMs: 20,
+        deps: { spawnSyncImpl: (() => { reviewRequests++; return { status: 0, stdout: "", stderr: "" }; }) as never },
+      });
+      const { calls, client: presence } = fakeClient();
+      let exited = false;
+      const onSignal = shutdownHandler(presence as never, agentId, () => {}, () => { exited = true; }, 80, [taskLoop.stop, reviewLoop.stop], 80);
+      process.once("SIGTERM", onSignal);
+      try {
+        await waitFor(() => release.length === 2);
+        process.emit("SIGTERM");
+        for (const resolve of release) resolve();
+        await waitFor(() => exited);
+        expect(reads).toEqual(["ok", "ok"]);
+        expect({ tasks: handled, reviewRequests }, "late pages must not dispatch").toEqual({ tasks: 0, reviewRequests: 0 });
+        expect(calls).toEqual(["PRESENCE idle"]);
+      } finally {
+        for (const resolve of release) resolve();
+        await Promise.all([taskLoop.stop(), reviewLoop.stop()]);
+        process.off("SIGTERM", onSignal);
+      }
+    });
+  }, 5000);
+
 });

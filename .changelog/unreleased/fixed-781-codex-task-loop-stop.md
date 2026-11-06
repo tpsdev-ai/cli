@@ -1,2 +1,2 @@
-- **The codex runtime stops its Flair task loop, and the review-trigger loop when
-  configured, on shutdown.** Their stop handles run before the final Presence beat.
+- **The Codex runtime bounds the drain of its Flair loop stop handles before
+  the final Presence beat.** Stopped loops discard late reads.

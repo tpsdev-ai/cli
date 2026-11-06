@@ -625,6 +625,8 @@ async function _runAutoCommitLegacy(
 export const HEARTBEAT_INTERVAL_MS = 5 * 60 * 1000;
 /** Upper bound on the final shutdown beat before the process exits. */
 export const SHUTDOWN_BEAT_TIMEOUT_MS = 3000;
+/** Total bound for draining loop stops before the final beat. */
+export const SHUTDOWN_DRAIN_TIMEOUT_MS = SHUTDOWN_BEAT_TIMEOUT_MS;
 
 /**
  * The Flair key path the runtime authenticates with: the configured path, else
@@ -694,12 +696,7 @@ export async function shutdownPresenceBeat(
   }
 }
 
-/**
- * The SIGINT/SIGTERM handler: stop the heartbeat and every loop whose stop
- * handle is in `stops`, await the bounded final beat, then exit. Each stop is
- * called before the beat, and a promise it returns (the loop's exit) is awaited.
- * `exit` and `timeoutMs` are injectable so a test drives the real handler.
- */
+/** Call loop stops, bound the drain, then send the bounded final beat and exit once. */
 export function shutdownHandler(
   client: Pick<FlairClient, "presence">,
   agentId: string,
@@ -707,16 +704,30 @@ export function shutdownHandler(
   exit: (code: number) => void = (code) => process.exit(code),
   timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
   stops: Array<() => void | Promise<void>> = [],
+  drainTimeoutMs: number = SHUTDOWN_DRAIN_TIMEOUT_MS,
 ): () => void {
+  let shuttingDown = false;
   return () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     stopHeartbeat();
+    const pending: Promise<void>[] = [];
+    for (const stop of stops) {
+      try {
+        pending.push(Promise.resolve(stop()));
+      } catch {
+        // Continue stopping the remaining loops.
+      }
+    }
     void (async () => {
-      for (const stop of stops) {
-        try {
-          await stop();
-        } catch {
-          // A failing stop must not keep the runtime from its final beat and exit.
-        }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          Promise.allSettled(pending),
+          new Promise<void>((resolve) => { timer = setTimeout(resolve, drainTimeoutMs); }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
       }
       await shutdownPresenceBeat(client, agentId, timeoutMs);
       exit(0);
@@ -795,10 +806,13 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   // startup, independent of the mail loop; the signal handlers await the bounded
   // final beat before exiting.
   const stopHeartbeat = startPresenceHeartbeat(flair, agentId);
-  // The loops start after startup, so they add their stop handles to this list
-  // and the handler reads it at signal time.
   const stopHandles: Array<() => void | Promise<void>> = [];
-  const onSignal = shutdownHandler(flair, agentId, stopHeartbeat, undefined, undefined, stopHandles);
+  let shutdownRequested = false;
+  const shutdown = shutdownHandler(flair, agentId, stopHeartbeat, undefined, undefined, stopHandles);
+  const onSignal = () => {
+    shutdownRequested = true;
+    shutdown();
+  };
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
@@ -841,6 +855,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     throw err;
   }
 
+  if (shutdownRequested) return;
 
   // Start Flair task loop (runs in parallel with mail loop)
   stopHandles.push(startTaskLoop(flair, agentId, async (event) => {

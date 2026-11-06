@@ -292,6 +292,7 @@ export function startTaskLoop(
     while (running) {
       try {
         const read = await flair.getEventsSince(agentId, cursorSince(position), position);
+        if (!running) return;
         if (read.status === "unavailable") {
           // A failed read is not an empty feed: log its bounded reason and back off
           // without advancing the cursor.
@@ -343,6 +344,10 @@ export function startTaskLoop(
             if (held === undefined && event.position) {
               if (withinLimit(event.position)) resumeAt = event.position;
               else held = event;
+            }
+            if (!running) {
+              failed = true;
+              break;
             }
           }
           // A drained read resumes at the feed's position; a failed or held one
