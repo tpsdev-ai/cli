@@ -6,8 +6,7 @@
  *
  *   dead  — OPENCLAW_GATEWAY_PORT points at a loopback port nothing listens on.
  *           heartbeat must persist `gateway unreachable` and exit 1.
- *   live  — the real gateway runs on an ephemeral loopback port. The lane waits
- *           for `gateway status --require-rpc` and heartbeat must exit 0 with an
+ *   live  — waits for `gateway status --require-rpc`; heartbeat must exit 0 with an
  *           online record.
  *
  * The lane installs OpenClaw into a throwaway prefix with --ignore-scripts
@@ -120,7 +119,7 @@ function laneEnv(testCase, port, binDir) {
   return env;
 }
 
-function makeCase(root, name, flairPort) {
+export function makeCase(root, name, flairPort) {
   const dir = join(root, name);
   const home = join(dir, "home");
   const workspace = join(home, ".tps", "branch-office", AGENT);
@@ -135,7 +134,7 @@ function makeCase(root, name, flairPort) {
     `agentId: ${AGENT}\nname: ${AGENT}\nworkspace: ${workspace}\nmailDir: ${join(home, ".tps", "mail")}\n`,
     "utf-8",
   );
-  writeFileSync(configPath, `${JSON.stringify({ gateway: { mode: "local" } })}\n`, "utf-8");
+  writeFileSync(configPath, `${JSON.stringify({ gateway: { mode: "local", bind: "loopback" } })}\n`, "utf-8");
   return { dir, home, workspace, stateDir, configPath, flairPort };
 }
 

@@ -1,10 +1,24 @@
 import { describe, expect, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
-import { assertPortClosed, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { assertPortClosed, makeCase, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
+
+test("the written OpenClaw config binds the local gateway to loopback", () => {
+  const root = mkdtempSync(join(tmpdir(), "heartbeat-config-"));
+  try {
+    const { configPath } = makeCase(root, "live", 1);
+    const config = JSON.parse(readFileSync(configPath, "utf-8"));
+    expect(config.gateway).toEqual({ mode: "local", bind: "loopback" });
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function blockedFor(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
