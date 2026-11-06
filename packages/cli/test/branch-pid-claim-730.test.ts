@@ -400,16 +400,17 @@ function recordFilesUnder(dir: string): string[] {
   return files;
 }
 
-/** True when `pid` runs this build's tps binary and, on Linux, its
- *  environment names this test root. On macOS the command line plus the
- *  identity probe decide; an unreadable probe answer is "unverified". */
-function runsTestDaemon(pid: number): IdentityVerdict {
+function runsTestDaemon(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  readProcessFile: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): IdentityVerdict {
   let command: string;
   let environ: string | null = null;
   try {
-    if (process.platform === "linux") {
-      command = readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ");
-      environ = readFileSync(`/proc/${pid}/environ`, "utf8");
+    if (platform === "linux") {
+      command = readProcessFile(`/proc/${pid}/cmdline`).replaceAll("\0", " ");
+      environ = readProcessFile(`/proc/${pid}/environ`);
     } else {
       const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
       if (ps.status !== 0 || typeof ps.stdout !== "string") return "unverified";
@@ -418,13 +419,13 @@ function runsTestDaemon(pid: number): IdentityVerdict {
   } catch {
     return "other";
   }
-  if (process.platform !== "linux") {
+  if (platform !== "linux") {
     if (command.trim() !== "tps" && !command.includes(TPS_BIN)) return "other";
     return probeStdoutUnderRoot(pid, root);
   }
-  if (!command.includes(TPS_BIN) || !command.includes("branch")) return "other";
+  if (command.trim() !== "tps" && (!command.includes(TPS_BIN) || !command.includes("branch"))) return "other";
   const entries = environ!.split("\0");
-  return entries.includes(`HOME=${root}`) ? "this-daemon" : "other";
+  return entries.includes(`HOME=${root}`) && entries.includes("TPS_BRANCH_DAEMON=1") ? "this-daemon" : "other";
 }
 
 function leakDiagnostic(pids: number[]): string {
@@ -458,12 +459,6 @@ async function stopRegisteredDaemons(
   if (failures.length > 0) throw new Error(`registered-daemon cleanup failed: ${failures.join("; ")}`);
 }
 
-/** Stop each process named by a pid record in the test root, after the
- *  record's start token and the process's command line verify it as this test
- *  build's daemon. Cleanup does not read launcher stdout, so a daemon whose
- *  announcement was missing or changed is still stopped when the identity
- *  probe answers for it. A token mismatch at the final pre-signal re-read
- *  prevents signalling and records an identity diagnostic. */
 async function stopRecordedDaemons(
   identity: (pid: number) => IdentityVerdict = runsTestDaemon,
   readToken: (pid: number) => string | null = processStartToken,
@@ -1183,6 +1178,7 @@ describe("branch pid record ownership (cli#730)", () => {
     children.push(launcher);
     const running = await waitForRunningRecord();
     unannouncedDaemon = running;
+    await waitForLogStarted();
     expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
@@ -1191,5 +1187,31 @@ describe("branch pid record ownership (cli#730)", () => {
     if (unannouncedDaemon === undefined) throw new Error("the launcher recorded no daemon");
     const leaked = pidExited(unannouncedDaemon.pid) ? [] : [unannouncedDaemon.pid];
     expect(leaked, leakDiagnostic(leaked)).toEqual([]);
+  });
+});
+
+describe("Linux daemon cleanup identity", () => {
+  test("matches the daemon before and after meow sets its title", () => {
+    const parsed = spawnSync("node", ["--input-type=module", "-e", `
+      import meow from "meow";
+      import { readFileSync } from "node:fs";
+      const command = () => process.platform === "linux" ? readFileSync("/proc/self/cmdline", "utf8") : null;
+      const beforeCommand = command();
+      const before = process.title;
+      meow("", { importMeta: { url: ${JSON.stringify(new URL("../bin/tps.ts", import.meta.url).href)} }, argv: ["branch", "start"] });
+      console.log(JSON.stringify({ before, after: process.title, commands: beforeCommand === null ? null : [beforeCommand, command()] }));
+    `, TPS_BIN, "branch", "start"], { encoding: "utf8" });
+    expect(parsed.status, parsed.stderr).toBe(0);
+    const titles = JSON.parse(parsed.stdout);
+    expect({ before: titles.before, after: titles.after }).toEqual({ before: "node", after: "tps" });
+    const commands: string[] = titles.commands ?? [`node\0${TPS_BIN}\0branch\0start\0`, `${titles.after}\0\0`];
+    for (const command of commands) {
+      const identity = (home: string, daemon: string) => runsTestDaemon(123, "linux", (path) =>
+        path.endsWith("/cmdline") ? command : `HOME=${home}\0${daemon}\0`);
+      expect(identity(root, "TPS_BRANCH_DAEMON=1")).toBe("this-daemon");
+      expect(identity(`${root}-other`, "TPS_BRANCH_DAEMON=1")).toBe("other");
+      expect(identity(root, "TPS_BRANCH_DAEMON=0")).toBe("other");
+      expect(identity(root, "")).toBe("other");
+    }
   });
 });

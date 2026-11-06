@@ -230,12 +230,17 @@ function runsTestDaemon(pid: number): boolean {
 /** stopRecordedDaemons verifies a recorded pid's start token and identity as this
  *  root's daemon before signalling it. It leaves unverified pids unsignalled and
  *  records them for leakDiagnostic. */
-async function stopRecordedDaemons(readToken: (pid: number) => string | null = processStartToken): Promise<void> {
+async function stopRecordedDaemons(
+  readToken: (pid: number) => string | null = processStartToken,
+  identity: (pid: number) => boolean = runsTestDaemon,
+  readRecord: (path: string) => ReturnType<typeof readPidFile> = readPidFile,
+): Promise<void> {
   const failures: string[] = [];
   const seen = new Set<number>();
   const stopVerified = async (pid: number, expectedToken: string): Promise<void> => {
     if (readToken(pid) !== expectedToken) {
       unverifiedIdentityPids.add(pid);
+      failures.push(`identity could not be verified for pid ${pid}; not signalled`);
       return;
     }
     try {
@@ -252,11 +257,11 @@ async function stopRecordedDaemons(readToken: (pid: number) => string | null = p
     }
   };
   for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
-    const state = readPidFile(path);
+    const state = readRecord(path);
     if (state.kind === "missing" || state.kind === "unreadable" || state.kind === "invalid" || state.kind === "stale") continue;
     seen.add(state.pid);
     if (!leakCheckPids.includes(state.pid)) leakCheckPids.push(state.pid);
-    if (state.kind === "unverified" || !runsTestDaemon(state.pid)) {
+    if (state.kind === "unverified" || !identity(state.pid)) {
       unverifiedIdentityPids.add(state.pid);
       continue;
     }
@@ -265,7 +270,12 @@ async function stopRecordedDaemons(readToken: (pid: number) => string | null = p
   for (const record of recordedDaemons) {
     if (seen.has(record.pid) || pidGone(record.pid)) continue;
     if (!leakCheckPids.includes(record.pid)) leakCheckPids.push(record.pid);
-    if (processStartToken(record.pid) !== record.startToken || !runsTestDaemon(record.pid)) {
+    if (readToken(record.pid) !== record.startToken) {
+      unverifiedIdentityPids.add(record.pid);
+      failures.push(`identity could not be verified for pid ${record.pid}; not signalled`);
+      continue;
+    }
+    if (!identity(record.pid)) {
       unverifiedIdentityPids.add(record.pid);
       continue;
     }
@@ -461,11 +471,31 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
     rememberRecordedDaemon(running.pid, running.startToken);
     await waitForLogStarted();
 
-    await stopRecordedDaemons(() => "recycled-token");
+    await expect(stopRecordedDaemons(() => "recycled-token")).rejects.toThrow(
+      `recorded-daemon cleanup failed: identity could not be verified for pid ${running.pid}; not signalled`,
+    );
 
     expect(pidState(running.pid)).toBe("alive");
     expect(leakDiagnostic([running.pid])).toBe(`identity could not be verified for pid ${running.pid}`);
   }, 40_000);
+
+  test.each(["pid file", "registered daemon", "registered daemon final read"])("stopRecordedDaemons reports a token mismatch from the %s before the process exits", async (source) => {
+    const live = startSleep();
+    const pid = live.pid!;
+    const token = "original-token";
+    if (source === "pid file") writeFileSync(pidFile, serializePidRecord(pid, token));
+    else rememberRecordedDaemon(pid, token);
+
+    let reads = 0;
+    const readToken = () => source === "registered daemon final read" && reads++ === 0 ? token : "recycled-token";
+    await expect(stopRecordedDaemons(readToken, () => true, (path) => readPidFile(path, () => token))).rejects.toThrow(
+      `recorded-daemon cleanup failed: identity could not be verified for pid ${pid}; not signalled`,
+    );
+    expect(pidGone(pid)).toBe(false);
+    expect(leakDiagnostic([pid])).toBe(`identity could not be verified for pid ${pid}`);
+    await stopTracked();
+    expect(pidGone(pid)).toBe(true);
+  });
 
   test("stopRecordedDaemons stops the recorded daemon when the launcher announcement is discarded", async () => {
     const port = await freePort();
