@@ -9,9 +9,9 @@
  *   live  — waits for `gateway status --require-rpc`; heartbeat must exit 0 with an
  *           online record.
  *
- * The lane installs OpenClaw into a throwaway prefix with --ignore-scripts
- * unless OPENCLAW_BIN_DIR names an existing install. It writes nothing to the
- * repository: no lockfile, no node_modules.
+ * Without OPENCLAW_BIN_DIR, the lane installs OpenClaw into a throwaway prefix
+ * with --ignore-scripts. A supplied directory must contain openclaw.
+ * It writes nothing to the repository: no lockfile, no node_modules.
  *
  * Env:
  *   OPENCLAW_BIN_DIR       reuse an installed OpenClaw bin directory
@@ -52,9 +52,9 @@ async function freePort() {
 }
 
 /**
- * Probe a loopback port once. Resolves "open" when a connection is accepted and
- * "closed" only on ECONNREFUSED; a timeout or any other error rejects with that
- * error named, because neither proves the port refuses connections.
+ * Probe a port once (loopback by default). Resolves "open" when a connection is
+ * accepted and "closed" only on ECONNREFUSED; a timeout or any other error rejects
+ * with that error named, because neither proves the port refuses connections.
  */
 export function probePort(port, { host = "127.0.0.1", timeoutMs = 1000, connect = net.connect } = {}) {
   return new Promise((resolveProbe, rejectProbe) => {
@@ -168,9 +168,9 @@ function defaultStatusProbe({ binDir, testCase, port, timeout, rpcTimeout }) {
 }
 
 /**
- * Poll `gateway status --require-rpc` until it succeeds or the readiness
- * deadline passes. Each probe's timeout and each sleep are capped by the time
- * left, and a success observed after the deadline is rejected.
+ * Poll `gateway status --require-rpc` until it succeeds, the gateway exits, or
+ * the readiness deadline passes. Each probe's timeout and each sleep are capped
+ * by the time left, and a success observed after the deadline is rejected.
  */
 export async function waitForRpc(testCase, port, binDir, gateway, logPath, options = {}) {
   const {
@@ -228,8 +228,9 @@ function defaultSignalGroup(pid) {
 }
 
 /**
- * Stop the gateway process group and confirm it exits. Throws when the exit is
- * not confirmed after SIGKILL: an unconfirmed stop must fail the lane, not warn.
+ * Signal the gateway process group and confirm the direct child exits. Throws
+ * when the exit is not confirmed after SIGKILL: an unconfirmed stop must fail
+ * the lane, not warn.
  */
 export async function stopGateway(child, options = {}) {
   if (!child.pid) return;
