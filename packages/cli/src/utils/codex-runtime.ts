@@ -1040,8 +1040,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             await writeTaskMemory(flair, agentId, "failure", { task: msg.body, error: err.message });
           }
         } finally {
-          // Completion boundary end — AFTER the reply is persisted and the
-          // auto-commit (above, which reads the newest cur/ body for its scope
+          // Completion boundary end — AFTER the reply attempt and any auto-commit
+          // work (above, which reads the newest cur/ body for its scope
           // guard) has finished. Acking here is what stops cli#377's lease sweep
           // re-presenting — and re-dispatching — a finished task forever.
           completeRuntimeMail(mailCfg, msg.id);
