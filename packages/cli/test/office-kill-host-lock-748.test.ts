@@ -151,6 +151,31 @@ afterEach(() => {
 });
 
 describe("host state record lock", () => {
+  test("office kill reports a held host lock and continues to the next record and branch daemon", async () => {
+    const dead = reapedPid();
+    if (dead === null) throw new Error("no reaped pid was available; rerun the test");
+    const first = hostStatePath("a-locked");
+    const second = hostStatePath("b-unlocked");
+    writeHostState(hostState("a-locked", dead, null));
+    writeHostState(hostState("b-unlocked", dead, null));
+    const lockRoot = hostStateLockRoot(first);
+    const lockDir = mailLockPath(lockRoot);
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({ pid: process.pid, startToken: null }));
+    const branch = join(home, ".tps", "branch.pid");
+    writeFileSync(branch, JSON.stringify({ pid: dead, startToken: null }));
+    const kill = runKill({ ...process.env, HOME: home });
+    expect(await kill.exited).toBe(1);
+    const output = kill.output();
+    expect(output).toContain(`Stale host state record removed: ${second}`);
+    expect(output).toContain(`Stale branch pid file removed: ${branch}`);
+    expect(existsSync(first)).toBe(true);
+    expect(existsSync(second)).toBe(false);
+    expect(existsSync(branch)).toBe(false);
+    expect(output).toContain(`Host state record ${first}: Host state record lock ${lockDir} could not be acquired`);
+    expect(output).toContain(`remove ${lockRoot} and retry`);
+  }, TIMEOUT);
+
   test(
     "an in-window write is refused; office kill keeps and reports the later retry",
     async () => {

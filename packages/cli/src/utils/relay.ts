@@ -15,7 +15,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { clearHostState, hostStatePath, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1163,6 +1163,7 @@ export async function connectAndKeepAlive(
   let stopped = false;
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
+  const failedChannels = new Set<TransportChannel>();
 
   const remotePath = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId, "remote.json");
   if (!existsSync(remotePath)) throw new Error(`No remote.json for branch: ${branchId}`);
@@ -1255,7 +1256,11 @@ export async function connectAndKeepAlive(
           } else {
             state.lastHeartbeatAck = now;
           }
-          persist();
+          try {
+            persist();
+          } catch (error) {
+            console.error(`[relay] Host state record ${hostStatePath(branchId)} could not be persisted; message still delivered: ${error instanceof Error ? error.message : String(error)}`);
+          }
           opts.onMessage?.(msg);
         };
         channel.onMessage(handler);
@@ -1268,7 +1273,19 @@ export async function connectAndKeepAlive(
         channel.offMessage(handler);
         try { await channel.close(); } catch {}
         currentChannel = null;
-      } catch {}
+      } catch {
+        if (currentChannel !== null) {
+          const failedChannel = currentChannel;
+          failedChannels.add(failedChannel);
+          currentChannel = null;
+          try {
+            await failedChannel.close();
+            failedChannels.delete(failedChannel);
+          } catch (error) {
+            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
 
       reconnectCount++;
       const st = (RECONNECT_BASE_MS * Math.pow(2, Math.min(reconnectCount, 6)));
@@ -1282,7 +1299,12 @@ export async function connectAndKeepAlive(
   return async () => {
     stopped = true;
     stopPrune();
-    try { await currentChannel?.close(); } catch {}
+    if (currentChannel !== null) failedChannels.add(currentChannel);
+    for (const channel of failedChannels) {
+      try { await channel.close(); failedChannels.delete(channel); } catch (error) {
+        console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
     clearHostState(branchId);
   };
 }

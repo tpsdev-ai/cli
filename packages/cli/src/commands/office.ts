@@ -1179,7 +1179,11 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           hostPasses++;
           let sawUnprocessed = false;
           for (const path of listing.paths) {
-            if (await stopRecord("Host state record", path)) sawUnprocessed = true;
+            try {
+              if (await stopRecord("Host state record", path)) sawUnprocessed = true;
+            } catch (error) {
+              failures.push(`Host state record ${path}: ${error instanceof Error ? error.message : String(error)}`);
+            }
           }
           if (!sawUnprocessed) return { kind: "settled" };
         }

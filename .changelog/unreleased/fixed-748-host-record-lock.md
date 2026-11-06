@@ -3,8 +3,10 @@
   The connector's `stop()` removes a valid record under that lock only when it names its own process
   and branch. Writes after `stop()` begins are suppressed under the lock; a late connection skips writing.
   The lock wait is bounded by its 5 s deadline plus the probes' own timeouts; a timeout names the lock
-  path and a removal remedy. Lock-acquisition errors propagate; host-record read/removal errors other than
-  ENOENT propagate. Lock release is best effort: lock-directory removal errors are ignored, and the next
+  path and a removal remedy. `office kill` collects host-record lock failures and continues shutdown before
+  exiting non-zero. After a connection attempt fails, the relay tries to close its channel before retry;
+  failed closes are reported and retained for `stop()`. Inbound persistence failures report the record path
+  and still call `onMessage`. Lock release is best effort: lock-directory removal errors are ignored, and the next
   acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps unreadable or invalid records
   and reports their path, instructing the operator to inspect the record and remove it if no connector
   for that host is running. Other removal failures except a missing file are rethrown.
