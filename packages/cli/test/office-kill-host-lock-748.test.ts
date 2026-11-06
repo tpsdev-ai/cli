@@ -6,9 +6,9 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import {
   clearHostState,
@@ -158,6 +158,7 @@ describe("host state record lock", () => {
       mkdirSync(root, { recursive: true });
       const pauseDir = join(home, "pause");
       mkdirSync(pauseDir);
+      expect(realpathSync(pauseDir).startsWith(`${realpathSync(process.env.TPS_TEST_ROOT!)}${sep}`)).toBe(true);
 
       const predecessor = spawnChild();
       const path = hostStatePath("host-a");
@@ -212,7 +213,6 @@ describe("host state record lock", () => {
         ...process.env,
         HOME: home,
         TPS_ROOT: root,
-        TPS_TEST_ROOT: root,
         TPS_BRANCH_TEST_PAUSE_DIR: pauseDir,
         TPS_OFFICE_KILL_HOST_PAUSE: "1",
       };
