@@ -1141,6 +1141,28 @@ const RECONNECT_MAX_MS = 60_000;
 const SERVICE_HEALTH_INTERVAL_MS = 5 * 60_000; // 5 minutes
 const INBOUND_PERSIST_RETRY_BASE_MS = 50;
 const INBOUND_PERSIST_RETRY_MAX_MS = 1000;
+/** Most failed channels a connection retains for a later stop() close. */
+const MAX_RETAINED_FAILED_CHANNELS = 4;
+
+/**
+ * Wrap a host record persist for the heartbeat and health callbacks: report the
+ * first failure per connection, stay silent for repeats, and report again after
+ * a write succeeds. The message carries the record path and the error, not the
+ * record's contents.
+ */
+function hostStateRefresher(branchId: string, persist: () => void): () => void {
+  let failureReported = false;
+  return () => {
+    try {
+      persist();
+      failureReported = false;
+    } catch (error) {
+      if (failureReported) return;
+      failureReported = true;
+      console.error(`[relay] Host state record ${hostStatePath(branchId)} refresh failed; connection continues: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+}
 
 async function probeServiceHealth(): Promise<ServiceHealth[]> {
   const services = listServices();
@@ -1166,6 +1188,22 @@ export async function connectAndKeepAlive(
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
+  let pendingChannelClose: Promise<void> | null = null;
+  // A channel whose reference was dropped without a confirmed close keeps the
+  // host record on stop(), even when every other retained channel closes.
+  let unconfirmedChannelClose = false;
+  const retainFailedChannel = (channel: TransportChannel) => {
+    // Bound the retained references and the close attempts stop() makes. This
+    // does not close anything.
+    if (failedChannels.size >= MAX_RETAINED_FAILED_CHANNELS) {
+      const oldest = failedChannels.values().next().value;
+      if (oldest !== undefined) {
+        failedChannels.delete(oldest);
+        unconfirmedChannelClose = true;
+      }
+    }
+    failedChannels.add(channel);
+  };
   let inboundPersistTimer: ReturnType<typeof setTimeout> | undefined;
   let inboundPersistState: HostConnectionState | undefined;
   let inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
@@ -1237,6 +1275,7 @@ export async function connectAndKeepAlive(
         };
         // stop() sets stopped before clearing; the write gate is checked under the lock.
         const persist = () => writeHostState(state, () => !stopped);
+        const refresh = hostStateRefresher(branchId, persist);
         persist();
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
@@ -1249,7 +1288,7 @@ export async function connectAndKeepAlive(
             await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
             state.lastHeartbeatSent = new Date().toISOString();
             state.messagesSent++;
-            persist();
+            refresh();
           } catch {}
         }, HEARTBEAT_INTERVAL_MS);
 
@@ -1261,11 +1300,11 @@ export async function connectAndKeepAlive(
           try {
             const health = await probeServiceHealth();
             state.services = health;
-            persist();
+            refresh();
           } catch {}
         }, SERVICE_HEALTH_INTERVAL_MS);
         // Initial probe on connect
-        probeServiceHealth().then((h) => { state.services = h; persist(); }).catch(() => {});
+        probeServiceHealth().then((h) => { state.services = h; refresh(); }).catch(() => {});
 
         const handler = (msg: TpsMessage) => {
           state.messagesReceived++;
@@ -1304,14 +1343,18 @@ export async function connectAndKeepAlive(
         cancelInboundPersist();
         if (currentChannel !== null) {
           const failedChannel = currentChannel;
-          failedChannels.add(failedChannel);
           currentChannel = null;
-          try {
-            await failedChannel.close();
-            failedChannels.delete(failedChannel);
-          } catch (error) {
-            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
-          }
+          pendingChannelClose = (async () => {
+            try {
+              await failedChannel.close();
+            } catch (error) {
+              console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+              retainFailedChannel(failedChannel);
+              if (stopped) unconfirmedChannelClose = true;
+            }
+          })();
+          await pendingChannelClose;
+          pendingChannelClose = null;
         }
       }
 
@@ -1328,13 +1371,17 @@ export async function connectAndKeepAlive(
     stopped = true;
     cancelInboundPersist();
     stopPrune();
-    if (currentChannel !== null) failedChannels.add(currentChannel);
+    if (pendingChannelClose !== null) await pendingChannelClose;
+    if (currentChannel !== null) {
+      retainFailedChannel(currentChannel);
+      currentChannel = null;
+    }
     for (const channel of failedChannels) {
       try { await channel.close(); failedChannels.delete(channel); } catch (error) {
         console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    if (failedChannels.size > 0) {
+    if (unconfirmedChannelClose || failedChannels.size > 0) {
       const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
       error.name = "HostChannelCloseError";
       throw error;
