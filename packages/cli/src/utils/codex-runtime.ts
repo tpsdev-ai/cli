@@ -695,10 +695,10 @@ export async function shutdownPresenceBeat(
 }
 
 /**
- * The SIGINT/SIGTERM handler: stop the task loop and the heartbeat, await the
- * bounded final beat, then exit. `stopTaskLoop` is called before the beat, and a
- * promise it returns (the loop's exit) is awaited. `exit` and `timeoutMs` are
- * injectable so a test drives the real handler.
+ * The SIGINT/SIGTERM handler: stop the heartbeat and every loop whose stop
+ * handle is in `stops`, await the bounded final beat, then exit. Each stop is
+ * called before the beat, and a promise it returns (the loop's exit) is awaited.
+ * `exit` and `timeoutMs` are injectable so a test drives the real handler.
  */
 export function shutdownHandler(
   client: Pick<FlairClient, "presence">,
@@ -706,15 +706,17 @@ export function shutdownHandler(
   stopHeartbeat: () => void,
   exit: (code: number) => void = (code) => process.exit(code),
   timeoutMs: number = SHUTDOWN_BEAT_TIMEOUT_MS,
-  stopTaskLoop?: () => void | Promise<void>,
+  stops: Array<() => void | Promise<void>> = [],
 ): () => void {
   return () => {
     stopHeartbeat();
     void (async () => {
-      try {
-        await stopTaskLoop?.();
-      } catch {
-        // A failing stop must not keep the runtime from its final beat and exit.
+      for (const stop of stops) {
+        try {
+          await stop();
+        } catch {
+          // A failing stop must not keep the runtime from its final beat and exit.
+        }
       }
       await shutdownPresenceBeat(client, agentId, timeoutMs);
       exit(0);
@@ -793,10 +795,10 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   // startup, independent of the mail loop; the signal handlers await the bounded
   // final beat before exiting.
   const stopHeartbeat = startPresenceHeartbeat(flair, agentId);
-  // The task loop starts after startup, so the handler reads its stop handle
-  // through this variable at signal time rather than taking it here.
-  let stopTaskLoop: (() => Promise<void>) | undefined;
-  const onSignal = shutdownHandler(flair, agentId, stopHeartbeat, undefined, undefined, () => stopTaskLoop?.());
+  // The loops start after startup, so they add their stop handles to this list
+  // and the handler reads it at signal time.
+  const stopHandles: Array<() => void | Promise<void>> = [];
+  const onSignal = shutdownHandler(flair, agentId, stopHeartbeat, undefined, undefined, stopHandles);
   process.once("SIGINT", onSignal);
   process.once("SIGTERM", onSignal);
 
@@ -841,7 +843,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
 
 
   // Start Flair task loop (runs in parallel with mail loop)
-  stopTaskLoop = startTaskLoop(flair, agentId, async (event) => {
+  stopHandles.push(startTaskLoop(flair, agentId, async (event) => {
     const taskBody = event.detail ?? event.summary;
     const taskId = event.refId ?? event.id;
     let preTaskState: WorkspaceState | undefined;
@@ -900,11 +902,11 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         await writeTaskMemory(flair, agentId, "failure", { task: taskBody, error: err.message });
       }
     }
-  }).stop;
+  }).stop);
 
   // Review trigger — polls the agent's own feed using a different cursor filename from the task loop.
   if (config.reviewTrigger) {
-    startReviewTriggerLoop(flair, agentId, config.reviewTrigger);
+    stopHandles.push(startReviewTriggerLoop(flair, agentId, config.reviewTrigger).stop);
     console.log(`[${agentId}] Review trigger active → ${config.reviewTrigger.reviewers.join(", ")}`);
   }
 

@@ -25,9 +25,22 @@ import {
   startPresenceHeartbeat,
 } from "../src/utils/codex-runtime.js";
 import { FlairClient } from "../src/utils/flair-client.js";
+import { homeDir } from "../src/utils/home.js";
 import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** The review-trigger loop's pre-seeded cursor, so its polls are identifiable. */
+const REVIEW_CURSOR_POSITION = "2026-01-01T00:00:00.000Z";
+
+/** How many feed reads the review-trigger loop made (its cursor names them). */
+function reviewTriggerPolls(http: string[]): number {
+  return http.filter((c) => {
+    const q = c.indexOf("?");
+    if (!c.startsWith("GET /OrgEventCatchup/testbot?") || q === -1) return false;
+    return new URLSearchParams(c.slice(q + 1)).get("after") === `${REVIEW_CURSOR_POSITION}\t`;
+  }).length;
+}
 
 /** Bounded poll: resolve when `cond` is true, else throw at `timeoutMs`. */
 async function waitFor(cond: () => boolean, timeoutMs = 5000, stepMs = 5): Promise<void> {
@@ -45,11 +58,25 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000, stepMs = 5): Promi
  * handler. Bounded waits only; the runtime's loop keeps running after the signal
  * (bun ends the file) and the signal listeners this run added are removed.
  */
-async function driveRuntime(signal: "SIGTERM" | "SIGINT", afterShutdown?: (http: string[]) => Promise<void>) {
+async function driveRuntime(
+  signal: "SIGTERM" | "SIGINT",
+  afterShutdown?: (http: string[]) => Promise<void>,
+  opts: { reviewTrigger?: { reviewers: string[]; repo: string } } = {},
+) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
   const workspace = join(dir, "workspace");
   mkdirSync(workspace, { recursive: true });
   const mailRoot = join(dir, "mail");
+  // A pre-seeded cursor makes the review-trigger loop's reads distinguishable
+  // from the task loop's, both of which read /OrgEventCatchup/testbot.
+  if (opts.reviewTrigger) {
+    const cursorDir = join(homeDir(), ".tps", "cursors");
+    mkdirSync(cursorDir, { recursive: true });
+    writeFileSync(
+      join(cursorDir, "testbot-review-trigger-task-loop.json"),
+      JSON.stringify({ position: `${REVIEW_CURSOR_POSITION}\t`, updatedAt: new Date().toISOString() }),
+    );
+  }
   const keyPath = join(dir, "testbot.key");
   writeFileSync(keyPath, keySeed().seed);
 
@@ -90,6 +117,7 @@ async function driveRuntime(signal: "SIGTERM" | "SIGINT", afterShutdown?: (http:
       flairUrl: "http://127.0.0.1:9931",
       flairKeyPath: keyPath,
       supervisorId: "flint",
+      reviewTrigger: opts.reviewTrigger,
     }).catch((e: Error) => {
       rejected = e;
     });
@@ -419,6 +447,24 @@ describe("codex runtime presence (cli#444)", () => {
         await sleep(11_000);
         expect(catchUps(), "no catch-up request after shutdown").toBe(catchUpsAtExit);
       });
+      expect(r.rejected).toBeUndefined();
+      expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
+    },
+    40_000,
+  );
+
+  it(
+    "runCodexRuntime stops the review-trigger loop on SIGTERM: no review-trigger poll after the shutdown handler runs",
+    async () => {
+      let pollsAtExit = 0;
+      const r = await driveRuntime("SIGTERM", async (http) => {
+        pollsAtExit = reviewTriggerPolls(http);
+        expect(pollsAtExit, "the review-trigger loop polled before shutdown").toBeGreaterThanOrEqual(1);
+        // Longer than the review-trigger loop's poll interval, so a stopped loop
+        // issues no further read while a running one would.
+        await sleep(11_000);
+        expect(reviewTriggerPolls(http), "no review-trigger poll after shutdown").toBe(pollsAtExit);
+      }, { reviewTrigger: { reviewers: ["reviewer-1"], repo: "example/repo" } });
       expect(r.rejected).toBeUndefined();
       expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
     },
