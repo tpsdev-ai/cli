@@ -1188,6 +1188,7 @@ export async function connectAndKeepAlive(
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
+  let pendingChannelClose: Promise<void> | null = null;
   // A channel whose reference was dropped without a confirmed close keeps the
   // host record on stop(), even when every other retained channel closes.
   let unconfirmedChannelClose = false;
@@ -1343,12 +1344,17 @@ export async function connectAndKeepAlive(
         if (currentChannel !== null) {
           const failedChannel = currentChannel;
           currentChannel = null;
-          try {
-            await failedChannel.close();
-          } catch (error) {
-            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
-            retainFailedChannel(failedChannel);
-          }
+          pendingChannelClose = (async () => {
+            try {
+              await failedChannel.close();
+            } catch (error) {
+              console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+              retainFailedChannel(failedChannel);
+              if (stopped) unconfirmedChannelClose = true;
+            }
+          })();
+          await pendingChannelClose;
+          pendingChannelClose = null;
         }
       }
 
@@ -1365,7 +1371,11 @@ export async function connectAndKeepAlive(
     stopped = true;
     cancelInboundPersist();
     stopPrune();
-    if (currentChannel !== null) retainFailedChannel(currentChannel);
+    if (pendingChannelClose !== null) await pendingChannelClose;
+    if (currentChannel !== null) {
+      retainFailedChannel(currentChannel);
+      currentChannel = null;
+    }
     for (const channel of failedChannels) {
       try { await channel.close(); failedChannels.delete(channel); } catch (error) {
         console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);

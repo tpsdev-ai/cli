@@ -166,6 +166,66 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
   }
 }, 20_000);
 
+for (const outcome of ["rejects", "resolves"] as const) {
+  test(`stop() waits for a pending reconnect close that ${outcome}`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-relay-pending-close-783-"));
+    const savedEnv = savedRelayEnv();
+    let settleClose!: () => void;
+    let closeStarted!: () => void;
+    const closing = new Promise<void>((resolve, reject) => {
+      settleClose = outcome === "rejects" ? () => reject(new Error("close refused")) : resolve;
+    });
+    const started = new Promise<void>((resolve) => { closeStarted = resolve; });
+    let closes = 0;
+    const channel: TransportChannel = {
+      async send() { throw new Error("initial heartbeat refused"); },
+      onMessage() {},
+      offMessage() {},
+      async close() {
+        if (++closes > 1) return;
+        closeStarted();
+        await closing;
+      },
+      isAlive() { return true; },
+      peerFingerprint() { return "remote"; },
+    };
+    const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+    const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    let stop: (() => Promise<void>) | undefined;
+    try {
+      const branch = await prepareBranch(root);
+      const path = hostStatePath(branch);
+      stop = await connectAndKeepAlive(branch);
+      await started;
+      expect(existsSync(path)).toBe(true);
+      let stopSettled = false;
+      const stopping = stop().then(
+        () => { stopSettled = true; return null; },
+        (error: unknown) => { stopSettled = true; return error; },
+      );
+      await Bun.sleep(10);
+      const settledBeforeClose = stopSettled;
+      settleClose();
+      const error = await stopping;
+      if (outcome === "rejects") {
+        expect(error).toMatchObject({ name: "HostChannelCloseError" });
+        expect(existsSync(path)).toBe(true);
+      } else {
+        expect(error).toBeNull();
+        expect(existsSync(path)).toBe(false);
+      }
+      expect(settledBeforeClose).toBe(false);
+    } finally {
+      settleClose();
+      await stop?.().catch(() => {});
+      connect.mockRestore();
+      diagnostic.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+}
+
 test("a failed host record refresh is reported once per connection until a write succeeds", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-refresh-report-783-"));
   const savedEnv = savedRelayEnv();
