@@ -15,7 +15,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostState, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { clearHostState, hostStatePath, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1139,6 +1139,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
 const SERVICE_HEALTH_INTERVAL_MS = 5 * 60_000; // 5 minutes
+const INBOUND_PERSIST_RETRY_BASE_MS = 50;
+const INBOUND_PERSIST_RETRY_MAX_MS = 1000;
 
 async function probeServiceHealth(): Promise<ServiceHealth[]> {
   const services = listServices();
@@ -1163,6 +1165,34 @@ export async function connectAndKeepAlive(
   let stopped = false;
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
+  const failedChannels = new Set<TransportChannel>();
+  let inboundPersistTimer: ReturnType<typeof setTimeout> | undefined;
+  let inboundPersistState: HostConnectionState | undefined;
+  let inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
+
+  const cancelInboundPersist = () => {
+    if (inboundPersistTimer !== undefined) clearTimeout(inboundPersistTimer);
+    inboundPersistTimer = undefined;
+    inboundPersistState = undefined;
+    inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
+  };
+  const attemptInboundPersist = () => {
+    inboundPersistTimer = undefined;
+    if (stopped || inboundPersistState === undefined) return;
+    try {
+      writeHostState(inboundPersistState, () => !stopped, 0);
+      cancelInboundPersist();
+    } catch (error) {
+      console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
+      inboundPersistTimer = setTimeout(attemptInboundPersist, inboundPersistBackoff);
+      inboundPersistBackoff = Math.min(inboundPersistBackoff * 2, INBOUND_PERSIST_RETRY_MAX_MS);
+    }
+  };
+  const persistInbound = (state: HostConnectionState) => {
+    if (stopped) return;
+    inboundPersistState = state;
+    if (inboundPersistTimer === undefined) inboundPersistTimer = setTimeout(attemptInboundPersist, 0);
+  };
 
   const remotePath = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId, "remote.json");
   if (!existsSync(remotePath)) throw new Error(`No remote.json for branch: ${branchId}`);
@@ -1183,7 +1213,13 @@ export async function connectAndKeepAlive(
           branchId,
           hostPublicKey: branch.encryptionKey!,
         });
+        if (stopped) {
+          // stop() began while the connect was pending: close and do not write.
+          try { await channel.close(); } catch {}
+          return;
+        }
         currentChannel = channel;
+        cancelInboundPersist();
 
         const now = new Date().toISOString();
         const state: HostConnectionState = {
@@ -1199,11 +1235,13 @@ export async function connectAndKeepAlive(
           pid: process.pid,
           startToken: processStartToken(process.pid),
         };
-        writeHostState(state);
+        // stop() sets stopped before clearing; the write gate is checked under the lock.
+        const persist = () => writeHostState(state, () => !stopped);
+        persist();
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
         state.messagesSent++;
-        writeHostState(state);
+        persist();
 
         const hb = setInterval(async () => {
           if (stopped || !channel.isAlive()) return;
@@ -1211,7 +1249,7 @@ export async function connectAndKeepAlive(
             await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
             state.lastHeartbeatSent = new Date().toISOString();
             state.messagesSent++;
-            writeHostState(state);
+            persist();
           } catch {}
         }, HEARTBEAT_INTERVAL_MS);
 
@@ -1223,11 +1261,11 @@ export async function connectAndKeepAlive(
           try {
             const health = await probeServiceHealth();
             state.services = health;
-            writeHostState(state);
+            persist();
           } catch {}
         }, SERVICE_HEALTH_INTERVAL_MS);
         // Initial probe on connect
-        probeServiceHealth().then((h) => { state.services = h; writeHostState(state); }).catch(() => {});
+        probeServiceHealth().then((h) => { state.services = h; persist(); }).catch(() => {});
 
         const handler = (msg: TpsMessage) => {
           state.messagesReceived++;
@@ -1248,7 +1286,7 @@ export async function connectAndKeepAlive(
           } else {
             state.lastHeartbeatAck = now;
           }
-          writeHostState(state);
+          persistInbound(state);
           opts.onMessage?.(msg);
         };
         channel.onMessage(handler);
@@ -1259,9 +1297,23 @@ export async function connectAndKeepAlive(
         clearInterval(hb);
         clearInterval(healthProbe);
         channel.offMessage(handler);
+        cancelInboundPersist();
         try { await channel.close(); } catch {}
         currentChannel = null;
-      } catch {}
+      } catch {
+        cancelInboundPersist();
+        if (currentChannel !== null) {
+          const failedChannel = currentChannel;
+          failedChannels.add(failedChannel);
+          currentChannel = null;
+          try {
+            await failedChannel.close();
+            failedChannels.delete(failedChannel);
+          } catch (error) {
+            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+      }
 
       reconnectCount++;
       const st = (RECONNECT_BASE_MS * Math.pow(2, Math.min(reconnectCount, 6)));
@@ -1274,8 +1326,19 @@ export async function connectAndKeepAlive(
 
   return async () => {
     stopped = true;
+    cancelInboundPersist();
     stopPrune();
-    try { await currentChannel?.close(); } catch {}
+    if (currentChannel !== null) failedChannels.add(currentChannel);
+    for (const channel of failedChannels) {
+      try { await channel.close(); failedChannels.delete(channel); } catch (error) {
+        console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (failedChannels.size > 0) {
+      const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
+      error.name = "HostChannelCloseError";
+      throw error;
+    }
     clearHostState(branchId);
   };
 }

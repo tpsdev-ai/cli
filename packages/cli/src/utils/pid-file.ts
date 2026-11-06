@@ -38,6 +38,14 @@ export type ParsedPidFile =
 
 const WHOLE_PID = /^[1-9]\d*$/;
 
+export function isPidRecordPid(pid: unknown): pid is number {
+  return typeof pid === "number" && Number.isInteger(pid) && pid >= 1 && pid <= 2147483647;
+}
+
+export function isPidRecordStartToken(token: unknown): token is string | null | undefined {
+  return token === undefined || token === null || (typeof token === "string" && token.length > 0);
+}
+
 /** Serialize a pid record. `startToken` may be null when it cannot be read. */
 export function serializePidRecord(pid: number, startToken: string | null): string {
   return `${JSON.stringify({ pid, startToken })}\n`;
@@ -59,15 +67,12 @@ function parseJsonRecord(text: string): ParsedPidFile {
   }
   const record = parsed as Record<string, unknown>;
   const pid = record.pid;
-  if (typeof pid !== "number" || !Number.isInteger(pid) || pid < 1 || pid > 2147483647) {
+  if (!isPidRecordPid(pid)) {
     return invalid("pid is not an integer in 1..2147483647");
   }
   const token = record.startToken;
-  if (token !== undefined && token !== null && typeof token !== "string") {
-    return invalid("startToken is not a string");
-  }
-  if (typeof token === "string" && token.length === 0) {
-    return invalid("startToken is empty");
+  if (!isPidRecordStartToken(token)) {
+    return invalid(typeof token === "string" ? "startToken is empty" : "startToken is not a string");
   }
   return { kind: "record", pid, startToken: typeof token === "string" ? token : null };
 }
@@ -85,7 +90,7 @@ export function parsePidFile(raw: string): ParsedPidFile {
   if (text.startsWith("{")) return parseJsonRecord(text);
   if (!WHOLE_PID.test(text)) return invalid("pid is not a whole positive decimal integer");
   const pid = Number(text);
-  if (pid > 2147483647) return invalid("pid is not an integer in 1..2147483647");
+  if (!isPidRecordPid(pid)) return invalid("pid is not an integer in 1..2147483647");
   return { kind: "record", pid, startToken: null };
 }
 
