@@ -2,15 +2,15 @@
  * probe.fixture.ts — the second file in the relay timeout-cascade lane
  * (test/relay-timeout-cascade-770.test.ts). It is run by an explicit path in
  * the same bun process as relay-delivery-loss.test.ts, after that file. It
- * compares the environment it sees with the environment the lane started with
- * and writes the difference for the lane's outer test.
+ * compares the audited environment keys it sees with the environment the lane
+ * started with and writes the difference for the lane's outer test.
  */
 import { expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 
-const KEYS = ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT"] as const;
+const KEYS = ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT", "TPS_RELAY_ACCEPT_RECEIPT_TTL_MS"] as const;
 
-test("with room the entry point writes the inbox: the next file sees the environment restored", () => {
+test("with room the entry point writes the inbox: the next file sees the audited environment keys restored", () => {
   const baselinePath = process.env.TPS_RELAY_PROBE_BASELINE;
   const resultPath = process.env.TPS_RELAY_PROBE_RESULT;
   if (!baselinePath) throw new Error("TPS_RELAY_PROBE_BASELINE is not set");

@@ -23,9 +23,8 @@ const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
 /**
  * Each sync case pays syncRemoteBranch's fixed 3000 ms delivery window
- * (src/utils/relay.ts) because its cleanup awaits the sync promise; a connect
- * case pays the keep-alive loop's 1000 ms poll plus its 1100 ms settle. Neither
- * wait has a test knob, so the cases carry an explicit per-test timeout with
+ * (src/utils/relay.ts) because its cleanup awaits the sync promise. That wait
+ * has no test knob, so the cases carry an explicit per-test timeout with
  * margin rather than running near bun's 5 s default. The cascade lane sets
  * TPS_RELAY_LOSS_TEST_TIMEOUT_MS to force the short timeout the fix must survive.
  */
@@ -34,7 +33,7 @@ const CASE_TIMEOUT_MS = (() => {
   return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
 })();
 
-const ENV_KEYS = ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT"] as const;
+const ENV_KEYS = ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT", "TPS_RELAY_ACCEPT_RECEIPT_TTL_MS"] as const;
 
 /** The values this file's cases may change, copied before any case runs. */
 const FILE_ENV: Record<string, string | undefined> = {};
@@ -138,11 +137,12 @@ for (const entry of ["sync", "connect"] as const) {
       completion = undefined;
     });
 
-    // The restore is synchronous and runs before any await: a case that times
+    // The cleanup that resolves paths from HOME/TPS_* runs before the restore,
+    // so it targets this case's tree. The environment is restored at the top of
+    // the next beforeEach, before any await, and in afterAll: a case that times
     // out, or an afterEach that then exceeds its own timeout, must not leave
-    // this file's environment or listeners for the next test file in the lane.
+    // this file's environment or listeners for the next case or test file.
     afterEach(async () => {
-      restoreEnv();
       restoreSignalListeners();
       mock.restore();
       try {
@@ -150,6 +150,7 @@ for (const entry of ["sync", "connect"] as const) {
         if (completion) await completion;
         if (entry === "connect") await Bun.sleep(1100);
       } finally {
+        restoreEnv();
         fs.rmSync(root, { recursive: true, force: true });
         roots.delete(root);
       }
@@ -645,13 +646,16 @@ for (const entry of ["sync", "connect"] as const) {
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
       await ackOnlyRecord();
       const marker = relayAcceptanceReceiptPath("remote", body.id);
+      const ttl = process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
       process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = "1000";
+      if (process.env.TPS_RELAY_LOSS_THROW_AFTER_TTL_ASSIGN === "1") throw new Error("injected throw after the receipt TTL assignment");
       const old = new Date(Date.now() - 5000);
       fs.utimesSync(marker, old, old);
       try {
         await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
       } finally {
-        delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+        if (ttl === undefined) delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+        else process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = ttl;
       }
       expect(acks.map((ack) => ack.body)).toEqual([{ id: body.id, accepted: true }, { id: body.id, accepted: true }]);
       expect(jsonFiles(getInbox("local").fresh)).toHaveLength(1);
@@ -664,6 +668,7 @@ for (const entry of ["sync", "connect"] as const) {
       const accepted = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote");
       const firstMarker = relayAcceptanceReceiptPath("remote", first.id);
       expect(fs.existsSync(firstMarker)).toBe(true);
+      const ttl = process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
       process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = "1000";
       const oldBucket = join(accepted, "2020-01-01");
       fs.mkdirSync(oldBucket);
@@ -672,7 +677,8 @@ for (const entry of ["sync", "connect"] as const) {
       try {
         await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: second });
       } finally {
-        delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+        if (ttl === undefined) delete process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS;
+        else process.env.TPS_RELAY_ACCEPT_RECEIPT_TTL_MS = ttl;
       }
       expect(fs.existsSync(oldBucket)).toBe(false);
       expect(fs.existsSync(relayAcceptanceReceiptPath("remote", second.id))).toBe(true);
