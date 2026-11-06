@@ -149,23 +149,28 @@ describe("the readiness deadline bounds each probe", () => {
 
   test("a probe timeout never exceeds the time left before the deadline", async () => {
     const budgetMs = 60;
+    let clockMs = 0;
     const probeTimeouts: number[] = [];
     const runStatus = ({ timeout }: { timeout: number }) => {
       probeTimeouts.push(timeout);
+      clockMs += 10;
       return { status: 1, stdout: "", stderr: "" };
     };
     await expect(
       waitForRpc(CASE_STUB, 9, "/nonexistent/bin", GATEWAY_RUNNING, "/nonexistent/log", {
         timeoutMs: budgetMs,
-        pollMs: 10,
+        pollMs: 15,
         probeTimeoutMs: 60_000,
         runStatus,
+        now: () => clockMs,
+        sleep: async (ms: number) => {
+          clockMs += ms;
+        },
       }),
     ).rejects.toThrow(/did not answer --require-rpc within 0\.06s/);
-    expect(probeTimeouts.length).toBeGreaterThan(1);
-    for (const timeout of probeTimeouts) expect(timeout).toBeLessThanOrEqual(budgetMs);
-    expect(probeTimeouts.at(-1)).toBeLessThan(probeTimeouts[0]);
-  });
+    expect(probeTimeouts).toEqual([60, 35, 10]);
+    expect(clockMs).toBe(budgetMs);
+  }, 1000);
 });
 
 describe("cleanup fails the lane when the gateway does not exit", () => {

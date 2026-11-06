@@ -183,16 +183,18 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
     probeTimeoutMs = 5000,
     rpcTimeoutMs = 2000,
     runStatus = defaultStatusProbe,
+    now = Date.now,
+    sleep = delay,
   } = options;
-  const deadline = Date.now() + timeoutMs;
+  const deadline = now() + timeoutMs;
   let last;
-  while (Date.now() < deadline) {
+  while (now() < deadline) {
     if (gateway.exitCode !== null || (gateway.signalCode ?? null) !== null) {
       throw new Error(
         `gateway exited with ${gateway.exitCode !== null ? `code ${gateway.exitCode}` : `signal ${gateway.signalCode}`} before RPC readiness\n${readLogTail(logPath)}`,
       );
     }
-    const remaining = Math.max(1, deadline - Date.now());
+    const remaining = Math.max(1, deadline - now());
     last = runStatus({
       binDir,
       testCase,
@@ -201,12 +203,12 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
       rpcTimeout: Math.max(1, Math.min(rpcTimeoutMs, remaining)),
     });
     if (last.status === 0) {
-      if (Date.now() > deadline) {
+      if (now() > deadline) {
         throw new Error(`gateway answered --require-rpc after the ${timeoutMs / 1000}s readiness deadline`);
       }
       return;
     }
-    await delay(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+    await sleep(Math.min(pollMs, Math.max(0, deadline - now())));
   }
   throw new Error(
     `gateway did not answer --require-rpc within ${timeoutMs / 1000}s\n${describeRun(last)}\n${readLogTail(logPath)}`,
