@@ -26,7 +26,7 @@ const launchFlags = readLaunchFlags(ownArgv());
 if (launchFlags.refusal) enforceLaunchControl({ argv: ownArgv() });
 
 const getRuntimeFlag = (action: "create" | "set-runtime"): string | undefined => {
-  const args = helpArgs.argv;
+  const args = process.argv.slice(2);
   const values: (string | undefined)[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
