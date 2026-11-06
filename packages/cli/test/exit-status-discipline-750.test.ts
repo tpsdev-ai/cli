@@ -80,7 +80,7 @@ const ALLOWLIST: ZeroExitAllowance[] = [
       "runOffice > case \"relay\" > process.on(\"SIGINT\")[callback:1] #1 (zero)",
       "runOffice > case \"connect\" > process.on(\"SIGINT\")[callback:1] #1 (zero)",
     ],
-    reason: "office relay/connect SIGINT/SIGTERM shutdown handlers",
+    reason: "office relay SIGINT/SIGTERM and connect SIGINT shutdown handlers",
   },
   {
     file: "src/commands/branch.ts",
