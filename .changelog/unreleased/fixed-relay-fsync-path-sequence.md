@@ -1,0 +1,1 @@
+- **The relay fsync test asserts a path sequence, not a process-wide count.**

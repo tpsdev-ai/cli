@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach, afterAll, spyOn, mock } 
 import { MailClient, hasCommittedMessageId } from "@tpsdev-ai/agent";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath, relayRecordFileName } from "../src/utils/mail.js";
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
@@ -18,6 +18,101 @@ import { writeKeyFile, buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stu
 afterEach(() => {
   mock.restore();
 });
+
+const watchMailFsyncs = (mailRoot: string, onDeliverySync?: (index: number) => void) => {
+  const inMailRoot = (path: string) => path === mailRoot || path.startsWith(`${mailRoot}${sep}`);
+  const all: string[] = [];
+  const delivery: string[] = [];
+  const openPaths = new Map<number, string>();
+  const open = fs.openSync as (path: string, flags: string, mode?: number) => number;
+  const sync = fs.fsyncSync;
+  const closeSync = fs.closeSync;
+  const close = fs.close;
+  const openHandle = fs.promises.open;
+  const handleCloseSpies: Array<{ mockRestore(): void }> = [];
+  let watching = true;
+  const openSpy = spyOn(fs, "openSync").mockImplementation(((path: string, flags: string, mode?: number) => {
+    const fd = open(path, flags, mode);
+    openPaths.set(fd, path);
+    return fd;
+  }) as typeof fs.openSync);
+  const closeSyncSpy = spyOn(fs, "closeSync").mockImplementation((fd) => {
+    openPaths.delete(fd);
+    return closeSync(fd);
+  });
+  const closeSpy = spyOn(fs, "close").mockImplementation((fd, callback) => {
+    openPaths.delete(fd);
+    return close(fd, callback);
+  });
+  const openHandleSpy = spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+    const handle = await openHandle(...args);
+    if (!watching) return handle;
+    const closeHandle = handle.close.bind(handle);
+    handleCloseSpies.push(spyOn(handle, "close").mockImplementation(() => {
+      openPaths.delete(handle.fd);
+      return closeHandle();
+    }));
+    return handle;
+  });
+  const syncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+    let path = openPaths.get(fd);
+    if (path === undefined) {
+      try { path = fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { path = `<unknown fd ${fd}>`; }
+    }
+    all.push(path);
+    if (inMailRoot(path)) {
+      delivery.push(path);
+      onDeliverySync?.(delivery.length - 1);
+    }
+    return sync(fd);
+  });
+  return {
+    all,
+    delivery,
+    restore() {
+      watching = false;
+      syncSpy.mockRestore();
+      for (const spy of handleCloseSpies) spy.mockRestore();
+      openHandleSpy.mockRestore();
+      closeSpy.mockRestore();
+      closeSyncSpy.mockRestore();
+      openSpy.mockRestore();
+    },
+  };
+};
+
+for (const closeMode of ["sync", "callback"] as const) {
+  test(`fsync watcher excludes an async foreign open after ${closeMode} close reuses a tracked fd`, async () => {
+    const root = fs.mkdtempSync(join(tmpdir(), "tps-fsync-reuse-"));
+    const mailRoot = join(root, "mail");
+    fs.mkdirSync(mailRoot);
+    const inside = join(mailRoot, "inside");
+    const outside = join(root, "outside");
+    fs.writeFileSync(inside, "inside");
+    fs.writeFileSync(outside, "outside");
+    const indexes: number[] = [];
+    const watch = watchMailFsyncs(mailRoot, (index) => {
+      indexes.push(index);
+      throw new Error("injected delivery fsync failure");
+    });
+    try {
+      const fd = fs.openSync(inside, "r");
+      if (closeMode === "sync") fs.closeSync(fd);
+      else await new Promise<void>((resolve, reject) => fs.close(fd, (error) => error ? reject(error) : resolve()));
+      const foreign = await fs.promises.open(outside, "r");
+      try {
+        expect(foreign.fd).toBe(fd);
+        expect(() => fs.fsyncSync(foreign.fd)).not.toThrow();
+        expect(watch.delivery).toEqual([]);
+        expect(indexes).toEqual([]);
+        expect(watch.all).toHaveLength(1);
+      } finally { await foreign.close(); }
+    } finally {
+      watch.restore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 5000);
+}
 
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
@@ -886,9 +981,9 @@ for (const entry of ["sync", "connect"] as const) {
         for (let stripe = 0; stripe < RELAY_ACCEPT_LOCK_STRIPES; stripe++) {
           fs.mkdirSync(join(process.env.TPS_MAIL_DIR!, ".relay-accept-locks", String(stripe)), { recursive: true });
         }
-        const sync = fs.fsyncSync;
-        const trace: number[] = [];
-        const capture = spyOn(fs, "fsyncSync").mockImplementation((fd) => { trace.push(fd); return sync(fd); });
+        const mailRoot = resolve(process.env.TPS_MAIL_DIR!);
+        const inMailRoot = (path: string) => path === mailRoot || path.startsWith(`${mailRoot}${sep}`);
+        // Resolve fsync paths best-effort; index faults by paths under this mail root.
         // recordAcceptance creates the UTC-day receipt bucket on a branch's first
         // delivery of the day, and mkdirMailDirectory then fsyncs the new bucket's
         // parent; a delivery that finds the bucket already there makes one fewer
@@ -905,29 +1000,55 @@ for (const entry of ["sync", "connect"] as const) {
           }
         };
         const initial = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "sync trace", SEEDS)));
+        const warmed = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "warmed sync trace", SEEDS)));
+        const record = relayRecordFileName("remote", warmed.id);
+        const acceptedBranch = join(mailRoot, ".relay-accepted", "by-branch", "remote");
+        const warmup = watchMailFsyncs(mailRoot);
         try {
           await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: initial });
-          trace.length = 0;
-          removeReceiptBucket();
-          const warmed = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "warmed sync trace", SEEDS)));
+        } finally { warmup.restore(); }
+        removeReceiptBucket();
+        const receipt = relayAcceptanceReceiptPath("remote", warmed.id);
+        const bucket = dirname(receipt);
+        const expected = (destination === "inbox"
+          ? [
+            join(mailRoot, "local", "tmp", record),
+            join(mailRoot, "local", "new"),
+            join(mailRoot, "local", "tmp"),
+            acceptedBranch,
+            `${receipt}.tmp`,
+            bucket,
+          ]
+          : [
+            join(mailRoot, "local", "dlq", `${record}.reason`),
+            join(mailRoot, "local", "tmp", record),
+            join(mailRoot, "local", "dlq"),
+            join(mailRoot, "local", "tmp"),
+            acceptedBranch,
+            `${receipt}.tmp`,
+            bucket,
+          ]).map((path) => relative(mailRoot, path));
+        const capture = watchMailFsyncs(mailRoot);
+        try {
           await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: warmed });
-        }
-        finally { capture.mockRestore(); }
+        } finally { capture.restore(); }
         expect(acks.length).toBe(2);
-        expect(trace.length).toBe(destination === "inbox" ? 6 : 7);
-        for (let step = 1; step <= trace.length; step++) {
+        const actual = capture.delivery.map((path) => relative(mailRoot, path));
+        if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+          const trace = capture.all.map((path) => `  ${inMailRoot(path) ? "mail" : "foreign"} ${path}`).join("\n");
+          throw new Error(`fsync path sequence mismatch for the ${destination} delivery\nexpected (${expected.length}):\n${expected.map((path) => `  mail ${path}`).join("\n")}\nactual (${actual.length}):\n${actual.map((path) => `  mail ${path}`).join("\n")}\nall fsyncs in the window (${capture.all.length}):\n${trace}`);
+        }
+        for (let step = 1; step <= expected.length; step++) {
           const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", `sync fault ${step}`, SEEDS)));
           const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: step + 1, ts: new Date().toISOString(), body };
           const beforeAcks = acks.length;
           const beforeRecords = jsonFiles(inbox.fresh).length + jsonFiles(inbox.dlq).length;
           removeReceiptBucket();
-          let calls = 0;
-          const fault = spyOn(fs, "fsyncSync").mockImplementation((fd) => {
-            if (++calls === step) throw new Error(`injected fsync failure ${step}`);
-            return sync(fd);
+          const fault = watchMailFsyncs(mailRoot, (index) => {
+            if (index + 1 === step) throw new Error(`injected fsync failure ${step}`);
           });
-          try { await deliverDirect(msg); } finally { fault.mockRestore(); }
-          expect(calls).toBeGreaterThanOrEqual(step);
+          try { await deliverDirect(msg); } finally { fault.restore(); }
+          expect(fault.delivery.length).toBeGreaterThanOrEqual(step);
           expect(acks.length).toBe(beforeAcks);
           expect(fs.existsSync(relayAcceptanceReceiptPath("remote", body.id))).toBe(false);
           expect(jsonFiles(inbox.fresh).length + jsonFiles(inbox.dlq).length).toBe(beforeRecords);
