@@ -112,7 +112,7 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(state.branch);
   withHostStateRecordLock(path, "write the host state record", () => {
-    // Checked inside the lock: a caller that has begun shutting down sets its
+    // Checked inside the lock: a caller that has begun stop() sets its
     // flag before it takes the lock to clear, so a write it starts afterwards
     // is skipped.
     if (shouldWrite !== undefined && !shouldWrite()) return;
@@ -144,7 +144,7 @@ type HostRecordRead =
 /** Read a host state record and distinguish an absent file from one whose
  *  owner cannot be verified. A non-regular file (a directory or a symlink) and
  *  a parse or shape failure are reported, never treated as absent. */
-function readHostRecord(path: string): HostRecordRead {
+function readHostRecord(path: string, branch: string): HostRecordRead {
   let isFile: boolean;
   try {
     isFile = lstatSync(path).isFile();
@@ -171,8 +171,27 @@ function readHostRecord(path: string): HostRecordRead {
     return { kind: "invalid" };
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { kind: "invalid" };
-  const state = parsed as { pid?: unknown };
-  if (typeof state.pid !== "number") return { kind: "invalid" };
+  const state = parsed as Record<string, unknown>;
+  if (state.branch !== branch
+    || typeof state.connectedAt !== "string"
+    || typeof state.lastHeartbeatSent !== "string"
+    || (state.lastHeartbeatAck !== null && typeof state.lastHeartbeatAck !== "string")
+    || typeof state.reconnectCount !== "number"
+    || typeof state.bytesSent !== "number"
+    || typeof state.bytesReceived !== "number"
+    || typeof state.messagesSent !== "number"
+    || typeof state.messagesReceived !== "number"
+    || typeof state.pid !== "number"
+    || (state.startToken !== undefined && state.startToken !== null && typeof state.startToken !== "string")
+    || (state.services !== undefined && (!Array.isArray(state.services) || !state.services.every((service: unknown) => {
+      if (typeof service !== "object" || service === null || Array.isArray(service)) return false;
+      const health = service as Record<string, unknown>;
+      return typeof health.name === "string"
+        && (health.status === "healthy" || health.status === "unhealthy" || health.status === "unknown")
+        && (health.lastCheck === null || typeof health.lastCheck === "string")
+        && (health.lastHealthy === null || typeof health.lastHealthy === "string")
+        && (health.error === undefined || typeof health.error === "string");
+    })))) return { kind: "invalid" };
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
@@ -184,7 +203,7 @@ export function clearHostState(branch: string): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(branch);
   withHostStateRecordLock(path, "remove the host state record", () => {
-    const current = readHostRecord(path);
+    const current = readHostRecord(path, branch);
     if (current.kind === "absent") return;
     if (current.kind !== "record") {
       throw new Error(

@@ -150,7 +150,7 @@ test("stop() reports a host record that is not a regular file and keeps it", asy
   }
 });
 
-test("stop() suppresses the host record write of a connection that resolves after shutdown", async () => {
+test("stop() suppresses the host record write of a connection that resolves after stop()", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-stop-connect-748-"));
   const savedEnv = savedRelayEnv();
   const connection = deferred<TransportChannel>();
@@ -182,7 +182,7 @@ test("stop() suppresses the host record write of a connection that resolves afte
   }
 });
 
-test("stop() suppresses the host record write of a heartbeat send that resolves after shutdown", async () => {
+test("stop() suppresses the host record write of a heartbeat send that resolves after stop()", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-stop-send-748-"));
   const savedEnv = savedRelayEnv();
   const sent = deferred<void>();

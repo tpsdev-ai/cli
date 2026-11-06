@@ -1204,8 +1204,7 @@ export async function connectAndKeepAlive(
           pid: process.pid,
           startToken: processStartToken(process.pid),
         };
-        // Each write is gated on the live connection: stop() sets stopped
-        // before it clears the record, and the gate is checked under the lock.
+        // stop() sets stopped before clearing; the write gate is checked under the lock.
         const persist = () => writeHostState(state, () => !stopped);
         persist();
 

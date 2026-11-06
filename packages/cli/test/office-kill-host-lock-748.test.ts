@@ -1,6 +1,6 @@
 /**
  * cli#748 — one shared lock per host state record. The host connection writer
- * and the connector's shutdown take it, and `office kill` holds it across its
+ * and the connector's stop() take it, and `office kill` holds it across its
  * final read and removal, so the host connection writer cannot replace and
  * lose a successor record in the window between the two.
  */
@@ -152,7 +152,7 @@ afterEach(() => {
 
 describe("host state record lock", () => {
   test(
-    "a successor write attempted between office kill's final read and removal is kept and reported",
+    "an in-window write is refused; office kill keeps and reports the later retry",
     async () => {
       const root = join(home, "tps-root");
       mkdirSync(root, { recursive: true });
@@ -318,7 +318,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "clearHostState leaves a record whose fabricated start token names another process",
+    "clearHostState leaves a record with a mismatched start token",
     () => {
       const token = childToken(process.pid);
       const foreign = token.startsWith("ps:") ? "ps:Thu Jan 1 00:00:00 1970" : "proc:1";
