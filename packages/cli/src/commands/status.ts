@@ -155,7 +155,8 @@ function checkWorkspaceWritable(agentWorkspace: string): string[] {
 }
 
 function checkGatewayHealth(): string[] {
-  const check = spawnSync("openclaw", ["gateway", "status"], {
+  // Older OpenClaw versions rejecting --require-rpc fail closed via their non-zero exit.
+  const check = spawnSync("openclaw", ["gateway", "status", "--require-rpc"], {
     encoding: "utf-8",
     timeout: 5000,
   });

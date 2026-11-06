@@ -10,6 +10,15 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 let home: string;
 let fakeBin: string;
 
+function failGatewayProbe(probe?: string): void {
+  writeFileSync(join(fakeBin, "openclaw"), `#!/bin/sh
+${probe ? `echo probed > '${probe}'\n` : ""}for arg in "$@"; do
+  if [ "$arg" = "--require-rpc" ]; then exit 1; fi
+done
+exit 0
+`);
+}
+
 beforeEach(() => {
   home = mkdtempSync(join(tmpdir(), "tps-exit-750-"));
   fakeBin = join(home, "fake-bin");
@@ -86,7 +95,7 @@ describe("cli#750 — command failure paths exit non-zero", () => {
     mkdirSync(join(home, ".openclaw"), { recursive: true });
     writeFileSync(join(home, ".openclaw", "openclaw.json"), JSON.stringify({ agents: { list: [{ id: "other-agent" }] } }));
     const probe = join(home, "gateway-probed");
-    writeFileSync(join(fakeBin, "openclaw"), `#!/bin/sh\necho probed > '${probe}'\nexit 1\n`);
+    failGatewayProbe(probe);
 
     const result = await runTps(["heartbeat", agent]);
     expect(result.status).toBe(1);
@@ -110,7 +119,7 @@ describe("cli#750 — command failure paths exit non-zero", () => {
     const configPath = join(home, "custom-config.json");
     const model = "custom-provider/custom-model";
     writeFileSync(configPath, JSON.stringify({ agents: { list: [{ id: agent, model }] } }));
-    writeFileSync(join(fakeBin, "openclaw"), "#!/bin/sh\nexit 1\n");
+    failGatewayProbe();
 
     const result = await runTps(["heartbeat", agent, "--config", configPath]);
     expect(result.status).toBe(1);
@@ -121,12 +130,12 @@ describe("cli#750 — command failure paths exit non-zero", () => {
     expect(recorded.model).toBe(model);
   });
 
-  test("an OpenClaw agent heartbeat exits 1 for a failed gateway check", async () => {
+  test("heartbeat exits 1 when the gateway stub's RPC probe fails", async () => {
     const agent = "openclaw-agent";
     mkdirSync(join(home, ".tps", "branch-office", agent), { recursive: true });
     mkdirSync(join(home, ".openclaw"), { recursive: true });
     writeFileSync(join(home, ".openclaw", "openclaw.json"), JSON.stringify({ agents: { list: [{ id: agent }] } }));
-    writeFileSync(join(fakeBin, "openclaw"), "#!/bin/sh\nexit 1\n");
+    failGatewayProbe();
 
     const result = await runTps(["heartbeat", agent]);
     expect(result.status).toBe(1);
