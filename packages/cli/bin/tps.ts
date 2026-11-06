@@ -25,6 +25,34 @@ function ownArgv(): string[] {
 const launchFlags = readLaunchFlags(ownArgv());
 if (launchFlags.refusal) enforceLaunchControl({ argv: ownArgv() });
 
+const getRuntimeFlag = (action: "create" | "set-runtime"): string | undefined => {
+  const args = process.argv.slice(2);
+  const values: (string | undefined)[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--") break;
+    if (arg === "--runtime") {
+      const next = args[index + 1];
+      values.push(next?.startsWith("-") ? undefined : next);
+    } else if (arg.startsWith("--runtime=")) {
+      values.push(arg.slice("--runtime=".length));
+    }
+  }
+  const reasons: string[] = [];
+  if (values.some((value) => !value)) reasons.push("it requires a value");
+  if (values.length > 1) reasons.push("give --runtime once");
+  if (reasons.length > 0) {
+    console.error(`❌ Refusing --runtime: ${reasons.join("; ")}; only 'openclaw' and 'native' are accepted.`);
+    console.error(`   Run: tps agent ${action} --id <agent-id> --runtime <openclaw|native>`);
+    process.exit(1);
+  }
+  return values[0];
+};
+
+const [rawCommand, rawAction] = helpArgs.positionals;
+const agentRuntime = rawCommand === "agent" && (rawAction === "create" || rawAction === "set-runtime")
+  ? getRuntimeFlag(rawAction) : undefined;
+
 const cli = meow(
   `
   Usage
@@ -396,23 +424,13 @@ async function main() {
         return idx >= 0 ? process.argv[idx + 1] : undefined;
       };
 
-      // `--runtime=value` is accepted alongside `--runtime value`; the shared
-      // flag parser defaults runtime to openclaw for hire, so read the argv.
-      const getRuntimeFlag = (): string | undefined => {
-        const args = helpArgs.argv;
-        const idx = args.indexOf("--runtime");
-        if (idx >= 0) return args[idx + 1];
-        const inline = args.find((arg) => arg.startsWith("--runtime="));
-        return inline?.slice("--runtime=".length);
-      };
-
       const { runAgent } = await import("../src/commands/agent.js");
 
       if (action === "create") {
         await runAgent({
           action: "create",
           id: getFlag("id") ?? rest[1],
-          runtime: getRuntimeFlag(),
+          runtime: agentRuntime,
           name: getFlag("name"),
           model: getFlag("model"),
           flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
@@ -424,7 +442,7 @@ async function main() {
         await runAgent({
           action: "set-runtime",
           id: getFlag("id") ?? rest[1],
-          runtime: getRuntimeFlag(),
+          runtime: agentRuntime,
         });
       } else if (action === "list") {
         await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });

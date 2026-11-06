@@ -17,7 +17,7 @@ import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/iden
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
-import { accessSync, chmodSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
+import { accessSync, chmodSync, chownSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
 import { randomUUID, sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
@@ -158,11 +158,38 @@ function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime):
   return `${configText.slice(0, insertion)}runtime: ${runtime}${newline}${configText.slice(insertion)}`;
 }
 
-function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number, expected: Buffer): void {
+interface ConfigOwnership {
+  mode: number;
+  uid: number;
+  gid: number;
+}
+
+function writeRuntimeConfig(configPath: string, contents: string | Buffer, original: ConfigOwnership, expected: Buffer): void {
   const temporary = join(dirname(configPath), `.agent-runtime-${randomUUID()}.tmp`);
+  const permissions = original.mode & 0o777;
   try {
-    writeFileSync(temporary, contents, { flag: "wx", mode });
-    chmodSync(temporary, mode);
+    writeFileSync(temporary, contents, { flag: "wx", mode: permissions });
+    try {
+      chmodSync(temporary, permissions);
+    } catch (e) {
+      throw new Error(`Cannot set permissions on ${temporary}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    try {
+      chownSync(temporary, original.uid, original.gid);
+    } catch (first) {
+      const code = (first as NodeJS.ErrnoException).code;
+      const failure = new Error(
+        `Cannot preserve the owner and group of ${temporary} (uid ${original.uid}, gid ${original.gid}, code ${code ?? "unknown"}): ` +
+        (first instanceof Error ? first.message : String(first)),
+      );
+      if (code !== "EPERM" && code !== "EACCES") throw failure;
+      // An ordinary unprivileged process cannot take ownership for another user.
+      try {
+        chownSync(temporary, -1, original.gid);
+      } catch {
+        throw failure;
+      }
+    }
     if (!readFileSync(configPath).equals(expected)) {
       throw new Error("Config changed since it was read; leaving it unchanged.");
     }
@@ -826,11 +853,11 @@ function setAgentRuntime(args: AgentArgs): void {
 
   const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
   let original: Buffer;
-  let mode: number;
+  let ownership: ConfigOwnership;
   try {
     const stat = lstatSync(configPath);
     if (!stat.isFile()) throw new Error("Config must be a regular file; edit the file by hand.");
-    mode = stat.mode;
+    ownership = { mode: stat.mode, uid: stat.uid, gid: stat.gid };
     original = readFileSync(configPath);
   } catch (e) {
     const code = (e as { code?: string } | null)?.code;
@@ -855,7 +882,7 @@ function setAgentRuntime(args: AgentArgs): void {
   }
   let written = false;
   try {
-    writeRuntimeConfig(configPath, updated, mode, original);
+    writeRuntimeConfig(configPath, updated, ownership, original);
     written = true;
     const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
     if (parsed?.runtime !== runtime) throw new Error("Runtime verification failed; edit the file by hand.");
@@ -864,7 +891,7 @@ function setAgentRuntime(args: AgentArgs): void {
       try {
         const writtenBytes = Buffer.from(updated, "utf-8");
         if (readFileSync(configPath).equals(writtenBytes)) {
-          writeRuntimeConfig(configPath, original, mode, writtenBytes);
+          writeRuntimeConfig(configPath, original, ownership, writtenBytes);
         } else {
           console.error(`❌ Config changed after writing ${configPath}; leaving it unchanged.`);
         }

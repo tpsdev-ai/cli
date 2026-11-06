@@ -1,6 +1,6 @@
 // cli#757 — built CLI with temporary HOME; the native case removes the fake OpenClaw.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import yaml from "js-yaml";
@@ -45,12 +45,12 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-async function runTps(args: string[], env: Record<string, string> = {}, preload?: string): Promise<{
+async function runTps(args: string[], env: Record<string, string> = {}, preload?: string, execPath = process.execPath): Promise<{
   status: number;
   stdout: string;
   stderr: string;
 }> {
-  const command = preload ? ["node", "--import", preload, TPS_BIN, ...args] : [process.execPath, TPS_BIN, ...args];
+  const command = preload ? ["node", "--import", preload, TPS_BIN, ...args] : [execPath, TPS_BIN, ...args];
   const proc = Bun.spawn(command, {
     env: {
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
@@ -302,6 +302,134 @@ describe("cli#757 — recording the runtime", () => {
     expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("native");
   }, 30000);
 
+  test("create refuses a bare --runtime and writes nothing", async () => {
+    const agent = "runtime-bare";
+    const result = await runTps(["agent", "create", "--id", agent, "--runtime"]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("requires a value");
+    expect(result.stderr).toContain("only 'openclaw' and 'native' are accepted");
+    expect(existsSync(join(home, ".tps"))).toBe(false);
+  }, 20000);
+
+  test("create refuses a --runtime followed by another flag and writes nothing", async () => {
+    const agent = "runtime-followed";
+    const result = await runTps(["agent", "create", "--id", agent, "--runtime", "--name", "Agent A"]);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("requires a value");
+    expect(result.stderr).toContain("only 'openclaw' and 'native' are accepted");
+    expect(existsSync(join(home, ".tps"))).toBe(false);
+  }, 20000);
+
+  for (const action of ["create", "set-runtime"]) {
+    test(`${action} ignores runtime tokens after -- with an existing config`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath);
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["agent", action, "--id", "x", "--", "--runtime", "native"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Refusing runtime ''");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime <openclaw|native>");
+      } else {
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("Config preserved at");
+      }
+      expect(readFileSync(configPath)).toEqual(before);
+      expect(statSync(configPath).ino).toBe(inode);
+    }, 20000);
+
+    test(`${action} reads the runtime before -- with an existing config`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath, "utf-8");
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["agent", action, "--id", "x", "--runtime", "native", "--", "--runtime", "openclaw"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(0);
+        expect(result.stdout.match(/runtime recorded as 'native'/g)).toHaveLength(1);
+        expect(readFileSync(configPath, "utf-8")).toBe(before.replace("runtime: openclaw", "runtime: native"));
+        expect(statSync(configPath).ino).not.toBe(inode);
+      } else {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Config already exists at");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime native");
+        expect(readFileSync(configPath, "utf-8")).toBe(before);
+        expect(statSync(configPath).ino).toBe(inode);
+      }
+    }, 20000);
+
+    test(`${action} dispatches after a leading -- as meow positional input`, async () => {
+      const configPath = writeAgentConfig("x", "openclaw");
+      const before = readFileSync(configPath);
+      const inode = statSync(configPath).ino;
+      const result = await runTps(["--", "agent", action, "--id", "x", "--runtime", "native"], {}, undefined, "node");
+      if (action === "set-runtime") {
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("Refusing runtime ''");
+        expect(result.stderr).toContain("Run: tps agent set-runtime --id x --runtime <openclaw|native>");
+      } else {
+        expect(result.status).toBe(0);
+        expect(result.stdout).toContain("Config preserved at");
+      }
+      expect(readFileSync(configPath)).toEqual(before);
+      expect(statSync(configPath).ino).toBe(inode);
+    }, 20000);
+
+    for (const args of [
+      ["--runtime"],
+      ["--runtime", "--name", "Ignored"],
+      ["--runtime", "-x"],
+      ["--runtime", "--help"],
+      ["--runtime", "-h"],
+      ["--runtime", "--version"],
+      ["--runtime", "-v"],
+      ["--runtime="],
+      ["--runtime", "native", "--runtime"],
+      ["--runtime", "native", "--runtime", "--name", "Ignored"],
+      ["--runtime", "native", "--runtime", "openclaw"],
+      ["--runtime=native", "--runtime=openclaw"],
+      ["--runtime=native", "--runtime", "openclaw"],
+      ["--runtime", "native", "--runtime="],
+      ["--runtime=", "--runtime", "native"],
+    ]) {
+      test(`${action} refuses ${args.join(" ")} before writing`, async () => {
+        const agent = "runtime-argv";
+        const occurrences = args.filter((arg) => arg === "--runtime" || arg.startsWith("--runtime="));
+        const missingValue = args.some((arg, index) => arg === "--runtime=" ||
+          (arg === "--runtime" && (!args[index + 1] || args[index + 1].startsWith("-"))));
+        const refuse = async () => {
+          const result = await runTps(["agent", action, "--id", agent, ...args]);
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain("only 'openclaw' and 'native' are accepted");
+          expect(result.stderr).toContain(`Run: tps agent ${action} --id <agent-id> --runtime <openclaw|native>`);
+          if (missingValue) expect(result.stderr).toContain("requires a value");
+          if (occurrences.length > 1) expect(result.stderr).toContain("give --runtime once");
+        };
+        if (action === "create") {
+          await refuse();
+          expect(existsSync(join(home, ".tps"))).toBe(false);
+        }
+        const configPath = writeAgentConfig(agent, "openclaw");
+        const before = readFileSync(configPath);
+        const inode = statSync(configPath).ino;
+        await refuse();
+        expect(readFileSync(configPath)).toEqual(before);
+        expect(statSync(configPath).ino).toBe(inode);
+        expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+      }, 20000);
+    }
+
+    for (const args of [["--runtime=native"], ["--runtime", "native"]]) {
+      test(`${action} accepts ${args.join(" ")}`, async () => {
+        const agent = "runtime-valid";
+        if (action === "set-runtime") writeAgentConfig(agent, "openclaw");
+        const result = await runTps(["agent", action, "--id", agent, ...args]);
+        expect(result.status).toBe(0);
+        const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+        expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("native");
+      }, 20000);
+    }
+  }
+
   test("tps init records the native runtime", async () => {
     const agent = "agent-init";
     const result = await runTps(["init", "--id", agent]);
@@ -354,6 +482,173 @@ syncBuiltinESMExports();
     const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("injected chmod failure");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  test("set-runtime drops setuid, setgid and sticky bits and keeps the permission bits", async () => {
+    const agent = "runtime-special-bits";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    for (const special of [0o4755, 0o2755, 0o1755]) {
+      chmodSync(configPath, special);
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+      expect(result.status).toBe(0);
+      const after = readFileSync(configPath, "utf-8");
+      expect(after).toContain("runtime: native");
+      const mode = statSync(configPath).mode & 0o7777;
+      expect(mode & 0o7000).toBe(0);
+      expect(mode & 0o777).toBe(0o755);
+    }
+  }, 30000);
+
+  function probeAlternateGroup(
+    groups = process.getgroups(),
+    primary = process.getgid(),
+    chown = chownSync,
+  ): { group: number; skipReason?: never } | { group?: never; skipReason: string } {
+    const candidates = groups.filter((group) => group !== primary);
+    if (candidates.length === 0) return { skipReason: "this process has no second group" };
+    const probeRoot = mkdtempSync(join(tmpdir(), "tps-runtime-757-"));
+    try {
+      const probePath = join(probeRoot, "chown-probe");
+      writeFileSync(probePath, "");
+      for (const group of candidates) {
+        try {
+          chown(probePath, -1, group);
+          return { group };
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code !== "EPERM" && code !== "EACCES") throw error;
+        }
+      }
+      return { skipReason: "chown to a second group is not permitted for this process here" };
+    } finally {
+      rmSync(probeRoot, { recursive: true, force: true });
+    }
+  }
+
+  test("group probe fails on EIO", () => {
+    const error = Object.assign(new Error("EIO: injected chown failure"), { code: "EIO" });
+    expect(() => probeAlternateGroup([10, 20], 10, () => { throw error; })).toThrow(error);
+  });
+
+  test("group probe skips when every candidate chown returns EPERM or EACCES", () => {
+    for (const code of ["EPERM", "EACCES"]) {
+      const error = Object.assign(new Error(`${code}: injected chown refusal`), { code });
+      expect(probeAlternateGroup([10, 20], 10, () => { throw error; })).toEqual({
+        skipReason: "chown to a second group is not permitted for this process here",
+      });
+    }
+  });
+
+  test("group probe skips when this process has no second group", () => {
+    expect(probeAlternateGroup([10], 10, () => { throw new Error("unexpected chown"); })).toEqual({
+      skipReason: "this process has no second group",
+    });
+  });
+
+  const groupProbe = probeAlternateGroup();
+  if (groupProbe.skipReason !== undefined) {
+    test.skip(`set-runtime keeps the config's group (skipped: ${groupProbe.skipReason})`, () => {});
+  } else {
+    const alternateGroup = groupProbe.group;
+    test("set-runtime keeps the config's group", async () => {
+      const agent = "runtime-group";
+      const configPath = writeAgentConfig(agent, "openclaw");
+      chownSync(configPath, -1, alternateGroup);
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+      expect(result.status).toBe(0);
+      const after = readFileSync(configPath, "utf-8");
+      expect(after).toContain("runtime: native");
+      expect(statSync(configPath).gid).toBe(alternateGroup);
+    }, 20000);
+  }
+
+  test("set-runtime refuses EIO without a group-only retry", async () => {
+    const agent = "runtime-chown-eio";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const callsPath = join(home, "chown-calls.json");
+    const preload = join(home, "chown-eio.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const chown = fs.chownSync;
+const calls = [];
+fs.chownSync = (...args) => {
+  calls.push(args);
+  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));
+  if (calls.length === 1) throw Object.assign(new Error("injected ownership failure"), { code: "EIO" });
+  return chown(...args);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("EIO");
+    const calls = JSON.parse(readFileSync(callsPath, "utf-8")) as [string, number, number][];
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toBe(statSync(configPath).uid);
+    expect(calls[0][2]).toBe(statSync(configPath).gid);
+    expect(result.stderr).toContain(calls[0][0]);
+    expect(existsSync(calls[0][0])).toBe(false);
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  for (const code of ["EPERM", "EACCES"]) {
+    test(`set-runtime retries group-only after ${code}`, async () => {
+      const agent = `runtime-chown-${code.toLowerCase()}`;
+      const configPath = writeAgentConfig(agent, "openclaw");
+      const original = statSync(configPath);
+      const callsPath = join(home, "chown-calls.json");
+      const preload = join(home, "chown-permission.mjs");
+      writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const chown = fs.chownSync;
+const calls = [];
+fs.chownSync = (...args) => {
+  calls.push(args);
+  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));
+  if (calls.length === 1) throw Object.assign(new Error("injected permission refusal"), { code: ${JSON.stringify(code)} });
+  return chown(...args);
+};
+syncBuiltinESMExports();
+`);
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+      expect(result.status).toBe(0);
+      const calls = JSON.parse(readFileSync(callsPath, "utf-8")) as [string, number, number][];
+      expect(calls).toEqual([
+        [calls[0][0], original.uid, original.gid],
+        [calls[0][0], -1, original.gid],
+      ]);
+      expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
+      expect(statSync(configPath).gid).toBe(original.gid);
+      expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+    }, 20000);
+  }
+
+  test("set-runtime refuses the write when both ownership attempts fail", async () => {
+    const agent = "runtime-chown";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const preload = join(home, "fail-chown.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+let attempts = 0;
+fs.chownSync = () => {
+  attempts++;
+  fs.writeFileSync(${JSON.stringify(join(home, "chown-attempts"))}, String(attempts));
+  throw Object.assign(new Error("injected chown failure"), { code: "EPERM" });
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("injected chown failure");
+    expect(readFileSync(join(home, "chown-attempts"), "utf-8")).toBe("2");
     expect(readFileSync(configPath)).toEqual(before);
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
