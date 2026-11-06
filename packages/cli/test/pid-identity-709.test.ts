@@ -1104,6 +1104,7 @@ describe("bridge stop identity", () => {
       expect(result.message).toContain(legacyBridgePid);
       expect(result.message).toMatch(/could not be removed/);
       expect(result.message).toMatch(/kept/);
+      expect(result.signals.length).toBe(1);
       expect(result.message).toMatch(/EISDIR|EPERM/);
       expect(result.logs.join("\n")).not.toMatch(/already gone/i);
       expect(result.message).not.toMatch(/\n\s+at /);
