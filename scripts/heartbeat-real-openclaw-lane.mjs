@@ -11,7 +11,6 @@
  *
  * Without OPENCLAW_BIN_DIR, the lane installs OpenClaw into a throwaway prefix
  * with --ignore-scripts. A supplied directory must contain openclaw.
- * It writes nothing to the repository: no lockfile, no node_modules.
  *
  * Env:
  *   OPENCLAW_BIN_DIR       reuse an installed OpenClaw bin directory
@@ -86,6 +85,11 @@ export async function assertPortClosed(port, options = {}) {
     "closed",
     `port ${port} is listening; the dead-gateway case needs a port that refuses connections`,
   );
+}
+
+export function assertOpenClawVersion(stdout) {
+  const found = stdout.trim().match(/^(?:OpenClaw\s+)?(\S+)/)?.[1] ?? "(missing)";
+  assert.equal(found, OPENCLAW_VERSION, `expected OpenClaw ${OPENCLAW_VERSION}, found: ${found}`);
 }
 
 function installOpenClaw(root) {
@@ -315,7 +319,7 @@ export async function main() {
     assert.ok(existsSync(openclawBin), `openclaw not found in ${binDir}`);
     const version = spawnSync(openclawBin, ["--version"], { encoding: "utf-8", timeout: 30_000 });
     assert.equal(version.status, 0, `openclaw --version failed: ${version.stderr ?? ""}`);
-    assert.match(version.stdout, new RegExp(OPENCLAW_VERSION.replaceAll(".", "\\.")), `expected OpenClaw ${OPENCLAW_VERSION}, got: ${version.stdout.trim()}`);
+    assertOpenClawVersion(version.stdout);
     console.log(`[lane] using ${openclawBin} (${version.stdout.trim()})`);
 
     await runDeadCase(root, binDir);

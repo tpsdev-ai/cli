@@ -5,10 +5,23 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertPortClosed, makeCase, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { assertOpenClawVersion, assertPortClosed, makeCase, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
+
+describe("the OpenClaw version pin", () => {
+  test("accepts the exact pin", () => {
+    expect(() => assertOpenClawVersion("OpenClaw 2026.5.7\n")).not.toThrow();
+  });
+
+  test.each(["2026.5.70", "2026.5.7-beta", "12026.5.7", ""])("refuses version %j", (version) => {
+    const output = version ? `OpenClaw ${version}\n` : "";
+    expect(() => assertOpenClawVersion(output)).toThrow(
+      `expected OpenClaw 2026.5.7, found: ${version || "(missing)"}`,
+    );
+  });
+});
 
 test("the written OpenClaw config binds the local gateway to loopback", () => {
   const root = mkdtempSync(join(tmpdir(), "heartbeat-config-"));
