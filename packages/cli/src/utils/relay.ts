@@ -1183,6 +1183,11 @@ export async function connectAndKeepAlive(
           branchId,
           hostPublicKey: branch.encryptionKey!,
         });
+        if (stopped) {
+          // stop() began while the connect was pending: close and do not write.
+          try { await channel.close(); } catch {}
+          return;
+        }
         currentChannel = channel;
 
         const now = new Date().toISOString();
@@ -1199,11 +1204,14 @@ export async function connectAndKeepAlive(
           pid: process.pid,
           startToken: processStartToken(process.pid),
         };
-        writeHostState(state);
+        // Each write is gated on the live connection: stop() sets stopped
+        // before it clears the record, and the gate is checked under the lock.
+        const persist = () => writeHostState(state, () => !stopped);
+        persist();
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
         state.messagesSent++;
-        writeHostState(state);
+        persist();
 
         const hb = setInterval(async () => {
           if (stopped || !channel.isAlive()) return;
@@ -1211,7 +1219,7 @@ export async function connectAndKeepAlive(
             await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
             state.lastHeartbeatSent = new Date().toISOString();
             state.messagesSent++;
-            writeHostState(state);
+            persist();
           } catch {}
         }, HEARTBEAT_INTERVAL_MS);
 
@@ -1223,11 +1231,11 @@ export async function connectAndKeepAlive(
           try {
             const health = await probeServiceHealth();
             state.services = health;
-            writeHostState(state);
+            persist();
           } catch {}
         }, SERVICE_HEALTH_INTERVAL_MS);
         // Initial probe on connect
-        probeServiceHealth().then((h) => { state.services = h; writeHostState(state); }).catch(() => {});
+        probeServiceHealth().then((h) => { state.services = h; persist(); }).catch(() => {});
 
         const handler = (msg: TpsMessage) => {
           state.messagesReceived++;
@@ -1248,7 +1256,7 @@ export async function connectAndKeepAlive(
           } else {
             state.lastHeartbeatAck = now;
           }
-          writeHostState(state);
+          persist();
           opts.onMessage?.(msg);
         };
         channel.onMessage(handler);

@@ -164,17 +164,18 @@ describe("host state record lock", () => {
       writeHostState(hostState("host-a", predecessor.pid, childToken(predecessor.pid)));
 
       const started = join(home, "writer-started");
+      const blocked = join(home, "writer-blocked");
       const written = join(home, "writer-written");
+      const goRetry = join(home, "writer-go-retry");
       const writerScript = join(home, "successor-writer.ts");
       writeFileSync(
         writerScript,
         `
-          import { writeFileSync } from "node:fs";
+          import { existsSync, writeFileSync } from "node:fs";
           import { processStartToken } from ${JSON.stringify(AGENT_INDEX)};
           import { writeHostState } from ${JSON.stringify(CONNECTION_STATE)};
-          const [started, written, branch] = process.argv.slice(2);
-          writeFileSync(started, "");
-          writeHostState({
+          const [started, blocked, written, goRetry, branch] = process.argv.slice(2);
+          const state = {
             branch,
             connectedAt: "",
             lastHeartbeatSent: "",
@@ -186,7 +187,20 @@ describe("host state record lock", () => {
             messagesReceived: 0,
             pid: process.pid,
             startToken: processStartToken(process.pid),
-          });
+          };
+          writeFileSync(started, "");
+          try {
+            writeHostState(state);
+            writeFileSync(blocked, "written");
+          } catch (error) {
+            writeFileSync(blocked, error instanceof Error ? error.message : String(error));
+          }
+          const deadline = Date.now() + 60000;
+          while (!existsSync(goRetry)) {
+            if (Date.now() > deadline) process.exit(2);
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+          writeHostState(state);
           writeFileSync(written, "");
           process.on("SIGTERM", () => {});
           setInterval(() => {}, 1000);
@@ -208,29 +222,36 @@ describe("host state record lock", () => {
       let writer: Bun.Subprocess | undefined;
       let goHostSent = false;
       let goBranchSent = false;
+      let goRetrySent = false;
       let status: number | null = null;
       const goHost = join(pauseDir, "go-office-kill-host-before-removal");
       const goBranch = join(pauseDir, "go-office-kill-branch-before-decision");
       try {
         await waitForPrefix(pauseDir, "ready-office-kill-host-before-removal-");
-        writer = Bun.spawn([process.execPath, writerScript, started, written, "host-a"], {
+        writer = Bun.spawn([process.execPath, writerScript, started, blocked, written, goRetry, "host-a"], {
           env,
           stdio: ["ignore", "ignore", "pipe"],
         });
         await waitForPath(started, 5_000);
 
         // Office kill holds the record lock between its final read and the
-        // removal, so the host connection writer cannot replace the record in
-        // that window.
-        await Bun.sleep(250);
+        // removal while paused, so the writer's attempt refuses within the
+        // lock's own bound instead of writing.
+        await waitForPath(blocked, 30_000);
+        expect(readFileSync(blocked, "utf8")).toContain(
+          "could not be acquired within 5000 ms; refusing to write the host state record.",
+        );
         expect(existsSync(written)).toBe(false);
+        expect(readHostState("host-a")?.pid).toBe(predecessor.pid);
 
         writeFileSync(goHost, "");
         goHostSent = true;
-        // The lock is released by the removal; the successor's write lands
-        // after it, so the record that remains names the successor.
-        await waitForPath(written, 10_000);
+        // The wrapper releases the lock after the removal, so the successor's
+        // write lands after it and the record that remains names the successor.
         await waitForPrefix(pauseDir, "ready-office-kill-branch-before-decision-");
+        writeFileSync(goRetry, "");
+        goRetrySent = true;
+        await waitForPath(written, 10_000);
         writeFileSync(goBranch, "");
         goBranchSent = true;
         status = await kill.exited;
@@ -247,6 +268,13 @@ describe("host state record lock", () => {
         if (!goHostSent) {
           try {
             writeFileSync(goHost, "");
+          } catch {
+            /* the pause directory is gone */
+          }
+        }
+        if (!goRetrySent) {
+          try {
+            writeFileSync(goRetry, "");
           } catch {
             /* the pause directory is gone */
           }
@@ -273,7 +301,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "the connector's shutdown leaves a record that names another process",
+    "clearHostState leaves a record that names another process's pid",
     () => {
       const other = spawnChild();
       const path = hostStatePath("host-a");
@@ -289,7 +317,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "the connector's shutdown leaves a record whose start token names another process",
+    "clearHostState leaves a record whose fabricated start token names another process",
     () => {
       const token = childToken(process.pid);
       const foreign = token.startsWith("ps:") ? "ps:Thu Jan 1 00:00:00 1970" : "proc:1";
@@ -305,7 +333,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "the connector's shutdown removes the record that names its own process",
+    "clearHostState removes the record that names the calling process",
     () => {
       writeHostState(hostState("host-a", process.pid, childToken(process.pid)));
 
@@ -317,7 +345,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "a stale lock from a dead holder is reclaimed",
+    "writeHostState reclaims a lock whose fabricated owner is a reaped pid",
     () => {
       const dead = reapedPid();
       if (dead === null) throw new Error("no reaped pid was available; rerun the test");
@@ -336,7 +364,7 @@ describe("host state record lock", () => {
   );
 
   test(
-    "a lock held by a live owner is refused after the bound with a remedy",
+    "writeHostState refuses a lock whose fabricated owner is the calling process",
     () => {
       const path = hostStatePath("host-a");
       const lockRoot = hostStateLockRoot(path);

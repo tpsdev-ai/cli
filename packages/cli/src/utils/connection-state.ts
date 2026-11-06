@@ -108,10 +108,14 @@ export function withHostStateRecordLock<T>(path: string, action: string, fn: () 
   }
 }
 
-export function writeHostState(state: HostConnectionState): void {
+export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(state.branch);
   withHostStateRecordLock(path, "write the host state record", () => {
+    // Checked inside the lock: a caller that has begun shutting down sets its
+    // flag before it takes the lock to clear, so a write it starts afterwards
+    // is skipped.
+    if (shouldWrite !== undefined && !shouldWrite()) return;
     writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8", mode: 0o600 });
   });
 }
@@ -139,7 +143,12 @@ export function clearHostState(branch: string): void {
   withHostStateRecordLock(path, "remove the host state record", () => {
     const current = readHostState(branch);
     if (current === null || !recordNamesOwnProcess(current)) return;
-    try { rmSync(path, { force: true }); } catch {}
+    try {
+      rmSync(path, { force: true });
+    } catch (error) {
+      // ENOENT is already gone; any other failure is reported to the caller.
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   });
 }
 
