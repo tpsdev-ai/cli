@@ -44,7 +44,7 @@ import {
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
 export interface AgentArgs {
-  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck";
+  action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | "set-runtime";
   config?: string;
   message?: string;
   /** For create/list/status */
@@ -74,9 +74,11 @@ export interface AgentArgs {
   /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
   sandboxRequired?: boolean;
   /**
-   * The selected agent runtime (`--runtime claude-code|codex|gemini`). Carried
-   * into the attested re-exec so the sandboxed child runs the runtime runner
-   * (cli#363 slice B); undefined for the default AgentRuntime path.
+   * For create/set-runtime: the agent's recorded runtime (`openclaw` or
+   * `native`). For start: the selected runtime (`--runtime
+   * claude-code|codex|gemini`), carried into the attested re-exec so the
+   * sandboxed child runs the runtime runner (cli#363 slice B); undefined for
+   * the default AgentRuntime path.
    */
   runtime?: string;
   lines?: number;
@@ -93,6 +95,30 @@ interface AgentHealthcheckResult {
 
 function healthcheckHomeDir(): string {
   return process.env.TPS_HOME ?? homedir();
+}
+
+const AGENT_RUNTIME_VALUES = ["openclaw", "native"] as const;
+type RecordedAgentRuntime = (typeof AGENT_RUNTIME_VALUES)[number];
+
+/** Only the two recorded runtimes are valid; everything else is refused. */
+function parseRecordedRuntime(value: string | undefined): RecordedAgentRuntime | null {
+  return value === "openclaw" || value === "native" ? value : null;
+}
+
+/**
+ * Set the top-level `runtime:` key without rewriting the rest of the file.
+ * Replaces the key in place when present, otherwise inserts it after `agentId`
+ * (or at the top when there is no `agentId` line).
+ */
+function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime): string {
+  const line = `runtime: ${runtime}`;
+  if (/^runtime\s*:.*$/m.test(configText)) {
+    return configText.replace(/^runtime\s*:.*$/gm, line);
+  }
+  if (/^agentId\s*:.*$/m.test(configText)) {
+    return configText.replace(/^agentId\s*:.*$/m, (match) => `${match}\n${line}`);
+  }
+  return `${line}\n${configText}`;
 }
 
 function agentHomeDir(): string {
@@ -468,6 +494,13 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const name = args.name ?? id;
   const model = args.model ?? "anthropic/claude-sonnet-4-6";
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
+  const requestedRuntime = args.runtime ?? "native";
+  const runtime = parseRecordedRuntime(requestedRuntime);
+  if (!runtime) {
+    console.error(`❌ Refusing runtime '${requestedRuntime}': only 'openclaw' and 'native' are accepted.`);
+    console.error(`   Run: tps agent create --id ${id} --runtime <openclaw|native>`);
+    process.exit(1);
+  }
   const identityDir = join(homedir(), ".tps", "identity");
   const keyPrefix = id;
 
@@ -681,6 +714,7 @@ async function createAgent(args: AgentArgs): Promise<void> {
 
   const config = `# TPS Agent config for ${id}
 agentId: ${id}
+runtime: ${runtime}
 name: ${name}
 workspace: ${workspace}
 mailDir: ${mailDir}
@@ -708,6 +742,49 @@ tools:
   console.log(`\n✅ Agent '${id}' is ready.`);
   console.log(`   Run:  tps agent start --id ${id}`);
   console.log(`   Or:   tps agent run --id ${id} --message "hello"`);
+}
+
+// ─── set-runtime ─────────────────────────────────────────────────────────────
+
+function setAgentRuntime(args: AgentArgs): void {
+  const id = args.id;
+  if (!id) {
+    console.error("Usage: tps agent set-runtime --id <agent-id> --runtime <openclaw|native>");
+    process.exit(1);
+  }
+  // Prevent path traversal via crafted agent IDs (e.g. "../../foo").
+  if (id.includes("/") || id.includes("\\") || id.includes("..")) {
+    console.error(`Invalid agent id: ${id}`);
+    process.exit(1);
+  }
+  const runtime = parseRecordedRuntime(args.runtime);
+  if (!runtime) {
+    console.error(`❌ Refusing runtime '${args.runtime ?? ""}': only 'openclaw' and 'native' are accepted.`);
+    console.error(`   Run: tps agent set-runtime --id ${id} --runtime <openclaw|native>`);
+    process.exit(1);
+  }
+
+  const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
+  let configText: string;
+  try {
+    configText = readFileSync(configPath, "utf-8");
+  } catch (e) {
+    const code = (e as { code?: string } | null)?.code;
+    if (code === "ENOENT") {
+      console.error(`❌ Agent '${id}' has no config at ${configPath}. Run: tps agent create --id ${id}`);
+    } else {
+      console.error(`❌ Cannot read ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    process.exit(1);
+  }
+
+  try {
+    writeFileSync(configPath, withRecordedRuntime(configText, runtime), "utf-8");
+  } catch (e) {
+    console.error(`❌ Cannot write ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  }
+  console.log(`✓ Agent '${id}' runtime recorded as '${runtime}' in ${configPath}`);
 }
 
 // ─── list ─────────────────────────────────────────────────────────────────────
@@ -1164,6 +1241,9 @@ async function runAgentCommand(
   switch (args.action) {
     case "create":
       return createAgent(args);
+
+    case "set-runtime":
+      return setAgentRuntime(args);
 
     case "list":
       return listAgents(args);

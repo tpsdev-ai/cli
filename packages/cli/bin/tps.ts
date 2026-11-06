@@ -163,7 +163,8 @@ const USAGE: Record<string, string> = {
   review: "Review who? I'm gonna need a name.\n\n  tps review <agent-name>",
   bootstrap: "Usage: tps bootstrap <agent-id>",
   agent: "Usage:\n" +
-          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent create --id <agent-id> [--runtime <openclaw|native>] [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent set-runtime --id <agent-id> --runtime <openclaw|native>\n" +
           "  tps agent list [--json]\n" +
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
@@ -370,12 +371,13 @@ async function main() {
     }
 
     case "agent": {
-      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate", "logs", "healthcheck"];
-      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | undefined;
+      const validActions = ["run", "start", "health", "create", "list", "status", "decommission", "commit", "isolate", "logs", "healthcheck", "set-runtime"];
+      const action = rest[0] as "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | "set-runtime" | undefined;
       if (!action || !validActions.includes(action)) {
         console.error(
           "Usage:\n" +
-          "  tps agent create --id <agent-id> [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent create --id <agent-id> [--runtime <openclaw|native>] [--name <name>] [--model <provider/model>] [--display-name <name>] [--soul-file <path>] [--no-seed]\n" +
+          "  tps agent set-runtime --id <agent-id> --runtime <openclaw|native>\n" +
           "  tps agent list [--json]\n" +
           "  tps agent status --id <agent-id> [--json]\n" +
           "  tps agent decommission --id <agent-id> [--force]\n" +
@@ -394,18 +396,35 @@ async function main() {
         return idx >= 0 ? process.argv[idx + 1] : undefined;
       };
 
+      // `--runtime=value` is accepted alongside `--runtime value`; the shared
+      // flag parser defaults runtime to openclaw for hire, so read the argv.
+      const getRuntimeFlag = (): string | undefined => {
+        const args = helpArgs.argv;
+        const idx = args.indexOf("--runtime");
+        if (idx >= 0) return args[idx + 1];
+        const inline = args.find((arg) => arg.startsWith("--runtime="));
+        return inline?.slice("--runtime=".length);
+      };
+
       const { runAgent } = await import("../src/commands/agent.js");
 
       if (action === "create") {
         await runAgent({
           action: "create",
           id: getFlag("id") ?? rest[1],
+          runtime: getRuntimeFlag(),
           name: getFlag("name"),
           model: getFlag("model"),
           flairUrl: getFlag("flair-url") ?? process.env.FLAIR_URL,
           displayName: getFlag("display-name"),
           soulFile: getFlag("soul-file"),
           noSeed: process.argv.includes("--no-seed"),
+        });
+      } else if (action === "set-runtime") {
+        await runAgent({
+          action: "set-runtime",
+          id: getFlag("id") ?? rest[1],
+          runtime: getRuntimeFlag(),
         });
       } else if (action === "list") {
         await runAgent({ action: "list", json: cli.flags.json, flairUrl: getFlag("flair-url") });

@@ -21,7 +21,7 @@ npm install -g @tpsdev-ai/cli
 | `tps backup <agent>` | Create encrypted, checksummed workspace backup |
 | `tps restore <agent> <archive>` | Restore agent workspace with transactional rollback |
 | `tps status` | Operational dashboard — health, uptime, cost tracking |
-| `tps heartbeat <agent>` | Agent self-reports health (workspace, gateway, provider) |
+| `tps heartbeat <agent>` | Agent self-reports health (workspace, gateway probe unless recorded native, provider) |
 | `tps identity init` | Generate Ed25519 host keypair |
 | `tps branch init` | Initialize a remote branch office |
 | `tps office join` | Join a branch to the head office via Noise_IK handshake |

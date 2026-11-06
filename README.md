@@ -158,6 +158,7 @@ The native runtime provides:
 
 ```yaml
 id: coder
+runtime: native                   # openclaw for an agent run by the OpenClaw gateway
 name: Coder
 workspace: /workspace/coder
 systemPrompt: "You are a coding agent."
@@ -172,7 +173,10 @@ flair:
 ```
 
 A relative `workspace` resolves against the directory containing the config
-file; an absolute workspace remains absolute and is normalized. `repo` is used
+file; an absolute workspace remains absolute and is normalized. `runtime`
+names the runtime that runs the agent; `tps heartbeat` skips the gateway
+probe when it is `native`. Set it on an existing agent with
+`tps agent set-runtime --id <id> --runtime <openclaw|native>`. `repo` is used
 when `workspace` is absent. `${NAME}` references (a name of upper-case letters,
 digits and underscores) in `workspace` and `repo` are expanded, including for a
 selected runtime (`--runtime`), and an unset variable fails the start. A
@@ -207,6 +211,7 @@ Each office is a Docker container running agents with layered isolation:
 
 ```
 tps agent create <id>          Create a new agent with identity
+tps agent set-runtime --id <id> --runtime <openclaw|native>
 tps agent run --config <yaml>  One-shot agent task
 tps agent start --config <yaml> Start agent daemon
 tps office start <agent>       Start a Docker office

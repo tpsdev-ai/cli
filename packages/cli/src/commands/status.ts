@@ -154,16 +154,41 @@ function checkWorkspaceWritable(agentWorkspace: string): string[] {
   return errs;
 }
 
-function checkGatewayHealth(): string[] {
+/**
+ * An agent config may record its runtime (`openclaw` or `native`). Absent, an
+ * unreadable file, a non-string value or a malformed YAML document all return
+ * null, which is treated as unknown and probed.
+ */
+function recordedAgentRuntime(agentId: string): string | null {
+  const configPath = join(homeDir(), ".tps", "agents", safeAgentDir(agentId), "agent.yaml");
+  try {
+    if (!existsSync(configPath)) return null;
+    const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = parsed.runtime;
+    return typeof value === "string" ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Probe the gateway unless the recorded runtime is exactly `native`. Every
+ * other value (absent, `unknown`, unrecognised) is probed: fail closed.
+ */
+function checkGatewayHealth(runtime: string | null): { errors: string[]; note: string } {
+  if (runtime === "native") {
+    return { errors: [], note: "gateway skipped: native runtime" };
+  }
   // Older OpenClaw versions rejecting --require-rpc fail closed via their non-zero exit.
   const check = spawnSync("openclaw", ["gateway", "status", "--require-rpc"], {
     encoding: "utf-8",
     timeout: 5000,
   });
   if (check.status !== 0) {
-    return ["gateway unreachable"];
+    return { errors: ["gateway unreachable"], note: "gateway probed" };
   }
-  return [];
+  return { errors: [], note: "gateway probed" };
 }
 
 function checkQueueAge(workspace: string): string[] {
@@ -415,7 +440,8 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 
   const checks: string[] = [];
   checks.push(...checkWorkspaceWritable(workspace));
-  checks.push(...checkGatewayHealth());
+  const gateway = checkGatewayHealth(recordedAgentRuntime(agentId));
+  checks.push(...gateway.errors);
   checks.push(...checkQueueAge(workspace));
 
   const now = nowIso();
@@ -462,12 +488,12 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
   rotateUsage(agentId);
 
   if (resolvedState === "error") {
-    console.log(`⚠️  Heartbeat for ${agentId}: error (${checks.join("; ")})`);
+    console.log(`⚠️  Heartbeat for ${agentId}: error (${checks.join("; ")}; ${gateway.note})`);
     // cli#750: a heartbeat that recorded a failed check is a failed command;
     // a script watching the exit status must not read it as healthy.
     process.exitCode = 1;
   } else {
-    console.log(`✅ Heartbeat for ${agentId}: ${resolvedState}`);
+    console.log(`✅ Heartbeat for ${agentId}: ${resolvedState} (${gateway.note})`);
   }
 }
 
