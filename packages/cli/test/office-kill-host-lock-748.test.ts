@@ -235,8 +235,9 @@ describe("host state record lock", () => {
         await waitForPath(started, 5_000);
 
         // Office kill holds the record lock between its final read and the
-        // removal while paused, so the writer's attempt refuses within the
-        // lock's own bound instead of writing.
+        // removal while paused, so the writer's attempt refuses instead of
+        // writing: its wait ends after the 5 s deadline plus the probes' own
+        // timeouts.
         await waitForPath(blocked, 30_000);
         expect(readFileSync(blocked, "utf8")).toContain(
           "could not be acquired within 5000 ms; refusing to write the host state record.",

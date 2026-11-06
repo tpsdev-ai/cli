@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { processStartToken } from "@tpsdev-ai/agent";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostStatePath } from "../src/utils/connection-state.js";
@@ -100,6 +100,53 @@ test("connectAndKeepAlive writes a host record that readPidFile verifies as runn
       }
       rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+test("stop() reports an invalid host record and keeps it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-invalid-record-748-"));
+  const savedEnv = savedRelayEnv();
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(
+    new Promise<TransportChannel>(() => {}),
+  );
+  try {
+    const branch = await prepareBranch(root);
+    const stop = await connectAndKeepAlive(branch);
+    const path = hostStatePath(branch);
+    mkdirSync(join(root, ".tps", "connections"), { recursive: true });
+    writeFileSync(path, "{ not json");
+
+    await expect(stop()).rejects.toThrow(path);
+
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+  } finally {
+    connect.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A directory in the record's place is not a regular file, so the read is
+// refused for every uid, root included.
+test("stop() reports a host record that is not a regular file and keeps it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-unreadable-record-748-"));
+  const savedEnv = savedRelayEnv();
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(
+    new Promise<TransportChannel>(() => {}),
+  );
+  try {
+    const branch = await prepareBranch(root);
+    const stop = await connectAndKeepAlive(branch);
+    const path = hostStatePath(branch);
+    mkdirSync(path, { recursive: true });
+
+    await expect(stop()).rejects.toThrow(path);
+
+    expect(readdirSync(path)).toEqual([]);
+  } finally {
+    connect.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

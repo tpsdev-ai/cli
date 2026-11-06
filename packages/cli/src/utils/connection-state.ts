@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
@@ -135,14 +135,63 @@ function recordNamesOwnProcess(state: HostConnectionState): boolean {
   return state.startToken === processStartToken(process.pid);
 }
 
+type HostRecordRead =
+  | { kind: "absent" }
+  | { kind: "unreadable"; reason: string }
+  | { kind: "invalid" }
+  | { kind: "record"; state: HostConnectionState };
+
+/** Read a host state record and distinguish an absent file from one whose
+ *  owner cannot be verified. A non-regular file (a directory or a symlink) and
+ *  a parse or shape failure are reported, never treated as absent. */
+function readHostRecord(path: string): HostRecordRead {
+  let isFile: boolean;
+  try {
+    isFile = lstatSync(path).isFile();
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { kind: "absent" };
+    return { kind: "unreadable", reason: `could not be inspected (${code})` };
+  }
+  if (!isFile) return { kind: "unreadable", reason: "is not a regular file" };
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    // A file removed between the two reads is absent; anything else is
+    // unreadable.
+    if (code === "ENOENT") return { kind: "absent" };
+    return { kind: "unreadable", reason: `could not be read (${code})` };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { kind: "invalid" };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { kind: "invalid" };
+  const state = parsed as { pid?: unknown };
+  if (typeof state.pid !== "number") return { kind: "invalid" };
+  return { kind: "record", state: parsed as HostConnectionState };
+}
+
 /** Remove the record only when a final read under its lock still names this
- *  process. A record that names another process is left in place. */
+ *  process. A record that names another process is left in place. A record
+ *  that is present but unreadable or invalid is left in place and reported,
+ *  because its owner cannot be verified. */
 export function clearHostState(branch: string): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(branch);
   withHostStateRecordLock(path, "remove the host state record", () => {
-    const current = readHostState(branch);
-    if (current === null || !recordNamesOwnProcess(current)) return;
+    const current = readHostRecord(path);
+    if (current.kind === "absent") return;
+    if (current.kind !== "record") {
+      throw new Error(
+        `Host state record ${path} is present but ${current.kind === "invalid" ? "is not a valid host state record" : current.reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+      );
+    }
+    if (!recordNamesOwnProcess(current.state)) return;
     try {
       rmSync(path, { force: true });
     } catch (error) {

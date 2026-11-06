@@ -909,7 +909,12 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
 
       console.log(`Persistent connection active for '${args.agent}'. Press Ctrl+C to disconnect.`);
       process.on("SIGINT", async () => {
-        await stop();
+        try {
+          await stop();
+        } catch (error) {
+          console.error(`Disconnect failed: ${(error as Error).message}`);
+          process.exit(1);
+        }
         process.exit(0);
       });
       // bun drops the no-op interval; hold the loop until SIGTERM/SIGINT.
