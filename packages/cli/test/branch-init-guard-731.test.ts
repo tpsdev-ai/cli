@@ -6,9 +6,9 @@
  * JOIN_COMPLETE. The launcher must refuse at the spawn point, naming the
  * record path and the stop remedy, and leave the record unchanged.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -107,9 +107,9 @@ async function connectToBranch(
   throw new Error(`the branch launcher did not accept a join connection: ${last?.message ?? "unknown"}`);
 }
 
-/** Pids whose command line runs this build's `branch start`, from `ps`. */
+/** Pids running this build's `branch start` with this test's HOME. */
 function branchStartPids(): number[] {
-  const ps = spawnSync("ps", ["-ax", "-o", "pid=,command="], { encoding: "utf8" });
+  const ps = spawnSync("ps", ["-ax", "-ww", "-o", "pid=,command="], { encoding: "utf8" });
   if (ps.status !== 0 || typeof ps.stdout !== "string") {
     throw new Error(`could not enumerate processes: ps status ${ps.status}, ${String(ps.stderr ?? "")}`);
   }
@@ -118,10 +118,30 @@ function branchStartPids(): number[] {
     const match = /^\s*(\d+)\s+(.*)$/.exec(line);
     if (match === null) continue;
     const command = match[2]!;
-    if (command.includes(TPS_BIN) && /\bbranch start\b/.test(command)) pids.push(Number(match[1]));
+    if (!command.includes(TPS_BIN) || !/\bbranch start\b/.test(command)) continue;
+    const pid = Number(match[1]);
+    let ours: boolean;
+    if (process.platform === "linux") {
+      const environment = readFileSync(`/proc/${pid}/environ`, "utf8");
+      if (!environment) throw new Error(`could not read environment for pid ${pid}`);
+      ours = environment.split("\0").includes(`HOME=${root}`);
+    } else if (process.platform === "darwin") {
+      const environment = spawnSync("ps", ["eww", "-p", String(pid), "-o", "command="], { encoding: "utf8" });
+      if (environment.status !== 0 || !/(?:^|\s)HOME=\S+/.test(environment.stdout ?? "")) {
+        throw new Error(`could not read environment for pid ${pid}: ${String(environment.stderr ?? "")}`);
+      }
+      ours = ` ${environment.stdout.trim()} `.includes(` HOME=${root} `);
+    } else {
+      throw new Error(`cannot read process environments on ${process.platform}`);
+    }
+    if (ours) pids.push(pid);
   }
   return pids;
 }
+
+beforeAll(() => {
+  if (!existsSync(TPS_BIN)) throw new Error(`tps binary not found at ${TPS_BIN}. Run 'bun run build' first.`);
+});
 
 beforeEach(() => {
   savedEnv = {};
