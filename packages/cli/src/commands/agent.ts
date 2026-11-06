@@ -18,7 +18,7 @@ import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEnc
 import { applyRole, loadPlugins } from "../plugins/index.js";
 import { createInterface as createPromptInterface } from "node:readline/promises";
 import { accessSync, constants, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, rmdirSync, statSync, watch, writeFileSync } from "node:fs";
-import { sign as cryptoSign } from "node:crypto";
+import { randomUUID, sign as cryptoSign } from "node:crypto";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as resolvePathMod } from "node:path";
 import {
@@ -74,7 +74,7 @@ export interface AgentArgs {
   /** The launch unit asserted --sandbox-required; carry it into the re-exec. */
   sandboxRequired?: boolean;
   /**
-   * For create/set-runtime: the agent's recorded runtime (`openclaw` or
+   * For create/set-runtime: heartbeat's recorded runtime (`openclaw` or
    * `native`). For start: the selected runtime (`--runtime
    * claude-code|codex|gemini`), carried into the attested re-exec so the
    * sandboxed child runs the runtime runner (cli#363 slice B); undefined for
@@ -100,25 +100,60 @@ function healthcheckHomeDir(): string {
 const AGENT_RUNTIME_VALUES = ["openclaw", "native"] as const;
 type RecordedAgentRuntime = (typeof AGENT_RUNTIME_VALUES)[number];
 
-/** Only the two recorded runtimes are valid; everything else is refused. */
 function parseRecordedRuntime(value: string | undefined): RecordedAgentRuntime | null {
   return value === "openclaw" || value === "native" ? value : null;
 }
 
-/**
- * Set the top-level `runtime:` key without rewriting the rest of the file.
- * Replaces the key in place when present, otherwise inserts it after `agentId`
- * (or at the top when there is no `agentId` line).
- */
 function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime): string {
-  const line = `runtime: ${runtime}`;
-  if (/^runtime\s*:.*$/m.test(configText)) {
-    return configText.replace(/^runtime\s*:.*$/gm, line);
+  type Node = { start: number; end: number; kind: string; value: unknown; children: Node[] };
+  const stack: Node[] = [];
+  let root: Node | undefined;
+  const parsed = yaml.load(configText, {
+    listener(event, state) {
+      if (event === "open") {
+        stack.push({ start: state.position, end: 0, kind: "", value: undefined, children: [] });
+      } else {
+        const node = stack.pop()!;
+        Object.assign(node, { end: state.position, kind: state.kind, value: state.result });
+        if (stack.length) stack[stack.length - 1].children.push(node);
+        else root = node;
+      }
+    },
+  });
+  const refuse = (): never => { throw new Error("Unsupported runtime YAML; edit the file by hand."); };
+  if (!root || root.kind !== "mapping" || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) refuse();
+  const mapping = root!;
+  if (configText.slice(mapping.start).trimStart().startsWith("{")) refuse();
+  const hasRuntimeKey = (node: Node): boolean =>
+    (node.kind === "mapping" && node.children.some((child, index) => index % 2 === 0 && child.value === "runtime"))
+    || node.children.some(hasRuntimeKey);
+  if (mapping.children.some(hasRuntimeKey)) refuse();
+  for (let i = 0; i < mapping.children.length; i += 2) {
+    const key = mapping.children[i];
+    if (key.value !== "runtime") continue;
+    const value = mapping.children[i + 1];
+    const raw = value && configText.slice(value.start, value.end);
+    const keyStart = Math.max(configText.lastIndexOf("\n", key.start - 1), configText.lastIndexOf("\r", key.start - 1)) + 1;
+    if (key.start !== keyStart || configText.slice(key.start, key.end) !== "runtime"
+      || !value || value.kind !== "scalar" || !raw?.trim() || /[\r\n\u0085\u2028\u2029]/.test(raw)
+      || /^[!&*|>\[\]{},'"%@`]/.test(raw.trimStart())
+      || !/^:[ \t]*$/.test(configText.slice(key.end, value.start))) refuse();
+    const lineBreak = configText.slice(value.end).search(/[\r\n]/);
+    const end = lineBreak < 0 ? configText.length : value.end + lineBreak;
+    return `${configText.slice(0, key.start)}runtime: ${runtime}${configText.slice(end)}`;
   }
-  if (/^agentId\s*:.*$/m.test(configText)) {
-    return configText.replace(/^agentId\s*:.*$/m, (match) => `${match}\n${line}`);
+  if (Object.hasOwn(parsed as object, "runtime")) refuse();
+  return `runtime: ${runtime}\n${configText}`;
+}
+
+function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number): void {
+  const temporary = join(dirname(configPath), `.agent-runtime-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, contents, { flag: "wx", mode });
+    renameSync(temporary, configPath);
+  } finally {
+    rmSync(temporary, { force: true });
   }
-  return `${line}\n${configText}`;
 }
 
 function agentHomeDir(): string {
@@ -494,9 +529,10 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const name = args.name ?? id;
   const model = args.model ?? "anthropic/claude-sonnet-4-6";
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
-  const requestedRuntime = args.runtime ?? "native";
-  const runtime = parseRecordedRuntime(requestedRuntime);
-  if (!runtime) {
+  const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
+  const requestedRuntime = args.runtime ?? (existsSync(configPath) ? undefined : "native");
+  const runtime = requestedRuntime === undefined ? undefined : parseRecordedRuntime(requestedRuntime);
+  if (requestedRuntime !== undefined && !runtime) {
     console.error(`❌ Refusing runtime '${requestedRuntime}': only 'openclaw' and 'native' are accepted.`);
     console.error(`   Run: tps agent create --id ${id} --runtime <openclaw|native>`);
     process.exit(1);
@@ -704,7 +740,6 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const agentsDir = join(homedir(), ".tps", "agents", id);
   mkdirSync(agentsDir, { recursive: true });
 
-  const configPath = join(agentsDir, "agent.yaml");
   const mailDir = join(homedir(), ".tps", "mail");
   const memoryPath = join(agentsDir, "memory.jsonl");
   const workspace = join(homedir(), "ops");
@@ -712,7 +747,8 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const [provider, ...modelParts] = model.split("/");
   const modelName = modelParts.join("/");
 
-  const config = `# TPS Agent config for ${id}
+  if (runtime !== undefined) {
+    const config = `# TPS Agent config for ${id}
 agentId: ${id}
 runtime: ${runtime}
 name: ${name}
@@ -736,8 +772,11 @@ tools:
   - mail
 `;
 
-  writeFileSync(configPath, config, "utf-8");
-  console.log(`  Config written to ${configPath}`);
+    writeFileSync(configPath, config, "utf-8");
+    console.log(`  Config written to ${configPath}`);
+  } else {
+    console.log(`  Config preserved at ${configPath}`);
+  }
 
   console.log(`\n✅ Agent '${id}' is ready.`);
   console.log(`   Run:  tps agent start --id ${id}`);
@@ -765,9 +804,13 @@ function setAgentRuntime(args: AgentArgs): void {
   }
 
   const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
-  let configText: string;
+  let original: Buffer;
+  let mode: number;
   try {
-    configText = readFileSync(configPath, "utf-8");
+    const stat = lstatSync(configPath);
+    if (!stat.isFile()) throw new Error("Config must be a regular file; edit the file by hand.");
+    mode = stat.mode;
+    original = readFileSync(configPath);
   } catch (e) {
     const code = (e as { code?: string } | null)?.code;
     if (code === "ENOENT") {
@@ -778,9 +821,29 @@ function setAgentRuntime(args: AgentArgs): void {
     process.exit(1);
   }
 
+  let updated: string;
   try {
-    writeFileSync(configPath, withRecordedRuntime(configText, runtime), "utf-8");
+    const configText = original.toString("utf-8");
+    if (!Buffer.from(configText, "utf-8").equals(original)) throw new Error("Config must be UTF-8; edit the file by hand.");
+    updated = withRecordedRuntime(configText, runtime);
   } catch (e) {
+    console.error(`❌ Cannot update ${configPath}: ${e instanceof Error ? e.message : String(e)} Edit the file by hand.`);
+    process.exit(1);
+  }
+  let written = false;
+  try {
+    writeRuntimeConfig(configPath, updated, mode);
+    written = true;
+    const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+    if (parsed?.runtime !== runtime) throw new Error("Runtime verification failed; edit the file by hand.");
+  } catch (e) {
+    if (written) {
+      try {
+        writeRuntimeConfig(configPath, original, mode);
+      } catch (restoreError) {
+        console.error(`❌ Cannot restore ${configPath}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);
+      }
+    }
     console.error(`❌ Cannot write ${configPath}: ${e instanceof Error ? e.message : String(e)}`);
     process.exit(1);
   }

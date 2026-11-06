@@ -154,11 +154,6 @@ function checkWorkspaceWritable(agentWorkspace: string): string[] {
   return errs;
 }
 
-/**
- * An agent config may record its runtime (`openclaw` or `native`). Absent, an
- * unreadable file, a non-string value or a malformed YAML document all return
- * null, which is treated as unknown and probed.
- */
 function recordedAgentRuntime(agentId: string): string | null {
   const configPath = join(homeDir(), ".tps", "agents", safeAgentDir(agentId), "agent.yaml");
   try {

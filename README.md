@@ -158,7 +158,7 @@ The native runtime provides:
 
 ```yaml
 id: coder
-runtime: native                   # openclaw for an agent run by the OpenClaw gateway
+runtime: native                   # heartbeat skips the OpenClaw gateway probe
 name: Coder
 workspace: /workspace/coder
 systemPrompt: "You are a coding agent."
@@ -174,8 +174,9 @@ flair:
 
 A relative `workspace` resolves against the directory containing the config
 file; an absolute workspace remains absolute and is normalized. `runtime`
-names the runtime that runs the agent; `tps heartbeat` skips the gateway
-probe when it is `native`. Set it on an existing agent with
+is the value heartbeat reads to decide whether to probe the OpenClaw gateway;
+`native` skips the probe. The agent config loader ignores it; `tps agent start`
+selects its runtime separately (`--runtime claude-code|codex|gemini`). Set it with
 `tps agent set-runtime --id <id> --runtime <openclaw|native>`. `repo` is used
 when `workspace` is absent. `${NAME}` references (a name of upper-case letters,
 digits and underscores) in `workspace` and `repo` are expanded, including for a

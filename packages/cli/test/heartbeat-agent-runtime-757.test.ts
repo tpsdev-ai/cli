@@ -1,10 +1,9 @@
-// cli#757 — the agent config records the runtime, and `tps heartbeat` skips the
-// gateway probe only for an exact `native`. Every test spawns the built CLI
-// with a fresh temporary HOME and a fake `openclaw` on PATH.
+// cli#757 — built CLI with temporary HOME; the native case removes the fake OpenClaw.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import yaml from "js-yaml";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const DEAD_FLAIR = "http://127.0.0.1:19926";
@@ -45,12 +44,13 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-async function runTps(args: string[], env: Record<string, string> = {}): Promise<{
+async function runTps(args: string[], env: Record<string, string> = {}, preload?: string): Promise<{
   status: number;
   stdout: string;
   stderr: string;
 }> {
-  const proc = Bun.spawn([process.execPath, TPS_BIN, ...args], {
+  const command = preload ? ["node", "--import", preload, TPS_BIN, ...args] : [process.execPath, TPS_BIN, ...args];
+  const proc = Bun.spawn(command, {
     env: {
       PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
       HOME: home,
@@ -149,6 +149,44 @@ describe("cli#757 — recording the runtime", () => {
     }
   }, 30000);
 
+  test("an unflagged create retry preserves openclaw and heartbeat probes", async () => {
+    const agent = "retry-openclaw";
+    expect((await runTps(["agent", "create", "--id", agent, "--runtime", "openclaw"])).status).toBe(0);
+    const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+    const before = readFileSync(configPath);
+    expect((await runTps(["agent", "create", "--id", agent])).status).toBe(0);
+    expect(readFileSync(configPath)).toEqual(before);
+    expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("openclaw");
+    const probe = join(home, "gateway-probed");
+    deadGateway(probe);
+    const heartbeat = await runTps(["heartbeat", agent]);
+    expect(heartbeat.status).toBe(1);
+    expect(heartbeat.stdout).toContain("gateway probed");
+    expect(readFileSync(probe, "utf-8")).toBe("probed\n");
+  }, 30000);
+
+  test("an unflagged create retry preserves an absent runtime and heartbeat probes", async () => {
+    const agent = "retry-absent";
+    const configPath = writeAgentConfig(agent);
+    const before = readFileSync(configPath);
+    expect((await runTps(["agent", "create", "--id", agent])).status).toBe(0);
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(Object.hasOwn(yaml.load(readFileSync(configPath, "utf-8")) as object, "runtime")).toBe(false);
+    const probe = join(home, "gateway-probed");
+    deadGateway(probe);
+    const heartbeat = await runTps(["heartbeat", agent]);
+    expect(heartbeat.status).toBe(1);
+    expect(heartbeat.stdout).toContain("gateway probed");
+    expect(readFileSync(probe, "utf-8")).toBe("probed\n");
+  }, 30000);
+
+  test("a fresh unflagged create records native", async () => {
+    const agent = "create-default";
+    expect((await runTps(["agent", "create", "--id", agent])).status).toBe(0);
+    const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+    expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("native");
+  }, 30000);
+
   test("tps init records the native runtime", async () => {
     const agent = "agent-init";
     const result = await runTps(["init", "--id", agent]);
@@ -157,19 +195,22 @@ describe("cli#757 — recording the runtime", () => {
     expect(config).toContain("runtime: native");
   }, 30000);
 
-  test("set-runtime accepts each valid value and leaves the other lines unchanged", async () => {
+  test("set-runtime replaces a plain runtime line in LF, CRLF and CR files", async () => {
     const agent = "agent-e";
     const configPath = writeAgentConfig(agent, "openclaw");
-    const otherLines = (value: string): string[] =>
-      value.split("\n").filter((line) => !line.startsWith("runtime:"));
-
-    for (const kind of ["native", "openclaw"]) {
-      const before = readFileSync(configPath, "utf-8");
-      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", kind]);
-      expect(result.status).toBe(0);
-      const after = readFileSync(configPath, "utf-8");
-      expect(after).toContain(`runtime: ${kind}`);
-      expect(otherLines(after)).toEqual(otherLines(before));
+    const original = readFileSync(configPath, "utf-8");
+    for (const newline of ["\n", "\r\n", "\r"]) {
+      writeFileSync(configPath, original.replaceAll("\n", newline));
+      for (const kind of ["native", "openclaw"]) {
+        const before = readFileSync(configPath, "utf-8");
+        const inode = statSync(configPath).ino;
+        const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", kind]);
+        expect(result.status).toBe(0);
+        const after = readFileSync(configPath, "utf-8");
+        expect((yaml.load(after) as { runtime: string }).runtime).toBe(kind);
+        expect(after).toBe(before.replace(/^runtime:[^\r\n]*/m, `runtime: ${kind}`));
+        expect(statSync(configPath).ino).not.toBe(inode);
+      }
     }
   }, 20000);
 
@@ -183,6 +224,81 @@ describe("cli#757 — recording the runtime", () => {
     expect(after.match(/^runtime:/gm)).toHaveLength(1);
     expect(after).toContain("runtime: native");
     expect(after).toContain(`agentId: ${agent}`);
+  }, 20000);
+
+  test("set-runtime refuses a block scalar before writing", async () => {
+    const agent = "runtime-block";
+    const configPath = writeAgentConfig(agent, "|-\n  openclaw");
+    const before = readFileSync(configPath);
+    const inode = statSync(configPath).ino;
+    expect((yaml.load(before.toString()) as { runtime: string }).runtime).toBe("openclaw");
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("edit the file by hand");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(statSync(configPath).ino).toBe(inode);
+  }, 20000);
+
+  test("set-runtime refuses duplicate runtime keys before writing", async () => {
+    const agent = "runtime-duplicate";
+    const configPath = writeAgentConfig(agent, "openclaw\nruntime: native");
+    const before = readFileSync(configPath);
+    expect(() => yaml.load(before.toString())).toThrow();
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Edit the file by hand");
+    expect(readFileSync(configPath)).toEqual(before);
+  }, 20000);
+
+  test("set-runtime refuses flow, nested, quoted and multiline values", async () => {
+    for (const value of ["[openclaw]", "{name: openclaw}", "\n  name: openclaw", "openclaw\n  continued", "\n  openclaw", "'openclaw'"]) {
+      const agent = "runtime-unsupported";
+      const configPath = writeAgentConfig(agent, value);
+      const before = readFileSync(configPath);
+      yaml.load(before.toString());
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("edit the file by hand");
+      expect(readFileSync(configPath)).toEqual(before);
+    }
+  }, 30000);
+
+  test("set-runtime refuses a nested runtime key", async () => {
+    const agent = "runtime-nested";
+    const configPath = writeAgentConfig(agent);
+    writeFileSync(configPath, `${readFileSync(configPath, "utf-8")}settings:\n  runtime: openclaw\n`);
+    const before = readFileSync(configPath);
+    yaml.load(before.toString());
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("edit the file by hand");
+    expect(readFileSync(configPath)).toEqual(before);
+  }, 20000);
+
+  test("set-runtime restores the original bytes after an injected runtime mismatch", async () => {
+    const agent = "runtime-verification";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const preload = join(home, "corrupt-after-rename.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.renameSync;
+let corrupt = true;
+fs.renameSync = (from, to) => {
+  rename(from, to);
+  if (corrupt && to === ${JSON.stringify(configPath)}) {
+    corrupt = false;
+    fs.writeFileSync(to, "runtime: mismatched\\n");
+  }
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Runtime verification failed");
+    expect(result.stdout).not.toContain("runtime recorded as");
+    expect(readFileSync(configPath)).toEqual(before);
   }, 20000);
 
   test("set-runtime refuses an invalid value and leaves the config unchanged", async () => {
