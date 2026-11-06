@@ -93,13 +93,13 @@ export function hostStateLockRoot(path: string): string {
  * `acquireMailLockSync` refuses nested acquisition and reclaims a dead owner;
  * a timeout is a refusal, never a proceed.
  */
-export function withHostStateRecordLock<T>(path: string, action: string, fn: () => T): T {
+export function withHostStateRecordLock<T>(path: string, action: string, fn: () => T, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): T {
   const root = hostStateLockRoot(path);
   const lockDir = mailLockPath(root);
-  const lock = acquireMailLockSync(root, { timeoutMs: HOST_STATE_LOCK_TIMEOUT_MS });
+  const lock = acquireMailLockSync(root, { timeoutMs });
   if (lock === null) {
     throw new Error(
-      `Host state record lock ${lockDir} could not be acquired within ${HOST_STATE_LOCK_TIMEOUT_MS} ms; refusing to ${action}. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${root} and retry.`,
+      `Host state record lock ${lockDir} could not be acquired within ${timeoutMs} ms; refusing to ${action}. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${root} and retry.`,
     );
   }
   try {
@@ -109,7 +109,7 @@ export function withHostStateRecordLock<T>(path: string, action: string, fn: () 
   }
 }
 
-export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean): void {
+export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(state.branch);
   withHostStateRecordLock(path, "write the host state record", () => {
@@ -118,7 +118,7 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
     // is skipped.
     if (shouldWrite !== undefined && !shouldWrite()) return;
     writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8", mode: 0o600 });
-  });
+  }, timeoutMs);
 }
 
 export function readHostState(branch: string): HostConnectionState | null {

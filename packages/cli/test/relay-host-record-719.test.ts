@@ -343,7 +343,7 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
   }
 });
 
-test("an inbound host lock timeout reports the record and still delivers the message without closing the channel", async () => {
+test.each(["live", "unverifiable", "stop"])("inbound persistence under contention (%s)", async (mode) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-inbound-lock-748-"));
   const savedEnv = savedRelayEnv();
   let stop: (() => Promise<void>) | undefined;
@@ -363,6 +363,7 @@ test("an inbound host lock timeout reports the record and still delivers the mes
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const onMessage = mock(() => {});
+  const owner = Bun.spawn(["sleep", "60"], { stdio: ["ignore", "ignore", "ignore"] });
   try {
     const branch = await prepareBranch(root);
     stop = await connectAndKeepAlive(branch, { onMessage });
@@ -370,17 +371,52 @@ test("an inbound host lock timeout reports the record and still delivers the mes
     expect(handler).toBeDefined();
     await Bun.sleep(20);
     const path = hostStatePath(branch);
-    lockRoot = holdHostLock(path);
+    const before = JSON.parse(readFileSync(path, "utf8"));
+    lockRoot = hostStateLockRoot(path);
+    const lockDir = mailLockPath(lockRoot);
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(join(lockDir, "owner.json"), JSON.stringify({
+      pid: owner.pid, startToken: mode === "unverifiable" ? "unknown:token" : processStartToken(owner.pid),
+    }));
     const message = { type: MSG_HEARTBEAT, seq: 9, ts: new Date().toISOString(), body: {} };
     diagnostic.mockClear();
-    handler!(message);
-    expect(onMessage).toHaveBeenCalledWith(message);
+    const started = performance.now();
+    for (let i = 0; i < 3; i++) handler!({ ...message, seq: i });
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(onMessage).toHaveBeenCalledTimes(3);
+    for (let i = 0; i < 3; i++) expect(onMessage).toHaveBeenNthCalledWith(i + 1, { ...message, seq: i });
+    expect(diagnostic).not.toHaveBeenCalled();
+    await Bun.sleep(20);
+    expect(performance.now() - started).toBeLessThan(500);
     expect(alive).toBe(true);
     expect(closes).toBe(0);
     expect(diagnostic).toHaveBeenCalledTimes(1);
     expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} update failed; message handling continues`);
-    expect(diagnostic.mock.calls[0][0]).toContain("could not be acquired");
+    expect(diagnostic.mock.calls[0][0]).toContain("could not be acquired within 0 ms");
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(before);
+    for (let i = 0; diagnostic.mock.calls.length < 2 && i < 100; i++) await Bun.sleep(5);
+    expect(diagnostic.mock.calls.length).toBeGreaterThanOrEqual(2);
+    handler!({ ...message, seq: 3 });
+    expect(onMessage).toHaveBeenCalledTimes(4);
+    rmSync(lockRoot, { recursive: true, force: true });
+    lockRoot = undefined;
+    if (mode === "stop") {
+      await stop();
+      await Bun.sleep(1100);
+      expect(existsSync(path)).toBe(false);
+    } else {
+      let record = before;
+      for (let i = 0; record.messagesReceived !== before.messagesReceived + 4 && i < 300; i++) {
+        await Bun.sleep(5);
+        record = JSON.parse(readFileSync(path, "utf8"));
+      }
+      expect(record.messagesReceived).toBe(before.messagesReceived + 4);
+      expect(record.lastHeartbeatAck).not.toBeNull();
+      expect(closes).toBe(0);
+    }
   } finally {
+    owner.kill();
+    await owner.exited;
     if (lockRoot) rmSync(lockRoot, { recursive: true, force: true });
     await stop?.();
     for (let i = 0; handler && !detached && i < 200; i++) await Bun.sleep(10);
@@ -389,4 +425,4 @@ test("an inbound host lock timeout reports the record and still delivers the mes
     restoreRelayEnv(savedEnv);
     rmSync(root, { recursive: true, force: true });
   }
-}, 20_000);
+}, 30_000);

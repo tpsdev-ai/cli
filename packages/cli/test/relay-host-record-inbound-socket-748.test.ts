@@ -33,7 +33,7 @@ async function waitFor(check: () => boolean): Promise<void> {
   }
 }
 
-test("a real WS channel delivers an inbound message through a host lock timeout and stays open", async () => {
+test("a real WS channel delivers inbound messages while host persistence retries", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-inbound-socket-748-"));
   const saved = { HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
     TPS_IDENTITY_DIR: process.env.TPS_IDENTITY_DIR, TPS_REGISTRY_DIR: process.env.TPS_REGISTRY_DIR,
@@ -75,7 +75,7 @@ test("a real WS channel delivers an inbound message through a host lock timeout 
     await waitFor(() => received.length > 0);
     expect(received[0]).toEqual(message);
     expect(peer!.isAlive()).toBe(true);
-    expect(diagnostic).toHaveBeenCalledTimes(1);
+    await waitFor(() => diagnostic.mock.calls.length > 0);
     expect(diagnostic.mock.calls[0][0]).toContain(`Host state record ${path} update failed; message handling continues`);
     rmSync(lockRoot, { recursive: true, force: true });
     lockRoot = undefined;

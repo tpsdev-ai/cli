@@ -8,8 +8,10 @@ import {
   clearHostState,
   connectionAlive,
   hostStatePath,
+  hostStateLockRoot,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
+import { mailLockPath } from "../src/utils/mail-lock.js";
 
 describe("connection-state", () => {
   let home = "";
@@ -88,6 +90,20 @@ describe("connection-state", () => {
     messagesSent: 0,
     messagesReceived: 0,
     pid: process.pid,
+  });
+
+  test("zero-wait writes check the stop gate while holding the record lock", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-gate-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    let checked = false;
+    writeHostState(completeState(), () => {
+      checked = true;
+      expect(existsSync(mailLockPath(hostStateLockRoot(path)))).toBe(true);
+      return false;
+    }, 0);
+    expect(checked).toBe(true);
+    expect(existsSync(path)).toBe(false);
   });
 
   function expectInvalidKept(state: unknown): void {

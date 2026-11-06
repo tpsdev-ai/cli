@@ -1139,6 +1139,8 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
 const SERVICE_HEALTH_INTERVAL_MS = 5 * 60_000; // 5 minutes
+const INBOUND_PERSIST_RETRY_BASE_MS = 50;
+const INBOUND_PERSIST_RETRY_MAX_MS = 1000;
 
 async function probeServiceHealth(): Promise<ServiceHealth[]> {
   const services = listServices();
@@ -1164,6 +1166,33 @@ export async function connectAndKeepAlive(
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
+  let inboundPersistTimer: ReturnType<typeof setTimeout> | undefined;
+  let inboundPersistState: HostConnectionState | undefined;
+  let inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
+
+  const cancelInboundPersist = () => {
+    if (inboundPersistTimer !== undefined) clearTimeout(inboundPersistTimer);
+    inboundPersistTimer = undefined;
+    inboundPersistState = undefined;
+    inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
+  };
+  const attemptInboundPersist = () => {
+    inboundPersistTimer = undefined;
+    if (stopped || inboundPersistState === undefined) return;
+    try {
+      writeHostState(inboundPersistState, () => !stopped, 0);
+      cancelInboundPersist();
+    } catch (error) {
+      console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
+      inboundPersistTimer = setTimeout(attemptInboundPersist, inboundPersistBackoff);
+      inboundPersistBackoff = Math.min(inboundPersistBackoff * 2, INBOUND_PERSIST_RETRY_MAX_MS);
+    }
+  };
+  const persistInbound = (state: HostConnectionState) => {
+    if (stopped) return;
+    inboundPersistState = state;
+    if (inboundPersistTimer === undefined) inboundPersistTimer = setTimeout(attemptInboundPersist, 0);
+  };
 
   const remotePath = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId, "remote.json");
   if (!existsSync(remotePath)) throw new Error(`No remote.json for branch: ${branchId}`);
@@ -1190,6 +1219,7 @@ export async function connectAndKeepAlive(
           return;
         }
         currentChannel = channel;
+        cancelInboundPersist();
 
         const now = new Date().toISOString();
         const state: HostConnectionState = {
@@ -1256,11 +1286,7 @@ export async function connectAndKeepAlive(
           } else {
             state.lastHeartbeatAck = now;
           }
-          try {
-            persist();
-          } catch (error) {
-            console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
-          }
+          persistInbound(state);
           opts.onMessage?.(msg);
         };
         channel.onMessage(handler);
@@ -1271,9 +1297,11 @@ export async function connectAndKeepAlive(
         clearInterval(hb);
         clearInterval(healthProbe);
         channel.offMessage(handler);
+        cancelInboundPersist();
         try { await channel.close(); } catch {}
         currentChannel = null;
       } catch {
+        cancelInboundPersist();
         if (currentChannel !== null) {
           const failedChannel = currentChannel;
           failedChannels.add(failedChannel);
@@ -1298,6 +1326,7 @@ export async function connectAndKeepAlive(
 
   return async () => {
     stopped = true;
+    cancelInboundPersist();
     stopPrune();
     if (currentChannel !== null) failedChannels.add(currentChannel);
     for (const channel of failedChannels) {
