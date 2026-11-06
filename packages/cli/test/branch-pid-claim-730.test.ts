@@ -6,16 +6,17 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { hostStatePath, writeHostState } from "../src/utils/connection-state.js";
 import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
+import { probeStdoutUnderRoot, type IdentityVerdict } from "./helpers/branch-daemon-identity.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -26,7 +27,8 @@ let pidFile: string;
 let logFile: string;
 let pauseDir: string;
 let savedEnv: Record<string, string | undefined>;
-const daemons: number[] = [];
+const daemons: { pid: number; startToken: string }[] = [];
+const unverifiedIdentityPids = new Set<number>();
 const children: ChildProcess[] = [];
 
 async function freePort(): Promise<number> {
@@ -398,39 +400,85 @@ function recordFilesUnder(dir: string): string[] {
   return files;
 }
 
-/** True when `pid` runs this build's tps binary and, on Linux, its
- *  environment names this test root. */
-function runsTestDaemon(pid: number): boolean {
-  let command: string | null;
+function runsTestDaemon(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  readProcessFile: (path: string) => string = (path) => readFileSync(path, "utf8"),
+): IdentityVerdict {
+  let command: string;
+  let environ: string | null = null;
   try {
-    command =
-      process.platform === "linux"
-        ? readFileSync(`/proc/${pid}/cmdline`, "utf8").replaceAll("\0", " ")
-        : (() => {
-            const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
-            return ps.status === 0 ? ps.stdout : null;
-          })();
+    if (platform === "linux") {
+      command = readProcessFile(`/proc/${pid}/cmdline`).replaceAll("\0", " ");
+      environ = readProcessFile(`/proc/${pid}/environ`);
+    } else {
+      const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+      if (ps.status !== 0 || typeof ps.stdout !== "string") return "unverified";
+      command = ps.stdout;
+    }
   } catch {
-    return false;
+    return "other";
   }
-  if (command === null || !command.includes(TPS_BIN) || !command.includes("branch")) return false;
-  if (process.platform !== "linux") return true;
-  try {
-    return readFileSync(`/proc/${pid}/environ`, "utf8").split("\0").includes(`HOME=${root}`);
-  } catch {
-    return false;
+  if (platform !== "linux") {
+    if (command.trim() !== "tps" && !command.includes(TPS_BIN)) return "other";
+    return probeStdoutUnderRoot(pid, root);
   }
+  if (command.trim() !== "tps" && (!command.includes(TPS_BIN) || !command.includes("branch"))) return "other";
+  const entries = environ!.split("\0");
+  return entries.includes(`HOME=${root}`) && entries.includes("TPS_BRANCH_DAEMON=1") ? "this-daemon" : "other";
 }
 
-/** Stop each process named by a pid record in the test root, after the
- *  record's start token and the process's command line verify it as this test
- *  build's daemon. Cleanup does not read launcher stdout, so a daemon whose
- *  announcement was missing or changed is still stopped. */
-async function stopRecordedDaemons(): Promise<void> {
+function leakDiagnostic(pids: number[]): string {
+  return pids
+    .map((pid) => unverifiedIdentityPids.has(pid) ? `identity could not be verified for pid ${pid}` : `pid ${pid} is still alive`)
+    .join("; ");
+}
+
+/** SIGKILL each registered daemon still running whose start token matches the
+ *  one recorded at registration. A pid whose token changed is left alone and
+ *  reported. */
+async function stopRegisteredDaemons(
+  records: { pid: number; startToken: string }[],
+  readToken: (pid: number) => string | null = processStartToken,
+): Promise<void> {
+  const failures: string[] = [];
+  for (const record of records) {
+    if (pidExited(record.pid)) continue;
+    if (readToken(record.pid) !== record.startToken) {
+      unverifiedIdentityPids.add(record.pid);
+      failures.push(`identity could not be verified for pid ${record.pid}; not signalled`);
+      continue;
+    }
+    try {
+      process.kill(record.pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await waitForPidGone(record.pid).catch(() => {});
+  }
+  if (failures.length > 0) throw new Error(`registered-daemon cleanup failed: ${failures.join("; ")}`);
+}
+
+async function stopRecordedDaemons(
+  identity: (pid: number) => IdentityVerdict = runsTestDaemon,
+  readToken: (pid: number) => string | null = processStartToken,
+): Promise<void> {
   const failures: string[] = [];
   for (const path of new Set([pidFile, ...recordFilesUnder(root)])) {
     const state = readPidFile(path);
-    if (state.kind !== "running" || !runsTestDaemon(state.pid)) continue;
+    if (state.kind !== "running") continue;
+    const verdict = identity(state.pid);
+    if (verdict === "unverified") {
+      unverifiedIdentityPids.add(state.pid);
+      failures.push(`identity could not be verified for pid ${state.pid}; not signalled`);
+      continue;
+    }
+    if (verdict !== "this-daemon") continue;
+    if (readToken(state.pid) !== state.startToken) {
+      unverifiedIdentityPids.add(state.pid);
+      failures.push(`identity could not be verified for pid ${state.pid}; not signalled`);
+      continue;
+    }
     try {
       process.kill(state.pid, "SIGKILL");
     } catch (error) {
@@ -475,13 +523,11 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  let cleanupError: unknown;
-  for (const pid of daemons.splice(0)) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
+  const cleanupFailures: string[] = [];
+  try {
+    await stopRegisteredDaemons(daemons.splice(0));
+  } catch (error) {
+    cleanupFailures.push((error as Error).message);
   }
   for (const child of children.splice(0)) {
     try {
@@ -493,16 +539,18 @@ afterEach(async () => {
   try {
     await stopRecordedDaemons();
   } catch (error) {
-    cleanupError = error;
-  } finally {
+    cleanupFailures.push((error as Error).message);
+  }
+  try {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
     rmSync(root, { recursive: true, force: true });
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
+  } finally {
+    if (cleanupFailures.length > 0) throw new Error(cleanupFailures.join("; "));
   }
-  if (cleanupError !== undefined) throw cleanupError;
 });
 
 describe("branch pid record ownership (cli#730)", () => {
@@ -541,7 +589,7 @@ describe("branch pid record ownership (cli#730)", () => {
     // Register before any assertion. afterEach also stops each running daemon
     // named by a verified record in this test root, so cleanup does not depend
     // on this announcement to find one.
-    daemons.push(...announced);
+    daemons.push(...announced.map((pid) => ({ pid, startToken: startToken(pid) })));
     expect(announced.length).toBe(1);
 
     const refused = exits.filter((exit) => exit.code !== 0);
@@ -549,7 +597,7 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(launchers.map(({ stderr }) => stderr()).join("\n")).toContain("refusing to spawn");
 
     const running = await waitForRunningRecord();
-    daemons.push(running.pid);
+    daemons.push(running);
     expect(running.pid).toBe(announced[0]!);
     expect(pidState(running.pid)).toBe("alive");
     expect(readPidFile(pidFile).kind).toBe("running");
@@ -563,7 +611,7 @@ describe("branch pid record ownership (cli#730)", () => {
     prepareBranch(port);
     const phase = "startup-before-listener";
     const daemon = spawnDaemon(phase);
-    daemons.push(daemon.pid!);
+    daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
     await waitForReady(phase, daemon.pid);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
@@ -583,7 +631,7 @@ describe("branch pid record ownership (cli#730)", () => {
     prepareBranch(port);
     const phase = "listening-before-steady-state";
     const daemon = spawnDaemon(phase);
-    daemons.push(daemon.pid!);
+    daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
     await waitForReady(phase, daemon.pid);
     await waitForListening(port);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
@@ -604,7 +652,7 @@ describe("branch pid record ownership (cli#730)", () => {
     prepareBranch(port);
     const phase = "shutdown-after-signal";
     const daemon = spawnDaemon(phase);
-    daemons.push(daemon.pid!);
+    daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
     await waitForLogStarted();
     await waitForListening(port);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
@@ -646,13 +694,126 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
     expect(stdout).toContain("Branch daemon spawned");
     const running = await waitForRunningRecord();
-    daemons.push(running.pid);
+    daemons.push(running);
     await waitForLogStarted();
     expect(pidState(running.pid)).toBe("alive");
     expect(readdirSync(pauseDir)).toEqual([]);
 
     process.kill(running.pid, "SIGTERM");
     await waitForPidGone(running.pid);
+  }, 40_000);
+
+  test("a hand-set TPS_TEST_ROOT without a valid marker token ignores the pause", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const env = launcherEnv("unused");
+    delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+    env.TPS_TEST_ROOT = root;
+    env.TPS_TEST_ROOT_TOKEN = "hand-set-token";
+
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    children.push(launcher);
+    let stdout = "";
+    launcher.stdout?.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    expect(stdout).toContain("Branch daemon spawned");
+    const running = await waitForRunningRecord();
+    daemons.push(running);
+    await waitForLogStarted();
+    expect(pidState(running.pid)).toBe("alive");
+    expect(readdirSync(pauseDir)).toEqual([]);
+
+    process.kill(running.pid, "SIGTERM");
+    await waitForPidGone(running.pid);
+  }, 40_000);
+
+  test("a matching token with a pause dir outside TPS_TEST_ROOT is ignored", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const outsideBase = dirname(realpathSync(process.env.TPS_TEST_ROOT!));
+    const outside = mkdtempSync(join(outsideBase, "tps-branch-730-outside-"));
+    try {
+      const env = launcherEnv("unused");
+      delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+      env.TPS_BRANCH_TEST_PAUSE_DIR = outside;
+      const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+        env,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      children.push(launcher);
+      let stdout = "";
+      launcher.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+
+      expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+      expect(stdout).toContain("Branch daemon spawned");
+      const running = await waitForRunningRecord();
+      daemons.push(running);
+      await waitForLogStarted();
+      expect(readdirSync(outside)).toEqual([]);
+
+      process.kill(running.pid, "SIGTERM");
+      await waitForPidGone(running.pid);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  }, 40_000);
+
+  test("a registered daemon whose start token changed is reported and not signalled", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env: plainEnv(),
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    children.push(launcher);
+    const running = await waitForRunningRecord();
+    daemons.push(running);
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    await waitForLogStarted();
+
+    let message = "";
+    try {
+      await stopRegisteredDaemons([running], () => "recycled-token");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain(`identity could not be verified for pid ${running.pid}; not signalled`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 200));
+    expect(pidState(running.pid)).toBe("alive");
+    expect(processStartToken(running.pid)).toBe(running.startToken);
+    expect(leakDiagnostic([running.pid])).toBe(`identity could not be verified for pid ${running.pid}`);
+  }, 40_000);
+
+  test("stopRecordedDaemons reports a daemon whose identity probe cannot answer and leaves it running", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+      env: plainEnv(),
+      stdio: ["ignore", "ignore", "ignore"],
+    });
+    children.push(launcher);
+    const running = await waitForRunningRecord();
+    daemons.push(running);
+    expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+    await waitForLogStarted();
+
+    let message = "";
+    try {
+      await stopRecordedDaemons(() => "unverified");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain(`identity could not be verified for pid ${running.pid}; not signalled`);
+    expect(pidState(running.pid)).toBe("alive");
+    expect(leakDiagnostic([running.pid])).toBe(`identity could not be verified for pid ${running.pid}`);
   }, 40_000);
 
   test("shutdown holds the record lock and preserves a replacement visible at its final read", async () => {
@@ -837,7 +998,7 @@ describe("branch pid record ownership (cli#730)", () => {
     });
     children.push(launcher);
     const launched = await waitForRunningRecord();
-    daemons.push(launched.pid);
+    daemons.push(launched);
     const replacement = readFileSync(pidFile, "utf8");
     expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
     release("office-kill-branch-before-unlink");
@@ -1050,12 +1211,40 @@ describe("branch pid record ownership (cli#730)", () => {
     children.push(launcher);
     const running = await waitForRunningRecord();
     unannouncedDaemon = running;
+    await waitForLogStarted();
     expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
     expect(pidState(running.pid)).toBe("alive");
   }, 40_000);
 
   afterAll(() => {
     if (unannouncedDaemon === undefined) throw new Error("the launcher recorded no daemon");
-    expect(pidExited(unannouncedDaemon.pid)).toBe(true);
+    const leaked = pidExited(unannouncedDaemon.pid) ? [] : [unannouncedDaemon.pid];
+    expect(leaked, leakDiagnostic(leaked)).toEqual([]);
+  });
+});
+
+describe("Linux daemon cleanup identity", () => {
+  test("matches the daemon before and after meow sets its title", () => {
+    const parsed = spawnSync("node", ["--input-type=module", "-e", `
+      import meow from "meow";
+      import { readFileSync } from "node:fs";
+      const command = () => process.platform === "linux" ? readFileSync("/proc/self/cmdline", "utf8") : null;
+      const beforeCommand = command();
+      const before = process.title;
+      meow("", { importMeta: { url: ${JSON.stringify(new URL("../bin/tps.ts", import.meta.url).href)} }, argv: ["branch", "start"] });
+      console.log(JSON.stringify({ before, after: process.title, commands: beforeCommand === null ? null : [beforeCommand, command()] }));
+    `, TPS_BIN, "branch", "start"], { encoding: "utf8" });
+    expect(parsed.status, parsed.stderr).toBe(0);
+    const titles = JSON.parse(parsed.stdout);
+    expect({ before: titles.before, after: titles.after }).toEqual({ before: "node", after: "tps" });
+    const commands: string[] = titles.commands ?? [`node\0${TPS_BIN}\0branch\0start\0`, `${titles.after}\0\0`];
+    for (const command of commands) {
+      const identity = (home: string, daemon: string) => runsTestDaemon(123, "linux", (path) =>
+        path.endsWith("/cmdline") ? command : `HOME=${home}\0${daemon}\0`);
+      expect(identity(root, "TPS_BRANCH_DAEMON=1")).toBe("this-daemon");
+      expect(identity(`${root}-other`, "TPS_BRANCH_DAEMON=1")).toBe("other");
+      expect(identity(root, "TPS_BRANCH_DAEMON=0")).toBe("other");
+      expect(identity(root, "")).toBe("other");
+    }
   });
 });
