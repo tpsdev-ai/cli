@@ -21,7 +21,7 @@ npm install -g @tpsdev-ai/cli
 | `tps backup <agent>` | Create encrypted, checksummed workspace backup |
 | `tps restore <agent> <archive>` | Restore agent workspace with transactional rollback |
 | `tps status` | Operational dashboard — health, uptime, cost tracking |
-| `tps heartbeat <agent>` | Agent self-reports health (workspace, queue age; gateway probed unless an explicit top-level `runtime: native` line as tps writes it) |
+| `tps heartbeat <agent>` | Agent self-reports health (workspace, queue age; gateway skipped only when `runtime` parses as `native` and has a single top-level plain `runtime: native` line, with optional trailing spaces, tabs or a `#` comment; every other form is probed) |
 | `tps identity init` | Generate Ed25519 host keypair |
 | `tps branch init` | Initialize a remote branch office |
 | `tps office join` | Join a branch to the head office via Noise_IK handshake |
@@ -29,6 +29,8 @@ npm install -g @tpsdev-ai/cli
 | `tps mail send` | Send async mail to a branch agent |
 | `tps mail check` | Check for incoming mail |
 | `tps secrets set/get` | Encrypted vault for API keys and credentials |
+
+`tps init`, `tps agent create` and `set-runtime` write the bare runtime form.
 
 ## Architecture
 

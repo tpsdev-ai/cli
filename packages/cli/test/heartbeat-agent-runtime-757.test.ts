@@ -4,6 +4,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writ
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import yaml from "js-yaml";
+import { loadAgentConfig } from "@tpsdev-ai/agent";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const DEAD_FLAIR = "http://127.0.0.1:19926";
@@ -146,7 +147,7 @@ describe("cli#757 — heartbeat and the recorded runtime", () => {
 
   test("a plain top-level native line with a trailing comment skips a dead gateway", async () => {
     const agent = "runtime-plain";
-    writeAgentConfig(agent, "native  # recorded by tps");
+    writeAgentConfig(agent, "native  # trailing comment");
     deadGateway();
     const result = await runTps(["heartbeat", agent]);
     expect(result.status).toBe(0);
@@ -191,6 +192,54 @@ describe("cli#757 — heartbeat and the recorded runtime", () => {
     expect(result.stdout).toContain("gateway probed");
     expect(readFileSync(probe, "utf-8")).toBe("probed\n");
   }, 20000);
+});
+
+describe("cli#757 — generated configs through the agent loader", () => {
+  for (const runtime of ["native", "openclaw"]) {
+    test(`the agent loader reads a fresh ${runtime} create config and a set-runtime update`, async () => {
+      const agent = `loader-create-${runtime}`;
+      const args = ["agent", "create", "--id", agent, "--name", "Loader seam", "--model", "anthropic/seam-model"];
+      if (runtime === "openclaw") args.push("--runtime", runtime);
+      expect((await runTps(args)).status).toBe(0);
+      const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+      expect(readFileSync(configPath, "utf-8").split("\n")).toContain(`runtime: ${runtime}`);
+      const loaded = loadAgentConfig(configPath);
+      expect(loaded).toMatchObject({
+        agentId: agent,
+        name: "Loader seam",
+        workspace: join(home, "ops"),
+        mailDir: join(home, ".tps", "mail"),
+        memoryPath: join(home, ".tps", "agents", agent, "memory.jsonl"),
+        contextWindowTokens: 200000,
+        llm: { provider: "anthropic", model: "seam-model", auth: "api-key" },
+        tools: ["read", "write", "edit", "exec", "mail"],
+      });
+      expect(loaded).not.toHaveProperty("runtime");
+
+      expect((await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"])).status).toBe(0);
+      expect(readFileSync(configPath, "utf-8").split("\n")).toContain("runtime: native");
+      expect(loadAgentConfig(configPath)).toEqual(loaded);
+    }, 30000);
+  }
+
+  test("the agent loader reads a fresh init config", async () => {
+    const agent = "loader-init";
+    expect((await runTps(["init", "--id", agent, "--model", "seam-model"])).status).toBe(0);
+    const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+    expect(readFileSync(configPath, "utf-8").split("\n")).toContain("runtime: native");
+    const loaded = loadAgentConfig(configPath);
+    expect(loaded).toMatchObject({
+      agentId: agent,
+      name: agent,
+      workspace: join(home, "ops", agent),
+      mailDir: join(home, ".tps", "mail"),
+      memoryPath: join(home, ".tps", "agents", agent, "memory.jsonl"),
+      contextWindowTokens: 200000,
+      llm: { provider: "openai", model: "seam-model", auth: "api-key" },
+      flair: { url: DEAD_FLAIR, keyPath: join(home, ".tps", "identity", `${agent}.key`) },
+    });
+    expect(loaded).not.toHaveProperty("runtime");
+  }, 30000);
 });
 
 describe("cli#757 — recording the runtime", () => {

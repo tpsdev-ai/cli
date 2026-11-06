@@ -184,8 +184,10 @@ function recordedAgentRuntime(agentId: string): string | null {
 }
 
 /**
- * Skip only for an explicit top-level `runtime: native` line as tps writes it;
+ * Skip only when `runtime` parses as `native` and has a single top-level plain
+ * `runtime: native` line, with optional trailing spaces, tabs or a `#` comment;
  * every other form is probed.
+ * `tps init`, `tps agent create` and `set-runtime` write the bare form.
  */
 function checkGatewayHealth(runtime: string | null): { errors: string[]; note: string } {
   if (runtime === "native") {
