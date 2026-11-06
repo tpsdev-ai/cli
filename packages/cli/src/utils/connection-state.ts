@@ -127,9 +127,7 @@ export function readHostState(branch: string): HostConnectionState | null {
   try { return JSON.parse(readFileSync(p, "utf-8")); } catch { return null; }
 }
 
-/** True when the record still names this process: same pid, and the same
- *  start token when the record captured one. A record without a token compares
- *  by pid alone. */
+/** True for the same PID, and the same start token when one is present. */
 function recordNamesOwnProcess(state: HostConnectionState): boolean {
   if (state.pid !== process.pid) return false;
   if (state.startToken === undefined || state.startToken === null) return true;
@@ -142,9 +140,6 @@ type HostRecordRead =
   | { kind: "invalid" }
   | { kind: "record"; state: HostConnectionState };
 
-/** Read a host state record and distinguish an absent file from one whose
- *  owner cannot be verified. A non-regular file (a directory or a symlink) and
- *  a parse or shape failure are reported, never treated as absent. */
 function readHostRecord(path: string, branch: string): HostRecordRead {
   let isFile: boolean;
   try {
@@ -160,8 +155,6 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
     raw = readFileSync(path, "utf-8");
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
-    // A file removed between the two reads is absent; anything else is
-    // unreadable.
     if (code === "ENOENT") return { kind: "absent" };
     return { kind: "unreadable", reason: `could not be read (${code})` };
   }
@@ -196,9 +189,7 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
-/** Remove the record only when a final read under its lock still names this
- *  process. A record that names another process is left in place. A record
- *  that is present but unreadable or invalid is left in place and reported,
+/** A record that is present but unreadable or invalid is left in place and reported,
  *  because its owner cannot be verified. */
 export function clearHostState(branch: string): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });

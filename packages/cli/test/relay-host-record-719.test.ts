@@ -229,7 +229,7 @@ function holdHostLock(path: string): string {
   return root;
 }
 
-test.each([false, true])("a host lock timeout attempts channel close before retry and retains a rejected close for stop (%s)", async (closeFails) => {
+test.each([false, true])("a host lock timeout attempts channel close before retry (close rejects: %s)", async (closeFails) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-retry-lock-748-"));
   const savedEnv = savedRelayEnv();
   let stop: (() => Promise<void>) | undefined;
