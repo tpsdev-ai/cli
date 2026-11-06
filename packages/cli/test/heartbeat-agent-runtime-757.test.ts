@@ -391,9 +391,30 @@ syncBuiltinESMExports();
     }
   }, 30000);
 
-  const alternateGroup = process.getgroups().find((group) => group !== process.getgid());
+  const alternateGroup = (() => {
+    let probeRoot: string | undefined;
+    try {
+      probeRoot = mkdtempSync(join(tmpdir(), "tps-runtime-757-"));
+      const probePath = join(probeRoot, "chown-probe");
+      writeFileSync(probePath, "");
+      for (const group of process.getgroups()) {
+        if (group === process.getgid()) continue;
+        try {
+          chownSync(probePath, -1, group);
+          return group;
+        } catch {
+          continue;
+        }
+      }
+    } catch {
+      return undefined;
+    } finally {
+      if (probeRoot !== undefined) rmSync(probeRoot, { recursive: true, force: true });
+    }
+    return undefined;
+  })();
   if (alternateGroup === undefined) {
-    test.skip("set-runtime keeps the config's group (skipped: this process has only one group)", () => {});
+    test.skip("set-runtime keeps the config's group (skipped: chown to a second group is not permitted for this process here)", () => {});
   } else {
     test("set-runtime keeps the config's group", async () => {
       const agent = "runtime-group";
