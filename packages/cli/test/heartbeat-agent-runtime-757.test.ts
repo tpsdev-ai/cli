@@ -1,6 +1,7 @@
 // cli#757 — built CLI with temporary HOME; the native case removes the fake OpenClaw.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import yaml from "js-yaml";
@@ -69,6 +70,23 @@ async function runTps(args: string[], env: Record<string, string> = {}, preload?
     proc.exited,
   ]);
   return { status, stdout, stderr };
+}
+
+function readableByAnotherUser(file: string): boolean {
+  let current = "/";
+  for (const part of resolve(file).split("/").filter(Boolean)) {
+    current = join(current, part);
+    try {
+      if ((statSync(current).mode & 0o001) === 0) return false;
+    } catch {
+      return false;
+    }
+  }
+  try {
+    return (statSync(file).mode & 0o004) !== 0;
+  } catch {
+    return false;
+  }
 }
 
 function writeAgentConfig(agent: string, runtime?: string): string {
@@ -783,7 +801,7 @@ syncBuiltinESMExports();
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
 
-  test("set-runtime warns once when only the group of another owner's config can be kept", async () => {
+  test("set-runtime warns once after the rename when another owner's config keeps only its group", async () => {
     const agent = "runtime-owner-warning";
     const configPath = writeAgentConfig(agent, "openclaw");
     const preload = join(home, "other-owner.mjs");
@@ -813,10 +831,86 @@ syncBuiltinESMExports();
 `);
     const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
     expect(result.status).toBe(0);
-    const warnings = result.stderr.split("\n").filter((line) => line.includes(configPath) && /owner/.test(line));
+    const warnings = result.stderr.split("\n").filter((line) => line.includes(configPath) && line.includes("Cannot preserve the owner"));
     expect(warnings).toHaveLength(1);
     expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
   }, 20000);
+
+  test("set-runtime does not warn when a group-only replacement fails before the rename", async () => {
+    const agent = "runtime-owner-failure";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const preload = join(home, "other-owner-failure.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const configPath = ${JSON.stringify(configPath)};
+const lstat = fs.lstatSync;
+const chown = fs.chownSync;
+const chmod = fs.chmodSync;
+const write = fs.writeFileSync;
+let ownershipCalls = 0;
+const isTemp = (path) => typeof path === "string" && path.includes(".agent-runtime-") && path.endsWith(".tmp");
+fs.lstatSync = (path, ...args) => {
+  const stat = lstat(path, ...args);
+  if (path === configPath && stat.isFile()) {
+    return { mode: stat.mode, uid: stat.uid + 1, gid: stat.gid, isFile: () => true };
+  }
+  return stat;
+};
+fs.chownSync = (path, uid, gid) => {
+  if (isTemp(path)) {
+    ownershipCalls++;
+    if (ownershipCalls === 1) throw Object.assign(new Error("injected owner refusal"), { code: "EPERM" });
+  }
+  return chown(path, uid, gid);
+};
+fs.chmodSync = (path, mode) => {
+  chmod(path, mode);
+  if (isTemp(path)) write(path, "runtime: tampered\\n", "utf-8");
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Temporary config does not match the expected content");
+    expect(result.stderr).not.toContain("Cannot preserve the owner");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  const canOwnAnotherUid =
+    typeof process.getuid === "function" &&
+    process.getuid() === 0 &&
+    [process.execPath, TPS_BIN].every(readableByAnotherUser);
+  if (!canOwnAnotherUid) {
+    test.skip("set-runtime warns after a real replacement keeps only the group (skipped: requires root and a CLI readable by another uid)", () => {});
+  } else {
+    test("set-runtime warns after a real replacement keeps only the group", async () => {
+      const agent = "runtime-real-owner";
+      const configPath = writeAgentConfig(agent, "openclaw");
+      chmodSync(configPath, 0o644);
+      chownSync(configPath, 0, 65534);
+      chownSync(join(configPath, ".."), 65534, 65534);
+      chmodSync(home, 0o755);
+      chmodSync(join(home, ".tps"), 0o755);
+      chmodSync(join(home, ".tps", "agents"), 0o755);
+      const result = spawnSync(process.execPath, [TPS_BIN, "agent", "set-runtime", "--id", agent, "--runtime", "native"], {
+        cwd: home,
+        encoding: "utf-8",
+        env: { HOME: home, TMPDIR: home, FLAIR_URL: DEAD_FLAIR, PATH: "/usr/bin:/bin" },
+        uid: 65534,
+        gid: 65534,
+        timeout: 20000,
+      });
+      expect(result.status).toBe(0);
+      const warnings = (result.stderr ?? "").split("\n").filter((line) => line.includes(configPath) && line.includes("Cannot preserve the owner"));
+      expect(warnings).toHaveLength(1);
+      expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
+      expect(statSync(configPath).uid).toBe(0);
+      expect(statSync(configPath).gid).toBe(65534);
+    }, 20000);
+  }
 
   test("set-runtime inserts an absent field in a plain mapping", async () => {
     const agent = "agent-f";

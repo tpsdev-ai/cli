@@ -190,7 +190,6 @@ function writeRuntimeConfig(
       } catch {
         throw failure;
       }
-      if (typeof process.getuid === "function" && original.uid !== process.getuid()) onOwnershipChange?.();
     }
     try {
       chmodSync(temporary, permissions);
@@ -204,12 +203,14 @@ function writeRuntimeConfig(
     if (!readFileSync(temporary).equals(expectedContents)) {
       throw new Error("Temporary config does not match the expected content; leaving it unchanged.");
     }
+    const ownershipPreserved = statSync(temporary).uid === original.uid;
     renameSync(temporary, configPath);
+    if (!ownershipPreserved) onOwnershipChange?.();
   } finally {
     try {
       rmSync(temporary, { force: true });
     } catch {
-      // The refusal stands even when the temporary file cannot be removed.
+      // Cleanup is best-effort and must not change the replacement's outcome.
     }
   }
 }
