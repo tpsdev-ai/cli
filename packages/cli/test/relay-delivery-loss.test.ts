@@ -1,4 +1,4 @@
-import { describe, expect, test, beforeEach, afterEach, spyOn, mock } from "bun:test";
+import { describe, expect, test, beforeEach, afterEach, afterAll, spyOn, mock } from "bun:test";
 import { MailClient, hasCommittedMessageId } from "@tpsdev-ai/agent";
 import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
@@ -21,10 +21,52 @@ afterEach(() => {
 
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
+/**
+ * Each sync case pays syncRemoteBranch's fixed 3000 ms delivery window
+ * (src/utils/relay.ts) because its cleanup awaits the sync promise; a connect
+ * case pays the keep-alive loop's 1000 ms poll plus its 1100 ms settle. Neither
+ * wait has a test knob, so the cases carry an explicit per-test timeout with
+ * margin rather than running near bun's 5 s default. The cascade lane sets
+ * TPS_RELAY_LOSS_TEST_TIMEOUT_MS to force the short timeout the fix must survive.
+ */
+const CASE_TIMEOUT_MS = (() => {
+  const raw = Number(process.env.TPS_RELAY_LOSS_TEST_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 30_000;
+})();
+
+const ENV_KEYS = ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT"] as const;
+
+/** The values this file's cases may change, copied before any case runs. */
+const FILE_ENV: Record<string, string | undefined> = {};
+for (const key of ENV_KEYS) FILE_ENV[key] = process.env[key];
+
+/** The signal listeners that existed before any case starts a branch. */
+const FILE_SIGNALS = new Map<"SIGTERM" | "SIGINT", Set<(...args: any[]) => void>>(
+  (["SIGTERM", "SIGINT"] as const).map((signal) => [signal, new Set(process.listeners(signal))])
+);
+
+function restoreEnv(): void {
+  for (const key of ENV_KEYS) {
+    const value = FILE_ENV[key];
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+}
+
+function restoreSignalListeners(): void {
+  for (const [signal, before] of FILE_SIGNALS) {
+    for (const listener of process.listeners(signal)) if (!before.has(listener)) process.removeListener(signal, listener);
+  }
+}
+
+function testCase(name: string, fn: () => void | Promise<void>): void {
+  test(name, fn, CASE_TIMEOUT_MS);
+}
+
 for (const entry of ["sync", "connect"] as const) {
   describe(`${entry} relayed local delivery retention`, () => {
     let root: string;
-    let savedEnv: Record<string, string | undefined>;
+    const roots = new Set<string>();
     let stop: (() => Promise<void>) | undefined;
     let completion: Promise<unknown> | undefined;
     let handlers: Set<(msg: TpsMessage) => void>;
@@ -32,12 +74,13 @@ for (const entry of ["sync", "connect"] as const) {
     let channel: TransportChannel;
     let branchReceive: (msg: TpsMessage, channel: TransportChannel) => void | Promise<void>;
     let branchChannel: TransportChannel;
-    let signalListeners: Map<"SIGTERM" | "SIGINT", Set<(...args: any[]) => void>>;
 
     beforeEach(async () => {
+      restoreEnv();
+      restoreSignalListeners();
+      mock.restore();
       root = fs.mkdtempSync(join(tmpdir(), "tps-relay-loss-"));
-      savedEnv = {};
-      for (const k of ["HOME", "TPS_MAIL_DIR", "FLAIR_URL", "FLAIR_KEY_PATH", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON", "TPS_ROOT"]) savedEnv[k] = process.env[k];
+      roots.add(root);
       process.env.HOME = root;
       process.env.TPS_ROOT = root;
       process.env.TPS_BRANCH_NO_DAEMON = "1";
@@ -89,26 +132,35 @@ for (const entry of ["sync", "connect"] as const) {
         return { onConnection() {}, async close() {} };
       });
       spyOn(fs, "watch").mockReturnValue({ close() {} } as fs.FSWatcher);
-      signalListeners = new Map(["SIGTERM", "SIGINT"].map((signal) => [signal as "SIGTERM" | "SIGINT", new Set(process.listeners(signal))]));
       void runBranch({ action: "start" });
       expect(branchReceive!).toBeDefined();
       stop = undefined;
       completion = undefined;
     });
 
+    // The restore is synchronous and runs before any await: a case that times
+    // out, or an afterEach that then exceeds its own timeout, must not leave
+    // this file's environment or listeners for the next test file in the lane.
     afterEach(async () => {
-      if (stop) await stop();
-      if (completion) await completion;
-      if (entry === "connect") await Bun.sleep(1100);
-      for (const [signal, before] of signalListeners) {
-        for (const listener of process.listeners(signal)) if (!before.has(listener)) process.removeListener(signal, listener);
-      }
+      restoreEnv();
+      restoreSignalListeners();
       mock.restore();
-      for (const [k, v] of Object.entries(savedEnv)) {
-        if (v === undefined) delete process.env[k];
-        else process.env[k] = v;
+      try {
+        if (stop) await stop();
+        if (completion) await completion;
+        if (entry === "connect") await Bun.sleep(1100);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+        roots.delete(root);
       }
-      fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    afterAll(() => {
+      restoreEnv();
+      restoreSignalListeners();
+      mock.restore();
+      for (const dir of roots) fs.rmSync(dir, { recursive: true, force: true });
+      roots.clear();
     });
 
     function jsonFiles(dir: string): string[] {
@@ -139,7 +191,7 @@ for (const entry of ["sync", "connect"] as const) {
       await Bun.sleep(0);
     }
 
-    test("retains an over-cap message and mail check refuses tampered and wrong-recipient envelopes", async () => {
+    testCase("retains an over-cap message and mail check refuses tampered and wrong-recipient envelopes", async () => {
       fillInbox();
       const valid = buildSignedEnvelope("remote", "local", "relayed reply", SEEDS);
       const tampered = { ...buildSignedEnvelope("remote", "local", "original", SEEDS), body: "tampered" };
@@ -170,7 +222,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const fault of ["sidecar", "record", "publish-throws"] as const) {
-      test(`${fault} failure leaves the branch source unacked and retryable`, async () => {
+      testCase(`${fault} failure leaves the branch source unacked and retryable`, async () => {
         fillInbox();
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "retry me", SEEDS)));
         const inbox = getInbox("local");
@@ -207,7 +259,7 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
-    test("a local write failure leaves the source unacked and its resend delivers once", async () => {
+    testCase("a local write failure leaves the source unacked and its resend delivers once", async () => {
       const env = buildSignedEnvelope("remote", "local", "write fault", SEEDS);
       queue(JSON.stringify(env));
       const inbox = getInbox("local");
@@ -241,7 +293,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(delivered[0].body).toBe("write fault");
     });
 
-    test("a replayed delivery is acknowledged without a second inbox record", async () => {
+    testCase("a replayed delivery is acknowledged without a second inbox record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
       await start();
       const msg: TpsMessage = { type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body };
@@ -258,7 +310,7 @@ for (const entry of ["sync", "connect"] as const) {
       await Bun.sleep(0);
     }
 
-    test("a changed promoted record conflicts with its original delivery without ACK", async () => {
+    testCase("a changed promoted record conflicts with its original delivery without ACK", async () => {
       const inbox = getInbox("local");
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
@@ -283,7 +335,7 @@ for (const entry of ["sync", "connect"] as const) {
       }
     });
 
-    test("invalid record field values are quarantined before ACK", async () => {
+    testCase("invalid record field values are quarantined before ACK", async () => {
       const inbox = getInbox("local");
       spyOn(console, "error").mockImplementation(() => {});
       await start();
@@ -311,7 +363,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const location of ["new", "cur", "dlq"] as const) {
-      test(`an incomplete ${location} record is quarantined before publication and unchanged resend ACK`, async () => {
+      testCase(`an incomplete ${location} record is quarantined before publication and unchanged resend ACK`, async () => {
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "incomplete candidate", SEEDS)));
         const inbox = getInbox("local");
         const dir = location === "new" ? inbox.fresh : inbox[location];
@@ -352,7 +404,7 @@ for (const entry of ["sync", "connect"] as const) {
 
     for (const location of ["new", "cur", "dlq", "promoted"] as const) {
       for (const field of ["from", "to", "content", "timestamp"] as const) {
-        test(`a same-ID resend with different ${field} conflicts with ${location} without ACK`, async () => {
+        testCase(`a same-ID resend with different ${field} conflicts with ${location} without ACK`, async () => {
           const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "original payload", SEEDS)));
           const inbox = getInbox("local");
           if (location === "dlq") fillInbox();
@@ -404,7 +456,7 @@ for (const entry of ["sync", "connect"] as const) {
 
     for (const destination of ["inbox", "DLQ", "cur"] as const) {
       for (const prior of ["none", "marker", "no-marker"] as const) {
-        test(`${destination} ${prior} receipt survives GC at ACK with an old sender timestamp`, async () => {
+        testCase(`${destination} ${prior} receipt survives GC at ACK with an old sender timestamp`, async () => {
           if (destination === "DLQ") fillInbox();
           const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "old timestamp", SEEDS)));
           body.timestamp = new Date(0).toISOString();
@@ -455,7 +507,7 @@ for (const entry of ["sync", "connect"] as const) {
       }
     }
 
-    test("receipt failure removes the new record before redelivery", async () => {
+    testCase("receipt failure removes the new record before redelivery", async () => {
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accept once", SEEDS)));
         const inbox = getInbox("local");
         const marker = relayAcceptanceReceiptPath("remote", body.id);
@@ -475,7 +527,7 @@ for (const entry of ["sync", "connect"] as const) {
         expect(drainOutbox(false)).toEqual([]);
       });
 
-    test("ACK failure then redelivery keeps one inbox record", async () => {
+    testCase("ACK failure then redelivery keeps one inbox record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "ACK retry", SEEDS)));
       const marker = relayAcceptanceReceiptPath("remote", body.id);
       spyOn(console, "error").mockImplementation(() => {});
@@ -498,7 +550,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const receipt of ["kept", "removed"] as const) {
-      test(`a lost ACK and the sender's resend leave one keyed inbox record and one ACK at the branch (receipt ${receipt}) (cli#513)`, async () => {
+      testCase(`a lost ACK and the sender's resend leave one keyed inbox record and one ACK at the branch (receipt ${receipt}) (cli#513)`, async () => {
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", `lost ACK ${receipt}`, SEEDS)));
         const inbox = getInbox("local");
         const keyed = relayRecordFileName("remote", body.id);
@@ -543,7 +595,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(jsonFiles(inbox.fresh)).toEqual([]);
     }
 
-    test("an identical resend after ACK is a duplicate: one record, no second delivered", async () => {
+    testCase("an identical resend after ACK is a duplicate: one record, no second delivered", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
       await start();
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
@@ -556,7 +608,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(drainOutbox(false)).toEqual([]);
     });
 
-    test("a differing resend after ACK is refused without a second delivery", async () => {
+    testCase("a differing resend after ACK is refused without a second delivery", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "once", SEEDS)));
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
@@ -569,7 +621,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(errors.mock.calls.flat().join("\n")).toContain("conflict");
     });
 
-    test("a flat per-branch marker from before receipts refuses resend after local ACK without ACK", async () => {
+    testCase("a flat per-branch marker from before receipts refuses resend after local ACK without ACK", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "legacy acceptance", SEEDS)));
       const original = sendMessage("local", body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
       const marker = join(process.env.TPS_MAIL_DIR!, ".relay-accepted", "by-branch", "remote", body.id);
@@ -587,7 +639,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(errors.mock.calls.flat().join("\n")).toContain(`relayed delivery conflict for branch remote message ${body.id}: accepted before receipts existed; payload cannot be compared; sender must not retry`);
     });
 
-    test("a receipt older than the prune bound no longer blocks a resend", async () => {
+    testCase("a receipt older than the prune bound no longer blocks a resend", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "late", SEEDS)));
       await start();
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body });
@@ -605,7 +657,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(jsonFiles(getInbox("local").fresh)).toHaveLength(1);
     });
 
-    test("a whole old receipt bucket is removed when a new receipt is written", async () => {
+    testCase("a whole old receipt bucket is removed when a new receipt is written", async () => {
       const first = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "first accepted", SEEDS)));
       await start();
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: first });
@@ -627,7 +679,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(jsonFiles(getInbox("local").fresh)).toHaveLength(2);
     });
 
-    test("a marker read failure refuses the delivery without an ACK", async () => {
+    testCase("a marker read failure refuses the delivery without an ACK", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "marker read", SEEDS)));
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
@@ -650,7 +702,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const state of ["removed-unread", "consumed"] as const) {
-      test(`an existing ${state} receipt with no record dedups an identical resend and is ACKed`, async () => {
+      testCase(`an existing ${state} receipt with no record dedups an identical resend and is ACKed`, async () => {
         const envelope = buildSignedEnvelope("remote", "local", state, SEEDS);
         const body = queue(JSON.stringify(envelope));
         const inbox = getInbox("local");
@@ -698,7 +750,7 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
-    test("an empty pre-receipt marker with no record refuses without an ACK", async () => {
+    testCase("an empty pre-receipt marker with no record refuses without an ACK", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "legacy", SEEDS)));
       const inbox = getInbox("local");
       const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
@@ -718,7 +770,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const signature of ["valid", "invalid"] as const) {
-      test(`a delivery whose envelope reuses a consumed message id is refused at promotion (${signature} signature)`, async () => {
+      testCase(`a delivery whose envelope reuses a consumed message id is refused at promotion (${signature} signature)`, async () => {
         const original = buildSignedEnvelope("remote", "local", "unrelated", SEEDS);
         sendMessage("local", JSON.stringify(original), "remote");
         const client = new MailClient(process.env.TPS_MAIL_DIR!, undefined, "local", {
@@ -744,7 +796,7 @@ for (const entry of ["sync", "connect"] as const) {
     }
 
     for (const dir of ["new", "cur", "dlq"] as const) {
-      test(`an unreadable matching ${dir} record refuses host acceptance without an ACK`, async () => {
+      testCase(`an unreadable matching ${dir} record refuses host acceptance without an ACK`, async () => {
         const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "read retry", SEEDS)));
         const inbox = getInbox("local");
         const record = sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
@@ -774,7 +826,7 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
-    test("inbox and DLQ write failures leave no marker or ACK, then retry writes one record", async () => {
+    testCase("inbox and DLQ write failures leave no marker or ACK, then retry writes one record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "write retry", SEEDS)));
       const inbox = getInbox("local");
       const marker = relayAcceptanceReceiptPath("remote", body.id);
@@ -799,7 +851,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const destination of ["inbox", "DLQ"] as const) {
-      test(`${destination} and marker fsync failures send no ACK at each sync call`, async () => {
+      testCase(`${destination} and marker fsync failures send no ACK at each sync call`, async () => {
         if (destination === "DLQ") fillInbox();
         const inbox = getInbox("local");
         spyOn(console, "error").mockImplementation(() => {});
@@ -857,7 +909,7 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
-    test("DLQ record is removed after receipt failure and written on redelivery", async () => {
+    testCase("DLQ record is removed after receipt failure and written on redelivery", async () => {
       fillInbox();
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "DLQ retry", SEEDS)));
       const inbox = getInbox("local");
@@ -876,7 +928,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(drainOutbox(false)).toEqual([]);
     });
 
-    test("an invalid recipient is dead-lettered to the host-level dlq and acknowledged", async () => {
+    testCase("an invalid recipient is dead-lettered to the host-level dlq and acknowledged", async () => {
       queueOutboxMessage("bad.recipient", "nowhere", "remote");
       spyOn(console, "error").mockImplementation(() => {});
       await start();
@@ -890,7 +942,7 @@ for (const entry of ["sync", "connect"] as const) {
       expect(fs.existsSync(join(process.env.TPS_MAIL_DIR!, "bad.recipient"))).toBe(false);
     });
 
-    test("with room the entry point writes the inbox and acknowledges the source", async () => {
+    testCase("with room the entry point writes the inbox and acknowledges the source", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "hello", SEEDS)));
       await start();
       await emit();
@@ -901,7 +953,7 @@ for (const entry of ["sync", "connect"] as const) {
     });
 
     for (const shape of ["uuid", "64-hex"] as const) {
-      test(`a ${shape} delivery id produces one inbox record, one ACK and an empty outbox`, async () => {
+      testCase(`a ${shape} delivery id produces one inbox record, one ACK and an empty outbox`, async () => {
         const env = buildSignedEnvelope("remote", "local", `${shape} delivery`, SEEDS);
         const id = shape === "64-hex" ? "ab".repeat(32) : queue(JSON.stringify(env)).id;
         if (shape === "64-hex") queueOutboxMessage("local", JSON.stringify(env), "remote", id);
@@ -919,7 +971,7 @@ for (const entry of ["sync", "connect"] as const) {
         expect(acks.length).toBe(2);
       });
 
-      test(`the same ${shape} delivery id from two branches is delivered for each`, async () => {
+      testCase(`the same ${shape} delivery id from two branches is delivered for each`, async () => {
         const kp = generateKeyPair();
         registerBranch("remote-b", kp.signing.publicKey, undefined, kp.encryption.publicKey);
         const dirB = join(root, ".tps", "branch-office", "remote-b");
@@ -946,7 +998,7 @@ for (const entry of ["sync", "connect"] as const) {
       });
     }
 
-    test("a malformed delivery id is refused and logged without the payload", async () => {
+    testCase("a malformed delivery id is refused and logged without the payload", async () => {
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
       const malformed = ["not-a-delivery-id", "AB".repeat(32), "ab".repeat(32) + "a"];
@@ -964,7 +1016,7 @@ for (const entry of ["sync", "connect"] as const) {
       for (const id of malformed) expect(logs).not.toContain(id);
     });
 
-    test("a UUID with a matching record and an unscoped marker reuses the record", async () => {
+    testCase("a UUID with a matching record and an unscoped marker reuses the record", async () => {
       const body = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "accepted before upgrade", SEEDS)));
       sendMessage(body.to, body.content, body.from, { branchId: "remote", id: body.id }, body.timestamp);
       const legacy = join(process.env.TPS_MAIL_DIR!, ".relay-accepted");
