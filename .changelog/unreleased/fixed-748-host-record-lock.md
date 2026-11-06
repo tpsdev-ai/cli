@@ -9,8 +9,8 @@
   is kept and `stop()` rejects with its path. Stalled closes are not detected: the transports resolve after
   their own timeout (cli#774). Inbound host-record update failures report the record path and that message
   handling continues. Lock release is best effort: lock-directory removal errors are ignored, and the next
-  acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps unreadable or invalid records
-  and reports their path, instructing the operator to inspect the record and remove it if no connector
+  acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps records classified as unreadable or invalid
+  by the locked read and reports their path, instructing the operator to inspect the record and remove it if no connector
   for that host is running. Other removal failures except a missing file are rethrown.
   `tps office connect` awaits `stop()` on SIGINT and exits 1 if it rejects, reporting the failed disconnect.
   On SIGTERM the process exits without that cleanup; `office kill` sends it and attempts record removal after confirming exit.

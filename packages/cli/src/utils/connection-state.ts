@@ -189,8 +189,7 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
-/** A record that is present but unreadable or invalid is left in place and reported,
- *  because its owner cannot be verified. */
+/** Records classified as unreadable or invalid by the locked read are kept and reported. */
 export function clearHostState(branch: string): void {
   mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
   const path = hostStatePath(branch);
