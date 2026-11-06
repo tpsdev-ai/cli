@@ -45,7 +45,7 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000, stepMs = 5): Promi
  * handler. Bounded waits only; the runtime's loop keeps running after the signal
  * (bun ends the file) and the signal listeners this run added are removed.
  */
-async function driveRuntime(signal: "SIGTERM" | "SIGINT") {
+async function driveRuntime(signal: "SIGTERM" | "SIGINT", afterShutdown?: (http: string[]) => Promise<void>) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
   const workspace = join(dir, "workspace");
   mkdirSync(workspace, { recursive: true });
@@ -100,6 +100,7 @@ async function driveRuntime(signal: "SIGTERM" | "SIGINT") {
     process.emit(signal);
     await waitFor(() => exitCode !== undefined, 5000); // signal handler ran
     await waitFor(() => presenceBodies.some((b) => b.includes("idle")), 5000);
+    if (afterShutdown) await afterShutdown(http);
   } finally {
     patchShared(globalThis, "fetch", savedFetch);
     patchShared(process, "exit", savedExit);
@@ -403,6 +404,25 @@ describe("codex runtime presence (cli#444)", () => {
       expect(r.http.some((c) => /^(PATCH|PUT) \/Agent\/testbot$/.test(c))).toBe(false);
     },
     20_000,
+  );
+
+  it(
+    "runCodexRuntime stops the task loop on SIGTERM: no catch-up request after the shutdown handler runs",
+    async () => {
+      let catchUpsAtExit = 0;
+      const r = await driveRuntime("SIGTERM", async (http) => {
+        const catchUps = () => http.filter((c) => c.startsWith("GET /OrgEventCatchup")).length;
+        catchUpsAtExit = catchUps();
+        expect(catchUpsAtExit, "the task loop polled before shutdown").toBeGreaterThanOrEqual(1);
+        // Longer than the task loop's poll interval, so a stopped loop issues
+        // no further read while a running one would.
+        await sleep(11_000);
+        expect(catchUps(), "no catch-up request after shutdown").toBe(catchUpsAtExit);
+      });
+      expect(r.rejected).toBeUndefined();
+      expect(r.exitCode, "the SIGTERM handler exited").toBe(0);
+    },
+    40_000,
   );
 
   it(
