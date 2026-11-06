@@ -295,6 +295,23 @@ describe("cli#757 — recording the runtime", () => {
     expect(readFileSync(configPath)).toEqual(before);
   }, 20000);
 
+  test("create validates --runtime before refusing an existing config", async () => {
+    const agent = "create-invalid-existing";
+    const args = ["agent", "create", "--id", agent, "--runtime", "bogus"];
+    const withoutConfig = await runTps(args);
+    expect(withoutConfig.status).toBe(1);
+    expect(withoutConfig.stderr).toContain("only 'openclaw' and 'native' are accepted");
+
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const withConfig = await runTps(args);
+    expect(withConfig.status).toBe(1);
+    expect(withConfig.stderr).toBe(withoutConfig.stderr);
+    expect(withConfig.stderr).not.toContain("Config already exists");
+    expect(withConfig.stderr).not.toContain("tps agent set-runtime");
+    expect(readFileSync(configPath)).toEqual(before);
+  }, 20000);
+
   test("a fresh unflagged create records native", async () => {
     const agent = "create-default";
     expect((await runTps(["agent", "create", "--id", agent])).status).toBe(0);
@@ -653,6 +670,97 @@ syncBuiltinESMExports();
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
 
+  test("set-runtime creates the temporary file owner-only and sets ownership before the final mode", async () => {
+    const agent = "runtime-order";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    chmodSync(configPath, 0o644);
+    const eventsPath = join(home, "fs-events.json");
+    const preload = join(home, "order.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const configPath = ${JSON.stringify(configPath)};
+const eventsPath = ${JSON.stringify(eventsPath)};
+const write = fs.writeFileSync;
+const chown = fs.chownSync;
+const chmod = fs.chmodSync;
+const read = fs.readFileSync;
+const rename = fs.renameSync;
+const events = [];
+const isTemp = (path) => typeof path === "string" && path.includes(".agent-runtime-") && path.endsWith(".tmp");
+const record = (event) => {
+  events.push(event);
+  write(eventsPath, JSON.stringify(events), "utf-8");
+};
+fs.writeFileSync = (path, data, options) => {
+  if (isTemp(path)) record({ op: "write", mode: typeof options === "object" && options !== null ? options.mode : undefined });
+  return write(path, data, options);
+};
+fs.chownSync = (path, uid, gid) => {
+  if (isTemp(path)) record({ op: "chown", uid, gid });
+  return chown(path, uid, gid);
+};
+fs.chmodSync = (path, mode) => {
+  if (isTemp(path)) record({ op: "chmod", mode });
+  return chmod(path, mode);
+};
+fs.readFileSync = (path, ...args) => {
+  if (isTemp(path)) record({ op: "read" });
+  return read(path, ...args);
+};
+fs.renameSync = (from, to) => {
+  if (isTemp(from) && to === configPath) record({ op: "rename" });
+  return rename(from, to);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(0);
+    const events = JSON.parse(readFileSync(eventsPath, "utf-8")) as Array<{ op: string; mode?: number }>;
+    expect(events.map((event) => event.op)).toEqual(["write", "chown", "chmod", "read", "rename"]);
+    expect(events[0].mode).toBe(0o600);
+    expect(events[2].mode).toBe(0o644);
+    expect(statSync(configPath).mode & 0o777).toBe(0o644);
+  }, 20000);
+
+  test("set-runtime refuses a temporary file whose bytes changed before the rename", async () => {
+    const agent = "runtime-tampered";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const eventsPath = join(home, "rename-events.json");
+    const preload = join(home, "tamper-temp.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const configPath = ${JSON.stringify(configPath)};
+const eventsPath = ${JSON.stringify(eventsPath)};
+const chmod = fs.chmodSync;
+const write = fs.writeFileSync;
+const rename = fs.renameSync;
+const renames = [];
+const isTemp = (path) => typeof path === "string" && path.includes(".agent-runtime-") && path.endsWith(".tmp");
+fs.chmodSync = (path, mode) => {
+  chmod(path, mode);
+  if (isTemp(path)) write(path, "runtime: tampered\\n", "utf-8");
+};
+fs.renameSync = (from, to) => {
+  if (isTemp(from) && to === configPath) {
+    renames.push(to);
+    write(eventsPath, JSON.stringify(renames), "utf-8");
+  }
+  return rename(from, to);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Temporary config does not match the expected content");
+    expect(result.stdout).not.toContain("runtime recorded as");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(existsSync(eventsPath)).toBe(false);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
   test("set-runtime refuses bytes changed before its pre-rename read", async () => {
     const agent = "runtime-concurrent";
     const configPath = writeAgentConfig(agent, "openclaw");
@@ -673,6 +781,41 @@ syncBuiltinESMExports();
     expect(result.stderr).toContain("Config changed since it was read");
     expect(readFileSync(configPath, "utf-8")).toBe(newer);
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  test("set-runtime warns once when only the group of another owner's config can be kept", async () => {
+    const agent = "runtime-owner-warning";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const preload = join(home, "other-owner.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const configPath = ${JSON.stringify(configPath)};
+const lstat = fs.lstatSync;
+const chown = fs.chownSync;
+let ownershipCalls = 0;
+const isTemp = (path) => typeof path === "string" && path.includes(".agent-runtime-") && path.endsWith(".tmp");
+fs.lstatSync = (path, ...args) => {
+  const stat = lstat(path, ...args);
+  if (path === configPath && stat.isFile()) {
+    return { mode: stat.mode, uid: stat.uid + 1, gid: stat.gid, isFile: () => true };
+  }
+  return stat;
+};
+fs.chownSync = (path, uid, gid) => {
+  if (isTemp(path)) {
+    ownershipCalls++;
+    if (ownershipCalls === 1) throw Object.assign(new Error("injected owner refusal"), { code: "EPERM" });
+  }
+  return chown(path, uid, gid);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(0);
+    const warnings = result.stderr.split("\n").filter((line) => line.includes(configPath) && /owner/.test(line));
+    expect(warnings).toHaveLength(1);
+    expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
   }, 20000);
 
   test("set-runtime inserts an absent field in a plain mapping", async () => {

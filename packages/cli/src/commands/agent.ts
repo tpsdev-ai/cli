@@ -164,16 +164,17 @@ interface ConfigOwnership {
   gid: number;
 }
 
-function writeRuntimeConfig(configPath: string, contents: string | Buffer, original: ConfigOwnership, expected: Buffer): void {
+function writeRuntimeConfig(
+  configPath: string,
+  contents: string | Buffer,
+  original: ConfigOwnership,
+  expected: Buffer,
+  onOwnershipChange?: () => void,
+): void {
   const temporary = join(dirname(configPath), `.agent-runtime-${randomUUID()}.tmp`);
   const permissions = original.mode & 0o777;
   try {
-    writeFileSync(temporary, contents, { flag: "wx", mode: permissions });
-    try {
-      chmodSync(temporary, permissions);
-    } catch (e) {
-      throw new Error(`Cannot set permissions on ${temporary}: ${e instanceof Error ? e.message : String(e)}`);
-    }
+    writeFileSync(temporary, contents, { flag: "wx", mode: 0o600 });
     try {
       chownSync(temporary, original.uid, original.gid);
     } catch (first) {
@@ -189,13 +190,27 @@ function writeRuntimeConfig(configPath: string, contents: string | Buffer, origi
       } catch {
         throw failure;
       }
+      if (typeof process.getuid === "function" && original.uid !== process.getuid()) onOwnershipChange?.();
+    }
+    try {
+      chmodSync(temporary, permissions);
+    } catch (e) {
+      throw new Error(`Cannot set permissions on ${temporary}: ${e instanceof Error ? e.message : String(e)}`);
     }
     if (!readFileSync(configPath).equals(expected)) {
       throw new Error("Config changed since it was read; leaving it unchanged.");
     }
+    const expectedContents = Buffer.isBuffer(contents) ? contents : Buffer.from(contents, "utf-8");
+    if (!readFileSync(temporary).equals(expectedContents)) {
+      throw new Error("Temporary config does not match the expected content; leaving it unchanged.");
+    }
     renameSync(temporary, configPath);
   } finally {
-    rmSync(temporary, { force: true });
+    try {
+      rmSync(temporary, { force: true });
+    } catch {
+      // The refusal stands even when the temporary file cannot be removed.
+    }
   }
 }
 
@@ -574,15 +589,15 @@ async function createAgent(args: AgentArgs): Promise<void> {
   const flairUrl = args.flairUrl ?? process.env.FLAIR_URL ?? "http://127.0.0.1:9926";
   const configPath = join(homedir(), ".tps", "agents", id, "agent.yaml");
   const configExists = existsSync(configPath);
-  if (configExists && args.runtime !== undefined) {
-    console.error(`❌ Config already exists at ${configPath}. Run: tps agent set-runtime --id ${id} --runtime ${args.runtime}`);
-    process.exit(1);
-  }
   const requestedRuntime = args.runtime ?? (configExists ? undefined : "native");
   const runtime = requestedRuntime === undefined ? undefined : parseRecordedRuntime(requestedRuntime);
   if (requestedRuntime !== undefined && !runtime) {
     console.error(`❌ Refusing runtime '${requestedRuntime}': only 'openclaw' and 'native' are accepted.`);
     console.error(`   Run: tps agent create --id ${id} --runtime <openclaw|native>`);
+    process.exit(1);
+  }
+  if (configExists && args.runtime !== undefined) {
+    console.error(`❌ Config already exists at ${configPath}. Run: tps agent set-runtime --id ${id} --runtime ${args.runtime}`);
     process.exit(1);
   }
   const identityDir = join(homedir(), ".tps", "identity");
@@ -880,9 +895,15 @@ function setAgentRuntime(args: AgentArgs): void {
     console.error(`❌ Cannot update ${configPath}: ${e instanceof Error ? e.message : String(e)} Edit the file by hand.`);
     process.exit(1);
   }
+  let ownershipWarned = false;
+  const warnOwnershipChange = (): void => {
+    if (ownershipWarned) return;
+    ownershipWarned = true;
+    console.error(`⚠️ Cannot preserve the owner of ${configPath}; kept its group only. The file will be owned by the running user.`);
+  };
   let written = false;
   try {
-    writeRuntimeConfig(configPath, updated, ownership, original);
+    writeRuntimeConfig(configPath, updated, ownership, original, warnOwnershipChange);
     written = true;
     const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
     if (parsed?.runtime !== runtime) throw new Error("Runtime verification failed; edit the file by hand.");
@@ -891,7 +912,7 @@ function setAgentRuntime(args: AgentArgs): void {
       try {
         const writtenBytes = Buffer.from(updated, "utf-8");
         if (readFileSync(configPath).equals(writtenBytes)) {
-          writeRuntimeConfig(configPath, original, ownership, writtenBytes);
+          writeRuntimeConfig(configPath, original, ownership, writtenBytes, warnOwnershipChange);
         } else {
           console.error(`❌ Config changed after writing ${configPath}; leaving it unchanged.`);
         }
