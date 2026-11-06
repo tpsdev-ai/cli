@@ -30,8 +30,6 @@ npm install -g @tpsdev-ai/cli
 | `tps mail check` | Check for incoming mail |
 | `tps secrets set/get` | Encrypted vault for API keys and credentials |
 
-`tps init`, `tps agent create` and `set-runtime` write the bare runtime form.
-
 ## Architecture
 
 TPS treats AI agents like employees in an organization:

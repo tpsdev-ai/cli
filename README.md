@@ -176,10 +176,7 @@ A relative `workspace` resolves against the directory containing the config
 file; an absolute workspace remains absolute and is normalized. Heartbeat skips
 the OpenClaw gateway probe only when `runtime` parses as `native` and has a single
 top-level plain `runtime: native` line, with optional trailing spaces, tabs or a
-`#` comment; every other form is probed. `tps init`, `tps agent create` and
-`set-runtime` write the bare form. The agent config loader ignores
-`runtime`; `tps agent start`
-selects its runtime separately (`--runtime claude-code|codex|gemini`). Set it with
+`#` comment; every other form is probed. Set it with
 `tps agent set-runtime --id <id> --runtime <openclaw|native>`. `repo` is used
 when `workspace` is absent. `${NAME}` references (a name of upper-case letters,
 digits and underscores) in `workspace` and `repo` are expanded, including for a
