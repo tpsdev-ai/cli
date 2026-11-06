@@ -6,10 +6,10 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, symlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { hostStatePath, writeHostState } from "../src/utils/connection-state.js";
@@ -731,6 +731,39 @@ describe("branch pid record ownership (cli#730)", () => {
 
     process.kill(running.pid, "SIGTERM");
     await waitForPidGone(running.pid);
+  }, 40_000);
+
+  test("a matching token with a pause dir outside TPS_TEST_ROOT is ignored", async () => {
+    const port = await freePort();
+    prepareBranch(port);
+    const outsideBase = dirname(realpathSync(process.env.TPS_TEST_ROOT!));
+    const outside = mkdtempSync(join(outsideBase, "tps-branch-730-outside-"));
+    try {
+      const env = launcherEnv("unused");
+      delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
+      env.TPS_BRANCH_TEST_PAUSE_DIR = outside;
+      const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
+        env,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      children.push(launcher);
+      let stdout = "";
+      launcher.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+
+      expect(await waitForExit(launcher)).toEqual({ code: 0, signal: null });
+      expect(stdout).toContain("Branch daemon spawned");
+      const running = await waitForRunningRecord();
+      daemons.push(running);
+      await waitForLogStarted();
+      expect(readdirSync(outside)).toEqual([]);
+
+      process.kill(running.pid, "SIGTERM");
+      await waitForPidGone(running.pid);
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
   }, 40_000);
 
   test("a registered daemon whose start token changed is reported and not signalled", async () => {
