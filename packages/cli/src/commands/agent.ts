@@ -177,15 +177,17 @@ function writeRuntimeConfig(configPath: string, contents: string | Buffer, origi
     try {
       chownSync(temporary, original.uid, original.gid);
     } catch (first) {
-      // A non-root process cannot take ownership for another user, but it can
-      // usually keep the original group when it belongs to that group.
+      const code = (first as NodeJS.ErrnoException).code;
+      const failure = new Error(
+        `Cannot preserve the owner and group of ${temporary} (uid ${original.uid}, gid ${original.gid}, code ${code ?? "unknown"}): ` +
+        (first instanceof Error ? first.message : String(first)),
+      );
+      if (code !== "EPERM" && code !== "EACCES") throw failure;
+      // An ordinary unprivileged process cannot take ownership for another user.
       try {
         chownSync(temporary, -1, original.gid);
       } catch {
-        throw new Error(
-          `Cannot preserve the owner and group of ${temporary} (uid ${original.uid}, gid ${original.gid}): ` +
-          (first instanceof Error ? first.message : String(first)),
-        );
+        throw failure;
       }
     }
     if (!readFileSync(configPath).equals(expected)) {

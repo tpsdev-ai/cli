@@ -454,6 +454,71 @@ syncBuiltinESMExports();
     }, 20000);
   }
 
+  test("set-runtime refuses EIO without a group-only retry", async () => {
+    const agent = "runtime-chown-eio";
+    const configPath = writeAgentConfig(agent, "openclaw");
+    const before = readFileSync(configPath);
+    const callsPath = join(home, "chown-calls.json");
+    const preload = join(home, "chown-eio.mjs");
+    writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const chown = fs.chownSync;
+const calls = [];
+fs.chownSync = (...args) => {
+  calls.push(args);
+  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));
+  if (calls.length === 1) throw Object.assign(new Error("injected ownership failure"), { code: "EIO" });
+  return chown(...args);
+};
+syncBuiltinESMExports();
+`);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("EIO");
+    const calls = JSON.parse(readFileSync(callsPath, "utf-8")) as [string, number, number][];
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1]).toBe(statSync(configPath).uid);
+    expect(calls[0][2]).toBe(statSync(configPath).gid);
+    expect(result.stderr).toContain(calls[0][0]);
+    expect(existsSync(calls[0][0])).toBe(false);
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+  }, 20000);
+
+  for (const code of ["EPERM", "EACCES"]) {
+    test(`set-runtime retries group-only after ${code}`, async () => {
+      const agent = `runtime-chown-${code.toLowerCase()}`;
+      const configPath = writeAgentConfig(agent, "openclaw");
+      const original = statSync(configPath);
+      const callsPath = join(home, "chown-calls.json");
+      const preload = join(home, "chown-permission.mjs");
+      writeFileSync(preload, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const chown = fs.chownSync;
+const calls = [];
+fs.chownSync = (...args) => {
+  calls.push(args);
+  fs.writeFileSync(${JSON.stringify(callsPath)}, JSON.stringify(calls));
+  if (calls.length === 1) throw Object.assign(new Error("injected permission refusal"), { code: ${JSON.stringify(code)} });
+  return chown(...args);
+};
+syncBuiltinESMExports();
+`);
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
+      expect(result.status).toBe(0);
+      const calls = JSON.parse(readFileSync(callsPath, "utf-8")) as [string, number, number][];
+      expect(calls).toEqual([
+        [calls[0][0], original.uid, original.gid],
+        [calls[0][0], -1, original.gid],
+      ]);
+      expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
+      expect(statSync(configPath).gid).toBe(original.gid);
+      expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+    }, 20000);
+  }
+
   test("set-runtime refuses the write when both ownership attempts fail", async () => {
     const agent = "runtime-chown";
     const configPath = writeAgentConfig(agent, "openclaw");
@@ -462,12 +527,18 @@ syncBuiltinESMExports();
     writeFileSync(preload, `
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-fs.chownSync = () => { throw new Error("injected chown failure"); };
+let attempts = 0;
+fs.chownSync = () => {
+  attempts++;
+  fs.writeFileSync(${JSON.stringify(join(home, "chown-attempts"))}, String(attempts));
+  throw Object.assign(new Error("injected chown failure"), { code: "EPERM" });
+};
 syncBuiltinESMExports();
 `);
     const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"], {}, preload);
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("injected chown failure");
+    expect(readFileSync(join(home, "chown-attempts"), "utf-8")).toBe("2");
     expect(readFileSync(configPath)).toEqual(before);
     expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
   }, 20000);
