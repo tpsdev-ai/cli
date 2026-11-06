@@ -62,6 +62,18 @@ function testCase(name: string, fn: () => void | Promise<void>): void {
   test(name, fn, CASE_TIMEOUT_MS);
 }
 
+/**
+ * Process-state ownership. A hook that exceeds its deadline keeps running, so
+ * a pending cleanup can settle while a later case is already running. Each
+ * case takes ownership at the top of its beforeEach; the next beforeEach, and
+ * afterAll, take it back. A late finally restores only while its own case
+ * still holds it.
+ */
+let processOwner = 0;
+let caseOwner = 0;
+/** Set by the cleanup-latency case so only its afterEach outlasts the hook. */
+let slowCleanupMs = 0;
+
 for (const entry of ["sync", "connect"] as const) {
   describe(`${entry} relayed local delivery retention`, () => {
     let root: string;
@@ -75,6 +87,7 @@ for (const entry of ["sync", "connect"] as const) {
     let branchChannel: TransportChannel;
 
     beforeEach(async () => {
+      caseOwner = ++processOwner;
       restoreEnv();
       restoreSignalListeners();
       mock.restore();
@@ -141,22 +154,30 @@ for (const entry of ["sync", "connect"] as const) {
     // so it targets this case's tree. The environment is restored at the top of
     // the next beforeEach, before any await, and in afterAll: a case that times
     // out, or an afterEach that then exceeds its own timeout, must not leave
-    // this file's environment or listeners for the next case or test file.
+    // this file's environment or listeners for the next case or test file. A
+    // late finally restores only while this case still owns process state.
     afterEach(async () => {
+      const owner = caseOwner;
+      const slow = slowCleanupMs;
+      slowCleanupMs = 0;
+      const marker = process.env.TPS_RELAY_LOSS_CLEANUP_MARKER;
+      if (marker) fs.appendFileSync(marker, `${entry}\n`);
       restoreSignalListeners();
       mock.restore();
       try {
         if (stop) await stop();
         if (completion) await completion;
         if (entry === "connect") await Bun.sleep(1100);
+        if (slow > 0) await Bun.sleep(slow);
       } finally {
-        restoreEnv();
+        if (processOwner === owner) restoreEnv();
         fs.rmSync(root, { recursive: true, force: true });
         roots.delete(root);
       }
     });
 
     afterAll(() => {
+      processOwner++;
       restoreEnv();
       restoreSignalListeners();
       mock.restore();
@@ -1020,6 +1041,23 @@ for (const entry of ["sync", "connect"] as const) {
       const logs = errors.mock.calls.flat().map(String).join("\n");
       expect(logs).not.toContain("payload-text");
       for (const id of malformed) expect(logs).not.toContain(id);
+    });
+
+    testCase("a cleanup that outlasts its hook deadline", async () => {
+      const raw = Number(process.env.TPS_RELAY_LOSS_SLOW_CLEANUP_MS);
+      if (Number.isFinite(raw) && raw > 0) slowCleanupMs = raw;
+    });
+
+    testCase("environment stays with the case while the previous cleanup settles", async () => {
+      const ownHome = process.env.HOME;
+      const ownMail = process.env.TPS_MAIL_DIR;
+      expect(ownHome).toBe(root);
+      expect(ownHome).not.toBe(FILE_ENV.HOME);
+      const slow = Number(process.env.TPS_RELAY_LOSS_SLOW_CLEANUP_MS);
+      if (Number.isFinite(slow) && slow > 0) await Bun.sleep(slow + 300);
+      expect(process.env.HOME).toBe(ownHome);
+      expect(process.env.TPS_MAIL_DIR).toBe(ownMail);
+      expect(process.env.TPS_ROOT).toBe(ownHome);
     });
 
     testCase("a UUID with a matching record and an unscoped marker reuses the record", async () => {
