@@ -320,6 +320,59 @@ describe("cli#757 — recording the runtime", () => {
     expect(existsSync(join(home, ".tps"))).toBe(false);
   }, 20000);
 
+  for (const action of ["create", "set-runtime"]) {
+    for (const args of [
+      ["--runtime"],
+      ["--runtime", "--name", "Ignored"],
+      ["--runtime", "-x"],
+      ["--runtime="],
+      ["--runtime", "native", "--runtime"],
+      ["--runtime", "native", "--runtime", "--name", "Ignored"],
+      ["--runtime", "native", "--runtime", "openclaw"],
+      ["--runtime=native", "--runtime=openclaw"],
+      ["--runtime=native", "--runtime", "openclaw"],
+      ["--runtime", "native", "--runtime="],
+      ["--runtime=", "--runtime", "native"],
+    ]) {
+      test(`${action} refuses ${args.join(" ")} before writing`, async () => {
+        const agent = "runtime-argv";
+        const occurrences = args.filter((arg) => arg === "--runtime" || arg.startsWith("--runtime="));
+        const missingValue = args.some((arg, index) => arg === "--runtime=" ||
+          (arg === "--runtime" && (!args[index + 1] || args[index + 1].startsWith("-"))));
+        const refuse = async () => {
+          const result = await runTps(["agent", action, "--id", agent, ...args]);
+          expect(result.status).toBe(1);
+          expect(result.stderr).toContain("only 'openclaw' and 'native' are accepted");
+          expect(result.stderr).toContain(`Run: tps agent ${action} --id <agent-id> --runtime <openclaw|native>`);
+          if (missingValue) expect(result.stderr).toContain("requires a value");
+          if (occurrences.length > 1) expect(result.stderr).toContain("give --runtime once");
+        };
+        if (action === "create") {
+          await refuse();
+          expect(existsSync(join(home, ".tps"))).toBe(false);
+        }
+        const configPath = writeAgentConfig(agent, "openclaw");
+        const before = readFileSync(configPath);
+        const inode = statSync(configPath).ino;
+        await refuse();
+        expect(readFileSync(configPath)).toEqual(before);
+        expect(statSync(configPath).ino).toBe(inode);
+        expect(readdirSync(join(configPath, ".."))).toEqual(["agent.yaml"]);
+      }, 20000);
+    }
+
+    for (const args of [["--runtime=native"], ["--runtime", "native"]]) {
+      test(`${action} accepts ${args.join(" ")}`, async () => {
+        const agent = "runtime-valid";
+        if (action === "set-runtime") writeAgentConfig(agent, "openclaw");
+        const result = await runTps(["agent", action, "--id", agent, ...args]);
+        expect(result.status).toBe(0);
+        const configPath = join(home, ".tps", "agents", agent, "agent.yaml");
+        expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("native");
+      }, 20000);
+    }
+  }
+
   test("tps init records the native runtime", async () => {
     const agent = "agent-init";
     const result = await runTps(["init", "--id", agent]);

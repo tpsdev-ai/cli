@@ -252,7 +252,7 @@ function parseCliArgs(argv) {
       `InvalidSecretsGuardMode: ${guardFlagsBeforeCommand[0]} before the secrets-guard subcommand; put the guard flag after the subcommand`
     );
   }
-  return { requested, versionRequested, argv: parsed, guardMode: { check, noGuard } };
+  return { requested, versionRequested, argv: parsed, positionals, guardMode: { check, noGuard } };
 }
 
 
