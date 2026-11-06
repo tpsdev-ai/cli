@@ -19,6 +19,101 @@ afterEach(() => {
   mock.restore();
 });
 
+const watchMailFsyncs = (mailRoot: string, onDeliverySync?: (index: number) => void) => {
+  const inMailRoot = (path: string) => path === mailRoot || path.startsWith(`${mailRoot}${sep}`);
+  const all: string[] = [];
+  const delivery: string[] = [];
+  const openPaths = new Map<number, string>();
+  const open = fs.openSync as (path: string, flags: string, mode?: number) => number;
+  const sync = fs.fsyncSync;
+  const closeSync = fs.closeSync;
+  const close = fs.close;
+  const openHandle = fs.promises.open;
+  const handleCloseSpies: Array<{ mockRestore(): void }> = [];
+  let watching = true;
+  const openSpy = spyOn(fs, "openSync").mockImplementation(((path: string, flags: string, mode?: number) => {
+    const fd = open(path, flags, mode);
+    openPaths.set(fd, path);
+    return fd;
+  }) as typeof fs.openSync);
+  const closeSyncSpy = spyOn(fs, "closeSync").mockImplementation((fd) => {
+    openPaths.delete(fd);
+    return closeSync(fd);
+  });
+  const closeSpy = spyOn(fs, "close").mockImplementation((fd, callback) => {
+    openPaths.delete(fd);
+    return close(fd, callback);
+  });
+  const openHandleSpy = spyOn(fs.promises, "open").mockImplementation(async (...args) => {
+    const handle = await openHandle(...args);
+    if (!watching) return handle;
+    const closeHandle = handle.close.bind(handle);
+    handleCloseSpies.push(spyOn(handle, "close").mockImplementation(() => {
+      openPaths.delete(handle.fd);
+      return closeHandle();
+    }));
+    return handle;
+  });
+  const syncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
+    let path = openPaths.get(fd);
+    if (path === undefined) {
+      try { path = fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { path = `<unknown fd ${fd}>`; }
+    }
+    all.push(path);
+    if (inMailRoot(path)) {
+      delivery.push(path);
+      onDeliverySync?.(delivery.length - 1);
+    }
+    return sync(fd);
+  });
+  return {
+    all,
+    delivery,
+    restore() {
+      watching = false;
+      syncSpy.mockRestore();
+      for (const spy of handleCloseSpies) spy.mockRestore();
+      openHandleSpy.mockRestore();
+      closeSpy.mockRestore();
+      closeSyncSpy.mockRestore();
+      openSpy.mockRestore();
+    },
+  };
+};
+
+for (const closeMode of ["sync", "callback"] as const) {
+  test(`fsync watcher excludes an async foreign open after ${closeMode} close reuses a tracked fd`, async () => {
+    const root = fs.mkdtempSync(join(tmpdir(), "tps-fsync-reuse-"));
+    const mailRoot = join(root, "mail");
+    fs.mkdirSync(mailRoot);
+    const inside = join(mailRoot, "inside");
+    const outside = join(root, "outside");
+    fs.writeFileSync(inside, "inside");
+    fs.writeFileSync(outside, "outside");
+    const indexes: number[] = [];
+    const watch = watchMailFsyncs(mailRoot, (index) => {
+      indexes.push(index);
+      throw new Error("injected delivery fsync failure");
+    });
+    try {
+      const fd = fs.openSync(inside, "r");
+      if (closeMode === "sync") fs.closeSync(fd);
+      else await new Promise<void>((resolve, reject) => fs.close(fd, (error) => error ? reject(error) : resolve()));
+      const foreign = await fs.promises.open(outside, "r");
+      try {
+        expect(foreign.fd).toBe(fd);
+        expect(() => fs.fsyncSync(foreign.fd)).not.toThrow();
+        expect(watch.delivery).toEqual([]);
+        expect(indexes).toEqual([]);
+        expect(watch.all).toHaveLength(1);
+      } finally { await foreign.close(); }
+    } finally {
+      watch.restore();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 5000);
+}
+
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
 for (const entry of ["sync", "connect"] as const) {
@@ -810,41 +905,7 @@ for (const entry of ["sync", "connect"] as const) {
         }
         const mailRoot = resolve(process.env.TPS_MAIL_DIR!);
         const inMailRoot = (path: string) => path === mailRoot || path.startsWith(`${mailRoot}${sep}`);
-        // The fsync spy is process-wide: other in-process work that syncs during a
-        // delivery is counted too. Record every fsync's PATH (an fsync reports only
-        // a descriptor, so openSync maps it; /proc covers a descriptor this watch
-        // did not open) and assert the path sequence of the ones under this case's
-        // mail root. `onDeliverySync` receives the index of a mail-root fsync, so
-        // fault injection targets a delivery's own syncs and not a foreign one.
-        const watchMailFsyncs = (onDeliverySync?: (index: number) => void) => {
-          const all: string[] = [];
-          const delivery: string[] = [];
-          const openPaths = new Map<number, string>();
-          const open = fs.openSync as (path: string, flags: string, mode?: number) => number;
-          const sync = fs.fsyncSync;
-          const openSpy = spyOn(fs, "openSync").mockImplementation(((path: string, flags: string, mode?: number) => {
-            const fd = open(path, flags, mode);
-            openPaths.set(fd, path);
-            return fd;
-          }) as typeof fs.openSync);
-          const syncSpy = spyOn(fs, "fsyncSync").mockImplementation((fd: number) => {
-            let path = openPaths.get(fd);
-            if (path === undefined) {
-              try { path = fs.readlinkSync(`/proc/self/fd/${fd}`); } catch { path = `<unknown fd ${fd}>`; }
-            }
-            all.push(path);
-            if (inMailRoot(path)) {
-              delivery.push(path);
-              onDeliverySync?.(delivery.length - 1);
-            }
-            return sync(fd);
-          });
-          return {
-            all,
-            delivery,
-            restore() { syncSpy.mockRestore(); openSpy.mockRestore(); },
-          };
-        };
+        // Resolve fsync paths best-effort; index faults by paths under this mail root.
         // recordAcceptance creates the UTC-day receipt bucket on a branch's first
         // delivery of the day, and mkdirMailDirectory then fsyncs the new bucket's
         // parent; a delivery that finds the bucket already there makes one fewer
@@ -864,7 +925,7 @@ for (const entry of ["sync", "connect"] as const) {
         const warmed = queue(JSON.stringify(buildSignedEnvelope("remote", "local", "warmed sync trace", SEEDS)));
         const record = relayRecordFileName("remote", warmed.id);
         const acceptedBranch = join(mailRoot, ".relay-accepted", "by-branch", "remote");
-        const warmup = watchMailFsyncs();
+        const warmup = watchMailFsyncs(mailRoot);
         try {
           await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 1, ts: new Date().toISOString(), body: initial });
         } finally { warmup.restore(); }
@@ -889,7 +950,7 @@ for (const entry of ["sync", "connect"] as const) {
             `${receipt}.tmp`,
             bucket,
           ]).map((path) => relative(mailRoot, path));
-        const capture = watchMailFsyncs();
+        const capture = watchMailFsyncs(mailRoot);
         try {
           await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body: warmed });
         } finally { capture.restore(); }
@@ -905,7 +966,7 @@ for (const entry of ["sync", "connect"] as const) {
           const beforeAcks = acks.length;
           const beforeRecords = jsonFiles(inbox.fresh).length + jsonFiles(inbox.dlq).length;
           removeReceiptBucket();
-          const fault = watchMailFsyncs((index) => {
+          const fault = watchMailFsyncs(mailRoot, (index) => {
             if (index + 1 === step) throw new Error(`injected fsync failure ${step}`);
           });
           try { await deliverDirect(msg); } finally { fault.restore(); }

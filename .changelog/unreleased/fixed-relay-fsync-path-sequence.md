@@ -1,1 +1,1 @@
-- **The relay fsync test asserts a path sequence, not a process-wide count.** An fsync from unrelated in-process work no longer fails it.
+- **The relay fsync test asserts a path sequence, not a process-wide count.**
