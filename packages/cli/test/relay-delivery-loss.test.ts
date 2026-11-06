@@ -22,8 +22,8 @@ afterEach(() => {
 const SEEDS = { remote: Buffer.alloc(32, 0x11), local: Buffer.alloc(32, 0x22) };
 
 /**
- * Each sync case pays syncRemoteBranch's fixed 3000 ms delivery window
- * (src/utils/relay.ts) because its cleanup awaits the sync promise. That wait
+ * Cases that call syncRemoteBranch pay its fixed 3000 ms delivery window
+ * (src/utils/relay.ts) because their cleanup awaits the sync promise. That wait
  * has no test knob, so the cases carry an explicit per-test timeout with
  * margin rather than running near bun's 5 s default. The cascade lane sets
  * TPS_RELAY_LOSS_TEST_TIMEOUT_MS to force the short timeout the fix must survive.
@@ -71,7 +71,7 @@ function testCase(name: string, fn: () => void | Promise<void>): void {
  */
 let processOwner = 0;
 let caseOwner = 0;
-/** Set by the cleanup-latency case so only its afterEach outlasts the hook. */
+/** The flag adds delay only to the donor's cleanup. */
 let slowCleanupMs = 0;
 
 for (const entry of ["sync", "connect"] as const) {
@@ -150,12 +150,8 @@ for (const entry of ["sync", "connect"] as const) {
       completion = undefined;
     });
 
-    // The cleanup that resolves paths from HOME/TPS_* runs before the restore,
-    // so it targets this case's tree. The environment is restored at the top of
-    // the next beforeEach, before any await, and in afterAll: a case that times
-    // out, or an afterEach that then exceeds its own timeout, must not leave
-    // this file's environment or listeners for the next case or test file. A
-    // late finally restores only while this case still owns process state.
+    // Cleanup completed before ownership changes resolves from this case's HOME.
+    // Late filesystem cleanup after ownership moves is tracked in cli#779.
     afterEach(async () => {
       const owner = caseOwner;
       const slow = slowCleanupMs;
@@ -165,7 +161,10 @@ for (const entry of ["sync", "connect"] as const) {
       restoreSignalListeners();
       mock.restore();
       try {
-        if (stop) await stop();
+        if (stop) {
+          await stop();
+          if (marker) fs.appendFileSync(marker, `${entry}:stop-completed\n`);
+        }
         if (completion) await completion;
         if (entry === "connect") await Bun.sleep(1100);
         if (slow > 0) await Bun.sleep(slow);

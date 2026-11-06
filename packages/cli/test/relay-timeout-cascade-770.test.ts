@@ -4,17 +4,16 @@
  * process.
  *
  * The lane runs relay-delivery-loss.test.ts and then probe.fixture.ts in ONE
- * child bun process, the way scripts/test-suite.mjs runs the cli lane. A short
- * hook deadline (--timeout=1000) makes the case's cleanup exceed its deadline;
- * the probe then compares the audited environment keys with the one the lane
- * started with. It fails on the unfixed file, naming the leaked names.
+ * child bun process, the way scripts/test-suite.mjs runs the cli lane. It
+ * requires the selected case's hook timeout and cleanup-entry marker; the probe
+ * then compares the audited environment keys with the lane's baseline.
  *
  * A second lane throws right after the receipt TTL assignment, before the case's
  * local try: the next file must still see the audited keys restored.
  *
- * A third lane runs a connect case with a baseline home whose connection-state
- * file is a sentinel: the case's cleanup must resolve paths from its own HOME,
- * so the sentinel is unchanged, with and without a forced timeout.
+ * A third lane runs a connect case with a baseline connection-state sentinel.
+ * The forced run requires a hook timeout and a marker after stop() fulfills.
+ * Both runs require the sentinel to remain unchanged.
  *
  * A fourth lane makes one case's cleanup outlast its afterEach deadline and
  * settle while the next case runs: the next case's environment must still be
@@ -64,10 +63,7 @@ function assertCaseTimedOut(output: string, name: string): void {
   const line = caseLine(output, name);
   expect(line.startsWith("(fail)"), output).toBe(true);
   const at = output.split("\n").indexOf(line);
-  expect(
-    output.split("\n").slice(at, at + 3).join("\n"),
-    output
-  ).toMatch(/this test timed out after|a beforeEach\/afterEach hook timed out for this test/);
+  expect(output.split("\n")[at + 1], output).toBe("  ^ a beforeEach/afterEach hook timed out for this test.");
 }
 
 function baselineOfCurrentEnv(): Record<string, string | null> {
@@ -175,7 +171,7 @@ describe("a timed-out relay case leaves no environment for the next file (cli#77
         );
         if (timeout) {
           assertCaseTimedOut(output, CASE);
-          expect(readFileSync(markerPath, "utf8"), output).toContain("connect");
+          expect(readFileSync(markerPath, "utf8"), output).toContain("connect:stop-completed\n");
         } else {
           assertCasePassed(output, CASE);
         }
@@ -191,6 +187,10 @@ describe("a timed-out relay case leaves no environment for the next file (cli#77
   test("the run checks reject a child whose selected case never executed", () => {
     const dir = mkdtempSync(join(tmpdir(), "tps-relay-negative-"));
     try {
+      const passed = join(dir, "case-passed.test.ts");
+      writeFileSync(passed, `import { test } from "bun:test"; test(${JSON.stringify(CONNECT_CASE)}, () => {});`);
+      const passedRun = runChild(["test", passed], {});
+      assertCasePassed(passedRun.output, CASE);
       const broken = join(dir, "load-failure.test.ts");
       writeFileSync(broken, [
         'import { test } from "bun:test";',
@@ -209,6 +209,48 @@ describe("a timed-out relay case leaves no environment for the next file (cli#77
       expect(() => assertCasePassed(brokenRun.output, CASE)).toThrow();
       const skippedRun = runChild(["test", skipped], {});
       expect(() => assertCasePassed(skippedRun.output, CASE)).toThrow();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  test("the timeout check accepts a hook timeout and rejects a body timeout before stop", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-relay-timeout-check-"));
+    try {
+      for (const kind of ["hook", "body"] as const) {
+        const fixture = join(dir, `${kind}.test.ts`);
+        const marker = join(dir, `${kind}.marker`);
+        writeFileSync(fixture, [
+          'import { test, afterEach } from "bun:test";',
+          'import { appendFileSync } from "node:fs";',
+          'let stop: (() => Promise<void>) | undefined;',
+          `const marker = ${JSON.stringify(marker)};`,
+          'afterEach(async () => {',
+          '  appendFileSync(marker, "cleanup-entry\\n");',
+          '  if (stop) {',
+          '    await stop();',
+          '    appendFileSync(marker, "stop-completed\\n");',
+          '  }',
+          ...(kind === "hook" ? ['  await Bun.sleep(200);'] : []),
+          '});',
+          `test(${JSON.stringify(CASE)}, async () => {`,
+          ...(kind === "body" ? ['  await new Promise<void>(() => {});'] : []),
+          '  stop = async () => {};',
+          '});',
+          "",
+        ].join("\n"));
+        const { output } = runChild(["test", "--timeout=50", fixture], {});
+        const stages = readFileSync(marker, "utf8");
+        expect(stages, output).toContain("cleanup-entry\n");
+        if (kind === "hook") {
+          assertCaseTimedOut(output, CASE);
+          expect(stages, output).toContain("stop-completed\n");
+        } else {
+          expect(output).toContain("this test timed out after 50ms.");
+          expect(stages, output).not.toContain("stop-completed\n");
+          expect(() => assertCaseTimedOut(output, CASE)).toThrow();
+        }
+      }
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
