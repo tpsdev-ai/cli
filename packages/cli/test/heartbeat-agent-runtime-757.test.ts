@@ -87,7 +87,7 @@ function writeAgentConfig(agent: string, runtime?: string): string {
 }
 
 describe("cli#757 — heartbeat and the recorded runtime", () => {
-  test("a native agent without openclaw skips the gateway probe", async () => {
+  test("a plain top-level native line skips the gateway without openclaw", async () => {
     const agent = "agent-a";
     writeAgentConfig(agent, "native");
     rmSync(join(fakeBin, "openclaw"));
@@ -95,6 +95,61 @@ describe("cli#757 — heartbeat and the recorded runtime", () => {
     const result = await runTps(["heartbeat", agent], { PATH: fakeBin });
     expect(result.status).toBe(0);
     expect(result.stdout).toContain(`Heartbeat for ${agent}: online`);
+    expect(result.stdout).toContain("gateway skipped: native runtime");
+  }, 20000);
+
+  test("a merged native runtime is probed with a dead gateway", async () => {
+    const agent = "runtime-merge";
+    const configPath = writeAgentConfig(agent);
+    writeFileSync(configPath, `${readFileSync(configPath, "utf-8")}defaults: &D {runtime: native}\n<<: *D\n`);
+    expect((yaml.load(readFileSync(configPath, "utf-8")) as { runtime: string }).runtime).toBe("native");
+    const probe = join(home, "gateway-probed");
+    deadGateway(probe);
+    const result = await runTps(["heartbeat", agent]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("gateway probed");
+    expect(readFileSync(probe, "utf-8")).toBe("probed\n");
+  }, 20000);
+
+  test("a quoted native runtime is probed with a dead gateway", async () => {
+    const agent = "runtime-quoted";
+    writeAgentConfig(agent, '"native"');
+    const probe = join(home, "gateway-probed");
+    deadGateway(probe);
+    const result = await runTps(["heartbeat", agent]);
+    expect(result.status).toBe(1);
+    expect(result.stdout).toContain("gateway probed");
+    expect(readFileSync(probe, "utf-8")).toBe("probed\n");
+  }, 20000);
+
+  test("tagged, anchored, aliased, duplicate and nested native forms are probed", async () => {
+    for (const source of [
+      "runtime: !!str native\n",
+      "runtime: &R native\n",
+      "value: &R native\nruntime: *R\n",
+      "runtime: native\nruntime: native\n",
+      "settings:\n  runtime: native\n",
+      'defaults: &D {runtime: native}\n<<: *D\ntext: "\nruntime: native\n"\n',
+    ]) {
+      const agent = "runtime-forms";
+      const configPath = writeAgentConfig(agent);
+      writeFileSync(configPath, `${readFileSync(configPath, "utf-8")}${source}`);
+      const probe = join(home, "gateway-probed");
+      deadGateway(probe);
+      const result = await runTps(["heartbeat", agent]);
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("gateway probed");
+      expect(readFileSync(probe, "utf-8")).toBe("probed\n");
+      rmSync(probe);
+    }
+  }, 30000);
+
+  test("a plain top-level native line with a trailing comment skips a dead gateway", async () => {
+    const agent = "runtime-plain";
+    writeAgentConfig(agent, "native  # recorded by tps");
+    deadGateway();
+    const result = await runTps(["heartbeat", agent]);
+    expect(result.status).toBe(0);
     expect(result.stdout).toContain("gateway skipped: native runtime");
   }, 20000);
 
@@ -214,7 +269,7 @@ describe("cli#757 — recording the runtime", () => {
     }
   }, 20000);
 
-  test("set-runtime inserts the field when it is absent", async () => {
+  test("set-runtime inserts an absent field in a plain mapping", async () => {
     const agent = "agent-f";
     const configPath = writeAgentConfig(agent);
 
@@ -224,6 +279,62 @@ describe("cli#757 — recording the runtime", () => {
     expect(after.match(/^runtime:/gm)).toHaveLength(1);
     expect(after).toContain("runtime: native");
     expect(after).toContain(`agentId: ${agent}`);
+  }, 20000);
+
+  test("set-runtime inserts after a leading document marker", async () => {
+    const agent = "runtime-marker";
+    const configPath = writeAgentConfig(agent);
+    writeFileSync(configPath, `---\n${readFileSync(configPath, "utf-8")}`);
+    const before = readFileSync(configPath, "utf-8");
+    yaml.load(before);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(0);
+    const after = readFileSync(configPath, "utf-8");
+    expect(after).toBe(before.replace("---\n", "---\nruntime: native\n"));
+    expect((yaml.load(after) as { runtime: string }).runtime).toBe("native");
+  }, 20000);
+
+  test("set-runtime inserts after a YAML directive and document marker", async () => {
+    const agent = "runtime-directive";
+    const configPath = writeAgentConfig(agent);
+    writeFileSync(configPath, `%YAML 1.2\n---\n${readFileSync(configPath, "utf-8")}`);
+    const before = readFileSync(configPath, "utf-8");
+    yaml.load(before);
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(0);
+    const after = readFileSync(configPath, "utf-8");
+    expect(after).toBe(before.replace("---\n", "---\nruntime: native\n"));
+    expect((yaml.load(after) as { runtime: string }).runtime).toBe("native");
+  }, 20000);
+
+  test("set-runtime refuses multiple documents and end markers before writing", async () => {
+    for (const suffix of ["---\nother: document\n", "...\n"]) {
+      const agent = "runtime-documents";
+      const configPath = writeAgentConfig(agent);
+      writeFileSync(configPath, `---\n${readFileSync(configPath, "utf-8")}${suffix}`);
+      const before = readFileSync(configPath);
+      const inode = statSync(configPath).ino;
+      yaml.loadAll(before.toString());
+      const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("edit the file by hand");
+      expect(readFileSync(configPath)).toEqual(before);
+      expect(statSync(configPath).ino).toBe(inode);
+    }
+  }, 20000);
+
+  test("set-runtime refuses an invalid insertion candidate before rename", async () => {
+    const agent = "runtime-candidate";
+    const configPath = writeAgentConfig(agent);
+    writeFileSync(configPath, `--- agentId: ${agent}\n`);
+    const before = readFileSync(configPath);
+    const inode = statSync(configPath).ino;
+    yaml.load(before.toString());
+    const result = await runTps(["agent", "set-runtime", "--id", agent, "--runtime", "native"]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("Edit the file by hand");
+    expect(readFileSync(configPath)).toEqual(before);
+    expect(statSync(configPath).ino).toBe(inode);
   }, 20000);
 
   test("set-runtime refuses a block scalar before writing", async () => {

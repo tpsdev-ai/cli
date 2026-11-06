@@ -158,18 +158,34 @@ function recordedAgentRuntime(agentId: string): string | null {
   const configPath = join(homeDir(), ".tps", "agents", safeAgentDir(agentId), "agent.yaml");
   try {
     if (!existsSync(configPath)) return null;
-    const parsed = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
-    if (!parsed || typeof parsed !== "object") return null;
-    const value = parsed.runtime;
-    return typeof value === "string" ? value : null;
+    const source = readFileSync(configPath, "utf-8");
+    type Node = { start: number; value: unknown; children: Node[] };
+    const stack: Node[] = [];
+    let root: Node | undefined;
+    const parsed = yaml.load(source, {
+      listener(event, state) {
+        if (event === "open") stack.push({ start: state.position, value: undefined, children: [] });
+        else {
+          const node = stack.pop()!;
+          node.value = state.result;
+          if (stack.length) stack[stack.length - 1].children.push(node);
+          else root = node;
+        }
+      },
+    }) as Record<string, unknown> | null;
+    if (!parsed || typeof parsed !== "object" || parsed.runtime !== "native") return null;
+    const lines = [...source.matchAll(/^runtime: native[ \t]*(?:#[^\r\n]*)?\r?$/gm)];
+    if (lines.length !== 1 || !root?.children.some((node, index) =>
+      index % 2 === 0 && node.value === "runtime" && node.start === lines[0].index)) return null;
+    return "native";
   } catch {
     return null;
   }
 }
 
 /**
- * Probe the gateway unless the recorded runtime is exactly `native`. Every
- * other value (absent, `unknown`, unrecognised) is probed: fail closed.
+ * Skip only for an explicit top-level `runtime: native` line as tps writes it;
+ * every other form is probed.
  */
 function checkGatewayHealth(runtime: string | null): { errors: string[]; note: string } {
   if (runtime === "native") {

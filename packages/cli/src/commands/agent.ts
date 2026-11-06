@@ -105,6 +105,10 @@ function parseRecordedRuntime(value: string | undefined): RecordedAgentRuntime |
 }
 
 function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime): string {
+  const refuse = (): never => { throw new Error("Unsupported runtime YAML; edit the file by hand."); };
+  const lines = configText.split(/\r\n|\r|\n/);
+  if (lines.filter((line) => /^---(?:[ \t]|$)/.test(line)).length > 1
+    || lines.some((line) => /^\.\.\.(?:[ \t]|$)/.test(line))) refuse();
   type Node = { start: number; end: number; kind: string; value: unknown; children: Node[] };
   const stack: Node[] = [];
   let root: Node | undefined;
@@ -120,7 +124,6 @@ function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime):
       }
     },
   });
-  const refuse = (): never => { throw new Error("Unsupported runtime YAML; edit the file by hand."); };
   if (!root || root.kind !== "mapping" || !parsed || typeof parsed !== "object" || Array.isArray(parsed)) refuse();
   const mapping = root!;
   if (configText.slice(mapping.start).trimStart().startsWith("{")) refuse();
@@ -143,7 +146,16 @@ function withRecordedRuntime(configText: string, runtime: RecordedAgentRuntime):
     return `${configText.slice(0, key.start)}runtime: ${runtime}${configText.slice(end)}`;
   }
   if (Object.hasOwn(parsed as object, "runtime")) refuse();
-  return `runtime: ${runtime}\n${configText}`;
+  let insertion = 0;
+  for (const line of lines) {
+    const marker = /^---[ \t]*(?:#.*)?$/.test(line);
+    if (!marker && !/^(?:%.*|[ \t]*(?:#.*)?)$/.test(line)) break;
+    const end = insertion + line.length;
+    insertion = end + (configText.slice(end).match(/^(?:\r\n|\r|\n)/)?.[0].length ?? 0);
+    if (marker) break;
+  }
+  const newline = configText.match(/\r\n|\r|\n/)?.[0] ?? "\n";
+  return `${configText.slice(0, insertion)}runtime: ${runtime}${newline}${configText.slice(insertion)}`;
 }
 
 function writeRuntimeConfig(configPath: string, contents: string | Buffer, mode: number): void {
@@ -826,6 +838,8 @@ function setAgentRuntime(args: AgentArgs): void {
     const configText = original.toString("utf-8");
     if (!Buffer.from(configText, "utf-8").equals(original)) throw new Error("Config must be UTF-8; edit the file by hand.");
     updated = withRecordedRuntime(configText, runtime);
+    const candidate = yaml.load(updated) as Record<string, unknown> | null;
+    if (candidate?.runtime !== runtime) throw new Error("Runtime candidate verification failed; edit the file by hand.");
   } catch (e) {
     console.error(`❌ Cannot update ${configPath}: ${e instanceof Error ? e.message : String(e)} Edit the file by hand.`);
     process.exit(1);
