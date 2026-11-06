@@ -1145,10 +1145,10 @@ const INBOUND_PERSIST_RETRY_MAX_MS = 1000;
 const MAX_RETAINED_FAILED_CHANNELS = 4;
 
 /**
- * Wrap a host record persist for the periodic heartbeat and health callbacks:
- * report the first failure per connection, stay silent for repeats, and report
- * again after a write succeeds. The reason is the error text only; the record
- * path and the error name the cause without the record's contents.
+ * Wrap a host record persist for the heartbeat and health callbacks: report the
+ * first failure per connection, stay silent for repeats, and report again after
+ * a write succeeds. The message carries the record path and the error, not the
+ * record's contents.
  */
 function hostStateRefresher(branchId: string, persist: () => void): () => void {
   let failureReported = false;
