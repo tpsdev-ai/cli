@@ -155,7 +155,8 @@ function checkWorkspaceWritable(agentWorkspace: string): string[] {
 }
 
 function checkGatewayHealth(): string[] {
-  const check = spawnSync("openclaw", ["gateway", "status"], {
+  // Older OpenClaw versions rejecting --require-rpc fail closed via their non-zero exit.
+  const check = spawnSync("openclaw", ["gateway", "status", "--require-rpc"], {
     encoding: "utf-8",
     timeout: 5000,
   });
@@ -266,8 +267,8 @@ function safeAgentId(agentId: string): string {
   return id || "unknown";
 }
 
-function resolveConfigModel(agentId: string): string | null {
-  const cfgPath = resolveConfigPath();
+function resolveConfigModel(agentId: string, configPath?: string): string | null {
+  const cfgPath = resolveConfigPath(configPath);
   if (!cfgPath) return null;
   try {
     const cfg: OpenClawConfig = readOpenClawConfig(cfgPath);
@@ -344,11 +345,11 @@ function resolveWorkspaceModel(agentId: string, workspace?: string): string | nu
   return null;
 }
 
-async function resolveModel(agentId: string, workspace?: string): Promise<string> {
+async function resolveModel(agentId: string, workspace?: string, configPath?: string): Promise<string> {
   return (
     await resolveModelFromHeartbeat(agentId) ??
     resolveWorkspaceModel(agentId, workspace) ??
-    resolveConfigModel(agentId) ??
+    resolveConfigModel(agentId, configPath) ??
     "unknown-model"
   );
 }
@@ -440,7 +441,7 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
   const status: NodeStatus = {
     agentId,
     host: hostFingerprint(),
-    model: await resolveModel(agentId, workspace),
+    model: await resolveModel(agentId, workspace, args.configPath),
     status: resolvedState,
     lastHeartbeat: lastHeartbeat,
     lastActivity: now,
@@ -462,6 +463,9 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
 
   if (resolvedState === "error") {
     console.log(`⚠️  Heartbeat for ${agentId}: error (${checks.join("; ")})`);
+    // cli#750: a heartbeat that recorded a failed check is a failed command;
+    // a script watching the exit status must not read it as healthy.
+    process.exitCode = 1;
   } else {
     console.log(`✅ Heartbeat for ${agentId}: ${resolvedState}`);
   }

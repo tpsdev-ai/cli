@@ -312,7 +312,7 @@ function injectSecrets(containerName: string, secrets: Array<{ key: string; valu
  * ops-209a: Conditionally provision Flair spoke on the remote branch.
  * Called from join when --tunnel-via is given and --no-flair is not set.
  */
-async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promise<void> {
+export async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promise<void> {
   if (args.noFlair) {
     console.log("ℹ️  --no-flair: skipping Flair spoke provisioning.");
     return;
@@ -330,6 +330,7 @@ async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promi
 
     if (plan.mode === "error") {
       console.error(`❌ Flair spoke provisioning blocked: ${plan.error}`);
+      process.exitCode = 1;
       return;
     }
 
@@ -340,6 +341,7 @@ async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promi
           `❌ Flair is already installed on '${args.tunnelVia}'.\n` +
           `   Use --force-reinstall-flair to reinstall (preserves data unless --purge-flair).`
         );
+        process.exitCode = 1;
         return;
       }
       console.log("♻️  Force-reinstalling Flair spoke...");
@@ -363,18 +365,21 @@ async function provisionFlairIfRequested(args: OfficeArgs, agent: string): Promi
         const fed = configureFederation(args.tunnelVia!, agent, plan);
         if (fed.lastSync) {
           console.log(`   ✅ Fed-sync configured + validated (timer ${fed.timerName})`);
-        } else {
+        } else if (state.os === "linux") {
+          process.exitCode = 1;
           console.log(`   ⚠️  Fed-sync partially configured: initial sync failed.`);
           console.log(`       Branch is hub-less until the sync is working.`);
         }
       } catch (e: any) {
         console.error(`   ⚠️  Fed-sync configuration failed: ${e.message}`);
         console.error(`       Flair is installed but federation is not active.`);
+        process.exitCode = 1;
       }
     }
   } catch (e: any) {
     console.error(`❌ Flair spoke provisioning failed: ${e.message}`);
     console.error("   The join was successful — fix the issue and re-run with --force-reinstall-flair.");
+    process.exitCode = 1;
   }
 }
 
@@ -821,8 +826,9 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
           console.log(`   Revoke with: tps office revoke ${agent}`);
         } catch (e: any) {
           console.error(`❌ Supervision provisioning failed: ${e.message}`);
-          // Don't undo the join — the branch is still registered
-          // But warn that supervision didn't take
+          // Don't undo the join — the branch is still registered, but the
+          // command reports the failed step through its exit status.
+          process.exitCode = 1;
         }
 
         // ops-209a: provision Flair spoke on the remote branch (default=on, opt-out with --no-flair)

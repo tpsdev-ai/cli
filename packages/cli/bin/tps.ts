@@ -1072,6 +1072,7 @@ async function main() {
       const { runHeartbeat } = await import("../src/commands/status.js");
       await runHeartbeat({
         agentId,
+        configPath: cli.flags.config,
         status: (cli.flags.statusOverride as any) || undefined,
         nonono: !!(cli.flags.nonono || cli.flags.quietNonoCheck),
         profile: "tps-status",
