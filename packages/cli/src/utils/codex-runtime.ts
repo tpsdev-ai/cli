@@ -1083,7 +1083,8 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const baselineResult = commitRepo
             ? spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: commitRepo, encoding: "utf-8" })
             : undefined;
-          const baseline = baselineResult?.status === 0 ? String(baselineResult.stdout ?? "").trim() : undefined;
+          const baselineHead = String(baselineResult?.stdout ?? "").trim();
+          const baseline = baselineResult?.status === 0 && baselineHead ? baselineHead : undefined;
           const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
             flairPublisher: flairPub2,
             onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
