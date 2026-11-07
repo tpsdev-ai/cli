@@ -348,12 +348,16 @@ export interface StaleRebaseDetection {
   state: "present" | "absent" | "indeterminate";
   /** The failed probe, when state is "indeterminate". */
   probe?: string;
+  /** The probe's unusable output, when state is "indeterminate". */
+  output?: string;
 }
 
 /**
  * Detect an interrupted rebase (merge or apply backend) in `repo` using git's
  * own paths for the repository at that location, including a linked worktree
- * whose `.git` is a file.
+ * whose `.git` is a file. A probe whose output is not an absolute path cannot
+ * name the repository's Git directory (git before 2.31 echoes the
+ * `--path-format=absolute` flag instead), so the detection is indeterminate.
  */
 export function detectStaleRebase(
   repo: string,
@@ -367,7 +371,7 @@ export function detectStaleRebase(
     });
     if (result.status !== 0) return { state: "indeterminate", probe };
     const path = String(result.stdout ?? "").trim();
-    if (!path) return { state: "indeterminate", probe };
+    if (!path || !isAbsolute(path)) return { state: "indeterminate", probe, output: path };
     if (existsSync(path)) return { state: "present" };
   }
   return { state: "absent" };
@@ -402,7 +406,8 @@ export function evaluateMailAutoCommitGate(
   const runSync = deps.runSync ?? spawnSync;
   const staleRebase = detectStaleRebase(repo, runSync);
   if (staleRebase.state === "indeterminate") {
-    return { action: "skip", message: `Stale rebase check could not run: ${staleRebase.probe} failed — skipping autoCommit` };
+    const detail = staleRebase.output !== undefined ? ` returned '${staleRebase.output}'` : " failed";
+    return { action: "skip", message: `Stale rebase check could not run: ${staleRebase.probe}${detail} — skipping autoCommit` };
   }
   if (baseline === undefined) {
     return { action: "skip", message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit" };
@@ -431,6 +436,9 @@ export function evaluateMailAutoCommitGate(
     return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) failed — skipping autoCommit" };
   }
   const finalHead = String(headResult.stdout ?? "").trim();
+  if (!finalHead) {
+    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) returned no output — skipping autoCommit" };
+  }
   if (restoredHead !== undefined && finalHead !== restoredHead) {
     return {
       action: "skip",

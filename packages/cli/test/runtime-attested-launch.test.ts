@@ -148,6 +148,27 @@ real("cli#363 slice B — the three runtimes reach the attested launch", () => {
       }
     }, 40_000);
   }
+
+  test("gemini: a sandboxed launch starts when autoCommit.repo contains an unset variable", async () => {
+    const sb = makeSandbox();
+    try {
+      const agentConfig = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+      writeFileSync(agentConfig, `${readFileSync(agentConfig, "utf-8")}autoCommit:\n  repo: \${TPS_TEST_PROJECT_ROOT}/x\n`);
+      const bin = writeFakeNono(sb, CANARY_FAKE_NONO);
+      const { text, stopped } = await runUntil(
+        sb,
+        ["agent", "start", "--id", "probe", "--runtime", "gemini", SANDBOX_REQUIRED],
+        { [NONO_BIN_ENV]: bin, FAKE_NONO_PS_JSON: join(sb.root, "ps.json"), TPS_TEST_PROJECT_ROOT: undefined },
+        (t) => t.includes(startup.gemini),
+        30_000
+      );
+      expect(text).not.toContain("Missing environment variable");
+      expect(text).toContain(startup.gemini);
+      expect(stopped).toBe(true);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 40_000);
 });
 
 describe("cli#363 slice B — the existing launch refusals still apply on the runtime path", () => {
@@ -550,6 +571,21 @@ describe("interactive selected runtime workspace values", () => {
       expect(existsSync(join(dir, ".tps-agent.pid"))).toBe(true);
     }, () => ({ TPS_TEST_UNSET_VALUE: undefined }));
   });
+
+  for (const rt of ["gemini", "claude-code"] as const) {
+    test(`${rt}: --no-sandbox starts with an unset variable in autoCommit.repo`, () => {
+      workspaceOptOut(
+        rt,
+        "autoCommit:\n  repo: ${TPS_TEST_PROJECT_ROOT}/project",
+        (run) => {
+          expect(run.result.text).not.toContain("Missing environment variable");
+          expect(run.result.status).toBe(0);
+          expect(existsSync(run.result.selectedMarker)).toBe(true);
+        },
+        () => ({ TPS_TEST_PROJECT_ROOT: undefined }),
+      );
+    });
+  }
 });
 
 test("interactive default runtime with no nono still warns and starts", () => {

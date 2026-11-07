@@ -562,9 +562,11 @@ async function main() {
             );
             // A relative autoCommit.repo follows the workspace convention: it is
             // anchored at the config file's directory, never the process cwd.
-            // The non-sandboxed loader expands ${NAME} the same way it does for
-            // workspace; a sandboxed child receives the snapshot's absolute value.
-            const autoCommit = agentCfg.autoCommit
+            // Only the Codex runtime reads autoCommit, so only it resolves the
+            // value and expands ${NAME}; a sandboxed child receives the
+            // snapshot's absolute value. An empty YAML entry is absent, so the
+            // runtime's workspace fallback applies.
+            const autoCommit = runtimeArg === "codex" && agentCfg.autoCommit
               ? { ...agentCfg.autoCommit, repo: resolveAutoCommitRepo(agentCfg.autoCommit.repo, cfgPath, !sandboxed) }
               : undefined;
 

@@ -1,8 +1,9 @@
 import { describe, expect, mock, test, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve } from "node:path";
+import yaml from "js-yaml";
 import { resolveAutoCommitRepo } from "../src/utils/agent-workspace.ts";
 import {
   composeSystemPrompt,
@@ -71,6 +72,20 @@ function initRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "cli800-gate-"));
   initRepoAt(dir);
   return dir;
+}
+
+/** An executable `git` stand-in in `dir`; the caller supplies its shell body. */
+function gitShim(dir: string, body: string): string {
+  const path = join(dir, "git");
+  writeFileSync(path, `#!/usr/bin/env bash\n${body}\n`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+/** Run the shim with the args and cwd the runtime passed. */
+function shimRunner(shim: string, env?: Record<string, string>): typeof spawnSync {
+  return ((_cmd: string, args: string[], opts: { cwd?: string }) =>
+    spawnSync(shim, args, { cwd: opts.cwd, encoding: "utf-8", env: { ...process.env, ...env } })) as unknown as typeof spawnSync;
 }
 
 /** Commit a conflicting change on `topic` and on `main`, then return to `topic`. */
@@ -154,6 +169,20 @@ describe("detectStaleRebase", () => {
       expect(detectStaleRebase(dir)).toEqual({
         state: "indeterminate",
         probe: "git rev-parse --path-format=absolute --git-path rebase-merge",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("reports indeterminate when the probe output is not an absolute path", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli800-oldgit-"));
+    try {
+      const shim = gitShim(dir, 'echo "--path-format=absolute"');
+      expect(detectStaleRebase(dir, shimRunner(shim))).toEqual({
+        state: "indeterminate",
+        probe: "git rev-parse --path-format=absolute --git-path rebase-merge",
+        output: "--path-format=absolute",
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -310,6 +339,41 @@ describe("evaluateMailAutoCommitGate", () => {
       message: "Stale rebase check could not run: git rev-parse --path-format=absolute --git-path rebase-merge failed — skipping autoCommit",
     });
   });
+
+  test("skips naming the probe and its non-absolute output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli800-oldgit-gate-"));
+    try {
+      const shim = gitShim(dir, 'echo "--path-format=absolute"');
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync: shimRunner(shim) })).toEqual({
+        action: "skip",
+        message:
+          "Stale rebase check could not run: git rev-parse --path-format=absolute --git-path rebase-merge returned '--path-format=absolute' — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("skips when the final HEAD read has no output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli800-empty-head-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "${SHIM_ROOT}/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then exit 0; fi',
+          'if [ "$1" = "status" ]; then exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync: shimRunner(shim, { SHIM_ROOT: dir }) })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse HEAD (after task) returned no output — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 describe("resolveAutoCommitRepo", () => {
@@ -374,6 +438,35 @@ describe("resolveAutoCommitRepo", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test("refuses an empty or blank autoCommit.repo after environment expansion", () => {
+    const configPath = join(tmpdir(), "cli800-empty-repo", "agent.yaml");
+    expect(() => resolveAutoCommitRepo("", configPath)).toThrow(
+      "autoCommit.repo is empty or blank: omit it to use the workspace, or give a path",
+    );
+    expect(() => resolveAutoCommitRepo("   ", configPath, true)).toThrow(
+      "autoCommit.repo is empty or blank: omit it to use the workspace, or give a path",
+    );
+    const previous = process.env.EMPTY;
+    process.env.EMPTY = "";
+    try {
+      expect(() => resolveAutoCommitRepo("${EMPTY}", configPath, true)).toThrow(
+        "autoCommit.repo is empty or blank: omit it to use the workspace, or give a path",
+      );
+    } finally {
+      if (previous === undefined) delete process.env.EMPTY;
+      else process.env.EMPTY = previous;
+    }
+  });
+
+  test("an empty YAML repo entry is absent, so the workspace fallback applies", () => {
+    const parsed = yaml.load("autoCommit:\n  repo:\n") as { autoCommit: { repo: unknown } };
+    expect(parsed.autoCommit.repo).toBeNull();
+    expect(resolveAutoCommitRepo(parsed.autoCommit.repo as string | null, join(tmpdir(), "agent.yaml"))).toBeUndefined();
+    expect(
+      resolveCommitRepo({ workspace: "/tmp/workspace", autoCommit: { repo: parsed.autoCommit.repo as string | undefined } }),
+    ).toBe("/tmp/workspace");
+  });
 
   test("refuses a relative autoCommit.repo when no config path can anchor it", () => {
     expect(() => resolveAutoCommitRepo("repo")).toThrow(

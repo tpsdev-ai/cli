@@ -13,3 +13,8 @@
   the launch snapshot carries the absolute value; a relative value with no
   config file to anchor it is refused. Sender notices are attempts: a failed
   signed send is logged and acknowledgement is attempted.
+
+  **`autoCommit.repo` is resolved only by the Codex runtime.** A Gemini or Claude Code launch neither resolves nor expands it, so an unset variable there cannot stop the launch; an empty YAML entry reads as absent, and the runtime's workspace fallback applies.
+  **An empty or blank `autoCommit.repo` string is refused.** After environment expansion, a blank value names the field and the remedy: omit it to use the workspace, or give a path.
+  **A rebase-path probe that does not return an absolute path is indeterminate.** A Git that does not support `--path-format` echoes the flag; auto-commit skips and reports the probe and its output.
+  **An empty final `git rev-parse HEAD` read is indeterminate.** The gate skips and reports the probe instead of reading the empty value as a change.

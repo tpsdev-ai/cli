@@ -26,12 +26,15 @@ export function agentWorkspace(
  * working directory.
  */
 export function resolveAutoCommitRepo(
-  configured: string | undefined,
+  configured: string | null | undefined,
   configPath?: string,
   expandEnv = false,
 ): string | undefined {
-  if (configured === undefined) return undefined;
+  if (configured === undefined || configured === null) return undefined;
   const value = expandEnv ? interpolateEnvInString(configured) : configured;
+  if (value.trim() === "") {
+    throw new Error("autoCommit.repo is empty or blank: omit it to use the workspace, or give a path");
+  }
   refuseTildeWorkspace(value, "autoCommit.repo");
   if (isAbsolute(value)) return resolve(value);
   if (configPath === undefined) {
