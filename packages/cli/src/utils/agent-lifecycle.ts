@@ -28,7 +28,7 @@ function getFallbackDir(agentId: string): string {
   return join(homeDir(), ".tps", "agents", agentId, "fallback");
 }
 
-function getFallbackSoulPath(agentId: string): string {
+export function getFallbackSoulPath(agentId: string): string {
   return join(getFallbackDir(agentId), "SOUL.md");
 }
 
