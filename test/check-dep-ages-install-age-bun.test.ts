@@ -47,6 +47,10 @@ const BACKSLASH_WORKSPACE_REASON =
   "it contains a backslash, which Bun reads as an escape of the next character; name the directory without the escape";
 const BRACE_CLASS_WORKSPACE_REASON =
   "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
+const UNMODELLED_WORKSPACE_REASON =
+  "it uses glob syntax the gate does not model; use a literal directory name, `*`, `**`, `?`, a `[...]` class or `{a,b}` alternatives";
+const BRACE_RANGE_WORKSPACE_REASON =
+  "it uses a `{1..3}` brace range, which the gate does not model; list the directories explicitly";
 
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
 function startRegistry(root: string, published: Published = AGE_FIXTURE) {
@@ -563,6 +567,36 @@ it.each([
   }
 }, 30000);
 
+/** Assert the gate's named refusal without pinning a set Bun installs differently. */
+async function gateRefusal(
+  workspaces: readonly string[],
+  dirs: readonly string[],
+  reason: string,
+  refused: string,
+) {
+  const root = mkdtempSync(join(tmpdir(), "age-unmodelled-"));
+  try {
+    const manifests: Record<string, unknown> = { "package.json": { name: "fixture", workspaces } };
+    for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll(/[^a-z0-9]/gi, "-")}` };
+    const project = writeProject(root, manifests, "http://127.0.0.1:1", { excludes: [NAME], lock: VALID_LOCK });
+    // A valid lockfile and root pin isolate the workspace refusal.
+    writeFileSync(
+      join(project, "package.json"),
+      JSON.stringify({ name: "fixture", workspaces, dependencies: { [NAME]: AGED } }),
+    );
+    const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
+    expect(gate.exit).toBe(2);
+    expect(gate.output).toContain(
+      `the root package.json \`workspaces\` could not be read: workspaces pattern \`${refused}\` cannot be read: ${reason}.`,
+    );
+    expect(gate.output).toContain(`Remedy: fix or remove the \`workspaces\` pattern \`${refused}\`.`);
+    expect(gate.output).not.toContain("Checking");
+    expect(gate.output).not.toContain("bun.lock");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
 /** Compare real Bun's install result with the gate's named workspace refusal. */
 async function refusalParity(
   workspaces: readonly string[],
@@ -658,4 +692,41 @@ it.each([
     await refusalParity([pattern], dirs, bunApplied, BRACE_CLASS_WORKSPACE_REASON, pattern);
   },
   60000,
+);
+
+// Bun 1.3.10 and 1.4.4 disagree on what these extglobs install, so the real-install
+// assertion is intentionally absent here; the gate must refuse both, on both versions.
+it.each([
+  ["packages/+([ab])", ["packages/a", "packages/ab"]],
+  ["packages/@(a|b)", ["packages/a", "packages/b"]],
+] as const)(
+  "refuses the unmodelled workspaces pattern %s",
+  async (pattern, dirs) => {
+    await gateRefusal([pattern], dirs, UNMODELLED_WORKSPACE_REASON, pattern);
+  },
+  30000,
+);
+
+it.each([
+  ["packages/(a)", ["packages/a"]],
+  ["packages/a|b", ["packages/a"]],
+] as const)(
+  "refuses the unmodelled workspaces pattern %s",
+  async (pattern, dirs) => {
+    await refusalParity([pattern], dirs, null, UNMODELLED_WORKSPACE_REASON, pattern);
+  },
+  60000,
+);
+
+it(
+  "refuses a {1..3} brace range",
+  async () => {
+    await gateRefusal(
+      ["packages/{1..3}"],
+      ["packages/1", "packages/2"],
+      BRACE_RANGE_WORKSPACE_REASON,
+      "packages/{1..3}",
+    );
+  },
+  30000,
 );

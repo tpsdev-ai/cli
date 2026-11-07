@@ -177,7 +177,7 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
   });
 
   // Also run against real Bun in check-dep-ages-install-age-bun.test.ts: the ** row,
-  // both ? rows and the ./ row. The other rows are expectations only.
+  // both ? rows, the ./ row, the object-form row, the character-class row and the brace row.
   it.each([
     ["a ** pattern reaches a nested directory", ["packages/**"], "packages/a/b", true],
     ["a ? pattern matches one character", ["packages/?"], "packages/a", true],

@@ -403,7 +403,9 @@ function hasBraceGroupAndClass(pattern) {
 
 /**
  * A shape whose meaning differs between the Bun versions this repo supports. The
- * gate refuses it instead of modelling one version's answer.
+ * gate refuses it instead of modelling one version's answer. The gate reads
+ * workspace patterns only when `minimumReleaseAgeExcludes` is non-empty, so a
+ * bunfig without exclusions never reaches this refusal.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
  */
@@ -425,6 +427,45 @@ function unsupportedWorkspacePattern(pattern) {
   }
   if (hasBraceGroupAndClass(pattern)) {
     return "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
+  }
+  return null;
+}
+
+/**
+ * The gate accepts a smaller grammar than Bun.Glob: literals, `/`, `*`, `**`,
+ * `?`, `[...]` classes and `{a,b}` alternatives. It refuses the remaining glob
+ * syntax, including `(`, `)` and `|` outside a class (Bun reads a paren
+ * literally outside an extglob), the extended globs `?(...)`, `*(...)`,
+ * `+(...)`, `@(...)` and `!(...)`, and brace ranges such as `{1..3}`. The gate
+ * reads workspace patterns only when `minimumReleaseAgeExcludes` is non-empty.
+ *
+ * @returns {string | null} the reason, naming the syntax and the remedy
+ */
+function unmodelledGlobSyntax(pattern) {
+  let braces = 0;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      i += 1; // an escape makes the next character a literal; escapes are refused separately
+      continue;
+    }
+    if (ch === "[") {
+      // The model copies a class body into a regex, so its members are literals here.
+      let end = i + 1;
+      if (pattern[end] === "!" || pattern[end] === "^") end += 1;
+      if (pattern[end] === "]") end += 1;
+      while (end < pattern.length && pattern[end] !== "]") end += 1;
+      if (end < pattern.length) i = end;
+      continue;
+    }
+    if (ch === "(" || ch === ")" || ch === "|") {
+      return "it uses glob syntax the gate does not model; use a literal directory name, `*`, `**`, `?`, a `[...]` class or `{a,b}` alternatives";
+    }
+    if (ch === "{") braces += 1;
+    else if (ch === "}") braces = Math.max(0, braces - 1);
+    else if (braces > 0 && ch === "." && pattern[i + 1] === ".") {
+      return "it uses a `{1..3}` brace range, which the gate does not model; list the directories explicitly";
+    }
   }
   return null;
 }
@@ -506,6 +547,8 @@ export function workspacePatterns(workspaces) {
  * `refuseVersionDependentPatterns` makes the gate fail closed on shapes whose
  * meaning differs between the Bun versions this repo supports. It is off by
  * default so the parity tests can still record what the model resolves.
+ * `auditExcludes` sets it, and the gate runs the audit only when
+ * `minimumReleaseAgeExcludes` is non-empty.
  *
  * @param {Array<{path: string, json: object}>} manifests
  * @param {{ refuseVersionDependentPatterns?: boolean }} [options]
@@ -522,7 +565,10 @@ export function appliedManifestPaths(manifests, { refuseVersionDependentPatterns
   const globs = [];
   for (const raw of patterns) {
     if (raw === "" || raw === "." || raw === "./" || raw === ".\\") continue;
-    const reason = (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ?? unsupportedWorkspacePattern(raw);
+    const reason =
+      (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ??
+      unsupportedWorkspacePattern(raw) ??
+      unmodelledGlobSyntax(raw);
     if (reason !== null) {
       return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
     }
