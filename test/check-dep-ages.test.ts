@@ -1306,21 +1306,28 @@ function workflowStep(run: string, workdir = "plugins/read"): string {
 const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/package-lock.json"]);
 
 describe("the npm ci workflow guard accepts established command shapes", () => {
-  it("accepts raw npm ci with sfw and literal install flags", () => {
-    expect(assertNpmCiLockfilesRead(workflowStep("sfw npm ci --ignore-scripts --no-audit --no-fund"), READ_TRACKED)).toBe(1);
-  });
+  it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a raw npm ci run step: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
+      `job build step 1: cannot establish the npm ci directory: raw npm ci is refused; use the tracked-lock helper: ${run}`,
+    );
+  }, 5_000);
 
   it("accepts the helper's literal tracked fixture with a variable prefix", () => {
     expect(assertNpmCiLockfilesRead(workflowStep(
-      'prefix="$RUNNER_TEMP/install"\nbash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix" --ignore-scripts', ".",
+      'prefix="$RUNNER_TEMP/install"\nbash scripts/npm-ci-tracked-lock.sh --via sfw plugins/good "$prefix" --ignore-scripts', ".",
     ), READ_TRACKED)).toBe(1);
   });
 
   it.each([
-    'bash scripts/npm-ci-tracked-lock.sh "$fixture" "$prefix"',
-    'bash scripts/npm-ci-tracked-lock.sh ${fixture} "$prefix"',
-    'bash scripts/npm-ci-tracked-lock.sh /absolute "$prefix"',
-    'bash scripts/npm-ci-tracked-lock.sh plugins/unread "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via "$installer" --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via other --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via npm --in-place "$fixture"',
+    'bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/good "prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw "$fixture" "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw ${fixture} "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw /absolute "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw plugins/unread "$prefix"',
   ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile)/);
   }, 30_000);
@@ -1336,7 +1343,7 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
     'pin="$(node scripts/pin.mjs --pin); npm run prepare-lock"',
     'echo "RESULT=$(npm run prepare-lock)" >> "$GITHUB_ENV"',
   ])("refuses a helper-step line: %s", (line) => {
-    const run = `prefix="$RUNNER_TEMP/install"\n${line}\nbash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix"`;
+    const run = `prefix="$RUNNER_TEMP/install"\n${line}\nbash scripts/npm-ci-tracked-lock.sh --via sfw plugins/good "$prefix"`;
     let error: unknown;
     try { assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED); } catch (caught) { error = caught; }
     expect(error).toBeInstanceOf(Error);
@@ -1347,7 +1354,7 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
   it("refuses the unrelated-copy and raw-prefix probe", () => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(
       "cp ../good/package-lock.json /tmp/dummy/package-lock.json\nnpm ci --prefix ../unread",
-    ), READ_TRACKED)).toThrow(/job build step 1.*(?:lockfile write|raw npm ci --prefix)/);
+    ), READ_TRACKED)).toThrow(/job build step 1.*raw npm ci is refused/);
   });
 
   it.each([
@@ -1373,36 +1380,30 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
   }, 30_000);
 
   it("uses workflow and job defaults with step working-directory taking precedence", () => {
-    const withoutStepDir = workflowStep("npm ci").replace(
-      "      - working-directory: plugins/read\n        run: |",
-      "      - run: |",
+    const run = "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/good";
+    const withoutStepDir = workflowStep(run).replace(
+      "      - working-directory: plugins/read\n        run: |", "      - run: |",
     );
     expect(assertNpmCiLockfilesRead(
-      `defaults:\n  run:\n    working-directory: plugins/good\n${withoutStepDir}`, READ_TRACKED,
+      `defaults:\n  run:\n    working-directory: .\n${withoutStepDir}`, READ_TRACKED,
     )).toBe(1);
     const jobDefault = withoutStepDir.replace(
-      "    steps:", "    defaults:\n      run:\n        working-directory: plugins/good\n    steps:",
+      "    steps:", "    defaults:\n      run:\n        working-directory: .\n    steps:",
     );
     expect(assertNpmCiLockfilesRead(
       `defaults:\n  run:\n    working-directory: plugins/unread\n${jobDefault}`, READ_TRACKED,
     )).toBe(1);
-    const stepOverride = workflowStep("npm ci").replace(
+    const stepOverride = workflowStep(run, ".").replace(
       "    steps:", "    defaults:\n      run:\n        working-directory: plugins/unread\n    steps:",
     );
     expect(assertNpmCiLockfilesRead(stepOverride, READ_TRACKED)).toBe(1);
   }, 30_000);
 
-  it("accepts one leading literal cd relative to the step directory", () => {
-    expect(assertNpmCiLockfilesRead(workflowStep("cd ../good && npm ci"), READ_TRACKED)).toBe(1);
-    expect(assertNpmCiLockfilesRead(workflowStep("cd plugins/x && npm ci", "."),
-      new Set(["plugins/x/package-lock.json"]))).toBe(1);
-  });
-
-  it("fails, naming the job and step, when cd reaches a lockfile the gate does not read", () => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep("cd ../unread && npm ci"), READ_TRACKED)).toThrow(
-      /job build step 1.*plugins\/unread\/package-lock\.json/,
-    );
-  });
+  it.each(["cd ../good && npm ci", "cd plugins/x && npm ci", "cd ../unread && npm ci"])(
+    "refuses a leading cd before raw npm ci: %s", (run) => {
+      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/raw npm ci is refused/);
+    }, 5_000,
+  );
 
   it.each([
     'cd "$DIR" && npm ci',

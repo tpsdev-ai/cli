@@ -1,16 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-  echo 'usage: npm-ci-tracked-lock.sh <fixture-dir> <prefix> [npm ci args...]' >&2
+if [ "$#" -lt 4 ] || [ "$1" != --via ]; then
+  echo 'usage: npm-ci-tracked-lock.sh --via <npm|sfw> [--in-place] <tracked-dir> [<prefix>] [npm ci args...]' >&2
   exit 1
 fi
-fixture=$1
-prefix=$2
+case "$2" in
+  npm) installer=(npm) ;;
+  sfw) installer=(sfw npm) ;;
+  *) echo "npm-ci-tracked-lock: unsupported installer: $2" >&2; exit 1 ;;
+esac
 shift 2
+in_place=false
+if [ "$1" = --in-place ]; then
+  in_place=true
+  shift
+fi
+fixture=$1
+shift
 lock="$fixture/package-lock.json"
-if ! command -v sfw >/dev/null; then
-  echo 'npm-ci-tracked-lock: sfw is required; install refused' >&2
+if [ "$in_place" = true ]; then
+  prefix=$fixture
+else
+  prefix=$1
+  shift
+fi
+if ! command -v "${installer[0]}" >/dev/null; then
+  echo "npm-ci-tracked-lock: ${installer[0]} is required; install refused" >&2
   exit 1
 fi
 for arg in "$@"; do
@@ -35,7 +51,7 @@ if [ "${GITHUB_ACTIONS:-}" = true ]; then
   revision=$GITHUB_SHA
 fi
 echo "npm-ci-tracked-lock: reading fixture files from $revision"
-if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+if [ "$in_place" = false ] && { [ -e "$prefix" ] || [ -L "$prefix" ]; }; then
   if [ ! -d "$prefix" ] || [ ! -r "$prefix" ] || [ ! -x "$prefix" ]; then
     echo "npm-ci-tracked-lock: cannot inspect prefix: $prefix" >&2
     exit 1
@@ -47,7 +63,13 @@ if [ -e "$prefix" ] || [ -L "$prefix" ]; then
     exit 1
   fi
 fi
-mkdir -p -- "$prefix"
+if [ -e "$prefix/npm-shrinkwrap.json" ] || [ -L "$prefix/npm-shrinkwrap.json" ]; then
+  echo "npm-ci-tracked-lock: npm-shrinkwrap.json refused: $prefix/npm-shrinkwrap.json" >&2
+  exit 1
+fi
+if [ "$in_place" = false ]; then
+  mkdir -p -- "$prefix"
+fi
 committed=$(mktemp -d)
 trap 'rm -f -- "$committed/package-lock.json" "$committed/package.json"; rmdir -- "$committed"' EXIT
 for path in "$lock" "$fixture/package.json"; do
@@ -56,8 +78,18 @@ for path in "$lock" "$fixture/package.json"; do
     exit 1
   fi
 done
-cp "$committed/package.json" "$committed/package-lock.json" "$prefix/"
-sfw npm ci --prefix "$prefix" "$@"
+if [ "$in_place" = true ]; then
+  for file in package-lock.json package.json; do
+    if ! cmp -- "$committed/$file" "$fixture/$file"; then
+      echo "npm-ci-tracked-lock: working file differs from $revision: $fixture/$file" >&2
+      exit 1
+    fi
+  done
+  (cd -- "$fixture" && "${installer[@]}" ci "$@")
+else
+  cp "$committed/package.json" "$committed/package-lock.json" "$prefix/"
+  "${installer[@]}" ci --prefix "$prefix" "$@"
+fi
 if ! cmp -- "$committed/package-lock.json" "$prefix/package-lock.json"; then
   exit 1
 fi

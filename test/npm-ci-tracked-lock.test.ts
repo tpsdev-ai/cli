@@ -36,7 +36,7 @@ const { readFileSync, writeFileSync } = require("node:fs");
 const { join, basename } = require("node:path");
 const argv = process.argv.slice(2);
 if (basename(process.argv[1]) === "npm") writeFileSync(process.env.RECORD + ".npm-call", JSON.stringify({ argv, cwd: process.cwd() }));
-const prefix = argv[argv.indexOf("--prefix") + 1];
+const prefix = argv.includes("--prefix") ? argv[argv.indexOf("--prefix") + 1] : process.cwd();
 const lockPath = join(prefix, "package-lock.json");
 const record = { argv, cwd: process.cwd(), lock: readFileSync(lockPath, "utf8"), manifest: readFileSync(join(prefix, "package.json"), "utf8") };
 `;
@@ -69,7 +69,7 @@ it("the helper copies the committed fixture and invokes npm ci through sfw with 
   harness((h) => {
     const lock = readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8");
     const manifest = readFileSync(join(REPO, FIXTURE, "package.json"), "utf8");
-    const result = h.run([HELPER, FIXTURE, h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"]);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"]);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
     expect(result.stdout).toContain("reading fixture files from HEAD");
     const args = ["ci", "--prefix", h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"];
@@ -87,7 +87,7 @@ it.each(["untracked", "missing"])("the helper refuses the %s lock before npm run
       writeFileSync(join(fixture, "package.json"), "{}");
       writeFileSync(join(fixture, "package-lock.json"), "{}");
     }
-    const result = h.run([HELPER, fixture, h.prefix]);
+    const result = h.run([HELPER, "--via", "sfw", fixture, h.prefix]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain(`cannot read committed file: ${fixture}/package-lock.json`);
     h.assertNoInstall();
@@ -110,7 +110,7 @@ it("the helper passes committed bytes to a stub installer despite a modified wor
     const manifest = committed("package.json");
     writeFileSync(join(repo, FIXTURE, "package-lock.json"), "working-tree lock\n");
     writeFileSync(join(repo, FIXTURE, "package.json"), "working-tree manifest\n");
-    const result = h.run([HELPER, FIXTURE, h.prefix], {}, repo);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix], {}, repo);
     expect(h.installed().lock).toBe(lock);
     expect(h.installed().manifest).toBe(manifest);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
@@ -141,6 +141,104 @@ function fixtureRepo(root: string) {
   return { repo, git, write };
 }
 
+function workingFixture(h: ReturnType<typeof makeHarness>) {
+  const repo = join(h.root, "repo");
+  mkdirSync(join(repo, FIXTURE), { recursive: true });
+  const result = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: REPO, encoding: "utf8", timeout: 10_000 });
+  expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+  symlinkSync(result.stdout.trim(), join(repo, ".git"));
+  for (const file of ["package-lock.json", "package.json"]) {
+    const committed = spawnSync("git", ["show", `HEAD:${FIXTURE}/${file}`], { cwd: REPO, encoding: "utf8", timeout: 10_000 });
+    expect({ status: committed.status, stderr: committed.stderr }).toMatchObject({ status: 0 });
+    writeFileSync(join(repo, FIXTURE, file), committed.stdout);
+  }
+  mkdirSync(join(repo, "scripts"));
+  writeFileSync(join(repo, "scripts/npm-ci-tracked-lock.sh"), readFileSync(HELPER));
+  return repo;
+}
+
+it.each(["npm-shrinkwrap.json", "package-lock.json", "package.json"])(
+  "in-place install refuses a prior workflow step writing %s before the installer runs", (file) => {
+    harness((h) => {
+      const repo = workingFixture(h);
+      const run = `echo '{}' > ${FIXTURE}/${file}`;
+      const install = `bash scripts/npm-ci-tracked-lock.sh --via npm --in-place ${FIXTURE} --ignore-scripts`;
+      const source = `jobs:\n  build:\n    steps:\n      - run: ${run}\n      - run: ${install}\n`;
+      const steps = parseWorkflow(source).jobs.build.steps;
+      expect(npmCiLockDirs(steps[0].run!, "", "prior writer")).toEqual([]);
+      expect(npmCiLockDirs(steps[1].run!, "", "install")).toEqual([FIXTURE]);
+      const prior = h.run(["-c", steps[0].run!], {}, repo);
+      expect({ status: prior.status, stderr: prior.stderr }).toMatchObject({ status: 0 });
+      const result = h.run(["-c", steps[1].run!], {}, repo);
+      h.assertNoInstall();
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(file === "npm-shrinkwrap.json"
+        ? `npm-shrinkwrap.json refused: ${FIXTURE}/${file}`
+        : `working file differs from HEAD: ${FIXTURE}/${file}`);
+    });
+  }, 30_000,
+);
+
+it.each(["npm", "sfw"])("in-place install uses the literal %s installer and preserves committed bytes", (via) => {
+  harness((h) => {
+    const repo = workingFixture(h);
+    const lock = readFileSync(join(repo, FIXTURE, "package-lock.json"), "utf8");
+    const manifest = readFileSync(join(repo, FIXTURE, "package.json"), "utf8");
+    const result = h.run([HELPER, "--via", via, "--in-place", FIXTURE, "--ignore-scripts"], {}, repo);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(h.installed()).toEqual({ argv: ["ci", "--ignore-scripts"], cwd: join(repo, FIXTURE), lock, manifest });
+    if (via === "sfw") expect(h.firewalled().argv).toEqual(["npm", "ci", "--ignore-scripts"]);
+    else expect(() => h.firewalled()).toThrow(/ENOENT/);
+    expect(readFileSync(join(repo, FIXTURE, "package-lock.json"), "utf8")).toBe(lock);
+  }, via === "sfw");
+}, 30_000);
+
+it("in-place install refuses a dangling shrinkwrap symlink", () => {
+  harness((h) => {
+    const repo = workingFixture(h);
+    symlinkSync("missing", join(repo, FIXTURE, "npm-shrinkwrap.json"));
+    const result = h.run([HELPER, "--via", "npm", "--in-place", FIXTURE], {}, repo);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`npm-shrinkwrap.json refused: ${FIXTURE}/npm-shrinkwrap.json`);
+    h.assertNoInstall();
+  });
+}, 30_000);
+
+it("in-place install refuses a lock rewritten by the installer", () => {
+  harness((h) => {
+    const repo = workingFixture(h);
+    const result = h.run([HELPER, "--via", "npm", "--in-place", FIXTURE], { REWRITE_LOCK: "1" }, repo);
+    expect(h.installed().argv).toEqual(["ci"]);
+    expect(result.status).not.toBe(0);
+  });
+}, 30_000);
+
+it.each([{ args: [] }, { args: ["--via", "other"] }, { args: ["--via"] }])("the helper refuses missing or invalid installer arguments %j", ({ args }) => {
+  harness((h) => {
+    const result = h.run([HELPER, ...args, "--in-place", FIXTURE]);
+    expect(result.status).not.toBe(0);
+    h.assertNoInstall();
+  });
+}, 30_000);
+
+it("the real workflow installs through four in-place npm calls and one sfw prefix call", () => {
+  const workflow = parseWorkflow(readFileSync(join(REPO, ".github/workflows/test.yml"), "utf8"));
+  const sites: { job: string; run: string }[] = [];
+  for (const [job, value] of Object.entries(workflow.jobs)) {
+    for (const step of value.steps) {
+      if (step.run === undefined) continue;
+      const dirs = npmCiLockDirs(step.run, step["working-directory"] ?? value.defaults?.run?.["working-directory"] ?? "", job);
+      if (dirs.length) sites.push({ job, run: step.run });
+    }
+  }
+  const mail = "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts";
+  const review = "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts";
+  expect(sites.filter((site) => site.job !== "heartbeat-real-openclaw").map((site) => site.run.trim()).sort()).toEqual([mail, mail, review, review].sort());
+  expect(sites.filter((site) => site.job === "heartbeat-real-openclaw").map((site) => site.run)).toEqual([
+    expect.stringContaining('bash scripts/npm-ci-tracked-lock.sh --via sfw test/fixtures/heartbeat-openclaw "$prefix" --ignore-scripts --no-audit --no-fund'),
+  ]);
+}, 5_000);
+
 it("the helper reads GITHUB_SHA bytes when HEAD moved after checkout under Actions", () => {
   harness((h) => {
     const { repo, git, write } = fixtureRepo(h.root);
@@ -151,7 +249,7 @@ it("the helper reads GITHUB_SHA bytes when HEAD moved after checkout under Actio
     git("add", ".");
     git("commit", "-qm", "fixture changed");
     expect(git("rev-parse", "HEAD")).not.toBe(sha);
-    const result = h.run([HELPER, FIXTURE, h.prefix], { GITHUB_ACTIONS: "true", GITHUB_SHA: sha }, repo);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix], { GITHUB_ACTIONS: "true", GITHUB_SHA: sha }, repo);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
     expect(result.stdout).toContain(`reading fixture files from ${sha}`);
     expect(h.installed().lock).toBe(lock);
@@ -164,7 +262,7 @@ it.each([undefined, "", "malformed", "a".repeat(39), "g".repeat(40)])(
     harness((h) => {
       const extra: Record<string, string> = { GITHUB_ACTIONS: "true" };
       if (sha !== undefined) extra.GITHUB_SHA = sha;
-      const result = h.run([HELPER, FIXTURE, h.prefix], extra);
+      const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix], extra);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("GITHUB_SHA must be 40 hex characters under GitHub Actions");
       h.assertNoInstall();
@@ -177,7 +275,7 @@ it.each(["npm-shrinkwrap.json", "package-lock.json", ".occupied"])(
     harness((h) => {
       mkdirSync(h.prefix);
       writeFileSync(join(h.prefix, file), "{}");
-      const result = h.run([HELPER, FIXTURE, h.prefix]);
+      const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix]);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(`non-empty prefix refused: ${h.prefix}`);
       h.assertNoInstall();
@@ -188,7 +286,7 @@ it.each(["npm-shrinkwrap.json", "package-lock.json", ".occupied"])(
 it("the helper accepts an existing empty prefix", () => {
   harness((h) => {
     mkdirSync(h.prefix);
-    const result = h.run([HELPER, FIXTURE, h.prefix]);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix]);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
     expect(h.installed().lock).toBe(readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8"));
   });
@@ -220,7 +318,7 @@ it("the gate refuses a tracked nested npm-shrinkwrap.json before registry lookup
 
 it("the helper refuses a lock rewritten by npm after the install", () => {
   harness((h) => {
-    const result = h.run([HELPER, FIXTURE, h.prefix], { REWRITE_LOCK: "1" });
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix], { REWRITE_LOCK: "1" });
     expect(h.installed().lock).toBe(readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8"));
     expect(result.status).not.toBe(0);
   });
@@ -228,7 +326,7 @@ it("the helper refuses a lock rewritten by npm after the install", () => {
 
 it("the helper refuses when sfw is absent without invoking bare npm", () => {
   harness((h) => {
-    const result = h.run([HELPER, FIXTURE, h.prefix]);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("sfw is required; install refused");
     h.assertNoInstall();
@@ -237,7 +335,7 @@ it("the helper refuses when sfw is absent without invoking bare npm", () => {
 
 it("the helper propagates npm failure", () => {
   harness((h) => {
-    const result = h.run([HELPER, FIXTURE, h.prefix], { NPM_EXIT: "9" });
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix], { NPM_EXIT: "9" });
     expect(h.installed().lock).toBe(readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8"));
     expect(result.status).toBe(9);
   });
@@ -245,7 +343,7 @@ it("the helper propagates npm failure", () => {
 
 it("the helper refuses a directory override before npm runs", () => {
   harness((h) => {
-    const result = h.run([HELPER, FIXTURE, h.prefix, "--prefix", "elsewhere"]);
+    const result = h.run([HELPER, "--via", "sfw", FIXTURE, h.prefix, "--prefix", "elsewhere"]);
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("directory override refused: --prefix");
     h.assertNoInstall();
@@ -315,7 +413,7 @@ it.each(quotedValues)("scans quoted value %j", (value, names) => {
 }, 5_000);
 
 it("checks greedily consumed names against prior assignments", () => {
-  const helper = 'bash scripts/npm-ci-tracked-lock.sh test/fixtures/heartbeat-openclaw "$prefix"';
+  const helper = 'bash scripts/npm-ci-tracked-lock.sh --via sfw test/fixtures/heartbeat-openclaw "$prefix"';
   expect(() => npmCiLockDirs('a="literal"\nprefix="$a0"\n' + helper, "", "guard")).toThrow();
   expect(npmCiLockDirs('a0="literal"\nprefix="$a0"\n' + helper, "", "guard")).toEqual([FIXTURE]);
 }, 5_000);

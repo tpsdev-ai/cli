@@ -143,9 +143,11 @@ describe("this repository's test job", () => {
       [7, ".", false],
       [8, ".", false],
       [9, ".", false],
-      [10, "plugins/openclaw-tps-mail", false],
-      [11, "plugins/openclaw-github-review", false],
-      [12, ".", true],
+      [10, ".", false],
+      [11, "plugins/openclaw-tps-mail", false],
+      [12, ".", false],
+      [13, "plugins/openclaw-github-review", false],
+      [14, ".", true],
     ]);
     expect(t.steps[0].script).toBe("node scripts/check-dep-ages.mjs --ci");
     expect(t.steps[1].script).toBe("sfw bun install --frozen-lockfile");
@@ -171,10 +173,11 @@ describe("this repository's test job", () => {
     // the planned env alone cannot show the step declares none: parse the
     // workflow the way the planner does and require no env key on the step.
     expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(false);
-    expect(t.steps[5].script).toContain("npm ci --ignore-scripts");
-    expect(t.steps[6].script).toContain("npm ci --ignore-scripts");
+    expect(t.steps[5].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts");
     expect(t.steps[6].script).toContain("bun run test");
-    expect(t.steps[7].script).toBe("node scripts/check-test-reports.mjs");
+    expect(t.steps[7].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts");
+    expect(t.steps[8].script).toContain("bun run test");
+    expect(t.steps[9].script).toBe("node scripts/check-test-reports.mjs");
   });
 
   test("the no-env check on the HOME-isolated step sees every YAML spelling of an env key", () => {
@@ -207,6 +210,8 @@ describe("this repository's test job", () => {
       [10, node],
       [11, node],
       [12, node],
+      [13, node],
+      [14, node],
     ]);
   });
 

@@ -18,28 +18,27 @@ without editing a list.
 
 The workflow guard inspects `npm ci` written directly in workflow `run:` steps
 and calls to `scripts/npm-ci-tracked-lock.sh`; installs inside other script files
-or composite actions are not inspected. It accepts raw `npm ci` (optionally
-behind `sfw`) without `--prefix` or lockfile writes in the step, using the
-step/default working directory and at most one leading literal
-`cd <relative path> &&`. The other accepted shape is the helper with a literal
-relative fixture directory whose `package-lock.json` is tracked. Helper steps
-allow `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including literal
-`node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper calls and `GITHUB_ENV` echoes.
-Other command shapes are refused. The raw guard and helper limit install flags to `--ignore-scripts`,
-`--no-audit` and `--no-fund`.
+or composite actions are not inspected. It accepts helper calls with a literal
+relative tracked directory and a required literal `--via npm` or `--via sfw`.
+Raw `npm ci` is refused, naming the job, step and line. Helper steps allow
+`set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
+literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
+calls and `GITHUB_ENV` echoes. Other helper-step lines are refused. The helper
+limits install flags to `--ignore-scripts`, `--no-audit` and `--no-fund`.
 
 The gate refuses tracked `npm-shrinkwrap.json` files anywhere in the repository.
-The helper requires `sfw` and an absent or empty prefix. Under GitHub Actions,
-it reads the fixture's manifest and lock from `GITHUB_SHA`, which must be 40 hex
-characters; locally it uses `HEAD`. It logs the selected revision and refuses if
-either file is absent there. It copies those bytes into the prefix and runs
-`sfw npm ci --prefix` there. After the install, `cmp` compares the copied
-`package-lock.json` with the saved committed lock.
-
-The gate and guard protect against drift: a lockfile, workflow or fixture change
-that would install packages the gate did not age. The workflow file itself is
-reviewed code; the guard constrains the shapes it accepts so drift cannot hide
-in them.
+The helper selects `GITHUB_SHA` under GitHub Actions (required to be 40 hex
+characters), or `HEAD` locally, and logs that revision. It requires the selected
+installer and reads the tracked directory's manifest and lock from that revision.
+In prefix mode it requires an absent or empty prefix and copies those bytes there.
+In `--in-place` mode it refuses `npm-shrinkwrap.json` in the install directory,
+including untracked files, and verifies that the working `package-lock.json` and
+`package.json` are byte-identical to the selected revision before installing there.
+Both modes compare the installed directory's `package-lock.json` against the saved
+revision bytes after the install. The drift check rests on this install-time
+verification. The heartbeat uses `--via sfw`; plugin installs use `--via npm`.
+#818 defers hermetic local-registry adversarial coverage; the heartbeat CI step
+already runs real npm through `sfw`.
 
 Add one line per exception under the `## Exceptions` heading below, in this
 exact shape:

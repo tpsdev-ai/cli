@@ -149,6 +149,8 @@ jobs:
             echo "::error::the suite wrote $iso_home/.tps — HOME is not isolated"
             exit 1
           fi
+      - name: Install openclaw-tps-mail dependencies
+        run: bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts
       - name: openclaw-tps-mail plugin tests (isolated HOME launcher)
         # cli#398: the plugin's outbox/archive writers resolve ~/.tps and the CLI
         # mail dirs from the process HOME, so the suite MUST run through its
@@ -157,15 +159,15 @@ jobs:
         # `bun test` aborts by name in the test preload before any module loads.
         working-directory: plugins/openclaw-tps-mail
         run: |
-          npm ci --ignore-scripts   # frozen, from the plugin's own package-lock.json — NEVER a bun install that writes a lockfile
           npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js
           bun run test              # the isolated launcher (see scripts/run-tests.mjs)
+      - name: Install openclaw-github-review dependencies
+        run: bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts
       - name: openclaw-github-review plugin tests (isolated HOME launcher)
         # The github_review tool plugin writes its JUnit report for the cli#411
         # guard below; it shares no code or dependency with the mail plugin.
         working-directory: plugins/openclaw-github-review
         run: |
-          npm ci --ignore-scripts
           npm run build
           npm run typecheck:test
           bun run test
@@ -211,10 +213,11 @@ jobs:
       - run: bun run build
       - name: Show the node that the gateway analog runs under
         run: node --version
-      - name: Install + build the plugin
+      - name: Install openclaw-tps-mail dependencies
+        run: bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts
+      - name: Build the plugin
         working-directory: plugins/openclaw-tps-mail
         run: |
-          npm ci --ignore-scripts # frozen, from the plugin's own package-lock.json; deps are file: links + the SDK; no lifecycle scripts on PR-controlled code
           npm run build           # tsc is GREEN after cli#393 — a compile failure MUST fail the job, never be swallowed
           test -f dist/src/index.js
       - name: Import the built plugin under node
@@ -261,7 +264,7 @@ jobs:
           set -euo pipefail
           pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"
           prefix="$RUNNER_TEMP/openclaw-$pin"
-          bash scripts/npm-ci-tracked-lock.sh test/fixtures/heartbeat-openclaw "$prefix" --ignore-scripts --no-audit --no-fund
+          bash scripts/npm-ci-tracked-lock.sh --via sfw test/fixtures/heartbeat-openclaw "$prefix" --ignore-scripts --no-audit --no-fund
           echo "OPENCLAW_BIN_DIR=$prefix/node_modules/.bin" >> "$GITHUB_ENV"
       - name: Run heartbeat against the pinned OpenClaw
         run: node scripts/heartbeat-real-openclaw-lane.mjs
@@ -301,10 +304,11 @@ jobs:
           mode: firewall-free
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
-      - name: Install + build the github-review plugin
+      - name: Install openclaw-github-review dependencies
+        run: bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts
+      - name: Build the github-review plugin
         working-directory: plugins/openclaw-github-review
         run: |
-          npm ci --ignore-scripts
           npm run build
           npm run typecheck:test
           test -f dist/src/index.js

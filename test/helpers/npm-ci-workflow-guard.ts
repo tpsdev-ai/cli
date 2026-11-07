@@ -43,16 +43,7 @@ function resolveRepoDir(base: string, target: string, label: string): string {
   return parts.join("/");
 }
 
-/**
- * Inspect npm ci written directly in workflow run text, plus the tracked-lock
- * helper. Script files and composite actions are not inspected. Accept raw npm
- * ci without --prefix, using the step/default directory and at most one leading
- * literal cd, or the helper with a literal relative fixture. Refuse other shapes.
- * Helper steps allow set -euo pipefail, allowlisted quoted assignments with lowercase names, a literal node
- * scripts/heartbeat-real-openclaw-lane.mjs --pin substitution, helper calls and GITHUB_ENV echoes only.
- * The helper requires sfw and committed manifest/lock bytes, then compares the copied package-lock.json.
- * The gate refuses tracked npm-shrinkwrap.json files; the helper refuses non-empty prefixes.
- */
+/** Inspect direct workflow run text and helper calls; scripts and composite actions are outside this guard. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
     .filter((line) => line !== "" && !line.startsWith("#"));
@@ -61,9 +52,11 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     throw new Error(`${label}: cannot establish the npm ci directory: ${reason}`);
   };
   if (!lines.some(isInstall)) {
-    if (/\bnpm\b.*\bci\b/.test(run.replace(/\\\n\s*/g, " "))) refuse("unsupported multiline npm ci shape");
+    if (/\bnpm\b(?!-).*\bci\b/.test(run.replace(/\\\n\s*/g, " "))) refuse("unsupported multiline npm ci shape");
     return [];
   }
+  const raw = lines.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line));
+  if (raw !== undefined) refuse(`raw npm ci is refused; use the tracked-lock helper: ${raw}`);
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
   if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
     const allowedSubstitutions = new Set(['"$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"']);
@@ -87,10 +80,11 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         assigned.add(name);
         continue;
       }
-      const helper = line.match(/^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh ([A-Za-z0-9_./-]+) ("[^"\r\n]*"|'[^'\r\n]*')(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/);
-      if (helper !== null && !helper[1].startsWith("/") && helper[1] !== "-" && quotedValue(helper[2]) &&
+      const helper = line.match(/^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: ("[^"\r\n]*"|'[^'\r\n]*'))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/);
+      if (helper !== null && !helper[3].startsWith("/") && helper[3] !== "-" &&
+          (helper[2] === "--in-place" ? helper[4] === undefined : helper[4] !== undefined && quotedValue(helper[4])) &&
           resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", label) === "scripts/npm-ci-tracked-lock.sh") {
-        dirs.push(resolveRepoDir(workdir, helper[1], label));
+        dirs.push(resolveRepoDir(workdir, helper[3], label));
         continue;
       }
       const echo = line.match(/^echo ("[A-Z_][A-Z0-9_]*=[^"\r\n]*") >> "\$GITHUB_ENV"$/);
@@ -99,43 +93,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     }
     return dirs;
   }
-  if (lines.some((line) => /(?:\b(?:cp|mv|ln|install|tee)\b.*|>{1,2}.*)(?:package-lock|npm-shrinkwrap)\.json/.test(line))) {
-    refuse("lockfile write in the install step");
-  }
-  const dirs: string[] = [];
-  let changedDirectory = false;
-  let uninspectedCommand = false;
-  for (const line of lines) {
-    if (!isInstall(line)) {
-      if (line === "set -euo pipefail") continue;
-      if (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[A-Za-z0-9_./${}-]*"|'[A-Za-z0-9_./-]*'|[A-Za-z0-9_./-]+)$/.test(line) ||
-          line === 'pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"') {
-        uninspectedCommand = true;
-        continue;
-      }
-      if (/^(?:npm|bun) run [A-Za-z0-9_:. -]+$/.test(line) || /^test -f [A-Za-z0-9_./-]+$/.test(line)) {
-        uninspectedCommand = true;
-        continue;
-      }
-      refuse("unsupported command in the install step");
-    }
-    if (changedDirectory) refuse("a prior install changed directory");
-    if (uninspectedCommand) refuse("uninspected command before raw npm ci");
-    const match = line.match(/^(?:cd\s+([A-Za-z0-9_./-]+)\s+&&\s+)?(?:sfw\s+)?npm\s+ci(?:\s+([^;&|`\\(){}<>]*))?$/);
-    if (match === null || match[1]?.startsWith("/") || match[1] === "-") refuse("unsupported raw npm ci shape");
-    if (/(?:^|\s)["']?--prefix(?:[=\s"']|$)/.test(match[2] ?? "")) refuse("raw npm ci --prefix is refused; use the tracked-lock helper");
-    if (/[$]/.test(match[2] ?? "")) refuse("non-literal npm ci arguments");
-    if ((match[2] ?? "").split(/\s+/).filter(Boolean).some((arg) => !["--ignore-scripts", "--no-audit", "--no-fund"].includes(arg))) {
-      refuse("unsupported raw npm ci argument");
-    }
-    changedDirectory = match[1] !== undefined;
-    try {
-      dirs.push(resolveRepoDir(workdir, match[1] ?? ".", label));
-    } catch {
-      refuse("directory leaves the repository root");
-    }
-  }
-  return dirs;
+  refuse(`raw npm ci is refused; use the tracked-lock helper: ${lines.find(isInstall)}`);
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>): number {
