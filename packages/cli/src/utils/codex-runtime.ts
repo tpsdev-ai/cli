@@ -963,7 +963,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+          const baselineResult = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" });
           const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
             flairPublisher: flairPub2,
             onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
@@ -985,7 +985,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           } else {
             await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
           }
-          // Auto-commit after mail task (same as Flair task path)
+          // Auto-commit after mail task
           if (config.autoCommit) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
@@ -1011,13 +1011,26 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
               (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
             if (hasStaleRebase) {
-              console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
-              spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
+              const abortResult = spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
+              if (abortResult.status !== 0) {
+                console.warn(`[${agentId}] Stale rebase abort failed (exit ${abortResult.status}): ${abortResult.stderr?.trim().split("\n")[0] ?? ""} — skipping autoCommit`);
+                continue;
+              }
+              console.warn(`[${agentId}] Stale rebase aborted before autoCommit`);
             }
             // Check for file changes or Codex-created commits before attempting autoCommit
             const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
-            const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
-            const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
+            const currentHeadResult = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" });
+            const failedProbe = baselineResult.status !== 0 ? "git rev-parse HEAD (before task)"
+              : gitStatusResult.status !== 0 ? "git status --porcelain"
+              : currentHeadResult.status !== 0 ? "git rev-parse HEAD (after task)" : null;
+            if (failedProbe) {
+              const message = `Change check could not run: ${failedProbe} failed — skipping autoCommit`;
+              console.warn(`[${agentId}] ${message}`);
+              notify(msg.from, message);
+              continue;
+            }
+            const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baselineResult.stdout?.trim(), currentHeadResult.stdout?.trim());
             if (!hasChanges) {
               console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
               notify(msg.from,
