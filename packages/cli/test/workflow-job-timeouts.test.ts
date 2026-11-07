@@ -1,12 +1,11 @@
 /**
- * workflow-job-timeouts.test.ts — a CI job that runs tests fails after a bounded
- * time instead of hanging (cli#799).
+ * workflow-job-timeouts.test.ts — a CI job fails after a bounded time instead of
+ * hanging (cli#799).
  *
  * Three runs hung at once: `test` ran 3 hours and `docker` 35-50 minutes,
  * against a normal 18-23, with no `timeout-minutes` and GitHub's 6-hour
- * default. This holds the timeout on every job that runs a suite or a
- * test-like lane, and makes a NEW job choose a list: it must be named as a
- * timeout job, or exempt with a reason.
+ * default. This holds a timeout on every job in test.yml, and makes a NEW job
+ * choose a list: it must be named as a timeout job, or exempt with a reason.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
@@ -23,37 +22,40 @@ interface Workflow {
 
 const WORKFLOW = join(import.meta.dir, "..", "..", "..", ".github", "workflows", "test.yml");
 
-/** Jobs that run a test suite or a test-like lane (fixtures, gates, a built binary). */
+/** Jobs whose timeout this test holds. */
 const TIMEOUT_JOBS = [
-  "test",
-  "docker",
+  "build",
   "lint",
   "promote-latest-fixtures",
+  "test",
   "node-plugin-load",
   "heartbeat-real-openclaw",
   "github-review-gateway-boundary",
   "reviewer-image",
+  "audit",
+  "docker",
   "binary-smoke",
   "nono-profile-gate",
+  "sast-semgrep",
+  "sast-codeql",
 ];
 
 /**
  * The smallest timeout allowed. A job's timeout counts from job start, so
- * checkout, setup and a cold `bun install` are inside it; a shorter bound
- * would fail a healthy run on a slow day.
+ * checkout, setup and a cold `bun install` are inside it; the floor allows
+ * headroom for those on a slow day.
  */
 const MIN_TIMEOUT_MINUTES = 10;
 
-/** Jobs that run no tests, and why. */
-const EXEMPT: Record<string, string> = {
-  build: "installs dependencies and runs the TypeScript build; no test step",
-  audit: "runs `bun audit` only; no test step",
-  "sast-semgrep": "runs the Semgrep scanner only; no test step",
-  "sast-codeql": "runs the CodeQL scanner only; no test step",
-};
+/** Jobs that run no tests, and why. Empty: every job is covered above. */
+const EXEMPT: Record<string, string> = {};
 
 function loadWorkflow(): Workflow {
   return yaml.load(readFileSync(WORKFLOW, "utf8")) as Workflow;
+}
+
+function displayValue(value: unknown): string {
+  return value === undefined ? "missing" : JSON.stringify(value);
 }
 
 function isPositiveInteger(value: unknown): boolean {
@@ -65,34 +67,39 @@ function timeoutProblems(
   timeoutJobs: readonly string[] = TIMEOUT_JOBS,
   exempt: Record<string, string> = EXEMPT,
 ): string[] {
-  const jobs = Object.keys(wf.jobs ?? {});
+  const jobs = wf.jobs ?? {};
+  const ids = Object.keys(jobs);
   const problems: string[] = [];
-  for (const id of jobs) {
+  for (const id of ids) {
     if (timeoutJobs.includes(id) || Object.hasOwn(exempt, id)) continue;
-    problems.push(`job "${id}" is neither in TIMEOUT_JOBS nor exempt; add it to one`);
+    problems.push(
+      `job "${id}" timeout-minutes ${displayValue(jobs[id]?.["timeout-minutes"])}: neither in TIMEOUT_JOBS nor exempt`,
+    );
   }
   for (const id of timeoutJobs) {
-    if (!jobs.includes(id)) {
-      problems.push(`job "${id}" is in TIMEOUT_JOBS but not in test.yml`);
-    } else if (!isPositiveInteger(wf.jobs?.[id]?.["timeout-minutes"])) {
-      problems.push(`job "${id}" does not set a positive integer timeout-minutes`);
-    } else {
-      const value = wf.jobs?.[id]?.["timeout-minutes"] as number;
-      if (value < MIN_TIMEOUT_MINUTES) {
-        problems.push(
-          `job "${id}" sets timeout-minutes ${value}, below the ${MIN_TIMEOUT_MINUTES}-minute floor`,
-        );
-      }
+    const value = jobs[id]?.["timeout-minutes"];
+    if (!ids.includes(id)) {
+      problems.push(
+        `job "${id}" timeout-minutes ${displayValue(value)}: in TIMEOUT_JOBS but not in test.yml`,
+      );
+    } else if (!isPositiveInteger(value)) {
+      problems.push(`job "${id}" timeout-minutes ${displayValue(value)}: not a positive integer`);
+    } else if (value < MIN_TIMEOUT_MINUTES) {
+      problems.push(
+        `job "${id}" timeout-minutes ${value}: below the ${MIN_TIMEOUT_MINUTES}-minute floor`,
+      );
     }
   }
   for (const id of Object.keys(exempt)) {
-    if (!jobs.includes(id)) problems.push(`job "${id}" is exempt but not in test.yml`);
+    if (!ids.includes(id)) {
+      problems.push(`job "${id}" timeout-minutes missing: exempt but not in test.yml`);
+    }
   }
   return problems;
 }
 
 describe("test.yml job timeouts (cli#799)", () => {
-  test("every job that runs tests sets a positive integer timeout-minutes", () => {
+  test("every job in test.yml sets a positive integer timeout-minutes", () => {
     const problems = timeoutProblems(loadWorkflow());
     expect(problems, problems.join("; ")).toEqual([]);
   });
@@ -108,24 +115,33 @@ describe("the timeout rule on fixtures", () => {
   const rule = (jobs: Record<string, Job | null>): string[] =>
     timeoutProblems({ jobs }, ["test"], { build: "this job runs no test step at all" });
 
-  test("a listed job with no timeout fails, naming the job", () => {
+  test("a listed job with no timeout fails, naming the job and value", () => {
     const problems = rule({ test: {}, build: {} });
     expect(problems.join("; ")).toContain(
-      'job "test" does not set a positive integer timeout-minutes',
+      'job "test" timeout-minutes missing: not a positive integer',
     );
   });
 
-  test("a new job in neither list fails, naming the job", () => {
-    const problems = rule({ test: { "timeout-minutes": 50 }, build: {}, "new-lane": {} });
-    expect(problems.join("; ")).toContain('job "new-lane" is neither in TIMEOUT_JOBS nor exempt');
-  });
-
-  test("a zero and a fractional timeout both fail", () => {
+  test("a zero and a fractional timeout both fail, naming the job and value", () => {
     const zero = rule({ test: { "timeout-minutes": 0 }, build: {} });
     const fractional = rule({ test: { "timeout-minutes": 2.5 }, build: {} });
-    expect(zero.join("; ")).toContain('job "test" does not set a positive integer timeout-minutes');
+    expect(zero.join("; ")).toContain('job "test" timeout-minutes 0: not a positive integer');
     expect(fractional.join("; ")).toContain(
-      'job "test" does not set a positive integer timeout-minutes',
+      'job "test" timeout-minutes 2.5: not a positive integer',
+    );
+  });
+
+  test("a non-integer timeout fails, naming the job and value", () => {
+    const problems = rule({ test: { "timeout-minutes": "30" }, build: {} });
+    expect(problems.join("; ")).toContain(
+      'job "test" timeout-minutes "30": not a positive integer',
+    );
+  });
+
+  test("a new job in neither list fails, naming the job and value", () => {
+    const problems = rule({ test: { "timeout-minutes": 50 }, build: {}, "new-lane": {} });
+    expect(problems.join("; ")).toContain(
+      'job "new-lane" timeout-minutes missing: neither in TIMEOUT_JOBS nor exempt',
     );
   });
 
