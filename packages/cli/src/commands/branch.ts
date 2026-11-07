@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, openSync, closeSync, writeSync, watch, readdirSync, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -338,8 +338,8 @@ function hostPath(identityDir: string): string {
   return join(identityDir, "host.json");
 }
 
-/** Escape CR, LF and the other control characters JSON-style so a fallback
- *  report is exactly one line. */
+/** Escape CR, LF, the Unicode line separators and the other control
+ *  characters JSON-style so a fallback report is exactly one line. */
 function escapeLogLine(text: string): string {
   let escaped = "";
   for (const char of text) {
@@ -347,24 +347,45 @@ function escapeLogLine(text: string): string {
     if (code === 0x0a) escaped += "\\n";
     else if (code === 0x0d) escaped += "\\r";
     else if (code === 0x09) escaped += "\\t";
-    else if (code < 0x20 || code === 0x7f) escaped += `\\u${code.toString(16).padStart(4, "0")}`;
-    else escaped += char;
+    else if (code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029) {
+      escaped += `\\u${code.toString(16).padStart(4, "0")}`;
+    } else escaped += char;
   }
   return escaped;
 }
 
+/** Bytes of fallback output we are willing to leave queued on stderr before
+ *  dropping lines instead of writing more. */
+const STDERR_FALLBACK_CAP_BYTES = 64 * 1024;
+
+/** Fallback lines dropped since the last fallback line that was written. */
+let droppedFallbackLines = 0;
+
+// A stderr stream error (a closed pipe, for example) arrives asynchronously;
+// without a listener it is uncaught and ends the daemon. The fallback cannot
+// report anything when stderr itself fails, so the error is swallowed.
+process.stderr.on("error", () => {});
+
 /** Best-effort branch log append: never throws, so logging cannot abort the
- *  daemon. On append failure it writes one escaped line synchronously to stderr
- *  carrying the original line and the append error; a stderr failure is
- *  swallowed too, so handling continues. */
+ *  daemon. On append failure it attempts one escaped line on stderr carrying
+ *  the original line and the append error. The write is bounded and
+ *  non-blocking: lines are dropped while stderr is not being drained, and every
+ *  failure is swallowed, so handling continues. */
 export function logLine(event: string, msg: string): void {
   const line = `[${new Date().toISOString()}] ${event}: ${msg}`;
   try {
     appendFileSync(logPath(), `${line}\n`, "utf-8");
   } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    if (process.stderr.writableLength >= STDERR_FALLBACK_CAP_BYTES) {
+      droppedFallbackLines += 1;
+      return;
+    }
+    const dropped = droppedFallbackLines;
+    const suffix = dropped > 0 ? ` (${dropped} fallback lines dropped)` : "";
     try {
-      const detail = error instanceof Error ? error.message : String(error);
-      writeSync(2, `${escapeLogLine(`${line} (log append failed: ${detail}`)}\n`);
+      process.stderr.write(`${escapeLogLine(`${line} (log append failed: ${detail})${suffix}`)}\n`);
+      droppedFallbackLines = 0;
     } catch {}
   }
 }
@@ -580,9 +601,10 @@ async function runStart(): Promise<void> {
     } catch (error) {
       // A state write failure must not stop message handling: the heartbeat
       // echo and the rest of the handler still run. The log report appends to
-      // the branch log; on append failure it writes one escaped line
-      // synchronously to stderr, and every logging failure is swallowed, so
-      // handling continues.
+      // the branch log; on append failure it attempts one escaped line on
+      // stderr, bounded and non-blocking (lines dropped when stderr is not
+      // being drained), and every logging failure is swallowed, so handling
+      // continues.
       logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
     }
 
