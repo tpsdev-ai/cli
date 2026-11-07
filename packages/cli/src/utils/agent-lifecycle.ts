@@ -13,7 +13,7 @@ import { constants, openSync, closeSync, fstatSync, existsSync, lstatSync, statS
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { homedir } from "node:os";
+import { homeDir } from "./home.js";
 import { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord, OrgEvent } from "./flair-client.js";
 import { catchUpTopics as _catchUpTopics } from "./mail-topics.js";
@@ -25,7 +25,7 @@ const { log: slog, warn: swarn, error: serror } = snooplogg("tps:agent:lifecycle
 // ── Boot context ───────────────────────────────────────────────────────────
 
 function getFallbackDir(agentId: string): string {
-  return join(homedir(), ".tps", "agents", agentId, "fallback");
+  return join(homeDir(), ".tps", "agents", agentId, "fallback");
 }
 
 function getFallbackSoulPath(agentId: string): string {
@@ -391,7 +391,7 @@ function probeRepo(path: string): RepoProbe {
 
 function resolveBaseRepo(workspacePath: string): string | null {
   const candidates = [
-    resolve(join(homedir(), "ops", "tps")),
+    resolve(join(homeDir(), "ops", "tps")),
     resolve(join(dirname(workspacePath), "tps")),
   ];
   for (const candidate of candidates) {

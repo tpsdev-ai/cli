@@ -27,6 +27,7 @@ import {
   startPresenceHeartbeat,
 } from "../src/utils/codex-runtime.js";
 import { FlairClient } from "../src/utils/flair-client.js";
+import { bootContext, snapshotSoulToDisk } from "../src/utils/agent-lifecycle.js";
 import { InvalidLoopIdError, startTaskLoop } from "../src/utils/flair-task-loop.js";
 import * as taskLoops from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
@@ -108,6 +109,8 @@ async function driveRuntime(
     signalDuringPreflight?: boolean;
     secondSignal?: "SIGTERM" | "SIGINT";
     preflightError?: Error;
+    /** Answer the boot preflight /Health probe with 503. */
+    flairOffline?: boolean;
     lateMail?: "poll" | "preparation";
     observeMailAfterExit?: boolean;
     autoCommitFailure?: "rebase" | "status" | "baseline" | "head" | "rebaseProbe";
@@ -164,7 +167,8 @@ async function driveRuntime(
   const captureAutoCommit = Boolean(opts.autoCommitFailure || opts.ignoredFileChange || opts.autoCommitRepo || opts.sendFailure);
   const realGit = childProcess.spawnSync;
   // The rebase/status/baseline fixtures need a valid HEAD for their passing
-  // probes; the real-workspace modes must probe the repository they set up.
+  // probes; the override and ignored-file modes probe the repository they set
+  // up, and the send-failure workspace sets up none.
   const fixtureCwd = opts.autoCommitRepo || opts.ignoredFileChange || opts.sendFailure
     ? undefined
     : join(import.meta.dir, "../../..");
@@ -305,6 +309,7 @@ async function driveRuntime(
     }
     if (path.startsWith("/WorkspaceState")) return Response.json([]);
     if (path === "/Health") {
+      if (opts.flairOffline) return new Response("", { status: 503 });
       if (opts.signalDuringPreflight) await new Promise<void>((resolve) => { releasePreflight = resolve; });
       return new Response("ok", { status: 200 });
     }
@@ -634,6 +639,40 @@ describe("mail auto-commit checks", () => {
       expect([...result.logs, ...result.warnings, ...result.mails].join("\n")).not.toMatch(/no files? (?:were )?chang/i);
     }, 10_000);
   }
+});
+
+describe("codex runtime fallback SOUL under the current HOME (cli#800)", () => {
+  it("writes, notices and reads the fallback SOUL.md at a HOME set after module load", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli800-fallback-home-"));
+    const savedHome = process.env.HOME;
+    const soulPath = join(dir, ".tps", "agents", "testbot", "fallback", "SOUL.md");
+    const warnSpy = spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // The modules above were imported under the launcher's HOME; every site
+      // below must use the fresh HOME set here, not that start-up value.
+      process.env.HOME = dir;
+
+      const writer = { getSoul: async () => [{ key: "name", value: "testbot" }] } as unknown as FlairClient;
+      await snapshotSoulToDisk(writer, "testbot");
+      const written = readFileSync(soulPath, "utf-8");
+      expect(written).toContain("**name:** testbot");
+      expect(existsSync(soulPath)).toBe(true);
+
+      const offline = { ping: async () => false } as unknown as FlairClient;
+      const boot = await bootContext(offline, "testbot", "task", join(dir, "workspace"));
+      expect(boot.identitySource).toBe("disk");
+      expect(boot.systemPrompt).toContain("**name:** testbot");
+
+      await driveRuntime("SIGTERM", undefined, { dir, flairOffline: true });
+      const notices = warnSpy.mock.calls.map((args) => args.join(" ")).join("\n");
+      expect(notices).toContain(`using disk fallback: ${soulPath}`);
+    } finally {
+      warnSpy.mockRestore();
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 describe("codex runtime presence (cli#444)", () => {
