@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
@@ -78,27 +78,43 @@ export function listHostStatePaths(): HostStatePathListing {
   };
 }
 
-function branchStatePath(): string {
+/** Path of the branch connection state record. */
+export function branchStatePath(): string {
   return join(connectionsDir(), "host.json");
 }
 
 const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
- * Write a file atomically: a uniquely named temp file in the same directory,
- * created exclusively with `mode`, renamed over the target. If writing or
- * renaming the temp file throws, the helper attempts to remove it and rethrows
- * the error.
+ * Write a file atomically: a uniquely named temp file in the same directory is
+ * created exclusively with `mode`, written through its descriptor, synced, and
+ * renamed over the target, so a write or rename failure leaves the previous
+ * record intact. The parent directory sync after the rename is best-effort:
+ * directory fsync is not supported everywhere, and the rename is already
+ * atomic for readers. If writing or renaming throws, the helper closes the
+ * descriptor, attempts to remove the temp file, and rethrows the error.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
+  let fd: number | undefined;
   try {
-    writeFileSync(tmpPath, content, { encoding: "utf-8", mode, flag: "wx" });
+    fd = openSync(tmpPath, "wx", mode);
+    writeFileSync(fd, content, "utf-8");
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
     renameSync(tmpPath, filePath);
   } catch (error) {
+    if (fd !== undefined) { try { closeSync(fd); } catch {} }
     try { rmSync(tmpPath, { force: true }); } catch {}
     throw error;
   }
+  // Best-effort only: directory fsync is not supported everywhere, and the
+  // rename is already atomic for readers.
+  try {
+    const dirFd = openSync(dirname(filePath), "r");
+    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+  } catch {}
 }
 
 /** Root of the inter-process lock that owns one host state record. */
@@ -229,6 +245,7 @@ export function clearHostState(branch: string): void {
   });
 }
 
+/** Write the branch connection state record atomically; a failure throws. */
 export function writeBranchState(state: BranchConnectionState): void {
   mkdirSync(connectionsDir(), { recursive: true });
   writeFileAtomic(branchStatePath(), JSON.stringify(state, null, 2), 0o666);

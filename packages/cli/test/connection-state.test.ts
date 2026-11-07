@@ -261,6 +261,30 @@ describe("connection-state", () => {
     const dir = join(home, ".tps", "connections");
     writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
     expect(readBranchState()).toEqual({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    expect(readFileSync(join(dir, "host.json"), "utf-8"))
+      .toBe(JSON.stringify({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 }, null, 2));
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("a failed branch state sync keeps the previous record and removes the temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-branch-sync-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = join(dir, "host.json");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    const before = readFileSync(record);
+
+    const injected = spyOn(fs, "fsyncSync").mockImplementation(() => {
+      throw new Error("injected sync failure");
+    });
+    try {
+      expect(() => writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 4, messagesPushed: 5 }))
+        .toThrow("injected sync failure");
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
   });
 
