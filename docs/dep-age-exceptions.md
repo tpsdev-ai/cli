@@ -21,4 +21,21 @@ Everything above the heading is documentation. Every non-blank line under the
 heading must be an entry; an entry that is undated, has an impossible or past
 date, has no reason, uses invalid semver, or is absent from `bun.lock` fails the gate (exit 2).
 
+## Workspace patterns
+
+When `minimumReleaseAgeExcludes` is non-empty, the gate reads the root
+`package.json` `workspaces` patterns to decide which manifests Bun applies. It
+refuses `!`-negated patterns, and patterns it cannot mirror, rather than
+guessing which Bun version to follow:
+
+- a `!`-negated pattern is refused, because Bun 1.3.10 and 1.4.4 resolve some
+  negated spellings to different workspace sets (with
+  `["!packages/x", "packages/*"]`, 1.3.10 installs `packages/x` and
+  `packages/y`, and 1.4.4 installs only `packages/y`);
+- a pattern mixing a `{...}` brace group with a `[...]` character class is
+  refused; the unbalanced spelling `packages/{a,[b}c]` is version-dependent too
+  (1.3.10 installs `packages/a`, 1.4.4 installs nothing).
+
+List only the directories to include.
+
 ## Exceptions
