@@ -1204,7 +1204,8 @@ export async function connectAndKeepAlive(
     }
     failedChannels.add(channel);
   };
-  /** The one close-failure line: record path and reason, never record contents. */
+  /** The close-failure line: it prints the record path and the error text and
+   *  does not read host state; it does not filter what `error.message` contains. */
   const channelCloseFailure = (error: unknown): string =>
     `[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`;
   /** Track one channel's close as pending until it settles; retain the channel
