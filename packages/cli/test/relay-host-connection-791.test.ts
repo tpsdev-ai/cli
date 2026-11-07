@@ -127,6 +127,66 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
   }
 }, 20_000);
 
+test("a rejected heartbeat send whose channel close refuses keeps the record and stop reports it", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-send-close-reject-791-"));
+  const savedEnv = savedRelayEnv();
+  let closes = 0;
+  let sends = 0;
+  let closeStarted!: () => void;
+  const started = new Promise<void>((resolve) => { closeStarted = resolve; });
+  const never = new Promise<TransportChannel>(() => {});
+  const channel: TransportChannel = {
+    async send() {
+      sends++;
+      throw new Error("send failed");
+    },
+    onMessage() {},
+    offMessage() {},
+    async close() {
+      closes++;
+      closeStarted();
+      throw new Error("close refused");
+    },
+    isAlive() { return false; },
+    peerFingerprint() { return "remote"; },
+  };
+  const backoff = fastReconnectBackoff();
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  let connects = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    connects++;
+    return connects === 1 ? channel : never;
+  });
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    const branch = await prepareBranch(root);
+    stop = await connectAndKeepAlive(branch);
+    const path = hostStatePath(branch);
+    await started;
+    // Let the reconnect path finish and reach the next connect, so stop() is
+    // not merely racing the close that is still in flight.
+    for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
+    expect(connects).toBeGreaterThanOrEqual(2);
+    expect(sends).toBe(1);
+    expect(readHostState(branch)).not.toBeNull();
+    await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
+    expect(readHostState(branch)).not.toBeNull();
+    expect(closes).toBeGreaterThanOrEqual(2);
+    expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
+    const closeLines = diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    expect(closeLines.length).toBeGreaterThan(0);
+    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
+    for (const text of closeLines) expect(text).toBe(expectedCloseLine);
+  } finally {
+    await stop?.().catch(() => {});
+    connect.mockRestore();
+    diagnostic.mockRestore();
+    backoff.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
 test("a normal disconnect whose close resolves lets stop clear the record", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-disconnect-resolve-791-"));
   const savedEnv = savedRelayEnv();
