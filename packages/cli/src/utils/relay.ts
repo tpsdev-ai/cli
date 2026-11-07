@@ -1348,8 +1348,12 @@ export async function connectAndKeepAlive(
         channel.offMessage(handler);
         cancelInboundPersist();
         // A graceful disconnect tracks its close like the reconnect path: the
-        // pending close is awaited, and a rejected close retains the channel so
-        // stop() keeps the host record and reports the failure.
+        // pending close is awaited, and a rejected close retains the channel.
+        // stop() retries a retained close: if that retry succeeds the channel
+        // is removed and the record can be cleared; if it rejects, stop()
+        // throws HostChannelCloseError and keeps the record. Today's WS and TCP
+        // channels resolve close() on timeout, so this branch is reached
+        // through the channel interface; the real transports are tracked in #774.
         currentChannel = null;
         pendingChannelClose = (async () => {
           try {

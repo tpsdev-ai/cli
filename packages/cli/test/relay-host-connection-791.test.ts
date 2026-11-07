@@ -42,7 +42,7 @@ async function prepareBranch(root: string): Promise<string> {
   return branch;
 }
 
-/** Hold a host record's lock from this process, so the next write refuses. */
+/** Write a lock marker whose owner cannot be verified, so the next write refuses. */
 function holdHostLock(path: string): string {
   const root = hostStateLockRoot(path);
   const dir = mailLockPath(root);
@@ -51,8 +51,8 @@ function holdHostLock(path: string): string {
   return root;
 }
 
-/** Shorten reconnect waits to a real timer. A microtask here would remove the only
- *  timer between attempts, letting a retry chain starve the test timeout. */
+/** Shorten reconnect waits to a real timer. A microtask here would remove one of
+ *  the timers between attempts; the connect fake also waits on a real timer. */
 const TEST_RECONNECT_BACKOFF_MS = 100;
 function fastReconnectBackoff() {
   return spyOn(globalThis, "setTimeout").mockImplementation(((
@@ -67,7 +67,7 @@ function fastReconnectBackoff() {
   }) as typeof setTimeout);
 }
 
-test("a normal disconnect whose close rejects keeps the record and stop reports it", async () => {
+test("a persistently rejected normal-disconnect close keeps the record and stop reports it", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-disconnect-reject-791-"));
   const savedEnv = savedRelayEnv();
   let closes = 0;
@@ -292,7 +292,7 @@ test("a connect-time host record write failure is reported before reconnecting",
   try {
     const branch = await prepareBranch(root);
     const path = hostStatePath(branch);
-    // A file where the connections directory belongs makes every connect-time
+    // A file where the connections directory belongs makes a connect-time
     // record write fail at once, without the lock's 5 s wait, so attempts are
     // countable inside the test's window.
     blocker = join(root, ".tps", "connections");
@@ -300,8 +300,9 @@ test("a connect-time host record write failure is reported before reconnecting",
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
-    // One attempt per TEST_RECONNECT_BACKOFF_MS: 20 ms later the next attempt is
-    // still 80 ms away. More than one attempt here is a retry with no backoff.
+    // Each reconnect waits TEST_RECONNECT_BACKOFF_MS. This window starts after
+    // the second attempt, so at most one further attempt can start; a retry
+    // with no backoff exceeds the cumulative count of 3.
     await Bun.sleep(20);
     expect(connects).toBeLessThanOrEqual(3);
     const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
@@ -313,6 +314,63 @@ test("a connect-time host record write failure is reported before reconnecting",
     await stop();
   } finally {
     if (blocker) rmSync(blocker, { force: true });
+    await stop?.().catch(() => {});
+    connect.mockRestore();
+    diagnostic.mockRestore();
+    backoff.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 20_000);
+
+test("a second connect-time host record write failure is reported before reconnecting", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-connect-write-second-791-"));
+  const savedEnv = savedRelayEnv();
+  const never = new Promise<TransportChannel>(() => {});
+  const backoff = fastReconnectBackoff();
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  let connects = 0;
+  let branch = "";
+  let path = "";
+  let lockRoot: string | undefined;
+  let firstWriteVisible = false;
+  const releaseLock = () => {
+    if (lockRoot) rmSync(lockRoot, { recursive: true, force: true });
+    lockRoot = undefined;
+  };
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    connects++;
+    if (connects > 1) return never;
+    return {
+      async send() {
+        // The first connect-time write has landed; block the second.
+        firstWriteVisible = readHostState(branch) !== null;
+        lockRoot = holdHostLock(path);
+      },
+      onMessage() {},
+      offMessage() {},
+      async close() {},
+      isAlive() { return true; },
+      peerFingerprint() { return "remote"; },
+    } satisfies TransportChannel;
+  });
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    branch = await prepareBranch(root);
+    path = hostStatePath(branch);
+    stop = await connectAndKeepAlive(branch);
+    for (let i = 0; (connects < 2 || diagnostic.mock.calls.length === 0) && i < 1400; i++) await Bun.sleep(5);
+    expect(connects).toBeGreaterThanOrEqual(2);
+    expect(firstWriteVisible).toBe(true);
+    const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
+    expect(line).toBeDefined();
+    expect(line).toContain(path);
+    expect(line).toContain("Host state record lock");
+    expect(readHostState(branch)).not.toBeNull();
+    releaseLock();
+    await stop();
+  } finally {
+    releaseLock();
     await stop?.().catch(() => {});
     connect.mockRestore();
     diagnostic.mockRestore();
