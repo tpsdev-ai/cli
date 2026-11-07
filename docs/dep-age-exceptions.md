@@ -23,9 +23,9 @@ date, has no reason, uses invalid semver, or is absent from `bun.lock` fails the
 
 ## Workspace patterns
 
-When `minimumReleaseAgeExcludes` is non-empty, the gate reads the root
-`package.json` `workspaces` patterns to decide which manifests Bun applies. It
-refuses these shapes rather than guess which Bun version to follow:
+When `minimumReleaseAgeExcludes` is non-empty, the gate uses its local workspace
+model of the root `package.json` `workspaces` patterns to decide which manifests
+an exclusion applies to. It refuses these shapes:
 
 - a `!`-negated pattern, because Bun 1.3.10 and 1.4.4 resolve some negated
   spellings to different workspace sets (with `["!packages/x", "packages/*"]`,

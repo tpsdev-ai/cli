@@ -1,8 +1,8 @@
-- **When release-age exclusions are configured, the gate refuses workspace patterns whose meaning differs between Bun versions.**
+- **With release-age exclusions, the gate refuses leading `!` patterns, brace/class mixes, extglobs, `|` or bare parentheses outside classes, and brace ranges in workspace patterns.**
 
   When `minimumReleaseAgeExcludes` is non-empty, `scripts/check-dep-ages.mjs`
-  reads the root `package.json` `workspaces` patterns and refuses three shapes
-  instead of modelling which manifests Bun applies: a `!`-negated pattern, a
+  reads the root `package.json` `workspaces` patterns and refuses: a
+  `!`-negated pattern, a
   pattern mixing a `{...}` brace group with a `[...]` character class, and a
   pattern using glob syntax the gate does not model (a `(`, `)` or `|`
   outside a `[...]` class, an extended glob such as `+(...)`, or a brace range

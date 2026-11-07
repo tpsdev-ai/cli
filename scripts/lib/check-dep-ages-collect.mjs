@@ -402,10 +402,8 @@ function hasBraceGroupAndClass(pattern) {
 }
 
 /**
- * A shape whose meaning differs between the Bun versions this repo supports. The
- * gate refuses it instead of modelling one version's answer. The gate reads
- * workspace patterns only when `minimumReleaseAgeExcludes` is non-empty, so a
- * bunfig without exclusions never reaches this refusal.
+ * Refuse leading `!` patterns; some spellings differ across supported Bun versions.
+ * The gate reads workspace patterns when `minimumReleaseAgeExcludes` is non-empty.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
  */
@@ -433,8 +431,8 @@ function unsupportedWorkspacePattern(pattern) {
 
 /**
  * The gate accepts a smaller grammar than Bun.Glob: literals, `/`, `*`, `**`,
- * `?`, `[...]` classes and `{a,b}` alternatives. It refuses the remaining glob
- * syntax, including `(`, `)` and `|` outside a class (Bun reads a paren
+ * `?`, `[...]` classes and `{a,b}` alternatives. It refuses
+ * `(`, `)` and `|` outside a class (Bun reads a paren
  * literally outside an extglob), the extended globs `?(...)`, `*(...)`,
  * `+(...)`, `@(...)` and `!(...)`, and brace ranges such as `{1..3}`. The gate
  * reads workspace patterns only when `minimumReleaseAgeExcludes` is non-empty.
@@ -450,7 +448,7 @@ function unmodelledGlobSyntax(pattern) {
       continue;
     }
     if (ch === "[") {
-      // The model copies a class body into a regex, so its members are literals here.
+      // Skip class contents here; segmentRegex interprets their ranges and negation.
       let end = i + 1;
       if (pattern[end] === "!" || pattern[end] === "^") end += 1;
       if (pattern[end] === "]") end += 1;
@@ -544,8 +542,7 @@ export function workspacePatterns(workspaces) {
 /**
  * Resolve supported workspace patterns; refuse unreadable shapes and spellings.
  *
- * `refuseVersionDependentPatterns` makes the gate fail closed on shapes whose
- * meaning differs between the Bun versions this repo supports. It is off by
+ * `refuseVersionDependentPatterns` enables refusal of leading `!` patterns. It is off by
  * default so the parity tests can still record what the model resolves.
  * `auditExcludes` sets it, and the gate runs the audit only when
  * `minimumReleaseAgeExcludes` is non-empty.

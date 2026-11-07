@@ -463,8 +463,7 @@ it.each([
   60000,
 );
 
-// These shapes mean different workspace sets to Bun 1.3.10 and 1.4.4, so the gate
-// refuses them on every version instead of modelling one version's answer.
+// The gate refuses the leading `!` patterns below instead of modelling one Bun version's answer.
 it.each([
   ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], "!packages/x"],
   ["a negated wildcard pattern", ["!packages/*"], ["packages/a", "packages/b", "tools/t"], "!packages/*"],
