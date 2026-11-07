@@ -2,15 +2,24 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Reads bunfig.toml's install table with Bun's TOML parser. Checks every external
- * version in bun.lock against its minimumReleaseAge (at least 7 days), and that
- * every minimumReleaseAgeExcludes name has an unexpired entry in
+ * Reads bunfig.toml's install table with Bun's TOML parser. Checks external
+ * versions in bun.lock and tracked package-lock.json files (from `git ls-files`;
+ * under TPS_DEP_AGES_ROOT, every package-lock.json in the fixture tree outside
+ * `node_modules` and `.git`), against its minimumReleaseAge (at least 7 days),
+ * and that every minimumReleaseAgeExcludes name has an unexpired entry in
  * docs/dep-age-exceptions.md and an exact declaration Bun applies: a dependency
  * section or `overrides` of the root package.json, or a dependency section of a
  * manifest a root `workspaces` pattern names. A name pinned exactly only in a
  * manifest Bun does not apply is refused, naming that manifest; an override must
  * be in the root package.json, and a resolutions key of `name` or `**\/name` is
- * refused.
+ * refused. An npm lockfile entry with a canonical registry tarball URL is aged as the
+ * package that URL identifies, and is refused, naming the lockfile and entry,
+ * when that URL disagrees with the recorded name or version or is not a registry
+ * tarball URL (query strings and encoded scopes are refused).
+ * A `git:`/`git+...` entry is refused because it has no publish time; a local
+ * `file:` or `workspace:` entry, the root entry and a `link: true` entry are not
+ * checked. An entry without a `resolved` URL is aged by its recorded
+ * name@version regardless of `inBundle`; a versionless entry is refused.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *
@@ -19,7 +28,10 @@
  *       exception covers it), and every excluded name Bun reads has an unexpired entry,
  *       exact declarations, no override in a nested package.json, and no resolutions key naming it
  *   1 — all required publish times are available and an uncovered version is too fresh
- *   2 — missing publish times, unreadable or unparseable required files, Bun not
+ *   2 — missing publish times, unreadable or unparseable required files or npm
+ *       lockfiles, an npm entry with no version, an npm `resolved` URL that is a
+ *       git dependency, is not a registry tarball URL, or does not identify the
+ *       recorded package and version, Bun not
  *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold
  *       or one below 7 days, invalid or unused exceptions, an excluded name without an
  *       unexpired exception or an exact declaration Bun applies, an excluded name pinned
@@ -37,9 +49,11 @@ import { dirname, isAbsolute, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   auditExcludes,
+  collectNpmLockDeps,
   collectResolvedDeps,
   evaluateAges,
   excludesFromInstallTable,
+  lockfilesFromFileList,
   parseBunLock,
   parseExceptions,
   thresholdFromInstallTable,
@@ -217,6 +231,93 @@ function collectPackageJsons(root) {
   return out;
 }
 
+// The limit counts lockfiles, not directory entries.
+const MAX_LOCKFILES = 1000;
+
+/**
+ * Every `package-lock.json` the gate checks. In the repository that is the
+ * tracked set from `git ls-files` (so a new lockfile is read without editing a
+ * list); under a fixture root it is every file of that name in the tree, which
+ * is walked without descending into `node_modules` or `.git`.
+ */
+function collectLockfiles(root) {
+  const out = [];
+  if (ROOT_OVERRIDE === undefined) {
+    const run = spawnSync("git", ["ls-files", "-z"], {
+      cwd: root,
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (run.error) {
+      console.error(`check-dep-ages: cannot run git ls-files: ${run.error.code ?? run.error.message ?? run.error}`);
+      console.error("Refusing, because the tracked lockfiles could not be listed.");
+      process.exit(2);
+    }
+    if (run.status !== 0) {
+      console.error(`check-dep-ages: git ls-files exited ${run.status ?? run.signal}: ${String(run.stderr).trim()}`);
+      console.error("Refusing, because the tracked lockfiles could not be listed.");
+      process.exit(2);
+    }
+    for (const path of lockfilesFromFileList(run.stdout.split("\0"))) {
+      out.push(path);
+    }
+  } else {
+    const pending = [""];
+    const visited = new Set();
+    let realRoot;
+    try {
+      realRoot = realpathSync(root);
+    } catch (err) {
+      console.error(`check-dep-ages: cannot resolve ${root}: ${err?.code ?? err?.message ?? err}`);
+      process.exit(2);
+    }
+    while (pending.length > 0) {
+      const dir = pending.pop();
+      let real;
+      try {
+        real = realpathSync(join(root, dir));
+      } catch (err) {
+        console.error(`check-dep-ages: cannot resolve ${join(root, dir)}: ${err?.code ?? err?.message ?? err}`);
+        process.exit(2);
+      }
+      const rel = relative(realRoot, real);
+      if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+        console.error(`check-dep-ages: ${join(root, dir)} resolves outside the repository root — refusing.`);
+        process.exit(2);
+      }
+      if (visited.has(real)) continue;
+      visited.add(real);
+      let entries;
+      try {
+        entries = readdirSync(real, { withFileTypes: true });
+      } catch (err) {
+        console.error(`check-dep-ages: cannot list ${join(root, dir)}: ${err?.code ?? err?.message ?? err}`);
+        process.exit(2);
+      }
+      for (const entry of entries) {
+        if (entry.name === "node_modules" || entry.name === ".git") continue;
+        const path = dir ? `${dir}${sep}${entry.name}` : entry.name;
+        let stat;
+        try {
+          stat = statSync(join(root, path));
+        } catch (err) {
+          console.error(`check-dep-ages: cannot inspect ${path}: ${err?.code ?? err?.message ?? err}`);
+          process.exit(2);
+        }
+        if (stat.isDirectory()) pending.push(path);
+        else if (stat.isFile() && entry.name === "package-lock.json") out.push(path);
+      }
+    }
+  }
+  const unique = [...new Set(out)].sort();
+  if (unique.length > MAX_LOCKFILES) {
+    console.error(`check-dep-ages: more than ${MAX_LOCKFILES} package-lock.json files — refusing.`);
+    process.exit(2);
+  }
+  return unique;
+}
+
 // ── Gate value, as Bun's TOML parser reads bunfig.toml ──────────────────────
 const installTable = readInstallTableWithBun(readOrExit(join(ROOT, "bunfig.toml"), "bunfig.toml"));
 const { seconds: gateSeconds, error: thresholdError } = thresholdFromInstallTable(installTable);
@@ -331,24 +432,55 @@ try {
   console.error(`check-dep-ages: bun.lock is not parseable: ${err?.message ?? err}`);
   process.exit(2);
 }
-const deps = collectResolvedDeps(lock);
+const bunDeps = collectResolvedDeps(lock);
+
+// ── The npm lockfiles CI installs from ─────────────────────────────────────
+const npmDeps = [];
+const npmLockSummaries = [];
+for (const lockfile of collectLockfiles(ROOT)) {
+  const text = readOrExit(join(ROOT, lockfile), lockfile);
+  let npmLock;
+  try {
+    npmLock = JSON.parse(text);
+  } catch (err) {
+    console.error(`check-dep-ages: ${lockfile} is not parseable: ${err?.message ?? err}`);
+    process.exit(2);
+  }
+  const { deps: entries, problems } = collectNpmLockDeps(npmLock, lockfile);
+  if (problems.length > 0) {
+    for (const problem of problems) {
+      console.error(
+        `check-dep-ages: ${problem.lockfile}${problem.entry ? `: entry ${problem.entry}` : ""}: ${problem.message}`,
+      );
+    }
+    console.error("Refusing, because an entry with an unreadable resolution must not read as absent.");
+    process.exit(2);
+  }
+  npmDeps.push(...entries);
+  npmLockSummaries.push({ lockfile, count: entries.length });
+}
+
+const deps = [...bunDeps, ...npmDeps];
 const resolutions = new Set(deps.map(({ name, version }) => `${name}@${version}`));
 const unusedExceptions = [...exceptionEntries].filter(([key]) => !resolutions.has(key));
 if (unusedExceptions.length > 0) {
   for (const [key, entry] of unusedExceptions) {
-    console.error(`check-dep-ages: line ${entry.line}: unused exception: ${key} — no resolution in bun.lock`);
+    console.error(`check-dep-ages: line ${entry.line}: unused exception: ${key} — no resolution in bun.lock or a tracked package-lock.json`);
   }
   process.exit(2);
 }
 
 if (deps.length === 0) {
-  console.error("check-dep-ages: bun.lock resolves no external packages — refusing (a broken read must not read as a pass).");
+  console.error("check-dep-ages: the lockfiles resolve no external packages — refusing (a broken read must not read as a pass).");
   process.exit(2);
 }
 
 console.log(
   `Checking ${deps.length} external resolved versions against the ${gateDays}-day release-age gate...`,
 );
+for (const summary of npmLockSummaries) {
+  console.log(`    ${summary.lockfile}: ${summary.count} npm entries`);
+}
 
 // ── Publish times ───────────────────────────────────────────────────────────
 function isRetryable(err) {
@@ -427,7 +559,8 @@ if (fetchFails.length > 0 || missing.length > 0) {
   console.error("Failed to fetch publish times:");
   for (const f of fetchFails) console.error(`    ${f.name}${f.version ? `@${f.version}` : ""}: ${f.error}`);
   for (const d of missing) {
-    if (!fetchFails.some((f) => f.name === d.name)) console.error(`    ${d.name}@${d.version}: no publish time in the registry response`);
+    const where = d.lockfile ? `${d.lockfile}: ` : "";
+    if (!fetchFails.some((f) => f.name === d.name)) console.error(`    ${where}${d.name}@${d.version}: no publish time in the registry response`);
   }
   console.error("");
   console.error("Treating as fail (closed). If the registry is genuinely down, retry; do not bypass.");
@@ -438,7 +571,8 @@ if (uncovered.length > 0) {
   console.error(`External packages younger than the ${gateDays}-day release-age gate:`);
   console.error("");
   for (const f of uncovered.sort((a, b) => b.publishedAt - a.publishedAt)) {
-    console.error(`    ${f.name}@${f.version}    — published ${f.ageDays.toFixed(1)} days ago (gate: >=${gateDays} days)`);
+    const where = f.lockfile ? `${f.lockfile}: ` : "";
+    console.error(`    ${where}${f.name}@${f.version}    — published ${f.ageDays.toFixed(1)} days ago (gate: >=${gateDays} days)`);
   }
   console.error("");
   console.error("To let one through: pin an older version, or add a dated entry to");
