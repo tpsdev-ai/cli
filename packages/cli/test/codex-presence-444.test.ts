@@ -25,7 +25,8 @@ import {
   startPresenceHeartbeat,
 } from "../src/utils/codex-runtime.js";
 import { FlairClient } from "../src/utils/flair-client.js";
-import { startTaskLoop } from "../src/utils/flair-task-loop.js";
+import { InvalidLoopIdError, startTaskLoop } from "../src/utils/flair-task-loop.js";
+import * as taskLoops from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import { homeDir } from "../src/utils/home.js";
 import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
@@ -234,7 +235,7 @@ async function driveRuntime(
       releaseMail?.();
       releasePreparation?.();
       await sleep(30);
-      expect(taskGit!.mock.calls, "late mail does not reach workspace sync").toHaveLength(0);
+      expect(taskGit!.mock.calls, "late mail does not reach the Git baseline probe").toHaveLength(0);
       expect(taskSpawn!.mock.calls, "late mail does not launch Codex").toHaveLength(0);
       expect(prepared).toBe(opts.lateMail === "poll" ? 0 : 1);
       expect(resets, "no reset after the boot reset").toBe(1);
@@ -624,7 +625,73 @@ describe("codex runtime presence (cli#444)", () => {
     10_000,
   );
 
-  it.each(["poll", "preparation"] as const)("mail held in %s at SIGTERM stays unacknowledged without workspace sync or task launch", async (lateMail) => {
+  it.each(["review startup", "mail poll"] as const)("stops started loops and removes listeners after %s rejects", async (failure) => {
+    const dir = mkdtempSync(join(tmpdir(), "cli781-rejection-"));
+    const agentId = failure === "review startup" ? "a".repeat(65) : "agent-a";
+    const workspace = join(dir, "workspace");
+    mkdirSync(workspace);
+    const keyPath = join(dir, "agent.key");
+    writeFileSync(keyPath, keySeed().seed);
+    const savedHome = process.env.HOME;
+    const savedMailDir = process.env.TPS_MAIL_DIR;
+    const sigint = process.listeners("SIGINT");
+    const sigterm = process.listeners("SIGTERM");
+    const stops: Array<() => Promise<void>> = [];
+    const originalStart = taskLoops.startTaskLoop;
+    const startSpy = spyOn(taskLoops, "startTaskLoop").mockImplementation((...args) => {
+      const loop = originalStart(...args);
+      stops.push(loop.stop);
+      return loop;
+    });
+    let catchups = 0;
+    const restoreFetch = patchShared(globalThis, "fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe("http://127.0.0.1:9931");
+      if (url.pathname === "/Health") return new Response("ok");
+      if (url.pathname.startsWith("/OrgEventCatchup/")) {
+        catchups++;
+        return Response.json({ events: [], nextAfter: url.searchParams.get("after") ?? url.searchParams.get("since"), hasMore: false });
+      }
+      if (url.pathname.startsWith("/Soul") && init?.method === "GET") return Response.json([]);
+      return new Response(null, { status: 204 });
+    }) as typeof fetch);
+    const pollError = new Error("mail poll failed");
+    const pollSpy = spyOn(runtimeMail, "pollRuntimeMail").mockImplementation(async () => {
+      await waitFor(() => catchups >= 2);
+      throw pollError;
+    });
+    try {
+      process.env.HOME = dir;
+      process.env.TPS_MAIL_DIR = join(dir, "mail");
+      const runtime = runCodexRuntime({
+        agentId, workspace, mailDir: join(dir, "mail", agentId),
+        flairUrl: "http://127.0.0.1:9931", flairKeyPath: keyPath,
+        reviewTrigger: { reviewers: ["reviewer-a"], repo: "example/repo" },
+      });
+      if (failure === "review startup") await expect(runtime).rejects.toBeInstanceOf(InvalidLoopIdError);
+      else await expect(runtime).rejects.toBe(pollError);
+      expect(stops).toHaveLength(failure === "review startup" ? 1 : 2);
+      expect(process.listenerCount("SIGINT")).toBe(sigint.length);
+      expect(process.listenerCount("SIGTERM")).toBe(sigterm.length);
+      const readsAtRejection = catchups;
+      await sleep(11_000);
+      expect(catchups, "no catch-up request after runtime rejection").toBe(readsAtRejection);
+    } finally {
+      await Promise.all(stops.map((stop) => stop()));
+      startSpy.mockRestore();
+      pollSpy.mockRestore();
+      restoreFetch();
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+      else process.env.TPS_MAIL_DIR = savedMailDir;
+      for (const listener of process.listeners("SIGINT")) if (!sigint.includes(listener)) process.off("SIGINT", listener);
+      for (const listener of process.listeners("SIGTERM")) if (!sigterm.includes(listener)) process.off("SIGTERM", listener);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it.each(["poll", "preparation"] as const)("mail held in %s at SIGTERM stays unacknowledged with no reset and no launch", async (lateMail) => {
     const r = await driveRuntime("SIGTERM", undefined, { lateMail });
     expect(r.rejected).toBeUndefined();
     expect(r.exitCode).toBe(0);

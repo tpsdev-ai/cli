@@ -696,6 +696,29 @@ export async function shutdownPresenceBeat(
   }
 }
 
+async function drainLoopStops(
+  stops: Array<() => void | Promise<void>>,
+  timeoutMs: number = SHUTDOWN_DRAIN_TIMEOUT_MS,
+): Promise<void> {
+  const pending: Promise<void>[] = [];
+  for (const stop of stops) {
+    try {
+      pending.push(Promise.resolve(stop()));
+    } catch {
+      // Continue stopping the remaining loops.
+    }
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.allSettled(pending),
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, timeoutMs); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Call loop stops, bound the drain, then send the bounded final beat and exit once. */
 export function shutdownHandler(
   client: Pick<FlairClient, "presence">,
@@ -711,24 +734,8 @@ export function shutdownHandler(
     if (shuttingDown) return;
     shuttingDown = true;
     stopHeartbeat();
-    const pending: Promise<void>[] = [];
-    for (const stop of stops) {
-      try {
-        pending.push(Promise.resolve(stop()));
-      } catch {
-        // Continue stopping the remaining loops.
-      }
-    }
     void (async () => {
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      try {
-        await Promise.race([
-          Promise.allSettled(pending),
-          new Promise<void>((resolve) => { timer = setTimeout(resolve, drainTimeoutMs); }),
-        ]);
-      } finally {
-        if (timer) clearTimeout(timer);
-      }
+      await drainLoopStops(stops, drainTimeoutMs);
       await shutdownPresenceBeat(client, agentId, timeoutMs);
       exit(0);
     })();
@@ -1059,6 +1066,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     throw err;
   } finally {
     if (shutdownRequested) await shutdownComplete;
+    else await drainLoopStops(stopHandles);
     removeSignalListeners();
   }
 }
