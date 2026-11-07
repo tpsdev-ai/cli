@@ -157,6 +157,10 @@ async function driveRuntime(
   let completedMail = false;
   let headReads = 0;
   let autoCommits = 0;
+  /** What the real `tps agent commit` spawn returned, for the assertion message. */
+  let tpsCommit: { status: number | null; stdout: string; stderr: string; error?: string } | undefined;
+  /** Marker written by the HOME-local tps shim when it runs. */
+  let tpsShimMarker: string | undefined;
   const captureAutoCommit = Boolean(opts.autoCommitFailure || opts.ignoredFileChange || opts.autoCommitRepo || opts.sendFailure);
   const realGit = childProcess.spawnSync;
   // The rebase/status/baseline fixtures need a valid HEAD for their passing
@@ -170,7 +174,21 @@ async function driveRuntime(
     const probe = (args as string[]).join(" ");
     if (probe.startsWith("agent commit ")) {
       autoCommits++;
-      if (opts.realAutoCommit) return realGit(command, args, options) as never;
+      if (opts.realAutoCommit) {
+        const real = realGit(command, args, options) as {
+          status: number | null;
+          stdout: string | Buffer | null;
+          stderr: string | Buffer | null;
+          error?: Error;
+        };
+        tpsCommit = {
+          status: real.status,
+          stdout: String(real.stdout ?? ""),
+          stderr: String(real.stderr ?? ""),
+          error: real.error?.message,
+        };
+        return real as never;
+      }
       return { status: 0, stdout: "", stderr: "" } as never;
     }
     if (opts.autoCommitRepo) return realGit(command, args, options) as never;
@@ -311,8 +329,11 @@ async function driveRuntime(
     if (opts.realAutoCommit) {
       const binDir = join(dir, ".tps", "bin");
       mkdirSync(binDir, { recursive: true });
+      tpsShimMarker = join(dir, "tps-shim-ran");
       writeFileSync(join(binDir, "tps"), `#!/usr/bin/env bun
+import { writeFileSync } from "node:fs";
 process.env.TPS_AGENT_ID = "testbot";
+writeFileSync(${JSON.stringify(tpsShimMarker)}, "ran\\n");
 await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
 `, { mode: 0o755 });
     }
@@ -439,7 +460,7 @@ await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
 
-  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits };
+  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits, tpsCommit, tpsShimMarker };
 }
 
 async function withLoopClient(
@@ -571,8 +592,13 @@ describe("mail auto-commit checks", () => {
       const overrideBefore = gitIn(override, "rev-parse", "HEAD").trim();
       process.chdir(root);
       const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: "override", realAutoCommit: true });
+      const tpsOutcome = result.tpsCommit
+        ? `tps agent commit exit=${result.tpsCommit.status} stderr=${JSON.stringify(result.tpsCommit.stderr)}${result.tpsCommit.error ? ` error=${JSON.stringify(result.tpsCommit.error)}` : ""}`
+        : "tps agent commit was never spawned";
       expect(result.autoCommits).toBe(1);
-      expect(gitIn(override, "rev-parse", "HEAD").trim()).not.toBe(overrideBefore);
+      expect(result.tpsShimMarker, "the real-CLI case did not install a tps shim").toBeString();
+      expect(existsSync(result.tpsShimMarker!), `the tps shim under the current HOME did not run (${tpsOutcome})`).toBe(true);
+      expect(gitIn(override, "rev-parse", "HEAD").trim(), `the commit did not land (${tpsOutcome})`).not.toBe(overrideBefore);
       expect(result.logs.join("\n")).toContain("tps agent commit exit=0");
       expect(gitIn(override, "show", "HEAD:file.txt")).toBe("task change\n");
       expect(gitIn(override, "status", "--porcelain")).toBe("");

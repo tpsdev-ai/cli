@@ -1,0 +1,1 @@
+- **The codex runtime resolves its tps executable under the current HOME.** Auto-commit looks for `$HOME/.tps/bin/tps` on every call, so a runtime whose HOME changes after start-up uses the tps installed there instead of falling back to a `tps` on PATH.

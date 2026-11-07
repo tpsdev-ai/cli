@@ -6,7 +6,6 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, createWriteStream, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import {
   refreshOpenAIToken,
@@ -26,6 +25,7 @@ import {
 } from "./agent-lifecycle.js";
 import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
+import { homeDir } from "./home.js";
 import { startReviewTriggerLoop } from "./pr-review-trigger.js";
 import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
@@ -42,7 +42,7 @@ function shouldSendTaskCompletion(recipient: string, reviewNotify?: string[]): b
 
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
-  const credPath = join(homedir(), ".tps", "auth", "openai.json");
+  const credPath = join(homeDir(), ".tps", "auth", "openai.json");
   if (!existsSync(credPath)) return null;
   try {
     const data = JSON.parse(readFileSync(credPath, "utf-8"));
@@ -198,12 +198,12 @@ async function runCodex(
 
   const args = codexExecArgs(config);
 
-  const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
+  const logPath = config.sessionLogPath ?? join(homeDir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (codex)\n${"=".repeat(60)}\n`, "utf-8");
   const logStream = createWriteStream(logPath, { flags: "a" });
 
   return new Promise((resolve, reject) => {
-    const codexToolsDir = join(homedir(), ".tps", "bin", "codex-tools");
+    const codexToolsDir = join(homeDir(), ".tps", "bin", "codex-tools");
     const codexEnv = { ...process.env, PATH: `${codexToolsDir}:${process.env.PATH ?? ""}` };
     const proc = spawn("codex", args, { cwd: config.workspace, env: codexEnv });
     proc.stdin.write(prompt);
@@ -678,7 +678,7 @@ async function _runAutoCommitLegacy(
   const safeBranch = `${branchPrefix}${taskId}`.replace(/[^a-zA-Z0-9._/-]/g, "-");
   const authorName = cfg.authorName ?? agentId;
   const authorEmail = cfg.authorEmail ?? `${agentId}@tps.dev`;
-  const tpsBin = join(homedir(), ".tps", "bin", "tps");
+  const tpsBin = join(homeDir(), ".tps", "bin", "tps");
   const tpsCommand = existsSync(tpsBin) ? tpsBin : undefined;
   const ghAgent = cfg.githubPat
     ? basename(cfg.githubPat).replace(/-github-pat(?:\.[^.]+)?$/, "").replace(/\.[^.]+$/, "")
@@ -942,7 +942,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     if (flairOnline) {
       await snapshotSoulToDisk(flair, agentId);
     } else {
-      const fallback = join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
+      const fallback = join(homeDir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
       console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
     }
 
