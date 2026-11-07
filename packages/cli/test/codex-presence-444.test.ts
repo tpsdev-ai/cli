@@ -36,6 +36,14 @@ afterEach(() => { mock.restore(); });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const GIT = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
+
+/** Run git in `cwd` and throw on a non-zero exit (test fixtures only). */
+function gitIn(cwd: string, ...args: string[]): void {
+  const result = childProcess.spawnSync(GIT, args, { cwd, encoding: "utf-8" });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+}
+
 /** The review-trigger loop's pre-seeded cursor, so its polls are identifiable. */
 const REVIEW_CURSOR_POSITION = "2026-01-01T00:00:00.000Z";
 
@@ -73,10 +81,15 @@ async function driveRuntime(
     preflightError?: Error;
     lateMail?: "poll" | "preparation";
     observeMailAfterExit?: boolean;
-    autoCommitFailure?: "rebase" | "status" | "baseline" | "head";
+    autoCommitFailure?: "rebase" | "status" | "baseline" | "head" | "rebaseProbe";
+    ignoredFileChange?: boolean;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
+  const savedHome = process.env.HOME;
+  // Point HOME at this run's own directory: the review-trigger cursor below and
+  // any other home-relative state stay inside the test's temp root.
+  process.env.HOME = dir;
   const workspace = join(dir, "workspace");
   mkdirSync(workspace, { recursive: true });
   const mailRoot = join(dir, "mail");
@@ -99,10 +112,15 @@ async function driveRuntime(
   let completedMail = false;
   let headReads = 0;
   let autoCommits = 0;
+  const captureAutoCommit = Boolean(opts.autoCommitFailure || opts.ignoredFileChange);
   const realGit = childProcess.spawnSync;
   const mailGit = opts.autoCommitFailure ? spyOn(childProcess, "spawnSync").mockImplementation((command, args) => {
     const probe = (args as string[]).join(" ");
     if (probe.startsWith("agent commit ")) autoCommits++;
+    if (probe.startsWith("rev-parse --path-format=absolute --git-path ")) {
+      if (opts.autoCommitFailure === "rebaseProbe") return { status: 128, stdout: "", stderr: "fixture probe failure" } as never;
+      return { status: 0, stdout: `${join(workspace, ".git", probe.split(" ").pop()!)}\n`, stderr: "" } as never;
+    }
     if (probe === "rev-parse HEAD") {
       headReads++;
       if ((opts.autoCommitFailure === "baseline" && headReads === 1) || (opts.autoCommitFailure === "head" && headReads === 2)) {
@@ -118,8 +136,9 @@ async function driveRuntime(
     if (probe === "rebase --abort") return { status: 1, stdout: "", stderr: "fixture abort failure\nsecond line" } as never;
     return { status: 0, stdout: "fixture", stderr: "" } as never;
   }) : undefined;
-  const mailSpawn = opts.autoCommitFailure ? spyOn(childProcess, "spawn").mockImplementation(() => {
+  const mailSpawn = captureAutoCommit ? spyOn(childProcess, "spawn").mockImplementation(() => {
     if (opts.autoCommitFailure === "rebase") mkdirSync(join(workspace, ".git", "rebase-merge"), { recursive: true });
+    if (opts.ignoredFileChange) writeFileSync(join(workspace, "ignored.log"), "ignored\n");
     const proc = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
     setTimeout(() => {
       proc.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "fixture result" } }) + "\n"));
@@ -127,11 +146,11 @@ async function driveRuntime(
     }, 0);
     return proc as never;
   }) : undefined;
-  const warnSpy = opts.autoCommitFailure ? spyOn(console, "warn").mockImplementation((...args) => { warnings.push(args.join(" ")); }) : undefined;
-  const logSpy = opts.autoCommitFailure ? spyOn(console, "log").mockImplementation((...args) => { logs.push(args.join(" ")); }) : undefined;
-  const mailSpy = opts.autoCommitFailure ? spyOn(runtimeMail, "sendRuntimeMail").mockImplementation((_cfg, _to, body) => { mails.push(body); }) : undefined;
+  const warnSpy = captureAutoCommit ? spyOn(console, "warn").mockImplementation((...args) => { warnings.push(args.join(" ")); }) : undefined;
+  const logSpy = captureAutoCommit ? spyOn(console, "log").mockImplementation((...args) => { logs.push(args.join(" ")); }) : undefined;
+  const mailSpy = captureAutoCommit ? spyOn(runtimeMail, "sendRuntimeMail").mockImplementation((_cfg, _to, body) => { mails.push(body); }) : undefined;
   const savedComplete = runtimeMail.completeRuntimeMail;
-  const completeSpy = opts.autoCommitFailure ? spyOn(runtimeMail, "completeRuntimeMail").mockImplementation((...args) => {
+  const completeSpy = captureAutoCommit ? spyOn(runtimeMail, "completeRuntimeMail").mockImplementation((...args) => {
     savedComplete(...args);
     completedMail = true;
   }) : undefined;
@@ -186,8 +205,17 @@ async function driveRuntime(
   const inboxCur = join(mailRoot, "testbot", "cur");
 
   process.env.TPS_MAIL_DIR = mailRoot;
-  if (opts.autoCommitFailure) writeFileSync(join(workspace, "SOUL.md"), "fixture instructions");
-  if (opts.lateMail || opts.autoCommitFailure) {
+  if (opts.ignoredFileChange) {
+    gitIn(workspace, "init", "-q", "-b", "main");
+    gitIn(workspace, "config", "user.email", "agent-a@example.com");
+    gitIn(workspace, "config", "user.name", "agent-a");
+    writeFileSync(join(workspace, ".gitignore"), "*.log\n.tps-agent.pid\n");
+    writeFileSync(join(workspace, "tracked.txt"), "fixture\n");
+    gitIn(workspace, "add", ".gitignore", "tracked.txt");
+    gitIn(workspace, "commit", "-q", "-m", "fixture baseline");
+  }
+  if (captureAutoCommit && !opts.ignoredFileChange) writeFileSync(join(workspace, "SOUL.md"), "fixture instructions");
+  if (opts.lateMail || captureAutoCommit) {
     const seeds = { "agent-a": Buffer.alloc(32, 0x57) };
     const envelope = buildSignedEnvelope("agent-a", "testbot", "fixture task", seeds, { trust: "internal" });
     sendMessage("testbot", JSON.stringify(envelope), "agent-a");
@@ -248,15 +276,15 @@ async function driveRuntime(
       flairKeyPath: keyPath,
       supervisorId: "agent-supervisor",
       reviewTrigger: opts.reviewTrigger,
-      autoCommit: opts.autoCommitFailure ? {} : undefined,
-      sessionLogPath: opts.autoCommitFailure ? join(dir, "session.log") : undefined,
+      autoCommit: captureAutoCommit ? {} : undefined,
+      sessionLogPath: captureAutoCommit ? join(dir, "session.log") : undefined,
       workspaceProvider: opts.lateMail ? workspaceProvider : undefined,
     }).then(() => { runtimeFinished = true; }).catch((e: Error) => {
       rejected = e;
     });
 
     await waitFor(() => presenceBodies.length >= 1, 5000); // startup beat
-    if (opts.autoCommitFailure) {
+    if (captureAutoCommit) {
       await waitFor(() => completedMail);
     } else if (opts.signalDuringPreflight) {
       await waitFor(() => releasePreflight !== undefined);
@@ -347,6 +375,8 @@ async function driveRuntime(
     patchShared(FlairClient.prototype, "ping", savedPing);
     if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
     else process.env.TPS_MAIL_DIR = savedMailDir;
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
     for (const l of process.listeners("SIGTERM")) if (!savedSigterm.includes(l)) process.off("SIGTERM", l);
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
@@ -425,6 +455,26 @@ describe("mail auto-commit checks", () => {
     expect(result.logs.join("\n")).not.toContain("Auto-commit:");
     expect(result.warnings.join("\n")).toContain("Stale rebase abort failed (exit 1): fixture abort failure");
     expect(result.warnings.join("\n")).not.toContain("second line");
+    expect(result.mails.some((body) => body.includes("Stale rebase abort failed (exit 1): fixture abort failure"))).toBe(true);
+  }, 10_000);
+
+  it("skips auto-commit and mails the sender when the stale rebase check cannot run", async () => {
+    const result = await driveRuntime("SIGTERM", undefined, { autoCommitFailure: "rebaseProbe" });
+    const expected = "Stale rebase check could not run: git rev-parse --path-format=absolute --git-path rebase-merge failed";
+    expect(result.autoCommits).toBe(0);
+    expect(result.logs.join("\n")).not.toContain("Auto-commit:");
+    expect(result.warnings.join("\n")).toContain(expected);
+    expect(result.mails.some((body) => body.includes(expected))).toBe(true);
+    expect([...result.logs, ...result.warnings, ...result.mails].join("\n")).not.toMatch(/no files? (?:were )?chang/i);
+  }, 10_000);
+
+  it("says what the change check proves when only an ignored file changed", async () => {
+    const result = await driveRuntime("SIGTERM", undefined, { ignoredFileChange: true });
+    expect(result.autoCommits).toBe(0);
+    const mail = result.mails.join("\n");
+    expect(mail).toContain("no Git-visible changes or new commit");
+    expect(mail).not.toMatch(/no files? (?:were )?chang/i);
+    expect(result.warnings.join("\n")).toContain("no Git-visible changes or new commit");
   }, 10_000);
 
   for (const [failure, probe] of [

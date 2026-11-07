@@ -322,6 +322,35 @@ export function hasWorkspaceChangesOrNewCommit(statusOutput: string, baseline?: 
   return statusOutput.trim().length > 0 || currentHead !== baseline;
 }
 
+export interface StaleRebaseDetection {
+  state: "present" | "absent" | "indeterminate";
+  /** The failed probe, when state is "indeterminate". */
+  probe?: string;
+}
+
+/**
+ * Detect an interrupted rebase (merge or apply backend) in `workspace` using
+ * git's own paths for the repository at that location, including a linked
+ * worktree whose `.git` is a file.
+ */
+export function detectStaleRebase(
+  workspace: string,
+  runSync: typeof spawnSync = spawnSync,
+): StaleRebaseDetection {
+  for (const dir of ["rebase-merge", "rebase-apply"]) {
+    const probe = `git rev-parse --path-format=absolute --git-path ${dir}`;
+    const result = runSync(GIT_BIN, ["rev-parse", "--path-format=absolute", "--git-path", dir], {
+      cwd: workspace,
+      encoding: "utf-8",
+    });
+    if (result.status !== 0) return { state: "indeterminate", probe };
+    const path = String(result.stdout ?? "").trim();
+    if (!path) return { state: "indeterminate", probe };
+    if (existsSync(path)) return { state: "present" };
+  }
+  return { state: "absent" };
+}
+
 interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
 }
@@ -990,35 +1019,30 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
             }};
-            // Detect stale rebase state before attempting autoCommit
-            const rebaseMergeDir = join(config.workspace, ".git", "rebase-merge");
-            const rebaseApplyDir = join(config.workspace, ".git", "rebase-apply");
-            // Also check worktree .git file reference
-            // Resolve worktree git dir (workspace may use a .git file pointer)
-            let wtGitDir: string | null = null;
-            try {
-              const gitFile = join(config.workspace, ".git");
-              if (existsSync(gitFile)) {
-                const stat = require("node:fs").statSync(gitFile);
-                if (!stat.isDirectory()) {
-                  const content2 = readFileSync(gitFile, "utf-8").trim();
-                  const match = content2.match(/^gitdir:\s*(.+)$/);
-                  if (match?.[1]) wtGitDir = match[1].trim();
-                }
-              }
-            } catch { /* ignore */ }
-            const rebaseMergeDirWt = wtGitDir ? join(wtGitDir, "rebase-merge") : null;
-            const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
-              (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
-            if (hasStaleRebase) {
+            // Detect stale rebase state before attempting autoCommit. git
+            // reports where the state lives for this checkout, so a linked
+            // worktree is resolved by git rather than by reading its .git file.
+            const staleRebase = detectStaleRebase(config.workspace);
+            if (staleRebase.state === "indeterminate") {
+              const message = `Stale rebase check could not run: ${staleRebase.probe} failed — skipping autoCommit`;
+              console.warn(`[${agentId}] ${message}`);
+              notify(msg.from, message);
+              continue;
+            }
+            if (staleRebase.state === "present") {
               const abortResult = spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
               if (abortResult.status !== 0) {
-                console.warn(`[${agentId}] Stale rebase abort failed (exit ${abortResult.status}): ${abortResult.stderr?.trim().split("\n")[0] ?? ""} — skipping autoCommit`);
+                const message = `Stale rebase abort failed (exit ${abortResult.status}): ${abortResult.stderr?.trim().split("\n")[0] ?? ""} — skipping autoCommit`;
+                console.warn(`[${agentId}] ${message}`);
+                notify(msg.from, message);
                 continue;
               }
               console.warn(`[${agentId}] Stale rebase aborted before autoCommit`);
             }
-            // Check for file changes or Codex-created commits before attempting autoCommit
+            // git status --porcelain omits ignored files, and an unchanged HEAD
+            // rules out a new commit. A clean status with the same HEAD
+            // therefore establishes only this: no Git-visible workspace changes
+            // and no new commit.
             const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
             const currentHeadResult = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" });
             const failedProbe = baselineResult.status !== 0 ? "git rev-parse HEAD (before task)"
@@ -1032,9 +1056,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             }
             const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baselineResult.stdout?.trim(), currentHeadResult.stdout?.trim());
             if (!hasChanges) {
-              console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
+              console.warn(`[${agentId}] Task produced no Git-visible changes or new commit — skipping autoCommit`);
               notify(msg.from,
-                `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
+                `Task complete but there were no Git-visible changes or new commit.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
               );
             } else {
               const mailSubject = msg.body.split("\n")[0].slice(0, 72);
