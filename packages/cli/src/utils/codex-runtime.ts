@@ -819,16 +819,23 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     process.off("SIGINT", onSignal);
     process.off("SIGTERM", onSignal);
   };
-  let finishShutdown!: () => void;
-  const shutdownComplete = new Promise<void>((resolve) => { finishShutdown = resolve; });
-  const shutdown = shutdownHandler(flair, agentId, stopHeartbeat, (code) => {
-    removeSignalListeners();
-    finishShutdown();
-    process.exit(code);
-  }, undefined, stopHandles);
+  let shutdownComplete: Promise<void> | undefined;
+  const shutdown = () => {
+    if (!shutdownComplete) {
+      stopHeartbeat();
+      shutdownComplete = (async () => {
+        await drainLoopStops(stopHandles);
+        if (shutdownRequested) await shutdownPresenceBeat(flair, agentId);
+        removeSignalListeners();
+        if (shutdownRequested) process.exit(0);
+      })();
+    }
+    return shutdownComplete;
+  };
   const onSignal = () => {
+    if (shutdownRequested) return;
     shutdownRequested = true;
-    shutdown();
+    void shutdown();
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
@@ -866,7 +873,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       }
     }
     if (shutdownRequested) {
-      await shutdownComplete;
+      await shutdown();
       return;
     }
 
@@ -1051,8 +1058,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           }
         } finally {
           // Completion boundary end — AFTER the reply attempt and any auto-commit
-          // work (above, which reads the newest cur/ body for its scope
-          // guard) has finished. Acking here is what stops cli#377's lease sweep
+          // work has finished. Acking here is what stops cli#377's lease sweep
           // re-presenting — and re-dispatching — a finished task forever.
           completeRuntimeMail(mailCfg, msg.id);
         }
@@ -1061,12 +1067,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
       if (shutdownRequested) break;
       await new Promise(r => setTimeout(r, 5000));
     }
-  } catch (err) {
-    stopHeartbeat();
-    throw err;
   } finally {
-    if (shutdownRequested) await shutdownComplete;
-    else await drainLoopStops(stopHandles);
-    removeSignalListeners();
+    await shutdown();
   }
 }

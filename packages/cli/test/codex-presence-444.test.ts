@@ -691,6 +691,124 @@ describe("codex runtime presence (cli#444)", () => {
     }
   }, 20_000);
 
+  it.each(["SIGINT", "SIGTERM"] as const)("%s during rejection shares the drain and retains listeners through the final beat", async (signal) => {
+    const dir = mkdtempSync(join(tmpdir(), "cli781-shared-shutdown-"));
+    const workspace = join(dir, "workspace");
+    mkdirSync(workspace);
+    const keyPath = join(dir, "agent.key");
+    writeFileSync(keyPath, keySeed().seed);
+    const savedHome = process.env.HOME;
+    const savedMailDir = process.env.TPS_MAIL_DIR;
+    const sigint = process.listeners("SIGINT");
+    const sigterm = process.listeners("SIGTERM");
+    const stops: Array<() => Promise<void>> = [];
+    const stopCalls: number[] = [];
+    let releaseStops!: () => void;
+    const pendingStop = new Promise<void>((resolve) => { releaseStops = resolve; });
+    let releaseBeat!: () => void;
+    const pendingBeat = new Promise<void>((resolve) => { releaseBeat = resolve; });
+    const originalStart = taskLoops.startTaskLoop;
+    const startSpy = spyOn(taskLoops, "startTaskLoop").mockImplementation((...args) => {
+      const loop = originalStart(...args);
+      const index = stops.length;
+      stops.push(loop.stop);
+      stopCalls.push(0);
+      return { ...loop, stop: async () => {
+        stopCalls[index]++;
+        await loop.stop();
+        if (index === 0) await pendingStop;
+      } };
+    });
+    const pollError = new Error("mail poll failed");
+    const pollSpy = spyOn(runtimeMail, "pollRuntimeMail").mockImplementation(async () => {
+      await waitFor(() => stops.length === 2);
+      throw pollError;
+    });
+    let finalBeats = 0;
+    const restoreFetch = patchShared(globalThis, "fetch", (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(String(input));
+      expect(url.origin).toBe("http://127.0.0.1:9931");
+      if (url.pathname === "/Health") return new Response("ok");
+      if (url.pathname.startsWith("/OrgEventCatchup/")) {
+        return Response.json({ events: [], nextAfter: url.searchParams.get("after") ?? url.searchParams.get("since"), hasMore: false });
+      }
+      if (url.pathname.startsWith("/Soul") && init?.method === "GET") return Response.json([]);
+      if (url.pathname === "/Presence" && String(init?.body).includes('"idle"')) {
+        finalBeats++;
+        await pendingBeat;
+      }
+      return new Response(null, { status: 204 });
+    }) as typeof fetch);
+    const exits: number[] = [];
+    const exitSpy = spyOn(process, "exit").mockImplementation(((code: number) => { exits.push(code); }) as never);
+    let rejected: unknown;
+    let settled = false;
+    let runtime: Promise<void> | undefined;
+    let signalled = false;
+    const expectListeners = () => {
+      expect(process.listenerCount("SIGINT"), "SIGINT listener remains until shutdown completes").toBe(sigint.length + 1);
+      expect(process.listenerCount("SIGTERM"), "SIGTERM listener remains until shutdown completes").toBe(sigterm.length + 1);
+    };
+    try {
+      process.env.HOME = dir;
+      process.env.TPS_MAIL_DIR = join(dir, "mail");
+      runtime = runCodexRuntime({
+        agentId: "agent-a", workspace, mailDir: join(dir, "mail", "agent-a"),
+        flairUrl: "http://127.0.0.1:9931", flairKeyPath: keyPath,
+        reviewTrigger: { reviewers: ["reviewer-a"], repo: "example/repo" },
+      }).then(() => { settled = true; }, (err) => { rejected = err; settled = true; });
+      await waitFor(() => stopCalls.some((calls) => calls > 0));
+      expect(stopCalls).toEqual([1, 1]);
+      expectListeners();
+      signalled = true;
+      expect(process.emit(signal)).toBe(true);
+      await sleep(0);
+      expect(stopCalls, "signal during rejection must reuse the drain").toEqual([1, 1]);
+      expectListeners();
+      expect(process.emit(signal === "SIGINT" ? "SIGTERM" : "SIGINT")).toBe(true);
+      await sleep(0);
+      expect(stopCalls, "repeated signal must reuse the drain").toEqual([1, 1]);
+      expect(finalBeats).toBe(0);
+      expect(settled).toBe(false);
+      expect(exits).toEqual([]);
+      expectListeners();
+      releaseStops();
+      await waitFor(() => finalBeats === 1);
+      expectListeners();
+      expect(process.emit(signal)).toBe(true);
+      await sleep(0);
+      expect(stopCalls).toEqual([1, 1]);
+      expect(finalBeats).toBe(1);
+      expect(settled, "runtime rejection waits for the final beat").toBe(false);
+      expect(exits).toEqual([]);
+      expectListeners();
+      releaseBeat();
+      await runtime;
+      expect(rejected).toBe(pollError);
+      expect(exits).toEqual([0]);
+      expect(finalBeats).toBe(1);
+      expect(process.listenerCount("SIGINT")).toBe(sigint.length);
+      expect(process.listenerCount("SIGTERM")).toBe(sigterm.length);
+    } finally {
+      releaseStops();
+      releaseBeat();
+      await runtime;
+      if (signalled) await waitFor(() => exits.length > 0);
+      await Promise.all(stops.map((stop) => stop()));
+      exitSpy.mockRestore();
+      pollSpy.mockRestore();
+      startSpy.mockRestore();
+      restoreFetch();
+      if (savedHome === undefined) delete process.env.HOME;
+      else process.env.HOME = savedHome;
+      if (savedMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+      else process.env.TPS_MAIL_DIR = savedMailDir;
+      for (const listener of process.listeners("SIGINT")) if (!sigint.includes(listener)) process.off("SIGINT", listener);
+      for (const listener of process.listeners("SIGTERM")) if (!sigterm.includes(listener)) process.off("SIGTERM", listener);
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it.each(["poll", "preparation"] as const)("mail held in %s at SIGTERM stays unacknowledged with no reset and no launch", async (lateMail) => {
     const r = await driveRuntime("SIGTERM", undefined, { lateMail });
     expect(r.rejected).toBeUndefined();
