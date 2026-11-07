@@ -1,14 +1,16 @@
 import { describe, expect, mock, test, afterEach } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
+import { isAbsolute, join, relative, resolve } from "node:path";
+import { resolveAutoCommitRepo } from "../src/utils/agent-workspace.ts";
 import {
   composeSystemPrompt,
   detectStaleRebase,
   evaluateMailAutoCommitGate,
   hasWorkspaceChangesOrNewCommit,
   publishTaskOutcomeEvent,
+  resolveCommitRepo,
   runAutoCommit,
   syncWorkspaceBeforeTask,
   type CodexRuntimeConfig,
@@ -53,15 +55,21 @@ function git(cwd: string, ...args: string[]): string {
   return String(result.stdout ?? "");
 }
 
-/** A repository with one commit on `main`, in a fresh temp dir. */
-function initRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "cli800-gate-"));
+/** A repository with one commit on `main`, at `dir`. */
+function initRepoAt(dir: string): void {
+  mkdirSync(dir, { recursive: true });
   git(dir, "init", "-q", "-b", "main");
   git(dir, "config", "user.email", "agent-a@example.com");
   git(dir, "config", "user.name", "agent-a");
   writeFileSync(join(dir, "file.txt"), "base\n");
   git(dir, "add", "file.txt");
   git(dir, "commit", "-q", "-m", "base");
+}
+
+/** A repository with one commit on `main`, in a fresh temp dir. */
+function initRepo(): string {
+  const dir = mkdtempSync(join(tmpdir(), "cli800-gate-"));
+  initRepoAt(dir);
   return dir;
 }
 
@@ -190,12 +198,53 @@ describe("evaluateMailAutoCommitGate", () => {
     }
   }, 30_000);
 
-  test("aborting an interrupted rebase resets the comparison, so a no-change task stays clean", () => {
+  test("task commits made before an interrupted rebase are kept, so the gate commits", () => {
     const repo = initRepo();
     try {
-      const midRebaseHead = interruptedRebase(repo);
-      const decision = evaluateMailAutoCommitGate(repo, midRebaseHead);
-      expect(decision.action).toBe("clean");
+      // The runtime reads the baseline before the task runs.
+      const baseline = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "-b", "topic");
+      writeFileSync(join(repo, "file.txt"), "task\n");
+      git(repo, "commit", "-q", "-am", "task");
+      const taskCommit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "main");
+      writeFileSync(join(repo, "file.txt"), "main\n");
+      git(repo, "commit", "-q", "-am", "main");
+      git(repo, "checkout", "-q", "topic");
+      expect(spawnSync(GIT, ["rebase", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
+
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({ action: "commit" });
+
+      // The abort restored the tip that contains the task's commit, and it is
+      // still reachable from the branch after the gate ran.
+      expect(git(repo, "branch", "--show-current").trim()).toBe("topic");
+      expect(
+        spawnSync(GIT, ["merge-base", "--is-ancestor", taskCommit, "HEAD"], { cwd: repo, encoding: "utf-8" }).status,
+      ).toBe(0);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("aborting an interrupted rebase with no task commits stays clean against the pre-task baseline", () => {
+    const repo = initRepo();
+    try {
+      // A branch tip above `main` that predates the task, and the pre-task HEAD
+      // read the runtime makes before the task runs.
+      git(repo, "checkout", "-q", "-b", "topic");
+      writeFileSync(join(repo, "file.txt"), "topic\n");
+      git(repo, "commit", "-q", "-am", "before task");
+      const baseline = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "main");
+      writeFileSync(join(repo, "file.txt"), "main\n");
+      git(repo, "commit", "-q", "-am", "main");
+      git(repo, "checkout", "-q", "topic");
+      expect(spawnSync(GIT, ["rebase", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
+
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "clean",
+        message: "Git status is clean and HEAD matches its pre-task value — skipping autoCommit",
+      });
       const rebasePath = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "rebase-merge").trim();
       expect(existsSync(rebasePath)).toBe(false);
       expect(git(repo, "status", "--porcelain").trim()).toBe("");
@@ -210,6 +259,82 @@ describe("evaluateMailAutoCommitGate", () => {
       action: "skip",
       message: "Stale rebase check could not run: git rev-parse --path-format=absolute --git-path rebase-merge failed — skipping autoCommit",
     });
+  });
+});
+
+describe("resolveAutoCommitRepo", () => {
+  test("a relative autoCommit.repo in a real config file resolves against the config file's directory from a different cwd", () => {
+    const root = mkdtempSync(join(tmpdir(), "cli800-config-"));
+    try {
+      const configDir = join(root, "config");
+      const repoDir = join(configDir, "repo");
+      const launchDir = join(root, "launch");
+      mkdirSync(configDir);
+      mkdirSync(launchDir);
+      initRepoAt(repoDir);
+      const configFile = join(configDir, "agent.yaml");
+      writeFileSync(configFile, "agentId: agent-a\nworkspace: workspace\nautoCommit:\n  repo: repo\n");
+
+      // The child loads the real config file the way `tps` does (js-yaml over
+      // the file contents) from a third directory, then runs the gate and the
+      // commit against the repository the loader resolved.
+      const workspaceSource = resolve(import.meta.dir, "../src/utils/agent-workspace.ts");
+      const runtimeSource = resolve(import.meta.dir, "../src/utils/codex-runtime.ts");
+      const yamlModule = resolve(import.meta.dir, "../../../node_modules/js-yaml/index.js");
+      const script = join(launchDir, "probe.ts");
+      writeFileSync(script, `
+        import { readFileSync, writeFileSync } from "node:fs";
+        import { spawnSync } from "node:child_process";
+        import { join } from "node:path";
+        import yaml from ${JSON.stringify(yamlModule)};
+        import { resolveAutoCommitRepo } from ${JSON.stringify(workspaceSource)};
+        import { evaluateMailAutoCommitGate } from ${JSON.stringify(runtimeSource)};
+        const configPath = ${JSON.stringify(configFile)};
+        const parsed = yaml.load(readFileSync(configPath, "utf-8"));
+        const repo = resolveAutoCommitRepo(parsed.autoCommit.repo, configPath);
+        const probe = spawnSync("${GIT}", ["-C", repo, "rev-parse", "--is-inside-work-tree"], { encoding: "utf-8" });
+        const result = { repo, cwd: process.cwd(), git: probe.status, decision: null, add: null, commit: null, stderr: "" };
+        if (probe.status === 0 && probe.stdout.trim() === "true") {
+          const baseline = String(spawnSync("${GIT}", ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" }).stdout ?? "").trim();
+          writeFileSync(join(repo, "task.txt"), "task\\n");
+          result.decision = evaluateMailAutoCommitGate(repo, baseline);
+          result.add = spawnSync("${GIT}", ["-C", repo, "add", "task.txt"], { encoding: "utf-8" }).status;
+          const committed = spawnSync("${GIT}", ["-C", repo, "commit", "-m", "task"], { encoding: "utf-8" });
+          result.commit = committed.status;
+          result.stderr = committed.stderr;
+        }
+        console.log(JSON.stringify(result));
+      `);
+      const child = spawnSync(process.execPath, [script], { cwd: launchDir, encoding: "utf-8", timeout: 30_000 });
+      expect(child.error).toBeUndefined();
+      expect(child.stderr).toBe("");
+      expect(child.status).toBe(0);
+      const result = JSON.parse(child.stdout.trim());
+      expect(result.git).toBe(0);
+      expect(result.cwd).toBe(launchDir);
+      expect(result.repo).toBe(repoDir);
+      expect(isAbsolute(result.repo)).toBe(true);
+      expect(result.decision).toEqual({ action: "commit" });
+      expect(result.add).toBe(0);
+      expect(result.commit).toBe(0);
+      expect(git(repoDir, "log", "--format=%s").split("\n")).toContain("task");
+      expect(existsSync(join(launchDir, ".git"))).toBe(false);
+      expect(existsSync(join(launchDir, "repo"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("refuses a relative autoCommit.repo when no config path can anchor it", () => {
+    expect(() => resolveAutoCommitRepo("repo")).toThrow(
+      "autoCommit.repo 'repo' is relative and there is no config file path to resolve it against: use an absolute path",
+    );
+  });
+
+  test("the runtime refuses a relative autoCommit.repo", () => {
+    expect(() => resolveCommitRepo({ workspace: "/tmp/workspace", autoCommit: { repo: "repo" } })).toThrow(
+      "autoCommit.repo 'repo' is relative: use an absolute path",
+    );
   });
 });
 

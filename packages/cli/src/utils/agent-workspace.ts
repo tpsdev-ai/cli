@@ -16,3 +16,21 @@ export function agentWorkspace(
   }
   return workspace;
 }
+
+/**
+ * Resolve `autoCommit.repo` the way a relative `workspace` is resolved: against
+ * the config file's directory, so the runtime only ever sees an absolute path.
+ * A relative value with no config file to anchor it is refused rather than
+ * resolved against the process working directory.
+ */
+export function resolveAutoCommitRepo(configured: string | undefined, configPath?: string): string | undefined {
+  if (configured === undefined) return undefined;
+  refuseTildeWorkspace(configured, "autoCommit.repo");
+  if (isAbsolute(configured)) return resolve(configured);
+  if (configPath === undefined) {
+    throw new Error(
+      `autoCommit.repo '${configured}' is relative and there is no config file path to resolve it against: use an absolute path`,
+    );
+  }
+  return resolve(dirname(configPath), configured);
+}

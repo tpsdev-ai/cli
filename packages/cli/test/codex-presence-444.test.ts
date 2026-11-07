@@ -16,6 +16,8 @@ import { sendMessage } from "../src/utils/mail.js";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { load as parseYaml } from "js-yaml";
+import { resolveAutoCommitRepo } from "../src/utils/agent-workspace.js";
 import {
   HEARTBEAT_INTERVAL_MS,
   SHUTDOWN_DRAIN_TIMEOUT_MS,
@@ -60,8 +62,8 @@ function initRepo(dir: string): void {
   gitIn(dir, "commit", "-q", "-m", "base");
 }
 
-/** Start a conflicting rebase in `dir` and leave it interrupted. */
-function interruptedRebase(dir: string): void {
+/** A topic branch with a commit of its own and a conflicting `main`; leaves `topic` checked out. */
+function divergedBranches(dir: string): void {
   gitIn(dir, "checkout", "-q", "-b", "topic");
   writeFileSync(join(dir, "file.txt"), "topic\n");
   gitIn(dir, "commit", "-q", "-am", "topic");
@@ -69,6 +71,10 @@ function interruptedRebase(dir: string): void {
   writeFileSync(join(dir, "file.txt"), "main\n");
   gitIn(dir, "commit", "-q", "-am", "main");
   gitIn(dir, "checkout", "-q", "topic");
+}
+
+/** Start the conflicting rebase of the checked-out topic branch and leave it interrupted. */
+function startInterruptedRebase(dir: string): void {
   if (realSpawnSync(GIT, ["rebase", "main"], { cwd: dir, encoding: "utf-8" }).status === 0) {
     throw new Error("fixture rebase did not conflict");
   }
@@ -119,6 +125,8 @@ async function driveRuntime(
     dir?: string;
     /** Configured commit repository override (autoCommit.repo). */
     autoCommitRepo?: string;
+    /** Start the conflicting rebase in the override repository while the task runs. */
+    rebaseDuringTask?: boolean;
     realAutoCommit?: boolean;
     /** Make every sender notice throw, as a failed signed send does. */
     sendFailure?: boolean;
@@ -216,6 +224,7 @@ async function driveRuntime(
     return { status: 0, stdout: "fixture", stderr: "" } as never;
   }) : undefined;
   const mailSpawn = captureAutoCommit ? spyOn(childProcess, "spawn").mockImplementation(() => {
+    if (opts.rebaseDuringTask && opts.autoCommitRepo) startInterruptedRebase(resolve(opts.autoCommitRepo));
     if (opts.autoCommitFailure === "rebase") mkdirSync(join(workspace, ".git", "rebase-merge"), { recursive: true });
     if (opts.ignoredFileChange) writeFileSync(join(workspace, "ignored.log"), "ignored\n");
     if (opts.realAutoCommit) writeFileSync(resolve(opts.autoCommitRepo!, "file.txt"), "task change\n");
@@ -568,16 +577,18 @@ describe("mail auto-commit checks", () => {
     try {
       initRepo(workspace);
       initRepo(override);
-      interruptedRebase(override);
+      // The topic commit predates the task, so the pre-task baseline is the tip
+      // a successful abort restores.
+      divergedBranches(override);
       const overrideBefore = childProcess.spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: override, encoding: "utf-8" }).stdout?.trim();
-      const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: override });
+      const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: override, rebaseDuringTask: true });
       expect(result.autoCommits).toBe(0);
       expect(result.logs.join("\n")).not.toContain("Auto-commit:");
-      expect(result.warnings.join("\n")).toContain("Git status is clean and HEAD matches the restored value after aborting a stale rebase");
+      expect(result.warnings.join("\n")).toContain("Git status is clean and HEAD matches its pre-task value");
       const rebasePath = childProcess.spawnSync(GIT, ["rev-parse", "--path-format=absolute", "--git-path", "rebase-merge"], { cwd: override, encoding: "utf-8" }).stdout?.trim();
       expect(rebasePath && existsSync(rebasePath)).toBe(false);
       expect(childProcess.spawnSync(GIT, ["status", "--porcelain"], { cwd: override, encoding: "utf-8" }).stdout?.trim()).toBe("");
-      expect(childProcess.spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: override, encoding: "utf-8" }).stdout?.trim()).not.toBe(overrideBefore);
+      expect(childProcess.spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: override, encoding: "utf-8" }).stdout?.trim()).toBe(overrideBefore);
       // The workspace's untracked SOUL.md still exists.
       expect(existsSync(join(workspace, "SOUL.md"))).toBe(true);
     } finally {
@@ -585,7 +596,7 @@ describe("mail auto-commit checks", () => {
     }
   }, 20_000);
 
-  it("commits in the repository probed for a relative override through the real CLI", async () => {
+  it("commits in the repository resolved from a relative autoCommit.repo in a real config file", async () => {
     const root = mkdtempSync(join(tmpdir(), "cli800-relative-repo-"));
     const workspace = join(root, "workspace");
     const override = join(root, "override");
@@ -595,8 +606,16 @@ describe("mail auto-commit checks", () => {
       initRepo(override);
       const workspaceBefore = gitIn(workspace, "rev-parse", "HEAD").trim();
       const overrideBefore = gitIn(override, "rev-parse", "HEAD").trim();
-      process.chdir(root);
-      const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: "override", realAutoCommit: true });
+      // The real config file carries a relative autoCommit.repo; it is loaded the
+      // way `tps` loads it, with the config file's directory as the base.
+      const configFile = join(root, "agent.yaml");
+      writeFileSync(configFile, "agentId: testbot\nworkspace: workspace\nautoCommit:\n  repo: override\n");
+      const parsed = parseYaml(readFileSync(configFile, "utf-8")) as { autoCommit: { repo: string } };
+      const resolvedOverride = resolveAutoCommitRepo(parsed.autoCommit.repo, configFile);
+      expect(resolvedOverride).toBe(override);
+      // Run from the workspace, a different directory from the config file's.
+      process.chdir(workspace);
+      const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: resolvedOverride, realAutoCommit: true });
       const tpsOutcome = result.tpsCommit
         ? `tps agent commit exit=${result.tpsCommit.status} stderr=${JSON.stringify(result.tpsCommit.stderr)}${result.tpsCommit.error ? ` error=${JSON.stringify(result.tpsCommit.error)}` : ""}`
         : "tps agent commit was never spawned";

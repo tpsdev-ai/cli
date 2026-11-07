@@ -6,7 +6,7 @@
 
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, createWriteStream, existsSync, readFileSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { basename, isAbsolute, join, resolve } from "node:path";
 import {
   refreshOpenAIToken,
   type StoredCredentials,
@@ -79,7 +79,11 @@ async function ensureFreshOpenAIToken(agentId: string): Promise<void> {
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export interface AutoCommitConfig {
-  /** Repository path to commit changes in (defaults to workspace); relative paths use the runtime process working directory. */
+  /**
+   * Repository path to commit changes in (defaults to workspace). A relative
+   * path is resolved against the config file's directory when the agent config
+   * is loaded; the runtime requires an absolute path.
+   */
   repo?: string;
   /** Branch name prefix; task refId appended: e.g. "task/" -> "task/ops-68" */
   branchPrefix?: string;
@@ -120,6 +124,23 @@ export interface CodexRuntimeConfig {
   autoCommit?: AutoCommitConfig;
   /** If set, listen for pr.opened events and auto-request reviews */
   reviewTrigger?: { reviewers: string[]; repo: string };
+}
+
+/**
+ * The repository auto-commit writes to. Config load resolves a relative
+ * `autoCommit.repo` against the config file's directory; a relative value that
+ * reaches the runtime is refused rather than resolved against the process
+ * working directory.
+ */
+export function resolveCommitRepo(config: { workspace: string; autoCommit?: AutoCommitConfig }): string {
+  const configured = config.autoCommit?.repo;
+  const repo = configured ?? config.workspace;
+  if (!isAbsolute(repo)) {
+    throw new Error(
+      `${configured === undefined ? "workspace" : "autoCommit.repo"} '${repo}' is relative: use an absolute path`,
+    );
+  }
+  return resolve(repo);
 }
 
 interface MailMessage {
@@ -361,13 +382,14 @@ export type MailAutoCommitDecision =
  * Decide whether a mail task left changes worth committing in `repo`.
  *
  * Every probe runs against the one repository the caller resolved for the
- * commit, and an interrupted rebase is detected and aborted there too. A
- * successful abort restores HEAD, so the comparison is reset to the restored
- * value; a failed probe is indeterminate and yields a skip with its outcome
- * reported. The clean decision establishes exactly this: Git status is clean
- * and HEAD matches its pre-task value (or the restored value after an abort) —
- * `git status --porcelain` omits ignored files, and equal HEADs do not rule out
- * a commit that was later reset.
+ * commit, and an interrupted rebase is detected and aborted there too. The
+ * comparison is always the HEAD read before the task: a successful abort
+ * restores the tip that contains the task's own commits, so a restored HEAD
+ * that differs from the baseline is the evidence of those commits. A failed
+ * probe is indeterminate and yields a skip with its outcome reported. The
+ * clean decision establishes exactly this: Git status is clean and HEAD
+ * matches its pre-task value — `git status --porcelain` omits ignored files,
+ * and equal HEADs do not rule out a commit that was later reset.
  */
 export function evaluateMailAutoCommitGate(
   repo: string,
@@ -383,8 +405,7 @@ export function evaluateMailAutoCommitGate(
     return { action: "skip", message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit" };
   }
 
-  let comparison = baseline;
-  let aborted = false;
+  let restoredHead: string | undefined;
   if (staleRebase.state === "present") {
     const abortResult = runSync(GIT_BIN, ["rebase", "--abort"], { cwd: repo, encoding: "utf-8" });
     if (abortResult.status !== 0) {
@@ -392,12 +413,10 @@ export function evaluateMailAutoCommitGate(
       return { action: "skip", message: `Stale rebase abort failed (exit ${abortResult.status}): ${firstLine} — skipping autoCommit` };
     }
     const restored = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
-    const restoredHead = String(restored.stdout ?? "").trim();
+    restoredHead = String(restored.stdout ?? "").trim();
     if (restored.status !== 0 || !restoredHead) {
       return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after rebase abort) failed — skipping autoCommit" };
     }
-    comparison = restoredHead;
-    aborted = true;
   }
 
   const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
@@ -411,12 +430,11 @@ export function evaluateMailAutoCommitGate(
 
   const changed = hasWorkspaceChangesOrNewCommit(
     String(statusResult.stdout ?? ""),
-    comparison,
-    String(headResult.stdout ?? "").trim(),
+    baseline,
+    restoredHead ?? String(headResult.stdout ?? "").trim(),
   );
   if (changed) return { action: "commit" };
-  const basis = aborted ? "the restored value after aborting a stale rebase" : "its pre-task value";
-  return { action: "clean", message: `Git status is clean and HEAD matches ${basis} — skipping autoCommit` };
+  return { action: "clean", message: "Git status is clean and HEAD matches its pre-task value — skipping autoCommit" };
 }
 
 interface AutoCommitFlair {
@@ -1017,7 +1035,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          const prUrl = await _runAutoCommitLegacy(agentId, resolve(config.autoCommit.repo ?? config.workspace), taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
+          const prUrl = await _runAutoCommitLegacy(agentId, resolveCommitRepo(config), taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
           await publishPrResult(flair, agentId, taskId, prUrl);
         }
       } catch (e) {
@@ -1078,7 +1096,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           // Choose the commit repository ONCE: every probe and the rebase abort
           // below run against this repository, so a configured override is used
           // for all of them.
-          const commitRepo = config.autoCommit ? resolve(config.autoCommit.repo ?? config.workspace) : undefined;
+          const commitRepo = config.autoCommit ? resolveCommitRepo(config) : undefined;
           const baselineResult = commitRepo
             ? spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: commitRepo, encoding: "utf-8" })
             : undefined;
@@ -1107,8 +1125,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           }
           // Auto-commit after a mail task. Unlike the Flair task path above,
           // the mail path detects and aborts an interrupted rebase in the
-          // commit repository, resets the comparison baseline after a
-          // successful abort, and probes Git status and HEAD before deciding.
+          // commit repository, keeps the pre-task baseline as the comparison
+          // (a restored HEAD above it is evidence of the task's commits), and
+          // probes Git status and HEAD before deciding.
           if (config.autoCommit && commitRepo !== undefined) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
