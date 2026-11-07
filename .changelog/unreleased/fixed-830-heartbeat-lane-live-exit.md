@@ -1,0 +1,1 @@
+- **The heartbeat lane's live case fails naming the gateway's exit code or signal when the gateway exits while the heartbeat runs.**
