@@ -434,8 +434,8 @@ await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
     } else if (opts.signalDuringPreflight) {
       await waitFor(() => runtimeFinished || http.some((c) => c.startsWith("GET /OrgEventCatchup")));
     }
-    expect(process.listenerCount("SIGTERM")).toBe(savedSigterm.length);
-    expect(process.listenerCount("SIGINT")).toBe(savedSigint.length);
+    expect(process.listeners("SIGTERM").filter((l) => !savedSigterm.includes(l)), "the runtime leaves no SIGTERM listener").toEqual([]);
+    expect(process.listeners("SIGINT").filter((l) => !savedSigint.includes(l)), "the runtime leaves no SIGINT listener").toEqual([]);
     if (opts.observeMailAfterExit) {
       const pollsAtExit = mailPolls;
       expect(pollsAtExit).toBeGreaterThan(0);
@@ -1070,9 +1070,18 @@ describe("codex runtime presence (cli#444)", () => {
     let settled = false;
     let runtime: Promise<void> | undefined;
     let signalled = false;
+    const addedListeners = (signal: "SIGINT" | "SIGTERM") =>
+      process.listeners(signal).filter((listener) => !(signal === "SIGINT" ? sigint : sigterm).includes(listener));
+    // Deliver the signal to this runtime's listeners only: handlers another test
+    // file left in the shared process would also run on process.emit.
+    const sendSignal = (signal: "SIGINT" | "SIGTERM") => {
+      const listeners = addedListeners(signal);
+      for (const listener of listeners) (listener as () => void)();
+      return listeners.length > 0;
+    };
     const expectListeners = () => {
-      expect(process.listenerCount("SIGINT"), "SIGINT listener remains until shutdown completes").toBe(sigint.length + 1);
-      expect(process.listenerCount("SIGTERM"), "SIGTERM listener remains until shutdown completes").toBe(sigterm.length + 1);
+      expect(addedListeners("SIGINT"), "SIGINT listener remains until shutdown completes").toHaveLength(1);
+      expect(addedListeners("SIGTERM"), "SIGTERM listener remains until shutdown completes").toHaveLength(1);
     };
     try {
       process.env.HOME = dir;
@@ -1086,11 +1095,11 @@ describe("codex runtime presence (cli#444)", () => {
       expect(stopCalls).toEqual([1, 1]);
       expectListeners();
       signalled = true;
-      expect(process.emit(signal)).toBe(true);
+      expect(sendSignal(signal)).toBe(true);
       await sleep(0);
       expect(stopCalls, "signal during rejection must reuse the drain").toEqual([1, 1]);
       expectListeners();
-      expect(process.emit(signal === "SIGINT" ? "SIGTERM" : "SIGINT")).toBe(true);
+      expect(sendSignal(signal === "SIGINT" ? "SIGTERM" : "SIGINT")).toBe(true);
       await sleep(0);
       expect(stopCalls, "repeated signal must reuse the drain").toEqual([1, 1]);
       expect(finalBeats).toBe(0);
@@ -1100,7 +1109,7 @@ describe("codex runtime presence (cli#444)", () => {
       releaseStops();
       await waitFor(() => finalBeats === 1);
       expectListeners();
-      expect(process.emit(signal)).toBe(true);
+      expect(sendSignal(signal)).toBe(true);
       await sleep(0);
       expect(stopCalls).toEqual([1, 1]);
       expect(finalBeats).toBe(1);
@@ -1112,8 +1121,8 @@ describe("codex runtime presence (cli#444)", () => {
       expect(rejected).toBe(pollError);
       expect(exits).toEqual([0]);
       expect(finalBeats).toBe(1);
-      expect(process.listenerCount("SIGINT")).toBe(sigint.length);
-      expect(process.listenerCount("SIGTERM")).toBe(sigterm.length);
+      expect(addedListeners("SIGINT")).toHaveLength(0);
+      expect(addedListeners("SIGTERM")).toHaveLength(0);
     } finally {
       releaseStops();
       releaseBeat();
