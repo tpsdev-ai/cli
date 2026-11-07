@@ -90,6 +90,67 @@ export function collectResolvedDeps(lock) {
   return [...out.values()];
 }
 
+/** The `package-lock.json` paths in a list of repository-relative file paths. */
+export function lockfilesFromFileList(paths) {
+  return [...new Set(paths.filter((path) => path.split("/").pop() === "package-lock.json"))].sort();
+}
+
+/**
+ * The registry-resolved entries in a parsed npm `package-lock.json` (v2/v3).
+ *
+ * Only `node_modules/...` entries with a registry `resolved` URL are returned.
+ * The root `""` entry and the local forms npm records (`link: true`, a
+ * `file:`/`git:`/`workspace:` URL) are skipped. Any other non-registry URL is a
+ * problem, not a silent skip.
+ *
+ * The name is the entry's own `name` when npm recorded one (an aliased install,
+ * such as `node_modules/foo` resolving to `@scope/bar`, carries the real name),
+ * otherwise the last `node_modules/` path segment, which keeps a scoped name's
+ * `@scope/`.
+ *
+ * @returns {{ deps: Array<{name: string, version: string, lockfile: string}>,
+ *             problems: Array<{lockfile: string, entry: string, message: string}> }}
+ */
+export function collectNpmLockDeps(lock, lockfile) {
+  const deps = [];
+  const problems = [];
+  const packages = lock && typeof lock === "object" ? lock.packages : null;
+  if (!packages || typeof packages !== "object" || Array.isArray(packages)) {
+    return {
+      deps,
+      problems: [{ lockfile, entry: "", message: "no `packages` map (a v2 or v3 lockfile is required)" }],
+    };
+  }
+  for (const [entry, value] of Object.entries(packages)) {
+    if (entry === "") continue;
+    const marker = entry.lastIndexOf("node_modules/");
+    if (marker === -1 || (marker !== 0 && entry[marker - 1] !== "/")) continue;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      problems.push({ lockfile, entry, message: "entry is not an object" });
+      continue;
+    }
+    if (value.link === true) continue;
+    const resolved = value.resolved;
+    if (typeof resolved !== "string") continue; // bundled or extraneous: npm records no fetch URL
+    if (/^(?:file|git|workspace):/.test(resolved)) continue;
+    if (!/^https?:\/\/registry\.npmjs\.org\//.test(resolved)) {
+      problems.push({ lockfile, entry, message: `resolved URL is not a registry URL: ${resolved}` });
+      continue;
+    }
+    const version = value.version;
+    if (typeof version !== "string" || version === "") {
+      problems.push({ lockfile, entry, message: "registry-resolved entry has no version" });
+      continue;
+    }
+    const name =
+      typeof value.name === "string" && value.name !== ""
+        ? value.name
+        : entry.slice(marker + "node_modules/".length);
+    deps.push({ name, version, lockfile });
+  }
+  return { deps, problems };
+}
+
 /**
  * The semver grammar the exception gate accepts, shared with the exact-pin
  * check so both read a version the same way.
