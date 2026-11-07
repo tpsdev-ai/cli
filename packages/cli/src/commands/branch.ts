@@ -12,7 +12,7 @@ import { sendMessage, inboxExists, findRelayedRecord } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
-import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
+import { branchStatePath, clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
@@ -548,7 +548,13 @@ async function runStart(): Promise<void> {
       activeHostChannel = channel;
     }
 
-    writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
+    try {
+      writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
+    } catch (error) {
+      // A state write failure must not stop message handling: the heartbeat
+      // echo and the rest of the handler still run.
+      logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     if (msg.type === MSG_HEARTBEAT) {
       // Echo heartbeat back so host can track bidirectional liveness
