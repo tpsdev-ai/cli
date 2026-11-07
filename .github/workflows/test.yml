@@ -28,6 +28,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -51,6 +52,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -85,6 +87,7 @@ jobs:
     name: promote-latest fixtures (${{ matrix.os }})
     permissions:
       contents: read # actions/checkout reads the repository
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -111,6 +114,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -195,6 +199,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -286,6 +291,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -336,6 +342,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -379,6 +386,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -401,6 +409,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -529,6 +538,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -561,6 +571,7 @@ jobs:
     name: nono profile gate (${{ matrix.os }})
     permissions:
       contents: read # actions/checkout reads the repository
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -634,6 +645,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Known false positives excluded via --exclude-rule flags above
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
@@ -661,6 +673,7 @@ jobs:
       contents: read # actions/checkout reads the repository
       security-events: write # CodeQL's upload of SARIF results (the "Perform CodeQL Analysis" step)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
