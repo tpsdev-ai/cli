@@ -1,6 +1,7 @@
-import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 import { isPidRecordPid, isPidRecordStartToken } from "./pid-file.js";
 
@@ -83,6 +84,22 @@ function branchStatePath(): string {
 
 const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
+/**
+ * Write a file atomically: a uniquely named temp file in the same directory,
+ * created exclusively with `mode`, renamed over the target. On failure the temp
+ * file is removed and the error propagates unchanged.
+ */
+function writeFileAtomic(filePath: string, content: string, mode: number): void {
+  const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(tmpPath, content, { encoding: "utf-8", mode, flag: "wx" });
+    renameSync(tmpPath, filePath);
+  } catch (error) {
+    try { rmSync(tmpPath, { force: true }); } catch {}
+    throw error;
+  }
+}
+
 /** Root of the inter-process lock that owns one host state record. */
 export function hostStateLockRoot(path: string): string {
   return `${path}.lock`;
@@ -117,7 +134,7 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
     // flag before it takes the lock to clear, so a write it starts afterwards
     // is skipped.
     if (shouldWrite !== undefined && !shouldWrite()) return;
-    writeFileSync(path, JSON.stringify(state, null, 2), { encoding: "utf-8", mode: 0o600 });
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
   }, timeoutMs);
 }
 
@@ -213,7 +230,7 @@ export function clearHostState(branch: string): void {
 
 export function writeBranchState(state: BranchConnectionState): void {
   mkdirSync(connectionsDir(), { recursive: true });
-  writeFileSync(branchStatePath(), JSON.stringify(state, null, 2), "utf-8");
+  writeFileAtomic(branchStatePath(), JSON.stringify(state, null, 2), 0o666);
 }
 
 export function readBranchState(): BranchConnectionState | null {

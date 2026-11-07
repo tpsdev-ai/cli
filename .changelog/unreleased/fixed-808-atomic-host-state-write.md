@@ -1,0 +1,1 @@
+- **Host and branch connection state records are written atomically, so a failed write leaves the previous record intact (Closes #808).**

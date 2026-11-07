@@ -1,5 +1,6 @@
-import { describe, test, expect, afterEach } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { describe, test, expect, afterEach, spyOn, mock } from "bun:test";
+import * as fs from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -9,9 +10,13 @@ import {
   connectionAlive,
   hostStatePath,
   hostStateLockRoot,
+  writeBranchState,
+  readBranchState,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
+
+afterEach(() => { mock.restore(); });
 
 describe("connection-state", () => {
   let home = "";
@@ -175,5 +180,87 @@ describe("connection-state", () => {
       services: [{ name: "service", status: "healthy", lastCheck: "now", lastHealthy: null, error: "" }] });
     clearHostState("x");
     expect(existsSync(hostStatePath("x"))).toBe(false);
+  });
+
+  const writeState = (branch: string, messagesReceived: number): HostConnectionState => ({
+    branch,
+    connectedAt: "",
+    lastHeartbeatSent: "",
+    lastHeartbeatAck: null,
+    reconnectCount: 0,
+    bytesSent: 0,
+    bytesReceived: 0,
+    messagesSent: 0,
+    messagesReceived,
+    pid: process.pid,
+  });
+
+  test("a failed rename keeps the previous record and leaves no temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-rename-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = hostStatePath("branch-a");
+    writeHostState(writeState("branch-a", 1));
+    const before = readFileSync(record);
+
+    const rename = fs.renameSync;
+    const injected = spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof rename>) => {
+      if (String(args[1]) === record) throw new Error("injected rename failure");
+      return rename(...args);
+    });
+    try {
+      expect(() => writeHostState(writeState("branch-a", 2))).toThrow("injected rename failure");
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("a failed write keeps the previous record and removes the temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-write-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = hostStatePath("branch-a");
+    writeHostState(writeState("branch-a", 1));
+    const before = readFileSync(record);
+
+    const write = fs.writeFileSync;
+    const injected = spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof write>) => {
+      if (!String(args[0]).includes(".mail-lock")) {
+        write(...args);
+        throw new Error("injected write failure");
+      }
+      return write(...args);
+    });
+    try {
+      expect(() => writeHostState(writeState("branch-a", 2))).toThrow("injected write failure");
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("a successful write stores mode 0600 and leaves no temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-mode-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = hostStatePath("branch-a");
+    writeHostState(writeState("branch-a", 1));
+    expect(readHostState("branch-a")?.messagesReceived).toBe(1);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+    expect(statSync(record).mode & 0o777).toBe(0o600);
+  });
+
+  test("branch state writes atomically and round-trips", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-branch-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    expect(readBranchState()).toEqual({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
   });
 });
