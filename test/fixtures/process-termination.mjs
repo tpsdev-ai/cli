@@ -29,9 +29,9 @@ function processState(pid) {
 }
 
 /**
- * Block until the pid is a zombie or gone, polling at most every `pollMs` up
- * to `timeoutMs`. A zombie means the process has ended at the OS level while
- * node has not reaped it, so its exit event is still pending.
+ * Block until the pid is a zombie or gone, sleeping `pollMs` between probes and
+ * giving up after `timeoutMs`. A zombie means the process has ended at the OS
+ * level while node has not reaped it, so its exit event is still pending.
  */
 export function waitForTermination(pid, { timeoutMs = 5_000, pollMs = POLL_MS } = {}) {
   const deadline = Date.now() + timeoutMs;
