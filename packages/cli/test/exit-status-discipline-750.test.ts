@@ -20,6 +20,13 @@ const ALLOWLIST: ZeroExitAllowance[] = [
     reason: "npm launcher --version fast path; runs before any command can set a code",
   },
   {
+    file: "src/utils/codex-runtime.ts",
+    contexts: [
+      "runCodexRuntime > shutdown > if(!shutdownComplete):then > ArrowFunction > if(shutdownRequested):then #1 (zero)",
+    ],
+    reason: "Codex runtime SIGINT/SIGTERM shutdown handler",
+  },
+  {
     file: "src/utils/mail-bridge.ts",
     contexts: [
       "startBridgeDaemon > shutdown > core.stop().then()[callback:0] #1 (zero)",
