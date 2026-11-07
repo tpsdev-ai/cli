@@ -145,6 +145,58 @@ describe("branch daemon state-write failure", () => {
     expect(stderr).toBe("");
   }, 30_000);
 
+  test("a state and log write failure is counted and reported in the next appended log line", async () => {
+    const branch = generateKeyPair();
+    const host = generateKeyPair();
+    saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
+    mkdirSync(process.env.TPS_ROOT!, { recursive: true });
+    writeFileSync(
+      join(process.env.TPS_IDENTITY_DIR!, "host.json"),
+      JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
+    );
+    const port = await freePort();
+    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+
+    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
+    delete env.TPS_BRANCH_DAEMON;
+    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+
+    channel = await connectHost(port, host, branch);
+    expect(channel.isAlive()).toBe(true);
+
+    // The daemon is connected with a working log and state path; break both
+    // now. A regular file in the connections directory's place and a directory
+    // in the log file's place fail for every uid, including root in CI.
+    const connections = join(process.env.TPS_ROOT!, "connections");
+    rmSync(connections, { recursive: true, force: true });
+    writeFileSync(connections, "not a directory");
+    const logPath = join(process.env.TPS_ROOT!, "branch.log");
+    rmSync(logPath, { force: true });
+    mkdirSync(logPath);
+
+    for (const seq of [40, 41]) {
+      const echoed = await exchange(channel, { type: MSG_HEARTBEAT, seq, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+      expect(echoed.seq).toBe(seq);
+    }
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+    expect(stderr).toBe("");
+
+    // Each broken heartbeat fails two appends: the state-write warning and the
+    // outbox-drained line, so the two heartbeats lost four lines. Wait for the
+    // daemon to finish the last heartbeat's trailing append attempt, then make
+    // the log writable again; the next appended line reports those four.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 300));
+    rmSync(logPath, { recursive: true, force: true });
+    const appended = await exchange(channel, { type: MSG_HEARTBEAT, seq: 42, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+    expect(appended.seq).toBe(42);
+
+    const entries = readFileSync(logPath, "utf-8").split("\n").filter((line) => line.length > 0);
+    expect(entries[0]).toContain("(4 log lines lost)");
+  }, 30_000);
+
   test("heartbeat echoes continue when the state and log paths fail after connect and the stderr pipe is closed", async () => {
     const branch = generateKeyPair();
     const host = generateKeyPair();
@@ -176,9 +228,9 @@ describe("branch daemon state-write failure", () => {
     rmSync(logPath, { force: true });
     mkdirSync(logPath);
 
-    // Close the read end of the child's stderr pipe. The fallback must write
-    // synchronously inside its try/catch: a stream write surfaces the
-    // closed-pipe error after it returns, uncaught, which kills the child.
+    // Close the read end of the child's stderr pipe. Logging writes nothing to
+    // stderr, so this is a regression pin: the child must stay alive and keep
+    // echoing.
     child.stderr!.destroy();
 
     const first = await exchange(channel, { type: MSG_HEARTBEAT, seq: 30, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
@@ -186,8 +238,7 @@ describe("branch daemon state-write failure", () => {
     const second = await exchange(channel, { type: MSG_HEARTBEAT, seq: 31, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
     expect(second.seq).toBe(31);
 
-    // Give a deferred stderr error a chance to surface before asserting the
-    // child is still running.
+    // Give the child a moment before asserting it is still running.
     await new Promise((resolveWait) => setTimeout(resolveWait, 500));
     expect(child.exitCode).toBeNull();
     expect(child.signalCode).toBeNull();
@@ -209,8 +260,8 @@ describe("branch daemon state-write failure", () => {
     const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
     delete env.TPS_BRANCH_DAEMON;
     child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
-    // Leave the read end open and never drain it, so the child's stderr queue
-    // fills. The capacity assumed below is a Linux pipe's default 64 KiB.
+    // Leave the read end open and never drain it: a stderr write from log
+    // handling would fill the pipe and stall a blocking writer.
     child.stderr!.pause();
 
     channel = await connectHost(port, host, branch);
@@ -226,9 +277,9 @@ describe("branch daemon state-write failure", () => {
     rmSync(logPath, { force: true });
     mkdirSync(logPath);
 
-    // Each heartbeat makes the daemon attempt two fallback lines: the
-    // state-write warning and the outbox-drained line. 400 heartbeats force
-    // about 800 lines of roughly 200 bytes each, past the 64 KiB pipe.
+    // Each heartbeat attempts two log appends. The pipe stays open but is
+    // never drained, so a blocking stderr fallback would eventually stall the
+    // daemon; log handling writes nothing to stderr.
     for (let i = 0; i < 400; i++) {
       const seq = 100 + i;
       const echo = await exchange(channel, { type: MSG_HEARTBEAT, seq, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
@@ -241,10 +292,9 @@ describe("branch daemon state-write failure", () => {
     expect(() => process.kill(child!.pid!, 0)).not.toThrow();
   }, 60_000);
 
-  test("a newline in a log message is escaped so the stderr fallback is one line", async () => {
+  test("a newline in a log message is escaped onto one appended line", async () => {
     mkdirSync(process.env.TPS_ROOT!, { recursive: true });
     const logPath = join(process.env.TPS_ROOT!, "branch.log");
-    mkdirSync(logPath);
     const script = join(root, "log-line.ts");
     writeFileSync(
       script,
@@ -252,15 +302,12 @@ describe("branch daemon state-write failure", () => {
         `logLine("PROXY", "Service 'agent\\nname\\u0085nel\\u2028ls\\u2029ps' proxied");\n`,
     );
 
-    child = spawn(process.execPath, [script], { env: { ...process.env }, stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+    child = spawn(process.execPath, [script], { env: { ...process.env }, stdio: ["ignore", "ignore", "ignore"] });
     const code = await new Promise<number | null>((resolveExit) => child!.once("exit", resolveExit));
 
     expect(code).toBe(0);
-    const lines = stderr.split("\n").filter((line) => line.length > 0);
-    expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("Service 'agent\\nname\\u0085nel\\u2028ls\\u2029ps' proxied");
-    expect(lines[0]).toContain("log append failed");
+    const entries = readFileSync(logPath, "utf-8").split("\n").filter((line) => line.length > 0);
+    expect(entries).toHaveLength(1);
+    expect(entries[0]).toContain("Service 'agent\\nname\\u0085nel\\u2028ls\\u2029ps' proxied");
   }, 30_000);
 });

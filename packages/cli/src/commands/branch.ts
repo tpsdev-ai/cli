@@ -339,7 +339,7 @@ function hostPath(identityDir: string): string {
 }
 
 /** Escape CR, LF, the Unicode line separators and the other control
- *  characters JSON-style so a fallback report is exactly one line. */
+ *  characters JSON-style so one log entry occupies exactly one line. */
 function escapeLogLine(text: string): string {
   let escaped = "";
   for (const char of text) {
@@ -354,40 +354,24 @@ function escapeLogLine(text: string): string {
   return escaped;
 }
 
-/** Bytes of fallback output we are willing to leave queued on stderr before
- *  dropping lines instead of writing more. */
-const STDERR_FALLBACK_CAP_BYTES = 64 * 1024;
-
-/** Fallback lines dropped since the last fallback line that was written. */
-let droppedFallbackLines = 0;
-
-// A stderr stream error (a closed pipe, for example) arrives asynchronously;
-// without a listener it is uncaught and ends the daemon. The fallback cannot
-// report anything when stderr itself fails, so the error is swallowed.
-process.stderr.on("error", () => {});
+/** Branch-log lines that could not be appended since the last successful
+ *  append. */
+let lostLogLines = 0;
 
 /** Best-effort branch log append: never throws, so logging cannot abort the
- *  daemon. On append failure it attempts one escaped line on stderr carrying
- *  the original line and the append error. The write is bounded and
- *  non-blocking: lines are dropped while stderr is not being drained, and every
- *  failure is swallowed, so handling continues. */
+ *  daemon. A failure is counted and reported in the next line that is
+ *  appended; nothing is written to stderr, and handling continues. */
 export function logLine(event: string, msg: string): void {
-  const line = `[${new Date().toISOString()}] ${event}: ${msg}`;
+  const lost = lostLogLines;
+  const suffix = lost > 0 ? ` (${lost} log lines lost)` : "";
+  const line = `${escapeLogLine(`[${new Date().toISOString()}] ${event}: ${msg}`)}${suffix}`;
   try {
     appendFileSync(logPath(), `${line}\n`, "utf-8");
-  } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
-    if (process.stderr.writableLength >= STDERR_FALLBACK_CAP_BYTES) {
-      droppedFallbackLines += 1;
-      return;
-    }
-    const dropped = droppedFallbackLines;
-    const suffix = dropped > 0 ? ` (${dropped} fallback lines dropped)` : "";
-    try {
-      process.stderr.write(`${escapeLogLine(`${line} (log append failed: ${detail})${suffix}`)}\n`);
-      droppedFallbackLines = 0;
-    } catch {}
+  } catch {
+    lostLogLines += 1;
+    return;
   }
+  lostLogLines = 0;
 }
 
 /**
@@ -601,10 +585,9 @@ async function runStart(): Promise<void> {
     } catch (error) {
       // A state write failure must not stop message handling: the heartbeat
       // echo and the rest of the handler still run. The log report appends to
-      // the branch log; on append failure it attempts one escaped line on
-      // stderr, bounded and non-blocking (lines dropped when stderr is not
-      // being drained), and every logging failure is swallowed, so handling
-      // continues.
+      // the branch log; a branch-log append failure is counted and reported in
+      // the next line that is appended, nothing is written to stderr, and
+      // handling continues.
       logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
     }
 
