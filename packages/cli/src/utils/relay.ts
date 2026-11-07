@@ -1276,11 +1276,21 @@ export async function connectAndKeepAlive(
         // stop() sets stopped before clearing; the write gate is checked under the lock.
         const persist = () => writeHostState(state, () => !stopped);
         const refresh = hostStateRefresher(branchId, persist);
-        persist();
+        // The connect-time writes stay outside the refresher so a refusal still
+        // reconnects, after one line naming the record path and reason.
+        const persistConnect = () => {
+          try {
+            persist();
+          } catch (error) {
+            console.error(`[relay] Host state record ${hostStatePath(branchId)} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
+            throw error;
+          }
+        };
+        persistConnect();
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
         state.messagesSent++;
-        persist();
+        persistConnect();
 
         const hb = setInterval(async () => {
           if (stopped || !channel.isAlive()) return;
@@ -1337,8 +1347,25 @@ export async function connectAndKeepAlive(
         clearInterval(healthProbe);
         channel.offMessage(handler);
         cancelInboundPersist();
-        try { await channel.close(); } catch {}
+        // A graceful disconnect tracks its close like the reconnect path: the
+        // pending close is awaited, and a rejected close retains the channel.
+        // stop() retries a retained close: if that retry succeeds the channel
+        // is removed and the record can be cleared; if it rejects, stop()
+        // throws HostChannelCloseError and keeps the record. Today's WS and TCP
+        // channels resolve close() on timeout, so this branch is reached
+        // through the channel interface; the real transports are tracked in #774.
         currentChannel = null;
+        pendingChannelClose = (async () => {
+          try {
+            await channel.close();
+          } catch (error) {
+            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+            retainFailedChannel(channel);
+            if (stopped) unconfirmedChannelClose = true;
+          }
+        })();
+        await pendingChannelClose;
+        pendingChannelClose = null;
       } catch {
         cancelInboundPersist();
         if (currentChannel !== null) {
