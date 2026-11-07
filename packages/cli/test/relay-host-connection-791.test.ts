@@ -14,8 +14,8 @@ afterEach(() => { mock.restore(); });
 /** The real timer, captured before any test replaces globalThis.setTimeout. */
 const realSetTimeout = globalThis.setTimeout;
 
-/** A distinctive clock value written into the record, so a diagnostic that
- *  serializes the full host state would carry it. */
+/** A distinctive clock value used to build the connect state, so a diagnostic
+ *  that serializes the full host state would carry it. */
 const SEEDED_CONNECTED_AT = "2001-02-03T04:05:06.789Z";
 
 const savedRelayEnv = () => ({ HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
