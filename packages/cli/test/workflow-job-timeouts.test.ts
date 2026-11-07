@@ -154,7 +154,7 @@ describe("the timeout rule on fixtures", () => {
     );
   });
 
-  test("a cyclic YAML timeout fails, naming the job and a readable value", () => {
+  test("a cyclic YAML timeout names the job and prints <unprintable value>", () => {
     const wf = yaml.load("jobs:\n  test:\n    timeout-minutes: &x [*x]\n") as Workflow;
     expect(timeoutProblems(wf, ["test"], {}).join("; ")).toContain(
       'job "test" timeout-minutes <unprintable value>: not a positive integer',
