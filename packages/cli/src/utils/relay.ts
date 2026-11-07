@@ -1204,6 +1204,24 @@ export async function connectAndKeepAlive(
     }
     failedChannels.add(channel);
   };
+  /** The one close-failure line: record path and reason, never record contents. */
+  const channelCloseFailure = (error: unknown): string =>
+    `[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`;
+  /** Track one channel's close as pending until it settles; retain the channel
+   *  when close rejects so stop() can retry it. Shared by both in-loop close paths. */
+  const trackChannelClose = async (channel: TransportChannel): Promise<void> => {
+    pendingChannelClose = (async () => {
+      try {
+        await channel.close();
+      } catch (error) {
+        console.error(channelCloseFailure(error));
+        retainFailedChannel(channel);
+        if (stopped) unconfirmedChannelClose = true;
+      }
+    })();
+    await pendingChannelClose;
+    pendingChannelClose = null;
+  };
   let inboundPersistTimer: ReturnType<typeof setTimeout> | undefined;
   let inboundPersistState: HostConnectionState | undefined;
   let inboundPersistBackoff = INBOUND_PERSIST_RETRY_BASE_MS;
@@ -1355,33 +1373,13 @@ export async function connectAndKeepAlive(
         // channels resolve close() on timeout, so this branch is reached
         // through the channel interface; the real transports are tracked in #774.
         currentChannel = null;
-        pendingChannelClose = (async () => {
-          try {
-            await channel.close();
-          } catch (error) {
-            console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
-            retainFailedChannel(channel);
-            if (stopped) unconfirmedChannelClose = true;
-          }
-        })();
-        await pendingChannelClose;
-        pendingChannelClose = null;
+        await trackChannelClose(channel);
       } catch {
         cancelInboundPersist();
         if (currentChannel !== null) {
           const failedChannel = currentChannel;
           currentChannel = null;
-          pendingChannelClose = (async () => {
-            try {
-              await failedChannel.close();
-            } catch (error) {
-              console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
-              retainFailedChannel(failedChannel);
-              if (stopped) unconfirmedChannelClose = true;
-            }
-          })();
-          await pendingChannelClose;
-          pendingChannelClose = null;
+          await trackChannelClose(failedChannel);
         }
       }
 
@@ -1405,7 +1403,7 @@ export async function connectAndKeepAlive(
     }
     for (const channel of failedChannels) {
       try { await channel.close(); failedChannels.delete(channel); } catch (error) {
-        console.error(`[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`);
+        console.error(channelCloseFailure(error));
       }
     }
     if (unconfirmedChannelClose || failedChannels.size > 0) {

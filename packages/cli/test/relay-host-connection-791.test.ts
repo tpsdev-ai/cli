@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,10 @@ afterEach(() => { mock.restore(); });
 
 /** The real timer, captured before any test replaces globalThis.setTimeout. */
 const realSetTimeout = globalThis.setTimeout;
+
+/** A distinctive clock value, so a record written under it carries a marker no
+ *  diagnostic line contains unless it prints record contents. */
+const SEEDED_CONNECTED_AT = "2001-02-03T04:05:06.789Z";
 
 const savedRelayEnv = () => ({ HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
   TPS_IDENTITY_DIR: process.env.TPS_IDENTITY_DIR, TPS_REGISTRY_DIR: process.env.TPS_REGISTRY_DIR,
@@ -109,6 +113,11 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
+    const record = readHostState(branch);
+    expect(record).not.toBeNull();
+    const closeLines = diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    expect(closeLines.length).toBeGreaterThan(0);
+    expect(closeLines.every((text) => !text.includes(record!.connectedAt))).toBe(true);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -298,6 +307,7 @@ test("a connect-time host record write failure is reported before reconnecting",
     // countable inside the test's window.
     blocker = join(root, ".tps", "connections");
     writeFileSync(blocker, "blocked");
+    setSystemTime(new Date(SEEDED_CONNECTED_AT));
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
@@ -310,10 +320,12 @@ test("a connect-time host record write failure is reported before reconnecting",
     expect(line).toBeDefined();
     expect(line).toContain(path);
     expect(line).toContain("EEXIST");
+    expect(line).not.toContain(SEEDED_CONNECTED_AT);
     rmSync(blocker, { force: true });
     blocker = undefined;
     await stop();
   } finally {
+    setSystemTime();
     if (blocker) rmSync(blocker, { force: true });
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -367,7 +379,9 @@ test("a second connect-time host record write failure is reported before reconne
     expect(line).toBeDefined();
     expect(line).toContain(path);
     expect(line).toContain("Host state record lock");
-    expect(readHostState(branch)).not.toBeNull();
+    const record = readHostState(branch);
+    expect(record).not.toBeNull();
+    expect(line).not.toContain(record!.connectedAt);
     releaseLock();
     await stop();
   } finally {
