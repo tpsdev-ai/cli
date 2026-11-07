@@ -897,14 +897,21 @@ syncBuiltinESMExports();
   // gets it as a supplementary group, which is what lets an unprivileged
   // process chgrp the replacement to it.
   const SPARE_GROUP = 100;
-  const canOwnAnotherUid =
-    typeof process.getuid === "function" &&
-    process.getuid() === 0 &&
-    executableByAnotherUser(NODE_BIN) &&
-    executableByAnotherUser(SETPRIV_BIN) &&
-    readableByAnotherUser(TPS_BIN);
+  const missingOwnerPrerequisites: string[] = [];
+  if (typeof process.getuid !== "function" || process.getuid() !== 0) missingOwnerPrerequisites.push("root");
+  if (!executableByAnotherUser(NODE_BIN)) missingOwnerPrerequisites.push(`${NODE_BIN} executable by another user`);
+  if (!executableByAnotherUser(SETPRIV_BIN)) missingOwnerPrerequisites.push(`${SETPRIV_BIN} executable by another user`);
+  if (!readableByAnotherUser(TPS_BIN)) missingOwnerPrerequisites.push("the CLI readable by another user");
+  const canOwnAnotherUid = missingOwnerPrerequisites.length === 0;
   if (!canOwnAnotherUid) {
-    test.skip("set-runtime warns after a real replacement keeps only the group (skipped: requires root, a node runtime, setpriv and the CLI readable by another uid)", () => {});
+    const ownerCaseTitle = "set-runtime warns after a real replacement keeps only the group";
+    if (process.env.TPS_TEST_REQUIRE_REAL_OWNER === "1") {
+      test(`${ownerCaseTitle} (this lane requires it; missing ${missingOwnerPrerequisites.join(", ")})`, () => {
+        throw new Error(`the required case cannot run; missing ${missingOwnerPrerequisites.join(", ")}`);
+      });
+    } else {
+      test.skip(`${ownerCaseTitle} (skipped: requires root, a node runtime, setpriv and the CLI readable by another uid)`, () => {});
+    }
   } else {
     test("set-runtime warns after a real replacement keeps only the group", async () => {
       const agent = "runtime-real-owner";
