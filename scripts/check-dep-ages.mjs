@@ -230,8 +230,8 @@ const MAX_LOCKFILES = 1000;
 /**
  * Every `package-lock.json` the gate checks. In the repository that is the
  * tracked set from `git ls-files` (so a new lockfile is read without editing a
- * list); under a fixture root it is every file of that name in the tree.
- * `node_modules` and `.git` are not walked.
+ * list); under a fixture root it is every file of that name in the tree, which
+ * is walked without descending into `node_modules` or `.git`.
  */
 function collectLockfiles(root) {
   const out = [];
