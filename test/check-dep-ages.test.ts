@@ -611,6 +611,43 @@ describe("CLI — the production lockfile selection", () => {
 describe("CLI — npm lockfiles", () => {
   const bunOnlyTimes = { "dep-a": { "1.0.0": OLD_ISO } };
 
+  it.each([
+    ["encoded-scope", "@scope%2fpkg", "https://registry.npmjs.org/@scope%2fpkg/-/@scope%2fpkg-1.0.0.tgz"],
+    ["encoded-basename", "pkg", "https://registry.npmjs.org/pkg/-/%70kg-1.0.0.tgz"],
+  ])("exits 2 naming the lockfile, entry and URL for %s", async (label, name, resolved) => {
+    const lock = npmLock({ "node_modules/alias": { name, version: "1.0.0", resolved } });
+    const collected = collectNpmLockDeps(lock, "package-lock.json");
+    expect(collected.deps).toEqual([]);
+    expect(collected.problems).toEqual([{
+      lockfile: "package-lock.json", entry: "node_modules/alias",
+      message: `resolved URL has a percent-encoded path component: ${resolved}`,
+    }]);
+    const root = writeFixtureRepo(join(scratch, label), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/alias");
+    expect(output).toContain(`resolved URL has a percent-encoded path component: ${resolved}`);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it.each([["missing", undefined], ["1", 1], ["4", 4]] as const)("exits 2 naming lockfileVersion %s", async (_label, version) => {
+    const lock = { lockfileVersion: version, packages: { "node_modules/pkg": { version: "1.0.0" } } };
+    const message = `a v2 or v3 lockfile is required; lockfileVersion found: ${version ?? "missing"}`;
+    expect(collectNpmLockDeps(lock, "package-lock.json")).toEqual({
+      deps: [], problems: [{ lockfile: "package-lock.json", entry: "", message }],
+    });
+    const root = writeFixtureRepo(join(scratch, `npm-format-${version ?? "missing"}`), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json:");
+    expect(output).toContain(message);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
   it("exits 1 naming the lockfile, package and version of a too-young entry", async () => {
     const root = writeFixtureRepo(join(scratch, "npm-young"), {
       exceptions: "## Exceptions\n",
@@ -1254,7 +1291,7 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
 
   it("accepts the helper's literal tracked fixture with a variable prefix", () => {
     expect(assertNpmCiLockfilesRead(workflowStep(
-      'bash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix" --ignore-scripts', ".",
+      'prefix="$RUNNER_TEMP/install"\nbash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix" --ignore-scripts', ".",
     ), READ_TRACKED)).toBe(1);
   });
 
@@ -1265,6 +1302,23 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
     'bash scripts/npm-ci-tracked-lock.sh plugins/unread "$prefix"',
   ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile)/);
+  }, 30_000);
+
+  it.each([
+    "npm run prepare-lock", "PATH=./fakebin", 'PATH="./fakebin"', 'TZ="UTC"',
+    'NODE_OPTIONS="--require=./prepare.cjs"', 'npm_config_userconfig="./npmrc"',
+    'GIT_CONFIG_GLOBAL="./gitconfig"', "export prefix=elsewhere", "source ./prepare.sh",
+    ". ./prepare.sh", "eval true", "prepare() { true; }", "echo unexpected",
+    'prefix="$unassigned/install"', 'prefix="$(pwd)"', 'prefix=unquoted',
+    'pin="$(node scripts/pin.mjs --pin); npm run prepare-lock"',
+    'echo "RESULT=$(npm run prepare-lock)" >> "$GITHUB_ENV"',
+  ])("refuses a helper-step line: %s", (line) => {
+    const run = `prefix="$RUNNER_TEMP/install"\n${line}\nbash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix"`;
+    let error: unknown;
+    try { assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("job build step 1");
+    expect((error as Error).message).toContain(line);
   }, 30_000);
 
   it("refuses the unrelated-copy and raw-prefix probe", () => {

@@ -27,7 +27,9 @@ function resolveRepoDir(base: string, target: string, label: string): string {
  * helper. Script files and composite actions are not inspected. Accept raw npm
  * ci without --prefix, using the step/default directory and at most one leading
  * literal cd, or the helper with a literal relative fixture. Refuse other shapes.
- * The helper requires sfw and a tracked lock, then compares the installed copy.
+ * Helper steps allow set -euo pipefail, allowlisted quoted assignments with lowercase names, a literal node
+ * scripts/<file>.mjs substitution, helper calls and GITHUB_ENV echoes only.
+ * The helper requires sfw and committed manifest/lock bytes, then compares the installed lock.
  */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
@@ -41,6 +43,41 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     return [];
   }
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
+  if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
+    const assigned = new Set<string>(["RUNNER_TEMP"]);
+    const quotedValue = (value: string): boolean => {
+      if (/^'[^'\r\n]*'$/.test(value)) return true;
+      if (!/^"(?:[A-Za-z0-9_./ :+-]|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}))*"$/.test(value)) return false;
+      return [...value.matchAll(/\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})/g)]
+        .every((match) => assigned.has(match[1] ?? match[2]));
+    };
+    const dirs: string[] = [];
+    for (const line of lines) {
+      if (line === "set -euo pipefail") continue;
+      const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
+      if (assignment !== null) {
+        const [, name, value] = assignment;
+        if (!/^[a-z][a-z0-9_]*$/.test(name) || /^(?:PATH|NODE_.*|NPM_.*|GIT_.*|BASH.*|ENV|SHELLOPTS|SHELL|CDPATH|IFS|HOME|TMPDIR|TMP|TEMP|LANG|LANGUAGE|LC_.*|XDG_.*|SFW_.*|SOCKET_.*|LD_.*|DYLD_.*|SSL_.*|OPENSSL_.*|.*_PROXY|COREPACK_.*|GITHUB_.*|RUNNER_.*)$/i.test(name)) {
+          refuse(`tool environment assignment is refused: ${line}`);
+        }
+        if (!quotedValue(value) && !/^"\$\(node scripts\/[A-Za-z0-9_-]+\.mjs(?: [A-Za-z0-9_./=-]+)*\)"$/.test(value)) {
+          refuse(`unsupported helper-step line: ${line}`);
+        }
+        assigned.add(name);
+        continue;
+      }
+      const helper = line.match(/^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh ([A-Za-z0-9_./-]+) ("[^"\r\n]*"|'[^'\r\n]*')(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/);
+      if (helper !== null && !helper[1].startsWith("/") && helper[1] !== "-" && quotedValue(helper[2]) &&
+          resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", label) === "scripts/npm-ci-tracked-lock.sh") {
+        dirs.push(resolveRepoDir(workdir, helper[1], label));
+        continue;
+      }
+      const echo = line.match(/^echo ("[A-Z_][A-Z0-9_]*=[^"\r\n]*") >> "\$GITHUB_ENV"$/);
+      if (echo !== null && quotedValue(echo[1].replace(/^"[A-Z_][A-Z0-9_]*=/, '"'))) continue;
+      refuse(`unsupported helper-step line (helper requires a literal relative fixture directory and repository-root invocation): ${line}`);
+    }
+    return dirs;
+  }
   if (lines.some((line) => /(?:\b(?:cp|mv|ln|install|tee)\b.*|>{1,2}.*)(?:package-lock|npm-shrinkwrap)\.json/.test(line))) {
     refuse("lockfile write in the install step");
   }
@@ -50,8 +87,6 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   for (const line of lines) {
     if (!isInstall(line)) {
       if (line === "set -euo pipefail") continue;
-      // The helper's workflow prelude has no directory changes. The pin command
-      // is a literal invocation; other command substitutions are refused.
       if (/^[A-Za-z_][A-Za-z0-9_]*=(?:"[A-Za-z0-9_./${}-]*"|'[A-Za-z0-9_./-]*'|[A-Za-z0-9_./-]+)$/.test(line) ||
           line === 'pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"') {
         uninspectedCommand = true;
@@ -61,19 +96,9 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         uninspectedCommand = true;
         continue;
       }
-      if (line === 'echo "OPENCLAW_BIN_DIR=$prefix/node_modules/.bin" >> "$GITHUB_ENV"') continue;
       refuse("unsupported command in the install step");
     }
     if (changedDirectory) refuse("a prior install changed directory");
-    if (line.includes("npm-ci-tracked-lock.sh")) {
-      const helper = line.match(/^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh ([A-Za-z0-9_./-]+) (?:"[A-Za-z0-9_./${}-]+"|'[A-Za-z0-9_./-]+'|[A-Za-z0-9_./$\{\}-]+)(?: [A-Za-z0-9_./=-]+)*$/);
-      if (helper === null || helper[1].startsWith("/") || helper[1] === "-" ||
-          resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", label) !== "scripts/npm-ci-tracked-lock.sh") {
-        refuse("helper requires a literal relative fixture directory and repository-root invocation");
-      }
-      dirs.push(resolveRepoDir(workdir, helper[1], label));
-      continue;
-    }
     if (uninspectedCommand) refuse("uninspected command before raw npm ci");
     const match = line.match(/^(?:cd\s+([A-Za-z0-9_./-]+)\s+&&\s+)?(?:sfw\s+)?npm\s+ci(?:\s+([^;&|`\\(){}<>]*))?$/);
     if (match === null || match[1]?.startsWith("/") || match[1] === "-") refuse("unsupported raw npm ci shape");

@@ -15,8 +15,9 @@
  * refused. An npm lockfile entry with a canonical registry tarball URL is aged as the
  * package that URL identifies, and is refused, naming the lockfile and entry,
  * when that URL disagrees with the recorded name or version or is not a registry
- * tarball URL (query strings and encoded scopes are refused).
- * A `git:`/`git+...` entry is refused because it has no publish time; a local
+ * tarball URL (query strings and percent-encoded path components are refused).
+ * A v2 or v3 npm lockfile is required.
+ * A `git:`/`git+...` entry is refused because it has no publish time; an unencoded local
  * `file:` or `workspace:` entry, the root entry and a `link: true` entry are not
  * checked. An entry without a `resolved` URL is aged by its recorded
  * name@version regardless of `inBundle`; a versionless entry is refused.
@@ -29,7 +30,7 @@
  *       exact declarations, no override in a nested package.json, and no resolutions key naming it
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files or npm
- *       lockfiles, an npm entry with no version, an npm `resolved` URL that is a
+ *       lockfiles, an npm lockfileVersion other than 2 or 3 (including missing), an npm entry with no version, an npm `resolved` URL that is a
  *       git dependency, is not a registry tarball URL, or does not identify the
  *       recorded package and version, Bun not
  *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold

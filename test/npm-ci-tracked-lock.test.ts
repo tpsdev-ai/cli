@@ -26,7 +26,7 @@ function harness(action: (h: ReturnType<typeof makeHarness>) => void, sfw = true
 function makeHarness(root: string, sfw: boolean) {
   const bin = join(root, "bin");
   mkdirSync(bin);
-  for (const name of ["git", "cp", "mkdir", "cmp", "node", "bash"]) {
+  for (const name of ["git", "cp", "mkdir", "cmp", "node", "bash", "mktemp", "rm", "rmdir"]) {
     const path = Bun.which(name);
     if (path === null) throw new Error(`test setup requires ${name}`);
     symlinkSync(path, join(bin, name));
@@ -54,8 +54,8 @@ process.exit(result.status ?? 1);
   const prefix = join(root, "prefix with spaces");
   const record = join(root, "record");
   const env = { HOME: process.env.HOME, PATH: bin, RECORD: record, RUNNER_TEMP: root, GITHUB_ENV: join(root, "github-env") };
-  const run = (args: string[], extra: Record<string, string> = {}) => spawnSync("/bin/bash", args, {
-    cwd: REPO, env: { ...env, ...extra }, encoding: "utf8", timeout: 10_000,
+  const run = (args: string[], extra: Record<string, string> = {}, cwd = REPO) => spawnSync("/bin/bash", args, {
+    cwd, env: { ...env, ...extra }, encoding: "utf8", timeout: 10_000,
   });
   const installed = () => JSON.parse(readFileSync(`${record}.npm`, "utf8")) as Recorded;
   const firewalled = () => JSON.parse(readFileSync(`${record}.sfw`, "utf8")) as Recorded;
@@ -65,7 +65,7 @@ process.exit(result.status ?? 1);
   return { root, prefix, run, installed, firewalled, assertNoInstall };
 }
 
-it("the helper copies the tracked fixture and invokes npm ci through sfw with the requested prefix", () => {
+it("the helper copies the committed fixture and invokes npm ci through sfw with the requested prefix", () => {
   harness((h) => {
     const lock = readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8");
     const manifest = readFileSync(join(REPO, FIXTURE, "package.json"), "utf8");
@@ -88,8 +88,32 @@ it.each(["untracked", "missing"])("the helper refuses the %s lock before npm run
     }
     const result = h.run([HELPER, fixture, h.prefix]);
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain(`cannot verify tracked lock: ${fixture}/package-lock.json`);
+    expect(result.stderr).toContain(`cannot read committed file: ${fixture}/package-lock.json`);
     h.assertNoInstall();
+  });
+}, 30_000);
+
+it("the helper installs committed bytes despite a modified working-tree lock and manifest", () => {
+  harness((h) => {
+    const repo = join(h.root, "repo");
+    mkdirSync(join(repo, FIXTURE), { recursive: true });
+    const gitDir = spawnSync("git", ["rev-parse", "--absolute-git-dir"], { cwd: REPO, encoding: "utf8", timeout: 10_000 });
+    expect({ status: gitDir.status, stderr: gitDir.stderr }).toMatchObject({ status: 0 });
+    symlinkSync(gitDir.stdout.trim(), join(repo, ".git"));
+    const committed = (file: string) => {
+      const result = spawnSync("git", ["show", `HEAD:${FIXTURE}/${file}`], { cwd: repo, encoding: "utf8", timeout: 10_000 });
+      expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+      return result.stdout;
+    };
+    const lock = committed("package-lock.json");
+    const manifest = committed("package.json");
+    writeFileSync(join(repo, FIXTURE, "package-lock.json"), "working-tree lock\n");
+    writeFileSync(join(repo, FIXTURE, "package.json"), "working-tree manifest\n");
+    const result = h.run([HELPER, FIXTURE, h.prefix], {}, repo);
+    expect(h.installed().lock).toBe(lock);
+    expect(h.installed().manifest).toBe(manifest);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(readFileSync(join(h.prefix, "package-lock.json"), "utf8")).toBe(lock);
   });
 }, 30_000);
 

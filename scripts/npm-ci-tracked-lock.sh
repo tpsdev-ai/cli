@@ -9,10 +9,6 @@ fixture=$1
 prefix=$2
 shift 2
 lock="$fixture/package-lock.json"
-if ! git ls-files --error-unmatch -- "$lock" >/dev/null; then
-  echo "npm-ci-tracked-lock: cannot verify tracked lock: $lock" >&2
-  exit 1
-fi
 if ! command -v sfw >/dev/null; then
   echo 'npm-ci-tracked-lock: sfw is required; install refused' >&2
   exit 1
@@ -30,9 +26,17 @@ for arg in "$@"; do
       ;;
   esac
 done
+committed=$(mktemp -d)
+trap 'rm -f -- "$committed/package-lock.json" "$committed/package.json"; rmdir -- "$committed"' EXIT
+for path in "$lock" "$fixture/package.json"; do
+  if ! git show "HEAD:$path" > "$committed/${path##*/}"; then
+    echo "npm-ci-tracked-lock: cannot read committed file: $path" >&2
+    exit 1
+  fi
+done
 mkdir -p -- "$prefix"
-cp "$fixture/package.json" "$lock" "$prefix/"
+cp "$committed/package.json" "$committed/package-lock.json" "$prefix/"
 sfw npm ci --prefix "$prefix" "$@"
-if ! cmp -- "$lock" "$prefix/package-lock.json"; then
+if ! cmp -- "$committed/package-lock.json" "$prefix/package-lock.json"; then
   exit 1
 fi

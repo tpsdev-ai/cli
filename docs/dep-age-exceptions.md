@@ -5,9 +5,9 @@
 For npm entries, it ages the package identified by a canonical registry tarball
 URL, or recorded name@version without `resolved`, regardless of `inBundle`.
 Versionless entries, URL/name/version disagreement, non-canonical registry URLs
-(including query strings and encoded scopes), and git URLs are refused. The root,
-`link: true`, and local `file:`/`workspace:` entries are skipped.
-The tracked npm lockfiles are:
+(including query strings and percent-encoded path components), and git URLs are refused. The root,
+`link: true`, and unencoded local `file:`/`workspace:` entries are skipped.
+A v2 or v3 npm lockfile is required. The tracked npm lockfiles are:
 
 - `plugins/openclaw-github-review/package-lock.json`
 - `plugins/openclaw-tps-mail/package-lock.json`
@@ -22,13 +22,16 @@ or composite actions are not inspected. It accepts raw `npm ci` (optionally
 behind `sfw`) without `--prefix` or lockfile writes in the step, using the
 step/default working directory and at most one leading literal
 `cd <relative path> &&`. The other accepted shape is the helper with a literal
-relative fixture directory whose `package-lock.json` is tracked. Other command
-shapes are refused. The raw guard and helper limit install flags to `--ignore-scripts`,
+relative fixture directory whose `package-lock.json` is tracked. Helper steps
+allow `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including literal
+`node scripts/<file>.mjs` substitutions), helper calls and `GITHUB_ENV` echoes.
+Other command shapes are refused. The raw guard and helper limit install flags to `--ignore-scripts`,
 `--no-audit` and `--no-fund`.
 
-The helper requires `sfw`, refuses an untracked fixture lock, copies the fixture's
-package and lock into the prefix, and runs `sfw npm ci --prefix` there. After the
-install, `cmp` must find the prefix lock byte-identical to the tracked fixture.
+The helper requires `sfw`, reads the fixture's package and lock from `HEAD`,
+refuses if either path is absent there, copies those committed bytes into the
+prefix, and runs `sfw npm ci --prefix` there. After the install, `cmp` must find
+the prefix lock byte-identical to the saved committed lock.
 
 Add one line per exception under the `## Exceptions` heading below, in this
 exact shape:

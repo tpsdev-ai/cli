@@ -98,7 +98,7 @@ export function lockfilesFromFileList(paths) {
 /**
  * Accepted canonical registry tarball form:
  * `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz` (also http).
- * Query strings and encoded scopes are refused.
+ * Query strings and percent-encoded path components are refused.
  */
 const REGISTRY_TARBALL_RE = /^https?:\/\/registry\.npmjs\.org\/((?:@[^/]+\/)?[^/]+)\/-\/([^/]+)\.tgz$/;
 
@@ -111,7 +111,7 @@ function entryPackageName(entry, marker) {
  * Collect npm lockfile v2/v3 entries by the package identified by a canonical
  * registry tarball URL, or by recorded name@version without `resolved`.
  * Refuse URL/name/version disagreement, non-canonical registry URLs and git.
- * Skip the root, `link: true`, and local `file:`/`workspace:` entries.
+ * Skip the root, `link: true`, and unencoded local `file:`/`workspace:` entries.
  * `inBundle` does not exempt an entry; missing publish times refuse closed.
  * Without a recorded name, use the last `node_modules/` path segment.
  *
@@ -125,11 +125,18 @@ function entryPackageName(entry, marker) {
 export function collectNpmLockDeps(lock, lockfile) {
   const deps = [];
   const problems = [];
+  const version = lock?.lockfileVersion;
+  if (version !== 2 && version !== 3) {
+    return {
+      deps,
+      problems: [{ lockfile, entry: "", message: `a v2 or v3 lockfile is required; lockfileVersion found: ${JSON.stringify(version) ?? "missing"}` }],
+    };
+  }
   const packages = lock && typeof lock === "object" ? lock.packages : null;
   if (!packages || typeof packages !== "object" || Array.isArray(packages)) {
     return {
       deps,
-      problems: [{ lockfile, entry: "", message: "no `packages` map (a v2 or v3 lockfile is required)" }],
+      problems: [{ lockfile, entry: "", message: "no `packages` map" }],
     };
   }
   for (const [entry, value] of Object.entries(packages)) {
@@ -153,6 +160,11 @@ export function collectNpmLockDeps(lock, lockfile) {
         continue;
       }
       deps.push({ name, version, lockfile });
+      continue;
+    }
+    const urlPath = resolved.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*/, "").split(/[?#]/, 1)[0];
+    if (urlPath.includes("%")) {
+      problems.push({ lockfile, entry, message: `resolved URL has a percent-encoded path component: ${resolved}` });
       continue;
     }
     if (/^(?:file|workspace):/.test(resolved)) continue;
