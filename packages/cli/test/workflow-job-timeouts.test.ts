@@ -4,7 +4,7 @@
  *
  * Three runs hung at once: `test` ran 3 hours and `docker` 35-50 minutes,
  * against a normal 18-23, with no `timeout-minutes` and GitHub's 6-hour
- * default. This holds a timeout on every job in test.yml, and makes a NEW job
+ * default. This holds a timeout on covered jobs in test.yml, and makes a NEW job
  * choose a list: it must be named as a timeout job, or exempt with a reason.
  */
 import { describe, expect, test } from "bun:test";
@@ -55,6 +55,7 @@ function loadWorkflow(): Workflow {
 }
 
 function displayValue(value: unknown): string {
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
   return value === undefined ? "missing" : JSON.stringify(value);
 }
 
@@ -99,7 +100,7 @@ function timeoutProblems(
 }
 
 describe("test.yml job timeouts (cli#799)", () => {
-  test("every job in test.yml sets a positive integer timeout-minutes", () => {
+  test("covered jobs in test.yml set a positive integer timeout-minutes", () => {
     const problems = timeoutProblems(loadWorkflow());
     expect(problems, problems.join("; ")).toEqual([]);
   });
@@ -135,6 +136,17 @@ describe("the timeout rule on fixtures", () => {
     const problems = rule({ test: { "timeout-minutes": "30" }, build: {} });
     expect(problems.join("; ")).toContain(
       'job "test" timeout-minutes "30": not a positive integer',
+    );
+  });
+
+  test.each([
+    [".inf", "Infinity"],
+    ["-.inf", "-Infinity"],
+    [".nan", "NaN"],
+  ])("a YAML %s timeout fails, naming the job and %s", (scalar, value) => {
+    const wf = yaml.load(`jobs:\n  test:\n    timeout-minutes: ${scalar}\n`) as Workflow;
+    expect(timeoutProblems(wf, ["test"], {}).join("; ")).toContain(
+      `job "test" timeout-minutes ${value}: not a positive integer`,
     );
   });
 
