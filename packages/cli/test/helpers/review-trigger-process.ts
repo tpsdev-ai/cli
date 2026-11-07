@@ -15,10 +15,18 @@ if (command === "codex") {
   else if (args[1] !== "api") process.exit(1);
 } else if (command === "git") {
   switch (args[0]) {
-    case "rev-parse":
+    case "rev-parse": {
       if (args.includes("--is-inside-work-tree")) process.exit(1);
+      const gitPathIndex = args.indexOf("--git-path");
+      if (gitPathIndex !== -1) {
+        // Real git names the repository's Git directory even when the path is
+        // absent; no rebase is in progress here, so the path does not exist.
+        console.log(join(process.cwd(), ".git", args[gitPathIndex + 1] ?? ""));
+        break;
+      }
       console.log(existsSync(changed) ? "model-head" : "baseline-head");
       break;
+    }
     case "symbolic-ref": console.log(args.includes("--short") ? "origin/main" : "refs/heads/main"); break;
     case "rev-list": console.log("1"); break;
     case "rebase": process.exit(1); break;
