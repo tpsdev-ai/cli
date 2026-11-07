@@ -19,6 +19,7 @@ import {
   onTaskComplete,
   onTaskFailure,
   onTaskStart,
+  getFallbackSoulPath,
   searchPastExperience,
   snapshotSoulToDisk,
   writeTaskMemory,
@@ -942,7 +943,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     if (flairOnline) {
       await snapshotSoulToDisk(flair, agentId);
     } else {
-      const fallback = join(homeDir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
+      const fallback = getFallbackSoulPath(agentId);
       console.warn(`[${agentId}] using disk fallback: ${existsSync(fallback) ? fallback : "NONE"}`);
     }
 

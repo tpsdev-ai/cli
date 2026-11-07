@@ -10,6 +10,7 @@ mock.module(join(utils, "agent-lifecycle.ts"), () => ({
   bootContext: async () => ({ systemPrompt: "test", identitySource: "test" }),
   searchPastExperience: async () => "", snapshotSoulToDisk: async () => {},
   writeTaskMemory: async () => {}, catchUpTopics: async () => 0,
+  getFallbackSoulPath: () => join(root!, "fallback", "SOUL.md"),
   onBoot: async () => ({}), onTaskStart: async () => ({}),
   onTaskComplete: async () => {}, onTaskFailure: async () => {},
 }));
