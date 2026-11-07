@@ -154,7 +154,7 @@ describe("detectStaleRebase", () => {
 });
 
 describe("evaluateMailAutoCommitGate", () => {
-  test("commits when the repository has an uncommitted change", () => {
+  test("chooses commit when the repository has an uncommitted change", () => {
     const repo = initRepo();
     try {
       const baseline = git(repo, "rev-parse", "HEAD").trim();
@@ -165,7 +165,7 @@ describe("evaluateMailAutoCommitGate", () => {
     }
   }, 30_000);
 
-  test("commits when the task created a new commit", () => {
+  test("chooses commit when the task created a new commit", () => {
     const repo = initRepo();
     try {
       const baseline = git(repo, "rev-parse", "HEAD").trim();

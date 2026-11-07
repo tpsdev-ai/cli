@@ -15,7 +15,7 @@ import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
 import { sendMessage } from "../src/utils/mail.js";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   HEARTBEAT_INTERVAL_MS,
   SHUTDOWN_DRAIN_TIMEOUT_MS,
@@ -42,9 +42,10 @@ const GIT = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
 const realSpawnSync = childProcess.spawnSync;
 
 /** Run git in `cwd` and throw on a non-zero exit (test fixtures only). */
-function gitIn(cwd: string, ...args: string[]): void {
+function gitIn(cwd: string, ...args: string[]): string {
   const result = realSpawnSync(GIT, args, { cwd, encoding: "utf-8" });
   if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+  return String(result.stdout ?? "");
 }
 
 /** A repository with one commit on `main`, at `dir`. */
@@ -115,6 +116,7 @@ async function driveRuntime(
     dir?: string;
     /** Configured commit repository override (autoCommit.repo). */
     autoCommitRepo?: string;
+    realAutoCommit?: boolean;
     /** Make every sender notice throw, as a failed signed send does. */
     sendFailure?: boolean;
   } = {},
@@ -168,6 +170,7 @@ async function driveRuntime(
     const probe = (args as string[]).join(" ");
     if (probe.startsWith("agent commit ")) {
       autoCommits++;
+      if (opts.realAutoCommit) return realGit(command, args, options) as never;
       return { status: 0, stdout: "", stderr: "" } as never;
     }
     if (opts.autoCommitRepo) return realGit(command, args, options) as never;
@@ -193,6 +196,7 @@ async function driveRuntime(
   const mailSpawn = captureAutoCommit ? spyOn(childProcess, "spawn").mockImplementation(() => {
     if (opts.autoCommitFailure === "rebase") mkdirSync(join(workspace, ".git", "rebase-merge"), { recursive: true });
     if (opts.ignoredFileChange) writeFileSync(join(workspace, "ignored.log"), "ignored\n");
+    if (opts.realAutoCommit) writeFileSync(resolve(opts.autoCommitRepo!, "file.txt"), "task change\n");
     const proc = Object.assign(new EventEmitter(), { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
     setTimeout(() => {
       proc.stdout.emit("data", Buffer.from(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "fixture result" } }) + "\n"));
@@ -304,6 +308,14 @@ async function driveRuntime(
     // HOME is this run's directory, so the seeded cursor is written inside the
     // test's temp root; the finally restores it even when setup throws.
     process.env.HOME = dir;
+    if (opts.realAutoCommit) {
+      const binDir = join(dir, ".tps", "bin");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(join(binDir, "tps"), `#!/usr/bin/env bun
+process.env.TPS_AGENT_ID = "testbot";
+await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
+`, { mode: 0o755 });
+    }
     // A pre-seeded cursor makes the review-trigger loop's reads distinguishable
     // from the task loop's, both of which read /OrgEventCatchup/testbot.
     if (opts.reviewTrigger) {
@@ -523,7 +535,7 @@ describe("mail auto-commit checks", () => {
     expect(result.warnings.join("\n")).toContain("Git status is clean and HEAD matches its pre-task value");
   }, 10_000);
 
-  it("probes and aborts the configured override repository, leaving the workspace untouched", async () => {
+  it("probes and aborts the configured override repository and keeps workspace SOUL.md present", async () => {
     const root = mkdtempSync(join(tmpdir(), "cli800-two-repos-"));
     const workspace = join(root, "workspace");
     const override = join(root, "override");
@@ -540,14 +552,40 @@ describe("mail auto-commit checks", () => {
       expect(rebasePath && existsSync(rebasePath)).toBe(false);
       expect(childProcess.spawnSync(GIT, ["status", "--porcelain"], { cwd: override, encoding: "utf-8" }).stdout?.trim()).toBe("");
       expect(childProcess.spawnSync(GIT, ["rev-parse", "HEAD"], { cwd: override, encoding: "utf-8" }).stdout?.trim()).not.toBe(overrideBefore);
-      // The workspace's own untracked file is untouched: the probes ran in the override repo.
+      // The workspace's untracked SOUL.md still exists.
       expect(existsSync(join(workspace, "SOUL.md"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   }, 20_000);
 
-  it("acknowledges the mail when a sender notice cannot be sent", async () => {
+  it("commits in the repository probed for a relative override through the real CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cli800-relative-repo-"));
+    const workspace = join(root, "workspace");
+    const override = join(root, "override");
+    const savedCwd = process.cwd();
+    try {
+      initRepo(workspace);
+      initRepo(override);
+      const workspaceBefore = gitIn(workspace, "rev-parse", "HEAD").trim();
+      const overrideBefore = gitIn(override, "rev-parse", "HEAD").trim();
+      process.chdir(root);
+      const result = await driveRuntime("SIGTERM", undefined, { dir: root, autoCommitRepo: "override", realAutoCommit: true });
+      expect(result.autoCommits).toBe(1);
+      expect(gitIn(override, "rev-parse", "HEAD").trim()).not.toBe(overrideBefore);
+      expect(result.logs.join("\n")).toContain("tps agent commit exit=0");
+      expect(gitIn(override, "show", "HEAD:file.txt")).toBe("task change\n");
+      expect(gitIn(override, "status", "--porcelain")).toBe("");
+      expect(gitIn(workspace, "rev-parse", "HEAD").trim()).toBe(workspaceBefore);
+      expect(readFileSync(join(workspace, "file.txt"), "utf-8")).toBe("base\n");
+      expect(gitIn(workspace, "diff", "HEAD")).toBe("");
+    } finally {
+      process.chdir(savedCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  it("attempts acknowledgement when a sender notice cannot be sent", async () => {
     const result = await driveRuntime("SIGTERM", undefined, { sendFailure: true });
     expect(result.autoCommits).toBe(0);
     expect(result.warnings.join("\n")).toContain("outbound mail to agent-a failed: fixture send failure");

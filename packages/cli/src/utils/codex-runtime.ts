@@ -7,7 +7,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { appendFileSync, createWriteStream, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve } from "node:path";
 import {
   refreshOpenAIToken,
   type StoredCredentials,
@@ -78,7 +78,7 @@ async function ensureFreshOpenAIToken(agentId: string): Promise<void> {
 const FLAIR_SNAPSHOT_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 export interface AutoCommitConfig {
-  /** Repository path to commit changes in (defaults to workspace) */
+  /** Repository path to commit changes in (defaults to workspace); relative paths use the runtime process working directory. */
   repo?: string;
   /** Branch name prefix; task refId appended: e.g. "task/" -> "task/ops-68" */
   branchPrefix?: string;
@@ -687,7 +687,7 @@ async function _runAutoCommitLegacy(
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
     const prUrl = await runAutoCommit(
-      { workspace: cfg.repo ?? workspace },
+      { workspace },
       flair,
       {
         taskId,
@@ -896,11 +896,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   const mailCfg: RuntimeMailConfig = { agentId, flairUrl, flairKeyPath: keyPath };
 
   // All runtime outbound mail goes through the SIGNED path; a send failure must
-  // not abort a task that otherwise completed (the completion boundary closes
-  // regardless — see completeRuntimeMail below).
-  // Sender notices are ATTEMPTS: notify() logs a failed signed-mail send and
-  // the completion boundary still acknowledges the mail, so a notice is not
-  // retried and its delivery is not guaranteed.
+  // not abort a task that otherwise completed.
+  // Sender notices are ATTEMPTS: notify() logs a failed signed-mail send;
+  // the completion boundary still attempts acknowledgement.
   const notify = (to: string, body: string) => {
     try { sendRuntimeMail(mailCfg, to, body); }
     catch (e: any) { console.warn(`[${agentId}] outbound mail to ${to} failed: ${e.message}`); }
@@ -1018,7 +1016,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
+          const prUrl = await _runAutoCommitLegacy(agentId, resolve(config.autoCommit.repo ?? config.workspace), taskId, config.autoCommit, flairPublisher, taskBody?.split("\n")[0].slice(0, 72), taskBody, mailCfg);
           await publishPrResult(flair, agentId, taskId, prUrl);
         }
       } catch (e) {
@@ -1079,7 +1077,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           // Choose the commit repository ONCE: every probe and the rebase abort
           // below run against this repository, so a configured override is used
           // for all of them.
-          const commitRepo = config.autoCommit ? (config.autoCommit.repo ?? config.workspace) : undefined;
+          const commitRepo = config.autoCommit ? resolve(config.autoCommit.repo ?? config.workspace) : undefined;
           const baselineResult = commitRepo
             ? spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: commitRepo, encoding: "utf-8" })
             : undefined;
