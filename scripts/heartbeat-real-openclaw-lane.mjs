@@ -197,6 +197,17 @@ async function settleGatewayEvents(gateway) {
 }
 
 /**
+ * Fail the live case when the launched gateway exited while the heartbeat ran,
+ * naming its exit code or signal. The post-readiness check is unchanged.
+ */
+export async function assertGatewaySurvivedHeartbeat(gateway, logPath) {
+  await settleGatewayEvents(gateway);
+  if (gatewayExited(gateway)) {
+    throw new Error(`gateway exited with ${gatewayExitDescription(gateway)} during the heartbeat\n${readLogTail(logPath)}`);
+  }
+}
+
+/**
  * Poll `gateway status --require-rpc` until it succeeds, the gateway exits, or
  * the readiness deadline passes. Each probe's timeout and each sleep are capped
  * by the time left, and a success observed after the deadline is rejected.
@@ -365,11 +376,16 @@ async function runLiveCase(root, binDir) {
     async () => {
       await waitForRpc(testCase, port, binDir, gateway, logPath);
       const result = runHeartbeat(testCase, port, binDir);
-      assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
-      assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
-      const persisted = readPersisted(testCase);
-      assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
-      assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
+      await finishWithCleanup(
+        () => assertGatewaySurvivedHeartbeat(gateway, logPath),
+        async () => {
+          assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
+          assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
+          const persisted = readPersisted(testCase);
+          assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
+          assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
+        },
+      );
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
     async () => {

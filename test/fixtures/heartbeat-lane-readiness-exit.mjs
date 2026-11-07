@@ -1,7 +1,8 @@
 // Run the lane's readiness recheck under node against a stub gateway that
-// answers one readiness probe and exits immediately.
+// answers one readiness probe and exits.
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { waitForTermination } from "./process-termination.mjs";
 
 const { waitForRpc } = await import(pathToFileURL(process.argv[2]).href);
 
@@ -10,6 +11,7 @@ const stubSource =
 const stub = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: ["ignore", "pipe", "inherit"],
 });
+if (!stub.pid) throw new Error("stub gateway did not start");
 const port = await new Promise((resolvePort, rejectPort) => {
   stub.stdout.once("data", (chunk) => resolvePort(Number(String(chunk).trim())));
   stub.once("error", rejectPort);
@@ -17,8 +19,6 @@ const port = await new Promise((resolvePort, rejectPort) => {
 });
 
 const probeSource = `import net from "node:net";const socket=net.connect(${port},"127.0.0.1");let answered="";socket.setEncoding("utf8");socket.on("data",(chunk)=>{answered+=chunk;});socket.on("end",()=>process.exit(answered==="ready"?0:1));socket.on("error",()=>process.exit(1));`;
-
-const blockFor = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 try {
   await waitForRpc(
@@ -34,8 +34,9 @@ try {
           encoding: "utf-8",
           timeout: 10_000,
         });
-        // The stub exits on its own; block so that exit is pending, not late.
-        blockFor(300);
+        // Block until the stub has terminated at the OS level; node has not
+        // reaped it, so its exit event is pending for waitForRpc's recheck.
+        waitForTermination(stub.pid);
         return { status: probe.status ?? 1, stdout: probe.stdout ?? "", stderr: probe.stderr ?? "" };
       },
     },
