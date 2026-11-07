@@ -7,17 +7,21 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
+import { assertNpmCiLockfilesRead } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
+  collectNpmLockDeps,
   collectResolvedDeps,
   evaluateAges,
   excludesFromInstallTable,
   isExactVersionPin,
+  lockfilesFromFileList,
   MIN_RELEASE_AGE_SECONDS,
   parseBunLock,
   parseExceptions,
@@ -398,6 +402,7 @@ function writeFixtureRepo(
     exceptions?: string;
     excludes?: string[];
     packages?: Record<string, unknown>;
+    npmLocks?: Record<string, unknown>;
   } = {},
 ): string {
   mkdirSync(join(root, "docs"), { recursive: true });
@@ -415,6 +420,10 @@ function writeFixtureRepo(
   for (const [path, json] of Object.entries(opts.packages ?? {})) {
     mkdirSync(dirname(join(root, path)), { recursive: true });
     writeFileSync(join(root, path), JSON.stringify(json));
+  }
+  for (const [path, lock] of Object.entries(opts.npmLocks ?? {})) {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), JSON.stringify(lock));
   }
   if (!existsSync(join(root, "bun.lock"))) setupFailure(`fixture lock not written under ${root}`);
   return root;
@@ -435,7 +444,18 @@ async function runGate(env: Record<string, string>, args: string[] = []) {
 }
 
 const ISO_NOW = new Date().toISOString();
+const OLD_ISO = "2020-01-01T00:00:00.000Z";
 const FUTURE = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+
+/** An npm v3 lockfile whose root entry carries no dependencies. */
+function npmLock(entries: Record<string, unknown>): unknown {
+  return { lockfileVersion: 3, packages: { "": { name: "fixture", version: "0.0.0" }, ...entries } };
+}
+
+function npmResolved(name: string, version: string): string {
+  const short = name.startsWith("@") ? name.slice(name.indexOf("/") + 1) : name;
+  return `https://registry.npmjs.org/${name}/-/${short}-${version}.tgz`;
+}
 
 describe("CLI — a version younger than the gate fails", () => {
   it("exits 1 and names the fresh dep, with no exception", async () => {
@@ -522,17 +542,27 @@ describe("CLI — a version younger than the gate fails", () => {
   }, 30_000);
 });
 
-describe("CLI — the current lockfile passes", () => {
-  it("exits 0 on this repo's bun.lock when every resolved version is old enough", async () => {
-    // Serve the real lockfile's resolved versions with a fixed old publish
+describe("CLI — the current lockfiles pass", () => {
+  it("exits 0 on this repo's bun.lock and tracked package-lock.json files when every resolved version is old enough", async () => {
+    // Serve the real lockfiles' resolved versions with a fixed old publish
     // time, so the case is deterministic and offline yet still reads the real
-    // bun.lock through the real collect path.
-    const lock = parseBunLock(readFileSync(join(REPO, "bun.lock"), "utf8"));
-    const deps = collectResolvedDeps(lock);
-    if (deps.length < 100) setupFailure(`expected the real lockfile to resolve >100 packages, got ${deps.length}`);
+    // files through the real collect path.
+    const bunDeps = collectResolvedDeps(parseBunLock(readFileSync(join(REPO, "bun.lock"), "utf8")));
+    if (bunDeps.length < 100) setupFailure(`expected the real bun.lock to resolve >100 packages, got ${bunDeps.length}`);
+    const npmDeps = [];
+    for (const lockfile of trackedLockfiles()) {
+      const { deps, problems } = collectNpmLockDeps(
+        JSON.parse(readFileSync(join(REPO, lockfile), "utf8")),
+        lockfile,
+      );
+      expect(problems).toEqual([]);
+      npmDeps.push(...deps);
+    }
+    if (npmDeps.length === 0) setupFailure("expected the tracked package-lock.json files to resolve at least one entry");
+    const deps = [...bunDeps, ...npmDeps];
     const times: Record<string, Record<string, string>> = {};
     for (const d of deps) {
-      times[d.name] = { ...(times[d.name] ?? {}), [d.version]: "2020-01-01T00:00:00.000Z" };
+      times[d.name] = { ...(times[d.name] ?? {}), [d.version]: OLD_ISO };
     }
     const registry = fixtureRegistry(times);
     try {
@@ -546,6 +576,427 @@ describe("CLI — the current lockfile passes", () => {
       registry.stop();
     }
   }, 60_000);
+});
+
+describe("CLI — the production lockfile selection", () => {
+  /** Every pair the real bun.lock and tracked package-lock.json files resolve, served old. */
+  function realResolvedTimes(): Record<string, Record<string, string>> {
+    const deps = collectResolvedDeps(parseBunLock(readFileSync(join(REPO, "bun.lock"), "utf8")));
+    for (const lockfile of trackedLockfiles()) {
+      const { deps: npmDeps } = collectNpmLockDeps(
+        JSON.parse(readFileSync(join(REPO, lockfile), "utf8")),
+        lockfile,
+      );
+      deps.push(...npmDeps);
+    }
+    const times: Record<string, Record<string, string>> = {};
+    for (const d of deps) times[d.name] = { ...(times[d.name] ?? {}), [d.version]: OLD_ISO };
+    return times;
+  }
+
+  it("reads every tracked package-lock.json with git ls-files, without a root override", async () => {
+    const lockfiles = trackedLockfiles();
+    expect(lockfiles.length).toBeGreaterThan(1);
+    const registry = fixtureRegistry(realResolvedTimes());
+    try {
+      const { exitCode, output } = await runGate({ TPS_DEP_AGES_REGISTRY: registry.url });
+      expect(exitCode).toBe(0);
+      for (const lockfile of lockfiles) expect(output).toContain(`${lockfile}: `);
+    } finally {
+      registry.stop();
+    }
+  }, 120_000);
+});
+
+describe("CLI — npm lockfiles", () => {
+  const bunOnlyTimes = { "dep-a": { "1.0.0": OLD_ISO } };
+
+  it.each([
+    ["encoded-scope", "@scope%2fpkg", "https://registry.npmjs.org/@scope%2fpkg/-/@scope%2fpkg-1.0.0.tgz"],
+    ["encoded-basename", "pkg", "https://registry.npmjs.org/pkg/-/%70kg-1.0.0.tgz"],
+  ])("exits 2 naming the lockfile, entry and URL for %s", async (label, name, resolved) => {
+    const lock = npmLock({ "node_modules/alias": { name, version: "1.0.0", resolved } });
+    const collected = collectNpmLockDeps(lock, "package-lock.json");
+    expect(collected.deps).toEqual([]);
+    expect(collected.problems).toEqual([{
+      lockfile: "package-lock.json", entry: "node_modules/alias",
+      message: `resolved URL has a percent-encoded path component: ${resolved}`,
+    }]);
+    const root = writeFixtureRepo(join(scratch, label), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/alias");
+    expect(output).toContain(`resolved URL has a percent-encoded path component: ${resolved}`);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it.each([
+    ["query-name", "pkg?x", "1.0.0", "https://registry.npmjs.org/pkg?x/-/pkg?x-1.0.0.tgz"],
+    ["fragment-name", "pkg#x", "1.0.0", "https://registry.npmjs.org/pkg#x/-/pkg#x-1.0.0.tgz"],
+    ["query-basename", "pkg", "1.0.0?x", "https://registry.npmjs.org/pkg/-/pkg-1.0.0?x.tgz"],
+    ["fragment-basename", "pkg", "1.0.0#x", "https://registry.npmjs.org/pkg/-/pkg-1.0.0#x.tgz"],
+  ])("exits 2 naming the lockfile, entry and URL for %s", async (label, name, version, resolved) => {
+    const lock = npmLock({ "node_modules/alias": { name, version, resolved } });
+    const message = `resolved URL has a query or fragment delimiter: ${resolved}`;
+    expect(collectNpmLockDeps(lock, "package-lock.json")).toEqual({
+      deps: [], problems: [{ lockfile: "package-lock.json", entry: "node_modules/alias", message }],
+    });
+    const root = writeFixtureRepo(join(scratch, label), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/alias");
+    expect(output).toContain(message);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it.each([["missing", undefined], ["1", 1], ["4", 4]] as const)("exits 2 naming lockfileVersion %s", async (_label, version) => {
+    const lock = { lockfileVersion: version, packages: { "node_modules/pkg": { version: "1.0.0" } } };
+    const message = `a v2 or v3 lockfile is required; lockfileVersion found: ${version ?? "missing"}`;
+    expect(collectNpmLockDeps(lock, "package-lock.json")).toEqual({
+      deps: [], problems: [{ lockfile: "package-lock.json", entry: "", message }],
+    });
+    const root = writeFixtureRepo(join(scratch, `npm-format-${version ?? "missing"}`), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json:");
+    expect(output).toContain(message);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("exits 1 naming the lockfile, package and version of a too-young entry", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-young"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "plugins/example/package-lock.json": npmLock({
+          "node_modules/fresh-dep": { version: "2.0.0", resolved: npmResolved("fresh-dep", "2.0.0") },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({ ...bunOnlyTimes, "fresh-dep": { "2.0.0": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(1);
+      expect(output).toContain("plugins/example/package-lock.json: fresh-dep@2.0.0");
+      expect(output).toContain("plugins/example/package-lock.json: 1 npm entries");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("exits 0 when a dated exception covers the npm entry", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-covered"), {
+      exceptions: `## Exceptions\n- fresh-dep@2.0.0 | expires:${FUTURE} | reason: fixture exception\n`,
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/fresh-dep": { version: "2.0.0", resolved: npmResolved("fresh-dep", "2.0.0") },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({ ...bunOnlyTimes, "fresh-dep": { "2.0.0": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(0);
+      expect(output).toContain("allowed by a dated exception");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("ignores the root entry, link entries and local file:/workspace: entries", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-local"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/linked": { resolved: "../linked", link: true },
+          "node_modules/local": { version: "1.0.0", resolved: "file:../local" },
+          "node_modules/local-workspace": { version: "1.0.0", resolved: "workspace:*" },
+        }),
+      },
+    });
+    const registry = fixtureRegistry(bunOnlyTimes);
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(0);
+      expect(output).toContain("package-lock.json: 0 npm entries");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("exits 2 naming a git: resolved entry before fetching", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-git-local"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/local-git": { version: "1.0.0", resolved: "git:../local-git" },
+        }),
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/local-git");
+    expect(output).toContain("resolved URL is a git dependency, which has no publish time: git:../local-git");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("exits 2 naming a git+https resolved entry before fetching", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-git-remote"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/remote-dep": {
+            version: "1.0.0",
+            resolved: "git+https://github.com/example/remote-dep.git#0123456",
+          },
+        }),
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/remote-dep");
+    expect(output).toContain("git+https://github.com/example/remote-dep.git#0123456");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("parses a scoped package's name from its node_modules path", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-scoped"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/@scope/pkg": { version: "1.2.3", resolved: npmResolved("@scope/pkg", "1.2.3") },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({ ...bunOnlyTimes, "@scope/pkg": { "1.2.3": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(1);
+      expect(output).toContain("package-lock.json: @scope/pkg@1.2.3");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("uses a recorded name for an aliased install", async () => {
+    // npm's lockfile records the real registry package in `name`; the install
+    // path is the alias. The lookup must use the former.
+    const root = writeFixtureRepo(join(scratch, "npm-alias"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/aliased": {
+            name: "@scope/real-dep",
+            version: "1.5.0",
+            resolved: npmResolved("@scope/real-dep", "1.5.0"),
+          },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({ ...bunOnlyTimes, "@scope/real-dep": { "1.5.0": OLD_ISO } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(0);
+      expect(registry.requests.map((path) => decodeURIComponent(path))).toContain("/@scope/real-dep");
+      expect(output).toContain("package-lock.json: 1 npm entries");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("exits 2 naming an npm entry with no publish time", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-no-time"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/no-time": { version: "1.0.0", resolved: npmResolved("no-time", "1.0.0") },
+        }),
+      },
+    });
+    const registry = fixtureRegistry(bunOnlyTimes);
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(2);
+      expect(output).toContain("package-lock.json: no-time@1.0.0: no publish time");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("refuses a resolved tarball URL that names a different package", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-name-mismatch"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/recorded-dep": {
+            name: "recorded-dep",
+            version: "1.0.0",
+            resolved: npmResolved("other-dep", "9.9.9"),
+          },
+        }),
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/recorded-dep");
+    expect(output).toContain("resolved URL identifies other-dep, but the entry records recorded-dep");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("refuses a resolved tarball URL whose version differs from the recorded version", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-version-mismatch"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/recorded-dep": {
+            version: "1.0.0",
+            resolved: npmResolved("recorded-dep", "9.9.9"),
+          },
+        }),
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/recorded-dep");
+    expect(output).toContain(
+      "resolved URL identifies recorded-dep@9.9.9, but the entry records version 1.0.0",
+    );
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("ages an entry with no resolved URL by its recorded name and version", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-no-resolved"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/unresolved-young": { version: "2.0.0" },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({ ...bunOnlyTimes, "unresolved-young": { "2.0.0": ISO_NOW } });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(1);
+      expect(output).toContain("package-lock.json: unresolved-young@2.0.0");
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("collects no-resolved entries despite inBundle flags on the entry or parent", () => {
+    const lock = npmLock({
+      "node_modules/bundled-dep": { version: "1.0.0", inBundle: true },
+      "node_modules/bundled-parent": { version: "1.0.0", inBundle: true },
+      "node_modules/bundled-parent/node_modules/nested": { version: "1.0.0" },
+    });
+    const { deps, problems } = collectNpmLockDeps(lock, "package-lock.json");
+    expect(problems).toEqual([]);
+    expect(deps).toEqual([
+      { name: "bundled-dep", version: "1.0.0", lockfile: "package-lock.json" },
+      { name: "bundled-parent", version: "1.0.0", lockfile: "package-lock.json" },
+      { name: "nested", version: "1.0.0", lockfile: "package-lock.json" },
+    ]);
+  }, 30_000);
+
+  it("ages no-resolved entries marked inBundle and nested under an inBundle parent", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-bundled"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({
+          "node_modules/bundled-dep": { version: "1.0.0", inBundle: true },
+          "node_modules/bundled-parent": { version: "1.0.0", inBundle: true },
+          "node_modules/bundled-parent/node_modules/nested": { version: "1.0.0" },
+        }),
+      },
+    });
+    const registry = fixtureRegistry({
+      ...bunOnlyTimes,
+      "bundled-dep": { "1.0.0": ISO_NOW },
+      "bundled-parent": { "1.0.0": ISO_NOW },
+      nested: { "1.0.0": ISO_NOW },
+    });
+    try {
+      const { exitCode, output } = await runGate({
+        TPS_DEP_AGES_ROOT: root,
+        TPS_DEP_AGES_REGISTRY: registry.url,
+      });
+      expect(exitCode).toBe(1);
+      for (const name of ["bundled-dep", "bundled-parent", "nested"]) {
+        expect(output).toContain(`package-lock.json: ${name}@1.0.0`);
+      }
+    } finally {
+      registry.stop();
+    }
+  }, 30_000);
+
+  it("refuses an entry with no resolved URL and no version", async () => {
+    const root = writeFixtureRepo(join(scratch, "npm-versionless"), {
+      exceptions: "## Exceptions\n",
+      npmLocks: {
+        "package-lock.json": npmLock({ "node_modules/versionless": { inBundle: true } }),
+      },
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/versionless");
+    expect(output).toContain("entry with no `resolved` URL has no version");
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it("collects the real aliased entry under the recorded package name", () => {
+    const lockfile = "plugins/openclaw-tps-mail/package-lock.json";
+    const lock = JSON.parse(readFileSync(join(REPO, lockfile), "utf8"));
+    const aliasPath = "node_modules/openclaw/node_modules/node-domexception";
+    expect(lock.packages[aliasPath].name).toBe("@nolyfill/domexception");
+    const { deps, problems } = collectNpmLockDeps(lock, lockfile);
+    expect(problems).toEqual([]);
+    expect(deps).toContainEqual({
+      name: lock.packages[aliasPath].name,
+      version: lock.packages[aliasPath].version,
+      lockfile,
+    });
+  });
 });
 
 describe("CLI — the threshold is the value Bun parses", () => {
@@ -798,7 +1249,7 @@ function assertInstallGates(source: string) {
     );
     for (const [index, step] of job.steps.entries()) {
       if (!step.run?.split("\n").some((line) =>
-        !line.trimStart().startsWith("#") && /\b(?:bun install|npm (?:ci|install))\b/.test(line),
+        !line.trimStart().startsWith("#") && /\b(?:bun install|npm (?:ci|install)|bash scripts\/npm-ci-tracked-lock\.sh)\b/.test(line),
       )) continue;
       installs++;
       expect(checkout).toBeGreaterThanOrEqual(0);
@@ -809,7 +1260,7 @@ function assertInstallGates(source: string) {
   expect(installs).toBeGreaterThan(0);
 }
 
-it("runs the lock gate before every install step in the CI workflow", () => {
+it("runs the lock gate before literal bun install, npm ci, npm install command words and helper calls in the CI workflow", () => {
   assertInstallGates(readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8"));
 });
 
@@ -821,4 +1272,160 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   );
   expect(commented).not.toBe(workflow);
   expect(() => assertInstallGates(commented)).toThrow();
+});
+
+/* Literal npm ci command words and helper calls; some escaped or quoted spellings evade classification, for example `n\pm ci` and `npm c\i` (deferred to #836); script files and composite actions are not inspected. */
+
+function trackedLockfiles(): string[] {
+  const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
+  const files = listed.split("\0").filter(Boolean);
+  if (files.length === 0) setupFailure("git ls-files listed no files");
+  const lockfiles = lockfilesFromFileList(files);
+  if (lockfiles.length === 0) setupFailure("git ls-files listed no package-lock.json");
+  return lockfiles;
+}
+
+it("checks literal npm ci command words and tracked-lock helper calls in workflow run steps", () => {
+  const tracked = new Set(trackedLockfiles());
+  const workflowsDir = join(REPO, ".github", "workflows");
+  const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
+  expect(workflows.length).toBeGreaterThan(0);
+  let installs = 0;
+  for (const name of workflows) {
+    installs += assertNpmCiLockfilesRead(readFileSync(join(workflowsDir, name), "utf8"), tracked);
+  }
+  expect(installs).toBeGreaterThan(0);
+});
+
+/** One job, one step, with `run` as a YAML block scalar. */
+function workflowStep(run: string, workdir = "plugins/read"): string {
+  const body = run.split("\n").map((line) => `          ${line}`).join("\n");
+  return `jobs:\n  build:\n    steps:\n      - working-directory: ${workdir}\n        run: |\n${body}\n`;
+}
+
+const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/package-lock.json"]);
+
+describe("the workflow guard checks literal npm ci command words and helper calls", () => {
+  it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a literal npm ci command word outside the helper: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
+      `job build step 1: cannot establish the npm ci directory: raw npm ci is refused; use the tracked-lock helper: ${run}`,
+    );
+  }, 5_000);
+
+  it("accepts the helper's literal tracked fixture with a variable prefix", () => {
+    expect(assertNpmCiLockfilesRead(workflowStep(
+      'prefix="$RUNNER_TEMP/install"\nbash scripts/npm-ci-tracked-lock.sh --via sfw plugins/good "$prefix" --ignore-scripts', ".",
+    ), READ_TRACKED)).toBe(1);
+  });
+
+  it.each([
+    'bash scripts/npm-ci-tracked-lock.sh --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via "$installer" --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via other --in-place plugins/good',
+    'bash scripts/npm-ci-tracked-lock.sh --via npm --in-place "$fixture"',
+    'bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/good "prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw "$fixture" "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw ${fixture} "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw /absolute "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh --via sfw plugins/unread "$prefix"',
+  ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile)/);
+  }, 30_000);
+
+  it.each([
+    "npm run prepare-lock", "PATH=./fakebin", 'PATH="./fakebin"', 'TZ="UTC"',
+    'NODE_OPTIONS="--require=./prepare.cjs"', 'npm_config_userconfig="./npmrc"',
+    'GIT_CONFIG_GLOBAL="./gitconfig"', 'GITHUB_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+    'GITHUB_ACTIONS="false"', 'github_sha="ignored"',
+    'pin="$(node scripts/change-head.mjs --pin)"', "export prefix=elsewhere", "source ./prepare.sh",
+    ". ./prepare.sh", "eval true", "prepare() { true; }", "echo unexpected",
+    'prefix="$unassigned/install"', 'prefix="$(pwd)"', 'prefix=unquoted',
+    'pin="$(node scripts/pin.mjs --pin); npm run prepare-lock"',
+    'echo "RESULT=$(npm run prepare-lock)" >> "$GITHUB_ENV"',
+  ])("refuses a helper-step line: %s", (line) => {
+    const run = `prefix="$RUNNER_TEMP/install"\n${line}\nbash scripts/npm-ci-tracked-lock.sh --via sfw plugins/good "$prefix"`;
+    let error: unknown;
+    try { assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain("job build step 1");
+    expect((error as Error).message).toContain(line);
+  }, 30_000);
+
+  it("refuses the unrelated-copy and raw-prefix probe", () => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(
+      "cp ../good/package-lock.json /tmp/dummy/package-lock.json\nnpm ci --prefix ../unread",
+    ), READ_TRACKED)).toThrow(/job build step 1.*raw npm ci is refused/);
+  });
+
+  it.each([
+    "npm ci --prefix ../good",
+    "npm --prefix ../good ci",
+    'npm "ci" --prefix ../good',
+    "npm \\\nci --prefix ../good",
+    "sfw npm ci --prefix=../good",
+    "npm ci -C ../good",
+    "npm ci --pref ../good",
+    "source ../move.sh\nnpm ci",
+    ". ../move.sh\nnpm ci",
+    "npm run prepare-lock\nnpm ci",
+    "cp ../good/package-lock.json package-lock.json\nnpm ci",
+    "mv ../good/package-lock.json package-lock.json\nnpm ci",
+    "ln ../good/package-lock.json package-lock.json\nnpm ci",
+    "install ../good/package-lock.json package-lock.json\nnpm ci",
+    "tee package-lock.json\nnpm ci",
+    "echo replacement > package-lock.json\nnpm ci",
+    "npm ci\necho replacement >> npm-shrinkwrap.json",
+  ])("refuses literal npm ci command words outside the helper: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/job build step 1: cannot establish the npm ci directory:/);
+  }, 30_000);
+
+  it("uses workflow and job defaults with step working-directory taking precedence", () => {
+    const run = "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/good";
+    const withoutStepDir = workflowStep(run).replace(
+      "      - working-directory: plugins/read\n        run: |", "      - run: |",
+    );
+    expect(assertNpmCiLockfilesRead(
+      `defaults:\n  run:\n    working-directory: .\n${withoutStepDir}`, READ_TRACKED,
+    )).toBe(1);
+    const jobDefault = withoutStepDir.replace(
+      "    steps:", "    defaults:\n      run:\n        working-directory: .\n    steps:",
+    );
+    expect(assertNpmCiLockfilesRead(
+      `defaults:\n  run:\n    working-directory: plugins/unread\n${jobDefault}`, READ_TRACKED,
+    )).toBe(1);
+    const stepOverride = workflowStep(run, ".").replace(
+      "    steps:", "    defaults:\n      run:\n        working-directory: plugins/unread\n    steps:",
+    );
+    expect(assertNpmCiLockfilesRead(stepOverride, READ_TRACKED)).toBe(1);
+  }, 30_000);
+
+  it.each(["cd ../good && npm ci", "cd plugins/x && npm ci", "cd ../unread && npm ci"])(
+    "refuses a leading cd before literal npm ci command words: %s", (run) => {
+      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/raw npm ci is refused/);
+    }, 5_000,
+  );
+
+  it.each([
+    'cd "$DIR" && npm ci',
+    "cd $(pwd) && npm ci",
+    "pushd ../good\nnpm ci",
+    "popd\nnpm ci",
+    "(cd ../good && npm ci)",
+    "{ cd ../good && npm ci; }",
+    "if true; then npm ci; fi",
+    "case x in x) npm ci;; esac",
+    "cd ../../../outside && npm ci",
+    "cd ../good\nnpm ci",
+    "cd a && cd b && npm ci",
+    "cd ../good && npm ci\nnpm ci",
+    "cd ../good && npm ci\ncd ../read && npm ci",
+    "cd - && npm ci",
+    "cd 'a # b' && npm ci",
+    "cd a; cd b && npm ci",
+    "cd ../unread || cd ../good && npm ci",
+  ])("refuses an unestablished npm ci directory: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
+      /job build step 1: cannot establish the npm ci directory/,
+    );
+  }, 30_000);
 });

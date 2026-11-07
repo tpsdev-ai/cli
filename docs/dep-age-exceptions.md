@@ -1,7 +1,44 @@
 # Dependency release-age exceptions
 
-`scripts/check-dep-ages.mjs` checks every external version in `bun.lock` against
-`[install] minimumReleaseAge` in `bunfig.toml`.
+`scripts/check-dep-ages.mjs` checks external versions in `bun.lock` and tracked
+`package-lock.json` files against `[install] minimumReleaseAge` in `bunfig.toml`.
+For npm entries, it ages the package identified by a canonical registry tarball
+URL, or recorded name@version without `resolved`, regardless of `inBundle`.
+Versionless entries, URL/name/version disagreement, non-canonical registry URLs
+(including query strings and percent-encoded path components), and git URLs are refused. The root,
+`link: true`, and unencoded local `file:`/`workspace:` entries are skipped.
+A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
+
+- `plugins/openclaw-github-review/package-lock.json`
+- `plugins/openclaw-tps-mail/package-lock.json`
+- `test/fixtures/heartbeat-openclaw/package-lock.json`
+
+The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
+without editing a list.
+
+A literal `npm ci` command word in a workflow `run:` step must be a helper call
+to `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
+literal `--via npm` or `--via sfw`. Some escaped or quoted spellings evade classification,
+for example `n\pm ci` and `npm c\i` (deferred to #836). Installs inside other script
+files or composite actions are not inspected. Helper steps allow
+`set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
+literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
+calls and `GITHUB_ENV` echoes. Other helper-step lines are refused. The helper
+limits install flags to `--ignore-scripts`, `--no-audit` and `--no-fund`.
+
+The gate refuses tracked `npm-shrinkwrap.json` files anywhere in the repository.
+The helper selects `GITHUB_SHA` under GitHub Actions (required to be 40 hex
+characters), or `HEAD` locally, and logs that revision. It requires the selected
+installer and reads the tracked directory's manifest and lock from that revision.
+In prefix mode it requires an absent or empty prefix and copies those bytes there.
+In `--in-place` mode it refuses `npm-shrinkwrap.json` in the install directory,
+including untracked files, and verifies that the working `package-lock.json` and
+`package.json` are byte-identical to the selected revision before installing there.
+Both modes compare the installed directory's `package-lock.json` against the saved
+revision bytes after the install. npm configuration is not checked (#837).
+The heartbeat uses `--via sfw`; plugin installs use `--via npm`.
+#818 defers hermetic local-registry adversarial coverage; the heartbeat CI step
+already runs real npm through `sfw`.
 
 Add one line per exception under the `## Exceptions` heading below, in this
 exact shape:
@@ -10,7 +47,8 @@ exact shape:
 - name@version | expires:YYYY-MM-DD | reason: why this version is needed now
 ```
 
-- `name@version` must use valid semver and match a resolution in `bun.lock` byte for byte
+- `name@version` must use valid semver and match a resolution in `bun.lock` or a
+  tracked `package-lock.json` byte for byte
   (a scoped name keeps its `@scope/`, so `@scope/pkg@1.2.3`).
 - `expires` is a real calendar date, `YYYY-MM-DD`, and is inclusive: the entry
   holds through the end of that day, UTC. It is a deadline to remove the
@@ -19,6 +57,6 @@ exact shape:
 
 Everything above the heading is documentation. Every non-blank line under the
 heading must be an entry; an entry that is undated, has an impossible or past
-date, has no reason, uses invalid semver, or is absent from `bun.lock` fails the gate (exit 2).
+date, has no reason, uses invalid semver, or is absent from `bun.lock` and the tracked `package-lock.json` files fails the gate (exit 2).
 
 ## Exceptions

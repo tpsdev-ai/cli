@@ -90,6 +90,135 @@ export function collectResolvedDeps(lock) {
   return [...out.values()];
 }
 
+/** The `package-lock.json` paths in a list of repository-relative file paths. */
+export function lockfilesFromFileList(paths) {
+  return [...new Set(paths.filter((path) => path.split("/").pop() === "package-lock.json"))].sort();
+}
+
+/**
+ * Accepted canonical registry tarball form:
+ * `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz` (also http).
+ * Query strings and percent-encoded path components are refused.
+ */
+const REGISTRY_TARBALL_RE = /^https?:\/\/registry\.npmjs\.org\/((?:@[^/]+\/)?[^/]+)\/-\/([^/]+)\.tgz$/;
+
+/** The `node_modules/...` path segment that names an entry, scoped name included. */
+function entryPackageName(entry, marker) {
+  return entry.slice(marker + "node_modules/".length);
+}
+
+/**
+ * Collect npm lockfile v2/v3 entries by the package identified by a canonical
+ * registry tarball URL, or by recorded name@version without `resolved`.
+ * Refuse URL/name/version disagreement, non-canonical registry URLs and git.
+ * Skip the root, `link: true`, and unencoded local `file:`/`workspace:` entries.
+ * `inBundle` does not exempt an entry; missing publish times refuse closed.
+ * Without a recorded name, use the last `node_modules/` path segment.
+ *
+ * Model source: npm@11.19.0/node_modules/@npmcli/arborist (version 9.9.1),
+ * lib/arborist/reify.js:743-750 selects `resolved` or package name@version;
+ * :775-778 passes `resolved` to pacote.extract.
+ * npm docs/content/configuring-npm/package-lock-json.md:35 gives shrinkwrap
+ * precedence; docs/content/commands/npm-ci.md:27-28 says ci does not write locks.
+ * The gate therefore refuses tracked npm-shrinkwrap.json files, and the helper
+ * refuses non-empty prefixes before copying package-lock.json.
+ *
+ * @returns {{ deps: Array<{name: string, version: string, lockfile: string}>,
+ *             problems: Array<{lockfile: string, entry: string, message: string}> }}
+ */
+export function collectNpmLockDeps(lock, lockfile) {
+  const deps = [];
+  const problems = [];
+  const version = lock?.lockfileVersion;
+  if (version !== 2 && version !== 3) {
+    return {
+      deps,
+      problems: [{ lockfile, entry: "", message: `a v2 or v3 lockfile is required; lockfileVersion found: ${JSON.stringify(version) ?? "missing"}` }],
+    };
+  }
+  const packages = lock && typeof lock === "object" ? lock.packages : null;
+  if (!packages || typeof packages !== "object" || Array.isArray(packages)) {
+    return {
+      deps,
+      problems: [{ lockfile, entry: "", message: "no `packages` map" }],
+    };
+  }
+  for (const [entry, value] of Object.entries(packages)) {
+    if (entry === "") continue;
+    const marker = entry.lastIndexOf("node_modules/");
+    if (marker === -1 || (marker !== 0 && entry[marker - 1] !== "/")) continue;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      problems.push({ lockfile, entry, message: "entry is not an object" });
+      continue;
+    }
+    if (value.link === true) continue;
+    const name =
+      typeof value.name === "string" && value.name !== ""
+        ? value.name
+        : entryPackageName(entry, marker);
+    const resolved = value.resolved;
+    if (typeof resolved !== "string") {
+      const version = value.version;
+      if (typeof version !== "string" || version === "") {
+        problems.push({ lockfile, entry, message: "entry with no `resolved` URL has no version" });
+        continue;
+      }
+      deps.push({ name, version, lockfile });
+      continue;
+    }
+    if (/[?#]/.test(resolved)) {
+      problems.push({ lockfile, entry, message: `resolved URL has a query or fragment delimiter: ${resolved}` });
+      continue;
+    }
+    const urlPath = resolved.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*/, "").split(/[?#]/, 1)[0];
+    if (urlPath.includes("%")) {
+      problems.push({ lockfile, entry, message: `resolved URL has a percent-encoded path component: ${resolved}` });
+      continue;
+    }
+    if (/^(?:file|workspace):/.test(resolved)) continue;
+    if (/^git(?:\+|:)/.test(resolved)) {
+      problems.push({
+        lockfile,
+        entry,
+        message: `resolved URL is a git dependency, which has no publish time: ${resolved}`,
+      });
+      continue;
+    }
+    const version = value.version;
+    if (typeof version !== "string" || version === "") {
+      problems.push({ lockfile, entry, message: "registry-resolved entry has no version" });
+      continue;
+    }
+    const match = resolved.match(REGISTRY_TARBALL_RE);
+    if (match === null) {
+      problems.push({ lockfile, entry, message: `resolved URL is not a registry tarball URL: ${resolved}` });
+      continue;
+    }
+    const urlName = match[1];
+    const basename = urlName.slice(urlName.lastIndexOf("/") + 1);
+    const file = match[2];
+    if (!file.startsWith(`${basename}-`)) {
+      problems.push({ lockfile, entry, message: `resolved URL file name does not match ${urlName}: ${resolved}` });
+      continue;
+    }
+    const urlVersion = file.slice(basename.length + 1);
+    if (urlName !== name) {
+      problems.push({ lockfile, entry, message: `resolved URL identifies ${urlName}, but the entry records ${name}` });
+      continue;
+    }
+    if (urlVersion !== version) {
+      problems.push({
+        lockfile,
+        entry,
+        message: `resolved URL identifies ${urlName}@${urlVersion}, but the entry records version ${version}`,
+      });
+      continue;
+    }
+    deps.push({ name: urlName, version: urlVersion, lockfile });
+  }
+  return { deps, problems };
+}
+
 /**
  * The semver grammar the exception gate accepts, shared with the exact-pin
  * check so both read a version the same way.
