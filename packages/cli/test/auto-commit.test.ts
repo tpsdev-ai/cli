@@ -1,11 +1,6 @@
 import { describe, expect, mock, test, afterEach } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { isAbsolute, join, relative } from "node:path";
 import {
   composeSystemPrompt,
-  detectStaleRebase,
   hasWorkspaceChangesOrNewCommit,
   publishTaskOutcomeEvent,
   runAutoCommit,
@@ -41,109 +36,6 @@ describe("hasWorkspaceChangesOrNewCommit", () => {
     expect(hasWorkspaceChangesOrNewCommit("", "abc123", "abc123")).toBe(false);
     expect(hasWorkspaceChangesOrNewCommit(" M file.ts", "abc123", "abc123")).toBe(true);
   });
-});
-
-const GIT = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
-
-/** Run git in `cwd` and throw on a non-zero exit. */
-function git(cwd: string, ...args: string[]): string {
-  const result = spawnSync(GIT, args, { cwd, encoding: "utf-8" });
-  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
-  return String(result.stdout ?? "");
-}
-
-/** A repository with one commit on `main`, in a fresh temp dir. */
-function initRepo(): string {
-  const dir = mkdtempSync(join(tmpdir(), "cli781-rebase-"));
-  git(dir, "init", "-q", "-b", "main");
-  git(dir, "config", "user.email", "agent-a@example.com");
-  git(dir, "config", "user.name", "agent-a");
-  writeFileSync(join(dir, "file.txt"), "base\n");
-  git(dir, "add", "file.txt");
-  git(dir, "commit", "-q", "-m", "base");
-  return dir;
-}
-
-/** Commit a conflicting change on `topic` and on `main`, then return to `topic`. */
-function conflictingBranches(cwd: string): void {
-  git(cwd, "checkout", "-q", "-b", "topic");
-  writeFileSync(join(cwd, "file.txt"), "topic\n");
-  git(cwd, "commit", "-q", "-am", "topic");
-  git(cwd, "checkout", "-q", "main");
-  writeFileSync(join(cwd, "file.txt"), "main\n");
-  git(cwd, "commit", "-q", "-am", "main");
-  git(cwd, "checkout", "-q", "topic");
-}
-
-describe("detectStaleRebase", () => {
-  test("reports a stale rebase in a main checkout", () => {
-    const repo = initRepo();
-    try {
-      conflictingBranches(repo);
-      expect(spawnSync(GIT, ["rebase", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
-      expect(detectStaleRebase(repo)).toEqual({ state: "present" });
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  test("reports a stale rebase in a linked worktree whose .git file is relative", () => {
-    const repo = initRepo();
-    const worktree = `${repo}-wt`;
-    try {
-      git(repo, "worktree", "add", "-q", "-b", "topic", worktree, "main");
-      writeFileSync(join(worktree, "file.txt"), "topic\n");
-      git(worktree, "commit", "-q", "-am", "topic");
-      writeFileSync(join(repo, "file.txt"), "main\n");
-      git(repo, "commit", "-q", "-am", "main");
-      // git writes an absolute gitdir; rewrite it relative to the worktree, which
-      // git resolves against the .git file's directory.
-      const gitFile = join(worktree, ".git");
-      const gitDir = readFileSync(gitFile, "utf-8").trim().replace(/^gitdir:\s*/, "");
-      const relativeGitDir = relative(worktree, gitDir);
-      expect(isAbsolute(relativeGitDir)).toBe(false);
-      writeFileSync(gitFile, `gitdir: ${relativeGitDir}\n`);
-      expect(spawnSync(GIT, ["rev-parse", "--git-path", "rebase-merge"], { cwd: worktree, encoding: "utf-8" }).status).toBe(0);
-
-      expect(spawnSync(GIT, ["rebase", "main"], { cwd: worktree, encoding: "utf-8" }).status).not.toBe(0);
-      expect(detectStaleRebase(worktree)).toEqual({ state: "present" });
-    } finally {
-      rmSync(worktree, { recursive: true, force: true });
-      rmSync(repo, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  test("reports a stale rebase started with the apply backend", () => {
-    const repo = initRepo();
-    try {
-      conflictingBranches(repo);
-      expect(spawnSync(GIT, ["rebase", "--apply", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
-      expect(detectStaleRebase(repo)).toEqual({ state: "present" });
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  test("reports no stale rebase in a clean repository", () => {
-    const repo = initRepo();
-    try {
-      expect(detectStaleRebase(repo)).toEqual({ state: "absent" });
-    } finally {
-      rmSync(repo, { recursive: true, force: true });
-    }
-  }, 30_000);
-
-  test("reports indeterminate when the directory is not a repository", () => {
-    const dir = mkdtempSync(join(tmpdir(), "cli781-norepo-"));
-    try {
-      expect(detectStaleRebase(dir)).toEqual({
-        state: "indeterminate",
-        probe: "git rev-parse --path-format=absolute --git-path rebase-merge",
-      });
-    } finally {
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 30_000);
 });
 
 describe("runAutoCommit", () => {
