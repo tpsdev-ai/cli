@@ -261,6 +261,15 @@ export async function stopGateway(child, options = {}) {
   }
 }
 
+function formatThrownValue(value) {
+  try {
+    const message = value?.message;
+    return typeof message === "string" ? message : String(value);
+  } catch {
+    return "<unprintable thrown value>";
+  }
+}
+
 /**
  * Run `action`, then `cleanup`; preserve thrown values, action first.
  */
@@ -277,7 +286,7 @@ export async function finishWithCleanup(action, cleanup) {
     await cleanup();
   } catch (error) {
     if (!actionFailed) throw error;
-    throw new AggregateError([failure, error], `${failure?.message ?? String(failure)}\ncleanup also failed: ${error?.message ?? String(error)}`);
+    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\ncleanup also failed: ${formatThrownValue(error)}`);
   }
   if (actionFailed) throw failure;
 }
