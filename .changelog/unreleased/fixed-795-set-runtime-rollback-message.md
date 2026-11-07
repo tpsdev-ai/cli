@@ -1,0 +1,1 @@
+- **`agent set-runtime` reports when the config changed after its replacement was written and no rollback was attempted (Refs #795).**

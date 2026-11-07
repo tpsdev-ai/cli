@@ -893,6 +893,10 @@ syncBuiltinESMExports();
 
   const NODE_BIN = "/usr/bin/node";
   const SETPRIV_BIN = "/usr/bin/setpriv";
+  // Not the uid-65534 process's egid: the image's `users` group. The child
+  // gets it as a supplementary group, which is what lets an unprivileged
+  // process chgrp the replacement to it.
+  const SPARE_GROUP = 100;
   const canOwnAnotherUid =
     typeof process.getuid === "function" &&
     process.getuid() === 0 &&
@@ -908,7 +912,7 @@ syncBuiltinESMExports();
       try {
         const configPath = writeAgentConfig(agent, "openclaw", ownerHome);
         chmodSync(configPath, 0o644);
-        chownSync(configPath, 0, 65534);
+        chownSync(configPath, 0, SPARE_GROUP);
         chownSync(join(configPath, ".."), 65534, 65534);
         chownSync(ownerHome, 65534, 65534);
         chmodSync(ownerHome, 0o755);
@@ -917,7 +921,7 @@ syncBuiltinESMExports();
         const result = spawnSync(SETPRIV_BIN, [
           "--reuid=65534",
           "--regid=65534",
-          "--clear-groups",
+          `--groups=${SPARE_GROUP}`,
           NODE_BIN,
           TPS_BIN,
           "agent",
@@ -937,7 +941,7 @@ syncBuiltinESMExports();
         expect(warnings).toHaveLength(1);
         expect(readFileSync(configPath, "utf-8")).toContain("runtime: native");
         expect(statSync(configPath).uid).toBe(65534);
-        expect(statSync(configPath).gid).toBe(65534);
+        expect(statSync(configPath).gid).toBe(SPARE_GROUP);
       } finally {
         rmSync(ownerHome, { recursive: true, force: true });
       }
@@ -1084,7 +1088,7 @@ syncBuiltinESMExports();
     expect(result.stderr).toContain("Runtime verification failed");
     expect(result.stdout).not.toContain("runtime recorded as");
     expect(readFileSync(configPath, "utf-8")).toBe("runtime: mismatched\n");
-    expect(result.stderr).toContain("Config changed after writing");
+    expect(result.stderr).toContain(`❌ Config at ${configPath} changed after the replacement was written; no rollback was attempted (it now holds another writer's content).`);
   }, 20000);
 
   test("set-runtime restores original bytes when verification fails and its write remains", async () => {
