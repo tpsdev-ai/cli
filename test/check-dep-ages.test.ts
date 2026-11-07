@@ -1260,7 +1260,7 @@ function assertInstallGates(source: string) {
   expect(installs).toBeGreaterThan(0);
 }
 
-it("runs the lock gate before direct installs and the helper in the CI workflow", () => {
+it("runs the lock gate before literal bun install, npm ci, npm install command words and helper calls in the CI workflow", () => {
   assertInstallGates(readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8"));
 });
 
@@ -1274,7 +1274,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* Workflow run text only; script files and composite actions are not inspected. */
+/* Literal npm ci command words and helper calls; escaped/quoted spellings (#836), script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
@@ -1285,7 +1285,7 @@ function trackedLockfiles(): string[] {
   return lockfiles;
 }
 
-it("checks every npm ci written directly in a workflow run step and the tracked-lock helper", () => {
+it("checks literal npm ci command words and tracked-lock helper calls in workflow run steps", () => {
   const tracked = new Set(trackedLockfiles());
   const workflowsDir = join(REPO, ".github", "workflows");
   const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
@@ -1305,8 +1305,8 @@ function workflowStep(run: string, workdir = "plugins/read"): string {
 
 const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/package-lock.json"]);
 
-describe("the npm ci workflow guard accepts established command shapes", () => {
-  it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a raw npm ci run step: %s", (run) => {
+describe("the workflow guard checks literal npm ci command words and helper calls", () => {
+  it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a literal npm ci command word outside the helper: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
       `job build step 1: cannot establish the npm ci directory: raw npm ci is refused; use the tracked-lock helper: ${run}`,
     );
@@ -1375,7 +1375,7 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
     "tee package-lock.json\nnpm ci",
     "echo replacement > package-lock.json\nnpm ci",
     "npm ci\necho replacement >> npm-shrinkwrap.json",
-  ])("refuses a raw install outside its directory and lock contract: %s", (run) => {
+  ])("refuses literal npm ci command words outside the helper: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/job build step 1: cannot establish the npm ci directory:/);
   }, 30_000);
 
@@ -1400,7 +1400,7 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
   }, 30_000);
 
   it.each(["cd ../good && npm ci", "cd plugins/x && npm ci", "cd ../unread && npm ci"])(
-    "refuses a leading cd before raw npm ci: %s", (run) => {
+    "refuses a leading cd before literal npm ci command words: %s", (run) => {
       expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/raw npm ci is refused/);
     }, 5_000,
   );

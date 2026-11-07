@@ -16,11 +16,11 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-The workflow guard inspects `npm ci` written directly in workflow `run:` steps
-and calls to `scripts/npm-ci-tracked-lock.sh`; installs inside other script files
-or composite actions are not inspected. It accepts helper calls with a literal
-relative tracked directory and a required literal `--via npm` or `--via sfw`.
-Raw `npm ci` is refused, naming the job, step and line. Helper steps allow
+A literal `npm ci` command word in a workflow `run:` step must be a helper call
+to `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
+literal `--via npm` or `--via sfw`. Spellings Bash would still execute as `npm ci`
+via escapes or quotes are not classified (#836). Installs inside other script
+files or composite actions are not inspected. Helper steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
 calls and `GITHUB_ENV` echoes. Other helper-step lines are refused. The helper
@@ -35,8 +35,8 @@ In `--in-place` mode it refuses `npm-shrinkwrap.json` in the install directory,
 including untracked files, and verifies that the working `package-lock.json` and
 `package.json` are byte-identical to the selected revision before installing there.
 Both modes compare the installed directory's `package-lock.json` against the saved
-revision bytes after the install. The drift check rests on this install-time
-verification. The heartbeat uses `--via sfw`; plugin installs use `--via npm`.
+revision bytes after the install. npm configuration is not checked (#837).
+The heartbeat uses `--via sfw`; plugin installs use `--via npm`.
 #818 defers hermetic local-registry adversarial coverage; the heartbeat CI step
 already runs real npm through `sfw`.
 

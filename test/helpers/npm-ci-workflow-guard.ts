@@ -43,7 +43,8 @@ function resolveRepoDir(base: string, target: string, label: string): string {
   return parts.join("/");
 }
 
-/** Inspect direct workflow run text and helper calls; scripts and composite actions are outside this guard. */
+/** Inspect literal npm ci command words and helper calls in workflow run text.
+ * Escaped or quoted spellings are not classified (#836); scripts and composite actions are outside this guard. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
     .filter((line) => line !== "" && !line.startsWith("#"));
