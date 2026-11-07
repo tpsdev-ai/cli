@@ -175,6 +175,27 @@ function defaultStatusProbe({ binDir, testCase, port, timeout, rpcTimeout }) {
   });
 }
 
+function gatewayExited(gateway) {
+  return gateway.exitCode !== null || (gateway.signalCode ?? null) !== null;
+}
+
+function gatewayExitDescription(gateway) {
+  if (gateway.exitCode !== null) {
+    return gateway.signalCode ? `code ${gateway.exitCode} (signal ${gateway.signalCode})` : `code ${gateway.exitCode}`;
+  }
+  return `signal ${gateway.signalCode}`;
+}
+
+/**
+ * Let pending process events run so a child's exit is delivered before the
+ * gateway is checked again.
+ */
+async function settleGatewayEvents(gateway) {
+  for (let turn = 0; turn < 2 && !gatewayExited(gateway); turn++) {
+    await new Promise((resolveTurn) => setImmediate(resolveTurn));
+  }
+}
+
 /**
  * Poll `gateway status --require-rpc` until it succeeds, the gateway exits, or
  * the readiness deadline passes. Each probe's timeout and each sleep are capped
@@ -193,9 +214,9 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
   const deadline = now() + timeoutMs;
   let last;
   while (now() < deadline) {
-    if (gateway.exitCode !== null || (gateway.signalCode ?? null) !== null) {
+    if (gatewayExited(gateway)) {
       throw new Error(
-        `gateway exited with ${gateway.exitCode !== null ? `code ${gateway.exitCode}` : `signal ${gateway.signalCode}`} before RPC readiness\n${readLogTail(logPath)}`,
+        `gateway exited with ${gatewayExitDescription(gateway)} before RPC readiness\n${readLogTail(logPath)}`,
       );
     }
     const remaining = Math.max(1, deadline - now());
@@ -209,6 +230,12 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
     if (last.status === 0) {
       if (now() > deadline) {
         throw new Error(`gateway answered --require-rpc after the ${timeoutMs / 1000}s readiness deadline`);
+      }
+      await settleGatewayEvents(gateway);
+      if (gatewayExited(gateway)) {
+        throw new Error(
+          `gateway exited with ${gatewayExitDescription(gateway)} after answering --require-rpc\n${readLogTail(logPath)}`,
+        );
       }
       return;
     }
@@ -291,6 +318,17 @@ export async function finishWithCleanup(action, cleanup) {
   if (actionFailed) throw failure;
 }
 
+/**
+ * Stop the gateway and close its log, keeping both failures: the first when the
+ * other succeeds, and both in order when both fail.
+ */
+export async function stopGatewayAndCloseLog(gateway, logFd, options = {}) {
+  await finishWithCleanup(
+    () => stopGateway(gateway, options),
+    async () => closeSync(logFd),
+  );
+}
+
 async function runDeadCase(root, binDir) {
   const port = await freePort();
   await assertPortClosed(port);
@@ -335,11 +373,7 @@ async function runLiveCase(root, binDir) {
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
     async () => {
-      try {
-        await stopGateway(gateway);
-      } finally {
-        closeSync(logFd);
-      }
+      await stopGatewayAndCloseLog(gateway, logFd);
     },
   );
 }

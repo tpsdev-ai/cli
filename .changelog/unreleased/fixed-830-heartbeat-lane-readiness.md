@@ -1,0 +1,1 @@
+- **The heartbeat lane rechecks the launched gateway after a successful readiness probe and fails readiness if it has gone.**

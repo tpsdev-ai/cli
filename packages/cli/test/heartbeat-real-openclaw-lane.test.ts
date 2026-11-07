@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, makeCase, OPENCLAW_VERSION, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, makeCase, OPENCLAW_VERSION, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
@@ -273,6 +273,42 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     const cleanupAt = aggregate.message.indexOf("did not exit after SIGKILL");
     expect(assertionAt).toBeGreaterThanOrEqual(0);
     expect(cleanupAt).toBeGreaterThan(assertionAt);
+  });
+
+  test("reports the assertion first, then the failing gateway stop, then the failing log close", async () => {
+    const assertion = new Error("live gateway: heartbeat exit status must be 0");
+    const child = { pid: 4326, exitCode: null };
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-cleanup-"));
+    try {
+      const logFd = openSync(join(root, "gateway.log"), "w");
+      closeSync(logFd);
+      let reported: unknown;
+      try {
+        await finishWithCleanup(
+          async () => {
+            throw assertion;
+          },
+          () => stopGatewayAndCloseLog(child, logFd, { graceMs: 5, killMs: 10, pollMs: 2, signalGroup: () => {} }),
+        );
+      } catch (error) {
+        reported = error;
+      }
+      expect(reported).toBeInstanceOf(AggregateError);
+      const aggregate = reported as AggregateError;
+      expect(aggregate.errors[0]).toBe(assertion);
+      const cleanup = aggregate.errors[1] as AggregateError;
+      expect(cleanup).toBeInstanceOf(AggregateError);
+      expect(cleanup.errors).toHaveLength(2);
+      expect((cleanup.errors[0] as Error).message).toMatch(/gateway process 4326 did not exit after SIGKILL/);
+      expect((cleanup.errors[1] as NodeJS.ErrnoException).code).toBe("EBADF");
+      const lines = aggregate.message.split("\n");
+      expect(lines).toHaveLength(3);
+      expect(lines[0]).toBe(assertion.message);
+      expect(lines[1]).toMatch(/^cleanup also failed: gateway process 4326 did not exit after SIGKILL/);
+      expect(lines[2]).toMatch(/^cleanup also failed: EBADF/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test("a cleanup failure on its own is still reported", async () => {
