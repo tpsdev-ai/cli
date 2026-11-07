@@ -118,6 +118,10 @@ function entryPackageName(entry, marker) {
  * Model source: npm@11.19.0/node_modules/@npmcli/arborist (version 9.9.1),
  * lib/arborist/reify.js:743-750 selects `resolved` or package name@version;
  * :775-778 passes `resolved` to pacote.extract.
+ * npm docs/content/configuring-npm/package-lock-json.md:35 gives shrinkwrap
+ * precedence; docs/content/commands/npm-ci.md:27-28 says ci does not write locks.
+ * The gate therefore refuses tracked npm-shrinkwrap.json files, and the helper
+ * refuses non-empty prefixes before copying package-lock.json.
  *
  * @returns {{ deps: Array<{name: string, version: string, lockfile: string}>,
  *             problems: Array<{lockfile: string, entry: string, message: string}> }}
@@ -160,6 +164,10 @@ export function collectNpmLockDeps(lock, lockfile) {
         continue;
       }
       deps.push({ name, version, lockfile });
+      continue;
+    }
+    if (/[?#]/.test(resolved)) {
+      problems.push({ lockfile, entry, message: `resolved URL has a query or fragment delimiter: ${resolved}` });
       continue;
     }
     const urlPath = resolved.replace(/^[A-Za-z][A-Za-z0-9+.-]*:\/\/[^/?#]*/, "").split(/[?#]/, 1)[0];

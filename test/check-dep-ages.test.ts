@@ -543,7 +543,7 @@ describe("CLI — a version younger than the gate fails", () => {
 });
 
 describe("CLI — the current lockfiles pass", () => {
-  it("exits 0 on this repo's bun.lock and tracked npm lockfiles when every resolved version is old enough", async () => {
+  it("exits 0 on this repo's bun.lock and tracked package-lock.json files when every resolved version is old enough", async () => {
     // Serve the real lockfiles' resolved versions with a fixed old publish
     // time, so the case is deterministic and offline yet still reads the real
     // files through the real collect path.
@@ -558,7 +558,7 @@ describe("CLI — the current lockfiles pass", () => {
       expect(problems).toEqual([]);
       npmDeps.push(...deps);
     }
-    if (npmDeps.length === 0) setupFailure("expected the tracked npm lockfiles to resolve at least one entry");
+    if (npmDeps.length === 0) setupFailure("expected the tracked package-lock.json files to resolve at least one entry");
     const deps = [...bunDeps, ...npmDeps];
     const times: Record<string, Record<string, string>> = {};
     for (const d of deps) {
@@ -579,7 +579,7 @@ describe("CLI — the current lockfiles pass", () => {
 });
 
 describe("CLI — the production lockfile selection", () => {
-  /** Every pair the real bun.lock and tracked npm lockfiles resolve, served old. */
+  /** Every pair the real bun.lock and tracked package-lock.json files resolve, served old. */
   function realResolvedTimes(): Record<string, Record<string, string>> {
     const deps = collectResolvedDeps(parseBunLock(readFileSync(join(REPO, "bun.lock"), "utf8")));
     for (const lockfile of trackedLockfiles()) {
@@ -594,7 +594,7 @@ describe("CLI — the production lockfile selection", () => {
     return times;
   }
 
-  it("reads every tracked npm lockfile with git ls-files, without a root override", async () => {
+  it("reads every tracked package-lock.json with git ls-files, without a root override", async () => {
     const lockfiles = trackedLockfiles();
     expect(lockfiles.length).toBeGreaterThan(1);
     const registry = fixtureRegistry(realResolvedTimes());
@@ -629,6 +629,27 @@ describe("CLI — npm lockfiles", () => {
     expect(exitCode).toBe(2);
     expect(output).toContain("package-lock.json: entry node_modules/alias");
     expect(output).toContain(`resolved URL has a percent-encoded path component: ${resolved}`);
+    expect(output).not.toContain("Checking");
+  }, 30_000);
+
+  it.each([
+    ["query-name", "pkg?x", "1.0.0", "https://registry.npmjs.org/pkg?x/-/pkg?x-1.0.0.tgz"],
+    ["fragment-name", "pkg#x", "1.0.0", "https://registry.npmjs.org/pkg#x/-/pkg#x-1.0.0.tgz"],
+    ["query-basename", "pkg", "1.0.0?x", "https://registry.npmjs.org/pkg/-/pkg-1.0.0?x.tgz"],
+    ["fragment-basename", "pkg", "1.0.0#x", "https://registry.npmjs.org/pkg/-/pkg-1.0.0#x.tgz"],
+  ])("exits 2 naming the lockfile, entry and URL for %s", async (label, name, version, resolved) => {
+    const lock = npmLock({ "node_modules/alias": { name, version, resolved } });
+    const message = `resolved URL has a query or fragment delimiter: ${resolved}`;
+    expect(collectNpmLockDeps(lock, "package-lock.json")).toEqual({
+      deps: [], problems: [{ lockfile: "package-lock.json", entry: "node_modules/alias", message }],
+    });
+    const root = writeFixtureRepo(join(scratch, label), {
+      exceptions: "## Exceptions\n", npmLocks: { "package-lock.json": lock },
+    });
+    const { exitCode, output } = await runGate({ TPS_DEP_AGES_ROOT: root, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" });
+    expect(exitCode).toBe(2);
+    expect(output).toContain("package-lock.json: entry node_modules/alias");
+    expect(output).toContain(message);
     expect(output).not.toContain("Checking");
   }, 30_000);
 
@@ -1307,7 +1328,9 @@ describe("the npm ci workflow guard accepts established command shapes", () => {
   it.each([
     "npm run prepare-lock", "PATH=./fakebin", 'PATH="./fakebin"', 'TZ="UTC"',
     'NODE_OPTIONS="--require=./prepare.cjs"', 'npm_config_userconfig="./npmrc"',
-    'GIT_CONFIG_GLOBAL="./gitconfig"', "export prefix=elsewhere", "source ./prepare.sh",
+    'GIT_CONFIG_GLOBAL="./gitconfig"', 'GITHUB_SHA="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
+    'GITHUB_ACTIONS="false"', 'github_sha="ignored"',
+    'pin="$(node scripts/change-head.mjs --pin)"', "export prefix=elsewhere", "source ./prepare.sh",
     ". ./prepare.sh", "eval true", "prepare() { true; }", "echo unexpected",
     'prefix="$unassigned/install"', 'prefix="$(pwd)"', 'prefix=unquoted',
     'pin="$(node scripts/pin.mjs --pin); npm run prepare-lock"',

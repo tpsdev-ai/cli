@@ -49,8 +49,9 @@ function resolveRepoDir(base: string, target: string, label: string): string {
  * ci without --prefix, using the step/default directory and at most one leading
  * literal cd, or the helper with a literal relative fixture. Refuse other shapes.
  * Helper steps allow set -euo pipefail, allowlisted quoted assignments with lowercase names, a literal node
- * scripts/<file>.mjs substitution, helper calls and GITHUB_ENV echoes only.
- * The helper requires sfw and committed manifest/lock bytes, then compares the installed lock.
+ * scripts/heartbeat-real-openclaw-lane.mjs --pin substitution, helper calls and GITHUB_ENV echoes only.
+ * The helper requires sfw and committed manifest/lock bytes, then compares the copied package-lock.json.
+ * The gate refuses tracked npm-shrinkwrap.json files; the helper refuses non-empty prefixes.
  */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
@@ -65,6 +66,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   }
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
   if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
+    const allowedSubstitutions = new Set(['"$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"']);
     const assigned = new Set<string>(["RUNNER_TEMP"]);
     const quotedValue = (value: string): boolean => {
       const names = scanQuotedValue(value);
@@ -79,7 +81,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         if (!/^[a-z][a-z0-9_]*$/.test(name) || /^(?:PATH|NODE_.*|NPM_.*|GIT_.*|BASH.*|ENV|SHELLOPTS|SHELL|CDPATH|IFS|HOME|TMPDIR|TMP|TEMP|LANG|LANGUAGE|LC_.*|XDG_.*|SFW_.*|SOCKET_.*|LD_.*|DYLD_.*|SSL_.*|OPENSSL_.*|.*_PROXY|COREPACK_.*|GITHUB_.*|RUNNER_.*)$/i.test(name)) {
           refuse(`tool environment assignment is refused: ${line}`);
         }
-        if (!quotedValue(value) && !/^"\$\(node scripts\/[A-Za-z0-9_-]+\.mjs(?: [A-Za-z0-9_./=-]+)*\)"$/.test(value)) {
+        if (!quotedValue(value) && !allowedSubstitutions.has(value)) {
           refuse(`unsupported helper-step line: ${line}`);
         }
         assigned.add(name);

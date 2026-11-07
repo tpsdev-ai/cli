@@ -26,15 +26,36 @@ for arg in "$@"; do
       ;;
   esac
 done
+revision=HEAD
+if [ "${GITHUB_ACTIONS:-}" = true ]; then
+  if [[ ! "${GITHUB_SHA:-}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+    echo 'npm-ci-tracked-lock: GITHUB_SHA must be 40 hex characters under GitHub Actions; install refused' >&2
+    exit 1
+  fi
+  revision=$GITHUB_SHA
+fi
+echo "npm-ci-tracked-lock: reading fixture files from $revision"
+if [ -e "$prefix" ] || [ -L "$prefix" ]; then
+  if [ ! -d "$prefix" ] || [ ! -r "$prefix" ] || [ ! -x "$prefix" ]; then
+    echo "npm-ci-tracked-lock: cannot inspect prefix: $prefix" >&2
+    exit 1
+  fi
+  shopt -s dotglob nullglob
+  prefix_entries=("$prefix"/*)
+  if [ "${#prefix_entries[@]}" -ne 0 ]; then
+    echo "npm-ci-tracked-lock: non-empty prefix refused: $prefix" >&2
+    exit 1
+  fi
+fi
+mkdir -p -- "$prefix"
 committed=$(mktemp -d)
 trap 'rm -f -- "$committed/package-lock.json" "$committed/package.json"; rmdir -- "$committed"' EXIT
 for path in "$lock" "$fixture/package.json"; do
-  if ! git show "HEAD:$path" > "$committed/${path##*/}"; then
+  if ! git show "$revision:$path" > "$committed/${path##*/}"; then
     echo "npm-ci-tracked-lock: cannot read committed file: $path" >&2
     exit 1
   fi
 done
-mkdir -p -- "$prefix"
 cp "$committed/package.json" "$committed/package-lock.json" "$prefix/"
 sfw npm ci --prefix "$prefix" "$@"
 if ! cmp -- "$committed/package-lock.json" "$prefix/package-lock.json"; then

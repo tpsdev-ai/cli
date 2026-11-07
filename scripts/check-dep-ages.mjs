@@ -16,7 +16,7 @@
  * package that URL identifies, and is refused, naming the lockfile and entry,
  * when that URL disagrees with the recorded name or version or is not a registry
  * tarball URL (query strings and percent-encoded path components are refused).
- * A v2 or v3 npm lockfile is required.
+ * A v2 or v3 npm lockfile is required; tracked npm-shrinkwrap.json files are refused.
  * A `git:`/`git+...` entry is refused because it has no publish time; an unencoded local
  * `file:` or `workspace:` entry, the root entry and a `link: true` entry are not
  * checked. An entry without a `resolved` URL is aged by its recorded
@@ -30,7 +30,7 @@
  *       exact declarations, no override in a nested package.json, and no resolutions key naming it
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files or npm
- *       lockfiles, an npm lockfileVersion other than 2 or 3 (including missing), an npm entry with no version, an npm `resolved` URL that is a
+ *       lockfiles, a tracked npm-shrinkwrap.json, an npm lockfileVersion other than 2 or 3 (including missing), an npm entry with no version, an npm `resolved` URL that is a
  *       git dependency, is not a registry tarball URL, or does not identify the
  *       recorded package and version, Bun not
  *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold
@@ -260,7 +260,13 @@ function collectLockfiles(root) {
       console.error("Refusing, because the tracked lockfiles could not be listed.");
       process.exit(2);
     }
-    for (const path of lockfilesFromFileList(run.stdout.split("\0"))) {
+    const tracked = run.stdout.split("\0");
+    const shrinkwrap = tracked.find((path) => path.split("/").pop() === "npm-shrinkwrap.json");
+    if (shrinkwrap !== undefined) {
+      console.error(`check-dep-ages: ${shrinkwrap}: npm-shrinkwrap.json is not aged; install refused.`);
+      process.exit(2);
+    }
+    for (const path of lockfilesFromFileList(tracked)) {
       out.push(path);
     }
   } else {
@@ -304,6 +310,10 @@ function collectLockfiles(root) {
           stat = statSync(join(root, path));
         } catch (err) {
           console.error(`check-dep-ages: cannot inspect ${path}: ${err?.code ?? err?.message ?? err}`);
+          process.exit(2);
+        }
+        if (entry.name === "npm-shrinkwrap.json") {
+          console.error(`check-dep-ages: ${path}: npm-shrinkwrap.json is not aged; install refused.`);
           process.exit(2);
         }
         if (stat.isDirectory()) pending.push(path);

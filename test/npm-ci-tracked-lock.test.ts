@@ -71,6 +71,7 @@ it("the helper copies the committed fixture and invokes npm ci through sfw with 
     const manifest = readFileSync(join(REPO, FIXTURE, "package.json"), "utf8");
     const result = h.run([HELPER, FIXTURE, h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"]);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(result.stdout).toContain("reading fixture files from HEAD");
     const args = ["ci", "--prefix", h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"];
     expect(h.installed()).toEqual({ argv: args, cwd: REPO.replace(/\/$/, ""), lock, manifest });
     expect(h.firewalled()).toEqual({ argv: ["npm", ...args], cwd: REPO.replace(/\/$/, ""), lock, manifest });
@@ -93,7 +94,7 @@ it.each(["untracked", "missing"])("the helper refuses the %s lock before npm run
   });
 }, 30_000);
 
-it("the helper installs committed bytes despite a modified working-tree lock and manifest", () => {
+it("the helper passes committed bytes to a stub installer despite a modified working-tree lock and manifest", () => {
   harness((h) => {
     const repo = join(h.root, "repo");
     mkdirSync(join(repo, FIXTURE), { recursive: true });
@@ -114,6 +115,106 @@ it("the helper installs committed bytes despite a modified working-tree lock and
     expect(h.installed().manifest).toBe(manifest);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
     expect(readFileSync(join(h.prefix, "package-lock.json"), "utf8")).toBe(lock);
+  });
+}, 30_000);
+
+function fixtureRepo(root: string) {
+  const repo = join(root, "repo");
+  mkdirSync(join(repo, FIXTURE), { recursive: true });
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: repo, env: process.env, encoding: "utf8", timeout: 10_000 });
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    return result.stdout.trim();
+  };
+  git("init", "-q");
+  git("config", "user.name", "Fixture Author");
+  git("config", "user.email", "fixture@example.test");
+  const write = (version: string) => {
+    writeFileSync(join(repo, FIXTURE, "package.json"), JSON.stringify({ name: "fixture", version }));
+    writeFileSync(join(repo, FIXTURE, "package-lock.json"), JSON.stringify({
+      name: "fixture", version, lockfileVersion: 3, packages: { "": { name: "fixture", version } },
+    }));
+  };
+  write("1.0.0");
+  git("add", ".");
+  git("commit", "-qm", "fixture initial");
+  return { repo, git, write };
+}
+
+it("the helper reads GITHUB_SHA bytes when HEAD moved after checkout under Actions", () => {
+  harness((h) => {
+    const { repo, git, write } = fixtureRepo(h.root);
+    const sha = git("rev-parse", "HEAD");
+    const lock = readFileSync(join(repo, FIXTURE, "package-lock.json"), "utf8");
+    const manifest = readFileSync(join(repo, FIXTURE, "package.json"), "utf8");
+    write("2.0.0");
+    git("add", ".");
+    git("commit", "-qm", "fixture changed");
+    expect(git("rev-parse", "HEAD")).not.toBe(sha);
+    const result = h.run([HELPER, FIXTURE, h.prefix], { GITHUB_ACTIONS: "true", GITHUB_SHA: sha }, repo);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(result.stdout).toContain(`reading fixture files from ${sha}`);
+    expect(h.installed().lock).toBe(lock);
+    expect(h.installed().manifest).toBe(manifest);
+  });
+}, 30_000);
+
+it.each([undefined, "", "malformed", "a".repeat(39), "g".repeat(40)])(
+  "the helper refuses Actions with invalid GITHUB_SHA %j before npm runs", (sha) => {
+    harness((h) => {
+      const extra: Record<string, string> = { GITHUB_ACTIONS: "true" };
+      if (sha !== undefined) extra.GITHUB_SHA = sha;
+      const result = h.run([HELPER, FIXTURE, h.prefix], extra);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("GITHUB_SHA must be 40 hex characters under GitHub Actions");
+      h.assertNoInstall();
+    });
+  }, 30_000,
+);
+
+it.each(["npm-shrinkwrap.json", "package-lock.json", ".occupied"])(
+  "the helper refuses a non-empty prefix containing %s before npm runs", (file) => {
+    harness((h) => {
+      mkdirSync(h.prefix);
+      writeFileSync(join(h.prefix, file), "{}");
+      const result = h.run([HELPER, FIXTURE, h.prefix]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(`non-empty prefix refused: ${h.prefix}`);
+      h.assertNoInstall();
+    });
+  }, 30_000,
+);
+
+it("the helper accepts an existing empty prefix", () => {
+  harness((h) => {
+    mkdirSync(h.prefix);
+    const result = h.run([HELPER, FIXTURE, h.prefix]);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    expect(h.installed().lock).toBe(readFileSync(join(REPO, FIXTURE, "package-lock.json"), "utf8"));
+  });
+}, 30_000);
+
+it("the gate refuses a tracked nested npm-shrinkwrap.json before registry lookup", () => {
+  harness((h) => {
+    const { repo, git } = fixtureRepo(h.root);
+    mkdirSync(join(repo, "scripts", "lib"), { recursive: true });
+    mkdirSync(join(repo, "docs"));
+    writeFileSync(join(repo, "scripts", "check-dep-ages.mjs"), readFileSync(join(REPO, "scripts", "check-dep-ages.mjs")));
+    writeFileSync(join(repo, "scripts", "lib", "check-dep-ages-collect.mjs"), readFileSync(join(REPO, "scripts", "lib", "check-dep-ages-collect.mjs")));
+    writeFileSync(join(repo, "bunfig.toml"), "[install]\nminimumReleaseAge = 604800\n");
+    writeFileSync(join(repo, "bun.lock"), JSON.stringify({ packages: { pkg: ["pkg@1.0.0"] } }));
+    writeFileSync(join(repo, "docs", "dep-age-exceptions.md"), "## Exceptions\n");
+    const shrinkwrap = `${FIXTURE}/npm-shrinkwrap.json`;
+    writeFileSync(join(repo, shrinkwrap), "{}");
+    git("add", shrinkwrap);
+    const result = spawnSync(NODE, [join(repo, "scripts", "check-dep-ages.mjs")], {
+      cwd: repo, env: { PATH: process.env.PATH, TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1" },
+      encoding: "utf8", timeout: 10_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`${shrinkwrap}: npm-shrinkwrap.json is not aged; install refused.`);
+    expect(result.stdout).not.toContain("Checking");
   });
 }, 30_000);
 
@@ -151,7 +252,7 @@ it("the helper refuses a directory override before npm runs", () => {
   });
 }, 30_000);
 
-it("the real workflow step installs the tracked fixture selected independently by the guard", () => {
+it("the real workflow step passes the tracked fixture selected independently by the guard to a stub installer", () => {
   const workflow = parseWorkflow(readFileSync(join(REPO, ".github/workflows/test.yml"), "utf8"));
   const job = workflow.jobs["heartbeat-real-openclaw"];
   const step = job.steps.find((candidate) => candidate.name === "Install the pinned OpenClaw into a temp prefix");
