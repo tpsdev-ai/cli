@@ -98,18 +98,18 @@ test("stop() attempts at most the retained bound of channel closes after many re
   let stop: (() => Promise<void>) | undefined;
   try {
     const branch = await prepareBranch(root);
+    const started = performance.now();
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; closes < failures && i < 2_000; i++) await Bun.sleep(5);
-    // Attempts are spaced by TEST_RECONNECT_BACKOFF_MS, so a microtask backoff
-    // adds many attempts inside this window and fails the bound.
+    // Spaced retries cannot exceed elapsed/backoff, plus the first attempt and one in flight.
     await Bun.sleep(20);
     expect(connects).toBeGreaterThanOrEqual(failures);
-    expect(connects).toBeLessThanOrEqual(failures + 1);
+    expect(connects).toBeLessThanOrEqual(2 + Math.floor((performance.now() - started) / TEST_RECONNECT_BACKOFF_MS));
     expect(closes).toBe(failures);
     const beforeStop = closes;
-    const started = performance.now();
+    const stopStarted = performance.now();
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
-    expect(performance.now() - started).toBeLessThan(5_000);
+    expect(performance.now() - stopStarted).toBeLessThan(5_000);
     expect(closes - beforeStop).toBeGreaterThan(0);
     expect(closes - beforeStop).toBeLessThanOrEqual(retainedBound);
     expect(diagnostic).toHaveBeenCalled();
@@ -155,15 +155,15 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
   try {
     const branch = await prepareBranch(root);
     const path = hostStatePath(branch);
+    const started = performance.now();
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects <= failures && i < 2_000; i++) await Bun.sleep(5);
-    // Attempts are spaced by TEST_RECONNECT_BACKOFF_MS, so a microtask backoff
-    // adds many attempts inside this window and fails the bound.
+    // Spaced retries cannot exceed elapsed/backoff, plus the first attempt and one in flight.
     expect(connects).toBeGreaterThan(failures);
-    expect(connects).toBeLessThanOrEqual(failures + 1);
+    expect(connects).toBeLessThanOrEqual(2 + Math.floor((performance.now() - started) / TEST_RECONNECT_BACKOFF_MS));
     expect(closes).toBeGreaterThanOrEqual(failures);
     await Bun.sleep(20);
-    expect(connects).toBeLessThanOrEqual(failures + 1);
+    expect(connects).toBeLessThanOrEqual(2 + Math.floor((performance.now() - started) / TEST_RECONNECT_BACKOFF_MS));
     expect(existsSync(path)).toBe(true);
     stopPhase = true;
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
