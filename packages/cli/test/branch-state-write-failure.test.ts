@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
@@ -145,7 +145,7 @@ describe("branch daemon state-write failure", () => {
     expect(stderr).toBe("");
   }, 30_000);
 
-  test("heartbeat echoes continue when both the state record and the log are unwritable", async () => {
+  test("heartbeat echoes continue when the state and log paths fail after connect and the stderr pipe is closed", async () => {
     const branch = generateKeyPair();
     const host = generateKeyPair();
     saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
@@ -154,34 +154,66 @@ describe("branch daemon state-write failure", () => {
       join(process.env.TPS_IDENTITY_DIR!, "host.json"),
       JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
     );
-    // A regular file in the connections directory's place and a directory in
-    // the log file's place fail for every uid, including root in CI.
-    writeFileSync(join(process.env.TPS_ROOT!, "connections"), "not a directory");
-    const logPath = join(process.env.TPS_ROOT!, "branch.log");
-    mkdirSync(logPath);
-    expect(() => appendFileSync(logPath, "probe\n", "utf-8")).toThrow();
     const port = await freePort();
     writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
 
+    // The daemon runs the built CLI (dist/bin/tps.js) under this test's
+    // runtime, Bun.
     const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
     delete env.TPS_BRANCH_DAEMON;
     child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
 
     channel = await connectHost(port, host, branch);
     expect(channel.isAlive()).toBe(true);
-    const first = await exchange(channel, { type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
-    expect(first.seq).toBe(7);
-    const second = await exchange(channel, { type: MSG_HEARTBEAT, seq: 8, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
-    expect(second.seq).toBe(8);
 
+    // The daemon is connected with a working log and state path; break both
+    // now. A regular file in the connections directory's place and a directory
+    // in the log file's place fail for every uid, including root in CI.
+    const connections = join(process.env.TPS_ROOT!, "connections");
+    rmSync(connections, { recursive: true, force: true });
+    writeFileSync(connections, "not a directory");
+    const logPath = join(process.env.TPS_ROOT!, "branch.log");
+    rmSync(logPath, { force: true });
+    mkdirSync(logPath);
+
+    // Close the read end of the child's stderr pipe. The fallback must write
+    // synchronously inside its try/catch: a stream write surfaces the
+    // closed-pipe error after it returns, uncaught, which kills the child.
+    child.stderr!.destroy();
+
+    const first = await exchange(channel, { type: MSG_HEARTBEAT, seq: 30, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+    expect(first.seq).toBe(30);
+    const second = await exchange(channel, { type: MSG_HEARTBEAT, seq: 31, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+    expect(second.seq).toBe(31);
+
+    // Give a deferred stderr error a chance to surface before asserting the
+    // child is still running.
+    await new Promise((resolveWait) => setTimeout(resolveWait, 500));
     expect(child.exitCode).toBeNull();
     expect(child.signalCode).toBeNull();
     expect(() => process.kill(child!.pid!, 0)).not.toThrow();
-    // The best-effort report reaches stderr with the original line and the
-    // append error, and the daemon keeps running.
-    expect(stderr).toContain(`Branch state write failed at ${branchStatePath()}`);
-    expect(stderr).toContain("log append failed");
+  }, 30_000);
+
+  test("a newline in a log message is escaped so the stderr fallback is one line", async () => {
+    mkdirSync(process.env.TPS_ROOT!, { recursive: true });
+    const logPath = join(process.env.TPS_ROOT!, "branch.log");
+    mkdirSync(logPath);
+    const script = join(root, "log-line.ts");
+    writeFileSync(
+      script,
+      `import { logLine } from ${JSON.stringify(resolve(import.meta.dir, "../src/commands/branch.ts"))};\n` +
+        `logLine("PROXY", "Service 'agent\\nname' proxied");\n`,
+    );
+
+    child = spawn(process.execPath, [script], { env: { ...process.env }, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => { stderr += String(chunk); });
+    const code = await new Promise<number | null>((resolveExit) => child!.once("exit", resolveExit));
+
+    expect(code).toBe(0);
+    const lines = stderr.split("\n").filter((line) => line.length > 0);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toContain("Service 'agent\\nname' proxied");
+    expect(lines[0]).toContain("log append failed");
   }, 30_000);
 });

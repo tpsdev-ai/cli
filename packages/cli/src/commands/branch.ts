@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, openSync, closeSync, watch, readdirSync, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync, appendFileSync, openSync, closeSync, writeSync, watch, readdirSync, type FSWatcher } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { homedir, hostname } from "node:os";
 import { spawn, type ChildProcess } from "node:child_process";
@@ -338,16 +338,33 @@ function hostPath(identityDir: string): string {
   return join(identityDir, "host.json");
 }
 
+/** Escape CR, LF and the other control characters JSON-style so a fallback
+ *  report is exactly one line. */
+function escapeLogLine(text: string): string {
+  let escaped = "";
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    if (code === 0x0a) escaped += "\\n";
+    else if (code === 0x0d) escaped += "\\r";
+    else if (code === 0x09) escaped += "\\t";
+    else if (code < 0x20 || code === 0x7f) escaped += `\\u${code.toString(16).padStart(4, "0")}`;
+    else escaped += char;
+  }
+  return escaped;
+}
+
 /** Best-effort branch log append: never throws, so logging cannot abort the
- *  daemon. On append failure it tries one line on stderr carrying the original
- *  line and the append error; a stderr failure is swallowed too. */
-function logLine(event: string, msg: string): void {
+ *  daemon. On append failure it writes one escaped line synchronously to stderr
+ *  carrying the original line and the append error; a stderr failure is
+ *  swallowed too, so handling continues. */
+export function logLine(event: string, msg: string): void {
   const line = `[${new Date().toISOString()}] ${event}: ${msg}`;
   try {
     appendFileSync(logPath(), `${line}\n`, "utf-8");
   } catch (error) {
     try {
-      process.stderr.write(`${line} (log append failed: ${error instanceof Error ? error.message : String(error)})\n`);
+      const detail = error instanceof Error ? error.message : String(error);
+      writeSync(2, `${escapeLogLine(`${line} (log append failed: ${detail}`)}\n`);
     } catch {}
   }
 }
@@ -562,8 +579,10 @@ async function runStart(): Promise<void> {
       writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
     } catch (error) {
       // A state write failure must not stop message handling: the heartbeat
-      // echo and the rest of the handler still run. The log report is
-      // best-effort, so handling continues either way.
+      // echo and the rest of the handler still run. The log report appends to
+      // the branch log; on append failure it writes one escaped line
+      // synchronously to stderr, and every logging failure is swallowed, so
+      // handling continues.
       logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
     }
 
