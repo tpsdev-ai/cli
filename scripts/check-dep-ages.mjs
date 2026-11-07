@@ -2,9 +2,8 @@
 /**
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
- * Reads bunfig.toml's install table with Bun's TOML parser. Checks every external
- * version in bun.lock, and every `node_modules` entry in every tracked
- * package-lock.json that npm fetches from the registry (from `git ls-files`;
+ * Reads bunfig.toml's install table with Bun's TOML parser. Checks external
+ * versions in bun.lock and tracked package-lock.json files (from `git ls-files`;
  * under TPS_DEP_AGES_ROOT, every package-lock.json in the fixture tree outside
  * `node_modules` and `.git`), against its minimumReleaseAge (at least 7 days),
  * and that every minimumReleaseAgeExcludes name has an unexpired entry in
@@ -13,14 +12,14 @@
  * manifest a root `workspaces` pattern names. A name pinned exactly only in a
  * manifest Bun does not apply is refused, naming that manifest; an override must
  * be in the root package.json, and a resolutions key of `name` or `**\/name` is
- * refused. An npm lockfile entry with a registry `resolved` URL is aged as the
+ * refused. An npm lockfile entry with a canonical registry tarball URL is aged as the
  * package that URL identifies, and is refused, naming the lockfile and entry,
  * when that URL disagrees with the recorded name or version or is not a registry
- * tarball URL.
+ * tarball URL (query strings and encoded scopes are refused).
  * A `git:`/`git+...` entry is refused because it has no publish time; a local
  * `file:` or `workspace:` entry, the root entry and a `link: true` entry are not
  * checked. An entry without a `resolved` URL is aged by its recorded
- * name@version, unless it is bundled.
+ * name@version regardless of `inBundle`; a versionless entry is refused.
  * TPS_DEP_AGES_ROOT and TPS_DEP_AGES_REGISTRY select fixture inputs outside --ci.
  * --ci refuses root and registry overrides.
  *

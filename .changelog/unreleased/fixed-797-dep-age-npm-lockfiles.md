@@ -1,6 +1,8 @@
-- **The release-age gate checks every tracked npm lockfile CI installs from (Closes #797).**
-  Each `node_modules` entry with a registry `resolved` URL is aged as the package
-  that URL identifies, against the same minimum age and exception list as
-  `bun.lock`. A URL that disagrees with the recorded name or version, or a
-  `git:`/`git+...` entry, is refused naming the lockfile and entry. A test
-  refuses a workflow `npm ci` step it cannot trace to a tracked lockfile.
+- **The release-age gate checks tracked npm lockfiles (Closes #797).**
+  It ages npm entries by canonical registry tarball URL, or recorded name@version
+  without `resolved`, regardless of `inBundle`. It refuses versionless entries,
+  URL/name/version disagreement, non-canonical registry URLs (including query
+  strings and encoded scopes), and git URLs. Root, link and local entries are
+  skipped. The workflow guard accepts the step/default directory with at most
+  one leading literal `cd <relative path> &&`, retains the temp-prefix fixture
+  lookup, and refuses other directory/control shapes.

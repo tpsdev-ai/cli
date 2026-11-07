@@ -96,10 +96,9 @@ export function lockfilesFromFileList(paths) {
 }
 
 /**
- * The tarball URL npm's Arborist hands to pacote for a registry entry:
- * `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz`, where
- * `<basename>` is the last path segment of `<name>` (a scoped package keeps
- * `@scope/` in the URL but not in the file name).
+ * Accepted canonical registry tarball form:
+ * `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz` (also http).
+ * Query strings and encoded scopes are refused.
  */
 const REGISTRY_TARBALL_RE = /^https?:\/\/registry\.npmjs\.org\/((?:@[^/]+\/)?[^/]+)\/-\/([^/]+)\.tgz$/;
 
@@ -108,39 +107,17 @@ function entryPackageName(entry, marker) {
   return entry.slice(marker + "node_modules/".length);
 }
 
-/** The ancestor `node_modules/...` entries of a nested install path. */
-function nestedAncestors(entry) {
-  const ancestors = [];
-  let from = 0;
-  while (true) {
-    const marker = entry.indexOf("/node_modules/", from);
-    if (marker === -1) break;
-    ancestors.push(entry.slice(0, marker));
-    from = marker + 1;
-  }
-  return ancestors;
-}
-
 /**
- * The registry packages an npm `package-lock.json` (v2/v3) installs.
+ * Collect npm lockfile v2/v3 entries by the package identified by a canonical
+ * registry tarball URL, or by recorded name@version without `resolved`.
+ * Refuse URL/name/version disagreement, non-canonical registry URLs and git.
+ * Skip the root, `link: true`, and local `file:`/`workspace:` entries.
+ * `inBundle` does not exempt an entry; missing publish times refuse closed.
+ * Without a recorded name, use the last `node_modules/` path segment.
  *
- * `npm ci` fetches a `node_modules/...` entry from the package its `resolved`
- * tarball URL identifies, not from the entry's recorded `name`/`version`, so
- * this ages the URL's package@version and reports an entry whose URL disagrees
- * with the recorded name or version. An aliased install records the real
- * package in `name` and the alias in the install path; the URL must identify the
- * recorded name.
- *
- * An entry without a `resolved` URL is aged by its `name`@`version` unless it is
- * marked `inBundle` (or nested under an entry that is): npm fetches those from
- * the parent package's tarball, not the registry. The root `""` entry,
- * `link: true` and local `file:`/`workspace:` entries are skipped. A
- * `git:`/`git+...` entry has no publish time, so it is a problem, not a skip.
- *
- * The name is the entry's own `name` when npm recorded one (an aliased install,
- * such as `node_modules/foo` resolving to `@scope/bar`, carries the real name),
- * otherwise the last `node_modules/` path segment, which keeps a scoped name's
- * `@scope/`.
+ * Model source: npm@11.19.0/node_modules/@npmcli/arborist (version 9.9.1),
+ * lib/arborist/reify.js:743-750 selects `resolved` or package name@version;
+ * :775-778 passes `resolved` to pacote.extract.
  *
  * @returns {{ deps: Array<{name: string, version: string, lockfile: string}>,
  *             problems: Array<{lockfile: string, entry: string, message: string}> }}
@@ -155,13 +132,6 @@ export function collectNpmLockDeps(lock, lockfile) {
       problems: [{ lockfile, entry: "", message: "no `packages` map (a v2 or v3 lockfile is required)" }],
     };
   }
-  const bundled = (entry, value) => {
-    if (value.inBundle === true) return true;
-    return nestedAncestors(entry).some((ancestor) => {
-      const parent = packages[ancestor];
-      return parent !== null && typeof parent === "object" && !Array.isArray(parent) && parent.inBundle === true;
-    });
-  };
   for (const [entry, value] of Object.entries(packages)) {
     if (entry === "") continue;
     const marker = entry.lastIndexOf("node_modules/");
@@ -177,7 +147,6 @@ export function collectNpmLockDeps(lock, lockfile) {
         : entryPackageName(entry, marker);
     const resolved = value.resolved;
     if (typeof resolved !== "string") {
-      if (bundled(entry, value)) continue; // npm installs it from the parent's tarball
       const version = value.version;
       if (typeof version !== "string" || version === "") {
         problems.push({ lockfile, entry, message: "entry with no `resolved` URL has no version" });

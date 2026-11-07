@@ -1,10 +1,13 @@
 # Dependency release-age exceptions
 
-`scripts/check-dep-ages.mjs` checks every external version in `bun.lock` and
-every `node_modules` entry in every tracked `package-lock.json` that `npm ci`
-fetches from the registry, against `[install] minimumReleaseAge` in
-`bunfig.toml`. The gate reads every tracked `package-lock.json`; today that set
-is:
+`scripts/check-dep-ages.mjs` checks external versions in `bun.lock` and tracked
+`package-lock.json` files against `[install] minimumReleaseAge` in `bunfig.toml`.
+For npm entries, it ages the package identified by a canonical registry tarball
+URL, or recorded name@version without `resolved`, regardless of `inBundle`.
+Versionless entries, URL/name/version disagreement, non-canonical registry URLs
+(including query strings and encoded scopes), and git URLs are refused. The root,
+`link: true`, and local `file:`/`workspace:` entries are skipped.
+The tracked npm lockfiles are:
 
 - `plugins/openclaw-github-review/package-lock.json`
 - `plugins/openclaw-tps-mail/package-lock.json`
