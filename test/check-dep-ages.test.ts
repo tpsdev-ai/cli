@@ -10,9 +10,10 @@ import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, join, dirname } from "node:path";
+import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
+import { assertNpmCiLockfilesRead } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -1190,7 +1191,7 @@ function assertInstallGates(source: string) {
     );
     for (const [index, step] of job.steps.entries()) {
       if (!step.run?.split("\n").some((line) =>
-        !line.trimStart().startsWith("#") && /\b(?:bun install|npm (?:ci|install))\b/.test(line),
+        !line.trimStart().startsWith("#") && /\b(?:bun install|npm (?:ci|install)|bash scripts\/npm-ci-tracked-lock\.sh)\b/.test(line),
       )) continue;
       installs++;
       expect(checkout).toBeGreaterThanOrEqual(0);
@@ -1201,7 +1202,7 @@ function assertInstallGates(source: string) {
   expect(installs).toBeGreaterThan(0);
 }
 
-it("runs the lock gate before every install step in the CI workflow", () => {
+it("runs the lock gate before direct installs and the helper in the CI workflow", () => {
   assertInstallGates(readFileSync(join(REPO, ".github", "workflows", "test.yml"), "utf8"));
 });
 
@@ -1215,7 +1216,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* ─────────────── every CI npm ci installs from a lockfile the gate reads ─────────────── */
+/* Workflow run text only; script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
@@ -1226,159 +1227,7 @@ function trackedLockfiles(): string[] {
   return lockfiles;
 }
 
-type WorkflowStep = { run?: string; uses?: string; "working-directory"?: string };
-type WorkflowJob = {
-  steps: WorkflowStep[];
-  defaults?: { run?: { "working-directory"?: string } };
-};
-
-function shellTokens(line: string): string[] {
-  const tokens: string[] = [];
-  const token = /"([^"]*)"|'([^']*)'|(\S+)/g;
-  let match: RegExpExecArray | null;
-  while ((match = token.exec(line)) !== null) tokens.push(match[1] ?? match[2] ?? match[3]);
-  return tokens;
-}
-
-/** Simple `name=value` assignments in a run block; a value with `$` is left unresolved. */
-function shellVariables(run: string): Map<string, string> {
-  const vars = new Map<string, string>();
-  for (const line of run.split("\n")) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)=("([^"]*)"|'([^']*)'|(\S+))\s*$/);
-    if (match === null) continue;
-    const value = match[3] ?? match[4] ?? match[5];
-    if (!value.includes("$")) vars.set(match[1], value);
-  }
-  return vars;
-}
-
-function expandShell(value: string, vars: Map<string, string>): string | null {
-  let unresolved = false;
-  const expanded = value.replace(
-    /\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)/g,
-    (_whole, braced: string | undefined, bare: string | undefined) => {
-      const replacement = vars.get(braced ?? bare ?? "");
-      if (replacement === undefined) {
-        unresolved = true;
-        return "";
-      }
-      return replacement;
-    },
-  );
-  return unresolved ? null : expanded;
-}
-
-/** Resolve a repo-relative directory; refuse a path that leaves the repository. */
-function resolveRepoDir(base: string, target: string, label: string): string {
-  const parts = base === "" ? [] : base.split("/").filter((segment) => segment !== "" && segment !== ".");
-  for (const segment of target.split("/")) {
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") {
-      if (parts.length === 0) throw new Error(`${label}: ${target} leaves the repository root`);
-      parts.pop();
-      continue;
-    }
-    parts.push(segment);
-  }
-  return parts.join("/");
-}
-
-/**
- * Accept the step/default working directory and at most one leading literal
- * `cd <relative path> &&` on the npm ci line. Refuse other directory/control
- * shapes. Retain the fixture-copy lookup for the workflow's temp --prefix.
- */
-function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
-  const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
-    .filter((line) => line !== "" && !line.startsWith("#"));
-  if (!lines.some((line) => /\bnpm\s+ci\b/.test(line))) return [];
-  const refuse = (): never => {
-    throw new Error(`${label}: cannot establish the npm ci directory`);
-  };
-  if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse();
-  // Directory changes on other lines and shell control structures are outside
-  // the accepted grammar, even if the npm line itself looks simple.
-  for (const line of lines) {
-    if (/\b(?:pushd|popd|if|then|elif|else|fi|case|esac|for|while|until|do|done)\b/.test(line) ||
-        /^[({]|[)}]$/.test(line)) refuse();
-    if (/\bcd\b/.test(line) && !/\bnpm\s+ci\b/.test(line)) refuse();
-  }
-  const vars = shellVariables(run);
-  const copied: string[] = [];
-  const dirs: string[] = [];
-  let changedDirectory = false;
-  for (const line of lines) {
-    if (!/\bnpm\s+ci\b/.test(line)) {
-      const tokens = shellTokens(line);
-      if (tokens[0] !== "cp") continue;
-      for (const token of tokens.slice(1)) {
-        const expanded = expandShell(token, vars);
-        if (expanded === null || basename(expanded) !== "package-lock.json" || expanded.startsWith("/")) continue;
-        copied.push(resolveRepoDir(workdir, dirname(expanded), label));
-      }
-      continue;
-    }
-    if (changedDirectory) refuse();
-    const match = line.match(/^(?:cd\s+([A-Za-z0-9_./-]+)\s+&&\s+)?(?:sfw\s+)?npm\s+ci(?:\s+([^;&|`\\(){}<>]*))?$/);
-    if (match === null || match[1]?.startsWith("/") || match[1] === "-") refuse();
-    changedDirectory = match[1] !== undefined;
-    let cwd: string;
-    try {
-      cwd = resolveRepoDir(workdir, match[1] ?? ".", label);
-    } catch {
-      refuse();
-    }
-    const tokens = shellTokens(match[2] ?? "");
-    let prefix: string | null = null;
-    for (let i = 0; i < tokens.length; i++) {
-      if (tokens[i] === "--prefix") {
-        prefix = tokens[i + 1] ?? "";
-        break;
-      }
-      if (tokens[i].startsWith("--prefix=")) {
-        prefix = tokens[i].slice("--prefix=".length);
-        break;
-      }
-    }
-    if (prefix === null) {
-      if (tokens.some((token) => /[$]/.test(token))) refuse();
-      dirs.push(cwd);
-      continue;
-    }
-    if (copied.length > 0) {
-      dirs.push(...copied);
-      continue;
-    }
-    const expanded = expandShell(prefix, vars);
-    if (expanded === null || !/^(?!\/)[A-Za-z0-9_./-]+$/.test(expanded)) refuse();
-    dirs.push(resolveRepoDir(cwd, expanded, label));
-  }
-  return dirs;
-}
-
-function assertNpmCiLockfilesRead(source: string, tracked: Set<string>): number {
-  const workflow = load(source) as { jobs?: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"] };
-  let installs = 0;
-  for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
-    const defaultWorkdir = job.defaults?.run?.["working-directory"] ?? workflow.defaults?.run?.["working-directory"] ?? "";
-    for (const [index, step] of job.steps.entries()) {
-      if (step.run === undefined) continue;
-      const label = `job ${jobName} step ${index + 1}`;
-      for (const dir of npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label)) {
-        installs++;
-        const lockfile = dir === "" ? "package-lock.json" : `${dir}/package-lock.json`;
-        if (!tracked.has(lockfile)) {
-          throw new Error(
-            `${label} runs npm ci from ${dir === "" ? "." : dir}, but ${lockfile} is not a lockfile the gate reads`,
-          );
-        }
-      }
-    }
-  }
-  return installs;
-}
-
-it("checks every npm ci step in the CI workflows against a tracked lockfile", () => {
+it("checks every npm ci written directly in a workflow run step and the tracked-lock helper", () => {
   const tracked = new Set(trackedLockfiles());
   const workflowsDir = join(REPO, ".github", "workflows");
   const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
@@ -1399,6 +1248,53 @@ function workflowStep(run: string, workdir = "plugins/read"): string {
 const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/package-lock.json"]);
 
 describe("the npm ci workflow guard accepts established command shapes", () => {
+  it("accepts raw npm ci with sfw and literal install flags", () => {
+    expect(assertNpmCiLockfilesRead(workflowStep("sfw npm ci --ignore-scripts --no-audit --no-fund"), READ_TRACKED)).toBe(1);
+  });
+
+  it("accepts the helper's literal tracked fixture with a variable prefix", () => {
+    expect(assertNpmCiLockfilesRead(workflowStep(
+      'bash scripts/npm-ci-tracked-lock.sh plugins/good "$prefix" --ignore-scripts', ".",
+    ), READ_TRACKED)).toBe(1);
+  });
+
+  it.each([
+    'bash scripts/npm-ci-tracked-lock.sh "$fixture" "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh ${fixture} "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh /absolute "$prefix"',
+    'bash scripts/npm-ci-tracked-lock.sh plugins/unread "$prefix"',
+  ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile)/);
+  }, 30_000);
+
+  it("refuses the unrelated-copy and raw-prefix probe", () => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(
+      "cp ../good/package-lock.json /tmp/dummy/package-lock.json\nnpm ci --prefix ../unread",
+    ), READ_TRACKED)).toThrow(/job build step 1.*(?:lockfile write|raw npm ci --prefix)/);
+  });
+
+  it.each([
+    "npm ci --prefix ../good",
+    "npm --prefix ../good ci",
+    'npm "ci" --prefix ../good',
+    "npm \\\nci --prefix ../good",
+    "sfw npm ci --prefix=../good",
+    "npm ci -C ../good",
+    "npm ci --pref ../good",
+    "source ../move.sh\nnpm ci",
+    ". ../move.sh\nnpm ci",
+    "npm run prepare-lock\nnpm ci",
+    "cp ../good/package-lock.json package-lock.json\nnpm ci",
+    "mv ../good/package-lock.json package-lock.json\nnpm ci",
+    "ln ../good/package-lock.json package-lock.json\nnpm ci",
+    "install ../good/package-lock.json package-lock.json\nnpm ci",
+    "tee package-lock.json\nnpm ci",
+    "echo replacement > package-lock.json\nnpm ci",
+    "npm ci\necho replacement >> npm-shrinkwrap.json",
+  ])("refuses a raw install outside its directory and lock contract: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/job build step 1: cannot establish the npm ci directory:/);
+  }, 30_000);
+
   it("uses workflow and job defaults with step working-directory taking precedence", () => {
     const withoutStepDir = workflowStep("npm ci").replace(
       "      - working-directory: plugins/read\n        run: |",

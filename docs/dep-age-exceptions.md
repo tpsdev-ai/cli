@@ -16,6 +16,20 @@ The tracked npm lockfiles are:
 The gate lists them with `git ls-files`, so a new tracked lockfile is read
 without editing a list.
 
+The workflow guard inspects `npm ci` written directly in workflow `run:` steps
+and calls to `scripts/npm-ci-tracked-lock.sh`; installs inside other script files
+or composite actions are not inspected. It accepts raw `npm ci` (optionally
+behind `sfw`) without `--prefix` or lockfile writes in the step, using the
+step/default working directory and at most one leading literal
+`cd <relative path> &&`. The other accepted shape is the helper with a literal
+relative fixture directory whose `package-lock.json` is tracked. Other command
+shapes are refused. The raw guard and helper limit install flags to `--ignore-scripts`,
+`--no-audit` and `--no-fund`.
+
+The helper requires `sfw`, refuses an untracked fixture lock, copies the fixture's
+package and lock into the prefix, and runs `sfw npm ci --prefix` there. After the
+install, `cmp` must find the prefix lock byte-identical to the tracked fixture.
+
 Add one line per exception under the `## Exceptions` heading below, in this
 exact shape:
 

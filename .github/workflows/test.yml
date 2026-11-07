@@ -261,10 +261,7 @@ jobs:
           set -euo pipefail
           pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"
           prefix="$RUNNER_TEMP/openclaw-$pin"
-          fixture=test/fixtures/heartbeat-openclaw
-          mkdir -p "$prefix"
-          cp "$fixture/package.json" "$fixture/package-lock.json" "$prefix/"
-          sfw npm ci --prefix "$prefix" --ignore-scripts --no-audit --no-fund
+          bash scripts/npm-ci-tracked-lock.sh test/fixtures/heartbeat-openclaw "$prefix" --ignore-scripts --no-audit --no-fund
           echo "OPENCLAW_BIN_DIR=$prefix/node_modules/.bin" >> "$GITHUB_ENV"
       - name: Run heartbeat against the pinned OpenClaw
         run: node scripts/heartbeat-real-openclaw-lane.mjs
