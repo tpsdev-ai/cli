@@ -41,6 +41,13 @@ const AGE_FIXTURE: Published = { [NAME]: { [AGED]: { ageDays: 90 }, [FRESH]: { a
 /** A parseable lockfile with an external resolution for workspace refusal gate tests. */
 const VALID_LOCK = `{"lockfileVersion":1,"workspaces":{"":{"name":"fixture"}},"packages":{"${NAME}":["${NAME}@${AGED}","",{}]}}`;
 
+const NEGATED_WORKSPACE_REASON =
+  "it is `!`-negated, and Bun 1.3.10 and 1.4.4 resolve some negated spellings to different workspace sets; the gate refuses every negated pattern rather than guess. List only the directories to include";
+const BACKSLASH_WORKSPACE_REASON =
+  "it contains a backslash, which Bun reads as an escape of the next character; name the directory without the escape";
+const BRACE_CLASS_WORKSPACE_REASON =
+  "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
+
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
 function startRegistry(root: string, published: Published = AGE_FIXTURE) {
   const tarballs = new Map<string, Buffer>();
@@ -356,7 +363,6 @@ it.each([
     ["packages/.hidden", "packages/a"],
   ],
   ["a ./ prefix and trailing slash", ["./packages/*/"], ["packages/a", "packages/a/b"], ["packages/a"]],
-  ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], ["packages/x", "packages/y"]],
   [
     "a positive pattern after a negation",
     ["packages/*", "!packages/x", "packages/x"],
@@ -413,18 +419,6 @@ it.each([
     ["packages/x"],
   ],
   [
-    "a negated wildcard pattern",
-    ["!packages/*"],
-    ["packages/a", "packages/b", "tools/t"],
-    ["tools/t"],
-  ],
-  [
-    "a positive pattern beside its negated wildcard",
-    ["packages/*", "!packages/*"],
-    ["packages/a", "packages/b", "tools/t"],
-    ["tools/t"],
-  ],
-  [
     "a negated literal pattern, without a wildcard",
     ["!packages/x"],
     ["packages/x", "packages/y", "tools/t"],
@@ -461,6 +455,25 @@ it.each([
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  },
+  60000,
+);
+
+// These shapes mean different workspace sets to Bun 1.3.10 and 1.4.4, so the gate
+// refuses them on every version instead of modelling one version's answer.
+it.each([
+  ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], "!packages/x"],
+  ["a negated wildcard pattern", ["!packages/*"], ["packages/a", "packages/b", "tools/t"], "!packages/*"],
+  [
+    "a positive pattern beside its negated wildcard",
+    ["packages/*", "!packages/*"],
+    ["packages/a", "packages/b", "tools/t"],
+    "!packages/*",
+  ],
+] as const)(
+  "workspace install parity: %s",
+  async (_label, workspaces, dirs, refused) => {
+    await refusalParity(workspaces, dirs, undefined, NEGATED_WORKSPACE_REASON, refused);
   },
   60000,
 );
@@ -551,33 +564,44 @@ it.each([
 }, 30000);
 
 /** Compare real Bun's install result with the gate's named workspace refusal. */
-async function refusalParity(pattern: string, dirs: string[], bunApplied: string[] | null, reason: string) {
+async function refusalParity(
+  workspaces: readonly string[],
+  dirs: readonly string[],
+  bunApplied: readonly string[] | null | undefined,
+  reason: string,
+  refused: string,
+) {
   const root = mkdtempSync(join(tmpdir(), "age-refusal-"));
   try {
-    const manifests: Record<string, unknown> = { "package.json": { name: "fixture", workspaces: [pattern] } };
+    const manifests: Record<string, unknown> = { "package.json": { name: "fixture", workspaces } };
     for (const dir of dirs) manifests[`${dir}/package.json`] = { name: `w-${dir.replaceAll(/[^a-z0-9]/gi, "-")}` };
     const project = writeProject(root, manifests, "http://127.0.0.1:1", { excludes: [NAME], lock: VALID_LOCK });
     const install = await bunInstall(project, ["--no-cache"]);
-    if (bunApplied === null) {
+    if (bunApplied === undefined) {
+      // The installed set differs between Bun versions for these shapes; assert
+      // only that each version can install them without an error.
+      expect(install.exit).toBe(0);
+    } else if (bunApplied === null) {
       expect(install.exit).not.toBe(0);
-      expect(install.output).toContain(`Workspace not found "${pattern}"`);
+      expect(install.output).toContain(`Workspace not found "${refused}"`);
     } else {
       expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
       const lockPath = join(project, "bun.lock");
       const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
-      expect(Object.keys(lock.workspaces).filter((key) => key !== "").sort()).toEqual(bunApplied);
+      expect(Object.keys(lock.workspaces).filter((key) => key !== "").sort()).toEqual([...bunApplied]);
     }
     writeFileSync(join(project, "bun.lock"), VALID_LOCK);
     // A valid lockfile and root pin isolate the workspace refusal.
     writeFileSync(
       join(project, "package.json"),
-      JSON.stringify({ name: "fixture", workspaces: [pattern], dependencies: { [NAME]: AGED } }),
+      JSON.stringify({ name: "fixture", workspaces, dependencies: { [NAME]: AGED } }),
     );
     const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
     expect(gate.exit).toBe(2);
-    expect(gate.output).toContain(`workspaces pattern \`${pattern}\` cannot be read:`);
-    expect(gate.output).toContain(reason);
-    expect(gate.output).toContain(`Remedy: fix or remove the \`workspaces\` pattern \`${pattern}\`.`);
+    expect(gate.output).toContain(
+      `the root package.json \`workspaces\` could not be read: workspaces pattern \`${refused}\` cannot be read: ${reason}.`,
+    );
+    expect(gate.output).toContain(`Remedy: fix or remove the \`workspaces\` pattern \`${refused}\`.`);
     expect(gate.output).not.toContain("Checking");
     expect(gate.output).not.toContain("bun.lock");
   } finally {
@@ -592,7 +616,7 @@ it.each([
 ] as const)(
   "refuses a workspaces pattern with %s",
   async (_label, pattern, dirs, bunApplied) => {
-    await refusalParity(pattern, dirs, bunApplied as string[] | null, "contains a backslash, which Bun reads as an escape");
+    await refusalParity([pattern], dirs, bunApplied as string[] | null, BACKSLASH_WORKSPACE_REASON, pattern);
   },
   60000,
 );
@@ -626,12 +650,12 @@ it.each([
     "an unbalanced class inside a brace group",
     "packages/{a,[b}c]",
     ["packages/a", "packages/b", "packages/c"],
-    ["packages/a"],
+    undefined,
   ],
 ] as const)(
   "refuses a workspaces pattern with %s",
   async (_label, pattern, dirs, bunApplied) => {
-    await refusalParity(pattern, dirs, bunApplied, "mixes a `{...}` brace group with a `[...]` character class");
+    await refusalParity([pattern], dirs, bunApplied, BRACE_CLASS_WORKSPACE_REASON, pattern);
   },
   60000,
 );

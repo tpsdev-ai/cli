@@ -402,6 +402,19 @@ function hasBraceGroupAndClass(pattern) {
 }
 
 /**
+ * A shape whose meaning differs between the Bun versions this repo supports. The
+ * gate refuses it instead of modelling one version's answer.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function versionDependentWorkspacePattern(pattern) {
+  if (pattern.startsWith("!")) {
+    return "it is `!`-negated, and Bun 1.3.10 and 1.4.4 resolve some negated spellings to different workspace sets; the gate refuses every negated pattern rather than guess. List only the directories to include";
+  }
+  return null;
+}
+
+/**
  * Conservatively refuse backslash escapes and patterns mixing braces and classes.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
@@ -490,11 +503,17 @@ export function workspacePatterns(workspaces) {
 /**
  * Resolve supported workspace patterns; refuse unreadable shapes and spellings.
  *
+ * `refuseVersionDependentPatterns` makes the gate fail closed on shapes whose
+ * meaning differs between the Bun versions this repo supports. It is off by
+ * default so the parity tests can still record what the model resolves.
+ *
+ * @param {Array<{path: string, json: object}>} manifests
+ * @param {{ refuseVersionDependentPatterns?: boolean }} [options]
  * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
  *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
  *   is then incomplete and must not be used. `pattern` is set only for a pattern.
  */
-export function appliedManifestPaths(manifests) {
+export function appliedManifestPaths(manifests, { refuseVersionDependentPatterns = false } = {}) {
   const applied = new Set(["package.json"]);
   const root = manifests.find((pj) => pj.path === "package.json");
   const { patterns, error } = workspacePatterns(root?.json?.workspaces);
@@ -506,6 +525,12 @@ export function appliedManifestPaths(manifests) {
     const reason = (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ?? unsupportedWorkspacePattern(raw);
     if (reason !== null) {
       return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
+    }
+    if (refuseVersionDependentPatterns) {
+      const versionReason = versionDependentWorkspacePattern(raw);
+      if (versionReason !== null) {
+        return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${versionReason}`, pattern: raw };
+      }
     }
     if (isGlobPattern(raw)) globs.push(raw);
     else literals.push(raw);
@@ -560,7 +585,9 @@ export function appliedManifestPaths(manifests) {
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
   const manifests = packageJsons ?? [];
-  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests);
+  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests, {
+    refuseVersionDependentPatterns: true,
+  });
   if (workspacesError !== null) return [{ kind: "workspaces", message: workspacesError, pattern }];
   for (const name of excludes ?? []) {
     let covered = false;
