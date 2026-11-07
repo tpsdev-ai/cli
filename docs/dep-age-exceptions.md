@@ -34,6 +34,10 @@ an exclusion applies to. It refuses these shapes:
 - a pattern mixing a `{...}` brace group with a `[...]` character class; the
   unbalanced spelling `packages/{a,[b}c]` is version-dependent too (1.3.10
   installs `packages/a`, 1.4.4 installs nothing);
+- a brace group with an empty or `.` alternative at any nesting level, such as
+  `packages/{a,}` or `packages/{a,{b,}}`; Bun applies only `packages/a` for
+  `packages/{a,}`, while the local workspace model would also apply the parent
+  directory `packages`;
 - a pattern using glob syntax the gate does not model: a `(`, `)` or `|`
   outside a `[...]` class, an extended glob (`?(...)`, `*(...)`, `+(...)`,
   `@(...)`, `!(...)`), or a brace range such as `{1..3}`. Bun 1.3.10 matches

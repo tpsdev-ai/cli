@@ -434,8 +434,9 @@ function unsupportedWorkspacePattern(pattern) {
  * `?`, `[...]` classes and `{a,b}` alternatives. It refuses
  * `(`, `)` and `|` outside a class (Bun reads a paren
  * literally outside an extglob), the extended globs `?(...)`, `*(...)`,
- * `+(...)`, `@(...)` and `!(...)`, and brace ranges such as `{1..3}`. The gate
- * reads workspace patterns only when `minimumReleaseAgeExcludes` is non-empty.
+ * `+(...)`, `@(...)` and `!(...)`, brace ranges such as `{1..3}`, and a brace
+ * group with an empty or `.` alternative. The gate reads workspace patterns
+ * only when `minimumReleaseAgeExcludes` is non-empty.
  *
  * @returns {string | null} the reason, naming the syntax and the remedy
  */
@@ -466,6 +467,45 @@ function unmodelledGlobSyntax(pattern) {
     }
   }
   return null;
+}
+
+/**
+ * Refuse a brace group with an empty or `.` alternative, at any nesting level.
+ * The model drops the empty or `.` segment, so `packages/{a,}` would also apply
+ * the directory `packages`, which Bun does not.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function emptyBraceAlternative(pattern) {
+  const hasEmpty = (text) => {
+    let i = 0;
+    while (i < text.length) {
+      const open = text.indexOf("{", i);
+      if (open === -1) return false;
+      let depth = 0;
+      let close = -1;
+      for (let j = open; j < text.length; j++) {
+        if (text[j] === "{") depth += 1;
+        else if (text[j] === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            close = j;
+            break;
+          }
+        }
+      }
+      if (close === -1) return false;
+      for (const alternative of splitBraceAlternatives(text.slice(open + 1, close))) {
+        if (alternative === "" || alternative === ".") return true;
+        if (hasEmpty(alternative)) return true;
+      }
+      i = close + 1;
+    }
+    return false;
+  };
+  return hasEmpty(pattern)
+    ? "it has a brace group with an empty or `.` alternative, which Bun drops; list the directories without an empty or `.` alternative"
+    : null;
 }
 
 /** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
@@ -565,7 +605,8 @@ export function appliedManifestPaths(manifests, { refuseVersionDependentPatterns
     const reason =
       (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ??
       unsupportedWorkspacePattern(raw) ??
-      unmodelledGlobSyntax(raw);
+      unmodelledGlobSyntax(raw) ??
+      emptyBraceAlternative(raw);
     if (reason !== null) {
       return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
     }

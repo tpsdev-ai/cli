@@ -51,6 +51,8 @@ const UNMODELLED_WORKSPACE_REASON =
   "it uses glob syntax the gate does not model; use a literal directory name, `*`, `**`, `?`, a `[...]` class or `{a,b}` alternatives";
 const BRACE_RANGE_WORKSPACE_REASON =
   "it uses a `{1..3}` brace range, which the gate does not model; list the directories explicitly";
+const EMPTY_ALTERNATIVE_WORKSPACE_REASON =
+  "it has a brace group with an empty or `.` alternative, which Bun drops; list the directories without an empty or `.` alternative";
 
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
 function startRegistry(root: string, published: Published = AGE_FIXTURE) {
@@ -725,6 +727,25 @@ it(
       ["packages/1", "packages/2"],
       BRACE_RANGE_WORKSPACE_REASON,
       "packages/{1..3}",
+    );
+  },
+  30000,
+);
+
+it.each([
+  "packages/{a,}",
+  "packages/{,x}",
+  "packages/{a,,b}",
+  "packages/{.,a}",
+  "packages/{a,{b,}}",
+])(
+  "refuses the brace group with an empty or `.` alternative: %s",
+  async (pattern) => {
+    await gateRefusal(
+      [pattern],
+      ["packages/a", "packages/b", "packages/x"],
+      EMPTY_ALTERNATIVE_WORKSPACE_REASON,
+      pattern,
     );
   },
   30000,
