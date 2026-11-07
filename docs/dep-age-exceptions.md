@@ -1,9 +1,10 @@
 # Dependency release-age exceptions
 
 `scripts/check-dep-ages.mjs` checks every external version in `bun.lock` and
-every registry-resolved `node_modules` entry in every tracked `package-lock.json`
-against `[install] minimumReleaseAge` in `bunfig.toml`. The gate reads every
-tracked `package-lock.json`; today that set is:
+every `node_modules` entry in every tracked `package-lock.json` that `npm ci`
+fetches from the registry, against `[install] minimumReleaseAge` in
+`bunfig.toml`. The gate reads every tracked `package-lock.json`; today that set
+is:
 
 - `plugins/openclaw-github-review/package-lock.json`
 - `plugins/openclaw-tps-mail/package-lock.json`

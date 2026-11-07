@@ -96,12 +96,46 @@ export function lockfilesFromFileList(paths) {
 }
 
 /**
- * The registry-resolved entries in a parsed npm `package-lock.json` (v2/v3).
+ * The tarball URL npm's Arborist hands to pacote for a registry entry:
+ * `https://registry.npmjs.org/<name>/-/<basename>-<version>.tgz`, where
+ * `<basename>` is the last path segment of `<name>` (a scoped package keeps
+ * `@scope/` in the URL but not in the file name).
+ */
+const REGISTRY_TARBALL_RE = /^https?:\/\/registry\.npmjs\.org\/((?:@[^/]+\/)?[^/]+)\/-\/([^/]+)\.tgz$/;
+
+/** The `node_modules/...` path segment that names an entry, scoped name included. */
+function entryPackageName(entry, marker) {
+  return entry.slice(marker + "node_modules/".length);
+}
+
+/** The ancestor `node_modules/...` entries of a nested install path. */
+function nestedAncestors(entry) {
+  const ancestors = [];
+  let from = 0;
+  while (true) {
+    const marker = entry.indexOf("/node_modules/", from);
+    if (marker === -1) break;
+    ancestors.push(entry.slice(0, marker));
+    from = marker + 1;
+  }
+  return ancestors;
+}
+
+/**
+ * The registry packages an npm `package-lock.json` (v2/v3) installs.
  *
- * Only `node_modules/...` entries with a registry `resolved` URL are returned.
- * The root `""` entry and the local forms npm records (`link: true`, a
- * `file:`/`git:`/`workspace:` URL) are skipped. Any other non-registry URL is a
- * problem, not a silent skip.
+ * `npm ci` fetches a `node_modules/...` entry from the package its `resolved`
+ * tarball URL identifies, not from the entry's recorded `name`/`version`, so
+ * this ages the URL's package@version and reports an entry whose URL disagrees
+ * with the recorded name or version. An aliased install records the real
+ * package in `name` and the alias in the install path; the URL must identify the
+ * recorded name.
+ *
+ * An entry without a `resolved` URL is aged by its `name`@`version` unless it is
+ * marked `inBundle` (or nested under an entry that is): npm fetches those from
+ * the parent package's tarball, not the registry. The root `""` entry,
+ * `link: true` and local `file:`/`workspace:` entries are skipped. A
+ * `git:`/`git+...` entry has no publish time, so it is a problem, not a skip.
  *
  * The name is the entry's own `name` when npm recorded one (an aliased install,
  * such as `node_modules/foo` resolving to `@scope/bar`, carries the real name),
@@ -121,6 +155,13 @@ export function collectNpmLockDeps(lock, lockfile) {
       problems: [{ lockfile, entry: "", message: "no `packages` map (a v2 or v3 lockfile is required)" }],
     };
   }
+  const bundled = (entry, value) => {
+    if (value.inBundle === true) return true;
+    return nestedAncestors(entry).some((ancestor) => {
+      const parent = packages[ancestor];
+      return parent !== null && typeof parent === "object" && !Array.isArray(parent) && parent.inBundle === true;
+    });
+  };
   for (const [entry, value] of Object.entries(packages)) {
     if (entry === "") continue;
     const marker = entry.lastIndexOf("node_modules/");
@@ -130,11 +171,28 @@ export function collectNpmLockDeps(lock, lockfile) {
       continue;
     }
     if (value.link === true) continue;
+    const name =
+      typeof value.name === "string" && value.name !== ""
+        ? value.name
+        : entryPackageName(entry, marker);
     const resolved = value.resolved;
-    if (typeof resolved !== "string") continue; // bundled or extraneous: npm records no fetch URL
-    if (/^(?:file|git|workspace):/.test(resolved)) continue;
-    if (!/^https?:\/\/registry\.npmjs\.org\//.test(resolved)) {
-      problems.push({ lockfile, entry, message: `resolved URL is not a registry URL: ${resolved}` });
+    if (typeof resolved !== "string") {
+      if (bundled(entry, value)) continue; // npm installs it from the parent's tarball
+      const version = value.version;
+      if (typeof version !== "string" || version === "") {
+        problems.push({ lockfile, entry, message: "entry with no `resolved` URL has no version" });
+        continue;
+      }
+      deps.push({ name, version, lockfile });
+      continue;
+    }
+    if (/^(?:file|workspace):/.test(resolved)) continue;
+    if (/^git(?:\+|:)/.test(resolved)) {
+      problems.push({
+        lockfile,
+        entry,
+        message: `resolved URL is a git dependency, which has no publish time: ${resolved}`,
+      });
       continue;
     }
     const version = value.version;
@@ -142,11 +200,32 @@ export function collectNpmLockDeps(lock, lockfile) {
       problems.push({ lockfile, entry, message: "registry-resolved entry has no version" });
       continue;
     }
-    const name =
-      typeof value.name === "string" && value.name !== ""
-        ? value.name
-        : entry.slice(marker + "node_modules/".length);
-    deps.push({ name, version, lockfile });
+    const match = resolved.match(REGISTRY_TARBALL_RE);
+    if (match === null) {
+      problems.push({ lockfile, entry, message: `resolved URL is not a registry tarball URL: ${resolved}` });
+      continue;
+    }
+    const urlName = match[1];
+    const basename = urlName.slice(urlName.lastIndexOf("/") + 1);
+    const file = match[2];
+    if (!file.startsWith(`${basename}-`)) {
+      problems.push({ lockfile, entry, message: `resolved URL file name does not match ${urlName}: ${resolved}` });
+      continue;
+    }
+    const urlVersion = file.slice(basename.length + 1);
+    if (urlName !== name) {
+      problems.push({ lockfile, entry, message: `resolved URL identifies ${urlName}, but the entry records ${name}` });
+      continue;
+    }
+    if (urlVersion !== version) {
+      problems.push({
+        lockfile,
+        entry,
+        message: `resolved URL identifies ${urlName}@${urlVersion}, but the entry records version ${version}`,
+      });
+      continue;
+    }
+    deps.push({ name: urlName, version: urlVersion, lockfile });
   }
   return { deps, problems };
 }
