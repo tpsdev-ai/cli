@@ -87,8 +87,8 @@ async function driveRuntime(
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
   const savedHome = process.env.HOME;
-  // Point HOME at this run's own directory: the review-trigger cursor below and
-  // any other home-relative state stay inside the test's temp root.
+  // Point HOME at this run's own directory so the review-trigger cursor below is
+  // written inside the test's temp root.
   process.env.HOME = dir;
   const workspace = join(dir, "workspace");
   mkdirSync(workspace, { recursive: true });
