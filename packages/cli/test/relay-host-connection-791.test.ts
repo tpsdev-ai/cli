@@ -1,4 +1,4 @@
-import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, setSystemTime, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,10 @@ afterEach(() => { mock.restore(); });
 
 /** The real timer, captured before any test replaces globalThis.setTimeout. */
 const realSetTimeout = globalThis.setTimeout;
+
+/** A distinctive clock value used to build the connect state, so a diagnostic
+ *  that serializes the full host state would carry it. */
+const SEEDED_CONNECTED_AT = "2001-02-03T04:05:06.789Z";
 
 const savedRelayEnv = () => ({ HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
   TPS_IDENTITY_DIR: process.env.TPS_IDENTITY_DIR, TPS_REGISTRY_DIR: process.env.TPS_REGISTRY_DIR,
@@ -109,6 +113,10 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
+    const closeLines = diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    expect(closeLines.length).toBeGreaterThan(0);
+    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
+    for (const text of closeLines) expect(text).toBe(expectedCloseLine);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -296,8 +304,10 @@ test("a connect-time host record write failure is reported before reconnecting",
     // A file where the connections directory belongs makes a connect-time
     // record write fail at once, without the lock's 5 s wait, so attempts are
     // countable inside the test's window.
-    blocker = join(root, ".tps", "connections");
+    const connectionsDir = join(root, ".tps", "connections");
+    blocker = connectionsDir;
     writeFileSync(blocker, "blocked");
+    setSystemTime(new Date(SEEDED_CONNECTED_AT));
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
@@ -308,12 +318,12 @@ test("a connect-time host record write failure is reported before reconnecting",
     expect(connects).toBeLessThanOrEqual(3);
     const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
     expect(line).toBeDefined();
-    expect(line).toContain(path);
-    expect(line).toContain("EEXIST");
+    expect(line).toBe(`[relay] Host state record ${path} connect write failed; reconnecting: EEXIST: file already exists, mkdir '${connectionsDir}'`);
     rmSync(blocker, { force: true });
     blocker = undefined;
     await stop();
   } finally {
+    setSystemTime();
     if (blocker) rmSync(blocker, { force: true });
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -365,8 +375,9 @@ test("a second connect-time host record write failure is reported before reconne
     expect(firstWriteVisible).toBe(true);
     const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
     expect(line).toBeDefined();
-    expect(line).toContain(path);
-    expect(line).toContain("Host state record lock");
+    const lockRootPath = hostStateLockRoot(path);
+    const lockDir = mailLockPath(lockRootPath);
+    expect(line).toBe(`[relay] Host state record ${path} connect write failed; reconnecting: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`);
     expect(readHostState(branch)).not.toBeNull();
     releaseLock();
     await stop();
