@@ -109,14 +109,18 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(readHostState(branch)).not.toBeNull();
+    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
+    const closeLines = () => diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    // The in-loop close failure logs before stop(); pin that line here, while
+    // stop()'s retry of the retained channel has not run yet.
+    for (let i = 0; closeLines().length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(closeLines()).toEqual([expectedCloseLine]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
-    const closeLines = diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
-    expect(closeLines.length).toBeGreaterThan(0);
-    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    for (const text of closeLines) expect(text).toBe(expectedCloseLine);
+    // stop() retries the retained channel; its line is a second, separate one.
+    expect(closeLines()).toEqual([expectedCloseLine, expectedCloseLine]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -169,14 +173,18 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(sends).toBe(1);
     expect(readHostState(branch)).not.toBeNull();
+    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
+    const closeLines = () => diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    // The catch-path close failure logs before stop(); pin that line here,
+    // while stop()'s retry of the retained channel has not run yet.
+    for (let i = 0; closeLines().length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(closeLines()).toEqual([expectedCloseLine]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
-    const closeLines = diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
-    expect(closeLines.length).toBeGreaterThan(0);
-    const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    for (const text of closeLines) expect(text).toBe(expectedCloseLine);
+    // stop() retries the retained channel; its line is a second, separate one.
+    expect(closeLines()).toEqual([expectedCloseLine, expectedCloseLine]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
