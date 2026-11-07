@@ -55,8 +55,12 @@ function loadWorkflow(): Workflow {
 }
 
 function displayValue(value: unknown): string {
-  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
-  return value === undefined ? "missing" : JSON.stringify(value);
+  try {
+    if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+    return value === undefined ? "missing" : (JSON.stringify(value) ?? "<unprintable value>");
+  } catch {
+    return "<unprintable value>";
+  }
 }
 
 function isPositiveInteger(value: unknown): boolean {
@@ -147,6 +151,13 @@ describe("the timeout rule on fixtures", () => {
     const wf = yaml.load(`jobs:\n  test:\n    timeout-minutes: ${scalar}\n`) as Workflow;
     expect(timeoutProblems(wf, ["test"], {}).join("; ")).toContain(
       `job "test" timeout-minutes ${value}: not a positive integer`,
+    );
+  });
+
+  test("a cyclic YAML timeout fails, naming the job and a readable value", () => {
+    const wf = yaml.load("jobs:\n  test:\n    timeout-minutes: &x [*x]\n") as Workflow;
+    expect(timeoutProblems(wf, ["test"], {}).join("; ")).toContain(
+      'job "test" timeout-minutes <unprintable value>: not a positive integer',
     );
   });
 
