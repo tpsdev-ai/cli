@@ -188,7 +188,7 @@ describe("the readiness deadline bounds each probe", () => {
 });
 
 describe("a cleanup failure does not hide the assertion that failed", () => {
-  test.each([undefined, 0])("preserves thrown %j when cleanup succeeds", async (value) => {
+  test.each([undefined, 0])("preserves thrown %p when cleanup succeeds", async (value) => {
     await expect(
       finishWithCleanup(
         async () => {
@@ -199,7 +199,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     ).rejects.toBe(value);
   });
 
-  test.each([undefined, 0])("preserves thrown %j before the cleanup failure", async (value) => {
+  test.each([undefined, 0])("preserves thrown %p before the cleanup failure", async (value) => {
     const cleanup = new Error("cleanup failed");
     let reported: unknown;
     try {
@@ -216,6 +216,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     }
     expect(reported).toBeInstanceOf(AggregateError);
     const aggregate = reported as AggregateError;
+    expect(aggregate.message.split("\n")[0]).toBe(String(value));
     expect(aggregate.errors).toHaveLength(2);
     expect(aggregate.errors[0]).toBe(value);
     expect(aggregate.errors[1]).toBe(cleanup);

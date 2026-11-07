@@ -277,7 +277,7 @@ export async function finishWithCleanup(action, cleanup) {
     await cleanup();
   } catch (error) {
     if (!actionFailed) throw error;
-    throw new AggregateError([failure, error], `${failure?.message}\ncleanup also failed: ${error?.message}`);
+    throw new AggregateError([failure, error], `${failure?.message ?? String(failure)}\ncleanup also failed: ${error?.message ?? String(error)}`);
   }
   if (actionFailed) throw failure;
 }
