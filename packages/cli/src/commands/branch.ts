@@ -358,9 +358,10 @@ function escapeLogLine(text: string): string {
  *  append. */
 let lostLogLines = 0;
 
-/** Best-effort branch log append: never throws, so logging cannot abort the
- *  daemon. A failure is counted and reported in the next line that is
- *  appended; nothing is written to stderr, and handling continues. */
+/** Best-effort branch log append: failed appends are counted. The logger
+ *  attempts to report the count on each later append; it appears on the next
+ *  successful append by the same running daemon. The count is lost if the
+ *  daemon exits or restarts. Nothing is written to stderr. */
 export function logLine(event: string, msg: string): void {
   const lost = lostLogLines;
   const suffix = lost > 0 ? ` (${lost} log lines lost)` : "";
@@ -584,10 +585,10 @@ async function runStart(): Promise<void> {
       writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
     } catch (error) {
       // A state write failure must not stop message handling: the heartbeat
-      // echo and the rest of the handler still run. The log report appends to
-      // the branch log; a branch-log append failure is counted and reported in
-      // the next line that is appended, nothing is written to stderr, and
-      // handling continues.
+      // echo and the rest of the handler still run. The logger attempts to
+      // append the report to the branch log. Failed appends are counted; the
+      // count appears on the next successful append by the same running daemon
+      // and is lost if the daemon exits or restarts. Nothing is written to stderr.
       logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
     }
 

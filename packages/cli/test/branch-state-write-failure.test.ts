@@ -187,7 +187,8 @@ describe("branch daemon state-write failure", () => {
     // Each broken heartbeat fails two appends: the state-write warning and the
     // outbox-drained line, so the two heartbeats lost four lines. Wait for the
     // daemon to finish the last heartbeat's trailing append attempt, then make
-    // the log writable again; the next appended line reports those four.
+    // the log writable again; the same running daemon's next successful
+    // append reports those four. The count is lost if the daemon exits or restarts.
     await new Promise((resolveWait) => setTimeout(resolveWait, 300));
     rmSync(logPath, { recursive: true, force: true });
     const appended = await exchange(channel, { type: MSG_HEARTBEAT, seq: 42, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
