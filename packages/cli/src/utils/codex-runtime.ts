@@ -322,6 +322,102 @@ export function hasWorkspaceChangesOrNewCommit(statusOutput: string, baseline?: 
   return statusOutput.trim().length > 0 || currentHead !== baseline;
 }
 
+export interface StaleRebaseDetection {
+  state: "present" | "absent" | "indeterminate";
+  /** The failed probe, when state is "indeterminate". */
+  probe?: string;
+}
+
+/**
+ * Detect an interrupted rebase (merge or apply backend) in `repo` using git's
+ * own paths for the repository at that location, including a linked worktree
+ * whose `.git` is a file.
+ */
+export function detectStaleRebase(
+  repo: string,
+  runSync: typeof spawnSync = spawnSync,
+): StaleRebaseDetection {
+  for (const dir of ["rebase-merge", "rebase-apply"]) {
+    const probe = `git rev-parse --path-format=absolute --git-path ${dir}`;
+    const result = runSync(GIT_BIN, ["rev-parse", "--path-format=absolute", "--git-path", dir], {
+      cwd: repo,
+      encoding: "utf-8",
+    });
+    if (result.status !== 0) return { state: "indeterminate", probe };
+    const path = String(result.stdout ?? "").trim();
+    if (!path) return { state: "indeterminate", probe };
+    if (existsSync(path)) return { state: "present" };
+  }
+  return { state: "absent" };
+}
+
+export type MailAutoCommitDecision =
+  | { action: "commit" }
+  | { action: "clean"; message: string }
+  | { action: "skip"; message: string };
+
+/**
+ * Decide whether a mail task left changes worth committing in `repo`.
+ *
+ * Every probe runs against the one repository the caller resolved for the
+ * commit, and an interrupted rebase is detected and aborted there too. A
+ * successful abort restores HEAD, so the comparison is reset to the restored
+ * value; a failed probe is indeterminate and yields a skip with its outcome
+ * reported. The clean decision establishes exactly this: Git status is clean
+ * and HEAD matches its pre-task value (or the restored value after an abort) —
+ * `git status --porcelain` omits ignored files, and equal HEADs do not rule out
+ * a commit that was later reset.
+ */
+export function evaluateMailAutoCommitGate(
+  repo: string,
+  baseline: string | undefined,
+  deps: { runSync?: typeof spawnSync } = {},
+): MailAutoCommitDecision {
+  const runSync = deps.runSync ?? spawnSync;
+  const staleRebase = detectStaleRebase(repo, runSync);
+  if (staleRebase.state === "indeterminate") {
+    return { action: "skip", message: `Stale rebase check could not run: ${staleRebase.probe} failed — skipping autoCommit` };
+  }
+  if (baseline === undefined) {
+    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit" };
+  }
+
+  let comparison = baseline;
+  let aborted = false;
+  if (staleRebase.state === "present") {
+    const abortResult = runSync(GIT_BIN, ["rebase", "--abort"], { cwd: repo, encoding: "utf-8" });
+    if (abortResult.status !== 0) {
+      const firstLine = String(abortResult.stderr ?? "").trim().split("\n")[0] ?? "";
+      return { action: "skip", message: `Stale rebase abort failed (exit ${abortResult.status}): ${firstLine} — skipping autoCommit` };
+    }
+    const restored = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
+    const restoredHead = String(restored.stdout ?? "").trim();
+    if (restored.status !== 0 || !restoredHead) {
+      return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after rebase abort) failed — skipping autoCommit" };
+    }
+    comparison = restoredHead;
+    aborted = true;
+  }
+
+  const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
+  if (statusResult.status !== 0) {
+    return { action: "skip", message: "Change check could not run: git status --porcelain failed — skipping autoCommit" };
+  }
+  const headResult = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  if (headResult.status !== 0) {
+    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) failed — skipping autoCommit" };
+  }
+
+  const changed = hasWorkspaceChangesOrNewCommit(
+    String(statusResult.stdout ?? ""),
+    comparison,
+    String(headResult.stdout ?? "").trim(),
+  );
+  if (changed) return { action: "commit" };
+  const basis = aborted ? "the restored value after aborting a stale rebase" : "its pre-task value";
+  return { action: "clean", message: `Git status is clean and HEAD matches ${basis} — skipping autoCommit` };
+}
+
 interface AutoCommitFlair {
   publishEvent(event: { kind: string; summary: string; detail?: string; refId?: string }): Promise<void>;
 }
@@ -802,6 +898,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
   // All runtime outbound mail goes through the SIGNED path; a send failure must
   // not abort a task that otherwise completed (the completion boundary closes
   // regardless — see completeRuntimeMail below).
+  // Sender notices are ATTEMPTS: notify() logs a failed signed-mail send and
+  // the completion boundary still acknowledges the mail, so a notice is not
+  // retried and its delivery is not guaranteed.
   const notify = (to: string, body: string) => {
     try { sendRuntimeMail(mailCfg, to, body); }
     catch (e: any) { console.warn(`[${agentId}] outbound mail to ${to} failed: ${e.message}`); }
@@ -977,7 +1076,14 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
           }};
-          const baseline = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
+          // Choose the commit repository ONCE: every probe and the rebase abort
+          // below run against this repository, so a configured override is used
+          // for all of them.
+          const commitRepo = config.autoCommit ? (config.autoCommit.repo ?? config.workspace) : undefined;
+          const baselineResult = commitRepo
+            ? spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: commitRepo, encoding: "utf-8" })
+            : undefined;
+          const baseline = baselineResult?.status === 0 ? String(baselineResult.stdout ?? "").trim() : undefined;
           const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
             flairPublisher: flairPub2,
             onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
@@ -999,47 +1105,26 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           } else {
             await writeTaskMemory(flair, agentId, "completion", { task: msg.body, summary });
           }
-          // Auto-commit after mail task (same as Flair task path)
-          if (config.autoCommit) {
+          // Auto-commit after a mail task. Unlike the Flair task path above,
+          // the mail path detects and aborts an interrupted rebase in the
+          // commit repository, resets the comparison baseline after a
+          // successful abort, and probes Git status and HEAD before deciding.
+          if (config.autoCommit && commitRepo !== undefined) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
             }};
-            // Detect stale rebase state before attempting autoCommit
-            const rebaseMergeDir = join(config.workspace, ".git", "rebase-merge");
-            const rebaseApplyDir = join(config.workspace, ".git", "rebase-apply");
-            // Also check worktree .git file reference
-            // Resolve worktree git dir (workspace may use a .git file pointer)
-            let wtGitDir: string | null = null;
-            try {
-              const gitFile = join(config.workspace, ".git");
-              if (existsSync(gitFile)) {
-                const stat = require("node:fs").statSync(gitFile);
-                if (!stat.isDirectory()) {
-                  const content2 = readFileSync(gitFile, "utf-8").trim();
-                  const match = content2.match(/^gitdir:\s*(.+)$/);
-                  if (match?.[1]) wtGitDir = match[1].trim();
-                }
-              }
-            } catch { /* ignore */ }
-            const rebaseMergeDirWt = wtGitDir ? join(wtGitDir, "rebase-merge") : null;
-            const hasStaleRebase = existsSync(rebaseMergeDir) || existsSync(rebaseApplyDir) ||
-              (rebaseMergeDirWt != null && existsSync(rebaseMergeDirWt));
-            if (hasStaleRebase) {
-              console.warn(`[${agentId}] Stale rebase state detected before autoCommit — aborting rebase and proceeding`);
-              spawnSync(GIT_BIN, ["rebase", "--abort"], { cwd: config.workspace, encoding: "utf-8" });
-            }
-            // Check for file changes or Codex-created commits before attempting autoCommit
-            const gitStatusResult = spawnSync(GIT_BIN, ["status", "--porcelain"], { cwd: config.workspace, encoding: "utf-8" });
-            const currentHead = spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: config.workspace, encoding: "utf-8" }).stdout?.trim();
-            const hasChanges = hasWorkspaceChangesOrNewCommit(gitStatusResult.stdout ?? "", baseline, currentHead);
-            if (!hasChanges) {
-              console.warn(`[${agentId}] Task produced no file changes — skipping autoCommit`);
+            const decision = evaluateMailAutoCommitGate(commitRepo, baseline);
+            if (decision.action === "skip") {
+              console.warn(`[${agentId}] ${decision.message}`);
+              notify(msg.from, decision.message);
+            } else if (decision.action === "clean") {
+              console.warn(`[${agentId}] ${decision.message}`);
               notify(msg.from,
-                `Task complete but no files were changed.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
+                `Task complete but ${decision.message}.\n\nThe implementation may have failed silently (e.g. test timeout, Codex exhausted context exploring). Please re-spec with exact file paths and line numbers.\n\nTask: ${msg.body.slice(0, 200)}`
               );
             } else {
               const mailSubject = msg.body.split("\n")[0].slice(0, 72);
-              const prUrl = await _runAutoCommitLegacy(agentId, config.workspace, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
+              const prUrl = await _runAutoCommitLegacy(agentId, commitRepo, msg.id, config.autoCommit, flairPublisher, mailSubject, msg.body, mailCfg);
               await publishPrResult(flair, agentId, msg.id, prUrl);
             }
           }
