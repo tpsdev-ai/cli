@@ -8,6 +8,7 @@ import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/iden
 import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 import { writeBranchConf } from "../src/commands/branch.js";
 import { branchStatePath, writeBranchState } from "../src/utils/connection-state.js";
+import { QUIET_NONO_CHECK_FLAG } from "../src/utils/nono.js";
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { MSG_HEARTBEAT } from "../src/utils/wire-mail.js";
 
@@ -124,7 +125,7 @@ describe("branch daemon state-write failure", () => {
 
     const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
     delete env.TPS_BRANCH_DAEMON;
-    child = spawn(process.execPath, [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
+    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
     let stderr = "";
     child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
 
