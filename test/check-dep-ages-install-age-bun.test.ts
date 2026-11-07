@@ -49,10 +49,10 @@ const BRACE_CLASS_WORKSPACE_REASON =
   "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
 const UNMODELLED_WORKSPACE_REASON =
   "it uses glob syntax the gate does not model; use a literal directory name, `*`, `**`, `?`, a `[...]` class or `{a,b}` alternatives";
-const BRACE_RANGE_WORKSPACE_REASON =
-  "it uses a `{1..3}` brace range, which the gate does not model; list the directories explicitly";
+const DOT_DOT_WORKSPACE_REASON =
+  "it has `..` inside a brace group, which the gate does not model; list the directories explicitly";
 const EMPTY_ALTERNATIVE_WORKSPACE_REASON =
-  "it has a brace group with an empty or `.` alternative, which Bun drops; list the directories without an empty or `.` alternative";
+  "it has an empty or `.` alternative inside a brace group; list the directories without an empty or `.` alternative";
 
 /** No external network (loopback-only local registry). The last version listed is `latest`. */
 function startRegistry(root: string, published: Published = AGE_FIXTURE) {
@@ -465,6 +465,54 @@ it.each([
   60000,
 );
 
+// A real install of an empty brace alternative: the lockfile says which manifests
+// Bun took, and the gate refuses the same tree.
+it(
+  "an empty brace alternative: the installed set and the gate's refusal",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "age-empty-brace-"));
+    try {
+      const project = writeProject(
+        root,
+        {
+          "package.json": { name: "fixture", workspaces: ["packages/{a,}"] },
+          "packages/package.json": { name: "w-packages" },
+          "packages/a/package.json": { name: "w-a" },
+        },
+        "http://127.0.0.1:1",
+        { excludes: [NAME] },
+      );
+      const install = await bunInstall(project, ["--no-cache"]);
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      const lockPath = join(project, "bun.lock");
+      // Bun writes no lockfile when no workspace and no dependency is installed.
+      const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
+      const installed = Object.keys(lock.workspaces)
+        .filter((key) => key !== "")
+        .map((key) => `${key}/package.json`)
+        .sort();
+      expect(installed).toEqual(["packages/a/package.json"]);
+
+      // A valid lockfile and root pin isolate the workspace refusal.
+      writeFileSync(join(project, "bun.lock"), VALID_LOCK);
+      writeFileSync(
+        join(project, "package.json"),
+        JSON.stringify({ name: "fixture", workspaces: ["packages/{a,}"], dependencies: { [NAME]: AGED } }),
+      );
+      const gate = await runGate(project, "http://127.0.0.1:1", `${NAME}@${AGED}`);
+      expect(gate.exit).toBe(2);
+      expect(gate.output).toContain(
+        `the root package.json \`workspaces\` could not be read: workspaces pattern \`packages/{a,}\` cannot be read: ${EMPTY_ALTERNATIVE_WORKSPACE_REASON}.`,
+      );
+      expect(gate.output).not.toContain("Checking");
+      expect(gate.output).not.toContain("bun.lock");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60000,
+);
+
 // The gate refuses the leading `!` patterns below instead of modelling one Bun version's answer.
 it.each([
   ["a negation before its positive pattern", ["!packages/x", "packages/*"], ["packages/x", "packages/y"], "!packages/x"],
@@ -719,15 +767,13 @@ it.each([
   60000,
 );
 
-it(
-  "refuses a {1..3} brace range",
-  async () => {
-    await gateRefusal(
-      ["packages/{1..3}"],
-      ["packages/1", "packages/2"],
-      BRACE_RANGE_WORKSPACE_REASON,
-      "packages/{1..3}",
-    );
+it.each([
+  ["a {1..3} brace group", "packages/{1..3}", ["packages/1", "packages/2"]],
+  ["a literal-dot brace alternative", "packages/{..,a}", ["packages/a"]],
+] as const)(
+  "refuses %s",
+  async (_label, pattern, dirs) => {
+    await gateRefusal([pattern], dirs, DOT_DOT_WORKSPACE_REASON, pattern);
   },
   30000,
 );

@@ -434,9 +434,9 @@ function unsupportedWorkspacePattern(pattern) {
  * `?`, `[...]` classes and `{a,b}` alternatives. It refuses
  * `(`, `)` and `|` outside a class (Bun reads a paren
  * literally outside an extglob), the extended globs `?(...)`, `*(...)`,
- * `+(...)`, `@(...)` and `!(...)`, brace ranges such as `{1..3}`, and a brace
- * group with an empty or `.` alternative. The gate reads workspace patterns
- * only when `minimumReleaseAgeExcludes` is non-empty.
+ * `+(...)`, `@(...)` and `!(...)`, `..` inside a brace group, and a brace group
+ * with an empty or `.` alternative. The gate reads workspace patterns only when
+ * `minimumReleaseAgeExcludes` is non-empty.
  *
  * @returns {string | null} the reason, naming the syntax and the remedy
  */
@@ -463,16 +463,17 @@ function unmodelledGlobSyntax(pattern) {
     if (ch === "{") braces += 1;
     else if (ch === "}") braces = Math.max(0, braces - 1);
     else if (braces > 0 && ch === "." && pattern[i + 1] === ".") {
-      return "it uses a `{1..3}` brace range, which the gate does not model; list the directories explicitly";
+      return "it has `..` inside a brace group, which the gate does not model; list the directories explicitly";
     }
   }
   return null;
 }
 
 /**
- * Refuse a brace group with an empty or `.` alternative, at any nesting level.
- * The model drops the empty or `.` segment, so `packages/{a,}` would also apply
- * the directory `packages`, which Bun does not.
+ * Refuse an empty or `.` alternative inside a brace group, at any nesting level.
+ * The gate reads such a branch as the directory itself, so `packages/{a,}` would
+ * also apply the parent directory `packages`; it refuses the pattern instead of
+ * modelling that reading.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
  */
@@ -504,7 +505,7 @@ function emptyBraceAlternative(pattern) {
     return false;
   };
   return hasEmpty(pattern)
-    ? "it has a brace group with an empty or `.` alternative, which Bun drops; list the directories without an empty or `.` alternative"
+    ? "it has an empty or `.` alternative inside a brace group; list the directories without an empty or `.` alternative"
     : null;
 }
 
