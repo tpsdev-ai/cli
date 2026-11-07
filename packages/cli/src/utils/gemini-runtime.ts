@@ -13,6 +13,7 @@ import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk, bootContext, searchPastExperience,
   catchUpTopics, onBoot, onTaskStart, onTaskComplete, onTaskFailure,
+  getFallbackSoulPath,
 } from "./agent-lifecycle.js";
 import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
@@ -50,10 +51,6 @@ interface MailMessage { id: string; from: string; to: string; body: string; time
  */
 export function geminiDispatchRefusal(envelope: Envelope | undefined, from: string, tier?: string): string | null {
   return externalDispatchRefusal(envelope, from, tier);
-}
-
-function getFallbackSoulPath(agentId: string): string {
-  return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
 }
 
 /** Returns { systemPrompt, userTask } — kept separate so gemini gets

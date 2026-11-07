@@ -43,6 +43,7 @@ import {
   searchPastExperience,
   writeTaskMemory,
   catchUpTopics,
+  getFallbackSoulPath,
   onBoot,
   onTaskStart,
   onTaskComplete,
@@ -100,10 +101,6 @@ export function claudeCodeDispatchRefusal(envelope: Envelope | undefined, from: 
 }
 
 // ─── System prompt (delegates to agent-lifecycle) ────────────────────────────
-
-function getFallbackSoulPath(agentId: string): string {
-  return join(homedir(), ".tps", "agents", agentId, "fallback", "SOUL.md");
-}
 
 async function buildSystemPrompt(
   message: MailMessage,

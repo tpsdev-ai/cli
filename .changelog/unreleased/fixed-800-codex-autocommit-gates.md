@@ -1,0 +1,10 @@
+- **The codex runtime's mail-task auto-commit probes the configured commit repository, resets after a rebase abort, and says what it established.**
+
+  The runtime resolves `autoCommit.repo ?? workspace` once and runs the mail auto-commit gate's Git
+  probes and the rebase abort there. An interrupted rebase is detected with
+  `git rev-parse --path-format=absolute --git-path`; a failed probe skips
+  auto-commit and reports it. A successful abort resets the comparison to the
+  restored HEAD. The clean message states that Git status is clean and HEAD
+  matches its pre-task value (or the restored value); skip messages report the
+  failed probe or abort. Sender notices are attempts: a failed signed send is
+  logged and acknowledgement is attempted.
