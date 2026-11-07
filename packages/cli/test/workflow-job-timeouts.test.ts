@@ -37,6 +37,13 @@ const TIMEOUT_JOBS = [
   "nono-profile-gate",
 ];
 
+/**
+ * The smallest timeout allowed. A job's timeout counts from job start, so
+ * checkout, setup and a cold `bun install` are inside it; a shorter bound
+ * would fail a healthy run on a slow day.
+ */
+const MIN_TIMEOUT_MINUTES = 10;
+
 /** Jobs that run no tests, and why. */
 const EXEMPT: Record<string, string> = {
   build: "installs dependencies and runs the TypeScript build; no test step",
@@ -69,6 +76,13 @@ function timeoutProblems(
       problems.push(`job "${id}" is in TIMEOUT_JOBS but not in test.yml`);
     } else if (!isPositiveInteger(wf.jobs?.[id]?.["timeout-minutes"])) {
       problems.push(`job "${id}" does not set a positive integer timeout-minutes`);
+    } else {
+      const value = wf.jobs?.[id]?.["timeout-minutes"] as number;
+      if (value < MIN_TIMEOUT_MINUTES) {
+        problems.push(
+          `job "${id}" sets timeout-minutes ${value}, below the ${MIN_TIMEOUT_MINUTES}-minute floor`,
+        );
+      }
     }
   }
   for (const id of Object.keys(exempt)) {

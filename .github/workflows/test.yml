@@ -51,7 +51,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -86,7 +86,7 @@ jobs:
     name: promote-latest fixtures (${{ matrix.os }})
     permissions:
       contents: read # actions/checkout reads the repository
-    timeout-minutes: 5
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -198,7 +198,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -286,7 +286,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -337,7 +337,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -532,7 +532,7 @@ jobs:
     permissions:
       contents: read # actions/checkout reads the repository
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
         with:
@@ -565,7 +565,7 @@ jobs:
     name: nono profile gate (${{ matrix.os }})
     permissions:
       contents: read # actions/checkout reads the repository
-    timeout-minutes: 3
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
