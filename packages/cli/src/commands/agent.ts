@@ -915,7 +915,7 @@ function setAgentRuntime(args: AgentArgs): void {
         if (readFileSync(configPath).equals(writtenBytes)) {
           writeRuntimeConfig(configPath, original, ownership, writtenBytes, warnOwnershipChange);
         } else {
-          console.error(`❌ Config changed after writing ${configPath}; leaving the replacement as written (no rollback).`);
+          console.error(`❌ Config at ${configPath} changed after the replacement was written; no rollback was attempted (it now holds another writer's content).`);
         }
       } catch (restoreError) {
         console.error(`❌ Cannot restore ${configPath}: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`);

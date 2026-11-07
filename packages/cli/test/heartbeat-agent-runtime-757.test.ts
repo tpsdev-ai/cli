@@ -1088,8 +1088,7 @@ syncBuiltinESMExports();
     expect(result.stderr).toContain("Runtime verification failed");
     expect(result.stdout).not.toContain("runtime recorded as");
     expect(readFileSync(configPath, "utf-8")).toBe("runtime: mismatched\n");
-    expect(result.stderr).toContain("Config changed after writing");
-    expect(result.stderr).toContain("leaving the replacement as written (no rollback)");
+    expect(result.stderr).toContain(`❌ Config at ${configPath} changed after the replacement was written; no rollback was attempted (it now holds another writer's content).`);
   }, 20000);
 
   test("set-runtime restores original bytes when verification fails and its write remains", async () => {
