@@ -385,7 +385,7 @@ function assertLiveHeartbeatResult(result, testCase) {
   assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
 }
 
-async function runLiveCase(root, binDir) {
+export async function runLiveCase(root, binDir) {
   const port = await freePort();
   const testCase = makeCase(root, "live", (await freePort()));
   const logPath = join(testCase.dir, "gateway.log");
@@ -404,22 +404,14 @@ async function runLiveCase(root, binDir) {
     async () => {
       await waitForRpc(testCase, port, binDir, gateway, logPath);
       const result = runHeartbeat(testCase, port, binDir);
-      if (result.status !== 0) {
-        // A failed heartbeat waits out the grace window so an exit already in
-        // progress is reported as itself. The result assertions still run, so
-        // neither failure hides the other.
-        await finishWithCleanup(
-          () => assertGatewaySurvivedHeartbeat(gateway, logPath),
-          async () => assertLiveHeartbeatResult(result, testCase),
-        );
-      } else {
-        if (gatewayExited(gateway)) {
-          throw new Error(
-            `gateway exited with ${gatewayExitDescription(gateway)} during the heartbeat\n${readLogTail(logPath)}`,
-          );
-        }
-        assertLiveHeartbeatResult(result, testCase);
-      }
+      // The exit check waits out the grace window for both outcomes, because a
+      // gateway exit during the heartbeat is not visible right after spawnSync
+      // returns. The result assertions still run, so neither failure hides the
+      // other.
+      await finishWithCleanup(
+        () => assertGatewaySurvivedHeartbeat(gateway, logPath),
+        async () => assertLiveHeartbeatResult(result, testCase),
+      );
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
     async () => {

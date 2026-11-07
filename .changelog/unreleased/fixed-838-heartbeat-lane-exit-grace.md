@@ -1,1 +1,1 @@
-- **The heartbeat lane waits a bounded window for a gateway exit after readiness and a failed live heartbeat, not a single event-loop turn.**
+- **The heartbeat lane waits a bounded window for a gateway exit after readiness and a live heartbeat, not a single event-loop turn.**
