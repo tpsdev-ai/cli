@@ -110,17 +110,17 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(readHostState(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    const closeLines = () => diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    // Each close-failure call must carry exactly the one expected argument.
+    const closeCalls = () => diagnostic.mock.calls.filter((call) => String(call[0]).includes("Failed channel close"));
     // The in-loop close failure logs before stop(); pin that line here, while
     // stop()'s retry of the retained channel has not run yet.
-    for (let i = 0; closeLines().length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(closeLines()).toEqual([expectedCloseLine]);
+    for (let i = 0; closeCalls().length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(closeCalls()).toEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
-    expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(closeLines()).toEqual([expectedCloseLine, expectedCloseLine]);
+    expect(closeCalls()).toEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -174,17 +174,17 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     expect(sends).toBe(1);
     expect(readHostState(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    const closeLines = () => diagnostic.mock.calls.map((call) => String(call[0])).filter((text) => text.includes("Failed channel close"));
+    // Each close-failure call must carry exactly the one expected argument.
+    const closeCalls = () => diagnostic.mock.calls.filter((call) => String(call[0]).includes("Failed channel close"));
     // The catch-path close failure logs before stop(); pin that line here,
     // while stop()'s retry of the retained channel has not run yet.
-    for (let i = 0; closeLines().length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(closeLines()).toEqual([expectedCloseLine]);
+    for (let i = 0; closeCalls().length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(closeCalls()).toEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
-    expect(diagnostic.mock.calls.some((call) => String(call[0]).includes(path))).toBe(true);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(closeLines()).toEqual([expectedCloseLine, expectedCloseLine]);
+    expect(closeCalls()).toEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -384,9 +384,11 @@ test("a connect-time host record write failure is reported before reconnecting",
     // with no backoff exceeds the cumulative count of 3.
     await Bun.sleep(20);
     expect(connects).toBeLessThanOrEqual(3);
-    const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
-    expect(line).toBeDefined();
-    expect(line).toBe(`[relay] Host state record ${path} connect write failed; reconnecting: EEXIST: file already exists, mkdir '${connectionsDir}'`);
+    const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: EEXIST: file already exists, mkdir '${connectionsDir}'`;
+    // Every matching attempt's call must carry exactly the one expected argument.
+    const connectCalls = diagnostic.mock.calls.filter((call) => String(call[0]).includes("connect write failed"));
+    expect(connectCalls.length).toBeGreaterThan(0);
+    for (const call of connectCalls) expect(call).toEqual([expectedLine]);
     rmSync(blocker, { force: true });
     blocker = undefined;
     await stop();
@@ -441,11 +443,13 @@ test("a second connect-time host record write failure is reported before reconne
     for (let i = 0; (connects < 2 || diagnostic.mock.calls.length === 0) && i < 1400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(firstWriteVisible).toBe(true);
-    const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
-    expect(line).toBeDefined();
     const lockRootPath = hostStateLockRoot(path);
     const lockDir = mailLockPath(lockRootPath);
-    expect(line).toBe(`[relay] Host state record ${path} connect write failed; reconnecting: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`);
+    const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`;
+    // Every matching attempt's call must carry exactly the one expected argument.
+    const connectCalls = diagnostic.mock.calls.filter((call) => String(call[0]).includes("connect write failed"));
+    expect(connectCalls.length).toBeGreaterThan(0);
+    for (const call of connectCalls) expect(call).toEqual([expectedLine]);
     expect(readHostState(branch)).not.toBeNull();
     releaseLock();
     await stop();
