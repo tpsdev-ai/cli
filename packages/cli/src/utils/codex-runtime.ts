@@ -384,10 +384,12 @@ export type MailAutoCommitDecision =
  * Every probe runs against the one repository the caller resolved for the
  * commit, and an interrupted rebase is detected and aborted there too. The
  * comparison is always the HEAD read before the task: a successful abort
- * restores the tip that contains the task's own commits, so a restored HEAD
- * that differs from the baseline is the evidence of those commits. A failed
- * probe is indeterminate and yields a skip with its outcome reported. The
- * clean decision establishes exactly this: Git status is clean and HEAD
+ * restores the branch tip checked out before the rebase started, so a restored
+ * HEAD different from the pre-task HEAD causes a commit attempt. That can be a
+ * commit made on that branch before the rebase, not necessarily this task's.
+ * A failed probe is indeterminate and yields a skip with its outcome reported,
+ * and so does a final HEAD that differs from the restored one. The clean
+ * decision establishes exactly this: Git status is clean and the final HEAD
  * matches its pre-task value — `git status --porcelain` omits ignored files,
  * and equal HEADs do not rule out a commit that was later reset.
  */
@@ -427,11 +429,18 @@ export function evaluateMailAutoCommitGate(
   if (headResult.status !== 0) {
     return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) failed — skipping autoCommit" };
   }
+  const finalHead = String(headResult.stdout ?? "").trim();
+  if (restoredHead !== undefined && finalHead !== restoredHead) {
+    return {
+      action: "skip",
+      message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restoredHead}, final ${finalHead}) — skipping autoCommit`,
+    };
+  }
 
   const changed = hasWorkspaceChangesOrNewCommit(
     String(statusResult.stdout ?? ""),
     baseline,
-    restoredHead ?? String(headResult.stdout ?? "").trim(),
+    finalHead,
   );
   if (changed) return { action: "commit" };
   return { action: "clean", message: "Git status is clean and HEAD matches its pre-task value — skipping autoCommit" };
@@ -1126,7 +1135,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           // Auto-commit after a mail task. Unlike the Flair task path above,
           // the mail path detects and aborts an interrupted rebase in the
           // commit repository, keeps the pre-task baseline as the comparison
-          // (a restored HEAD above it is evidence of the task's commits), and
+          // (a restored HEAD different from it causes a commit attempt), and
           // probes Git status and HEAD before deciding.
           if (config.autoCommit && commitRepo !== undefined) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {

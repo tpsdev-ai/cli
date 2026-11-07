@@ -253,6 +253,43 @@ describe("evaluateMailAutoCommitGate", () => {
     }
   }, 30_000);
 
+  test("skips as indeterminate when HEAD changes between the restored and final reads", () => {
+    const repo = initRepo();
+    try {
+      // A branch tip above `main` that predates the task; the abort restores it.
+      git(repo, "checkout", "-q", "-b", "topic");
+      writeFileSync(join(repo, "file.txt"), "topic\n");
+      git(repo, "commit", "-q", "-am", "before task");
+      const baseline = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "main");
+      writeFileSync(join(repo, "file.txt"), "main\n");
+      git(repo, "commit", "-q", "-am", "main");
+      git(repo, "checkout", "-q", "topic");
+      expect(spawnSync(GIT, ["rebase", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
+
+      // The gate starts at the restored read: the first HEAD read returns the
+      // restored tip, the second a different value.
+      const restored = git(repo, "rev-parse", "HEAD").trim();
+      const moved = "f".repeat(40);
+      let headReads = 0;
+      const runSync = ((command: any, args: any, options: any) => {
+        if ((args as string[]).join(" ") === "rev-parse HEAD") {
+          headReads++;
+          return { status: 0, stdout: `${headReads === 1 ? restored : moved}\n`, stderr: "" };
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(evaluateMailAutoCommitGate(repo, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restored}, final ${moved}) — skipping autoCommit`,
+      });
+      expect(headReads).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("skips and reports when the stale-rebase probe cannot run", () => {
     const runSync = (() => ({ status: 128, stdout: "", stderr: "fixture probe failure" })) as unknown as typeof spawnSync;
     expect(evaluateMailAutoCommitGate("/tmp/not-a-repo", "abc123", { runSync })).toEqual({

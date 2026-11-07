@@ -10,8 +10,8 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
-import { AgentRuntime, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
-import { agentWorkspace } from "../utils/agent-workspace.js";
+import { AgentRuntime, interpolateEnvInString, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
+import { agentWorkspace, resolveAutoCommitRepo } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
@@ -1431,7 +1431,22 @@ async function runAgentCommand(
       config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
       if (snapshot) {
         const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-        writeFileSync(configPath, yaml.dump({ ...document, workspace: config.workspace }, { lineWidth: -1 }));
+        const snapshotDocument: Record<string, unknown> = { ...document, workspace: config.workspace };
+        // The child resolves a relative autoCommit.repo against the config file
+        // it is handed — this snapshot — so resolve it here against the
+        // original config, with the same environment expansion the workspace
+        // loader applies, and write the absolute value.
+        const autoCommit = document.autoCommit;
+        if (autoCommit !== null && typeof autoCommit === "object" && !Array.isArray(autoCommit)) {
+          const configuredRepo = (autoCommit as Record<string, unknown>).repo;
+          if (typeof configuredRepo === "string") {
+            snapshotDocument.autoCommit = {
+              ...(autoCommit as Record<string, unknown>),
+              repo: resolveAutoCommitRepo(interpolateEnvInString(configuredRepo), snapshot.workspaceConfigPath),
+            };
+          }
+        }
+        writeFileSync(configPath, yaml.dump(snapshotDocument, { lineWidth: -1 }));
       }
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed
