@@ -14,8 +14,9 @@ afterEach(() => { mock.restore(); });
 /** The real timer, captured before any test replaces globalThis.setTimeout. */
 const realSetTimeout = globalThis.setTimeout;
 
-/** Reconnect waits run on a short real timer. A microtask here removes the only
- *  timer between attempts, so a retry chain can starve the per-test timeout. */
+/** Reconnect waits run on a short real timer. A microtask backoff together with
+ *  an immediate connect fake could starve the per-test timeout; the connect
+ *  fake's real timer keeps the retry chain reachable. */
 const TEST_RECONNECT_BACKOFF_MS = 100;
 
 function fastReconnectBackoff() {
@@ -80,13 +81,11 @@ test("stop() attempts at most the retained bound of channel closes after many re
   const retainedBound = 4;
   let connects = 0;
   let closes = 0;
-  const never = new Promise<TransportChannel>(() => {});
   const fastBackoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
     await yieldRealTimer();
-    if (connects > failures) return never;
     return {
       async send() { throw new Error("initial heartbeat refused"); },
       onMessage() {},
@@ -101,12 +100,12 @@ test("stop() attempts at most the retained bound of channel closes after many re
     const branch = await prepareBranch(root);
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; closes < failures && i < 2_000; i++) await Bun.sleep(5);
-    expect(closes).toBe(failures);
-    // One attempt per TEST_RECONNECT_BACKOFF_MS: a retry with no backoff would
-    // add many attempts inside this window.
+    // Attempts are spaced by TEST_RECONNECT_BACKOFF_MS, so a microtask backoff
+    // adds many attempts inside this window and fails the bound.
     await Bun.sleep(20);
     expect(connects).toBeGreaterThanOrEqual(failures);
     expect(connects).toBeLessThanOrEqual(failures + 1);
+    expect(closes).toBe(failures);
     const beforeStop = closes;
     const started = performance.now();
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
@@ -129,6 +128,7 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
   const savedEnv = savedRelayEnv();
   const failures = 5;
   let connects = 0;
+  let closes = 0;
   let stopPhase = false;
   const fastBackoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
@@ -144,6 +144,7 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
         // The first channel is evicted while still unclosed; every channel
         // still retained closes on stop's retry.
         if (stopPhase && id !== 1) return;
+        closes++;
         throw new Error("close refused");
       },
       isAlive() { return true; },
@@ -156,9 +157,11 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
     const path = hostStatePath(branch);
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects <= failures && i < 2_000; i++) await Bun.sleep(5);
-    // One attempt per TEST_RECONNECT_BACKOFF_MS: a retry with no backoff floods
-    // this window, so a tight loop fails here instead of starving the timeout.
+    // Attempts are spaced by TEST_RECONNECT_BACKOFF_MS, so a microtask backoff
+    // adds many attempts inside this window and fails the bound.
+    expect(connects).toBeGreaterThan(failures);
     expect(connects).toBeLessThanOrEqual(failures + 1);
+    expect(closes).toBeGreaterThanOrEqual(failures);
     await Bun.sleep(20);
     expect(connects).toBeLessThanOrEqual(failures + 1);
     expect(existsSync(path)).toBe(true);
