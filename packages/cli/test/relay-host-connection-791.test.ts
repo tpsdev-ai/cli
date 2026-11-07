@@ -52,7 +52,8 @@ function holdHostLock(path: string): string {
 }
 
 /** Shorten reconnect waits to a real timer. A microtask here would remove one of
- *  the timers between attempts; the connect fake also waits on a real timer. */
+ *  the timers between attempts; in the repeating first-write failure case the
+ *  connect fake also waits on a real timer. */
 const TEST_RECONNECT_BACKOFF_MS = 100;
 function fastReconnectBackoff() {
   return spyOn(globalThis, "setTimeout").mockImplementation(((
