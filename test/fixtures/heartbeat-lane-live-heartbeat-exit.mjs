@@ -1,11 +1,11 @@
 // Run the lane's live-heartbeat exit check under node against a stub gateway
-// that answers one readiness probe and exits while the heartbeat runs.
+// that answers one readiness probe and exits a short delay after the heartbeat
+// starts, well after a single event-loop turn: the grace window still sees it.
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { waitForTermination } from "./process-termination.mjs";
 
 const { assertGatewaySurvivedHeartbeat, finishWithCleanup, waitForRpc } = await import(
   pathToFileURL(process.argv[2]).href
@@ -13,8 +13,8 @@ const { assertGatewaySurvivedHeartbeat, finishWithCleanup, waitForRpc } = await 
 
 const root = mkdtempSync(join(tmpdir(), "heartbeat-live-exit-"));
 const trigger = join(root, "heartbeat-started");
-const stubSource =
-  'import net from "node:net";import { existsSync } from "node:fs";const server=net.createServer((socket)=>{socket.end("ready");});server.listen(0,"127.0.0.1",()=>{process.stdout.write(String(server.address().port)+"\\n");setInterval(()=>{if(existsSync(process.env.TRIGGER))process.exit(0);},10);});';
+const EXIT_DELAY_MS = 10;
+const stubSource = `import net from "node:net";import { existsSync } from "node:fs";let exiting=false;const server=net.createServer((socket)=>{socket.end("ready");});server.listen(0,"127.0.0.1",()=>{process.stdout.write(String(server.address().port)+"\\n");setInterval(()=>{if(!exiting&&existsSync(process.env.TRIGGER)){exiting=true;setTimeout(()=>process.exit(0),${EXIT_DELAY_MS});}},10);});`;
 const stub = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: ["ignore", "pipe", "inherit"],
   env: { ...process.env, TRIGGER: trigger },
@@ -46,10 +46,10 @@ try {
       },
     },
   );
-  // Stand-in for runHeartbeat: the stub exits while this blocks, and node has
-  // not reaped it, so its exit event is pending for the check that follows.
+  // Stand-in for runHeartbeat: the stub exits a short delay after it sees this
+  // write, while the check below waits out the grace window. No sleep here: the
+  // exit is not queued yet when the check starts, so the window is what sees it.
   writeFileSync(trigger, "heartbeat started\n");
-  waitForTermination(stub.pid);
   await finishWithCleanup(
     () => assertGatewaySurvivedHeartbeat(stub, "/nonexistent/log"),
     async () => {

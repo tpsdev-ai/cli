@@ -1,13 +1,14 @@
 // Run the lane's readiness recheck under node against a stub gateway that
-// answers one readiness probe and exits.
+// answers one readiness probe and exits a short delay later. The delay can be
+// raised (EXIT_DELAY_MS) so the exit lands well after a single event-loop turn:
+// the lane's grace window still sees it.
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
-import { waitForTermination } from "./process-termination.mjs";
 
 const { waitForRpc } = await import(pathToFileURL(process.argv[2]).href);
 
-const stubSource =
-  'import net from "node:net";const server=net.createServer((socket)=>{socket.end("ready");setTimeout(()=>process.exit(0),10);});server.listen(0,"127.0.0.1",()=>process.stdout.write(String(server.address().port)+"\\n"));';
+const EXIT_DELAY_MS = Number(process.env.EXIT_DELAY_MS ?? 10);
+const stubSource = `import net from "node:net";const server=net.createServer((socket)=>{socket.end("ready");setTimeout(()=>process.exit(0),${EXIT_DELAY_MS});});server.listen(0,"127.0.0.1",()=>process.stdout.write(String(server.address().port)+"\\n"));`;
 const stub = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: ["ignore", "pipe", "inherit"],
 });
@@ -34,9 +35,6 @@ try {
           encoding: "utf-8",
           timeout: 10_000,
         });
-        // Block until the stub has terminated at the OS level; node has not
-        // reaped it, so its exit event is pending for waitForRpc's recheck.
-        waitForTermination(stub.pid);
         return { status: probe.status ?? 1, stdout: probe.stdout ?? "", stderr: probe.stderr ?? "" };
       },
     },
