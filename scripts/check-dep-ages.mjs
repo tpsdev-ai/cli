@@ -13,9 +13,10 @@
  * manifest a root `workspaces` pattern names. A name pinned exactly only in a
  * manifest Bun does not apply is refused, naming that manifest; an override must
  * be in the root package.json, and a resolutions key of `name` or `**\/name` is
- * refused. An npm lockfile entry is aged as the package its `resolved` tarball
- * URL identifies, and is refused, naming the lockfile and entry, when that URL
- * disagrees with the recorded name or version or is not a registry tarball URL.
+ * refused. An npm lockfile entry with a registry `resolved` URL is aged as the
+ * package that URL identifies, and is refused, naming the lockfile and entry,
+ * when that URL disagrees with the recorded name or version or is not a registry
+ * tarball URL.
  * A `git:`/`git+...` entry is refused because it has no publish time; a local
  * `file:` or `workspace:` entry, the root entry and a `link: true` entry are not
  * checked. An entry without a `resolved` URL is aged by its recorded
@@ -30,7 +31,8 @@
  *   1 — all required publish times are available and an uncovered version is too fresh
  *   2 — missing publish times, unreadable or unparseable required files or npm
  *       lockfiles, an npm entry with no version, an npm `resolved` URL that is a
- *       git dependency or does not identify the recorded package and version, Bun not
+ *       git dependency, is not a registry tarball URL, or does not identify the
+ *       recorded package and version, Bun not
  *       runnable or rejecting bunfig.toml, a missing, non-numeric or negative threshold
  *       or one below 7 days, invalid or unused exceptions, an excluded name without an
  *       unexpired exception or an exact declaration Bun applies, an excluded name pinned
