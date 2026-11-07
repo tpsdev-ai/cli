@@ -263,4 +263,52 @@ describe("connection-state", () => {
     expect(readBranchState()).toEqual({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
   });
+
+  test("a failed branch state write keeps the previous record and removes the temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-branch-write-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = join(dir, "host.json");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    const before = readFileSync(record);
+
+    const write = fs.writeFileSync;
+    const injected = spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof write>) => {
+      write(...args);
+      throw new Error("injected write failure");
+    });
+    try {
+      expect(() => writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 4, messagesPushed: 5 }))
+        .toThrow("injected write failure");
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
+  test("a failed branch state rename keeps the previous record and removes the temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-branch-rename-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = join(dir, "host.json");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    const before = readFileSync(record);
+
+    const rename = fs.renameSync;
+    const injected = spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof rename>) => {
+      if (String(args[1]) === record) throw new Error("injected rename failure");
+      return rename(...args);
+    });
+    try {
+      expect(() => writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 4, messagesPushed: 5 }))
+        .toThrow("injected rename failure");
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
 });

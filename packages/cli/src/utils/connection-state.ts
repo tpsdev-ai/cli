@@ -86,8 +86,9 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
  * Write a file atomically: a uniquely named temp file in the same directory,
- * created exclusively with `mode`, renamed over the target. On failure the temp
- * file is removed and the error propagates unchanged.
+ * created exclusively with `mode`, renamed over the target. On a synchronous
+ * failure the helper attempts to remove the temp file and rethrows the original
+ * error.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
