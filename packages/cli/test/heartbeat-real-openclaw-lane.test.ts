@@ -188,6 +188,39 @@ describe("the readiness deadline bounds each probe", () => {
 });
 
 describe("a cleanup failure does not hide the assertion that failed", () => {
+  test.each([undefined, 0])("preserves thrown %j when cleanup succeeds", async (value) => {
+    await expect(
+      finishWithCleanup(
+        async () => {
+          throw value;
+        },
+        async () => {},
+      ),
+    ).rejects.toBe(value);
+  });
+
+  test.each([undefined, 0])("preserves thrown %j before the cleanup failure", async (value) => {
+    const cleanup = new Error("cleanup failed");
+    let reported: unknown;
+    try {
+      await finishWithCleanup(
+        async () => {
+          throw value;
+        },
+        async () => {
+          throw cleanup;
+        },
+      );
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBeInstanceOf(AggregateError);
+    const aggregate = reported as AggregateError;
+    expect(aggregate.errors).toHaveLength(2);
+    expect(aggregate.errors[0]).toBe(value);
+    expect(aggregate.errors[1]).toBe(cleanup);
+  });
+
   test("reports the assertion first and the failing stopGateway after it", async () => {
     const assertion = new Error("live gateway: heartbeat exit status must be 0");
     const child = { pid: 4324, exitCode: null };

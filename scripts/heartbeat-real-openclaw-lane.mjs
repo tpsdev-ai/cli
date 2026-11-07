@@ -262,24 +262,24 @@ export async function stopGateway(child, options = {}) {
 }
 
 /**
- * Run `action`, then `cleanup`, and keep both failures when both throw: the
- * action's error is reported first so a cleanup failure cannot hide the
- * assertion that failed. A cleanup failure on its own is still reported.
+ * Run `action`, then `cleanup`; preserve thrown values, action first.
  */
 export async function finishWithCleanup(action, cleanup) {
+  let actionFailed = false;
   let failure;
   try {
     await action();
   } catch (error) {
+    actionFailed = true;
     failure = error;
   }
   try {
     await cleanup();
   } catch (error) {
-    if (!failure) throw error;
-    throw new AggregateError([failure, error], `${failure.message}\ncleanup also failed: ${error.message}`);
+    if (!actionFailed) throw error;
+    throw new AggregateError([failure, error], `${failure?.message}\ncleanup also failed: ${error?.message}`);
   }
-  if (failure) throw failure;
+  if (actionFailed) throw failure;
 }
 
 async function runDeadCase(root, binDir) {
