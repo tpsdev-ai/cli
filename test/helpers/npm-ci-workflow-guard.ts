@@ -44,7 +44,7 @@ function resolveRepoDir(base: string, target: string, label: string): string {
 }
 
 /** Inspect literal npm ci command words and helper calls in workflow run text.
- * Escaped or quoted spellings are not classified (#836); scripts and composite actions are outside this guard. */
+ * Some escaped or quoted spellings evade classification, for example `n\pm ci` and `npm c\i` (deferred to #836); scripts and composite actions are outside this guard. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = run.split("\n").map((line) => line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "").trim())
     .filter((line) => line !== "" && !line.startsWith("#"));

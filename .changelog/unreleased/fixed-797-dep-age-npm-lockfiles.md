@@ -5,8 +5,8 @@
   strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
   skipped. A literal `npm ci` command word in a workflow `run:` step must be a
   helper call to `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory
-  and literal `--via npm` or `--via sfw`. Spellings Bash would still execute as
-  `npm ci` via escapes or quotes are not classified (#836).
+  and literal `--via npm` or `--via sfw`. Some escaped or quoted spellings evade classification,
+  for example `n\pm ci` and `npm c\i` (deferred to #836).
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with
   lowercase names, the literal heartbeat pin substitution, helper calls and
   `GITHUB_ENV` echoes. Other helper-step lines are refused.

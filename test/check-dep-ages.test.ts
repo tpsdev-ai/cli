@@ -1274,7 +1274,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* Literal npm ci command words and helper calls; escaped/quoted spellings (#836), script files and composite actions are not inspected. */
+/* Literal npm ci command words and helper calls; some escaped or quoted spellings evade classification, for example `n\pm ci` and `npm c\i` (deferred to #836); script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
