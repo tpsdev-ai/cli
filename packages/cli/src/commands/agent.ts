@@ -10,7 +10,7 @@
  *   status   Show status of a running agent (PID, last activity, Flair memory count)
  */
 
-import { AgentRuntime, interpolateEnvInString, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
+import { AgentRuntime, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
 import { agentWorkspace, resolveAutoCommitRepo } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
@@ -1442,7 +1442,7 @@ async function runAgentCommand(
           if (typeof configuredRepo === "string") {
             snapshotDocument.autoCommit = {
               ...(autoCommit as Record<string, unknown>),
-              repo: resolveAutoCommitRepo(interpolateEnvInString(configuredRepo), snapshot.workspaceConfigPath),
+              repo: resolveAutoCommitRepo(configuredRepo, snapshot.workspaceConfigPath, true),
             };
           }
         }

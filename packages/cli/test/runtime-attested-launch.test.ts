@@ -4,7 +4,7 @@
 import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, isAbsolute } from "node:path";
 import { cliEnv, makeSandbox, type Sandbox } from "./helpers/runtime-launch-fixture.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -489,6 +489,45 @@ describe("interactive selected runtime workspace values", () => {
       }, (sb) => ({ TPS_TEST_PROJECT_ROOT: join(sb.root, "expanded") }));
     });
   }
+
+  /** Run the built CLI's non-sandboxed loader with the codex runtime stubbed to report its config. */
+  function loaderCodexConfig(sb: Sandbox, config: string, extra: Record<string, string | undefined>) {
+    const codexModule = resolve(import.meta.dir, "../dist/src/utils/codex-runtime.js");
+    const preload = join(sb.root, "loader-preload.ts");
+    writeFileSync(preload, `
+      import { mock } from "bun:test";
+      Object.defineProperty(process.stdin, "isTTY", { value: true });
+      Object.defineProperty(process.stdout, "isTTY", { value: true });
+      const codex = await import(${JSON.stringify(codexModule)});
+      mock.module(${JSON.stringify(codexModule)}, () => ({ ...codex,
+        runCodexRuntime: async (config) => { console.log("CODEX_CONFIG " + JSON.stringify({ workspace: config.workspace, repo: config.autoCommit?.repo })); },
+      }));
+    `);
+    return spawnSync("bun", ["--preload", preload, TPS_BIN, "agent", "start", "--id", "probe", "--config", config, "--runtime", "codex", "--no-sandbox", "--quiet-nono-check"], {
+      cwd: sb.ws, env: cliEnv(sb, extra), encoding: "utf8", timeout: 20_000,
+    });
+  }
+
+  test("codex: the non-sandboxed loader expands \${NAME} in autoCommit.repo before the runtime receives it", () => {
+    const sb = makeSandbox();
+    try {
+      const expanded = join(sb.root, "expanded");
+      const repo = join(expanded, "repo");
+      mkdirSync(repo, { recursive: true });
+      const config = join(sb.root, "agent.yaml");
+      writeFileSync(config, "agentId: probe\nworkspace: " + sb.ws + "\nmailDir: " + join(sb.home, ".tps", "mail") + "\nautoCommit:\n  repo: ${TPS_TEST_PROJECT_ROOT}/repo\n");
+      const result = loaderCodexConfig(sb, config, { TPS_TEST_PROJECT_ROOT: expanded, TPS_AGENT_ID: undefined });
+      const text = `${result.stdout ?? ""}${result.stderr ?? ""}`;
+      expect(result.status, text).toBe(0);
+      const line = (result.stdout ?? "").split("\n").find((l) => l.startsWith("CODEX_CONFIG "));
+      expect(line, text).toBeDefined();
+      const received = JSON.parse(line!.slice("CODEX_CONFIG ".length));
+      expect(received).toEqual({ workspace: sb.ws, repo });
+      expect(isAbsolute(received.repo)).toBe(true);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test("codex: --no-sandbox refuses an unset variable in repo before worktree setup or runner start", () => {
     workspaceOptOut(

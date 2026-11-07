@@ -501,9 +501,12 @@ test("an absolute workspace containing .. is normalized for the parent, the snap
   );
 });
 
-test("the launch snapshot resolves a relative autoCommit.repo against the original config directory", () => {
+test("the launch snapshot and child carry the absolute autoCommit.repo override; the commit is exercised outside confinement", () => {
   const sb = makeSandbox();
   try {
+    // This proves the snapshot and the child carry the absolute override. The
+    // `tps agent commit` below runs in this test process, outside the nono
+    // session; it does not exercise a commit through the confined runtime.
     const configDir = join(sb.home, ".tps", "agents", "probe");
     const workspace = join(configDir, "workspace");
     const commitRepo = join(configDir, "commit-repo");

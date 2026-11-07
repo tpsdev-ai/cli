@@ -256,7 +256,8 @@ describe("evaluateMailAutoCommitGate", () => {
   test("skips as indeterminate when HEAD changes between the restored and final reads", () => {
     const repo = initRepo();
     try {
-      // A branch tip above `main` that predates the task; the abort restores it.
+      // A branch tip above `main` that predates the task; the pre-task HEAD is
+      // that tip, and the abort restores it.
       git(repo, "checkout", "-q", "-b", "topic");
       writeFileSync(join(repo, "file.txt"), "topic\n");
       git(repo, "commit", "-q", "-am", "before task");
@@ -267,15 +268,24 @@ describe("evaluateMailAutoCommitGate", () => {
       git(repo, "checkout", "-q", "topic");
       expect(spawnSync(GIT, ["rebase", "main"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
 
-      // The gate starts at the restored read: the first HEAD read returns the
-      // restored tip, the second a different value.
-      const restored = git(repo, "rev-parse", "HEAD").trim();
-      const moved = "f".repeat(40);
+      // The first post-abort read is the real restored HEAD; HEAD then moves
+      // before the final read, so the gate must skip and name both values.
+      let restored = "";
+      let moved = "";
       let headReads = 0;
       const runSync = ((command: any, args: any, options: any) => {
         if ((args as string[]).join(" ") === "rev-parse HEAD") {
           headReads++;
-          return { status: 0, stdout: `${headReads === 1 ? restored : moved}\n`, stderr: "" };
+          if (headReads === 1) {
+            const read = spawnSync(command, args, options);
+            restored = String(read.stdout ?? "").trim();
+            return read;
+          }
+          writeFileSync(join(repo, "moved.txt"), "moved\n");
+          git(repo, "add", "moved.txt");
+          git(repo, "commit", "-q", "-m", "moved");
+          moved = git(repo, "rev-parse", "HEAD").trim();
+          return { status: 0, stdout: `${moved}\n`, stderr: "" };
         }
         return spawnSync(command, args, options);
       }) as typeof spawnSync;
@@ -284,6 +294,9 @@ describe("evaluateMailAutoCommitGate", () => {
         action: "skip",
         message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restored}, final ${moved}) — skipping autoCommit`,
       });
+      // The fixture followed a real abort, and HEAD really moved after it.
+      expect(restored).toBe(baseline);
+      expect(moved).not.toBe(restored);
       expect(headReads).toBe(2);
     } finally {
       rmSync(repo, { recursive: true, force: true });
@@ -312,9 +325,9 @@ describe("resolveAutoCommitRepo", () => {
       const configFile = join(configDir, "agent.yaml");
       writeFileSync(configFile, "agentId: agent-a\nworkspace: workspace\nautoCommit:\n  repo: repo\n");
 
-      // The child loads the real config file the way `tps` does (js-yaml over
-      // the file contents) from a third directory, then runs the gate and the
-      // commit against the repository the loader resolved.
+      // The child parses the real config file with js-yaml from a third
+      // directory and resolves autoCommit.repo against the config file's
+      // directory, then runs the gate and the commit there.
       const workspaceSource = resolve(import.meta.dir, "../src/utils/agent-workspace.ts");
       const runtimeSource = resolve(import.meta.dir, "../src/utils/codex-runtime.ts");
       const yamlModule = resolve(import.meta.dir, "../../../node_modules/js-yaml/index.js");

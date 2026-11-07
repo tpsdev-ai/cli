@@ -1,5 +1,5 @@
 import { dirname, isAbsolute, resolve } from "node:path";
-import { refuseTildeWorkspace } from "@tpsdev-ai/agent";
+import { interpolateEnvInString, refuseTildeWorkspace } from "@tpsdev-ai/agent";
 import { WorktreeLifecycleError } from "./agent-lifecycle.js";
 
 export function agentWorkspace(
@@ -19,18 +19,25 @@ export function agentWorkspace(
 
 /**
  * Resolve `autoCommit.repo` the way a relative `workspace` is resolved: against
- * the config file's directory, so the runtime only ever sees an absolute path.
- * A relative value with no config file to anchor it is refused rather than
- * resolved against the process working directory.
+ * the config file's directory. With `expandEnv`, a loader that reads the config
+ * itself expands `${NAME}` before resolving; a relative value passed to the
+ * runtime directly is refused by `resolveCommitRepo`. A relative value with no
+ * config file to anchor it is refused rather than resolved against the process
+ * working directory.
  */
-export function resolveAutoCommitRepo(configured: string | undefined, configPath?: string): string | undefined {
+export function resolveAutoCommitRepo(
+  configured: string | undefined,
+  configPath?: string,
+  expandEnv = false,
+): string | undefined {
   if (configured === undefined) return undefined;
-  refuseTildeWorkspace(configured, "autoCommit.repo");
-  if (isAbsolute(configured)) return resolve(configured);
+  const value = expandEnv ? interpolateEnvInString(configured) : configured;
+  refuseTildeWorkspace(value, "autoCommit.repo");
+  if (isAbsolute(value)) return resolve(value);
   if (configPath === undefined) {
     throw new Error(
-      `autoCommit.repo '${configured}' is relative and there is no config file path to resolve it against: use an absolute path`,
+      `autoCommit.repo '${value}' is relative and there is no config file path to resolve it against: use an absolute path`,
     );
   }
-  return resolve(dirname(configPath), configured);
+  return resolve(dirname(configPath), value);
 }

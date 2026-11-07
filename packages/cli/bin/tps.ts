@@ -562,8 +562,10 @@ async function main() {
             );
             // A relative autoCommit.repo follows the workspace convention: it is
             // anchored at the config file's directory, never the process cwd.
+            // The non-sandboxed loader expands ${NAME} the same way it does for
+            // workspace; a sandboxed child receives the snapshot's absolute value.
             const autoCommit = agentCfg.autoCommit
-              ? { ...agentCfg.autoCommit, repo: resolveAutoCommitRepo(agentCfg.autoCommit.repo, cfgPath) }
+              ? { ...agentCfg.autoCommit, repo: resolveAutoCommitRepo(agentCfg.autoCommit.repo, cfgPath, !sandboxed) }
               : undefined;
 
             // OPS-47: Build workspace provider from agent.yaml config

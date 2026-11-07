@@ -606,8 +606,8 @@ describe("mail auto-commit checks", () => {
       initRepo(override);
       const workspaceBefore = gitIn(workspace, "rev-parse", "HEAD").trim();
       const overrideBefore = gitIn(override, "rev-parse", "HEAD").trim();
-      // The real config file carries a relative autoCommit.repo; it is loaded the
-      // way `tps` loads it, with the config file's directory as the base.
+      // The real config file carries a relative autoCommit.repo, resolved here
+      // against the config file's directory.
       const configFile = join(root, "agent.yaml");
       writeFileSync(configFile, "agentId: testbot\nworkspace: workspace\nautoCommit:\n  repo: override\n");
       const parsed = parseYaml(readFileSync(configFile, "utf-8")) as { autoCommit: { repo: string } };
