@@ -10,6 +10,27 @@ export function parseWorkflow(source: string) {
   return load(source) as { jobs: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"] };
 }
 
+export function scanQuotedValue(value: string): string[] | null {
+  if (/^'[^'\r\n]*'$/.test(value)) return [];
+  if (value.length < 2 || value[0] !== '"' || value[value.length - 1] !== '"') return null;
+  const names: string[] = [];
+  const end = value.length - 1;
+  for (let index = 1; index < end;) {
+    const char = value[index++];
+    if (/[A-Za-z0-9_./ :+-]/.test(char)) continue;
+    if (char !== "$") return null;
+    const braced = value[index] === "{";
+    if (braced) index++;
+    const start = index;
+    if (index >= end || !/[A-Za-z_]/.test(value[index])) return null;
+    index++;
+    while (index < end && /[A-Za-z0-9_]/.test(value[index])) index++;
+    names.push(value.slice(start, index));
+    if (braced && value[index++] !== "}") return null;
+  }
+  return names;
+}
+
 function resolveRepoDir(base: string, target: string, label: string): string {
   const parts = base.split("/").filter((segment) => segment !== "" && segment !== ".");
   for (const segment of target.split("/")) {
@@ -46,10 +67,8 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
     const assigned = new Set<string>(["RUNNER_TEMP"]);
     const quotedValue = (value: string): boolean => {
-      if (/^'[^'\r\n]*'$/.test(value)) return true;
-      if (!/^"(?:[A-Za-z0-9_./ :+-]|\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*\}))*"$/.test(value)) return false;
-      return [...value.matchAll(/\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})/g)]
-        .every((match) => assigned.has(match[1] ?? match[2]));
+      const names = scanQuotedValue(value);
+      return names !== null && names.every((name) => assigned.has(name));
     };
     const dirs: string[] = [];
     for (const line of lines) {

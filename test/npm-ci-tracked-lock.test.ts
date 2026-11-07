@@ -4,7 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { npmCiLockDirs, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
+import { npmCiLockDirs, parseWorkflow, scanQuotedValue } from "./helpers/npm-ci-workflow-guard";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
 const FIXTURE = "test/fixtures/heartbeat-openclaw";
@@ -173,3 +173,68 @@ it("the real workflow step installs the tracked fixture selected independently b
     expect(readFileSync(join(h.root, "github-env"), "utf8")).toBe(`OPENCLAW_BIN_DIR=${prefix}/node_modules/.bin\n`);
   });
 }, 30_000);
+
+const quotedValues: [string, string[] | null][] = [
+  ["\"\"", []],
+  ["\"literal_0./ :+-\"", []],
+  ["\"$name\"", ["name"]],
+  ["\"${name}\"", ["name"]],
+  ["\"$_name0\"", ["_name0"]],
+  ["\"${_name0}\"", ["_name0"]],
+  ["\"$A0\"", ["A0"]],
+  ["\"${A}0\"", ["A"]],
+  ["\"$A0$A\"", ["A0", "A"]],
+  ["\"path/$name:${other_2}/end\"", ["name", "other_2"]],
+  ["\"$A${B}$A\"", ["A", "B", "A"]],
+  ["''", []],
+  ["'literal $name ${name}'", []],
+  ["'embedded\"quote'", []],
+  ["literal", null],
+  ["\"unterminated", null],
+  ["\"$1\"", null],
+  ["\"$\"", null],
+  ["\"${\"", null],
+  ["\"${name\"", null],
+  ["\"${}\"", null],
+  ["\"${1name}\"", null],
+  ["\"${name-x}\"", null],
+  ["\"embedded\"quote\"", null],
+  ["\"$(name)\"", null],
+  ["\"line\nbreak\"", null],
+  ["\"line\rbreak\"", null],
+  ["\"back\\slash\"", null],
+  ["\"tab\there\"", null],
+  ["'line\nbreak'", null],
+  ["\"a\"\n", null],
+  ["\"\u00e9\"", null],
+];
+
+it.each(quotedValues)("scans quoted value %j", (value, names) => {
+  expect(scanQuotedValue(value)).toEqual(names);
+}, 5_000);
+
+it("checks greedily consumed names against prior assignments", () => {
+  const helper = 'bash scripts/npm-ci-tracked-lock.sh test/fixtures/heartbeat-openclaw "$prefix"';
+  expect(() => npmCiLockDirs('a="literal"\nprefix="$a0"\n' + helper, "", "guard")).toThrow();
+  expect(npmCiLockDirs('a0="literal"\nprefix="$a0"\n' + helper, "", "guard")).toEqual([FIXTURE]);
+}, 5_000);
+
+it("decides a long quoted value within 100 ms", () => {
+  const scanner = fileURLToPath(new URL("./helpers/npm-ci-workflow-guard.ts", import.meta.url));
+  const result = spawnSync(process.execPath, ["--eval", `
+    import { scanQuotedValue } from ${JSON.stringify(scanner)};
+    const input = '"$A' + "0$A".repeat(5000) + "x";
+    const start = performance.now();
+    const names = scanQuotedValue(input);
+    const malformed = scanQuotedValue(input + '!"');
+    const valid = scanQuotedValue(input + '"');
+    console.log(JSON.stringify({ names, malformed, count: valid?.length, elapsed: performance.now() - start }));
+  `], { encoding: "utf8", env: process.env, timeout: 2_000 });
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+  const { names, malformed, count, elapsed } = JSON.parse(result.stdout);
+  expect(names).toBeNull();
+  expect(malformed).toBeNull();
+  expect(count).toBe(5001);
+  expect(elapsed).toBeLessThan(100);
+}, 5_000);
