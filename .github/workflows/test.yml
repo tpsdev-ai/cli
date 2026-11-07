@@ -228,10 +228,11 @@ jobs:
 
   # cli#758 — the heartbeat gateway probe must run against the real OpenClaw
   # command, not only the PATH fake in the unit suite. The lane script prints
-  # the exact pin; this job installs that release into a throwaway prefix with
-  # install scripts disabled (the repo lockfile is untouched), then runs the
-  # built tps heartbeat with an isolated HOME and OpenClaw state: a dead port
-  # (exit 1, persisted error) and a gateway the lane starts (exit 0, online).
+  # the exact pin; this job installs that release into a throwaway prefix from
+  # the committed fixture lockfile with install scripts disabled (the repo
+  # lockfile is untouched, and the fixture's integrity pins the tarball), then
+  # runs the built tps heartbeat with an isolated HOME and OpenClaw state: a dead
+  # port (exit 1, persisted error) and a gateway the lane starts (exit 0, online).
   heartbeat-real-openclaw:
     name: Heartbeat against real OpenClaw
     permissions:
@@ -260,7 +261,10 @@ jobs:
           set -euo pipefail
           pin="$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"
           prefix="$RUNNER_TEMP/openclaw-$pin"
-          sfw npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "openclaw@$pin"
+          fixture=test/fixtures/heartbeat-openclaw
+          mkdir -p "$prefix"
+          cp "$fixture/package.json" "$fixture/package-lock.json" "$prefix/"
+          sfw npm ci --prefix "$prefix" --ignore-scripts --no-audit --no-fund
           echo "OPENCLAW_BIN_DIR=$prefix/node_modules/.bin" >> "$GITHUB_ENV"
       - name: Run heartbeat against the pinned OpenClaw
         run: node scripts/heartbeat-real-openclaw-lane.mjs

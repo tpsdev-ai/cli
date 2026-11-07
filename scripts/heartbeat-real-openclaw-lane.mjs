@@ -12,6 +12,10 @@
  * Without OPENCLAW_BIN_DIR, the lane installs OpenClaw into a throwaway prefix
  * with --ignore-scripts. A supplied directory must contain openclaw.
  *
+ * The dead and live cases run together, and should not be split: the dead case
+ * passes on a failed probe, while the live case is the control that shows the
+ * same command succeeds against a healthy gateway.
+ *
  * Env:
  *   OPENCLAW_BIN_DIR       reuse an installed OpenClaw bin directory
  *   TPS_HEARTBEAT_BIN      built tps entry point (default packages/cli/dist/bin/tps.js)
@@ -25,7 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const OPENCLAW_VERSION = "2026.5.7";
+export const OPENCLAW_VERSION = "2026.5.7";
 const AGENT = "agent-a";
 const TOKEN = "ci-lane-token";
 const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -257,6 +261,36 @@ export async function stopGateway(child, options = {}) {
   }
 }
 
+function formatThrownValue(value) {
+  try {
+    const message = value?.message;
+    return typeof message === "string" ? message : String(value);
+  } catch {
+    return "<unprintable thrown value>";
+  }
+}
+
+/**
+ * Run `action`, then `cleanup`; preserve thrown values, action first.
+ */
+export async function finishWithCleanup(action, cleanup) {
+  let actionFailed = false;
+  let failure;
+  try {
+    await action();
+  } catch (error) {
+    actionFailed = true;
+    failure = error;
+  }
+  try {
+    await cleanup();
+  } catch (error) {
+    if (!actionFailed) throw error;
+    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\ncleanup also failed: ${formatThrownValue(error)}`);
+  }
+  if (actionFailed) throw failure;
+}
+
 async function runDeadCase(root, binDir) {
   const port = await freePort();
   await assertPortClosed(port);
@@ -289,22 +323,25 @@ async function runLiveCase(root, binDir) {
       stdio: ["ignore", logFd, logFd],
     },
   );
-  try {
-    await waitForRpc(testCase, port, binDir, gateway, logPath);
-    const result = runHeartbeat(testCase, port, binDir);
-    assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
-    assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
-    const persisted = readPersisted(testCase);
-    assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
-    assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
-    console.log("PASS live gateway: exit 0, persisted online with no errors");
-  } finally {
-    try {
-      await stopGateway(gateway);
-    } finally {
-      closeSync(logFd);
-    }
-  }
+  await finishWithCleanup(
+    async () => {
+      await waitForRpc(testCase, port, binDir, gateway, logPath);
+      const result = runHeartbeat(testCase, port, binDir);
+      assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
+      assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
+      const persisted = readPersisted(testCase);
+      assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
+      assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
+      console.log("PASS live gateway: exit 0, persisted online with no errors");
+    },
+    async () => {
+      try {
+        await stopGateway(gateway);
+      } finally {
+        closeSync(logFd);
+      }
+    },
+  );
 }
 
 export async function main() {
