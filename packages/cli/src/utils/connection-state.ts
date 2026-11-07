@@ -91,8 +91,9 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * renamed over the target, so a write or rename failure leaves the previous
  * record intact. The parent directory sync after the rename is best-effort:
  * directory fsync is not supported everywhere, and the rename is already
- * atomic for readers. If writing or renaming throws, the helper closes the
- * descriptor, attempts to remove the temp file, and rethrows the error.
+ * atomic for readers. If writing or renaming throws, the helper attempts to
+ * close the descriptor and attempts to remove the temp file, then rethrows the
+ * error; a failed close or removal is swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
@@ -245,7 +246,9 @@ export function clearHostState(branch: string): void {
   });
 }
 
-/** Write the branch connection state record atomically; a failure throws. */
+/** Write the branch connection state record atomically; a write or rename
+ *  failure throws. The parent directory sync after the rename is best-effort,
+ *  so its failure is ignored. */
 export function writeBranchState(state: BranchConnectionState): void {
   mkdirSync(connectionsDir(), { recursive: true });
   writeFileAtomic(branchStatePath(), JSON.stringify(state, null, 2), 0o666);

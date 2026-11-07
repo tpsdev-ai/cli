@@ -338,8 +338,18 @@ function hostPath(identityDir: string): string {
   return join(identityDir, "host.json");
 }
 
+/** Best-effort branch log append: never throws, so logging cannot abort the
+ *  daemon. On append failure it tries one line on stderr carrying the original
+ *  line and the append error; a stderr failure is swallowed too. */
 function logLine(event: string, msg: string): void {
-  appendFileSync(logPath(), `[${new Date().toISOString()}] ${event}: ${msg}\n`, "utf-8");
+  const line = `[${new Date().toISOString()}] ${event}: ${msg}`;
+  try {
+    appendFileSync(logPath(), `${line}\n`, "utf-8");
+  } catch (error) {
+    try {
+      process.stderr.write(`${line} (log append failed: ${error instanceof Error ? error.message : String(error)})\n`);
+    } catch {}
+  }
 }
 
 /**
@@ -552,7 +562,8 @@ async function runStart(): Promise<void> {
       writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
     } catch (error) {
       // A state write failure must not stop message handling: the heartbeat
-      // echo and the rest of the handler still run.
+      // echo and the rest of the handler still run. The log report is
+      // best-effort, so handling continues either way.
       logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
     }
 

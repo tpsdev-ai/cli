@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
@@ -143,5 +143,45 @@ describe("branch daemon state-write failure", () => {
     expect(prefix).not.toBeNull();
     expect(line.slice(prefix![0].length)).toBe(`WARN: Branch state write failed at ${branchStatePath()}: ${writeFailure}`);
     expect(stderr).toBe("");
+  }, 30_000);
+
+  test("heartbeat echoes continue when both the state record and the log are unwritable", async () => {
+    const branch = generateKeyPair();
+    const host = generateKeyPair();
+    saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
+    mkdirSync(process.env.TPS_ROOT!, { recursive: true });
+    writeFileSync(
+      join(process.env.TPS_IDENTITY_DIR!, "host.json"),
+      JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
+    );
+    // A regular file in the connections directory's place and a directory in
+    // the log file's place fail for every uid, including root in CI.
+    writeFileSync(join(process.env.TPS_ROOT!, "connections"), "not a directory");
+    const logPath = join(process.env.TPS_ROOT!, "branch.log");
+    mkdirSync(logPath);
+    expect(() => appendFileSync(logPath, "probe\n", "utf-8")).toThrow();
+    const port = await freePort();
+    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+
+    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
+    delete env.TPS_BRANCH_DAEMON;
+    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+
+    channel = await connectHost(port, host, branch);
+    expect(channel.isAlive()).toBe(true);
+    const first = await exchange(channel, { type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+    expect(first.seq).toBe(7);
+    const second = await exchange(channel, { type: MSG_HEARTBEAT, seq: 8, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
+    expect(second.seq).toBe(8);
+
+    expect(child.exitCode).toBeNull();
+    expect(child.signalCode).toBeNull();
+    expect(() => process.kill(child!.pid!, 0)).not.toThrow();
+    // The best-effort report reaches stderr with the original line and the
+    // append error, and the daemon keeps running.
+    expect(stderr).toContain(`Branch state write failed at ${branchStatePath()}`);
+    expect(stderr).toContain("log append failed");
   }, 30_000);
 });
