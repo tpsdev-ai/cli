@@ -11,6 +11,31 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 
 afterEach(() => { mock.restore(); });
 
+/** The real timer, captured before any test replaces globalThis.setTimeout. */
+const realSetTimeout = globalThis.setTimeout;
+
+/** Reconnect waits run on a short real timer. A microtask here removes the only
+ *  timer between attempts, so a retry chain can starve the per-test timeout. */
+const TEST_RECONNECT_BACKOFF_MS = 100;
+
+function fastReconnectBackoff() {
+  return spyOn(globalThis, "setTimeout").mockImplementation(((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
+      return realSetTimeout(callback, TEST_RECONNECT_BACKOFF_MS, ...args);
+    }
+    return realSetTimeout(callback, delay, ...args);
+  }) as typeof setTimeout);
+}
+
+/** One macrotask, so every connect attempt is separated from the next by a real timer. */
+function yieldRealTimer(): Promise<void> {
+  return new Promise<void>((resolve) => { realSetTimeout(resolve, 1); });
+}
+
 const savedRelayEnv = () => ({ HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
   TPS_IDENTITY_DIR: process.env.TPS_IDENTITY_DIR, TPS_REGISTRY_DIR: process.env.TPS_REGISTRY_DIR,
   TPS_VAULT_KEY: process.env.TPS_VAULT_KEY });
@@ -56,23 +81,11 @@ test("stop() attempts at most the retained bound of channel closes after many re
   let connects = 0;
   let closes = 0;
   const never = new Promise<TransportChannel>(() => {});
-  const realSetTimeout = globalThis.setTimeout;
-  // The reconnect backoff is 4 s at its shortest and grows to 60 s. Run those
-  // waits as microtasks so the test reaches many failures without waiting.
-  const fastBackoff = spyOn(globalThis, "setTimeout").mockImplementation(((
-    callback: (...args: unknown[]) => void,
-    delay?: number,
-    ...args: unknown[]
-  ) => {
-    if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
-      queueMicrotask(() => callback(...args));
-      return 0;
-    }
-    return realSetTimeout(callback, delay, ...args);
-  }) as typeof setTimeout);
+  const fastBackoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
+    await yieldRealTimer();
     if (connects > failures) return never;
     return {
       async send() { throw new Error("initial heartbeat refused"); },
@@ -89,6 +102,11 @@ test("stop() attempts at most the retained bound of channel closes after many re
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; closes < failures && i < 2_000; i++) await Bun.sleep(5);
     expect(closes).toBe(failures);
+    // One attempt per TEST_RECONNECT_BACKOFF_MS: a retry with no backoff would
+    // add many attempts inside this window.
+    await Bun.sleep(20);
+    expect(connects).toBeGreaterThanOrEqual(failures);
+    expect(connects).toBeLessThanOrEqual(failures + 1);
     const beforeStop = closes;
     const started = performance.now();
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
@@ -112,23 +130,11 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
   const failures = 5;
   let connects = 0;
   let stopPhase = false;
-  const never = new Promise<TransportChannel>(() => {});
-  const realSetTimeout = globalThis.setTimeout;
-  const fastBackoff = spyOn(globalThis, "setTimeout").mockImplementation(((
-    callback: (...args: unknown[]) => void,
-    delay?: number,
-    ...args: unknown[]
-  ) => {
-    if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
-      queueMicrotask(() => callback(...args));
-      return 0;
-    }
-    return realSetTimeout(callback, delay, ...args);
-  }) as typeof setTimeout);
+  const fastBackoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
-    if (connects > failures) return never;
+    await yieldRealTimer();
     const id = connects;
     return {
       async send() { throw new Error("initial heartbeat refused"); },
@@ -150,7 +156,11 @@ test("an evicted channel left unclosed keeps the host record and reports the clo
     const path = hostStatePath(branch);
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects <= failures && i < 2_000; i++) await Bun.sleep(5);
-    expect(connects).toBeGreaterThan(failures);
+    // One attempt per TEST_RECONNECT_BACKOFF_MS: a retry with no backoff floods
+    // this window, so a tight loop fails here instead of starving the timeout.
+    expect(connects).toBeLessThanOrEqual(failures + 1);
+    await Bun.sleep(20);
+    expect(connects).toBeLessThanOrEqual(failures + 1);
     expect(existsSync(path)).toBe(true);
     stopPhase = true;
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
@@ -190,7 +200,10 @@ for (const outcome of ["rejects", "resolves"] as const) {
       peerFingerprint() { return "remote"; },
     };
     const diagnostic = spyOn(console, "error").mockImplementation(() => {});
-    const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+      await yieldRealTimer();
+      return channel;
+    });
     let stop: (() => Promise<void>) | undefined;
     try {
       const branch = await prepareBranch(root);
@@ -254,7 +267,10 @@ test("a failed host record refresh is reported once per connection until a write
     return realSetInterval(callback, delay, ...args);
   }) as typeof setInterval);
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
-  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    await yieldRealTimer();
+    return channel;
+  });
   let stop: (() => Promise<void>) | undefined;
   let lockRoot: string | undefined;
   const releaseLock = () => {
