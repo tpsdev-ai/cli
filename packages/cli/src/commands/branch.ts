@@ -12,7 +12,7 @@ import { sendMessage, inboxExists, findRelayedRecord } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
-import { clearBranchState, writeBranchState } from "../utils/connection-state.js";
+import { branchStatePath, clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
@@ -338,8 +338,41 @@ function hostPath(identityDir: string): string {
   return join(identityDir, "host.json");
 }
 
-function logLine(event: string, msg: string): void {
-  appendFileSync(logPath(), `[${new Date().toISOString()}] ${event}: ${msg}\n`, "utf-8");
+/** Escape CR, LF, the Unicode line separators and the other control
+ *  characters JSON-style so one log entry occupies exactly one line. */
+function escapeLogLine(text: string): string {
+  let escaped = "";
+  for (const char of text) {
+    const code = char.charCodeAt(0);
+    if (code === 0x0a) escaped += "\\n";
+    else if (code === 0x0d) escaped += "\\r";
+    else if (code === 0x09) escaped += "\\t";
+    else if (code < 0x20 || code === 0x7f || code === 0x85 || code === 0x2028 || code === 0x2029) {
+      escaped += `\\u${code.toString(16).padStart(4, "0")}`;
+    } else escaped += char;
+  }
+  return escaped;
+}
+
+/** Branch-log lines that could not be appended since the last successful
+ *  append. */
+let lostLogLines = 0;
+
+/** Best-effort branch log append: failed appends are counted. The logger
+ *  attempts to report the count on each later append; it appears on the next
+ *  successful append by the same running daemon. The count is lost if the
+ *  daemon exits or restarts. Nothing is written to stderr. */
+export function logLine(event: string, msg: string): void {
+  const lost = lostLogLines;
+  const suffix = lost > 0 ? ` (${lost} log lines lost)` : "";
+  const line = `${escapeLogLine(`[${new Date().toISOString()}] ${event}: ${msg}`)}${suffix}`;
+  try {
+    appendFileSync(logPath(), `${line}\n`, "utf-8");
+  } catch {
+    lostLogLines += 1;
+    return;
+  }
+  lostLogLines = 0;
 }
 
 /**
@@ -548,7 +581,16 @@ async function runStart(): Promise<void> {
       activeHostChannel = channel;
     }
 
-    writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
+    try {
+      writeBranchState({ connectedAt: new Date().toISOString(), lastSeen: new Date().toISOString(), messagesReceived: 0, messagesPushed: 0 });
+    } catch (error) {
+      // A state write failure must not stop message handling: the heartbeat
+      // echo and the rest of the handler still run. The logger attempts to
+      // append the report to the branch log. Failed appends are counted; the
+      // count appears on the next successful append by the same running daemon
+      // and is lost if the daemon exits or restarts. Nothing is written to stderr.
+      logLine("WARN", `Branch state write failed at ${branchStatePath()}: ${error instanceof Error ? error.message : String(error)}`);
+    }
 
     if (msg.type === MSG_HEARTBEAT) {
       // Echo heartbeat back so host can track bidirectional liveness
