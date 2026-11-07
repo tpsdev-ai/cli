@@ -11,6 +11,9 @@ import * as ws from "../src/utils/ws-noise-transport.js";
 
 afterEach(() => { mock.restore(); });
 
+/** The real timer, captured before any test replaces globalThis.setTimeout. */
+const realSetTimeout = globalThis.setTimeout;
+
 const savedRelayEnv = () => ({ HOME: process.env.HOME, TPS_ROOT: process.env.TPS_ROOT,
   TPS_IDENTITY_DIR: process.env.TPS_IDENTITY_DIR, TPS_REGISTRY_DIR: process.env.TPS_REGISTRY_DIR,
   TPS_VAULT_KEY: process.env.TPS_VAULT_KEY });
@@ -48,17 +51,17 @@ function holdHostLock(path: string): string {
   return root;
 }
 
-/** Run reconnect waits as microtasks so a test reaches a later connect quickly. */
+/** Shorten reconnect waits to a real timer. A microtask here would remove the only
+ *  timer between attempts, letting a retry chain starve the test timeout. */
+const TEST_RECONNECT_BACKOFF_MS = 100;
 function fastReconnectBackoff() {
-  const realSetTimeout = globalThis.setTimeout;
   return spyOn(globalThis, "setTimeout").mockImplementation(((
     callback: (...args: unknown[]) => void,
     delay?: number,
     ...args: unknown[]
   ) => {
     if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
-      queueMicrotask(() => callback(...args));
-      return 0;
+      return realSetTimeout(callback, TEST_RECONNECT_BACKOFF_MS, ...args);
     }
     return realSetTimeout(callback, delay, ...args);
   }) as typeof setTimeout);
@@ -267,7 +270,6 @@ test("a periodic health probe write failure reports path and reason without reco
 test("a connect-time host record write failure is reported before reconnecting", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-connect-write-791-"));
   const savedEnv = savedRelayEnv();
-  const never = new Promise<TransportChannel>(() => {});
   const channel: TransportChannel = {
     async send() {},
     onMessage() {},
@@ -281,29 +283,36 @@ test("a connect-time host record write failure is reported before reconnecting",
   let connects = 0;
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
-    return connects === 1 ? channel : never;
+    // Yield on a real timer: a retry with no backoff must not starve the runner.
+    await new Promise<void>((resolve) => { realSetTimeout(resolve, 1); });
+    return channel;
   });
   let stop: (() => Promise<void>) | undefined;
-  let lockRoot: string | undefined;
-  const releaseLock = () => {
-    if (lockRoot) rmSync(lockRoot, { recursive: true, force: true });
-    lockRoot = undefined;
-  };
+  let blocker: string | undefined;
   try {
     const branch = await prepareBranch(root);
     const path = hostStatePath(branch);
-    lockRoot = holdHostLock(path);
+    // A file where the connections directory belongs makes every connect-time
+    // record write fail at once, without the lock's 5 s wait, so attempts are
+    // countable inside the test's window.
+    blocker = join(root, ".tps", "connections");
+    writeFileSync(blocker, "blocked");
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
+    // One attempt per TEST_RECONNECT_BACKOFF_MS: 20 ms later the next attempt is
+    // still 80 ms away. More than one attempt here is a retry with no backoff.
+    await Bun.sleep(20);
+    expect(connects).toBeLessThanOrEqual(3);
     const line = diagnostic.mock.calls.map((call) => String(call[0])).find((text) => text.includes("connect write failed"));
     expect(line).toBeDefined();
     expect(line).toContain(path);
-    expect(line).toContain("Host state record lock");
-    releaseLock();
+    expect(line).toContain("EEXIST");
+    rmSync(blocker, { force: true });
+    blocker = undefined;
     await stop();
   } finally {
-    releaseLock();
+    if (blocker) rmSync(blocker, { force: true });
     await stop?.().catch(() => {});
     connect.mockRestore();
     diagnostic.mockRestore();
