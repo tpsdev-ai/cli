@@ -5,7 +5,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { assertOpenClawVersion, assertPortClosed, makeCase, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, makeCase, OPENCLAW_VERSION, stopGateway, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
@@ -20,6 +20,20 @@ describe("the OpenClaw version pin", () => {
     expect(() => assertOpenClawVersion(output)).toThrow(
       `expected OpenClaw 2026.5.7, found: ${version || "(missing)"}`,
     );
+  });
+});
+
+const FIXTURE_DIR = new URL("../../../test/fixtures/heartbeat-openclaw/", import.meta.url);
+
+describe("the committed OpenClaw fixture", () => {
+  test("pins the lane's OpenClaw version in its dependency and lockfile", () => {
+    const manifest = JSON.parse(readFileSync(new URL("package.json", FIXTURE_DIR), "utf-8"));
+    expect(manifest.dependencies).toEqual({ openclaw: OPENCLAW_VERSION });
+    const lock = JSON.parse(readFileSync(new URL("package-lock.json", FIXTURE_DIR), "utf-8"));
+    const entry = lock.packages["node_modules/openclaw"];
+    expect(entry).toBeDefined();
+    expect(entry.version).toBe(OPENCLAW_VERSION);
+    expect(entry.integrity).toMatch(/^sha512-/);
   });
 });
 
@@ -171,6 +185,43 @@ describe("the readiness deadline bounds each probe", () => {
     expect(probeTimeouts).toEqual([60, 35, 10]);
     expect(clockMs).toBe(budgetMs);
   }, 1000);
+});
+
+describe("a cleanup failure does not hide the assertion that failed", () => {
+  test("reports the assertion first and the failing stopGateway after it", async () => {
+    const assertion = new Error("live gateway: heartbeat exit status must be 0");
+    const child = { pid: 4324, exitCode: null };
+    let reported: unknown;
+    try {
+      await finishWithCleanup(
+        async () => {
+          throw assertion;
+        },
+        () => stopGateway(child, { graceMs: 5, killMs: 10, pollMs: 2, signalGroup: () => {} }),
+      );
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBeInstanceOf(AggregateError);
+    const aggregate = reported as AggregateError;
+    expect(aggregate.errors[0]).toBe(assertion);
+    const assertionAt = aggregate.message.indexOf(assertion.message);
+    const cleanupAt = aggregate.message.indexOf("did not exit after SIGKILL");
+    expect(assertionAt).toBeGreaterThanOrEqual(0);
+    expect(cleanupAt).toBeGreaterThan(assertionAt);
+  });
+
+  test("a cleanup failure on its own is still reported", async () => {
+    const cleanup = new Error("gateway process 4325 did not exit after SIGKILL");
+    await expect(
+      finishWithCleanup(
+        async () => {},
+        async () => {
+          throw cleanup;
+        },
+      ),
+    ).rejects.toBe(cleanup);
+  });
 });
 
 describe("cleanup fails the lane when the gateway does not exit", () => {
