@@ -379,16 +379,15 @@ test("a connect-time host record write failure is reported before reconnecting",
     stop = await connectAndKeepAlive(branch);
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
-    // Each reconnect waits TEST_RECONNECT_BACKOFF_MS. This window starts after
-    // the second attempt, so at most one further attempt can start; a retry
-    // with no backoff exceeds the cumulative count of 3.
-    await Bun.sleep(20);
-    expect(connects).toBeLessThanOrEqual(3);
+    // Each completed attempt logs one connect-write failure, so wait for the
+    // two failures the first two attempts produce. A third attempt cannot start
+    // before TEST_RECONNECT_BACKOFF_MS (100 ms), so the captured list is
+    // complete once the second failure lands.
+    for (let i = 0; diagnostic.mock.calls.length < 2 && i < 400; i++) await Bun.sleep(5);
     const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: EEXIST: file already exists, mkdir '${connectionsDir}'`;
-    // Every matching attempt's call must carry exactly the one expected argument.
-    const connectCalls = diagnostic.mock.calls.filter((call) => String(call[0]).includes("connect write failed"));
-    expect(connectCalls.length).toBeGreaterThan(0);
-    for (const call of connectCalls) expect(call).toEqual([expectedLine]);
+    // The complete captured list, unfiltered and in order: each completed
+    // failure logged exactly one one-argument call.
+    expect(diagnostic.mock.calls).toEqual([[expectedLine], [expectedLine]]);
     rmSync(blocker, { force: true });
     blocker = undefined;
     await stop();
@@ -446,10 +445,9 @@ test("a second connect-time host record write failure is reported before reconne
     const lockRootPath = hostStateLockRoot(path);
     const lockDir = mailLockPath(lockRootPath);
     const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`;
-    // Every matching attempt's call must carry exactly the one expected argument.
-    const connectCalls = diagnostic.mock.calls.filter((call) => String(call[0]).includes("connect write failed"));
-    expect(connectCalls.length).toBeGreaterThan(0);
-    for (const call of connectCalls) expect(call).toEqual([expectedLine]);
+    // The first write succeeded; only the second attempt's write failed, and
+    // it logged once. The complete captured list is compared unfiltered.
+    expect(diagnostic.mock.calls).toEqual([[expectedLine]]);
     expect(readHostState(branch)).not.toBeNull();
     releaseLock();
     await stop();
