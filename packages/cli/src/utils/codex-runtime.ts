@@ -934,7 +934,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
     let lastSnapshot = Date.now();
     let lastTokenRefresh = Date.now();
     const TOKEN_REFRESH_INTERVAL_MS = 30 * 60 * 1000; // check every 30min
-    while (true) {
+    while (!shutdownRequested) {
       if (Date.now() - lastTokenRefresh > TOKEN_REFRESH_INTERVAL_MS) {
         await ensureFreshOpenAIToken(agentId);
         lastTokenRefresh = Date.now();
@@ -943,7 +943,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         await snapshotSoulToDisk(flair, agentId);
         lastSnapshot = Date.now();
       }
+      if (shutdownRequested) break;
       for (const msg of await pollRuntimeMail(mailCfg)) {
+        if (shutdownRequested) break;
         console.log(`[${agentId}] Processing mail from ${msg.from}: ${msg.body.slice(0, 60)}...`);
         const refusal = codexDispatchRefusal(msg.envelope, msg.from, msg.trustTier);
         if (refusal) {
@@ -956,6 +958,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
             console.warn(`[${agentId}] Pre-task lifecycle failed: ${err.message}`);
           }
         }
+        if (shutdownRequested) break;
         try {
           const flairPub2 = { publishEvent: async (ev: Record<string, unknown>) => {
             try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
@@ -1048,6 +1051,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
         }
       }
 
+      if (shutdownRequested) break;
       await new Promise(r => setTimeout(r, 5000));
     }
   } catch (err) {

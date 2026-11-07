@@ -1,2 +1,2 @@
 - **The Codex runtime bounds the drain of its Flair loop stop handles before
-  the final Presence beat.** Stopped loops discard late reads.
+  the final Presence beat.** Stopped loops discard late reads. Mail awaiting dispatch at shutdown stays unacknowledged.

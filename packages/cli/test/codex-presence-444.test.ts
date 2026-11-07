@@ -4,9 +4,13 @@ const patchShared = createPatchShared();
 // NEVER writes the agent's own Agent row: in Flair `Agent.status` is the
 // principal's lifecycle state, so a value other than `active` deactivates the
 // agent.
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { generateKeyPairSync, verify as edVerify } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import * as childProcess from "node:child_process";
+import * as runtimeMail from "../src/utils/runtime-mail.js";
+import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+import { sendMessage } from "../src/utils/mail.js";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,6 +29,8 @@ import { startTaskLoop } from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import { homeDir } from "../src/utils/home.js";
 import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
+
+afterEach(() => { mock.restore(); });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -63,6 +69,8 @@ async function driveRuntime(
     signalDuringPreflight?: boolean;
     secondSignal?: "SIGTERM" | "SIGINT";
     preflightError?: Error;
+    lateMail?: "poll" | "preparation";
+    observeMailAfterExit?: boolean;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), `cli444-rt-${signal}-`));
@@ -82,6 +90,34 @@ async function driveRuntime(
   const keyPath = join(dir, "testbot.key");
   writeFileSync(keyPath, keySeed().seed);
 
+  const savedPoll = runtimeMail.pollRuntimeMail;
+  let mailPolls = 0;
+  let releaseMail: (() => void) | undefined;
+  let releaseLoop: (() => void) | undefined;
+  let releasePreparation: (() => void) | undefined;
+  let prepared = 0;
+  let resets = 0;
+  const state = { ref: "fixture", timestamp: new Date().toISOString(), provider: "test" };
+  const workspaceProvider: WorkspaceProvider = {
+    type: "test",
+    snapshot: async () => {
+      prepared++;
+      if (opts.lateMail === "preparation") await new Promise<void>((resolve) => { releasePreparation = resolve; });
+      return state;
+    },
+    reset: async () => { resets++; },
+    checkpoint: async () => state,
+    diff: async () => ({ summary: "" }),
+    baseline: async () => state,
+  };
+  const taskGit = opts.lateMail ? spyOn(childProcess, "spawnSync").mockImplementation(() => ({ status: 1, stdout: "", stderr: "fixture" }) as never) : undefined;
+  const taskSpawn = opts.lateMail ? spyOn(childProcess, "spawn").mockImplementation(() => { throw new Error("unexpected task launch"); }) : undefined;
+  const pollSpy = spyOn(runtimeMail, "pollRuntimeMail").mockImplementation(async (cfg) => {
+    mailPolls++;
+    const messages = await savedPoll(cfg);
+    if (opts.lateMail === "poll" && messages.length) await new Promise<void>((resolve) => { releaseMail = resolve; });
+    return messages;
+  });
   const savedFetch = globalThis.fetch;
   const savedExit = process.exit;
   const savedSetTimeout = globalThis.setTimeout;
@@ -105,6 +141,11 @@ async function driveRuntime(
   const inboxCur = join(mailRoot, "testbot", "cur");
 
   process.env.TPS_MAIL_DIR = mailRoot;
+  if (opts.lateMail) {
+    const seeds = { "agent-a": Buffer.alloc(32, 0x57) };
+    const envelope = buildSignedEnvelope("agent-a", "testbot", "fixture task", seeds, { trust: "internal" });
+    sendMessage("testbot", JSON.stringify(envelope), "agent-a");
+  }
   if (opts.preflightError) {
     patchShared(FlairClient.prototype, "ping", async () => {
       await new Promise<void>((resolve) => { releasePreflight = resolve; });
@@ -112,6 +153,7 @@ async function driveRuntime(
     });
   }
   patchShared(FlairClient.prototype, "getEventsSince", async function (...args) {
+    if (opts.lateMail && resets === 1) await new Promise<void>((resolve) => { releaseLoop = resolve; });
     const read = await savedRead.apply(this, args);
     if (read.status === "ok") successfulReads++;
     return read;
@@ -128,6 +170,11 @@ async function driveRuntime(
         await new Promise<void>((resolve) => { releaseFinalBeat = resolve; });
       }
     }
+    expect(new URL(url).origin).toBe("http://127.0.0.1:9931");
+    if (path === "/Agent/agent-a") {
+      return Response.json({ id: "agent-a", publicKey: pubkeyFromSeed(Buffer.alloc(32, 0x57)).toString("base64") });
+    }
+    if (path.startsWith("/WorkspaceState")) return Response.json([]);
     if (path === "/Health") {
       if (opts.signalDuringPreflight) await new Promise<void>((resolve) => { releasePreflight = resolve; });
       return new Response("ok", { status: 200 });
@@ -155,6 +202,7 @@ async function driveRuntime(
       flairKeyPath: keyPath,
       supervisorId: "agent-supervisor",
       reviewTrigger: opts.reviewTrigger,
+      workspaceProvider: opts.lateMail ? workspaceProvider : undefined,
     }).then(() => { runtimeFinished = true; }).catch((e: Error) => {
       rejected = e;
     });
@@ -162,6 +210,9 @@ async function driveRuntime(
     await waitFor(() => presenceBodies.length >= 1, 5000); // startup beat
     if (opts.signalDuringPreflight) {
       await waitFor(() => releasePreflight !== undefined);
+    } else if (opts.lateMail) {
+      await waitFor(() => releaseLoop !== undefined && (opts.lateMail === "poll" ? releaseMail !== undefined : releasePreparation !== undefined));
+      taskGit!.mockClear();
     } else {
       await waitFor(() => existsSync(inboxCur), 5000); // one mail tick
       ticked = true;
@@ -174,6 +225,20 @@ async function driveRuntime(
     patchShared(globalThis, "setTimeout", countDrainTimeout);
     signalResults.push(process.emit(signal));
     patchShared(globalThis, "setTimeout", savedSetTimeout);
+    if (opts.lateMail) {
+      expect(exits, "shutdown is still draining the task-loop read").toBe(0);
+      releaseMail?.();
+      releasePreparation?.();
+      await sleep(30);
+      expect(taskGit!.mock.calls, "late mail does not reach workspace sync").toHaveLength(0);
+      expect(taskSpawn!.mock.calls, "late mail does not launch Codex").toHaveLength(0);
+      expect(prepared).toBe(opts.lateMail === "poll" ? 0 : 1);
+      expect(resets, "no reset after the boot reset").toBe(1);
+      const records = readdirSync(inboxCur).filter((file) => file.endsWith(".json"));
+      expect(records, "late mail stays unacknowledged in cur").toHaveLength(1);
+      expect(JSON.parse(readFileSync(join(inboxCur, records[0]!), "utf8")).body).toBe("fixture task");
+      releaseLoop?.();
+    }
     if (opts.preflightError) {
       await waitFor(() => releaseFinalBeat !== undefined);
       releasePreflight?.();
@@ -200,8 +265,22 @@ async function driveRuntime(
     }
     expect(process.listenerCount("SIGTERM")).toBe(savedSigterm.length);
     expect(process.listenerCount("SIGINT")).toBe(savedSigint.length);
+    if (opts.observeMailAfterExit) {
+      const pollsAtExit = mailPolls;
+      expect(pollsAtExit).toBeGreaterThan(0);
+      process.env.TPS_MAIL_DIR = join(dir, "later-mail");
+      await sleep(5500);
+      expect(mailPolls, "mail polls stop after shutdown").toBe(pollsAtExit);
+      expect(existsSync(join(dir, "later-mail"))).toBe(false);
+    }
     if (afterShutdown) await afterShutdown(http);
   } finally {
+    releaseMail?.();
+    releasePreparation?.();
+    releaseLoop?.();
+    pollSpy.mockRestore();
+    taskGit?.mockRestore();
+    taskSpawn?.mockRestore();
     releasePreflight?.();
     releaseFinalBeat?.();
     if (releaseFinalBeat) await waitFor(() => exitCode !== undefined);
@@ -538,6 +617,18 @@ describe("codex runtime presence (cli#444)", () => {
     },
     10_000,
   );
+
+  it.each(["poll", "preparation"] as const)("mail held in %s at SIGTERM stays unacknowledged without workspace sync or task launch", async (lateMail) => {
+    const r = await driveRuntime("SIGTERM", undefined, { lateMail });
+    expect(r.rejected).toBeUndefined();
+    expect(r.exitCode).toBe(0);
+  }, 15_000);
+
+  it("mail polling stops after shutdown when process.exit returns", async () => {
+    const r = await driveRuntime("SIGTERM", undefined, { observeMailAfterExit: true });
+    expect(r.rejected).toBeUndefined();
+    expect(r.exitCode).toBe(0);
+  }, 15_000);
 
   it(
     "runCodexRuntime beats at startup, ticks the mailbox, and beats idle on SIGTERM — never writing /Agent/<id>",
