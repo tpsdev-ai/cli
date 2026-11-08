@@ -344,10 +344,8 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// cli#833 — the sandboxed launch's autoCommit.repo must sit inside a write
-// grant. One launch with the repository inside the workspace (the commit
-// lands there under the same profile) and one outside (the launch is refused
-// before anything is spawned).
+// cli#833 — check autoCommit.repo against launch-option paths before nono run
+// and the agent child. Profile-only filesystem.allow/write grants are not checked.
 // ---------------------------------------------------------------------------
 
 function writeProbeConfig(sb: { home: string; ws: string }, autoCommitRepo?: string): void {
@@ -379,8 +377,8 @@ const launchEnv = (sb: { home: string; tmp: string }) => ({
   TPS_LAUNCH_TIMEOUT_MS: "20000",
 });
 
-real("cli#833 — real nono: an autoCommit.repo outside the write grants is refused", () => {
-  test("the launch is refused with the message and nothing is spawned", () => {
+real("cli#833 — real nono: an autoCommit.repo outside launch-option paths is refused", () => {
+  test("the launch is refused before nono run and the agent child", () => {
     const sb = sandbox();
     try {
       const outside = join(sb.root, "outside", "repo");

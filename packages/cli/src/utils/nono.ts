@@ -751,7 +751,7 @@ function pathsOverlap(a: string, b: string): boolean {
 }
 
 /**
- * True when the write grant `grant` covers `target`: equal, or `target` is
+ * True when the directory write grant `grant` covers `target`: equal, or `target` is
  * beneath it. Both sides are compared as REAL paths (symlinks resolved), and
  * the match is on a path-segment boundary, so `/work/agent-x` is not inside
  * `/work/agent` (cli#833).
@@ -765,23 +765,24 @@ export function writeGrantCovers(grant: string, target: string): boolean {
 }
 
 /**
- * The refusal for an `autoCommit.repo` outside every write grant the launch
- * computes (workdir, cwd, `--allow` directories and `--allow-file` files), or
- * null when one grant covers it. It names the repository, the granted paths
- * and the remedy, and never adds or widens a grant (cli#833).
+ * Refuse an `autoCommit.repo` outside the launch-option paths checked:
+ * workdir, cwd and `--allow` directories, and exact `--allow-file` files.
+ * Profile-only `filesystem.allow` / `filesystem.write` grants are not consulted
+ * (cli#833).
  */
 export function autoCommitRepoGrantRefusal(repo: string, options: NonoOptions): string | null {
-  const grants = [
+  const directories = [
     ...new Set([
       ...(options.workdir ? [options.workdir] : []),
       ...(options.cwd ? [options.cwd] : []),
       ...(options.allow ?? []),
-      ...(options.allowFiles ?? []),
     ]),
   ];
-  if (grants.some((grant) => writeGrantCovers(grant, repo))) return null;
+  const files = [...new Set(options.allowFiles ?? [])];
+  if (directories.some((grant) => writeGrantCovers(grant, repo)) ||
+      files.some((grant) => canonicalPath(grant) === canonicalPath(repo))) return null;
   return (
-    `autoCommit.repo '${repo}' is outside the sandbox's write grants (${grants.join(", ")}): ` +
+    `autoCommit.repo '${repo}' is outside the launch-option paths checked (${[...directories, ...files].join(", ")}): ` +
     `put the repository under the workspace, or run that agent without the sandbox`
   );
 }

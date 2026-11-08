@@ -1,10 +1,9 @@
 /**
- * cli#833 — the sandboxed launch's auto-commit repository must sit inside one
- * of the sandbox's write grants. These cases pin the containment check: real
- * paths on both sides and a path-segment boundary.
+ * cli#833 — check launch-option directories and exact files, using real paths.
+ * Profile-only `filesystem.allow` / `filesystem.write` grants are not consulted.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { autoCommitRepoGrantRefusal, writeGrantCovers } from "../src/utils/nono.js";
@@ -19,7 +18,7 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-describe("cli#833 — write-grant containment", () => {
+describe("cli#833 — directory write-grant containment", () => {
   test("a repository inside the grant is covered", () => {
     const grant = join(root, "work", "agent");
     mkdirSync(join(grant, "repo"), { recursive: true });
@@ -40,7 +39,7 @@ describe("cli#833 — write-grant containment", () => {
     expect(writeGrantCovers(grant, sibling)).toBe(false);
   });
 
-  test("a path outside every grant is not covered", () => {
+  test("a path outside the directory grant is not covered", () => {
     const grant = join(root, "work", "agent");
     mkdirSync(grant, { recursive: true });
     expect(writeGrantCovers(grant, join(root, "elsewhere", "repo"))).toBe(false);
@@ -67,7 +66,24 @@ describe("cli#833 — write-grant containment", () => {
 });
 
 describe("cli#833 — the launch refusal", () => {
-  test("names the repository, the grants and the remedy", () => {
+  test("a repository beneath an allowFiles entry is refused", () => {
+    const fileGrant = join(root, "file-grant");
+    const repo = join(fileGrant, "repo");
+    mkdirSync(repo, { recursive: true });
+    expect(autoCommitRepoGrantRefusal(repo, { allowFiles: [fileGrant] })).toContain(
+      `autoCommit.repo '${repo}' is outside the launch-option paths checked`,
+    );
+  });
+
+  test("a canonically equal file grant is accepted", () => {
+    const file = join(root, "file");
+    const alias = join(root, "alias");
+    writeFileSync(file, "");
+    symlinkSync(file, alias);
+    expect(autoCommitRepoGrantRefusal(alias, { allowFiles: [file] })).toBeNull();
+  });
+
+  test("names the repository, the launch-option paths checked and the remedy", () => {
     const workspace = join(root, "work", "agent");
     const mailDir = join(root, "mail");
     const agentDir = join(root, "state", "agent");
@@ -80,12 +96,13 @@ describe("cli#833 — the launch refusal", () => {
       allowFiles: [],
     });
     expect(refusal).toContain(`autoCommit.repo '${outside}'`);
+    expect(refusal).toContain("outside the launch-option paths checked");
     expect(refusal).toContain(workspace);
     expect(refusal).toContain(agentDir);
     expect(refusal).toContain("put the repository under the workspace, or run that agent without the sandbox");
   });
 
-  test("is null for a repository inside a grant", () => {
+  test("is null for a repository inside a launch-option directory", () => {
     const workspace = join(root, "work", "agent");
     mkdirSync(join(workspace, "repo"), { recursive: true });
     expect(

@@ -2242,12 +2242,12 @@ exit 0
 });
 
 // ---------------------------------------------------------------------------
-// cli#833 — a sandboxed launch refuses an autoCommit.repo outside the
-// sandbox's write grants, before nono is spawned.
+// cli#833 — refuse autoCommit.repo outside launch-option paths before nono run
+// and the agent child. Profile-only filesystem.allow/write grants are not checked.
 // ---------------------------------------------------------------------------
 
 describe("cli#833 — autoCommit.repo containment at launch", () => {
-  test("outside every grant: refused before nono, naming the repo, the grants and the remedy", () => {
+  test("outside launch-option paths: refused before nono run and the agent child", () => {
     const sb = makeSandbox();
     try {
       const outside = join(sb.root, "outside", "repo");
@@ -2291,7 +2291,7 @@ describe("cli#833 — autoCommit.repo containment at launch", () => {
       );
       const runs = fakeNonoRuns(sb.root).join("\n");
       expect(runs).toContain("--runtime codex");
-      expect(runs).not.toContain("outside the sandbox's write grants");
+      expect(runs).not.toContain("outside the launch-option paths checked");
     } finally {
       rmSync(sb.root, { recursive: true, force: true });
     }
