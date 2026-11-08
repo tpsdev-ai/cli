@@ -1844,26 +1844,28 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // seenFiles dedupes inotify events (fs.watch can fire multiple times per
-    // write — see the debounce in the watcher callback) and the periodic rescan
-    // of new/ (cli#853). It is intentionally NOT pre-populated from the existing
-    // new/ snapshot at startup: any file already sitting in new/ when the gateway
-    // starts is mail that arrived while the gateway was down (or that a previous
-    // turn never ack'd) and MUST be processed on this startup, not silently
-    // swallowed. A path stays in seenFiles for this account lifetime, including
-    // after a processing error, so neither the watcher nor the rescan retries it
-    // before the next start.
+    // seenFiles holds every new/ path taken in this account lifetime. The
+    // watcher (fs.watch can fire several events per write — see its debounce),
+    // the startup sweep and the periodic rescan (cli#853) all go through
+    // processNewFile, so within one lifetime a path is promoted at most once,
+    // including after a processing error (no retry before the next start).
+    // It is NOT pre-populated at startup: a file already in new/ when the
+    // gateway starts (mail that arrived while it was down, or a path a previous
+    // lifetime left there after a failed promotion) is taken by the startup
+    // sweep.
     //
-    // Replay safety comes from `moveToCur` after dispatch — successful turns
-    // ack and move the file to cur/, failed dispatches nack and also move to
-    // cur/, malformed files are moved to dlq/. None of these paths leave a
-    // file in new/, so re-processing the same id twice is impossible across
-    // restarts unless the gateway crashed mid-turn (acceptable: at-least-once
-    // delivery is the contract).
+    // Across restarts: promote() moves a record new/ → cur/ (or dlq/) BEFORE it
+    // is dispatched, so a dispatched record is never read from new/ again; a
+    // record promoted but never acked is re-dispatched from cur/ by the
+    // crash-recovery sweep (at-least-once delivery is the contract).
     const seenFiles = new Set<string>();
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
+      // Dot-files are never mail (scratch/editor files; the agent-side reader
+      // skips them too): no path — watcher, startup sweep or rescan — promotes
+      // or dead-letters one.
+      if (basename(filePath).startsWith(".")) return;
       seenFiles.add(filePath);
 
       // ONE enforcement point, shared with the CLI: parse wrapper → envelope,
@@ -1931,7 +1933,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       seenFiles.add(curPath);
 
       if (rescanPath) {
-        log?.info?.(`tps-mail: delivered by rescan, no watch event: ${rescanPath}`);
+        log?.info?.(`tps-mail: promoted by rescan: ${rescanPath}`);
       }
       log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
       // Session key: one conversation per (channel, sender) pair.
@@ -2379,9 +2381,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         try {
           for (const filename of await readdir(newDir)) {
             if (!isLive()) break;
-            // Dot-files are never mail (scratch/editor files); the agent-side
-            // reader skips them too, so the rescan must not dead-letter one.
-            if (filename.startsWith(".")) continue;
             const filePath = resolve(newDir, filename);
             if (pendingWatchFiles.has(filePath)) continue;
             void processNewFile(agentId, filePath, "rescan").catch((err) => {

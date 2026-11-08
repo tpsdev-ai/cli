@@ -145,12 +145,12 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(dispatches).toEqual(["missed-event"]);
     expect(fs.existsSync(path)).toBe(false);
     expect(fs.existsSync(join(root, "recipient", "cur", "missed-event.json"))).toBe(true);
-    expect(logs.filter((line) => line.includes("delivered by rescan"))).toEqual([
-      `tps-mail: delivered by rescan, no watch event: ${path}`,
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toEqual([
+      `tps-mail: promoted by rescan: ${path}`,
     ]);
     await sleep(intervalMs);
     expect(promoteSpy).toHaveBeenCalledTimes(1);
-    expect(logs.filter((line) => line.includes("delivered by rescan"))).toHaveLength(1);
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toHaveLength(1);
   });
 
   it("skips dot-files in new/ (never mail) while delivering a missed message", async () => {
@@ -167,12 +167,25 @@ describe("new/ periodic rescan (cli#853)", () => {
       ? fs.readdirSync(join(root, "recipient", "dlq")).filter((f) => f.includes("scratch")) : []).toEqual([]);
   });
 
+  it("a dot-file reported by the watcher is not promoted either", async () => {
+    await boot();
+    suppressWatch = false;
+    const scratch = join(newDir, ".scratch-watched.json");
+    fs.writeFileSync(scratch, "{ not mail");
+    notifyWatch?.(".scratch-watched.json");
+    const path = plant("watched-after-dotfile");
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    await sleep(intervalMs);
+    expect(fs.existsSync(scratch)).toBe(true);
+    expect(promoteSpy.mock.calls.map((c: any[]) => String(c[1]))).toEqual([path]);
+  });
+
   it("rescans an inbox when watcher registration throws", async () => {
     watchSpy.mockImplementationOnce(() => { throw new Error("injected watch failure"); });
     await boot();
     const path = plant("watch-unavailable");
     expect(await until(() => dispatches.length === 1, intervalMs * 2)).toBe(true);
-    expect(logs).toContain(`tps-mail: delivered by rescan, no watch event: ${path}`);
+    expect(logs).toContain(`tps-mail: promoted by rescan: ${path}`);
   });
 
   it("keeps watched promotion single while rescans see its path in new/", async () => {
@@ -185,7 +198,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(fs.existsSync(path)).toBe(true);
     expect(await until(() => ticks >= 2)).toBe(true);
     expect(promoteSpy).toHaveBeenCalledTimes(1);
-    expect(logs.filter((line) => line.includes("delivered by rescan"))).toEqual([]);
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toEqual([]);
     releaseVerify!();
     expect(await until(() => dispatches.length === 1)).toBe(true);
     expect(dispatches).toEqual(["watched-event"]);
@@ -202,7 +215,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(watchCalls).toBe(1);
     expect(ticks).toBeGreaterThanOrEqual(1);
     expect(promoteSpy).toHaveBeenCalledTimes(1);
-    expect(logs.filter((line) => line.includes("delivered by rescan"))).toEqual([]);
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toEqual([]);
   });
 
   it("leaves an already-seen path in new/ after a processing error", async () => {
@@ -216,7 +229,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(promoteSpy).toHaveBeenCalledTimes(1);
     expect(fs.existsSync(path)).toBe(true);
     expect(dispatches).toEqual([]);
-    expect(logs.filter((line) => line.includes("delivered by rescan"))).toEqual([]);
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toEqual([]);
   });
 
   it("clears the rescan timer on abort before another callback fires", async () => {
