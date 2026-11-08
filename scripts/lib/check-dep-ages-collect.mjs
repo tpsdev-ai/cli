@@ -438,7 +438,7 @@ function unsupportedWorkspacePattern(pattern) {
  * with an empty or `.` alternative. The gate reads workspace patterns only when
  * `minimumReleaseAgeExcludes` is non-empty.
  *
- * @returns {string | null} the reason, naming the syntax and the remedy
+ * @returns {string | null} the reason and remedy
  */
 function unmodelledGlobSyntax(pattern) {
   let braces = 0;
@@ -471,9 +471,6 @@ function unmodelledGlobSyntax(pattern) {
 
 /**
  * Refuse an empty or `.` alternative inside a brace group, at any nesting level.
- * The gate reads such a branch as the directory itself, so `packages/{a,}` would
- * also apply the parent directory `packages`; it refuses the pattern instead of
- * modelling that reading.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
  */

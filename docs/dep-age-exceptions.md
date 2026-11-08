@@ -40,7 +40,8 @@ an exclusion applies to. It refuses these shapes:
   directory `packages`;
 - a pattern using glob syntax the gate does not model: a `(`, `)` or `|`
   outside a `[...]` class, an extended glob (`?(...)`, `*(...)`, `+(...)`,
-  `@(...)`, `!(...)`), or a brace range such as `{1..3}`. Bun 1.3.10 matches
+  `@(...)`, `!(...)`), or any `..` inside a brace group (such as
+  `packages/{1..3}` or `packages/{..,a}`). Bun 1.3.10 matches
   neither `packages/+([ab])` nor `packages/@(a|b)` and installs no workspace
   (`packages/@(a|b)` exits with `Workspace not found`), while 1.4.4 installs
   the matching directories.
