@@ -188,8 +188,8 @@ describe("openclaw-tps-mail: seenFiles startup behavior", () => {
     expect(result.ctx.MessageSid).toBe("msg-startup-001");
     expect(result.ctx.Body).toBe("hello from startup test");
 
-    // Poll for file to move from new/ to cur/ (moveToCur is sync but runs after
-    // dispatch; polling avoids brittle 50ms sleeps on slow CI).
+    // Poll for the file to leave new/ for cur/ (promote() commits the cur/ record
+    // before dispatch; polling avoids brittle 50ms sleeps on slow CI).
     const curDir = resolve(tempMailDir, agentId, "cur");
     const moved = await pollUntil(
       () => readdirSync(newDir).length === 0 && readdirSync(curDir).length >= 1,

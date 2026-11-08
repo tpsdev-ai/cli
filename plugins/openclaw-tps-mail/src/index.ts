@@ -53,6 +53,7 @@
 
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
@@ -810,6 +811,7 @@ const armedDeadlines = new Map<string, ArmedDeadline>();
 interface AccountLifetime {
   incarnation: symbol;
   timers: Set<ReturnType<typeof setTimeout>>;
+  intervals: Set<ReturnType<typeof setInterval>>;
   watchers: Set<FSWatcher>;
   resolveShutdown: () => void;
 }
@@ -864,6 +866,7 @@ function endAccountLifetime(accountId: string, incarnation?: symbol): void {
   if (lifetime) {
     lifetime.resolveShutdown();
     for (const timer of lifetime.timers) clearTimeout(timer);
+    for (const interval of lifetime.intervals) clearInterval(interval);
     for (const watcher of lifetime.watchers) {
       try { watcher.close(); } catch { /* ignore */ }
     }
@@ -1782,6 +1785,8 @@ const outbound: ChannelOutboundAdapter = {
   },
 };
 
+export const NEW_DIR_RESCAN_MS = 30_000;
+
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
     const { account, cfg, log } = ctx;
@@ -1823,7 +1828,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     const incarnation = Symbol(account.accountId);
     let resolveShutdown!: () => void;
     const shutdown = new Promise<void>((resolve) => { resolveShutdown = resolve; });
-    const lifetime: AccountLifetime = { incarnation, timers: new Set(), watchers: new Set(), resolveShutdown };
+    const lifetime: AccountLifetime = { incarnation, timers: new Set(), intervals: new Set(), watchers: new Set(), resolveShutdown };
     accountLifetimes.set(account.accountId, lifetime);
     gatewayIncarnations.set(ctx, incarnation);
     if (ctx.abortSignal) signalIncarnations.set(ctx.abortSignal, incarnation);
@@ -1839,23 +1844,30 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // seenFiles dedupes inotify events (fs.watch can fire multiple times per
-    // write — see the debounce in the watcher callback). It is intentionally
-    // NOT pre-populated from the existing new/ snapshot at startup: any file
-    // already sitting in new/ when the gateway starts is mail that arrived
-    // while the gateway was down (or that a previous turn never ack'd) and
-    // MUST be processed on this startup, not silently swallowed.
+    // seenFiles holds every new/ path taken in this account lifetime. The
+    // watcher (fs.watch can fire several events per write — see its debounce),
+    // the startup sweep and the periodic rescan (cli#853) all go through
+    // processNewFile, so within one lifetime a path is promoted at most once,
+    // including after a processing error (no retry before the next start).
+    // It is NOT pre-populated at startup: a file already in new/ when the
+    // gateway starts (mail that arrived while it was down, or a path a previous
+    // lifetime left there after a failed promotion) is taken by the startup
+    // sweep.
     //
-    // Replay safety comes from `moveToCur` after dispatch — successful turns
-    // ack and move the file to cur/, failed dispatches nack and also move to
-    // cur/, malformed files are moved to dlq/. None of these paths leave a
-    // file in new/, so re-processing the same id twice is impossible across
-    // restarts unless the gateway crashed mid-turn (acceptable: at-least-once
-    // delivery is the contract).
+    // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
+    // BEFORE dispatch; removing the new/ source is best-effort, and a later
+    // attempt on a leftover source still passes through the replay check.
+    // Startup attempts recovery of eligible cur/ records through
+    // re-verification; an existing obligation is reconciled rather than
+    // dispatched again (at-least-once delivery is the contract).
     const seenFiles = new Set<string>();
 
-    async function processNewFile(recipient: string, filePath: string): Promise<void> {
+    async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
+      // This plugin skips dot-files in new/ (scratch/editor files; the agent
+      // package's reader skips them too): no path here — watcher, startup sweep
+      // or rescan — promotes or dead-letters one.
+      if (basename(filePath).startsWith(".")) return;
       seenFiles.add(filePath);
 
       // ONE enforcement point, shared with the CLI: parse wrapper → envelope,
@@ -1870,7 +1882,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         );
         return;
       }
-      await deliverPromoted(recipient, promoted.message, promoted.path);
+      await deliverPromoted(recipient, promoted.message, promoted.path, source === "rescan" ? filePath : undefined);
     }
 
     /**
@@ -1913,7 +1925,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
      * would dead-letter it as a replay. The recovery path calls recoverPromoted()
      * for the re-check instead.
      */
-    async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string): Promise<void> {
+    async function deliverPromoted(recipient: string, msg: TpsMailBody, curPath: string, rescanPath?: string): Promise<void> {
       if (!isLive()) return;
       if (msg.trustTier === "external") {
         log?.warn?.(`tps-mail: external-tier mail ${msg.id} not dispatched`);
@@ -1922,6 +1934,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       if (seenFiles.has(curPath)) return;
       seenFiles.add(curPath);
 
+      if (rescanPath) {
+        log?.info?.(`tps-mail: promoted by rescan: ${rescanPath}`);
+      }
       log?.info?.(`tps-mail: delivering ${msg.id} from ${msg.from} to ${recipient}`);
       // Session key: one conversation per (channel, sender) pair.
       // Using `dmScope: "per-channel-peer"` isolates each tps-mail sender
@@ -2360,13 +2375,38 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       if (!existsSync(newDir)) {
         mkdirSync(newDir, { recursive: true });
       }
+      const pendingWatchFiles = new Set<string>();
+      let rescanning = false;
+      const rescan = async () => {
+        if (!isLive() || rescanning) return;
+        rescanning = true;
+        try {
+          for (const filename of await readdir(newDir)) {
+            if (!isLive()) break;
+            const filePath = resolve(newDir, filename);
+            if (pendingWatchFiles.has(filePath)) continue;
+            void processNewFile(agentId, filePath, "rescan").catch((err) => {
+              log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
+            });
+          }
+        } catch (err: any) {
+          log?.warn?.(`tps-mail: new/ rescan error for ${agentId}: ${err?.message ?? err}`);
+        } finally {
+          rescanning = false;
+        }
+      };
+      const rescanInterval = setInterval(() => { void rescan(); }, NEW_DIR_RESCAN_MS);
+      lifetime.intervals.add(rescanInterval);
+
       try {
         const watcher = fsWatch(newDir, { persistent: true }, (_event, filename) => {
           if (!isLive() || !filename) return;
           const filePath = resolve(newDir, String(filename));
           if (!existsSync(filePath)) return;
+          pendingWatchFiles.add(filePath);
           // Debounce: fs.watch can fire multiple events per file write.
           accountTimer(accountContext, () => {
+            pendingWatchFiles.delete(filePath);
             processNewFile(agentId, filePath).catch((err) => {
               log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
             });
