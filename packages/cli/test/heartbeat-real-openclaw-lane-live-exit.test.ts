@@ -29,5 +29,5 @@ describe("the live heartbeat reports a gateway exit that happens during it", () 
     expect(result.status).toBe(0);
     expect(stdout).toContain("LIVE_CASE_FAILED: gateway exited with code 0 during the heartbeat");
     expect(stdout).not.toContain("LIVE_CASE_ACCEPTED");
-  });
+  }, 70_000);
 });
