@@ -459,7 +459,7 @@ real("cli#833 — real nono: an autoCommit.repo inside the workspace is granted"
           cwd: sb.ws,
           encoding: "utf-8",
           timeout: 60_000,
-          env: { ...process.env, HOME: sb.tmp, XDG_STATE_HOME: state, LC_ALL: "C" },
+          env: { ...process.env, HOME: sb.home, XDG_STATE_HOME: state, LC_ALL: "C" },
         },
       );
       expect(commit.status, commit.stderr).toBe(0);
