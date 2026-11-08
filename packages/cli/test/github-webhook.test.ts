@@ -4,11 +4,14 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { drainOutbox } from "../src/utils/outbox.js";
+import { generateKeyPair } from "../src/utils/identity.js";
 import * as mailLock from "../src/utils/mail-lock.js";
+import { listenForHostWs } from "../src/utils/ws-noise-transport.js";
 import { handleGithubWebhook, processGithubWebhookEvent } from "../src/utils/github-webhook.js";
 
 afterEach(() => {
@@ -48,6 +51,29 @@ async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer:
     const part = await reader.read();
     if (part.done) return buffer.text;
     buffer.text += new TextDecoder().decode(part.value);
+  }
+}
+
+/** An ephemeral loopback port for a listener under test. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") return reject(new Error("no address"));
+      server.close(() => resolve(address.port));
+    });
+  });
+}
+
+/** Records waiting in a HOME's outbox/new, read without a separate existence probe. */
+function outboxRows(home: string): number {
+  try {
+    return readdirSync(join(home, ".tps", "outbox", "new")).filter((f) => f.endsWith(".json") && !f.startsWith(".")).length;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
   }
 }
 
@@ -668,11 +694,11 @@ describe("handleGithubWebhook", () => {
     };
     try {
       expect(await readLine(reader, buffer)).toBe("before");
-      // The reclaimer's removeClaim renames the lock away before this contender reads it.
+      // The test renames the lock away before the contender reads it.
       renameSync(request.lock, `${request.lock}.reclaimed`);
       await release();
       expect(await readLine(reader, buffer)).toBe("unverified");
-      // The reclaimer has claimed a fresh lock by the time the contender decides.
+      // The test creates a fresh lock, owned by this process, before the contender decides.
       mkdirSync(request.lock);
       writeFileSync(join(request.lock, "owner.json"), JSON.stringify({ pid: process.pid, startToken: mailLock.processStartToken(process.pid) }));
       await release();
@@ -688,6 +714,75 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toEqual([]);
     expect((await post(request.headers, request.body)).status).toBe(200);
     expect(drainOutbox()).toHaveLength(1);
+  }, 30_000);
+
+  test("a real listener reports duplicate in progress when a reclaim replaces the lock during the delivery", async () => {
+    const childHome = mkdtempSync(join(tmpdir(), "tps-gh-listener-"));
+    const payload = JSON.stringify({ repository: { full_name: "example/repo" }, ref: "refs/heads/main" });
+    const delivery = "real-listener-reclaim";
+    const headers = {
+      "content-type": "application/json",
+      "x-github-event": "push",
+      "x-github-delivery": delivery,
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}`,
+    };
+    const lock = join(childHome, ".tps", "outbox", "new", `.github-${createHash("sha256").update(delivery).digest("hex")}.lock`);
+    const port = await freePort();
+    const transportPath = new URL("../src/utils/ws-noise-transport.ts", import.meta.url).pathname;
+    const identityPath = new URL("../src/utils/identity.ts", import.meta.url).pathname;
+    const lockModulePath = new URL("../src/utils/mail-lock.ts", import.meta.url).pathname;
+    const listener = Bun.spawn([process.execPath, "-e", `
+      import { readSync } from "node:fs";
+      import { generateKeyPair } from ${JSON.stringify(identityPath)};
+      import { mailLockTestHooks } from ${JSON.stringify(lockModulePath)};
+      import { listenForHostWs } from ${JSON.stringify(transportPath)};
+      let heldBefore = false, heldUnverified = false;
+      function pause(stage) { console.log(stage); readSync(0, Buffer.alloc(1), 0, 1, null); }
+      mailLockTestHooks.beforeOwnerRead = () => { if (!heldBefore) { heldBefore = true; pause("before"); } };
+      mailLockTestHooks.unverifiedOwner = () => { if (!heldUnverified) { heldUnverified = true; pause("unverified"); } };
+      await listenForHostWs(generateKeyPair(), generateKeyPair().encryption.publicKey, ${port}, () => {});
+      console.log("listening");
+    `], { env: { ...process.env, HOME: childHome }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = listener.stdout.getReader();
+    const buffer = { text: "" };
+    const release = async () => {
+      if (!listener.stdin) throw new Error("listener stdin missing");
+      listener.stdin.write("x");
+      await listener.stdin.flush();
+    };
+    const deliver = () => fetch(`http://127.0.0.1:${port}/github/webhook`, { method: "POST", headers, body: payload });
+    try {
+      expect(await readLine(reader, buffer)).toBe("listening");
+      const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
+      expect(await reaped.exited).toBe(0);
+      mkdirSync(join(childHome, ".tps", "outbox", "new"), { recursive: true });
+      mkdirSync(lock);
+      writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: reaped.pid, startToken: "proc:0" }));
+      const contended = deliver();
+      expect(await readLine(reader, buffer)).toBe("before");
+      renameSync(lock, `${lock}.reclaimed`);
+      await release();
+      expect(await readLine(reader, buffer)).toBe("unverified");
+      mkdirSync(lock);
+      writeFileSync(join(lock, "owner.json"),
+        JSON.stringify({ pid: process.pid, startToken: mailLock.processStartToken(process.pid) }));
+      await release();
+      const duplicate = await contended;
+      expect(duplicate.status).toBe(503);
+      expect(await duplicate.text()).toBe("duplicate in progress");
+      expect(outboxRows(childHome)).toBe(0);
+      rmSync(lock, { recursive: true, force: true });
+      const ok = await deliver();
+      expect(ok.status).toBe(200);
+      expect(await ok.text()).toBe("ok");
+      expect(outboxRows(childHome)).toBe(1);
+    } finally {
+      listener.kill();
+      await listener.exited;
+      rmSync(lock, { recursive: true, force: true });
+      rmSync(`${lock}.reclaimed`, { recursive: true, force: true });
+      rmSync(childHome, { recursive: true, force: true });
+    }
   }, 30_000);
 
   for (const owner of [undefined, "directory", "{", "null", "{}", JSON.stringify({ pid: process.pid }),

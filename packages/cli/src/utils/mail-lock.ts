@@ -30,7 +30,7 @@ function readOwner(lockDir: string): LockOwner | null {
   }
 }
 
-/** The identity of the directory an owner record was read from; empty when absent. */
+/** The lock directory's identity, sampled before the owner record is read; empty when absent. */
 function lockIdentity(lockDir: string): string {
   try {
     const stats = statSync(lockDir);
@@ -133,8 +133,10 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
     if (state !== "dead") {
       mailLockTestHooks.unverifiedOwner?.(lockDir);
       // A reclaimer renames the lock away and claims a fresh one. An owner we
-      // could not read in a replaced directory is contention, not corruption;
-      // the same directory still unreadable fails closed below.
+      // could not read whose directory identity changed before this check is
+      // contention: the loop retries, and that retry reads the new directory's
+      // owner, so an unreadable one there still fails closed (as it does here
+      // when the identity did not change).
       if (lockIdentity(lockDir) !== identity) continue;
       if (!existsSync(lockDir)) continue;
       throw new MailLockOwnerError(lockDir);
