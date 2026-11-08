@@ -1,0 +1,1 @@
+- **The release npm upgrade uses an exact pin** CI checks its publish age against `bunfig.toml`; the release job repeats the check before upgrading.
