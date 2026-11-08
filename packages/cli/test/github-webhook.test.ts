@@ -3,7 +3,7 @@ const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
-import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -34,6 +34,21 @@ async function post(
   req.end(body);
   await pending;
   return { status: res.statusCode, text };
+}
+
+/** A line from a spawned process, buffered across reads. */
+async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer: { text: string }): Promise<string> {
+  for (;;) {
+    const newline = buffer.text.indexOf("\n");
+    if (newline !== -1) {
+      const line = buffer.text.slice(0, newline);
+      buffer.text = buffer.text.slice(newline + 1);
+      return line;
+    }
+    const part = await reader.read();
+    if (part.done) return buffer.text;
+    buffer.text += new TextDecoder().decode(part.value);
+  }
 }
 
 describe("handleGithubWebhook", () => {
@@ -602,24 +617,78 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toEqual([]);
     writeFileSync(ownerPath, owner);
     const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
-    const contenders = Array.from({ length: 8 }, () => Bun.spawn([process.execPath, "-e", `
+    const contender = Bun.spawn([process.execPath, "-e", `
       import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
       import { PassThrough } from "node:stream";
       const req = new PassThrough(); req.headers = ${JSON.stringify(request.headers)};
       const res = { statusCode: 200, end(text) { console.log(JSON.stringify({status: this.statusCode, text})); } };
       const pending = handleGithubWebhook(req, res); req.end(${JSON.stringify(request.body)}); await pending;
-    `], { env: process.env, stdout: "pipe", stderr: "pipe" }));
-    for (const contender of contenders) {
-      const result = JSON.parse(await new Response(contender.stdout).text());
-      expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
-      expect([200, 503]).toContain(result.status);
-      if (result.status === 503) expect(result.text).toBe("duplicate in progress");
-    }
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" });
+    const result = JSON.parse(await new Response(contender.stdout).text());
+    expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
+    expect(result).toEqual({ status: 200, text: "ok" });
     expect(existsSync(request.lock)).toBe(false);
     expect(drainOutbox()).toHaveLength(1);
     expect((await post(request.headers, request.body)).status).toBe(200);
     expect(drainOutbox()).toEqual([]);
-  });
+  }, 30_000);
+
+  for (const strandedReclaimer of [false, true]) test(`contention while a crashed owner's lock is reclaimed reports duplicate in progress (stranded reclaimer: ${strandedReclaimer})`, async () => {
+    const request = deliveryRequest(`reclaim-window-${strandedReclaimer}`);
+    const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
+    expect(await reaped.exited).toBe(0);
+    const deadOwner = JSON.stringify({ pid: reaped.pid, startToken: "proc:0" });
+    mkdirSync(request.lock, { recursive: true });
+    writeFileSync(join(request.lock, "owner.json"), deadOwner);
+    if (strandedReclaimer) {
+      mkdirSync(`${request.lock}.reclaim`, { recursive: true });
+      writeFileSync(join(`${request.lock}.reclaim`, "owner.json"), deadOwner);
+    }
+    const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
+    const lockModulePath = new URL("../src/utils/mail-lock.ts", import.meta.url).pathname;
+    const contender = Bun.spawn([process.execPath, "-e", `
+      import { readSync } from "node:fs";
+      import { mailLockTestHooks } from ${JSON.stringify(lockModulePath)};
+      import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
+      import { PassThrough } from "node:stream";
+      let heldBefore = false, heldUnverified = false;
+      function pause(stage) { console.log(stage); const buf = Buffer.alloc(1); readSync(0, buf, 0, 1, null); }
+      mailLockTestHooks.beforeOwnerRead = () => { if (!heldBefore) { heldBefore = true; pause("before"); } };
+      mailLockTestHooks.unverifiedOwner = () => { if (!heldUnverified) { heldUnverified = true; pause("unverified"); } };
+      const req = new PassThrough(); req.headers = ${JSON.stringify(request.headers)};
+      const res = { statusCode: 200, end(text) { console.log(JSON.stringify({status: this.statusCode, text})); } };
+      const pending = handleGithubWebhook(req, res); req.end(${JSON.stringify(request.body)}); await pending;
+    `], { env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = contender.stdout.getReader();
+    const buffer = { text: "" };
+    const release = async () => {
+      if (!contender.stdin) throw new Error("contender stdin missing");
+      contender.stdin.write("x");
+      await contender.stdin.flush();
+    };
+    try {
+      expect(await readLine(reader, buffer)).toBe("before");
+      // The reclaimer's removeClaim renames the lock away before this contender reads it.
+      renameSync(request.lock, `${request.lock}.reclaimed`);
+      await release();
+      expect(await readLine(reader, buffer)).toBe("unverified");
+      // The reclaimer has claimed a fresh lock by the time the contender decides.
+      mkdirSync(request.lock);
+      writeFileSync(join(request.lock, "owner.json"), JSON.stringify({ pid: process.pid, startToken: mailLock.processStartToken(process.pid) }));
+      await release();
+      expect(JSON.parse(await readLine(reader, buffer))).toEqual({ status: 503, text: "duplicate in progress" });
+      expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
+    } finally {
+      contender.kill();
+      await contender.exited;
+    }
+    rmSync(request.lock, { recursive: true, force: true });
+    rmSync(`${request.lock}.reclaimed`, { recursive: true, force: true });
+    rmSync(`${request.lock}.reclaim`, { recursive: true, force: true });
+    expect(drainOutbox()).toEqual([]);
+    expect((await post(request.headers, request.body)).status).toBe(200);
+    expect(drainOutbox()).toHaveLength(1);
+  }, 30_000);
 
   for (const owner of [undefined, "directory", "{", "null", "{}", JSON.stringify({ pid: process.pid }),
     JSON.stringify({ pid: process.pid, startToken: "unknown:token" })]) {

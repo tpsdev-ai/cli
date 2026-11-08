@@ -1,0 +1,1 @@
+- **A GitHub delivery that races a lock reclaim reports `duplicate in progress` (Closes #863).**

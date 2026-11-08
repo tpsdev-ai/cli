@@ -30,6 +30,17 @@ function readOwner(lockDir: string): LockOwner | null {
   }
 }
 
+/** The identity of the directory an owner record was read from; empty when absent. */
+function lockIdentity(lockDir: string): string {
+  try {
+    const stats = statSync(lockDir);
+    return `${stats.dev}:${stats.ino}`;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return "";
+    throw error;
+  }
+}
+
 function ownerState(
   owner: LockOwner | null,
   resolveToken: (pid: number) => string | null = processStartToken,
@@ -74,6 +85,15 @@ export class MailLockOwnerError extends Error {
   }
 }
 
+/**
+ * Test-only rendezvous points around the owner decision. Both are unset in
+ * production; a test holds a contender inside the reclaim window with them.
+ */
+export const mailLockTestHooks: {
+  beforeOwnerRead?: (lockDir: string) => void;
+  unverifiedOwner?: (lockDir: string) => void;
+} = {};
+
 function removeClaim(lockDir: string): void {
   const retired = join(dirname(lockDir), `${TEMP_PREFIX}${process.pid}.${randomBytes(6).toString("hex")}`);
   renameSync(lockDir, retired);
@@ -101,6 +121,8 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       throw error;
     }
+    mailLockTestHooks.beforeOwnerRead?.(lockDir);
+    const identity = lockIdentity(lockDir);
     const owner = readOwner(lockDir);
     const state = ownerState(owner, processStartToken, true);
     if (JSON.stringify(owner) !== JSON.stringify(readOwner(lockDir))) continue;
@@ -109,6 +131,11 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
       return null;
     }
     if (state !== "dead") {
+      mailLockTestHooks.unverifiedOwner?.(lockDir);
+      // A reclaimer renames the lock away and claims a fresh one. An owner we
+      // could not read in a replaced directory is contention, not corruption;
+      // the same directory still unreadable fails closed below.
+      if (lockIdentity(lockDir) !== identity) continue;
       if (!existsSync(lockDir)) continue;
       throw new MailLockOwnerError(lockDir);
     }
@@ -121,6 +148,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
     }
     if (!reclaim) return null;
     try {
+      const currentIdentity = lockIdentity(lockDir);
       const currentOwner = readOwner(lockDir);
       const current = ownerState(currentOwner, processStartToken, true);
       if (current === "alive") {
@@ -128,6 +156,8 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
         return null;
       }
       if (current !== "dead") {
+        mailLockTestHooks.unverifiedOwner?.(lockDir);
+        if (lockIdentity(lockDir) !== currentIdentity) continue;
         if (!existsSync(lockDir)) continue;
         throw new MailLockOwnerError(lockDir);
       }
