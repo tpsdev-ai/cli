@@ -1845,10 +1845,8 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // In-flight paths, paths moved to cur/ or dlq/, and exhausted paths stay
-    // claimed for this lifetime. A refused path whose source is still in new/
-    // (a transient refusal, or a rejection whose dead-letter move failed) is
-    // released for the next rescan, up to MAX_NEW_FILE_TRANSIENT_FAILURES.
+    // Refused sources retained in new/ retry up to the failure cap.
+    // Rescans release exhausted paths after observing their source absent.
     //
     // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
     // BEFORE dispatch; removing the new/ source is best-effort, and a later
@@ -1878,7 +1876,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           const failures = (transientFailures.get(filePath) ?? 0) + 1;
           transientFailures.set(filePath, failures);
           if (failures >= MAX_NEW_FILE_TRANSIENT_FAILURES) {
-            log?.warn?.(`tps-mail: promotion retry limit reached for ${filePath}; suppressed until restart`);
+            log?.warn?.(`tps-mail: promotion retry limit reached for ${filePath}; source suppressed`);
           } else {
             seenFiles.delete(filePath);
           }
@@ -2393,7 +2391,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           const filenames = await readdir(newDir);
           const present = new Set(filenames.map((filename) => resolve(newDir, filename)));
           for (const filePath of transientFailures.keys()) {
-            if (dirname(filePath) === newDir && !present.has(filePath)) transientFailures.delete(filePath);
+            if (dirname(filePath) === newDir && !present.has(filePath)) {
+              transientFailures.delete(filePath);
+              seenFiles.delete(filePath);
+            }
           }
           for (const filename of filenames) {
             if (!isLive()) break;

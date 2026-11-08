@@ -124,7 +124,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     await sleep(10);
   }
 
-  function plant(id: string) {
+  function plant(id: string, filename = `${id}.json`) {
     const timestamp = new Date().toISOString();
     const body = signEnvelope({
       v: 1, from: "flint", to: "recipient", body: "rescan test", messageId: id, timestamp,
@@ -133,9 +133,9 @@ describe("new/ periodic rescan (cli#853)", () => {
         { agent: "flint", kind: "agent", timestamp, rationale: "dispatches", signature: null },
       ],
     }, { flint: seed });
-    const path = join(newDir, `${id}.json`);
+    const path = join(newDir, filename);
     fs.writeFileSync(path, JSON.stringify({ id, from: "flint", to: "recipient", body: JSON.stringify(body), timestamp, read: false }));
-    notifyWatch?.(`${id}.json`);
+    notifyWatch?.(filename);
     return path;
   }
 
@@ -172,12 +172,12 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(fs.existsSync(join(root, "recipient", "cur", "busy-then-promoted.json"))).toBe(true);
   });
 
-  it("suppresses an exhausted path until restart and logs the retry limit once", async () => {
+  it("suppresses an exhausted source still present and logs the retry limit once", async () => {
     await boot();
     const lockDir = join(root, "recipient", ".mail-lock");
     fs.mkdirSync(lockDir);
     const path = plant("busy-exhausted");
-    const diagnostic = `tps-mail: promotion retry limit reached for ${path}; suppressed until restart`;
+    const diagnostic = `tps-mail: promotion retry limit reached for ${path}; source suppressed`;
     expect(await until(() => logs.includes(diagnostic))).toBe(true);
     expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
     fs.rmSync(lockDir, { recursive: true });
@@ -189,6 +189,34 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(logs.filter((line) => line === diagnostic)).toHaveLength(1);
     expect(fs.existsSync(path)).toBe(true);
     expect(dispatches).toEqual([]);
+  });
+
+  it("promotes a replacement at an exhausted path after a rescan observes removal", async () => {
+    await boot();
+    const lockDir = join(root, "recipient", ".mail-lock");
+    fs.mkdirSync(lockDir);
+    const filename = "exhausted-replacement.json";
+    const path = plant("exhausted-original", filename);
+    expect(await until(() => logs.some((line) => line.includes("retry limit reached")))).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
+    fs.rmSync(path);
+    let listedAbsent = false;
+    readSpy = spyOn(fsPromises, "readdir").mockImplementation((async (...args: any[]) => {
+      const filenames = await (realReaddir as any)(...args);
+      if (String(args[0]) === newDir && !filenames.includes(filename)) listedAbsent = true;
+      return filenames;
+    }) as typeof fsPromises.readdir);
+    expect(await until(() => listedAbsent)).toBe(true);
+    fs.rmSync(lockDir, { recursive: true });
+    plant("replacement-message", filename);
+    const before = ticks;
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    expect(ticks).toBe(before + 1);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES + 1);
+    expect(dispatches).toEqual(["replacement-message"]);
+    expect(fs.existsSync(path)).toBe(false);
+    const promoted = JSON.parse(fs.readFileSync(join(root, "recipient", "cur", filename), "utf-8"));
+    expect(promoted.envelopeId).toBe("replacement-message");
   });
 
   it("keeps a promoted path suppressed when the watcher reports it again", async () => {
