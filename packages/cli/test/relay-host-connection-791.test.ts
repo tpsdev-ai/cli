@@ -110,17 +110,16 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(readHostState(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    // Each close-failure call must carry exactly the one expected argument.
-    const closeCalls = () => diagnostic.mock.calls.filter((call) => String(call[0]).includes("Failed channel close"));
+    // Compare unfiltered console.error calls before and after stop() with the expected one-argument arrays in order.
     // The in-loop close failure logs before stop(); pin that line here, while
     // stop()'s retry of the retained channel has not run yet.
-    for (let i = 0; closeCalls().length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(closeCalls()).toEqual([[expectedCloseLine]]);
+    for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(closeCalls()).toEqual([[expectedCloseLine], [expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -174,17 +173,16 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     expect(sends).toBe(1);
     expect(readHostState(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
-    // Each close-failure call must carry exactly the one expected argument.
-    const closeCalls = () => diagnostic.mock.calls.filter((call) => String(call[0]).includes("Failed channel close"));
+    // Compare unfiltered console.error calls before and after stop() with the expected one-argument arrays in order.
     // The catch-path close failure logs before stop(); pin that line here,
     // while stop()'s retry of the retained channel has not run yet.
-    for (let i = 0; closeCalls().length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(closeCalls()).toEqual([[expectedCloseLine]]);
+    for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
+    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(closeCalls()).toEqual([[expectedCloseLine], [expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
