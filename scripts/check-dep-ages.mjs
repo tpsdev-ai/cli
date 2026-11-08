@@ -3,7 +3,8 @@
  * check-dep-ages.mjs — dependency release-age gate (cli#529).
  *
  * Reads bunfig.toml's install table with Bun's TOML parser. Checks external
- * versions in bun.lock and tracked package-lock.json files (from `git ls-files`;
+ * versions in bun.lock and tracked package-lock.json files (from the install
+ * revision under --ci, otherwise `git ls-files`;
  * under TPS_DEP_AGES_ROOT, every package-lock.json in the fixture tree outside
  * `node_modules` and `.git`), against its minimumReleaseAge (at least 7 days),
  * and that every minimumReleaseAgeExcludes name has an unexpired entry in
@@ -39,7 +40,7 @@
  *       exactly only in a manifest Bun does not apply, an excluded name in a nested
  *       package.json's overrides or as a resolutions key, an unreadable `workspaces`
  *       shape or pattern in the root package.json, no external resolutions, refused
- *       CI overrides, unexpected arguments, or registry fetch failures
+ *       CI overrides, changed checkout npm lockfiles, unexpected arguments, or registry fetch failures
  *
  */
 
@@ -105,6 +106,39 @@ function readOrExit(path, what) {
     console.error(`check-dep-ages: cannot read ${what} (${path}): ${err?.code ?? err?.message ?? err}`);
     process.exit(2);
   }
+}
+
+function runPinnedCommand(command, args, what) {
+  const run = spawnSync(command, args, {
+    cwd: ROOT,
+    timeout: 30_000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (run.error || run.status !== 0) {
+    console.error(`check-dep-ages: cannot ${what}: ${run.error?.message ?? String(run.stderr).trim()}`);
+    process.exit(2);
+  }
+  return run.stdout;
+}
+
+const NPM_REVISION = IS_CI_GATE
+  ? runPinnedCommand("bash", [join(ROOT, "scripts/lib/npm-ci-revision.sh")], "resolve npm install revision").toString().trim()
+  : null;
+
+function readPinnedLockfile(lockfile) {
+  const committed = runPinnedCommand("git", ["show", `${NPM_REVISION}:${lockfile}`], `read ${lockfile} from ${NPM_REVISION}`);
+  let working;
+  try {
+    working = readFileSync(join(ROOT, lockfile));
+  } catch (err) {
+    console.error(`check-dep-ages: cannot compare ${lockfile} with ${NPM_REVISION}: ${err?.code ?? err?.message ?? err}`);
+    process.exit(2);
+  }
+  if (!committed.equals(working)) {
+    console.error(`check-dep-ages: ${lockfile}: working file differs from ${NPM_REVISION}; refusing.`);
+    process.exit(2);
+  }
+  return committed.toString("utf8");
 }
 
 // Bun parses the text from stdin in an empty directory with only PATH set, so the
@@ -236,14 +270,20 @@ function collectPackageJsons(root) {
 const MAX_LOCKFILES = 1000;
 
 /**
- * Every `package-lock.json` the gate checks. In the repository that is the
- * tracked set from `git ls-files` (so a new lockfile is read without editing a
- * list); under a fixture root it is every file of that name in the tree, which
- * is walked without descending into `node_modules` or `.git`.
+ * Select npm lockfiles from the install revision under --ci, the index otherwise,
+ * or the fixture tree outside node_modules and .git under a root override.
  */
 function collectLockfiles(root) {
   const out = [];
-  if (ROOT_OVERRIDE === undefined) {
+  if (IS_CI_GATE) {
+    const tracked = runPinnedCommand("git", ["ls-tree", "-rz", "--name-only", NPM_REVISION], `list npm lockfiles at ${NPM_REVISION}`).toString().split("\0");
+    const shrinkwrap = tracked.find((path) => path.split("/").pop() === "npm-shrinkwrap.json");
+    if (shrinkwrap !== undefined) {
+      console.error(`check-dep-ages: ${shrinkwrap} at ${NPM_REVISION}: npm-shrinkwrap.json is not aged; install refused.`);
+      process.exit(2);
+    }
+    out.push(...lockfilesFromFileList(tracked));
+  } else if (ROOT_OVERRIDE === undefined) {
     const run = spawnSync("git", ["ls-files", "-z"], {
       cwd: root,
       encoding: "utf8",
@@ -449,7 +489,7 @@ const bunDeps = collectResolvedDeps(lock);
 const npmDeps = [];
 const npmLockSummaries = [];
 for (const lockfile of collectLockfiles(ROOT)) {
-  const text = readOrExit(join(ROOT, lockfile), lockfile);
+  const text = IS_CI_GATE ? readPinnedLockfile(lockfile) : readOrExit(join(ROOT, lockfile), lockfile);
   let npmLock;
   try {
     npmLock = JSON.parse(text);

@@ -152,8 +152,9 @@ function workingFixture(h: ReturnType<typeof makeHarness>) {
     expect({ status: committed.status, stderr: committed.stderr }).toMatchObject({ status: 0 });
     writeFileSync(join(repo, FIXTURE, file), committed.stdout);
   }
-  mkdirSync(join(repo, "scripts"));
+  mkdirSync(join(repo, "scripts/lib"), { recursive: true });
   writeFileSync(join(repo, "scripts/npm-ci-tracked-lock.sh"), readFileSync(HELPER));
+  writeFileSync(join(repo, "scripts/lib/npm-ci-revision.sh"), readFileSync(join(REPO, "scripts/lib/npm-ci-revision.sh")));
   return repo;
 }
 

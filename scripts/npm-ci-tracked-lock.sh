@@ -42,14 +42,7 @@ for arg in "$@"; do
       ;;
   esac
 done
-revision=HEAD
-if [ "${GITHUB_ACTIONS:-}" = true ]; then
-  if [[ ! "${GITHUB_SHA:-}" =~ ^[0-9a-fA-F]{40}$ ]]; then
-    echo 'npm-ci-tracked-lock: GITHUB_SHA must be 40 hex characters under GitHub Actions; install refused' >&2
-    exit 1
-  fi
-  revision=$GITHUB_SHA
-fi
+revision=$(bash "${BASH_SOURCE[0]%/*}/lib/npm-ci-revision.sh")
 echo "npm-ci-tracked-lock: reading fixture files from $revision"
 if [ "$in_place" = false ] && { [ -e "$prefix" ] || [ -L "$prefix" ]; }; then
   if [ ! -d "$prefix" ] || [ ! -r "$prefix" ] || [ ! -x "$prefix" ]; then

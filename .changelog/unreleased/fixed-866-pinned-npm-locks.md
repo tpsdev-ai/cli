@@ -1,0 +1,1 @@
+- **The CI release-age gate reads npm lockfiles from the install revision** and refuses changed or missing checkout copies.
