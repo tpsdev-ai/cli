@@ -250,9 +250,33 @@ describe("tps auth", () => {
       });
     });
 
+    for (const tokens of [{ access_token: "old-access" }, { refresh_token: "old-refresh" }]) {
+      test(`fills both nested tokens when starting with ${Object.keys(tokens)[0]} and re-imports them`, async () => {
+        const warnings: string[] = [];
+        patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
+        writeFileSync(codex, JSON.stringify({ tokens }));
+        respond({ access_token: "new-access", refresh_token: "new-refresh" });
+        const { refreshOpenAIToken, runAuth } = await import("../src/commands/auth.js");
+        await refreshOpenAIToken(credentials);
+        expect(JSON.parse(readFileSync(codex, "utf8"))).toEqual({
+          tokens: { access_token: "new-access", refresh_token: "new-refresh" },
+        });
+        rmSync(store);
+        await runAuth({ action: "login", provider: "openai" });
+        expect(JSON.parse(readFileSync(store, "utf8"))).toMatchObject({
+          accessToken: "new-access", refreshToken: "new-refresh",
+        });
+        expect(warnings).toHaveLength(0);
+      });
+    }
+
     for (const [shape, original] of [
       ["tokenless object", { auth_mode: "apikey" }],
       ["array tokens", { auth_mode: "chatgpt", tokens: [] }],
+      ["accessToken alone", { accessToken: "old-access" }],
+      ["access_token alone", { access_token: "old-access" }],
+      ["refreshToken alone", { refreshToken: "old-refresh" }],
+      ["refresh_token alone", { refresh_token: "old-refresh" }],
     ] as const) {
       test(`skips a Codex file with ${shape} and warns after saving TPS credentials`, async () => {
         const warnings: string[] = [];
@@ -271,28 +295,33 @@ describe("tps auth", () => {
       });
     }
 
-    test("skips a tokenless first Codex candidate and updates a later nested file", async () => {
-      const warnings: string[] = [];
-      patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
-      writeFileSync(codex, JSON.stringify({ auth_mode: "apikey" }));
-      const codexBefore = readFileSync(codex);
-      const later = join(root, ".config", "codex", "auth.json");
-      mkdirSync(join(root, ".config", "codex"), { recursive: true });
-      const original = {
-        tokens: { access_token: "old-access", refresh_token: "old-refresh", account_id: "fixture-client" },
-        metadata: { keep: true },
-      };
-      writeFileSync(later, JSON.stringify(original));
-      respond({ access_token: "new-access", refresh_token: "new-refresh" });
-      const { refreshOpenAIToken } = await import("../src/commands/auth.js");
-      const refreshed = await refreshOpenAIToken(credentials);
-      expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
-      expect(readFileSync(codex)).toEqual(codexBefore);
-      expect(JSON.parse(readFileSync(later, "utf8"))).toEqual({
-        ...original, tokens: { ...original.tokens, access_token: "new-access", refresh_token: "new-refresh" },
+    for (const [shape, partial] of [
+      ["tokenless", { auth_mode: "apikey" }],
+      ["partial flat", { accessToken: "old-access" }],
+    ] as const) {
+      test(`skips a ${shape} first Codex candidate and updates a later nested file`, async () => {
+        const warnings: string[] = [];
+        patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
+        writeFileSync(codex, JSON.stringify(partial));
+        const codexBefore = readFileSync(codex);
+        const later = join(root, ".config", "codex", "auth.json");
+        mkdirSync(join(root, ".config", "codex"), { recursive: true });
+        const original = {
+          tokens: { access_token: "old-access", refresh_token: "old-refresh", account_id: "fixture-client" },
+          metadata: { keep: true },
+        };
+        writeFileSync(later, JSON.stringify(original));
+        respond({ access_token: "new-access", refresh_token: "new-refresh" });
+        const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+        const refreshed = await refreshOpenAIToken(credentials);
+        expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
+        expect(readFileSync(codex)).toEqual(codexBefore);
+        expect(JSON.parse(readFileSync(later, "utf8"))).toEqual({
+          ...original, tokens: { ...original.tokens, access_token: "new-access", refresh_token: "new-refresh" },
+        });
+        expect(warnings).toHaveLength(0);
       });
-      expect(warnings).toHaveLength(0);
-    });
+    }
 
     for (const failure of ["absent", "blocked temporary path"]) {
       test(`keeps refreshed credentials in the provider store and warns on Codex sync failure: ${failure}`, async () => {
