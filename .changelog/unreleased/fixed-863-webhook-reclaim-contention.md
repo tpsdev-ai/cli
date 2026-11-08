@@ -1,0 +1,1 @@
+- **An unreadable lock owner with a changed sampled identity causes a retry.** A live owner in another process on that retry reports `duplicate in progress`. A live owner in the same process still raises `MailLockOwnerError`, which the webhook returns as a 503 naming the lock path, and a stable unreadable owner still fails closed with its named lock path (Closes #863).

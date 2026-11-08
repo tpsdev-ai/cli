@@ -3,12 +3,15 @@ const patchShared = createPatchShared();
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
-import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
+import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { drainOutbox } from "../src/utils/outbox.js";
+import { generateKeyPair } from "../src/utils/identity.js";
 import * as mailLock from "../src/utils/mail-lock.js";
+import { listenForHostWs } from "../src/utils/ws-noise-transport.js";
 import { handleGithubWebhook, processGithubWebhookEvent } from "../src/utils/github-webhook.js";
 
 afterEach(() => {
@@ -34,6 +37,44 @@ async function post(
   req.end(body);
   await pending;
   return { status: res.statusCode, text };
+}
+
+/** A line from a spawned process, buffered across reads. */
+async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer: { text: string }): Promise<string> {
+  for (;;) {
+    const newline = buffer.text.indexOf("\n");
+    if (newline !== -1) {
+      const line = buffer.text.slice(0, newline);
+      buffer.text = buffer.text.slice(newline + 1);
+      return line;
+    }
+    const part = await reader.read();
+    if (part.done) return buffer.text;
+    buffer.text += new TextDecoder().decode(part.value);
+  }
+}
+
+/** Selects a port using a temporary loopback socket. */
+async function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") return reject(new Error("no address"));
+      server.close(() => resolve(address.port));
+    });
+  });
+}
+
+/** Counts visible JSON filenames in a HOME's outbox/new. */
+function outboxRows(home: string): number {
+  try {
+    return readdirSync(join(home, ".tps", "outbox", "new")).filter((f) => f.endsWith(".json") && !f.startsWith(".")).length;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
 }
 
 describe("handleGithubWebhook", () => {
@@ -602,24 +643,147 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toEqual([]);
     writeFileSync(ownerPath, owner);
     const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
-    const contenders = Array.from({ length: 8 }, () => Bun.spawn([process.execPath, "-e", `
+    const contender = Bun.spawn([process.execPath, "-e", `
       import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
       import { PassThrough } from "node:stream";
       const req = new PassThrough(); req.headers = ${JSON.stringify(request.headers)};
       const res = { statusCode: 200, end(text) { console.log(JSON.stringify({status: this.statusCode, text})); } };
       const pending = handleGithubWebhook(req, res); req.end(${JSON.stringify(request.body)}); await pending;
-    `], { env: process.env, stdout: "pipe", stderr: "pipe" }));
-    for (const contender of contenders) {
-      const result = JSON.parse(await new Response(contender.stdout).text());
-      expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
-      expect([200, 503]).toContain(result.status);
-      if (result.status === 503) expect(result.text).toBe("duplicate in progress");
-    }
+    `], { env: process.env, stdout: "pipe", stderr: "pipe" });
+    const result = JSON.parse(await new Response(contender.stdout).text());
+    expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
+    expect(result).toEqual({ status: 200, text: "ok" });
     expect(existsSync(request.lock)).toBe(false);
     expect(drainOutbox()).toHaveLength(1);
     expect((await post(request.headers, request.body)).status).toBe(200);
     expect(drainOutbox()).toEqual([]);
-  });
+  }, 30_000);
+
+  for (const strandedReclaimer of [false, true]) test(`staged reclaim replacements report duplicate in progress (stranded reclaimer: ${strandedReclaimer})`, async () => {
+    const request = deliveryRequest(`reclaim-window-${strandedReclaimer}`);
+    const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
+    expect(await reaped.exited).toBe(0);
+    const deadOwner = JSON.stringify({ pid: reaped.pid, startToken: "proc:0" });
+    mkdirSync(request.lock, { recursive: true });
+    writeFileSync(join(request.lock, "owner.json"), deadOwner);
+    if (strandedReclaimer) {
+      mkdirSync(`${request.lock}.reclaim`, { recursive: true });
+      writeFileSync(join(`${request.lock}.reclaim`, "owner.json"), deadOwner);
+    }
+    const modulePath = new URL("../src/utils/github-webhook.ts", import.meta.url).pathname;
+    const lockModulePath = new URL("../src/utils/mail-lock.ts", import.meta.url).pathname;
+    const contender = Bun.spawn([process.execPath, "-e", `
+      import { readSync } from "node:fs";
+      import { mailLockTestHooks } from ${JSON.stringify(lockModulePath)};
+      import { handleGithubWebhook } from ${JSON.stringify(modulePath)};
+      import { PassThrough } from "node:stream";
+      let heldBefore = false, heldUnverified = false;
+      function pause(stage) { console.log(stage); const buf = Buffer.alloc(1); readSync(0, buf, 0, 1, null); }
+      mailLockTestHooks.beforeOwnerRead = () => { if (!heldBefore) { heldBefore = true; pause("before"); } };
+      mailLockTestHooks.unverifiedOwner = () => { if (!heldUnverified) { heldUnverified = true; pause("unverified"); } };
+      const req = new PassThrough(); req.headers = ${JSON.stringify(request.headers)};
+      const res = { statusCode: 200, end(text) { console.log(JSON.stringify({status: this.statusCode, text})); } };
+      const pending = handleGithubWebhook(req, res); req.end(${JSON.stringify(request.body)}); await pending;
+    `], { env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = contender.stdout.getReader();
+    const buffer = { text: "" };
+    const release = async () => {
+      if (!contender.stdin) throw new Error("contender stdin missing");
+      contender.stdin.write("x");
+      await contender.stdin.flush();
+    };
+    try {
+      expect(await readLine(reader, buffer)).toBe("before");
+      // The test renames the lock away before the contender reads it.
+      renameSync(request.lock, `${request.lock}.reclaimed`);
+      await release();
+      expect(await readLine(reader, buffer)).toBe("unverified");
+      // The test creates a fresh lock, owned by this process, before the contender decides.
+      mkdirSync(request.lock);
+      writeFileSync(join(request.lock, "owner.json"), JSON.stringify({ pid: process.pid, startToken: mailLock.processStartToken(process.pid) }));
+      await release();
+      expect(JSON.parse(await readLine(reader, buffer))).toEqual({ status: 503, text: "duplicate in progress" });
+      expect(await contender.exited, await new Response(contender.stderr).text()).toBe(0);
+    } finally {
+      contender.kill();
+      await contender.exited;
+    }
+    rmSync(request.lock, { recursive: true, force: true });
+    rmSync(`${request.lock}.reclaimed`, { recursive: true, force: true });
+    rmSync(`${request.lock}.reclaim`, { recursive: true, force: true });
+    expect(drainOutbox()).toEqual([]);
+    expect((await post(request.headers, request.body)).status).toBe(200);
+    expect(drainOutbox()).toHaveLength(1);
+  }, 30_000);
+
+  test("a real listener reports duplicate in progress after a staged reclaim replacement", async () => {
+    const childHome = mkdtempSync(join(tmpdir(), "tps-gh-listener-"));
+    const payload = JSON.stringify({ repository: { full_name: "example/repo" }, ref: "refs/heads/main" });
+    const delivery = "real-listener-reclaim";
+    const headers = {
+      "content-type": "application/json",
+      "x-github-event": "push",
+      "x-github-delivery": delivery,
+      "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}`,
+    };
+    const lock = join(childHome, ".tps", "outbox", "new", `.github-${createHash("sha256").update(delivery).digest("hex")}.lock`);
+    const port = await freePort();
+    const transportPath = new URL("../src/utils/ws-noise-transport.ts", import.meta.url).pathname;
+    const identityPath = new URL("../src/utils/identity.ts", import.meta.url).pathname;
+    const lockModulePath = new URL("../src/utils/mail-lock.ts", import.meta.url).pathname;
+    const listener = Bun.spawn([process.execPath, "-e", `
+      import { readSync } from "node:fs";
+      import { generateKeyPair } from ${JSON.stringify(identityPath)};
+      import { mailLockTestHooks } from ${JSON.stringify(lockModulePath)};
+      import { listenForHostWs } from ${JSON.stringify(transportPath)};
+      let heldBefore = false, heldUnverified = false;
+      function pause(stage) { console.log(stage); readSync(0, Buffer.alloc(1), 0, 1, null); }
+      mailLockTestHooks.beforeOwnerRead = () => { if (!heldBefore) { heldBefore = true; pause("before"); } };
+      mailLockTestHooks.unverifiedOwner = () => { if (!heldUnverified) { heldUnverified = true; pause("unverified"); } };
+      await listenForHostWs(generateKeyPair(), generateKeyPair().encryption.publicKey, ${port}, () => {});
+      console.log("listening");
+    `], { env: { ...process.env, HOME: childHome }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = listener.stdout.getReader();
+    const buffer = { text: "" };
+    const release = async () => {
+      if (!listener.stdin) throw new Error("listener stdin missing");
+      listener.stdin.write("x");
+      await listener.stdin.flush();
+    };
+    const deliver = () => fetch(`http://127.0.0.1:${port}/github/webhook`, { method: "POST", headers, body: payload });
+    try {
+      expect(await readLine(reader, buffer)).toBe("listening");
+      const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
+      expect(await reaped.exited).toBe(0);
+      mkdirSync(join(childHome, ".tps", "outbox", "new"), { recursive: true });
+      mkdirSync(lock);
+      writeFileSync(join(lock, "owner.json"), JSON.stringify({ pid: reaped.pid, startToken: "proc:0" }));
+      const contended = deliver();
+      expect(await readLine(reader, buffer)).toBe("before");
+      renameSync(lock, `${lock}.reclaimed`);
+      await release();
+      expect(await readLine(reader, buffer)).toBe("unverified");
+      mkdirSync(lock);
+      writeFileSync(join(lock, "owner.json"),
+        JSON.stringify({ pid: process.pid, startToken: mailLock.processStartToken(process.pid) }));
+      await release();
+      const duplicate = await contended;
+      expect(duplicate.status).toBe(503);
+      expect(await duplicate.text()).toBe("duplicate in progress");
+      expect(outboxRows(childHome)).toBe(0);
+      rmSync(lock, { recursive: true, force: true });
+      const ok = await deliver();
+      expect(ok.status).toBe(200);
+      expect(await ok.text()).toBe("ok");
+      expect(outboxRows(childHome)).toBe(1);
+    } finally {
+      listener.kill();
+      await listener.exited;
+      rmSync(lock, { recursive: true, force: true });
+      rmSync(`${lock}.reclaimed`, { recursive: true, force: true });
+      rmSync(childHome, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   for (const owner of [undefined, "directory", "{", "null", "{}", JSON.stringify({ pid: process.pid }),
     JSON.stringify({ pid: process.pid, startToken: "unknown:token" })]) {
