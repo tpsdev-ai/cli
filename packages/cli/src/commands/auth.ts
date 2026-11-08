@@ -12,7 +12,7 @@
  * The user authenticates directly with the provider's own tool. TPS reads
  * the resulting credentials and uses them for API calls.
  */
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync, openSync, closeSync, fsyncSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -74,6 +74,16 @@ function writeCredentialFile(target: string, data: unknown): void {
     closeSync(fd);
     fd = undefined;
     renameSync(temp, target);
+    // Directory fsync is best-effort on platforms that refuse it.
+    let directory: number | undefined;
+    try {
+      directory = openSync(dirname(target), "r");
+      fsyncSync(directory);
+    } catch (error) {
+      if (!["EISDIR", "EINVAL", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    } finally {
+      if (directory !== undefined) closeSync(directory);
+    }
   } finally {
     try {
       if (fd !== undefined) closeSync(fd);
@@ -312,38 +322,27 @@ async function loginOpenAI(): Promise<void> {
   console.log(`\nopenai     ✓ OAuth configured — ${humanExpiry(creds.expiresAt)}`);
 }
 
-/**
- * Discover Codex CLI credential store.
- * Codex stores credentials at ~/.codex/auth.json (file mode) or OS keyring.
- * We only support file mode — keyring is not scriptable cross-platform.
- * Format: { accessToken, refreshToken, expiresAt, clientId, scopes, ... }
- */
-function readCodexCredentials(): StoredCredentials | null {
-  const candidates = runtimeCredentialFiles("codex");
-
-  for (const credPath of candidates) {
+function selectCodexCredentialFile() {
+  for (const credPath of runtimeCredentialFiles("codex")) {
     if (!existsSync(credPath)) continue;
     try {
       const data = JSON.parse(readFileSync(credPath, "utf-8"));
-      // Codex auth.json actual format (ChatGPT auth mode):
-      //   { auth_mode: "chatgpt", tokens: { access_token, refresh_token, id_token, account_id } }
-      // Also support flat format as fallback.
-      const tokens = data.tokens ?? {};
+      if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+      const tokens = data.tokens && typeof data.tokens === "object" && !Array.isArray(data.tokens)
+        ? data.tokens : {};
       const accessToken = tokens.access_token ?? data.accessToken ?? data.access_token;
       const refreshToken = tokens.refresh_token ?? data.refreshToken ?? data.refresh_token;
       if (!accessToken || !refreshToken) continue;
-
-      return {
+      const credentials: StoredCredentials = {
         provider: "openai",
         refreshToken: String(refreshToken),
         accessToken: String(accessToken),
         expiresAt: (() => {
           const raw = Number(data.expiresAt ?? data.expires_at ?? 0);
           if (raw > 0) return raw;
-          // Decode JWT exp claim from access_token as fallback
+          // Decode JWT exp claim from access_token as fallback.
           try {
-            const at = String(accessToken);
-            const payload = JSON.parse(Buffer.from(at.split(".")[1], "base64url").toString());
+            const payload = JSON.parse(Buffer.from(String(accessToken).split(".")[1], "base64url").toString());
             if (payload.exp) return Number(payload.exp) * 1000;
           } catch { /* ignore */ }
           return 0;
@@ -351,49 +350,44 @@ function readCodexCredentials(): StoredCredentials | null {
         clientId: String(tokens.account_id ?? data.clientId ?? data.client_id ?? ""),
         scopes: String(data.scopes ?? data.scope ?? ""),
       };
-    } catch {
-      // try next
-    }
-  }
-
-  return null;
-}
-
-/**
- * Update a Codex token file to hold both access and refresh tokens (flat or nested), or warn.
- */
-function syncToCodexCli(creds: StoredCredentials): void {
-  const candidates = runtimeCredentialFiles("codex");
-
-  for (const credPath of candidates) {
-    if (!existsSync(credPath)) continue;
-    try {
-      const data = JSON.parse(readFileSync(credPath, "utf-8"));
-      if (!data || typeof data !== "object" || Array.isArray(data)) continue;
-      const nested = data.tokens && typeof data.tokens === "object" && !Array.isArray(data.tokens);
-      const flat = ("accessToken" in data || "access_token" in data)
-        && ("refreshToken" in data || "refresh_token" in data);
-      if (!nested && !flat) continue;
-
-      if (nested) {
-        data.tokens.access_token = creds.accessToken;
-        data.tokens.refresh_token = creds.refreshToken;
-      }
-      if ("last_refresh" in data) data.last_refresh = new Date().toISOString();
-      if ("accessToken" in data) data.accessToken = creds.accessToken;
-      if ("access_token" in data) data.access_token = creds.accessToken;
-      if ("refreshToken" in data) data.refreshToken = creds.refreshToken;
-      if ("refresh_token" in data) data.refresh_token = creds.refreshToken;
-      if ("expiresAt" in data) data.expiresAt = creds.expiresAt;
-      if ("expires_at" in data) data.expires_at = creds.expiresAt;
-
-      writeCredentialFile(credPath, data);
-      return;
+      return { credPath, data, credentials };
     } catch {
       // Try the next credential file.
     }
   }
-  console.warn(`CodexSyncWarning: could not sync refreshed credentials to ${candidates.join(", ")}`);
+  return null;
+}
+
+function readCodexCredentials(): StoredCredentials | null {
+  return selectCodexCredentialFile()?.credentials ?? null;
+}
+
+function syncToCodexCli(creds: StoredCredentials): void {
+  const selected = selectCodexCredentialFile();
+  if (!selected) {
+    const existing = runtimeCredentialFiles("codex").filter((path) => existsSync(path));
+    if (existing.length > 0) {
+      console.warn(`CodexSyncWarning: could not sync refreshed credentials to ${existing.join(", ")}`);
+    }
+    return;
+  }
+  const { credPath, data } = selected;
+  try {
+    if (data.tokens && typeof data.tokens === "object" && !Array.isArray(data.tokens)) {
+      data.tokens.access_token = creds.accessToken;
+      data.tokens.refresh_token = creds.refreshToken;
+    }
+    if ("last_refresh" in data) data.last_refresh = new Date().toISOString();
+    if ("accessToken" in data) data.accessToken = creds.accessToken;
+    if ("access_token" in data) data.access_token = creds.accessToken;
+    if ("refreshToken" in data) data.refreshToken = creds.refreshToken;
+    if ("refresh_token" in data) data.refresh_token = creds.refreshToken;
+    if ("expiresAt" in data) data.expiresAt = creds.expiresAt;
+    if ("expires_at" in data) data.expires_at = creds.expiresAt;
+    writeCredentialFile(credPath, data);
+  } catch {
+    console.warn(`CodexSyncWarning: could not sync refreshed credentials to ${credPath}`);
+  }
 }
 
 export async function refreshAnthropicToken(creds: StoredCredentials): Promise<StoredCredentials> {
@@ -491,14 +485,16 @@ export async function refreshOpenAIToken(creds: StoredCredentials): Promise<Stor
   const token = await res.json().catch(() => {
     throw new Error("OpenAI token refresh returned invalid JSON");
   });
-  if (typeof token?.access_token !== "string" || !token.access_token) {
-    throw new Error("OpenAI token refresh returned an invalid access token");
+  if (typeof token?.access_token !== "string" || !token.access_token
+    || ("refresh_token" in token && typeof token.refresh_token !== "string")
+    || ("expires_in" in token && (typeof token.expires_in !== "number" || !Number.isFinite(token.expires_in) || token.expires_in < 0))) {
+    throw new Error("OpenAI token refresh returned invalid token fields");
   }
   const refreshed: StoredCredentials = {
     ...creds,
     accessToken: token.access_token,
     refreshToken: token.refresh_token || creds.refreshToken,
-    expiresAt: Date.now() + Number(token.expires_in || 3600) * 1000,
+    expiresAt: Date.now() + (token.expires_in ?? 3600) * 1000,
     scopes: token.scope || creds.scopes,
   };
 
