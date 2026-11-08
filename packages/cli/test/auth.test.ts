@@ -474,6 +474,64 @@ describe("tps auth", () => {
       });
     }
 
+    for (const step of ["open", "fsync", "close"]) {
+      test(`reports refresh success and syncs Codex after TPS directory ${step} refusal`, async () => {
+        const directory = join(root, ".tps", "auth");
+        const open = fs.openSync;
+        const sync = fs.fsyncSync;
+        const close = fs.closeSync;
+        let descriptor: number | undefined;
+        let refused = false;
+        let closed = false;
+        const refuse = () => {
+          refused = true;
+          throw Object.assign(new Error(`directory ${step} refused`), { code: step === "open" ? "EACCES" : "ENOTSUP" });
+        };
+        const opening = spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+          if (String(path) === directory && flags === "r") {
+            if (step === "open") refuse();
+            descriptor = open(path, flags, mode);
+            return descriptor;
+          }
+          return open(path, flags, mode);
+        });
+        const syncing = spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+          if (fd === descriptor && !closed && step === "fsync") refuse();
+          return sync(fd);
+        });
+        const closing = spyOn(fs, "closeSync").mockImplementation((fd) => {
+          close(fd);
+          if (fd === descriptor && !closed) {
+            closed = true;
+            if (step === "close") refuse();
+          }
+        });
+        const warnings: string[] = [];
+        patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
+        respond({ access_token: "new-access", refresh_token: "new-refresh" });
+        const { runAuth } = await import("../src/commands/auth.js");
+        logs.length = 0;
+        try {
+          await runAuth({ action: "refresh", provider: "openai" });
+        } finally {
+          closing.mockRestore();
+          syncing.mockRestore();
+          opening.mockRestore();
+        }
+        expect(refused).toBe(true);
+        expect(closed).toBe(step !== "open");
+        const opened = descriptor;
+        if (opened !== undefined) expect(() => fs.fstatSync(opened)).toThrow();
+        const saved = JSON.parse(readFileSync(store, "utf8"));
+        expect(saved).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
+        expect(JSON.parse(readFileSync(codex, "utf8"))).toMatchObject({
+          accessToken: saved.accessToken, refreshToken: saved.refreshToken, expiresAt: saved.expiresAt,
+        });
+        expect(logs.join("\n")).toContain("✓ refreshed");
+        expect(warnings).toHaveLength(0);
+      });
+    }
+
     for (const kind of ["readable file", "symlink"]) {
       test(`leaves the old fixed Codex temporary path unchanged: ${kind}`, async () => {
         const previousUmask = process.umask(0o022);

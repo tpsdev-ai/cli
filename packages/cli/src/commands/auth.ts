@@ -74,15 +74,18 @@ function writeCredentialFile(target: string, data: unknown): void {
     closeSync(fd);
     fd = undefined;
     renameSync(temp, target);
-    // Directory fsync is best-effort on platforms that refuse it.
+    // Post-rename directory fsync is best-effort and never fails the write.
     let directory: number | undefined;
     try {
       directory = openSync(dirname(target), "r");
       fsyncSync(directory);
-    } catch (error) {
-      if (!["EISDIR", "EINVAL", "EPERM"].includes((error as NodeJS.ErrnoException).code ?? "")) throw error;
+    } catch {
     } finally {
-      if (directory !== undefined) closeSync(directory);
+      if (directory !== undefined) {
+        try {
+          closeSync(directory);
+        } catch {}
+      }
     }
   } finally {
     try {
