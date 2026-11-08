@@ -46,9 +46,12 @@ RUN apt-get update \
       xz-utils unzip procps coreutils \
  && rm -rf /var/lib/apt/lists/*
 
+# Every download below retries transient failures (a 504 or a partial transfer from the
+# release CDN, cli#852); curl restarts a retried transfer from the beginning, and the
+# checksum check after it is unchanged, so only a byte-exact file is accepted.
 # Node — exact version, verified against the trusted checksum.
 RUN set -eux; \
-    curl -fsSLo /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o /tmp/node.tar.xz "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-x64.tar.xz"; \
     echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum -c -; \
     tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1 --no-same-owner; \
     rm -f /tmp/node.tar.xz; \
@@ -56,7 +59,7 @@ RUN set -eux; \
 
 # Bun — exact version, verified against the trusted checksum.
 RUN set -eux; \
-    curl -fsSLo /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o /tmp/bun.zip "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-x64.zip"; \
     echo "${BUN_SHA256}  /tmp/bun.zip" | sha256sum -c -; \
     unzip -q /tmp/bun.zip -d /tmp/bun; \
     install -m 0755 /tmp/bun/bun-linux-x64/bun /usr/local/bin/bun; \
@@ -65,7 +68,7 @@ RUN set -eux; \
 
 # gh — exact version, verified against the trusted checksum, installed TOKENLESS.
 RUN set -eux; \
-    curl -fsSLo /tmp/gh.deb "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o /tmp/gh.deb "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.deb"; \
     echo "${GH_SHA256}  /tmp/gh.deb" | sha256sum -c -; \
     dpkg -i /tmp/gh.deb; rm -f /tmp/gh.deb; \
     gh --version
@@ -73,7 +76,7 @@ RUN set -eux; \
 # js-yaml — the launcher's workflow parser, at the version bun.lock pins, from
 # the npm registry tarball, verified against the trusted checksum.
 RUN set -eux; \
-    curl -fsSLo /tmp/js-yaml.tgz "https://registry.npmjs.org/js-yaml/-/js-yaml-${JSYAML_VERSION}.tgz"; \
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o /tmp/js-yaml.tgz "https://registry.npmjs.org/js-yaml/-/js-yaml-${JSYAML_VERSION}.tgz"; \
     echo "${JSYAML_SHA256}  /tmp/js-yaml.tgz" | sha256sum -c -; \
     mkdir -p /opt/reviewer/lib/node_modules/js-yaml; \
     tar -xzf /tmp/js-yaml.tgz -C /opt/reviewer/lib/node_modules/js-yaml --strip-components=1 --no-same-owner; \
