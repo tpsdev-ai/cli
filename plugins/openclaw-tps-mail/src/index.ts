@@ -1845,7 +1845,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // In-flight, terminal and exhausted paths stay claimed for this lifetime.
+    // In-flight paths, paths moved to cur/ or dlq/, and exhausted paths stay
+    // claimed for this lifetime. A refused path whose source is still in new/
+    // (a transient refusal, or a rejection whose dead-letter move failed) is
+    // released for the next rescan, up to MAX_NEW_FILE_TRANSIENT_FAILURES.
     //
     // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
     // BEFORE dispatch; removing the new/ source is best-effort, and a later
