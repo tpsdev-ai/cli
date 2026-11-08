@@ -114,12 +114,12 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     // The in-loop close failure logs before stop(); pin that line here, while
     // stop()'s retry of the retained channel has not run yet.
     for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine], [expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -177,12 +177,12 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     // The catch-path close failure logs before stop(); pin that line here,
     // while stop()'s retry of the retained channel has not run yet.
     for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(readHostState(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
-    expect(diagnostic.mock.calls).toEqual([[expectedCloseLine], [expectedCloseLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine], [expectedCloseLine]]);
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -266,11 +266,10 @@ test("an initial health probe write failure reports path and reason without reco
     lockRoot = holdHostLock(path);
     resolveFetch(new Response("ok"));
     for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
-    expect(diagnostic).toHaveBeenCalledTimes(1);
-    const line = String(diagnostic.mock.calls[0][0]);
-    expect(line).toContain(path);
-    expect(line).toContain("Host state record lock");
-    expect(line).not.toContain(record!.connectedAt);
+    const lockRootPath = hostStateLockRoot(path);
+    const lockDir = mailLockPath(lockRootPath);
+    const expectedLine = `[relay] Host state record ${path} refresh failed; connection continues: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`;
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedLine]]);
   } finally {
     releaseLock();
     await stop?.();
@@ -326,11 +325,10 @@ test("a periodic health probe write failure reports path and reason without reco
     expect(record).not.toBeNull();
     lockRoot = holdHostLock(path);
     await health!();
-    expect(diagnostic).toHaveBeenCalledTimes(1);
-    const line = String(diagnostic.mock.calls[0][0]);
-    expect(line).toContain(path);
-    expect(line).toContain("Host state record lock");
-    expect(line).not.toContain(record!.connectedAt);
+    const lockRootPath = hostStateLockRoot(path);
+    const lockDir = mailLockPath(lockRootPath);
+    const expectedLine = `[relay] Host state record ${path} refresh failed; connection continues: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`;
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedLine]]);
   } finally {
     releaseLock();
     await stop?.();
@@ -385,7 +383,7 @@ test("a connect-time host record write failure is reported before reconnecting",
     const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: EEXIST: file already exists, mkdir '${connectionsDir}'`;
     // The complete captured list, unfiltered and in order: each completed
     // failure logged exactly one one-argument call.
-    expect(diagnostic.mock.calls).toEqual([[expectedLine], [expectedLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedLine], [expectedLine]]);
     rmSync(blocker, { force: true });
     blocker = undefined;
     await stop();
@@ -445,7 +443,7 @@ test("a second connect-time host record write failure is reported before reconne
     const expectedLine = `[relay] Host state record ${path} connect write failed; reconnecting: Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRootPath} and retry.`;
     // The first write succeeded; only the second attempt's write failed, and
     // it logged once. The complete captured list is compared unfiltered.
-    expect(diagnostic.mock.calls).toEqual([[expectedLine]]);
+    expect(diagnostic.mock.calls).toStrictEqual([[expectedLine]]);
     expect(readHostState(branch)).not.toBeNull();
     releaseLock();
     await stop();
