@@ -1,1 +1,1 @@
-- **OpenAI token refresh saves updated credentials to the TPS provider store.** This retains a rotated refresh token for later runtime starts. Provider credential saves use a synced temporary file with mode 0600 and rename.
+- **OpenAI token refresh saves updated credentials to the TPS provider store.** This retains a rotated refresh token for later runtime starts. Provider credential saves use a synced temporary file with mode 0600 and rename. Codex sync updates flat or nested token fields; a sync failure warns with the file paths and retains the refreshed TPS credentials.

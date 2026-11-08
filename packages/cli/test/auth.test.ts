@@ -181,7 +181,7 @@ describe("tps auth", () => {
       codex = join(root, "codex-home", "auth.json");
       mkdirSync(join(root, "codex-home"));
       patchShared(process.env, "CODEX_HOME", join(root, "codex-home"));
-      writeFileSync(codex, JSON.stringify(credentials));
+      writeFileSync(codex, JSON.stringify({ ...credentials, metadata: { keep: true } }));
       const { runAuth } = await import("../src/commands/auth.js");
       await runAuth({ action: "login", provider: "openai" });
       store = join(root, ".tps", "auth", "openai.json");
@@ -198,7 +198,7 @@ describe("tps auth", () => {
       }) as typeof fetch);
     }
 
-    test("saves rotated OpenAI credentials to the provider store and Codex file", async () => {
+    test("saves rotated OpenAI credentials to the provider store and flat Codex file", async () => {
       respond({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 7200 });
       const before = Date.now();
       const { refreshOpenAIToken } = await import("../src/commands/auth.js");
@@ -208,7 +208,8 @@ describe("tps auth", () => {
       expect(saved).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
       expect(saved.expiresAt).toBeGreaterThanOrEqual(before + 7200_000);
       expect(saved.expiresAt).toBeLessThanOrEqual(Date.now() + 7200_000);
-      expect(JSON.parse(readFileSync(codex, "utf8"))).toMatchObject({
+      expect(JSON.parse(readFileSync(codex, "utf8"))).toEqual({
+        ...credentials, metadata: { keep: true },
         accessToken: saved.accessToken, refreshToken: saved.refreshToken, expiresAt: saved.expiresAt,
       });
       expect(statSync(store).mode & 0o777).toBe(0o600);
@@ -216,6 +217,60 @@ describe("tps auth", () => {
       expect(logs.join("\n")).not.toContain("new-access");
       expect(logs.join("\n")).not.toContain("new-refresh");
     });
+
+    test("saves rotated OpenAI credentials to the provider store and nested Codex file", async () => {
+      const original = {
+        auth_mode: "chatgpt", last_refresh: "2020-01-01T00:00:00.000Z", expires_at: 1,
+        tokens: {
+          access_token: "old-access", refresh_token: "old-refresh",
+          account_id: "fixture-client", id_token: "fixture-id", extra: { keep: true },
+        },
+        metadata: { keep: true },
+      };
+      writeFileSync(codex, JSON.stringify(original));
+      const { runAuth, refreshOpenAIToken } = await import("../src/commands/auth.js");
+      await runAuth({ action: "login", provider: "openai" });
+      const imported = JSON.parse(readFileSync(store, "utf8"));
+      expect(imported).toMatchObject({ accessToken: "old-access", refreshToken: "old-refresh", clientId: "fixture-client", expiresAt: 1 });
+      respond({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 7200 });
+      const before = Date.now();
+      const refreshed = await refreshOpenAIToken(imported);
+      expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
+      const synced = JSON.parse(readFileSync(codex, "utf8"));
+      expect(synced).toEqual({
+        ...original,
+        tokens: { ...original.tokens, access_token: "new-access", refresh_token: "new-refresh" },
+        expires_at: refreshed.expiresAt, last_refresh: synced.last_refresh,
+      });
+      expect(Date.parse(synced.last_refresh)).toBeGreaterThanOrEqual(before);
+      expect(Date.parse(synced.last_refresh)).toBeLessThanOrEqual(Date.now());
+      await runAuth({ action: "login", provider: "openai" });
+      expect(JSON.parse(readFileSync(store, "utf8"))).toMatchObject({
+        accessToken: "new-access", refreshToken: "new-refresh", expiresAt: refreshed.expiresAt,
+      });
+    });
+
+    for (const failure of ["absent", "blocked temporary path"]) {
+      test(`keeps refreshed credentials in the provider store and warns on Codex sync failure: ${failure}`, async () => {
+        const warnings: string[] = [];
+        patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
+        if (failure === "absent") rmSync(codex);
+        else mkdirSync(`${codex}.tmp`);
+        const codexBefore = existsSync(codex) ? readFileSync(codex) : undefined;
+        respond({ access_token: "new-access", refresh_token: "new-refresh" });
+        const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+        const refreshed = await refreshOpenAIToken(credentials);
+        expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
+        expect(refreshed).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
+        expect(existsSync(codex) ? readFileSync(codex) : undefined).toEqual(codexBefore);
+        expect(warnings).toHaveLength(1);
+        expect(warnings[0]).toContain("CodexSyncWarning:");
+        expect(warnings[0]).toContain(codex);
+        for (const token of ["old-access", "old-refresh", "new-access", "new-refresh"]) {
+          expect(warnings[0]).not.toContain(token);
+        }
+      });
+    }
 
     test("keeps the stored refresh token when the response omits refresh_token", async () => {
       respond({ access_token: "new-access", expires_in: 3600 });

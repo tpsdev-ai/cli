@@ -10,9 +10,7 @@
  *   tps auth login openai     →  (future) runs codex login → reads its credential store
  *
  * The user authenticates directly with the provider's own tool. TPS reads
- * the resulting credentials and uses them for API calls. When TPS refreshes
- * tokens, it writes updated credentials back to both its own store AND the
- * original CLI's credential file to prevent split-brain token invalidation.
+ * the resulting credentials and uses them for API calls.
  */
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -353,7 +351,7 @@ function readCodexCredentials(): StoredCredentials | null {
 }
 
 /**
- * Sync refreshed token back to Codex CLI's auth.json.
+ * Sync refreshed tokens to an existing Codex credential file, or warn.
  * Atomic write: write to .tmp then rename to prevent partial reads.
  */
 function syncToCodexCli(creds: StoredCredentials): void {
@@ -364,7 +362,11 @@ function syncToCodexCli(creds: StoredCredentials): void {
     try {
       const data = JSON.parse(readFileSync(credPath, "utf-8"));
 
-      // Update token fields — preserve all other Codex metadata
+      if (data.tokens && typeof data.tokens === "object") {
+        data.tokens.access_token = creds.accessToken;
+        data.tokens.refresh_token = creds.refreshToken;
+      }
+      if ("last_refresh" in data) data.last_refresh = new Date().toISOString();
       if ("accessToken" in data) data.accessToken = creds.accessToken;
       if ("access_token" in data) data.access_token = creds.accessToken;
       if ("refreshToken" in data) data.refreshToken = creds.refreshToken;
@@ -378,9 +380,10 @@ function syncToCodexCli(creds: StoredCredentials): void {
       renameSync(tmpPath, credPath);
       return;
     } catch {
-      // Best-effort — don't crash the proxy if sync fails
+      // Try the next credential file.
     }
   }
+  console.warn(`CodexSyncWarning: could not sync refreshed credentials to ${candidates.join(", ")}`);
 }
 
 export async function refreshAnthropicToken(creds: StoredCredentials): Promise<StoredCredentials> {
