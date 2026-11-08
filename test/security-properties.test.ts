@@ -105,7 +105,7 @@ describe("security properties regression checks", () => {
   test("auth dir + credentials are persisted with locked-down permissions (S46)", () => {
     const auth = src("packages/cli/src/commands/auth.ts");
     expect(auth).toContain("mkdirSync(authDir(), { recursive: true, mode: 0o700 });");
-    expect(auth).toContain("writeFileSync(authPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });");
+    expect(auth).toContain('openSync(temp, "wx", 0o600)');
   });
 
   test("token refresh syncs back to provider credential stores (S46)", () => {

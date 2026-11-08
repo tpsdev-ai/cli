@@ -15,7 +15,8 @@
  * original CLI's credential file to prevent split-brain token invalidation.
  */
 import { join } from "node:path";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, renameSync, openSync, closeSync, fsyncSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { homeDir } from "../utils/home.js";
 import { providerAuthPath, runtimeCredentialFiles } from "../utils/runtime-credentials.js";
@@ -59,7 +60,20 @@ function ensureAuthDir(): void {
 
 function saveCredentials(provider: string, creds: StoredCredentials): void {
   ensureAuthDir();
-  writeFileSync(authPath(provider), JSON.stringify(creds, null, 2), { mode: 0o600 });
+  const target = authPath(provider);
+  const temp = `${target}.${randomUUID()}.tmp`;
+  let fd: number | undefined;
+  try {
+    fd = openSync(temp, "wx", 0o600);
+    writeFileSync(fd, JSON.stringify(creds, null, 2));
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    renameSync(temp, target);
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    rmSync(temp, { force: true });
+  }
 }
 
 function loadCredentials(provider: string): StoredCredentials | null {
@@ -461,7 +475,12 @@ export async function refreshOpenAIToken(creds: StoredCredentials): Promise<Stor
     throw new Error(`OpenAI token refresh failed (${res.status})`);
   }
 
-  const token = (await res.json()) as any;
+  const token = await res.json().catch(() => {
+    throw new Error("OpenAI token refresh returned invalid JSON");
+  });
+  if (typeof token?.access_token !== "string" || !token.access_token) {
+    throw new Error("OpenAI token refresh returned an invalid access token");
+  }
   const refreshed: StoredCredentials = {
     ...creds,
     accessToken: token.access_token,
@@ -470,7 +489,7 @@ export async function refreshOpenAIToken(creds: StoredCredentials): Promise<Stor
     scopes: token.scope || creds.scopes,
   };
 
-  // Sync back to Codex CLI (atomic write)
+  saveCredentials("openai", refreshed);
   await syncToCodexCli(refreshed);
   return refreshed;
 }
@@ -539,7 +558,7 @@ export async function runAuth(args: AuthArgs): Promise<void> {
           : provider === "openai"
           ? await refreshOpenAIToken(creds)
           : await refreshGoogleToken(creds);
-        saveCredentials(provider, refreshed);
+        if (provider !== "openai") saveCredentials(provider, refreshed);
         console.log(`${provider.padEnd(10)} ✓ refreshed — ${humanExpiry(refreshed.expiresAt)}`);
       }
       return;

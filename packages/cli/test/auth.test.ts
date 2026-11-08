@@ -1,7 +1,7 @@
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -10,18 +10,21 @@ describe("tps auth", () => {
   let logs: string[];
   let oldHome: string | undefined;
   let oldLog: (...args: any[]) => void;
+  let oldFetch: typeof fetch;
 
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "tps-auth-test-"));
     oldHome = process.env.HOME;
     process.env.HOME = root;
 
+    oldFetch = globalThis.fetch;
     logs = [];
     oldLog = console.log;
     patchShared(console, "log", (...args: any[]) => logs.push(args.join(" ")));
   });
 
   afterEach(() => {
+    patchShared(globalThis, "fetch", oldFetch);
     patchShared(console, "log", oldLog);
     if (oldHome === undefined) delete process.env.HOME;
     else process.env.HOME = oldHome;
@@ -163,6 +166,106 @@ describe("tps auth", () => {
       }
     } finally {
       rmSync(other, { recursive: true, force: true });
+    }
+  });
+
+  describe("OpenAI token refresh", () => {
+    const credentials = {
+      provider: "openai", accessToken: "old-access", refreshToken: "old-refresh",
+      expiresAt: 1, clientId: "fixture-client", scopes: "fixture-scope",
+    };
+    let store: string;
+    let codex: string;
+
+    beforeEach(async () => {
+      codex = join(root, "codex-home", "auth.json");
+      mkdirSync(join(root, "codex-home"));
+      patchShared(process.env, "CODEX_HOME", join(root, "codex-home"));
+      writeFileSync(codex, JSON.stringify(credentials));
+      const { runAuth } = await import("../src/commands/auth.js");
+      await runAuth({ action: "login", provider: "openai" });
+      store = join(root, ".tps", "auth", "openai.json");
+    });
+
+    function respond(body: unknown, status = 200) {
+      patchShared(globalThis, "fetch", (async (url, init) => {
+        expect(String(url)).toBe("https://auth.openai.com/oauth/token");
+        expect(init?.method).toBe("POST");
+        expect(Object.fromEntries(new URLSearchParams(init?.body as URLSearchParams))).toEqual({
+          grant_type: "refresh_token", client_id: "fixture-client", refresh_token: "old-refresh",
+        });
+        return new Response(JSON.stringify(body), { status });
+      }) as typeof fetch);
+    }
+
+    test("saves rotated OpenAI credentials to the provider store and Codex file", async () => {
+      respond({ access_token: "new-access", refresh_token: "new-refresh", expires_in: 7200 });
+      const before = Date.now();
+      const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+      const refreshed = await refreshOpenAIToken(credentials);
+      const saved = JSON.parse(readFileSync(store, "utf8"));
+      expect(saved).toEqual(refreshed);
+      expect(saved).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
+      expect(saved.expiresAt).toBeGreaterThanOrEqual(before + 7200_000);
+      expect(saved.expiresAt).toBeLessThanOrEqual(Date.now() + 7200_000);
+      expect(JSON.parse(readFileSync(codex, "utf8"))).toMatchObject({
+        accessToken: saved.accessToken, refreshToken: saved.refreshToken, expiresAt: saved.expiresAt,
+      });
+      expect(statSync(store).mode & 0o777).toBe(0o600);
+      expect(statSync(join(root, ".tps", "auth")).mode & 0o777).toBe(0o700);
+      expect(logs.join("\n")).not.toContain("new-access");
+      expect(logs.join("\n")).not.toContain("new-refresh");
+    });
+
+    test("keeps the stored refresh token when the response omits refresh_token", async () => {
+      respond({ access_token: "new-access", expires_in: 3600 });
+      const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+      const refreshed = await refreshOpenAIToken(credentials);
+      expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
+      expect(refreshed.refreshToken).toBe("old-refresh");
+      expect(JSON.parse(readFileSync(codex, "utf8"))).toMatchObject({
+        accessToken: "new-access", refreshToken: "old-refresh", expiresAt: refreshed.expiresAt,
+      });
+    });
+
+    test("replaces the provider file with mode 0600", async () => {
+      const previous = join(root, "previous.json");
+      linkSync(store, previous);
+      const bytes = readFileSync(previous);
+      chmodSync(store, 0o644);
+      respond({ access_token: "new-access", refresh_token: "new-refresh" });
+      const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+      await refreshOpenAIToken(credentials);
+      expect(statSync(store).mode & 0o777).toBe(0o600);
+      expect(readFileSync(previous)).toEqual(bytes);
+      expect(readdirSync(join(root, ".tps", "auth"))).toEqual(["openai.json"]);
+    });
+
+    for (const failure of ["500", "network", "malformed JSON", "missing access_token", "non-string access_token"]) {
+      test(`leaves credential files unchanged on ${failure}`, async () => {
+        const storeBefore = readFileSync(store);
+        const codexBefore = readFileSync(codex);
+        if (failure === "500") {
+          respond({ access_token: "error-access", refresh_token: "error-refresh" }, 500);
+        } else if (failure === "network") {
+          patchShared(globalThis, "fetch", (async () => { throw new Error("fixture network failure"); }) as typeof fetch);
+        } else if (failure === "malformed JSON") {
+          patchShared(globalThis, "fetch", (async () => new Response('{"access_token":"error-access","refresh_token":"error-refresh",')) as typeof fetch);
+        } else {
+          respond({ refresh_token: "error-refresh", ...(failure === "non-string access_token" ? { access_token: 123 } : {}) });
+        }
+        const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+        if (failure === "malformed JSON") {
+          await expect(refreshOpenAIToken(credentials)).rejects.toThrow("OpenAI token refresh returned invalid JSON");
+        } else {
+          await expect(refreshOpenAIToken(credentials)).rejects.toThrow();
+        }
+        expect(readFileSync(store)).toEqual(storeBefore);
+        expect(readFileSync(codex)).toEqual(codexBefore);
+        expect(statSync(store).mode & 0o777).toBe(0o600);
+        expect(logs.join("\n")).not.toContain("error-access");
+        expect(logs.join("\n")).not.toContain("error-refresh");
+      });
     }
   });
 
