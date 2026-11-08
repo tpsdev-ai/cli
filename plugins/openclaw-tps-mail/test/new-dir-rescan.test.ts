@@ -153,7 +153,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(logs.filter((line) => line.includes("promoted by rescan"))).toHaveLength(1);
   });
 
-  it("skips dot-files in new/ (never mail) while delivering a missed message", async () => {
+  it("skips dot-files in new/ while promoting a missed message", async () => {
     await boot();
     const scratch = join(newDir, ".scratch-editor.json");
     fs.writeFileSync(scratch, "{ not mail");

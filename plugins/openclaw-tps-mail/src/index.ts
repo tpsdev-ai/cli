@@ -1862,9 +1862,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
-      // Dot-files are never mail (scratch/editor files; the agent-side reader
-      // skips them too): no path — watcher, startup sweep or rescan — promotes
-      // or dead-letters one.
+      // This plugin skips dot-files in new/ (scratch/editor files; the agent
+      // package's reader skips them too): no path here — watcher, startup sweep
+      // or rescan — promotes or dead-letters one.
       if (basename(filePath).startsWith(".")) return;
       seenFiles.add(filePath);
 
