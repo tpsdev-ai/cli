@@ -1786,6 +1786,7 @@ const outbound: ChannelOutboundAdapter = {
 };
 
 export const NEW_DIR_RESCAN_MS = 30_000;
+export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
@@ -1844,15 +1845,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // seenFiles holds every new/ path taken in this account lifetime. The
-    // watcher (fs.watch can fire several events per write — see its debounce),
-    // the startup sweep and the periodic rescan (cli#853) all go through
-    // processNewFile, so within one lifetime a path is promoted at most once,
-    // including after a processing error (no retry before the next start).
-    // It is NOT pre-populated at startup: a file already in new/ when the
-    // gateway starts (mail that arrived while it was down, or a path a previous
-    // lifetime left there after a failed promotion) is taken by the startup
-    // sweep.
+    // In-flight, terminal and exhausted paths stay claimed for this lifetime.
     //
     // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
     // BEFORE dispatch; removing the new/ source is best-effort, and a later
@@ -1861,6 +1854,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     // re-verification; an existing obligation is reconciled rather than
     // dispatched again (at-least-once delivery is the contract).
     const seenFiles = new Set<string>();
+    const transientFailures = new Map<string, number>();
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
@@ -1877,11 +1871,23 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       const promoted = await promote(recipient, filePath);
       if (!isLive()) return;
       if (!promoted.ok) {
+        if (existsSync(filePath)) {
+          const failures = (transientFailures.get(filePath) ?? 0) + 1;
+          transientFailures.set(filePath, failures);
+          if (failures >= MAX_NEW_FILE_TRANSIENT_FAILURES) {
+            log?.warn?.(`tps-mail: promotion retry limit reached for ${filePath}; suppressed until restart`);
+          } else {
+            seenFiles.delete(filePath);
+          }
+        } else {
+          transientFailures.delete(filePath);
+        }
         log?.warn?.(
           `tps-mail: not promoted (${promoted.class}) for ${recipient}: ${promoted.reason}`,
         );
         return;
       }
+      transientFailures.delete(filePath);
       await deliverPromoted(recipient, promoted.message, promoted.path, source === "rescan" ? filePath : undefined);
     }
 
@@ -2381,7 +2387,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         if (!isLive() || rescanning) return;
         rescanning = true;
         try {
-          for (const filename of await readdir(newDir)) {
+          const filenames = await readdir(newDir);
+          const present = new Set(filenames.map((filename) => resolve(newDir, filename)));
+          for (const filePath of transientFailures.keys()) {
+            if (dirname(filePath) === newDir && !present.has(filePath)) transientFailures.delete(filePath);
+          }
+          for (const filename of filenames) {
             if (!isLive()) break;
             const filePath = resolve(newDir, filename);
             if (pendingWatchFiles.has(filePath)) continue;

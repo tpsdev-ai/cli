@@ -8,7 +8,7 @@ import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope } from "@tpsdev-ai/agent";
 import * as mail from "@tpsdev-ai/cli/utils/mail";
-import pluginModule, { NEW_DIR_RESCAN_MS } from "../src/index.js";
+import pluginModule, { MAX_NEW_FILE_TRANSIENT_FAILURES, NEW_DIR_RESCAN_MS } from "../src/index.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 const seed = Buffer.alloc(32, 0x01);
@@ -46,6 +46,7 @@ describe("new/ periodic rescan (cli#853)", () => {
   let dispatches: string[];
   let verifyGate: Promise<void> | undefined;
   let releaseVerify: (() => void) | undefined;
+  let verifyUnavailable: boolean;
   let watchSpy: ReturnType<typeof spyOn>;
   let timerSpy: ReturnType<typeof spyOn>;
   let promoteSpy: ReturnType<typeof spyOn>;
@@ -67,11 +68,13 @@ describe("new/ periodic rescan (cli#853)", () => {
     dispatches = [];
     verifyGate = undefined;
     releaseVerify = undefined;
+    verifyUnavailable = false;
     readSpy = undefined;
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
           if (verifyGate) await verifyGate;
+          if (verifyUnavailable) throw new Error("injected verification outage");
           return name === "flint" ? { publicKey: Buffer.from(ed.getPublicKey(seed)) } : null;
         },
       }),
@@ -151,6 +154,102 @@ describe("new/ periodic rescan (cli#853)", () => {
     await sleep(intervalMs);
     expect(promoteSpy).toHaveBeenCalledTimes(1);
     expect(logs.filter((line) => line.includes("promoted by rescan"))).toHaveLength(1);
+  });
+
+  it("retries a busy promotion on the next rescan tick", async () => {
+    await boot();
+    const lockDir = join(root, "recipient", ".mail-lock");
+    fs.mkdirSync(lockDir);
+    const path = plant("busy-then-promoted");
+    expect(await until(() => logs.some((line) => line.includes("not promoted (busy)")))).toBe(true);
+    expect(ticks).toBe(1);
+    expect(fs.existsSync(path)).toBe(true);
+    fs.rmSync(lockDir, { recursive: true });
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    expect(ticks).toBe(2);
+    expect(promoteSpy).toHaveBeenCalledTimes(2);
+    expect(fs.existsSync(path)).toBe(false);
+    expect(fs.existsSync(join(root, "recipient", "cur", "busy-then-promoted.json"))).toBe(true);
+  });
+
+  it("suppresses an exhausted path until restart and logs the retry limit once", async () => {
+    await boot();
+    const lockDir = join(root, "recipient", ".mail-lock");
+    fs.mkdirSync(lockDir);
+    const path = plant("busy-exhausted");
+    const diagnostic = `tps-mail: promotion retry limit reached for ${path}; suppressed until restart`;
+    expect(await until(() => logs.includes(diagnostic))).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
+    fs.rmSync(lockDir, { recursive: true });
+    suppressWatch = false;
+    notifyWatch?.("busy-exhausted.json");
+    const before = ticks;
+    expect(await until(() => ticks >= before + 2)).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
+    expect(logs.filter((line) => line === diagnostic)).toHaveLength(1);
+    expect(fs.existsSync(path)).toBe(true);
+    expect(dispatches).toEqual([]);
+  });
+
+  it("keeps a promoted path suppressed when the watcher reports it again", async () => {
+    await boot();
+    const path = plant("already-cur");
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    expect(fs.existsSync(path)).toBe(false);
+    expect(fs.existsSync(join(root, "recipient", "cur", "already-cur.json"))).toBe(true);
+    fs.copyFileSync(join(root, "recipient", "cur", "already-cur.json"), path);
+    suppressWatch = false;
+    notifyWatch?.("already-cur.json");
+    const before = ticks;
+    expect(await until(() => ticks >= before + 2)).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(1);
+    expect(dispatches).toEqual(["already-cur"]);
+  });
+
+  it("retries verification unavailability when dead-lettering leaves the source", async () => {
+    await boot();
+    verifyUnavailable = true;
+    const dlq = join(root, "recipient", "dlq");
+    fs.writeFileSync(dlq, "blocks dead-letter directory creation");
+    const path = plant("verify-retained");
+    expect(await until(() => logs.some((line) => line.includes("not promoted (verify-unavailable)")))).toBe(true);
+    expect(fs.existsSync(path)).toBe(true);
+    fs.rmSync(dlq);
+    verifyUnavailable = false;
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps a verification rejection suppressed after it moves to dlq", async () => {
+    await boot();
+    verifyUnavailable = true;
+    const path = plant("verify-quarantined");
+    expect(await until(() => logs.some((line) => line.includes("not promoted (verify-unavailable)")))).toBe(true);
+    expect(fs.existsSync(path)).toBe(false);
+    expect(fs.existsSync(join(root, "recipient", "dlq", "verify-quarantined.json"))).toBe(true);
+    verifyUnavailable = false;
+    const before = ticks;
+    expect(await until(() => ticks >= before + 2)).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(1);
+    expect(dispatches).toEqual([]);
+  });
+
+  it("drops a vanished source's failure counter on a rescan", async () => {
+    await boot();
+    fs.mkdirSync(join(root, "recipient", ".mail-lock"));
+    const path = plant("vanished-source");
+    expect(await until(() => logs.some((line) => line.includes("not promoted (busy)")))).toBe(true);
+    fs.rmSync(path);
+    let listedAbsent = false;
+    readSpy = spyOn(fsPromises, "readdir").mockImplementation((async (...args: any[]) => {
+      const filenames = await (realReaddir as any)(...args);
+      if (String(args[0]) === newDir && !filenames.includes("vanished-source.json")) listedAbsent = true;
+      return filenames;
+    }) as typeof fsPromises.readdir);
+    expect(await until(() => listedAbsent)).toBe(true);
+    plant("vanished-source");
+    expect(await until(() => logs.some((line) => line.includes("retry limit reached")))).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(1 + MAX_NEW_FILE_TRANSIENT_FAILURES);
   });
 
   it("skips dot-files in new/ while promoting a missed message", async () => {
