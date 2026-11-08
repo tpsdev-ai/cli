@@ -1,12 +1,9 @@
-// A gateway child exits while the lane's event loop is blocked synchronously
-// past the exit grace window: the child writes "ready", then exits on a short
-// timer; the lane arms waitForGatewayExit and blocks with Atomics.wait longer
-// than both the exit and the window. The child has exited by the time the loop
-// runs again, but the exit is not delivered until the poll phase, after the
-// expired timer. waitForGatewayExit must still report the exit.
+// The child writes "ready", then exits on a short timer. The lane arms
+// waitForGatewayExit and blocks with Atomics.wait past the exit and grace window.
+// The expired timer runs before the poll phase delivers the child's exit.
 //
-// Each wait is capped: a child that never reports ready fails naming
-// STUB_GATEWAY_NOT_READY, and the test runs under an explicit timeout.
+// A child that never reports ready fails naming STUB_GATEWAY_NOT_READY,
+// and the test runs under an explicit timeout.
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
@@ -39,8 +36,7 @@ try {
     child.once("exit", (code) => settle(rejectReady)(new Error(`STUB_GATEWAY_EXITED_BEFORE_READY: code ${code}`)));
   });
 
-  // Arm the timer first, then block the loop past the child's exit and the
-  // window, so the expired timer is handled before the exit is delivered.
+  // Arm the grace timer before blocking past the child's exit and the window.
   const pending = waitForGatewayExit(child, GRACE_MS);
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, BLOCK_MS);
   const exited = await pending;
