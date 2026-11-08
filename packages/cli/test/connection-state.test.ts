@@ -288,6 +288,40 @@ describe("connection-state", () => {
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
   });
 
+  test("a failed branch state close preserves the original error and record and removes the temp file", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-branch-close-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    const record = join(dir, "host.json");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    const before = readFileSync(record);
+
+    const close = fs.closeSync;
+    const closeError = new Error("injected close failure");
+    const cleanupError = new Error("injected cleanup close failure");
+    const injected = spyOn(fs, "closeSync").mockImplementation((...args: Parameters<typeof close>) => {
+      if (injected.mock.calls.length === 1) throw closeError;
+      close(...args);
+      throw cleanupError;
+    });
+    try {
+      let caught: unknown;
+      try {
+        writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 4, messagesPushed: 5 });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBe(closeError);
+      expect(injected.mock.calls).toHaveLength(2);
+      expect(injected.mock.calls[1]).toEqual(injected.mock.calls[0]);
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(readFileSync(record).equals(before)).toBe(true);
+    expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
+  });
+
   test("a failed branch state write keeps the previous record and removes the temp file", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-branch-write-"));
     process.env.HOME = home;
