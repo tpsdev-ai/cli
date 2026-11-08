@@ -531,6 +531,19 @@ function hasBraceGroupAndClass(pattern) {
 }
 
 /**
+ * Refuse leading `!` patterns; some spellings differ across supported Bun versions.
+ * The gate reads workspace patterns when `minimumReleaseAgeExcludes` is non-empty.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function versionDependentWorkspacePattern(pattern) {
+  if (pattern.startsWith("!")) {
+    return "it is `!`-negated, and Bun 1.3.10 and 1.4.4 resolve some negated spellings to different workspace sets; the gate refuses every negated pattern rather than guess. List only the directories to include";
+  }
+  return null;
+}
+
+/**
  * Conservatively refuse backslash escapes and patterns mixing braces and classes.
  *
  * @returns {string | null} the reason, naming the shape and the remedy
@@ -543,6 +556,83 @@ function unsupportedWorkspacePattern(pattern) {
     return "it mixes a `{...}` brace group with a `[...]` character class, which is not simple to mirror; use one or the other";
   }
   return null;
+}
+
+/**
+ * The gate accepts a smaller grammar than Bun.Glob: literals, `/`, `*`, `**`,
+ * `?`, `[...]` classes and `{a,b}` alternatives. It refuses
+ * `(`, `)` and `|` outside a class (Bun reads a paren
+ * literally outside an extglob), the extended globs `?(...)`, `*(...)`,
+ * `+(...)`, `@(...)` and `!(...)`, `..` inside a brace group, and a brace group
+ * with an empty or `.` alternative. The gate reads workspace patterns only when
+ * `minimumReleaseAgeExcludes` is non-empty.
+ *
+ * @returns {string | null} the reason and remedy
+ */
+function unmodelledGlobSyntax(pattern) {
+  let braces = 0;
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      i += 1; // an escape makes the next character a literal; escapes are refused separately
+      continue;
+    }
+    if (ch === "[") {
+      // Skip class contents here; segmentRegex interprets their ranges and negation.
+      let end = i + 1;
+      if (pattern[end] === "!" || pattern[end] === "^") end += 1;
+      if (pattern[end] === "]") end += 1;
+      while (end < pattern.length && pattern[end] !== "]") end += 1;
+      if (end < pattern.length) i = end;
+      continue;
+    }
+    if (ch === "(" || ch === ")" || ch === "|") {
+      return "it uses glob syntax the gate does not model; use a literal directory name, `*`, `**`, `?`, a `[...]` class or `{a,b}` alternatives";
+    }
+    if (ch === "{") braces += 1;
+    else if (ch === "}") braces = Math.max(0, braces - 1);
+    else if (braces > 0 && ch === "." && pattern[i + 1] === ".") {
+      return "it has `..` inside a brace group, which the gate does not model; list the directories explicitly";
+    }
+  }
+  return null;
+}
+
+/**
+ * Refuse an empty or `.` alternative inside a brace group, at any nesting level.
+ *
+ * @returns {string | null} the reason, naming the shape and the remedy
+ */
+function emptyBraceAlternative(pattern) {
+  const hasEmpty = (text) => {
+    let i = 0;
+    while (i < text.length) {
+      const open = text.indexOf("{", i);
+      if (open === -1) return false;
+      let depth = 0;
+      let close = -1;
+      for (let j = open; j < text.length; j++) {
+        if (text[j] === "{") depth += 1;
+        else if (text[j] === "}") {
+          depth -= 1;
+          if (depth === 0) {
+            close = j;
+            break;
+          }
+        }
+      }
+      if (close === -1) return false;
+      for (const alternative of splitBraceAlternatives(text.slice(open + 1, close))) {
+        if (alternative === "" || alternative === ".") return true;
+        if (hasEmpty(alternative)) return true;
+      }
+      i = close + 1;
+    }
+    return false;
+  };
+  return hasEmpty(pattern)
+    ? "it has an empty or `.` alternative inside a brace group; list the directories without an empty or `.` alternative"
+    : null;
 }
 
 /** Whether the path segments match the (brace-expanded) glob segments; `**` spans segments. */
@@ -619,11 +709,18 @@ export function workspacePatterns(workspaces) {
 /**
  * Resolve supported workspace patterns; refuse unreadable shapes and spellings.
  *
+ * `refuseVersionDependentPatterns` enables refusal of leading `!` patterns. It is off by
+ * default so the parity tests can still record what the model resolves.
+ * `auditExcludes` sets it, and the gate runs the audit only when
+ * `minimumReleaseAgeExcludes` is non-empty.
+ *
+ * @param {Array<{path: string, json: object}>} manifests
+ * @param {{ refuseVersionDependentPatterns?: boolean }} [options]
  * @returns {{ applied: Set<string>, error: string | null, pattern?: string }}
  *   `error` names a `workspaces` shape or pattern the audit cannot read; `applied`
  *   is then incomplete and must not be used. `pattern` is set only for a pattern.
  */
-export function appliedManifestPaths(manifests) {
+export function appliedManifestPaths(manifests, { refuseVersionDependentPatterns = false } = {}) {
   const applied = new Set(["package.json"]);
   const root = manifests.find((pj) => pj.path === "package.json");
   const { patterns, error } = workspacePatterns(root?.json?.workspaces);
@@ -632,9 +729,19 @@ export function appliedManifestPaths(manifests) {
   const globs = [];
   for (const raw of patterns) {
     if (raw === "" || raw === "." || raw === "./" || raw === ".\\") continue;
-    const reason = (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ?? unsupportedWorkspacePattern(raw);
+    const reason =
+      (hasBraceGroupAndClass(raw) ? unsupportedWorkspacePattern(raw) : globError(raw)) ??
+      unsupportedWorkspacePattern(raw) ??
+      unmodelledGlobSyntax(raw) ??
+      emptyBraceAlternative(raw);
     if (reason !== null) {
       return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${reason}`, pattern: raw };
+    }
+    if (refuseVersionDependentPatterns) {
+      const versionReason = versionDependentWorkspacePattern(raw);
+      if (versionReason !== null) {
+        return { applied, error: `workspaces pattern \`${raw}\` cannot be read: ${versionReason}`, pattern: raw };
+      }
     }
     if (isGlobPattern(raw)) globs.push(raw);
     else literals.push(raw);
@@ -689,7 +796,9 @@ export function appliedManifestPaths(manifests) {
 export function auditExcludes({ excludes, exceptionEntries, exceptionErrors, packageJsons }) {
   const problems = [];
   const manifests = packageJsons ?? [];
-  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests);
+  const { applied, error: workspacesError, pattern } = appliedManifestPaths(manifests, {
+    refuseVersionDependentPatterns: true,
+  });
   if (workspacesError !== null) return [{ kind: "workspaces", message: workspacesError, pattern }];
   for (const name of excludes ?? []) {
     let covered = false;

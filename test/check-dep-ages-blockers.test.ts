@@ -176,14 +176,10 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
-  // Also run against real Bun in check-dep-ages-install-age-bun.test.ts: the ** row, both ? rows, the ./ row
-  // and both rows that put a negation before or after a positive pattern. The other rows are expectations only.
+  // Also run against real Bun in check-dep-ages-install-age-bun.test.ts: the ** row,
+  // both ? rows, the ./ row, the object-form row, the character-class row and the brace row.
   it.each([
     ["a ** pattern reaches a nested directory", ["packages/**"], "packages/a/b", true],
-    ["a negation removes a * match", ["packages/*", "!packages/x"], "packages/x", false],
-    ["a negation leaves other * matches", ["packages/*", "!packages/x"], "packages/y", true],
-    ["a negation before its positive pattern loses", ["!packages/x", "packages/*"], "packages/x", true],
-    ["a positive pattern after a negation wins", ["packages/*", "!packages/x", "packages/x"], "packages/x", true],
     ["a ? pattern matches one character", ["packages/?"], "packages/a", true],
     ["a ? pattern does not match two characters", ["packages/?"], "packages/ab", false],
     ["a ./ prefix and trailing slash", ["./packages/*/"], "packages/a", true],
@@ -191,7 +187,6 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     ["an object-form workspace", { packages: ["packages/*"] }, "packages/w", true],
     ["a character-class workspace", ["packages/[wx]"], "packages/w", true],
     ["a brace workspace", ["packages/{w,z}"], "packages/w", true],
-    ["a literal named once and negated", ["packages/w", "!packages/w"], "packages/w", true],
   ])("%s", (_label, workspaces, dir, expectApplied) => {
     appliedFixture((root) => {
       writeManifest(root, "package.json", { name: "fixture", workspaces });
@@ -205,6 +200,26 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
         );
         expect(output).not.toContain("Checking");
       }
+    });
+  });
+
+  it.each([
+    ["a negation removes a * match", ["packages/*", "!packages/x"]],
+    ["a negation leaves other * matches", ["packages/*", "!packages/x"]],
+    ["a negation before its positive pattern loses", ["!packages/x", "packages/*"]],
+    ["a positive pattern after a negation wins", ["packages/*", "!packages/x", "packages/x"]],
+    ["a literal named once and negated", ["packages/w", "!packages/w"]],
+  ])("refuses the negated workspace pattern: %s", (_label, workspaces) => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces });
+      writeManifest(root, join("packages", "w", "package.json"), {
+        name: "w", dependencies: { "dep-a": "1.0.0" },
+      });
+      const output = runGate(root);
+      const refused = (workspaces as string[]).find((pattern) => pattern.startsWith("!"));
+      expect(refused).toBeDefined();
+      expect(output).toContain(`workspaces pattern \`${refused}\` cannot be read: it is \`!\`-negated`);
+      expect(output).not.toContain("Checking");
     });
   });
 

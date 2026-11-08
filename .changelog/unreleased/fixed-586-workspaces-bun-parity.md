@@ -4,5 +4,4 @@
   with a `packages` array; when the bunfig has release-age exclusions, any other
   shape is refused with a named error, and so is a pattern whose class cannot
   compile (`packages/[z-a]`). Workspace patterns also support character classes (`packages/[ab]`) and brace alternatives
-  (`packages/{a,b}`), and a directory named by a literal pattern stays applied when
-  a later `!` pattern names it.
+  (`packages/{a,b}`).
