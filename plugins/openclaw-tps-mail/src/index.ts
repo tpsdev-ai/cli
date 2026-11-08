@@ -1854,10 +1854,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     // lifetime left there after a failed promotion) is taken by the startup
     // sweep.
     //
-    // Across restarts: promote() moves a record new/ → cur/ (or dlq/) BEFORE it
-    // is dispatched, so a dispatched record is never read from new/ again; a
-    // record promoted but never acked is re-dispatched from cur/ by the
-    // crash-recovery sweep (at-least-once delivery is the contract).
+    // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
+    // BEFORE dispatch; removing the new/ source is best-effort, and a later
+    // attempt on a leftover source still passes through the replay check.
+    // Startup attempts recovery of eligible cur/ records through
+    // re-verification; an existing obligation is reconciled rather than
+    // dispatched again (at-least-once delivery is the contract).
     const seenFiles = new Set<string>();
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
