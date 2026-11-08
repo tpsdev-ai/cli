@@ -132,11 +132,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
     }
     if (state !== "dead") {
       mailLockTestHooks.unverifiedOwner?.(lockDir);
-      // A reclaimer renames the lock away and claims a fresh one. An owner we
-      // could not read whose directory identity changed before this check is
-      // contention: the loop retries, and that retry reads the new directory's
-      // owner, so an unreadable one there still fails closed (as it does here
-      // when the identity did not change).
+      // A changed identity may indicate contention; retry to re-evaluate the lock path.
       if (lockIdentity(lockDir) !== identity) continue;
       if (!existsSync(lockDir)) continue;
       throw new MailLockOwnerError(lockDir);

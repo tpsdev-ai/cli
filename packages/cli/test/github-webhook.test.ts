@@ -54,7 +54,7 @@ async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer:
   }
 }
 
-/** An ephemeral loopback port for a listener under test. */
+/** Selects a port using a temporary loopback socket. */
 async function freePort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -67,7 +67,7 @@ async function freePort(): Promise<number> {
   });
 }
 
-/** Records waiting in a HOME's outbox/new, read without a separate existence probe. */
+/** Counts visible JSON filenames in a HOME's outbox/new. */
 function outboxRows(home: string): number {
   try {
     return readdirSync(join(home, ".tps", "outbox", "new")).filter((f) => f.endsWith(".json") && !f.startsWith(".")).length;
@@ -659,7 +659,7 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toEqual([]);
   }, 30_000);
 
-  for (const strandedReclaimer of [false, true]) test(`contention while a crashed owner's lock is reclaimed reports duplicate in progress (stranded reclaimer: ${strandedReclaimer})`, async () => {
+  for (const strandedReclaimer of [false, true]) test(`staged reclaim replacements report duplicate in progress (stranded reclaimer: ${strandedReclaimer})`, async () => {
     const request = deliveryRequest(`reclaim-window-${strandedReclaimer}`);
     const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
     expect(await reaped.exited).toBe(0);
@@ -716,7 +716,7 @@ describe("handleGithubWebhook", () => {
     expect(drainOutbox()).toHaveLength(1);
   }, 30_000);
 
-  test("a real listener reports duplicate in progress when a reclaim replaces the lock during the delivery", async () => {
+  test("a real listener reports duplicate in progress after a staged reclaim replacement", async () => {
     const childHome = mkdtempSync(join(tmpdir(), "tps-gh-listener-"));
     const payload = JSON.stringify({ repository: { full_name: "example/repo" }, ref: "refs/heads/main" });
     const delivery = "real-listener-reclaim";
