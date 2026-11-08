@@ -105,12 +105,16 @@ test.each([
   const root = mkdtempSync(join(tmpdir(), "cli-npm-clock-"));
   try {
     const preload = join(root, "registry.mjs");
-    writeFileSync(preload, `Date.now = () => ${NOW};\nglobalThis.fetch = async () => {
-      if (${published === null}) throw new Error("unreadable registry");
-      return Response.json({ time: { "11.21.1": ${JSON.stringify(published)} } });
+    writeFileSync(preload, `Date.now = () => Number(process.env.TPS_TEST_NPM_NOW);
+    const published = JSON.parse(process.env.TPS_TEST_NPM_PUBLISHED);
+    globalThis.fetch = async () => {
+      if (published === null) throw new Error("unreadable registry");
+      return Response.json({ time: { "11.21.1": published } });
     };\n`);
     const result = spawnSync("bun", ["--no-install", "--preload", preload, CLI], {
-      cwd: REPO, env: { ...process.env }, encoding: "utf8", timeout: 15000,
+      cwd: REPO,
+      env: { ...process.env, TPS_TEST_NPM_NOW: String(NOW), TPS_TEST_NPM_PUBLISHED: JSON.stringify(published) },
+      encoding: "utf8", timeout: 15000,
     });
     expect(result.error).toBeUndefined();
     expect(result.status, result.stderr).toBe(status);
