@@ -30,6 +30,7 @@ import {
   runtimeNonoOptions,
   runtimeNonoProfile,
   sandboxProfileGrantRefusal,
+  autoCommitRepoGrantRefusal,
   REFUSAL_EXIT_CODE,
   SUPERVISED_REFUSAL_EXIT_CODE,
   canonicalPath,
@@ -42,6 +43,7 @@ import {
   writeLaunchSnapshotOwner,
 } from "../utils/launch-snapshots.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
+import { resolveCommitRepo } from "../utils/codex-runtime.js";
 
 export interface AgentArgs {
   action: "run" | "start" | "health" | "create" | "list" | "status" | "decommission" | "commit" | "isolate" | "logs" | "healthcheck" | "set-runtime";
@@ -1374,6 +1376,30 @@ export async function runAgent(
   }
 }
 
+/**
+ * The repository the sandboxed Codex child will auto-commit to (cli#833).
+ * Reads the config file the child is handed and resolves it with the same
+ * functions and base directory the child uses — `resolveAutoCommitRepo`
+ * against that file, then `resolveCommitRepo`'s workspace fallback. Only the
+ * Codex runtime reads `autoCommit`; another runtime ignores the key.
+ */
+function sandboxedAutoCommitRepo(
+  configPath: string,
+  workspace: string,
+  runtime?: string,
+): string | undefined {
+  if (runtime !== "codex") return undefined;
+  const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+  const autoCommit = document?.autoCommit;
+  if (autoCommit === null || typeof autoCommit !== "object" || Array.isArray(autoCommit)) return undefined;
+  const configuredRepo = (autoCommit as Record<string, unknown>).repo;
+  if (configuredRepo !== undefined && configuredRepo !== null && typeof configuredRepo !== "string") return undefined;
+  return resolveCommitRepo({
+    workspace,
+    autoCommit: { repo: resolveAutoCommitRepo(configuredRepo, configPath, false) },
+  });
+}
+
 async function runAgentCommand(
   args: AgentArgs,
   snapshot?: { workspaceConfigPath: string; snapshotRoot: string },
@@ -1629,6 +1655,11 @@ async function runAgentCommand(
               worktreeCreated = start?.changed ?? worktreeCreated;
               cleanupBinding = start?.cleanupBinding;
               approval = approveLaunch();
+              const autoCommitRepo = sandboxedAutoCommitRepo(configPath, config.workspace, selectedRuntime);
+              const autoCommitRefusal = autoCommitRepo === undefined
+                ? null
+                : autoCommitRepoGrantRefusal(autoCommitRepo, approval.options);
+              if (autoCommitRefusal) throw new Error(autoCommitRefusal);
             } catch (err) {
               console.error(`❌ ${(err as Error).message}`);
               if (worktreeCreated) {
