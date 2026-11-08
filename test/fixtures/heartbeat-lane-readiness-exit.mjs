@@ -4,6 +4,7 @@
 // the lane's grace window still sees it.
 import { spawn, spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
 
 const { waitForRpc } = await import(pathToFileURL(process.argv[2]).href);
 
@@ -11,8 +12,10 @@ const EXIT_DELAY_MS = Number(process.env.EXIT_DELAY_MS ?? 10);
 const stubSource = `import net from "node:net";const server=net.createServer((socket)=>{socket.end("ready");setTimeout(()=>process.exit(0),${EXIT_DELAY_MS});});server.listen(0,"127.0.0.1",()=>process.stdout.write(String(server.address().port)+"\\n"));`;
 const stub = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: ["ignore", "pipe", "inherit"],
+  detached: true,
 });
 if (!stub.pid) throw new Error("stub gateway did not start");
+installGatewayTeardown(stub.pid);
 const port = await new Promise((resolvePort, rejectPort) => {
   stub.stdout.once("data", (chunk) => resolvePort(Number(String(chunk).trim())));
   stub.once("error", rejectPort);

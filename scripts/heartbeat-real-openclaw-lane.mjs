@@ -400,7 +400,7 @@ function assertLiveHeartbeatResult(result, testCase) {
 }
 
 export async function runLiveCase(root, binDir, options = {}) {
-  const { allocatePort = freePort } = options;
+  const { allocatePort = freePort, onGatewaySpawn } = options;
   const port = await allocatePort();
   const testCase = makeCase(root, "live", (await allocatePort()));
   const logPath = join(testCase.dir, "gateway.log");
@@ -415,6 +415,7 @@ export async function runLiveCase(root, binDir, options = {}) {
       stdio: ["ignore", logFd, logFd],
     },
   );
+  onGatewaySpawn?.(gateway);
   await finishWithCleanup(
     async () => {
       await waitForRpc(testCase, port, binDir, gateway, logPath, options);

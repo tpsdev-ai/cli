@@ -6,6 +6,7 @@
 // and the test runs under an explicit timeout.
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
+import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
 
 const { waitForGatewayExit } = await import(pathToFileURL(process.argv[2]).href);
 
@@ -17,9 +18,10 @@ const READY_TIMEOUT_MS = 5000;
 const child = spawn(
   process.execPath,
   ["--input-type=module", "-e", `process.stdout.write("ready\\n");setTimeout(() => process.exit(0), ${EXIT_DELAY_MS});`],
-  { stdio: ["ignore", "pipe", "inherit"] },
+  { stdio: ["ignore", "pipe", "inherit"], detached: true },
 );
 if (!child.pid) throw new Error("STUB_GATEWAY_NOT_STARTED: spawn returned no pid");
+installGatewayTeardown(child.pid);
 
 try {
   await new Promise((resolveReady, rejectReady) => {
