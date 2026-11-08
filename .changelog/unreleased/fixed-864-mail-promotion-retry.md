@@ -1,1 +1,1 @@
-- **Retry retained OpenClaw mail**: Retry rejected promotions that leave their source in new/, with a per-path failure limit and a diagnostic when exhausted.
+- **Retry retained OpenClaw mail**: Retry failed promotions that leave their source in new/, with a per-source-identity failure limit and a diagnostic when exhausted.
