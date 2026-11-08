@@ -36,6 +36,8 @@ const REPO = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const TPS_BIN = resolve(process.env.TPS_HEARTBEAT_BIN ?? join(REPO, "packages", "cli", "dist", "bin", "tps.js"));
 const KEEP = process.env.TPS_HEARTBEAT_KEEP === "1";
 const READY_TIMEOUT_MS = 90_000;
+/** How long a gateway exit already in progress may take to be delivered. */
+export const GATEWAY_EXIT_GRACE_MS = 250;
 /** The only connect failure that means "nothing is listening". */
 const PORT_CLOSED_CODES = new Set(["ECONNREFUSED"]);
 
@@ -187,22 +189,41 @@ function gatewayExitDescription(gateway) {
 }
 
 /**
- * Let pending process events run so a child's exit is delivered before the
- * gateway is checked again.
+ * Wait for the gateway child's `exit` event for at most `graceMs`, resolving
+ * early when it fires.
+ *
+ * An exit is queued on the event loop, not observable at once, and the number
+ * of turns it takes to deliver is not fixed: under container CPU contention a
+ * child that has already exited can be delivered later still. Waiting on the
+ * event itself, bounded, sees an exit already in progress without assuming a
+ * turn count; the bound keeps a gateway that stays up from holding the lane.
  */
-async function settleGatewayEvents(gateway) {
-  for (let turn = 0; turn < 2 && !gatewayExited(gateway); turn++) {
-    await new Promise((resolveTurn) => setImmediate(resolveTurn));
-  }
+export function waitForGatewayExit(gateway, graceMs = GATEWAY_EXIT_GRACE_MS) {
+  if (gatewayExited(gateway)) return Promise.resolve(true);
+  return new Promise((resolveExit) => {
+    let timer;
+    let settled = false;
+    const finish = (exited) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (typeof gateway.removeListener === "function") gateway.removeListener("exit", onExit);
+      resolveExit(exited);
+    };
+    const onExit = () => finish(true);
+    timer = setTimeout(() => finish(gatewayExited(gateway)), graceMs);
+    if (typeof gateway.once === "function") gateway.once("exit", onExit);
+    // The exit may have been delivered between the check above and the listener.
+    if (gatewayExited(gateway)) finish(true);
+  });
 }
 
 /**
  * Fail the live case when the launched gateway exited while the heartbeat ran,
- * naming its exit code or signal. The post-readiness check is unchanged.
+ * naming its exit code or signal.
  */
 export async function assertGatewaySurvivedHeartbeat(gateway, logPath) {
-  await settleGatewayEvents(gateway);
-  if (gatewayExited(gateway)) {
+  if (await waitForGatewayExit(gateway)) {
     throw new Error(`gateway exited with ${gatewayExitDescription(gateway)} during the heartbeat\n${readLogTail(logPath)}`);
   }
 }
@@ -242,8 +263,7 @@ export async function waitForRpc(testCase, port, binDir, gateway, logPath, optio
       if (now() > deadline) {
         throw new Error(`gateway answered --require-rpc after the ${timeoutMs / 1000}s readiness deadline`);
       }
-      await settleGatewayEvents(gateway);
-      if (gatewayExited(gateway)) {
+      if (await waitForGatewayExit(gateway)) {
         throw new Error(
           `gateway exited with ${gatewayExitDescription(gateway)} after answering --require-rpc\n${readLogTail(logPath)}`,
         );
@@ -357,7 +377,15 @@ async function runDeadCase(root, binDir) {
   console.log("PASS dead gateway: exit 1, persisted error gateway unreachable");
 }
 
-async function runLiveCase(root, binDir) {
+function assertLiveHeartbeatResult(result, testCase) {
+  assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
+  assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
+  const persisted = readPersisted(testCase);
+  assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
+  assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
+}
+
+export async function runLiveCase(root, binDir) {
   const port = await freePort();
   const testCase = makeCase(root, "live", (await freePort()));
   const logPath = join(testCase.dir, "gateway.log");
@@ -376,15 +404,13 @@ async function runLiveCase(root, binDir) {
     async () => {
       await waitForRpc(testCase, port, binDir, gateway, logPath);
       const result = runHeartbeat(testCase, port, binDir);
+      // The exit check waits out the grace window for both outcomes, because a
+      // gateway exit during the heartbeat is not visible right after spawnSync
+      // returns. The result assertions still run, so neither failure hides the
+      // other.
       await finishWithCleanup(
         () => assertGatewaySurvivedHeartbeat(gateway, logPath),
-        async () => {
-          assert.equal(result.status, 0, `live gateway: heartbeat exit status must be 0\n${describeRun(result)}`);
-          assert.match(result.stdout, /Heartbeat for .*: online/, `live gateway: stdout must report online\n${describeRun(result)}`);
-          const persisted = readPersisted(testCase);
-          assert.equal(persisted.status, "online", "live gateway: persisted status must be online");
-          assert.deepEqual(persisted.errors ?? [], [], "live gateway: persisted errors must be empty");
-        },
+        async () => assertLiveHeartbeatResult(result, testCase),
       );
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
