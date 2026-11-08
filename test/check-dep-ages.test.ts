@@ -7,7 +7,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -606,6 +606,125 @@ describe("CLI — the production lockfile selection", () => {
       registry.stop();
     }
   }, 120_000);
+});
+
+describe("CLI — pinned npm lockfiles under --ci", () => {
+  const lockfile = "fixtures/pinned lock/package-lock.json";
+
+  function fixture() {
+    const root = writeFixtureRepo(mkdtempSync(join(scratch, "ci-pinned-")), {
+      exceptions: "## Exceptions\n",
+      npmLocks: { [lockfile]: npmLock({ "node_modules/pinned": { version: "1.0.0" } }) },
+    });
+    const home = mkdtempSync(join(scratch, "ci-home-"));
+    const env = { PATH: process.env.PATH ?? "", HOME: home, GIT_CONFIG_NOSYSTEM: "1" };
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: root, env, encoding: "utf8" }).trim();
+    mkdirSync(join(root, "scripts/lib"), { recursive: true });
+    for (const path of ["scripts/check-dep-ages.mjs", "scripts/lib/check-dep-ages-collect.mjs", "scripts/lib/npm-ci-revision.sh"]) {
+      writeFileSync(join(root, path), readFileSync(join(REPO, path)));
+    }
+    const preload = join(root, "publish-times.mjs");
+    writeFileSync(preload, `globalThis.fetch = async (url) => {
+      console.log("publish-time request: " + url);
+      return Response.json({ time: { "1.0.0": ${JSON.stringify(OLD_ISO)}, "2.0.0": new Date().toISOString() } });
+    };\n`);
+    git("init", "-q");
+    git("config", "user.name", "Fixture Author");
+    git("config", "user.email", "fixture@example.test");
+    const commit = (message: string) => {
+      git("add", ".");
+      const parent = spawnSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: root, env, encoding: "utf8" });
+      const parents = parent.status === 0 ? ["-p", parent.stdout.trim()] : [];
+      const sha = git("commit-tree", git("write-tree"), ...parents, "-m", message);
+      git("update-ref", "HEAD", sha);
+    };
+    commit("pinned lock");
+    const revision = git("rev-parse", "HEAD");
+    const committed = readFileSync(join(root, lockfile));
+    const run = (args = ["--ci"], extra: Record<string, string | undefined> = {}) => {
+      const result = spawnSync("node", ["--import", preload, join(root, "scripts/check-dep-ages.mjs"), ...args], {
+        cwd: root, env: { ...env, GITHUB_ACTIONS: "true", GITHUB_SHA: revision, ...extra },
+        encoding: "utf8", timeout: 30_000,
+      });
+      expect(result.error).toBeUndefined();
+      return { exitCode: result.status, output: result.stdout + result.stderr };
+    };
+    return { root, git, revision, committed, commit, run };
+  }
+
+  it("refuses a changed checkout lock, naming its path and pinned revision", () => {
+    const h = fixture();
+    writeFileSync(join(h.root, lockfile), JSON.stringify(npmLock({ "node_modules/replacement": { version: "1.0.0" } })));
+    const result = h.run();
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toContain(`${lockfile}: working file differs from ${h.revision}`);
+    expect(result.output).not.toContain("publish-time request:");
+  }, 30_000);
+
+  it("selects an identical lock from GITHUB_SHA after HEAD and the index drop it", () => {
+    const h = fixture();
+    h.git("rm", lockfile);
+    writeFileSync(join(h.root, "package-lock.json"), JSON.stringify(npmLock({ "node_modules/head": { version: "2.0.0" } })));
+    h.commit("different HEAD lock");
+    expect(h.git("rev-parse", "HEAD")).not.toBe(h.revision);
+    mkdirSync(dirname(join(h.root, lockfile)), { recursive: true });
+    writeFileSync(join(h.root, lockfile), h.committed);
+    const result = h.run();
+    expect(result.exitCode).toBe(0);
+    expect(result.output).toContain(`${lockfile}: 1 npm entries`);
+    expect(result.output).toContain("publish-time request: https://registry.npmjs.org/pinned");
+    expect(result.output).not.toContain("publish-time request: https://registry.npmjs.org/head");
+    expect(result.output).toContain("All 2 external resolved versions");
+  }, 30_000);
+
+  it("fails the age verdict for an identical young committed lock", () => {
+    const h = fixture();
+    writeFileSync(join(h.root, lockfile), JSON.stringify(npmLock({ "node_modules/pinned": { version: "2.0.0" } })));
+    h.commit("young pinned lock");
+    const result = h.run(["--ci"], { GITHUB_SHA: h.git("rev-parse", "HEAD") });
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toContain(`${lockfile}: pinned@2.0.0`);
+  }, 30_000);
+
+  it("refuses a committed lock deleted from the checkout, naming its path and revision", () => {
+    const h = fixture();
+    rmSync(join(h.root, lockfile));
+    const result = h.run();
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toContain(`cannot compare ${lockfile} with ${h.revision}`);
+    expect(result.output).not.toContain("publish-time request:");
+  }, 30_000);
+
+  it("uses HEAD outside Actions when GITHUB_SHA is unset or invalid", () => {
+    const h = fixture();
+    for (const sha of [undefined, "", "invalid"]) {
+      const result = h.run(["--ci"], { GITHUB_ACTIONS: "", GITHUB_SHA: sha });
+      expect(result.exitCode).toBe(0);
+      expect(result.output).toContain(`${lockfile}: 1 npm entries`);
+    }
+    writeFileSync(join(h.root, lockfile), "{}\n");
+    const result = h.run(["--ci"], { GITHUB_ACTIONS: "", GITHUB_SHA: "" });
+    expect(result.exitCode).toBe(2);
+    expect(result.output).toContain(`${lockfile}: working file differs from HEAD`);
+  }, 30_000);
+
+  it.each([undefined, "", "malformed", "a".repeat(39), "g".repeat(40)])(
+    "refuses Actions with invalid GITHUB_SHA %j", (sha) => {
+      const h = fixture();
+      const result = h.run(["--ci"], { GITHUB_SHA: sha });
+      expect(result.exitCode).toBe(2);
+      expect(result.output).toContain("GITHUB_SHA must be 40 hex characters under GitHub Actions");
+    }, 30_000,
+  );
+
+  it("keeps reading the changed working lock outside --ci", () => {
+    const h = fixture();
+    writeFileSync(join(h.root, lockfile), JSON.stringify(npmLock({ "node_modules/working": { version: "2.0.0" } })));
+    const result = h.run([], { GITHUB_SHA: "invalid" });
+    expect(result.exitCode).toBe(1);
+    expect(result.output).toContain(`${lockfile}: working@2.0.0`);
+    expect(result.output).not.toContain("differs");
+  }, 30_000);
 });
 
 describe("CLI — npm lockfiles", () => {
