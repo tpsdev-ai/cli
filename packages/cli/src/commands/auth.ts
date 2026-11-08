@@ -59,18 +59,27 @@ function ensureAuthDir(): void {
 function saveCredentials(provider: string, creds: StoredCredentials): void {
   ensureAuthDir();
   const target = authPath(provider);
+  writeCredentialFile(target, creds);
+}
+
+function writeCredentialFile(target: string, data: unknown): void {
   const temp = `${target}.${randomUUID()}.tmp`;
   let fd: number | undefined;
+  let created = false;
   try {
     fd = openSync(temp, "wx", 0o600);
-    writeFileSync(fd, JSON.stringify(creds, null, 2));
+    created = true;
+    writeFileSync(fd, JSON.stringify(data, null, 2));
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
     renameSync(temp, target);
   } finally {
-    if (fd !== undefined) closeSync(fd);
-    rmSync(temp, { force: true });
+    try {
+      if (fd !== undefined) closeSync(fd);
+    } finally {
+      if (created) rmSync(temp, { force: true });
+    }
   }
 }
 
@@ -352,7 +361,6 @@ function readCodexCredentials(): StoredCredentials | null {
 
 /**
  * Update a Codex token file to hold both access and refresh tokens (flat or nested), or warn.
- * Atomic write: write to .tmp then rename to prevent partial reads.
  */
 function syncToCodexCli(creds: StoredCredentials): void {
   const candidates = runtimeCredentialFiles("codex");
@@ -379,10 +387,7 @@ function syncToCodexCli(creds: StoredCredentials): void {
       if ("expiresAt" in data) data.expiresAt = creds.expiresAt;
       if ("expires_at" in data) data.expires_at = creds.expiresAt;
 
-      // Atomic write: tmp → rename
-      const tmpPath = credPath + ".tmp";
-      writeFileSync(tmpPath, JSON.stringify(data, null, 2), { mode: 0o600 });
-      renameSync(tmpPath, credPath);
+      writeCredentialFile(credPath, data);
       return;
     } catch {
       // Try the next credential file.

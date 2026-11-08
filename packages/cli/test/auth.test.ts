@@ -1,9 +1,12 @@
 import { createPatchShared } from "./helpers/patch-shared.js";
 const patchShared = createPatchShared();
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
+import { chmodSync, existsSync, linkSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+
+afterEach(() => { mock.restore(); });
 
 describe("tps auth", () => {
   let root: string;
@@ -323,16 +326,46 @@ describe("tps auth", () => {
       });
     }
 
-    for (const failure of ["absent", "blocked temporary path"]) {
+    for (const failure of ["absent", "descriptor write"]) {
       test(`keeps refreshed credentials in the provider store and warns on Codex sync failure: ${failure}`, async () => {
         const warnings: string[] = [];
         patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
         if (failure === "absent") rmSync(codex);
-        else mkdirSync(`${codex}.tmp`);
+        let temporary: string | undefined;
+        let descriptor: number | undefined;
+        const open = fs.openSync;
+        const write = fs.writeFileSync;
+        const opening = spyOn(fs, "openSync").mockImplementation((path, flags, mode) => {
+          const fd = open(path, flags, mode);
+          if (String(path).startsWith(`${codex}.`)) {
+            temporary = String(path);
+            descriptor = fd;
+          }
+          return fd;
+        });
+        const writing = spyOn(fs, "writeFileSync").mockImplementation((path, data, options) => {
+          if (failure === "descriptor write" && path === descriptor) {
+            write(path, "partial");
+            throw new Error("fixture write failure: new-access new-refresh");
+          }
+          return write(path, data, options);
+        });
         const codexBefore = existsSync(codex) ? readFileSync(codex) : undefined;
         respond({ access_token: "new-access", refresh_token: "new-refresh" });
         const { refreshOpenAIToken } = await import("../src/commands/auth.js");
-        const refreshed = await refreshOpenAIToken(credentials);
+        let refreshed;
+        try {
+          refreshed = await refreshOpenAIToken(credentials);
+        } finally {
+          writing.mockRestore();
+          opening.mockRestore();
+        }
+        if (failure === "descriptor write") {
+          expect(temporary).toBeDefined();
+          expect(existsSync(temporary!)).toBe(false);
+          expect(() => fs.fstatSync(descriptor!)).toThrow();
+          expect(readdirSync(join(root, "codex-home"))).toEqual(["auth.json"]);
+        }
         expect(JSON.parse(readFileSync(store, "utf8"))).toEqual(refreshed);
         expect(refreshed).toMatchObject({ accessToken: "new-access", refreshToken: "new-refresh" });
         expect(existsSync(codex) ? readFileSync(codex) : undefined).toEqual(codexBefore);
@@ -342,6 +375,28 @@ describe("tps auth", () => {
         for (const token of ["old-access", "old-refresh", "new-access", "new-refresh"]) {
           expect(warnings[0]).not.toContain(token);
         }
+      });
+    }
+
+    for (const kind of ["readable file", "symlink"]) {
+      test(`leaves the old fixed Codex temporary path unchanged: ${kind}`, async () => {
+        const warnings: string[] = [];
+        patchShared(console, "warn", (...args: unknown[]) => warnings.push(args.join(" ")));
+        const fixed = `${codex}.tmp`;
+        const protectedFile = kind === "symlink" ? join(root, "symlink-target") : fixed;
+        writeFileSync(protectedFile, "keep this content", { mode: 0o644 });
+        if (kind === "symlink") symlinkSync(protectedFile, fixed);
+        chmodSync(codex, 0o644);
+        respond({ access_token: "new-access", refresh_token: "new-refresh" });
+        const { refreshOpenAIToken } = await import("../src/commands/auth.js");
+        await refreshOpenAIToken(credentials);
+        expect(readFileSync(protectedFile, "utf8")).toBe("keep this content");
+        expect(JSON.parse(readFileSync(codex, "utf8"))).toMatchObject({
+          accessToken: "new-access", refreshToken: "new-refresh",
+        });
+        expect(statSync(codex).mode & 0o777).toBe(0o600);
+        expect(readdirSync(join(root, "codex-home")).sort()).toEqual(["auth.json", "auth.json.tmp"]);
+        expect(warnings).toHaveLength(0);
       });
     }
 
