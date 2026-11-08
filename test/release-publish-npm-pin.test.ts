@@ -62,7 +62,12 @@ test.each(["removed", "after upgrade"])("the structure guard refuses an age chec
   expect(() => assertGates(job, true)).toThrow();
 });
 
-test("real npm uses the workflow registry over project and environment settings", () => {
+// This case runs the real npm CLI. The Unit lane (setup-node) has npm; the Docker
+// Integration image does not, so there it is skipped by name rather than failed.
+const npmProbe = spawnSync("npm", ["--version"], { encoding: "utf8", timeout: 10000 });
+const npmAvailable = npmProbe.error === undefined && npmProbe.status === 0;
+
+test.skipIf(!npmAvailable)("real npm uses the workflow registry over project and environment settings (needs npm on PATH)", () => {
   const root = mkdtempSync(join(tmpdir(), "cli-npm-registry-"));
   try {
     const home = join(root, "home");
