@@ -351,7 +351,7 @@ function readCodexCredentials(): StoredCredentials | null {
 }
 
 /**
- * Sync refreshed tokens to an existing Codex credential file, or warn.
+ * Update a supported flat or nested Codex token file, or warn.
  * Atomic write: write to .tmp then rename to prevent partial reads.
  */
 function syncToCodexCli(creds: StoredCredentials): void {
@@ -361,8 +361,12 @@ function syncToCodexCli(creds: StoredCredentials): void {
     if (!existsSync(credPath)) continue;
     try {
       const data = JSON.parse(readFileSync(credPath, "utf-8"));
+      if (!data || typeof data !== "object" || Array.isArray(data)) continue;
+      const nested = data.tokens && typeof data.tokens === "object" && !Array.isArray(data.tokens);
+      const flat = ["accessToken", "access_token", "refreshToken", "refresh_token"].some((key) => key in data);
+      if (!nested && !flat) continue;
 
-      if (data.tokens && typeof data.tokens === "object") {
+      if (nested) {
         data.tokens.access_token = creds.accessToken;
         data.tokens.refresh_token = creds.refreshToken;
       }
