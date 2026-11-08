@@ -544,7 +544,7 @@ async function main() {
               return null;
             }
             const agentCfg = parseYaml(readFileSync(cfgPath, "utf-8")) as any;
-            const { agentWorkspace: resolveWorkspace } = await import("../src/utils/agent-workspace.js");
+            const { agentWorkspace: resolveWorkspace, resolveAutoCommitRepo } = await import("../src/utils/agent-workspace.js");
             const { interpolateEnvInString, readConfiguredWorkspace } = await import("@tpsdev-ai/agent");
             // Expand ${NAME} in the two path keys only (cli#680); a sandboxed child
             // receives the parent loader's resolved workspace instead.
@@ -560,6 +560,15 @@ async function main() {
               configured.workspace ?? configured.repo ?? join(homedir(), "ops", "tps"),
               sandboxed ? process.env : undefined,
             );
+            // A relative autoCommit.repo follows the workspace convention: it is
+            // anchored at the config file's directory, never the process cwd.
+            // Only the Codex runtime reads autoCommit, so only it resolves the
+            // value and expands ${NAME}; a sandboxed child receives the
+            // snapshot's absolute value. An empty YAML entry is absent, so the
+            // runtime's workspace fallback applies.
+            const autoCommit = runtimeArg === "codex" && agentCfg.autoCommit
+              ? { ...agentCfg.autoCommit, repo: resolveAutoCommitRepo(agentCfg.autoCommit.repo, cfgPath, !sandboxed) }
+              : undefined;
 
             // OPS-47: Build workspace provider from agent.yaml config
             const { GitWorkspaceProvider } = await import("../src/utils/workspace-provider.js");
@@ -628,7 +637,7 @@ async function main() {
                 flairKeyPath: agentCfg.flair?.keyPath,
                 systemPrompt: typeof agentCfg.systemPrompt === "string" ? agentCfg.systemPrompt : undefined,
                 workspaceProvider,
-                autoCommit: agentCfg.autoCommit,
+                autoCommit,
                 reviewTrigger: parseReviewTriggerConfig(agentCfg),
               });
             } else if (runtimeArg === "gemini") {

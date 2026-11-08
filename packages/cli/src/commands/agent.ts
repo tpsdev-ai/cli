@@ -11,7 +11,7 @@
  */
 
 import { AgentRuntime, loadAgentConfig, pidState } from "@tpsdev-ai/agent";
-import { agentWorkspace } from "../utils/agent-workspace.js";
+import { agentWorkspace, resolveAutoCommitRepo } from "../utils/agent-workspace.js";
 import yaml from "js-yaml";
 import { generateKeyPair, saveKeyPair, loadKeyPair, verify } from "../utils/identity.js";
 import { createFlairClient, FlairAgentKeyRegisterError, FlairRequestError, isEncryptedPrivateKeyPem, loadFlairSigningKey } from "../utils/flair-client.js";
@@ -1427,11 +1427,40 @@ async function runAgentCommand(
         process.exit(1);
       }
 
+      if (snapshot && args.runtime !== "codex") {
+        // `autoCommit` is the Codex runtime's. Another runtime neither reads nor
+        // expands it, so drop it before the config loader interpolates the rest
+        // of the file — an unset variable there cannot stop the launch.
+        const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
+        if (document !== null && typeof document === "object" && Object.hasOwn(document, "autoCommit")) {
+          delete document.autoCommit;
+          writeFileSync(configPath, yaml.dump(document, { lineWidth: -1 }));
+        }
+      }
       const config = loadAgentConfig(configPath, snapshot ? dirname(snapshot.workspaceConfigPath) : undefined);
       config.workspace = agentWorkspace(snapshot?.workspaceConfigPath ?? configPath, config.workspace, args.sandboxed ? process.env : undefined);
       if (snapshot) {
         const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown>;
-        writeFileSync(configPath, yaml.dump({ ...document, workspace: config.workspace }, { lineWidth: -1 }));
+        const snapshotDocument: Record<string, unknown> = { ...document, workspace: config.workspace };
+        // The child resolves a relative autoCommit.repo against the config file
+        // it is handed — this snapshot — so resolve it here against the
+        // original config, with the same environment expansion the workspace
+        // loader applies, and write the absolute value. Only the Codex runtime
+        // reads autoCommit: another runtime neither resolves nor expands it, so
+        // an unset variable in it cannot stop the launch.
+        if (args.runtime === "codex") {
+          const autoCommit = document.autoCommit;
+          if (autoCommit !== null && typeof autoCommit === "object" && !Array.isArray(autoCommit)) {
+            const configuredRepo = (autoCommit as Record<string, unknown>).repo;
+            if (typeof configuredRepo === "string" || configuredRepo === null) {
+              snapshotDocument.autoCommit = {
+                ...(autoCommit as Record<string, unknown>),
+                repo: resolveAutoCommitRepo(configuredRepo, snapshot.workspaceConfigPath, true),
+              };
+            }
+          }
+        }
+        writeFileSync(configPath, yaml.dump(snapshotDocument, { lineWidth: -1 }));
       }
 
       // cli#351 r5 — the launch grant must NOT come from a file the sandboxed

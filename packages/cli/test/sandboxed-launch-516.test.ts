@@ -501,6 +501,107 @@ test("an absolute workspace containing .. is normalized for the parent, the snap
   );
 });
 
+test("the launch snapshot and child carry the absolute autoCommit.repo override; the commit is exercised outside confinement", () => {
+  const sb = makeSandbox();
+  try {
+    // This proves the snapshot and the child carry the absolute override. The
+    // `tps agent commit` below runs in this test process, outside the nono
+    // session; it does not exercise a commit through the confined runtime.
+    const configDir = join(sb.home, ".tps", "agents", "probe");
+    const workspace = join(configDir, "workspace");
+    const commitRepo = join(configDir, "commit-repo");
+    const g = (cwd: string, args: string[]) => {
+      const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+      return String(result.stdout ?? "").trim();
+    };
+    for (const repo of [workspace, commitRepo]) {
+      mkdirSync(repo, { recursive: true });
+      g(repo, ["init", "-q", "-b", "main"]);
+      g(repo, ["config", "user.email", "agent-a@example.com"]);
+      g(repo, ["config", "user.name", "agent-a"]);
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      g(repo, ["add", "file.txt"]);
+      g(repo, ["commit", "-qm", "base"]);
+    }
+
+    installFakeNono(sb, "  :");
+    writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+    const configPath = join(configDir, "agent.yaml");
+    writeFileSync(configPath, agentYaml(sb, "workspace") + "autoCommit:\n  repo: commit-repo\n");
+    const attestationModule = resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js");
+    const agentModule = resolve(import.meta.dir, "../dist/src/commands/agent.js");
+    const codexModule = resolve(import.meta.dir, "../dist/src/utils/codex-runtime.js");
+    const preload = join(sb.root, "child-preload.ts");
+    writeFileSync(preload, `
+      import { mock } from 'bun:test';
+      const attestation = await import(${JSON.stringify(attestationModule)});
+      mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+        attestConfinement: async () => ({ ok: true, worktreeBinding: { kind: 'none' } }),
+      }));
+      const codex = await import(${JSON.stringify(codexModule)});
+      mock.module(${JSON.stringify(codexModule)}, () => ({ ...codex,
+        runCodexRuntime: async (config) => console.log('CHILD ' + JSON.stringify({ workspace: config.workspace, repo: config.autoCommit?.repo })),
+      }));
+    `);
+    const script = `
+      import { mock } from 'bun:test';
+      import { readFileSync } from 'node:fs';
+      import { spawnSync } from 'node:child_process';
+      import yaml from ${JSON.stringify(resolve(import.meta.dir, "../../../node_modules/js-yaml/index.js"))};
+      const attestation = await import(${JSON.stringify(attestationModule)});
+      mock.module(${JSON.stringify(attestationModule)}, () => ({ ...attestation,
+        launchAttested: async (_profile, options, cmd, opts) => {
+          const path = cmd[cmd.indexOf('--config') + 1];
+          console.log('SNAPSHOT ' + JSON.stringify({ path, document: yaml.load(readFileSync(path, 'utf8')) }));
+          const child = spawnSync('bun', ['--preload', ${JSON.stringify(preload)}, ${JSON.stringify(TPS_BIN)}, ...cmd.slice(cmd.indexOf('agent'))], {
+            encoding: 'utf8', cwd: options.cwd ?? process.cwd(), env: { ...opts.env, TPS_AGENT_WORKSPACE: undefined, TPS_LAUNCH_SOCK: 'fixture' },
+          });
+          process.stdout.write(child.stdout); process.stderr.write(child.stderr);
+          return child.status ?? 1;
+        },
+      }));
+      const { runAgent } = await import(${JSON.stringify(agentModule)});
+      await runAgent({ action: 'start', id: 'probe', runtime: 'codex', sandboxRequired: true });
+    `;
+    const result = spawnSync("bun", ["-e", script], {
+      cwd: sb.run, encoding: "utf8", timeout: 20_000, env: cliEnv(sb),
+    });
+    expect(result.status, output(result)).toBe(0);
+    const snapshotLine = result.stdout.split("\n").find((line) => line.startsWith("SNAPSHOT "));
+    expect(snapshotLine, output(result)).toBeDefined();
+    const snapshot = JSON.parse(snapshotLine!.slice("SNAPSHOT ".length)) as {
+      path: string;
+      document: { workspace: string; autoCommit: { repo: string } };
+    };
+    expect(snapshot.path.startsWith(join(sb.home, ".tps", "launch"))).toBe(true);
+    expect(snapshot.document.workspace).toBe(workspace);
+    expect(snapshot.document.autoCommit.repo).toBe(commitRepo);
+
+    const childLine = result.stdout.split("\n").find((line) => line.startsWith("CHILD "));
+    expect(childLine, output(result)).toBeDefined();
+    const child = JSON.parse(childLine!.slice("CHILD ".length));
+    expect(child.workspace).toBe(workspace);
+    expect(child.repo).toBe(commitRepo);
+    expect(child.repo).not.toBe(child.workspace);
+
+    // A commit through the resolved repository lands there, not in the workspace.
+    const workspaceHead = g(workspace, ["rev-parse", "HEAD"]);
+    const commitHead = g(commitRepo, ["rev-parse", "HEAD"]);
+    writeFileSync(join(commitRepo, "task.txt"), "task\n");
+    const commit = spawnSync("bun", [
+      TPS_BIN, "agent", "commit", "--repo", child.repo, "--branch", "task/fixture",
+      "--message", "fixture task", "--author", "agent-a", "agent-a@example.com",
+    ], { cwd: sb.run, encoding: "utf8", env: { ...cliEnv(sb), TPS_AGENT_ID: "probe" } });
+    expect(commit.status, output(commit)).toBe(0);
+    expect(g(commitRepo, ["rev-parse", "HEAD"])).not.toBe(commitHead);
+    expect(g(workspace, ["rev-parse", "HEAD"])).toBe(workspaceHead);
+    expect(readFileSync(join(commitRepo, "task.txt"), "utf-8")).toBe("task\n");
+  } finally {
+    rmSync(sb.root, { recursive: true, force: true });
+  }
+}, 60_000);
+
 test("the parent removes its config snapshot on SIGTERM", () => {
   const sb = makeSandbox();
   try {

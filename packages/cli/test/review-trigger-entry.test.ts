@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -20,6 +20,13 @@ for (const taskPath of ["flair", "mail"]) {
     const keyPath = join(root, "agent-a.key");
     writeFileSync(keyPath, Buffer.alloc(32, 0x31));
     writeFileSync(join(workspace, "SOUL.md"), "Test agent");
+    const gitEnv = { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: "1" };
+    const runGit = (args: string[]) => spawnSync("git", args, { cwd: workspace, env: gitEnv, encoding: "utf-8" });
+    runGit(["init"]);
+    runGit(["config", "user.name", "agent-a"]);
+    runGit(["config", "user.email", "agent-a@example.test"]);
+    runGit(["add", "SOUL.md"]);
+    runGit(["commit", "-m", "Initial workspace"]);
     const processFixture = readFileSync(join(import.meta.dir, "helpers/review-trigger-process.ts"), "utf8");
     for (const command of ["codex", "git", "gh-as"]) {
       const path = join(bin, command);
@@ -82,6 +89,20 @@ for (const taskPath of ["flair", "mail"]) {
         args: ["agent-a", "api", "--method", "POST", "repos/example/repo/pulls/17/requested_reviewers", "--input", "-"],
         input: JSON.stringify({ reviewers: ["reviewer-1", "reviewer-2"] }),
       }]);
+      const gitPathProbes = calls.filter((call) => call.command === "git" && call.args[0] === "rev-parse" && call.args.includes("--git-path"));
+      const probedDirs = gitPathProbes.map((call) => call.args[call.args.indexOf("--git-path") + 1]);
+      if (taskPath === "mail") {
+        expect(probedDirs, output).toContain("rebase-merge");
+        expect(probedDirs, output).toContain("rebase-apply");
+      }
+      for (const probe of gitPathProbes) {
+        const stub = spawnSync(join(bin, "git"), probe.args, { cwd: workspace, env: { ...process.env, HOME: root }, encoding: "utf-8" });
+        const real = runGit(probe.args);
+        expect(real.status, String(real.stderr)).toBe(0);
+        expect(stub.stdout.trim(), JSON.stringify(probe.args)).toBe(real.stdout.trim());
+        expect(existsSync(real.stdout.trim())).toBe(false);
+      }
+      expect(runGit(["rev-parse", "--verify", "HEAD"]).status, output).toBe(0);
     } finally {
       child.kill("SIGKILL");
       await exited;
