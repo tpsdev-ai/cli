@@ -70,8 +70,7 @@ function probe(timeoutMs) {
     socket.once("error", (error) => finish(error.code === "ECONNREFUSED" ? "refused" : "error"));
   });
 }
-// Probe until the port reports the wanted outcome, for at most WAIT_MS on the
-// monotonic clock; on the cap, write the failure and exit non-zero.
+// Use a monotonic WAIT_MS retry budget, checked between attempts. On exhaustion, write the failure and exit non-zero.
 async function waitForPort(wanted, failure) {
   const deadline = performance.now() + WAIT_MS;
   for (let remaining = WAIT_MS; remaining > 0; remaining = deadline - performance.now()) {
