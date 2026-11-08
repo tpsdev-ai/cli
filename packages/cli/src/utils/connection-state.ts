@@ -91,9 +91,9 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * renamed over the target, so a write or rename failure leaves the previous
  * record intact. The parent directory sync after the rename is best-effort:
  * directory fsync is not supported everywhere, and the rename is already
- * atomic for readers. If writing or renaming throws, the helper attempts to
- * close the descriptor and attempts to remove the temp file, then rethrows the
- * error; a failed close or removal is swallowed.
+ * atomic for readers. If a temp-file operation or rename throws, the helper
+ * attempts to close any still-open descriptor and remove the temp file, then
+ * rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
