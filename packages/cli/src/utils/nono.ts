@@ -750,6 +750,43 @@ function pathsOverlap(a: string, b: string): boolean {
   return pathContainsOrEquals(a, b) || pathContainsOrEquals(b, a);
 }
 
+/**
+ * True when the directory write grant `grant` covers `target`: equal, or `target` is
+ * beneath it. Both sides are compared as REAL paths (symlinks resolved), and
+ * the match is on a path-segment boundary, so `/work/agent-x` is not inside
+ * `/work/agent` (cli#833).
+ */
+export function writeGrantCovers(grant: string, target: string): boolean {
+  const fold = (p: string) => (caseInsensitivePath(p) ? p.toLowerCase() : p);
+  const g = fold(canonicalPath(grant));
+  const t = fold(canonicalPath(target));
+  if (t === g) return true;
+  return g.endsWith(sep) ? t.startsWith(g) : t.startsWith(`${g}${sep}`);
+}
+
+/**
+ * Refuse an `autoCommit.repo` outside the launch-option paths checked:
+ * workdir, cwd and `--allow` directories, and exact `--allow-file` files.
+ * Profile-only `filesystem.allow` / `filesystem.write` grants are not consulted
+ * (cli#833).
+ */
+export function autoCommitRepoGrantRefusal(repo: string, options: NonoOptions): string | null {
+  const directories = [
+    ...new Set([
+      ...(options.workdir ? [options.workdir] : []),
+      ...(options.cwd ? [options.cwd] : []),
+      ...(options.allow ?? []),
+    ]),
+  ];
+  const files = [...new Set(options.allowFiles ?? [])];
+  if (directories.some((grant) => writeGrantCovers(grant, repo)) ||
+      files.some((grant) => canonicalPath(grant) === canonicalPath(repo))) return null;
+  return (
+    `autoCommit.repo '${repo}' is outside the launch-option paths checked (${[...directories, ...files].join(", ")}): ` +
+    `put the repository under the workspace, or run that agent without the sandbox`
+  );
+}
+
 export function approveRuntimeNonoOptions(
   runtime: string | undefined,
   grants: NonoOptions,

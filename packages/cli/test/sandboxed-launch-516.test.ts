@@ -2240,3 +2240,60 @@ exit 0
     }
   });
 });
+
+// ---------------------------------------------------------------------------
+// cli#833 — refuse autoCommit.repo outside launch-option paths before nono run
+// and the agent child. Profile-only filesystem.allow/write grants are not checked.
+// ---------------------------------------------------------------------------
+
+describe("cli#833 — autoCommit.repo containment at launch", () => {
+  test("outside launch-option paths: refused before nono run and the agent child", () => {
+    const sb = makeSandbox();
+    try {
+      const outside = join(sb.root, "outside", "repo");
+      mkdirSync(outside, { recursive: true });
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        `${agentYaml(sb, sb.ws)}autoCommit:\n  repo: ${outside}\n`,
+      );
+      const result = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb) },
+      );
+      const text = output(result);
+      expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+      expect(text).toContain(`autoCommit.repo '${outside}'`);
+      expect(text).toContain(sb.ws);
+      expect(text).toContain("put the repository under the workspace, or run that agent without the sandbox");
+      expect(fakeNonoRuns(sb.root)).toEqual([]);
+      expect(existsSync(join(sb.ws, ".tps-agent.pid"))).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("inside the workspace: the launch proceeds to nono with the codex runtime", () => {
+    const sb = makeSandbox();
+    try {
+      const inside = join(sb.ws, "repo");
+      mkdirSync(inside, { recursive: true });
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        `${agentYaml(sb, sb.ws)}autoCommit:\n  repo: ${inside}\n`,
+      );
+      runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb) },
+      );
+      const runs = fakeNonoRuns(sb.root).join("\n");
+      expect(runs).toContain("--runtime codex");
+      expect(runs).not.toContain("outside the launch-option paths checked");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});

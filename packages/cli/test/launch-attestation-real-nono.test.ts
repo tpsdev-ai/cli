@@ -20,6 +20,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { resolveNonoBinary, checkNonoPin } from "../src/utils/launch-attestation.js";
+import { REFUSAL_EXIT_CODE } from "../src/utils/nono.js";
 import { realNonoHomeBase } from "./helpers/launcher-grants.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -117,6 +118,18 @@ function seedHome(home: string, ws: string, nonoBin: string): void {
   };
   writeFileSync(join(profileDir, "tps-base-fixture.json"), JSON.stringify(base, null, 2));
   writeFileSync(join(profileDir, "tps-agent-run.json"), JSON.stringify(run, null, 2));
+  writeFileSync(
+    join(profileDir, "tps-agent-run-codex.json"),
+    JSON.stringify(
+      {
+        $schema: "https://nono.sh/schemas/nono-profile.schema.json",
+        extends: "tps-agent-run",
+        meta: { name: "tps-agent-run-codex" },
+      },
+      null,
+      2,
+    ),
+  );
   writeFileSync(
     join(agentDir, "agent.yaml"),
     `agentId: probe\nname: probe\nworkspace: ${ws}\n` +
@@ -324,6 +337,134 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
       expect(text).not.toContain("no released child within");
     } finally {
       const stopped = await stopRealLaunch(child, text);
+      rmSync(sb.root, { recursive: true, force: true });
+      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli#833 — check autoCommit.repo against launch-option paths before nono run
+// and the agent child. Profile-only filesystem.allow/write grants are not checked.
+// ---------------------------------------------------------------------------
+
+function writeProbeConfig(sb: { home: string; ws: string }, autoCommitRepo?: string): void {
+  writeFileSync(
+    join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+    `agentId: probe\nname: probe\nworkspace: ${sb.ws}\n` +
+      `mailDir: ${join(sb.home, ".tps", "mail")}\n` +
+      `memoryPath: ${join(sb.home, ".tps", "agents", "probe", "memory.jsonl")}\n` +
+      `llm:\n  provider: ollama\n  model: probe-model\n` +
+      (autoCommitRepo === undefined ? "" : `autoCommit:\n  repo: ${autoCommitRepo}\n`),
+  );
+}
+
+function initRepo(path: string): void {
+  mkdirSync(path, { recursive: true });
+  const git = (args: string[]) => {
+    const r = spawnSync("git", ["-C", path, ...args], { encoding: "utf-8" });
+    if (r.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${r.stderr}`);
+  };
+  git(["init", "-q"]);
+  git(["-c", "user.name=agent", "-c", "user.email=agent@example.test", "commit", "--allow-empty", "-qm", "init"]);
+}
+
+const launchEnv = (sb: { home: string; tmp: string }) => ({
+  ...process.env,
+  HOME: sb.home,
+  TMPDIR: sb.tmp,
+  NONO_BIN: NONO!,
+  TPS_LAUNCH_TIMEOUT_MS: "20000",
+});
+
+real("cli#833 — real nono: an autoCommit.repo outside launch-option paths is refused", () => {
+  test("the launch is refused before nono run and the agent child", () => {
+    const sb = sandbox();
+    try {
+      const outside = join(sb.root, "outside", "repo");
+      mkdirSync(outside, { recursive: true });
+      writeProbeConfig(sb, outside);
+      const r = spawnSync(
+        NODE,
+        [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.ws, encoding: "utf-8", timeout: 60_000, env: launchEnv(sb) },
+      );
+      const text = `${r.stdout ?? ""}${r.stderr ?? ""}`;
+      expect(r.status, text).toBe(REFUSAL_EXIT_CODE);
+      expect(text).toContain(`autoCommit.repo '${outside}'`);
+      expect(text).toContain(sb.ws);
+      expect(text).toContain("put the repository under the workspace, or run that agent without the sandbox");
+      expect(text).not.toContain("released under nono session");
+      expect(existsSync(join(sb.ws, ".tps-agent.pid"))).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+});
+
+real("cli#833 — real nono: an autoCommit.repo inside the workspace is granted", () => {
+  test("the launch is released and a sandboxed commit lands in that repository", async () => {
+    const sb = sandbox();
+    let child: ReturnType<typeof spawn> | undefined;
+    let text = "";
+    try {
+      const repo = join(sb.ws, "repo");
+      initRepo(repo);
+      writeProbeConfig(sb, repo);
+      child = spawn(
+        NODE,
+        [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.ws, detached: true, env: launchEnv(sb) },
+      );
+      const launcher = child;
+      const released = await new Promise<boolean>((resolvePromise) => {
+        const timer = setTimeout(() => resolvePromise(false), 45_000);
+        const onData = (chunk: Buffer) => {
+          text += chunk.toString("utf-8");
+          if (/released under nono session \S+ \(child pid \d+\)/.test(text)) {
+            clearTimeout(timer);
+            resolvePromise(true);
+          }
+        };
+        launcher.stdout?.on("data", onData);
+        launcher.stderr?.on("data", onData);
+        launcher.on("exit", () => {
+          clearTimeout(timer);
+          resolvePromise(/released under nono session \S+ \(child pid \d+\)/.test(text));
+        });
+      });
+      expect(released, text).toBe(true);
+
+      // The launch's own write grant covers the repository: a commit made
+      // under the same profile and workdir lands in it.
+      const profile = join(sb.home, ".config", "nono", "profiles", "tps-agent-run-codex.json");
+      const state = join(sb.root, "nono-state");
+      mkdirSync(state, { recursive: true });
+      const commit = spawnSync(
+        NONO!,
+        [
+          "run", "-s", "--profile", profile,
+          "--allow-cwd", "--workdir", sb.ws,
+          "--allow", sb.ws,
+          "--allow", join(sb.home, ".tps", "agents", "probe"),
+          "--allow", join(sb.home, ".tps", "mail"),
+          "--allow", sb.tmp,
+          "--", "git", "-C", repo,
+          "-c", "user.name=agent", "-c", "user.email=agent@example.test",
+          "commit", "--allow-empty", "-m", "sandbox auto-commit",
+        ],
+        {
+          cwd: sb.ws,
+          encoding: "utf-8",
+          timeout: 60_000,
+          env: { ...process.env, HOME: sb.home, XDG_STATE_HOME: state, LC_ALL: "C" },
+        },
+      );
+      expect(commit.status, commit.stderr).toBe(0);
+      const subject = spawnSync("git", ["-C", repo, "log", "-1", "--format=%s"], { encoding: "utf-8" });
+      expect(subject.stdout.trim()).toBe("sandbox auto-commit");
+    } finally {
+      const stopped = !child || await stopRealLaunch(child, text);
       rmSync(sb.root, { recursive: true, force: true });
       expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
     }
