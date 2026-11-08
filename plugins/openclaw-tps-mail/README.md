@@ -323,7 +323,7 @@ All five security concerns were reviewed. Two are fixed in this version; three a
 
 - **Single hub account.** The plugin assumes a single "default" account pointing at `~/.tps/mail`. Multi-user or multi-host setups would need account-per-host configuration.
 - **No per-principal auth.** The plugin trusts the OS user boundary for sender authenticity. This is acceptable on single-user rockit. For multi-host or shared-workstation deployments, file-level Ed25519 envelope signatures are required — see security review items 1-3 above. A `TPS-MAIL-SIGNATURES` spec will gate non-rockit deployment.
-- **No debounce beyond 50ms.** If the same file gets multiple `fs.watch` events in rapid succession, only the first gets processed (via `seenFiles` dedup). Concurrent-send scenarios haven't been stress-tested.
+- **No debounce beyond 50ms.** Path claims deduplicate in-flight attempts and suppress terminal outcomes; retained sources retry up to a small cap per dev/ino/size/mtime identity, with a fresh budget for a changed identity. Concurrent-send scenarios haven't been stress-tested.
 
 ## Development notes
 

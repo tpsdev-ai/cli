@@ -52,7 +52,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
@@ -1786,6 +1786,7 @@ const outbound: ChannelOutboundAdapter = {
 };
 
 export const NEW_DIR_RESCAN_MS = 30_000;
+export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
@@ -1844,15 +1845,8 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       return;
     }
     const watchers = lifetime.watchers;
-    // seenFiles holds every new/ path taken in this account lifetime. The
-    // watcher (fs.watch can fire several events per write — see its debounce),
-    // the startup sweep and the periodic rescan (cli#853) all go through
-    // processNewFile, so within one lifetime a path is promoted at most once,
-    // including after a processing error (no retry before the next start).
-    // It is NOT pre-populated at startup: a file already in new/ when the
-    // gateway starts (mail that arrived while it was down, or a path a previous
-    // lifetime left there after a failed promotion) is taken by the startup
-    // sweep.
+    // Path claims deduplicate in-flight attempts and suppress terminal outcomes.
+    // Retained sources retry by dev/ino/size/mtime identity, up to the failure cap.
     //
     // Across restarts: promote() commits a verified cur/ record (or a dlq/ one)
     // BEFORE dispatch; removing the new/ source is best-effort, and a later
@@ -1861,6 +1855,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     // re-verification; an existing obligation is reconciled rather than
     // dispatched again (at-least-once delivery is the contract).
     const seenFiles = new Set<string>();
+    const transientFailures = new Map<string, { filePath: string; failures: number }>();
+
+    function sourceIdentity(filePath: string): string | undefined {
+      try {
+        const stat = statSync(filePath, { bigint: true });
+        return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}`;
+      } catch (err) {
+        if (["ENOENT", "ENOTDIR"].includes((err as NodeJS.ErrnoException).code ?? "")) return undefined;
+        throw err;
+      }
+    }
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
@@ -1868,21 +1873,49 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // package's reader skips them too): no path here — watcher, startup sweep
       // or rescan — promotes or dead-letters one.
       if (basename(filePath).startsWith(".")) return;
+      const identity = sourceIdentity(filePath);
+      if (identity === undefined) return;
+      if ((transientFailures.get(identity)?.failures ?? 0) >= MAX_NEW_FILE_TRANSIENT_FAILURES) return;
       seenFiles.add(filePath);
 
       // ONE enforcement point, shared with the CLI: parse wrapper → envelope,
       // verify through an always-constructed Flair client, check recipient and
       // replay, and move new/ → cur/ (or dlq/ with a `.reason` sidecar). The
       // plugin carries no verification implementation of its own.
-      const promoted = await promote(recipient, filePath);
-      if (!isLive()) return;
-      if (!promoted.ok) {
-        log?.warn?.(
-          `tps-mail: not promoted (${promoted.class}) for ${recipient}: ${promoted.reason}`,
-        );
-        return;
+      let terminal = false;
+      try {
+        let promoted: Awaited<ReturnType<typeof promote>> | undefined;
+        try {
+          promoted = await promote(recipient, filePath);
+        } catch (err: any) {
+          log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
+        }
+        if (!isLive()) return;
+        if (!promoted?.ok) {
+          if (sourceIdentity(filePath) !== undefined) {
+            const failures = (transientFailures.get(identity)?.failures ?? 0) + 1;
+            transientFailures.set(identity, { filePath, failures });
+            if (failures >= MAX_NEW_FILE_TRANSIENT_FAILURES) {
+              log?.warn?.(`tps-mail: promotion retry limit reached for ${filePath}; source suppressed`);
+            }
+          } else {
+            transientFailures.delete(identity);
+            terminal = promoted?.class === "replay"
+              || sourceIdentity(resolve(dirname(filePath), "..", "dlq", basename(filePath))) === identity;
+          }
+          if (promoted) {
+            log?.warn?.(
+              `tps-mail: not promoted (${promoted.class}) for ${recipient}: ${promoted.reason}`,
+            );
+          }
+          return;
+        }
+        terminal = true;
+        transientFailures.delete(identity);
+        await deliverPromoted(recipient, promoted.message, promoted.path, source === "rescan" ? filePath : undefined);
+      } finally {
+        if (!terminal) seenFiles.delete(filePath);
       }
-      await deliverPromoted(recipient, promoted.message, promoted.path, source === "rescan" ? filePath : undefined);
     }
 
     /**
@@ -2381,7 +2414,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         if (!isLive() || rescanning) return;
         rescanning = true;
         try {
-          for (const filename of await readdir(newDir)) {
+          const filenames = await readdir(newDir);
+          const present = new Set(filenames.map((filename) => resolve(newDir, filename)));
+          for (const [identity, { filePath }] of transientFailures) {
+            if (dirname(filePath) === newDir && (!present.has(filePath) || sourceIdentity(filePath) !== identity)) {
+              transientFailures.delete(identity);
+            }
+          }
+          for (const filename of filenames) {
             if (!isLive()) break;
             const filePath = resolve(newDir, filename);
             if (pendingWatchFiles.has(filePath)) continue;
