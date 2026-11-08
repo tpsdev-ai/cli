@@ -19,8 +19,8 @@ if (command === "codex") {
       if (args.includes("--is-inside-work-tree")) process.exit(1);
       const gitPathIndex = args.indexOf("--git-path");
       if (gitPathIndex !== -1) {
-        // Real git names the repository's Git directory even when the path is
-        // absent; no rebase is in progress here, so the path does not exist.
+        // Mirrors real git's answer in an initialized repository with no rebase
+        // in progress; that path is absent.
         console.log(join(process.cwd(), ".git", args[gitPathIndex + 1] ?? ""));
         break;
       }
