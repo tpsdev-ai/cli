@@ -10,6 +10,30 @@ function readRows(path: string): any[] {
   return readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
 }
 
+function fixtureGitEnv(root: string, env = process.env): NodeJS.ProcessEnv {
+  const globalConfig = join(root, "gitconfig-empty");
+  writeFileSync(globalConfig, "");
+  return { ...env, HOME: root, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: globalConfig };
+}
+
+test("fixture git ignores the host GIT_CONFIG_GLOBAL user.name", () => {
+  const root = mkdtempSync(join(tmpdir(), "review-entry-git-"));
+  try {
+    const hostConfig = join(root, "host.gitconfig");
+    writeFileSync(hostConfig, "[user]\n\tname = host-user\n");
+    const hostEnv = { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: hostConfig };
+    const gitEnv = fixtureGitEnv(root, hostEnv);
+    const runGit = (args: string[], env = gitEnv) => spawnSync("git", args, { cwd: root, env, encoding: "utf8" });
+    expect(runGit(["init"]).status).toBe(0);
+    expect(runGit(["config", "--get", "user.name"], hostEnv).stdout.trim()).toBe("host-user");
+    const result = runGit(["config", "--get", "user.name"]);
+    expect(result.stdout).toBe("");
+    expect(result.status).toBe(1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 for (const taskPath of ["flair", "mail"]) {
   test(`${taskPath} task: config-file launch requests configured reviewers and ignores a signed non-admin POST claiming the agent's authorId`, async () => {
     const root = mkdtempSync(join(tmpdir(), "review-entry-"));
@@ -20,7 +44,7 @@ for (const taskPath of ["flair", "mail"]) {
     const keyPath = join(root, "agent-a.key");
     writeFileSync(keyPath, Buffer.alloc(32, 0x31));
     writeFileSync(join(workspace, "SOUL.md"), "Test agent");
-    const gitEnv = { ...process.env, HOME: root, GIT_CONFIG_NOSYSTEM: "1" };
+    const gitEnv = fixtureGitEnv(root);
     const runGit = (args: string[]) => spawnSync("git", args, { cwd: workspace, env: gitEnv, encoding: "utf-8" });
     runGit(["init"]);
     runGit(["config", "user.name", "agent-a"]);

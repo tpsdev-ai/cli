@@ -28,6 +28,7 @@ import { FlairClient, type PresenceActivity } from "./flair-client.js";
 import { startTaskLoop } from "./flair-task-loop.js";
 import { homeDir } from "./home.js";
 import { startReviewTriggerLoop } from "./pr-review-trigger.js";
+import { providerAuthPath } from "./runtime-credentials.js";
 import { completeRuntimeMail, pollRuntimeMail, type RuntimeMailConfig, runtimeBootPreflight, sendRuntimeMail } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
 import type { Envelope } from "@tpsdev-ai/agent";
@@ -43,7 +44,7 @@ function shouldSendTaskCompletion(recipient: string, reviewNotify?: string[]): b
 
 /** Read OpenAI OAuth creds from ~/.tps/auth/openai.json (written by tps auth login openai). */
 function readStoredOpenAICreds(): StoredCredentials | null {
-  const credPath = join(homeDir(), ".tps", "auth", "openai.json");
+  const credPath = providerAuthPath("openai");
   if (!existsSync(credPath)) return null;
   try {
     const data = JSON.parse(readFileSync(credPath, "utf-8"));
