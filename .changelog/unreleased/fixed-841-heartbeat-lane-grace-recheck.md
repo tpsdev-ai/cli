@@ -1,0 +1,1 @@
+- **The heartbeat lane re-checks a gateway exit after the grace timer fires, so an exit queued while the lane is blocked is still reported.**

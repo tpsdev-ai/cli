@@ -211,7 +211,16 @@ export function waitForGatewayExit(gateway, graceMs = GATEWAY_EXIT_GRACE_MS) {
       resolveExit(exited);
     };
     const onExit = () => finish(true);
-    timer = setTimeout(() => finish(gatewayExited(gateway)), graceMs);
+    timer = setTimeout(() => {
+      if (gatewayExited(gateway)) {
+        finish(true);
+        return;
+      }
+      // The timer runs in the timers phase, before the poll phase delivers a
+      // child exit that was queued while this loop was blocked. Re-check one
+      // phase later, when the exit is visible, before reporting survival.
+      setImmediate(() => finish(gatewayExited(gateway)));
+    }, graceMs);
     if (typeof gateway.once === "function") gateway.once("exit", onExit);
     // The exit may have been delivered between the check above and the listener.
     if (gatewayExited(gateway)) finish(true);
