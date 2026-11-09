@@ -5,13 +5,12 @@
 # The pinned action (v1.3.2) makes one un-retried download of this binary and
 # verifies no checksum of its own. It reuses a binary already present at its
 # tool-cache path, so the checks below run before the action can use the file:
-# a failed download or a checksum mismatch fails the job, and the firewall is
-# never skipped.
+# a downloaded binary that does not match the pin, or a failed download, fails
+# the job, and the firewall is never skipped.
 #
-# A verified binary is also cached through actions/cache (the restore step that
-# precedes this script in each job). A restored file is used only after its
-# sha256 matches the pin; a file that does not match is deleted and treated as
-# a cache miss.
+# Each job also attempts to restore a verified binary through actions/cache (the
+# restore step that precedes this script). A restored entry that does not match
+# the pin is discarded; the script downloads instead.
 set -euo pipefail
 
 FIREWALL_VERSION="1.15.4"
@@ -49,7 +48,14 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 
-URL="https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}"
+# Test-only seams, unset in CI: the retry test points the real curl at a local
+# server, overrides the pin to that server's payload, and shortens the backoff.
+# Unset, the URL and sha256 are the production values and curl uses its own
+# backoff.
+URL="${SFW_PREFETCH_URL:-https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}}"
+if [ -n "${SFW_PREFETCH_TEST_SHA256:-}" ]; then
+  SHA256="${SFW_PREFETCH_TEST_SHA256}"
+fi
 CACHE_DIR="${RUNNER_TOOL_CACHE}/socket-firewall-free/${FIREWALL_VERSION}/${ARCH}"
 CACHE_BINARY="${CACHE_DIR}/sfw"
 # actions/cache restores this workspace-relative path before the script runs.
@@ -75,9 +81,10 @@ install_binary() {
 # pin.
 if [ -f "${CACHE_BINARY}" ]; then
   if [ "$(sha256_of "${CACHE_BINARY}")" = "${SHA256}" ]; then
+    : > "${CACHE_DIR}.complete"
     exit 0
   fi
-  rm -f "${CACHE_BINARY}"
+  rm -f "${CACHE_BINARY}" "${CACHE_DIR}.complete"
 fi
 
 # A restored cache entry is used only when its sha256 still matches the pin. A
@@ -96,8 +103,13 @@ trap 'rm -f "${tmp}"' EXIT
 
 # Cold cache: bounded exponential backoff (curl doubles its delay between
 # attempts), so an outage of a few minutes is ridden out but the job's timeout
-# still bounds the wait.
-curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 20 --max-time 60 -o "${tmp}" "${URL}"
+# still bounds the wait. SFW_PREFETCH_RETRY_DELAY is test-only: unset in CI,
+# where curl keeps its own backoff.
+retry_delay_args=()
+if [ -n "${SFW_PREFETCH_RETRY_DELAY:-}" ]; then
+  retry_delay_args=(--retry-delay "${SFW_PREFETCH_RETRY_DELAY}")
+fi
+curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 20 --max-time 60 "${retry_delay_args[@]+"${retry_delay_args[@]}"}" -o "${tmp}" "${URL}"
 if [ "$(sha256_of "${tmp}")" != "${SHA256}" ]; then
   echo "::error::Socket Firewall binary checksum mismatch; refusing to install it" >&2
   exit 1
