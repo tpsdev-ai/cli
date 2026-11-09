@@ -87,7 +87,7 @@ function bracedNpm(line: string): boolean {
   return /\{[^{}]*\bnpm\b[^{}]*\}/.test(line);
 }
 
-/** The line's normalized tokens name npm and an install subcommand or an expansion in that position. */
+/** The line's normalized tokens name npm and an install-subcommand token after it, or an expansion in the subcommand position. */
 function isInstallCommandLine(line: string): boolean {
   const normalized = normalizeShellLine(line);
   const tokens = normalizedTokens(normalized);
