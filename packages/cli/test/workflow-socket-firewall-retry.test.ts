@@ -130,12 +130,13 @@ describe("every Socket Firewall action step", () => {
     }
 
     expect(violations).toEqual([]);
-    expect(total).toBe(14);
+    expect(total).toBe(15);
     expect(perFile).toEqual({
       "test.yml": 9,
       "release.yml": 3,
       "smoke.yml": 1,
       "real-flair.yml": 1,
+      "dependency-audit.yml": 1,
     });
   });
 
@@ -160,7 +161,7 @@ describe("every Socket Firewall action step", () => {
     }
 
     expect(violations).toEqual([]);
-    expect(total).toBe(14);
+    expect(total).toBe(15);
   });
 
   test("the pre-fetch verifies the pinned binary before it can be used", () => {
