@@ -14,8 +14,7 @@ on:
 permissions: {}
 
 env:
-  # The single platform list: the build matrix mirrors it, each leg smokes its
-  # own entry, and the publish job's index check reads it (cli#353).
+  # The build matrix mirrors this list; verify checks digest rows against it.
   PLATFORMS: linux/amd64,linux/arm64
 
 jobs:

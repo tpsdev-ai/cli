@@ -5,7 +5,7 @@
  * `.github/scripts/docker-image-tags.sh`. These tests RUN that script with a
  * stub `npm` first on PATH (no network, no real npm): the stub records each
  * call and answers from the case's STUB_* variables. The last group checks that
- * `docker.yml` runs the script before any build and pushes only its tags.
+ * `docker.yml` runs the script before any build; the GHCR step reads its tags.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -293,7 +293,7 @@ describe("docker-image-tags.sh — the npm checks and the tags (cli#420)", () =>
   });
 });
 
-describe("docker.yml runs docker-image-tags.sh before any build and pushes only its tags (cli#420)", () => {
+describe("docker.yml runs docker-image-tags.sh before any build and passes its tags to GHCR (cli#420)", () => {
   interface Step {
     name?: string;
     id?: string;
@@ -338,7 +338,7 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
     expect(jobs.build.needs, "the build needs the checked version").toBe("meta");
   });
 
-  test("the one build takes the checked version, and the GHCR copy uses only the computed tags", () => {
+  test("the one build takes the checked version, and GHCR push takes TAGS from meta", () => {
     const builds = jobs.build.steps.filter((s) => s.uses?.includes("docker/build-push-action"));
     expect(builds.length, "one action step per platform leg builds").toBe(1);
     expect(String(builds[0].with?.["build-args"]).trim()).toBe(

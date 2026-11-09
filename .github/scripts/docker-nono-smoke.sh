@@ -8,8 +8,8 @@
 # copied out of the image and hashed on the host, then executed in the image for
 # that platform. Its `--version` must print
 # exactly "nono <version>", with <version> read from .nono-version, and it must
-# exit 0. A red smoke therefore means a missing hash line, a hash mismatch, a
-# wrong version, or a failed run.
+# exit 0. A missing hash line, hash mismatch, wrong version, or failed binary
+# execution makes the smoke fail.
 set -euo pipefail
 
 platform="${1:?usage: docker-nono-smoke.sh <platform> <image>}"

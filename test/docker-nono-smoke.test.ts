@@ -12,8 +12,8 @@
  * downloads the `tps-office-*` artifacts and refuses files outside one archive
  * per platform, and runs the tested `.github/scripts/docker-publish-index.sh`
  * to copy each archive with `--all --preserve-digests`, assemble the index from
- * the recorded platform manifests, verify it against `PLATFORMS`, and rehearse
- * the push; only the GHCR login and push are gated on `inputs.publish`.
+ * the recorded platform manifests, check digest rows and index entries against
+ * `PLATFORMS`, and rehearse the push; only GHCR steps depend on `inputs.publish`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -368,7 +368,7 @@ describe("docker.yml", () => {
     expect(login?.if).toBe("${{ inputs.publish }}");
   });
 
-  test("publish downloads only the platform archives with the pinned action", () => {
+  test("publish downloads matching tps-office-* artifacts; a later step rejects unexpected files", () => {
     const download = (jobs.publish?.steps ?? []).find((s) =>
       s.uses?.startsWith("actions/download-artifact@"),
     );

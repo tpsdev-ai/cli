@@ -26,12 +26,9 @@
 # assemble: create $REGISTRY/$REPOSITORY:verify from the per-platform image
 # manifests by digest.
 #
-# verify: the index's entries, excluding attestation entries, must be exactly
-# PLATFORMS, each carrying the recorded image-manifest digest. Attestation
-# entries are excluded because they describe build provenance, not a runnable
-# platform image, so they are not part of the platform set this index promises.
-# The checked entries are printed, and the raw index is written to
-# [raw-index-file] when given.
+# verify: digest-file platforms must equal PLATFORMS. Index entries other than
+# marked attestations must match those platforms and their recorded digests.
+# Print the entries and optionally write the raw index to [raw-index-file].
 # push: copy the local index and compare the destination's raw digest
 # with the recorded local index digest. --rehearsal permits a local HTTP target.
 #
@@ -136,6 +133,17 @@ verify)
   raw_out="${3-}"
   if [ ! -s "$digests" ]; then
     echo "no platform manifests recorded in $digests" >&2
+    exit 1
+  fi
+
+  expected_platforms="$(for platform in ${platforms//,/ }; do printf '%s\n' "$platform"; done | sort -u)"
+  recorded_platforms="$(awk '{ print $1 }' "$digests" | sort)"
+  if [ "$expected_platforms" != "$recorded_platforms" ]; then
+    recorded_set="$(printf '%s\n' "$recorded_platforms" | uniq)"
+    missing="$(comm -23 <(printf '%s\n' "$expected_platforms") <(printf '%s\n' "$recorded_set") | paste -sd, -)"
+    extra="$(comm -13 <(printf '%s\n' "$expected_platforms") <(printf '%s\n' "$recorded_set") | paste -sd, -)"
+    duplicate="$(printf '%s\n' "$recorded_platforms" | uniq -d | paste -sd, -)"
+    echo "digest platform set differs from PLATFORMS: missing ${missing:-none}; extra ${extra:-none}; duplicate ${duplicate:-none}" >&2
     exit 1
   fi
 

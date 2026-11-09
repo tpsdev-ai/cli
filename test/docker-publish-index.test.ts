@@ -348,6 +348,58 @@ describe("docker-publish-index.sh assemble and verify", () => {
     expect(JSON.parse(readFileSync(raw, "utf8")).manifests).toHaveLength(3);
   });
 
+  test("rejects a missing digest row before inspecting the index", () => {
+    const c = newCase();
+    makeArchive(c, "linux/amd64", true);
+    makeArchive(c, "linux/arm64", false);
+    expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
+    const amd64 = recorded(c, "linux/amd64");
+    writeFileSync(c.digests, `${amd64.join(" ")}\n`);
+    seedIndex(c, [{ platform: "linux/amd64", digest: amd64[3] }]);
+
+    const r = runScript(c, ["verify", c.digests]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("missing linux/arm64");
+  });
+
+  test("rejects an extra digest platform before inspecting the index", () => {
+    const c = newCase();
+    makeArchive(c, "linux/amd64", true);
+    makeArchive(c, "linux/arm64", false);
+    expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
+    const amd64 = recorded(c, "linux/amd64");
+    const arm64 = recorded(c, "linux/arm64");
+    const extra = `sha256:${sha256("riscv64")}`;
+    writeFileSync(c.digests, `${readFileSync(c.digests, "utf8")}linux/riscv64 riscv64 ${extra} ${extra}\n`);
+    seedIndex(c, [
+      { platform: "linux/amd64", digest: amd64[3] },
+      { platform: "linux/arm64", digest: arm64[3] },
+      { platform: "linux/riscv64", digest: extra },
+    ]);
+
+    const r = runScript(c, ["verify", c.digests]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("extra linux/riscv64");
+  });
+
+  test("rejects a duplicate digest platform before inspecting the index", () => {
+    const c = newCase();
+    makeArchive(c, "linux/amd64", true);
+    makeArchive(c, "linux/arm64", false);
+    expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
+    const amd64 = recorded(c, "linux/amd64");
+    const arm64 = recorded(c, "linux/arm64");
+    writeFileSync(c.digests, `${readFileSync(c.digests, "utf8")}${amd64.join(" ")}\n`);
+    seedIndex(c, [
+      { platform: "linux/amd64", digest: amd64[3] },
+      { platform: "linux/arm64", digest: arm64[3] },
+    ]);
+
+    const r = runScript(c, ["verify", c.digests]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("duplicate linux/amd64");
+  });
+
   test("fails naming a missing platform", () => {
     const c = newCase();
     const amd64 = makeArchive(c, "linux/amd64", true);
