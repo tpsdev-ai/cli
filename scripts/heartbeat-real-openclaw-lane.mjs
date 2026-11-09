@@ -415,9 +415,9 @@ export async function runLiveCase(root, binDir, options = {}) {
       stdio: ["ignore", logFd, logFd],
     },
   );
-  onGatewaySpawn?.(gateway);
   await finishWithCleanup(
     async () => {
+      onGatewaySpawn?.(gateway);
       await waitForRpc(testCase, port, binDir, gateway, logPath, options);
       const result = runHeartbeat(testCase, port, binDir);
       // Keep the heartbeat assertions running when a gateway check fails.
