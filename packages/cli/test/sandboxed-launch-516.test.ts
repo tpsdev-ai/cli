@@ -2247,6 +2247,68 @@ exit 0
 // ---------------------------------------------------------------------------
 
 describe("cli#833 — autoCommit.repo containment at launch", () => {
+  test("an unset variable inside autoCommit.repo stops config loading before nono run", () => {
+    const sb = makeSandbox();
+    try {
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+      const configPath = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+      writeFileSync(configPath, `${agentYaml(sb, sb.ws)}autoCommit:\n  repo: {path: "\${UNSET_TPS_856}"}\n`);
+      const result = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb, { UNSET_TPS_856: undefined }) },
+      );
+      expect(result.status, output(result)).not.toBe(0);
+      expect(output(result)).toContain("Missing environment variable: UNSET_TPS_856");
+      expect(fakeNonoRuns(sb.root)).toEqual([]);
+      expect(existsSync(join(sb.ws, ".tps-agent.pid"))).toBe(false);
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  for (const [value, type] of [["42", "number"], ["{path: x}", "object"]] as const) {
+    test(`Codex refuses autoCommit.repo of type ${type} before nono run and the agent child`, () => {
+      const sb = makeSandbox();
+      try {
+        installFakeNono(sb, "  :");
+        writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+        const configPath = join(sb.home, ".tps", "agents", "probe", "agent.yaml");
+        writeFileSync(configPath, `${agentYaml(sb, sb.ws)}autoCommit:\n  repo: ${value}\n`);
+        const result = runLauncher(
+          ["agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED],
+          { cwd: sb.run, env: cliEnv(sb) },
+        );
+        const text = output(result);
+        expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
+        expect(text).toContain(`autoCommit.repo in ${configPath} must be a string or null (got ${type})`);
+        expect(fakeNonoRuns(sb.root)).toEqual([]);
+        expect(existsSync(join(sb.ws, ".tps-agent.pid"))).toBe(false);
+      } finally {
+        rmSync(sb.root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  test("another runtime ignores a numeric autoCommit.repo", () => {
+    const sb = makeSandbox();
+    try {
+      installFakeNono(sb, "  :");
+      writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-gemini");
+      writeFileSync(
+        join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+        `${agentYaml(sb, sb.ws)}autoCommit:\n  repo: 42\n`,
+      );
+      const result = runLauncher(
+        ["agent", "start", "--id", "probe", "--runtime", "gemini", SANDBOX_REQUIRED],
+        { cwd: sb.run, env: cliEnv(sb) },
+      );
+      expect(fakeNonoRuns(sb.root).join("\n"), output(result)).toContain("--runtime gemini");
+    } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
   test("outside launch-option paths: refused before nono run and the agent child", () => {
     const sb = makeSandbox();
     try {

@@ -3,10 +3,12 @@
   without `resolved`, regardless of `inBundle`. It refuses versionless entries,
   URL/name/version disagreement, non-canonical registry URLs (including query
   strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
-  skipped. A literal `npm ci` command word in a workflow `run:` step must be a
-  helper call to `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory
-  and literal `--via npm` or `--via sfw`. Some escaped or quoted spellings evade classification,
-  for example `n\pm ci` and `npm c\i` (deferred to #836).
+  skipped. The workflow guard flags physical `run:` lines when lowercasing and
+  deleting backslashes and quotes reveals `npm`. A flagged block must match a
+  complete block pinned in the guard or use a tracked-lock helper call or bounded
+  global install shape without backticks, `$(` or multiline quotes. Refusals name
+  the workflow, job, step and physical line. Variable or substitution indirection
+  such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with
   lowercase names, the literal heartbeat pin substitution, helper calls and
   `GITHUB_ENV` echoes. Other helper-step lines are refused.

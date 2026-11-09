@@ -70,6 +70,7 @@ import { basename, dirname, join, resolve, sep } from "node:path";
  * (`isPathFree`), so a path cannot arrive under one of these names either.
  */
 export const PASSED_ENV = {
+  TPS_TEST_REQUIRE_NPM: "the Unit & Integration Tests lane requires npm on PATH",
   TPS_TEST_REAL_FLAIR: "opts into tests against a running Flair server",
   TPS_TEST_FLAIR_HTTP_PORT: "scratch HTTP port; flairTarget validates it before building a loopback URL",
   TPS_TEST_FLAIR_OPS_PORT: "scratch operator-API port; flairTarget validates it before building a loopback URL",
@@ -104,6 +105,9 @@ export function sanitizedTestEnv(env) {
   const dropped = [];
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) continue;
+    if (name === "TPS_TEST_REQUIRE_NPM" && value !== "1") {
+      throw new IsolationRefusal("invalid TPS_TEST_REQUIRE_NPM; expected unset or 1");
+    }
     const passed = Object.hasOwn(PASSED_ENV, name) && (name === "PATH" || isPathFree(value));
     if (passed) out[name] = value;
     else dropped.push(name);

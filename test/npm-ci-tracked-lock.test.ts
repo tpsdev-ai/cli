@@ -166,7 +166,11 @@ it.each(["npm-shrinkwrap.json", "package-lock.json", "package.json"])(
       const install = `bash scripts/npm-ci-tracked-lock.sh --via npm --in-place ${FIXTURE} --ignore-scripts`;
       const source = `jobs:\n  build:\n    steps:\n      - run: ${run}\n      - run: ${install}\n`;
       const steps = parseWorkflow(source).jobs.build.steps;
-      expect(npmCiLockDirs(steps[0].run!, "", "prior writer")).toEqual([]);
+      if (file === "npm-shrinkwrap.json") {
+        expect(() => npmCiLockDirs(steps[0].run!, "", "prior writer")).toThrow(/physical line 1/);
+      } else {
+        expect(npmCiLockDirs(steps[0].run!, "", "prior writer")).toEqual([]);
+      }
       expect(npmCiLockDirs(steps[1].run!, "", "install")).toEqual([FIXTURE]);
       const prior = h.run(["-c", steps[0].run!], {}, repo);
       expect({ status: prior.status, stderr: prior.stderr }).toMatchObject({ status: 0 });
