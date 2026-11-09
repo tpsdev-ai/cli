@@ -1,1 +1,1 @@
-- **Sandboxed Codex launches refuse non-string, non-null autoCommit.repo values** before nono runs.
+- **Sandboxed Codex launch:** after a config loads, a present non-string, non-null `autoCommit.repo` is refused before `nono run` with the refusal exit code, naming the field, original config file, and type. A config-load error, including an unset variable inside that value, stops earlier with the loader's error before `nono run`.
