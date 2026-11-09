@@ -114,7 +114,6 @@ export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
-  /** The sweep's `left` list, when non-empty. */
   tempCleanupLeft?: { path: string; reason: string }[];
 }
 
