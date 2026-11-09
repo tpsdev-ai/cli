@@ -735,6 +735,23 @@ function manualRemovalCommand(target: { baseWorkingTree: string; workspace: stri
   return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
 }
 
+/**
+ * Drop the manual-removal advice for `target` from an error message. A caller
+ * uses this when the worktree the message names no longer exists when the
+ * launch exits (cli#686), so the output never asks an operator to remove a
+ * path that is already gone.
+ */
+export function withoutManualRemovalAdvice(
+  message: string,
+  target: { baseWorkingTree: string; workspace: string },
+): string {
+  const advice = `remove it manually with: ${manualRemovalCommand(target)}`;
+  const clause = `; ${advice}`;
+  const at = message.indexOf(clause);
+  if (at >= 0) return message.slice(0, at) + message.slice(at + clause.length);
+  return message.replace(advice, "").replace(/[;\s]+$/, "");
+}
+
 /** Guidance for a path the recorded base does not list as its worktree: no Git command. */
 function unregisteredGuidance(target: { baseWorkingTree: string; workspace: string }): string {
   return `${target.workspace} is no longer a registered worktree of ${target.baseWorkingTree}; inspect it and remove it yourself if it is yours`;

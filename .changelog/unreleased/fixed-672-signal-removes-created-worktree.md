@@ -1,0 +1,1 @@
+- **A signal after worktree creation removes the worktree this launch created and leaves a pre-existing worktree untouched.**

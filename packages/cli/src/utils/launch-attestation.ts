@@ -66,6 +66,17 @@ import {
  * capability; this variable only says where it lives. */
 export const LAUNCH_SOCK_ENV = "TPS_LAUNCH_SOCK";
 
+/** The signals a launcher forwards to the session it started, then re-raises. */
+export const INTERRUPT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
+
+/** How long a signalled launcher waits for the supervisor and the released
+ * child to exit before it sends SIGKILL, by the pids this launch holds. */
+export const SIGNAL_STOP_BOUND_MS = 5_000;
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
 /** The pinned nono binary — ABSOLUTE, never resolved through PATH. The same
  * variable the S4 pin gate (`scripts/check-nono-pin.sh`) and the S1b profile
  * gate (`scripts/check-nono-profiles.sh`) are driven with, so a lane has one
@@ -756,6 +767,12 @@ export interface LaunchOptions {
     disableCanaryCheck?: boolean;
     disablePidBinding?: boolean;
   };
+  /** Called when a termination signal arrives, after the supervisor and the
+   * released child have been stopped and before the launcher re-raises it.
+   * The launcher's own worktree cleanup runs here. */
+  onInterrupt?: (signal: NodeJS.Signals) => void;
+  /** Test seam: the bounded wait for the stopped pids (default SIGNAL_STOP_BOUND_MS). */
+  signalStopTimeoutMs?: number;
 }
 
 /**
@@ -802,6 +819,7 @@ export async function launchAttested(
   let child: ChildProcess | null = null;
   let sessionId: string | undefined;
   let childPid = 0;
+  let supervisorPid = 0;
 
   const killQuietly = (pid: number, signal: NodeJS.Signals = "SIGTERM") => {
     // NEVER pid 0 (the whole process group, including the launcher itself),
@@ -813,6 +831,54 @@ export async function launchAttested(
     } catch {
       /* already gone */
     }
+  };
+
+  // A signal to the launcher stops the session it started, cleans up what only
+  // this launch created, and only then re-raises so the exit status still says
+  // it was signalled. A second signal is ignored: it must not abandon cleanup.
+  let stopping = false;
+  let interruptDone: Promise<void> | undefined;
+  const beginInterrupt = (signal: NodeJS.Signals): void => {
+    if (stopping) return;
+    stopping = true;
+    interruptDone = (async () => {
+      // Forward the signal to the nono supervisor the launcher spawned: it
+      // stops its child. Stop the released child too, by the pid this launch
+      // holds — never by name or pattern.
+      if (supervisorPid > 1) killQuietly(supervisorPid, signal);
+      if (childPid > 1) killQuietly(childPid, "SIGTERM");
+      const bound = opts.signalStopTimeoutMs ?? SIGNAL_STOP_BOUND_MS;
+      const deadline = Date.now() + bound;
+      const alive = () =>
+        [supervisorPid, childPid].some((pid) => pid > 1 && pidAlive(pid));
+      while (alive() && Date.now() < deadline) await sleepMs(50);
+      if (supervisorPid > 1) killQuietly(supervisorPid, "SIGKILL");
+      if (childPid > 1) killQuietly(childPid, "SIGKILL");
+      const reapDeadline = Date.now() + 500;
+      while (alive() && Date.now() < reapDeadline) await sleepMs(25);
+      try {
+        opts.onInterrupt?.(signal);
+      } catch (err) {
+        console.error(`❌ ${(err as Error).message}`);
+      }
+      if (server) closeServer(server);
+      removePrivateLaunchDir(priv);
+      log.push(`cleaned=${!existsSync(priv.root)}`);
+      for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
+      process.kill(process.pid, signal);
+      // A platform that defers the self-signal must still never return here.
+      await new Promise<void>(() => {});
+    })();
+  };
+  const interruptHandlers = INTERRUPT_SIGNALS.map((signal) => {
+    const handler = () => beginInterrupt(signal);
+    process.on(signal, handler);
+    return { signal, handler };
+  });
+  const settleInterrupt = async (): Promise<never> => {
+    if (interruptDone) await interruptDone;
+    await new Promise<void>(() => {});
+    throw new Error("unreachable: the launcher re-raises the signal");
   };
 
   try {
@@ -848,6 +914,7 @@ export async function launchAttested(
     // (5) listen BEFORE spawning: the child may connect the moment nono starts it.
     server = createServer();
     const listening = await listen(server, priv.sockPath);
+    if (stopping) return await settleInterrupt();
     if (typeof listening === "string") return refuse(listening);
 
     // (6) spawn nono — async, keep P live; the launcher pins XDG_STATE_HOME so
@@ -866,6 +933,7 @@ export async function launchAttested(
     log.push(`spawn=${bin} ${args.join(" ")}`);
     child = spawn(bin, args, { stdio: "inherit", env: spawnEnv });
     const P = child.pid;
+    supervisorPid = P ?? 0;
     if (!P) return refuse(`could not spawn ${bin}`);
     log.push(`nono_pid=${P}`);
 
@@ -921,6 +989,7 @@ export async function launchAttested(
       }
     );
 
+    if (stopping) return await settleInterrupt();
     if (!verdict.ok || !verdict.session || verdict.pid === undefined) {
       // Nothing is written; the child's bounded wait expires; the session and
       // the child are stopped; the private dir is removed in the finally block.
@@ -951,7 +1020,9 @@ export async function launchAttested(
       return refuse(`the nono session's supervisor (${P}) died before the release was written`);
     }
     if (opts.failFirstSeam?.disablePidBinding) {
-      return await exitCodeOf(child);
+      const code = await exitCodeOf(child);
+      if (stopping) return await settleInterrupt();
+      return code;
     }
     const recheck = psSessions(bin, priv, env);
     const still = findBoundSession(recheck, {
@@ -966,8 +1037,11 @@ export async function launchAttested(
     }
 
     // (10) the child runs; its exit code is the launch's.
-    return await exitCodeOf(child);
+    const code = await exitCodeOf(child);
+    if (stopping) return await settleInterrupt();
+    return code;
   } finally {
+    for (const { signal, handler } of interruptHandlers) process.removeListener(signal, handler);
     if (server) closeServer(server);
     removePrivateLaunchDir(priv);
     log.push(`cleaned=${!existsSync(priv.root)}`);

@@ -1,0 +1,1 @@
+- **The manual worktree-removal advice prints only for a worktree that still exists when the launch exits.**

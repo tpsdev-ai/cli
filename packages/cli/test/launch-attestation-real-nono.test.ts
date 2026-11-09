@@ -19,7 +19,7 @@ import { describe, test, expect, beforeAll, setDefaultTimeout } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { resolveNonoBinary, checkNonoPin } from "../src/utils/launch-attestation.js";
+import { resolveNonoBinary, checkNonoPin, pidAlive, SIGNAL_STOP_BOUND_MS } from "../src/utils/launch-attestation.js";
 import { REFUSAL_EXIT_CODE } from "../src/utils/nono.js";
 import { realNonoHomeBase } from "./helpers/launcher-grants.js";
 
@@ -58,6 +58,15 @@ async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): 
     } while (Date.now() < deadline);
   }
   return false;
+}
+
+async function waitForPidsGone(pids: readonly number[], timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  const gone = () => pids.every((pid) => !pidAlive(pid));
+  while (!gone() && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return gone();
 }
 
 const SANDBOX_REQUIRED = "--sandbox-required";
@@ -258,6 +267,75 @@ real("4e positive — the attested launch against the pinned nono", () => {
       // The agent actually ran inside that session (the runtime writes its pid
       // file first thing).
       expect(existsSync(pidFile), text).toBe(true);
+    } finally {
+      const stopped = !child || await stopRealLaunch(child, text);
+      rmSync(sb.root, { recursive: true, force: true });
+      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+    }
+  });
+
+  test("SIGTERM to the launcher stops the released child and the supervisor, and exits signalled", async () => {
+    const sb = sandbox();
+    let child: ReturnType<typeof spawn> | undefined;
+    let text = "";
+    try {
+      child = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", SANDBOX_REQUIRED], {
+        cwd: sb.ws,
+        detached: true,
+        env: {
+          ...process.env,
+          HOME: sb.home,
+          NONO_BIN: NONO!,
+          TPS_LAUNCH_TIMEOUT_MS: "20000",
+        },
+      });
+      const launcher = child;
+      const pidFile = join(sb.ws, ".tps-agent.pid");
+      const released = await new Promise<boolean>((resolvePromise) => {
+        const timer = setTimeout(() => resolvePromise(false), 45_000);
+        const onData = (chunk: Buffer) => {
+          text += chunk.toString("utf-8");
+          if (/released under nono session \S+ \(child pid \d+\)/.test(text)) {
+            clearTimeout(timer);
+            resolvePromise(true);
+          }
+        };
+        launcher.stdout?.on("data", onData);
+        launcher.stderr?.on("data", onData);
+        launcher.on("exit", () => {
+          clearTimeout(timer);
+          resolvePromise(/released under nono session \S+ \(child pid \d+\)/.test(text));
+        });
+      });
+      expect(released, text).toBe(true);
+      // The released child writes its pid file first thing.
+      const readyDeadline = Date.now() + 5_000;
+      while (!existsSync(pidFile) && Date.now() < readyDeadline && launcher.exitCode === null) {
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      expect(existsSync(pidFile), text).toBe(true);
+
+      const childPid = Number.parseInt(/\(child pid (\d+)\)/.exec(text)?.[1] ?? "", 10);
+      const supervisorPid = Number.parseInt(/bound to the supervisor pid (\d+)/.exec(text)?.[1] ?? "", 10);
+      expect(Number.isFinite(childPid), text).toBe(true);
+      expect(Number.isFinite(supervisorPid), text).toBe(true);
+
+      const signalledAt = Date.now();
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) {
+          resolveExit({ code: launcher.exitCode, signal: launcher.signalCode });
+        } else {
+          launcher.once("exit", (code, signal) => resolveExit({ code, signal }));
+        }
+      });
+      const elapsed = Date.now() - signalledAt;
+      // Signal-shaped: the launcher re-raised the signal after cleanup.
+      expect(exit.signal, text).toBe("SIGTERM");
+      // The released child and the supervisor are gone within the bound.
+      const gone = await waitForPidsGone([childPid, supervisorPid], SIGNAL_STOP_BOUND_MS + 2_000);
+      expect(gone, `${text}\nchild=${childPid} supervisor=${supervisorPid}`).toBe(true);
+      expect(elapsed).toBeLessThan(SIGNAL_STOP_BOUND_MS + 4_000);
     } finally {
       const stopped = !child || await stopRealLaunch(child, text);
       rmSync(sb.root, { recursive: true, force: true });

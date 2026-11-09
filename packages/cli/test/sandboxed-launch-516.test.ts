@@ -2067,11 +2067,12 @@ exit 0
       const text = output(result);
       expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
       // One error line: the original failure, with setup's own failed cleanup.
-      // The retry succeeded and printed no error.
+      // The retry removed the worktree, so the stale manual-removal advice is
+      // dropped (cli#686).
       expect(errorLines(text)).toEqual([
-        `${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: fatal: injected removal failure; ` +
-          `remove it manually with: ${manualCommandFor(f)}`,
+        `${setupError(f)}; worktree cleanup failed for ${f.sb.ws}: fatal: injected removal failure`,
       ]);
+      expect(text).not.toContain("remove it manually with:");
       expect(existsSync(f.sb.ws)).toBe(false);
       expect(worktreeListing(f.base)).not.toContain(`worktree ${f.sb.ws}\n`);
       // Setup removed once and failed; the retry checked the registration, then removed.
@@ -2236,6 +2237,216 @@ exit 0
       rmSync(lock, { recursive: true, force: true });
       expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
     } finally {
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // cli#672 — a signal after worktree creation removes what THIS launch made
+  // and never a pre-existing worktree
+  // -------------------------------------------------------------------------
+
+  /** A fake nono that never releases and stays alive until a signal arrives. */
+  const HANGING_FAKE_NONO = [
+    "#!/usr/bin/env bash",
+    "set -u",
+    'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
+    'if [ "${1:-}" = "profile" ]; then exit 0; fi',
+    'if [ "${1:-}" = "why" ]; then echo \'{"status":"denied","reason":"path_not_granted"}\'; exit 0; fi',
+    'if [ "${1:-}" = "run" ]; then',
+    '  echo "ARGV $*" >> "${NONO_ARGV_LOG:?}"',
+    '  echo $$ > "${NONO_PID_FILE:?}"',
+    '  trap "exit 0" TERM INT HUP',
+    "  while :; do sleep 0.1; done",
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+
+  /** A fake nono that releases the scripted peer, then keeps the session alive
+   *  until a signal arrives. */
+  const RELEASE_THEN_WAIT_FAKE_NONO = [
+    "#!/usr/bin/env bash",
+    "set -u",
+    'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
+    'if [ "${1:-}" = "profile" ]; then exit 0; fi',
+    'printf \'%s\\n\' "ARGV $*" >> "${NONO_ARGV_LOG:?}"',
+    'if [ "${1:-}" = "why" ]; then echo \'{"status":"denied","reason":"path_not_granted"}\'; exit 0; fi',
+    'if [ "${1:-}" = "ps" ]; then',
+    "  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40; do",
+    '    [ -s "${FAKE_NONO_PS_JSON:?}" ] && break',
+    "    sleep 0.05",
+    "  done",
+    '  cat "${FAKE_NONO_PS_JSON:?}"; exit 0',
+    "fi",
+    'if [ "${1:-}" = "run" ]; then',
+    '  echo $$ > "${NONO_PID_FILE:?}"',
+    '  "${RELEASE_PEER_NODE:?}" "${RELEASE_PEER:?}" &',
+    "  child=$!",
+    '  prof=""; args=("$@"); i=0',
+    '  for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
+    '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
+    '  trap \'kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0\' TERM INT HUP',
+    "  while :; do sleep 0.1; done",
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+
+  async function waitUntil(check: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (check()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return check();
+  }
+
+  function pidFromFile(path: string): number | undefined {
+    try {
+      const pid = Number.parseInt(readFileSync(path, "utf-8").trim(), 10);
+      return Number.isFinite(pid) && pid > 1 ? pid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  function waitExit(child: ReturnType<typeof spawn>): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+    }
+    return new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+  }
+
+  function spawnLauncher(f: LaunchFixture, extra: Record<string, string | undefined>) {
+    return spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED], {
+      cwd: f.sb.run,
+      detached: true,
+      env: cliEnv(f.sb, extra),
+    });
+  }
+
+  test("a signal after worktree creation before release removes the created worktree and leaves a pre-existing one", async () => {
+    const f = launchFixture();
+    const neighbour = join(f.sb.root, "neighbour");
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", neighbour], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const nonoPidFile = join(f.sb.root, "nono.pid");
+    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000" });
+    let text = "";
+    launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    let supervisorPid: number | undefined;
+    try {
+      expect(
+        await waitUntil(() => existsSync(f.sb.ws) && pidFromFile(nonoPidFile) !== undefined, 10_000),
+        text,
+      ).toBe(true);
+      supervisorPid = pidFromFile(nonoPidFile);
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await waitExit(launcher);
+      expect(exit.signal).toBe("SIGTERM");
+      expect(existsSync(f.sb.ws), text).toBe(false);
+      expect(existsSync(neighbour)).toBe(true);
+      expect(worktreeListing(f.base)).toContain(`worktree ${neighbour}\n`);
+      expect(worktreeListing(f.base)).not.toContain(`worktree ${f.sb.ws}\n`);
+      expect(await waitUntil(() => !processAlive(supervisorPid!), 3_000), text).toBe(true);
+    } finally {
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      try { if (supervisorPid && processAlive(supervisorPid)) process.kill(supervisorPid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a signal after release removes the created worktree and leaves a pre-existing one", async () => {
+    const f = launchFixture();
+    const neighbour = join(f.sb.root, "neighbour");
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", neighbour], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    const peer = join(f.sb.root, "release-peer.cjs");
+    writeFileSync(peer, RELEASE_PEER);
+    writeFileSync(f.sb.nonoBin, RELEASE_THEN_WAIT_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const nonoPidFile = join(f.sb.root, "nono.pid");
+    const psFile = join(f.sb.root, "ps.json");
+    const launcher = spawnLauncher(f, {
+      NONO_PID_FILE: nonoPidFile,
+      FAKE_NONO_PS_JSON: psFile,
+      RELEASE_PEER_NODE: NODE,
+      RELEASE_PEER: peer,
+      TPS_LAUNCH_TIMEOUT_MS: "20000",
+    });
+    let text = "";
+    launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    let supervisorPid: number | undefined;
+    let childPid: number | undefined;
+    try {
+      expect(
+        await waitUntil(
+          () => /released under nono session \S+ \(child pid \d+\)/.test(text) && pidFromFile(nonoPidFile) !== undefined,
+          15_000,
+        ),
+        text,
+      ).toBe(true);
+      supervisorPid = pidFromFile(nonoPidFile);
+      childPid = Number.parseInt(/released under nono session \S+ \(child pid (\d+)\)/.exec(text)?.[1] ?? "", 10);
+      expect(Number.isFinite(childPid)).toBe(true);
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await waitExit(launcher);
+      expect(exit.signal).toBe("SIGTERM");
+      expect(existsSync(f.sb.ws), text).toBe(false);
+      expect(existsSync(neighbour)).toBe(true);
+      expect(worktreeListing(f.base)).toContain(`worktree ${neighbour}\n`);
+      expect(worktreeListing(f.base)).not.toContain(`worktree ${f.sb.ws}\n`);
+      expect(await waitUntil(() => !processAlive(supervisorPid!), 3_000), text).toBe(true);
+      expect(await waitUntil(() => !processAlive(childPid!), 3_000), text).toBe(true);
+    } finally {
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      try { if (supervisorPid && processAlive(supervisorPid)) process.kill(supervisorPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (childPid && processAlive(childPid)) process.kill(childPid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a signal leaves a pre-existing workspace worktree untouched", async () => {
+    const f = launchFixture();
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", f.sb.ws], { cwd: f.base, encoding: "utf8" });
+    expect(added.status, added.stderr).toBe(0);
+    const listingBefore = worktreeListing(f.base);
+    writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const nonoPidFile = join(f.sb.root, "nono.pid");
+    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000" });
+    let text = "";
+    launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    let supervisorPid: number | undefined;
+    try {
+      expect(await waitUntil(() => pidFromFile(nonoPidFile) !== undefined, 10_000), text).toBe(true);
+      supervisorPid = pidFromFile(nonoPidFile);
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await waitExit(launcher);
+      expect(exit.signal).toBe("SIGTERM");
+      // The launch did not create this worktree, so the signal path leaves it.
+      expect(existsSync(f.sb.ws), text).toBe(true);
+      expect(worktreeListing(f.base)).toBe(listingBefore);
+      expect(worktreeListing(f.base)).toContain(`worktree ${f.sb.ws}\n`);
+      expect(await waitUntil(() => !processAlive(supervisorPid!), 3_000), text).toBe(true);
+    } finally {
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      try { if (supervisorPid && processAlive(supervisorPid)) process.kill(supervisorPid, "SIGKILL"); } catch { /* gone */ }
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   });
