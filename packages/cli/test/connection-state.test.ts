@@ -1,6 +1,6 @@
 import { describe, test, expect, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, lutimesSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -12,6 +12,7 @@ import {
   hostStateLockRoot,
   writeBranchState,
   readBranchState,
+  sweepStaleConnectionTemps,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
@@ -253,6 +254,134 @@ describe("connection-state", () => {
     expect(readHostState("branch-a")?.messagesReceived).toBe(1);
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
     expect(statSync(record).mode & 0o777).toBe(0o600);
+  });
+
+  const tempName = (record: string): string => `.${record}.11111111-1111-4111-8111-111111111111.tmp`;
+
+  test("a stale temp file of the writer's shape is removed on the next write", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-stale-temp-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const stale = join(dir, tempName("branch-a.json"));
+    writeFileSync(stale, "partial");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, old, old);
+
+    writeHostState(writeState("branch-a", 1));
+
+    expect(existsSync(stale)).toBe(false);
+    expect(readHostState("branch-a")?.messagesReceived).toBe(1);
+  });
+
+  test("a fresh temp file of the writer's shape is kept", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-fresh-temp-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const fresh = join(dir, tempName("branch-a.json"));
+    writeFileSync(fresh, "in progress");
+
+    writeHostState(writeState("branch-a", 1));
+
+    expect(readFileSync(fresh, "utf-8")).toBe("in progress");
+    expect(existsSync(fresh)).toBe(true);
+  });
+
+  test("a near-miss temp name is kept", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-near-miss-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const nearMisses = [
+      join(dir, ".branch-a.json.11111111-1111-4111-8111-111111111111.tmp.bak"),
+      join(dir, ".branch-a.json.not-a-uuid.tmp"),
+      join(dir, ".other.txt.11111111-1111-4111-8111-111111111111.tmp"),
+    ];
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    for (const path of nearMisses) {
+      writeFileSync(path, "keep");
+      utimesSync(path, old, old);
+    }
+
+    writeHostState(writeState("branch-a", 1));
+
+    for (const path of nearMisses) {
+      expect(readFileSync(path, "utf-8")).toBe("keep");
+      expect(existsSync(path)).toBe(true);
+    }
+  });
+
+  test("a stale temp symlink is not followed or removed", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-temp-link-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const target = join(home, "target.txt");
+    writeFileSync(target, "target");
+    const link = join(dir, tempName("branch-a.json"));
+    symlinkSync(target, link);
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    lutimesSync(link, old, old);
+
+    writeHostState(writeState("branch-a", 1));
+
+    expect(readlinkSync(link)).toBe(target);
+    expect(readFileSync(target, "utf-8")).toBe("target");
+  });
+
+  test("a temp that vanishes between listing and removal is in neither list", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-vanish-temp-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const stale = join(dir, tempName("branch-a.json"));
+    writeFileSync(stale, "partial");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, old, old);
+
+    const lstat = fs.lstatSync;
+    const injected = spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof lstat>) => {
+      const stats = lstat(...args);
+      // Removed by another process after the listing and inspection, before ours.
+      if (String(args[0]) === stale) rmSync(stale);
+      return stats;
+    });
+    let sweep: ReturnType<typeof sweepStaleConnectionTemps>;
+    let inspections = 0;
+    try {
+      sweep = sweepStaleConnectionTemps();
+      inspections = injected.mock.calls.length;
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(inspections).toBeGreaterThan(0);
+    expect(sweep.removed).toEqual([]);
+    expect(sweep.left).toEqual([]);
+  });
+
+  test("a record tightened to 0600 keeps 0600 after a rewrite", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-keep-mode-"));
+    process.env.HOME = home;
+    const record = join(home, ".tps", "connections", "host.json");
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 1, messagesPushed: 1 });
+    chmodSync(record, 0o600);
+
+    writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 2, messagesPushed: 2 });
+
+    expect(readBranchState()?.messagesReceived).toBe(2);
+    expect(statSync(record).mode & 0o777).toBe(0o600);
+  });
+
+  test("a new record gets the default mode", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-default-mode-"));
+    process.env.HOME = home;
+    const record = join(home, ".tps", "connections", "host.json");
+
+    writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 1, messagesPushed: 1 });
+
+    expect(statSync(record).mode & 0o777).toBe(0o666 & ~process.umask());
   });
 
   test("branch state writes atomically and round-trips", () => {

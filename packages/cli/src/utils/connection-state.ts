@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
@@ -42,10 +42,79 @@ export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
+/**
+ * A `.<record>.<uuid>.tmp` name, the shape writeFileAtomic creates. The record
+ * part is any non-empty name ending in `.json`; the trailing part is hex groups
+ * in UUID layout.
+ */
+const TEMP_FILE_PATTERN = /^\..+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+/**
+ * The age threshold for cleanup: an entry whose mtime is older than this is
+ * treated as abandoned. This is a heuristic; a suspended writer or a clock
+ * jump can cross the threshold while a write is still in progress.
+ */
+const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
+
+export interface ConnectionTempSweep {
+  removed: string[];
+  /** Entries the sweep reported instead of removing, with the reason. */
+  left: { path: string; reason: string }[];
+}
+
+/**
+ * Attempt to remove temp files left by a crash between creating the temp file
+ * and renaming it. Only names matching the writer's temp shape are considered,
+ * and removal is attempted for a matching regular file older than the threshold.
+ * The inspection and the removal are separate steps:
+ * an entry replaced with a symlink in between is removed as the link it became,
+ * never followed. An entry that could not be inspected or removed is reported
+ * in `left`; an entry already gone is in neither list.
+ */
+export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
+  const dir = connectionsDir();
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { removed: [], left: [] };
+    return { removed: [], left: [{ path: dir, reason: code }] };
+  }
+  const removed: string[] = [];
+  const left: { path: string; reason: string }[] = [];
+  for (const name of entries) {
+    if (!TEMP_FILE_PATTERN.test(name)) continue;
+    const path = join(dir, name);
+    let stats;
+    try {
+      stats = lstatSync(path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      if (code !== "ENOENT") left.push({ path, reason: code });
+      continue;
+    }
+    if (!stats.isFile()) {
+      left.push({ path, reason: "not a regular file" });
+      continue;
+    }
+    if (now - stats.mtimeMs <= STALE_TEMP_AGE_MS) continue;
+    try {
+      rmSync(path);
+      removed.push(path);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      if (code !== "ENOENT") left.push({ path, reason: code });
+    }
+  }
+  return { removed, left };
+}
+
 export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
+  tempCleanupLeft?: { path: string; reason: string }[];
 }
 
 /** Connections directory `*.json` paths. A `host.json` object with neither
@@ -53,6 +122,7 @@ export interface HostStatePathListing {
  *  error other than ENOENT is reported. */
 export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
+  const sweep = sweepStaleConnectionTemps();
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -62,6 +132,7 @@ export function listHostStatePaths(): HostStatePathListing {
     return { paths: [], failure: { path: dir, code } };
   }
   return {
+    ...(sweep.left.length > 0 ? { tempCleanupLeft: sweep.left } : {}),
     paths: entries
       .filter((f) => {
         if (!f.endsWith(".json")) return false;
@@ -87,19 +158,30 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
  * Write a file atomically: a uniquely named temp file in the same directory is
- * created exclusively with `mode`, written through its descriptor, synced, and
- * renamed over the target, so a write or rename failure leaves the previous
- * record intact. The parent directory sync after the rename is best-effort:
- * directory fsync is not supported everywhere, and the rename is already
- * atomic for readers. If a temp-file operation or rename throws, the helper
- * attempts to close any still-open descriptor and remove the temp file, then
- * rethrows the original error; cleanup errors are swallowed.
+ * created exclusively with an existing regular record's observed permission
+ * bits when one exists, else `mode`, written through its descriptor, synced,
+ * and renamed over the target, so a write or rename failure leaves the
+ * previous record intact. The parent directory sync after the rename is
+ * best-effort: directory fsync is not supported everywhere, and the rename is
+ * already atomic for readers. If a temp-file operation or rename throws, the
+ * helper attempts to close any still-open descriptor and remove the temp file,
+ * then rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
+  sweepStaleConnectionTemps();
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
+  // A regular record's observed permission bits are preserved; a symlinked
+  // record is treated as absent, as before (the rename replaces the link with a
+  // regular file).
+  const existingMode = existingRecordMode(filePath);
   let fd: number | undefined;
   try {
-    fd = openSync(tmpPath, "wx", mode);
+    fd = openSync(tmpPath, "wx", existingMode ?? mode);
+    if (existingMode !== undefined) {
+      // fchmodSync restores the permission bits observed before the temp file
+      // was opened (openSync applies the umask).
+      fchmodSync(fd, existingMode);
+    }
     writeFileSync(fd, content, "utf-8");
     fsyncSync(fd);
     closeSync(fd);
@@ -116,6 +198,22 @@ function writeFileAtomic(filePath: string, content: string, mode: number): void 
     const dirFd = openSync(dirname(filePath), "r");
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch {}
+}
+
+/** The observed permission bits (0o777) of an existing regular record, or
+ *  undefined when there is none. */
+function existingRecordMode(filePath: string): number | undefined {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return undefined;
+    // An unreadable record must not be replaced with a broader default.
+    throw error;
+  }
+  if (!stats.isFile()) return undefined;
+  return stats.mode & 0o777;
 }
 
 /** Root of the inter-process lock that owns one host state record. */

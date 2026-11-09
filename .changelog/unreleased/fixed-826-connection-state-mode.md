@@ -1,0 +1,1 @@
+- **Rewriting a connection-state record keeps the observed permission bits (0o777), so a record tightened to 0600 stays 0600.**
