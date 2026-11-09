@@ -336,7 +336,7 @@ for ((i=0; i<count; i++)); do
   # cli#352 r7 — these roster-shape checks fire INSIDE the loop too, so at i>0
   # agents from earlier iterations are already backgrounded. Stop them before
   # exiting, like the launch refusals below. (The Part A control checks that an
-  # explicit exit form in this loop is preceded by shutdown_children.)
+  # explicit exit form in this loop is guarded by shutdown_children.)
   if [[ -z "$id" || "$id" == "null" ]]; then
     echo "Agent missing id at index $i" >&2
     shutdown_children TERM

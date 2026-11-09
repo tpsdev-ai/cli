@@ -27,9 +27,9 @@
 #   7. cli#357: a fallible step (useradd) fails while seating the SECOND agent,
 #      after the first has launched. `set -e` ends the script; the EXIT trap
 #      stops the first agent and no PID file remains.
-#   8. cli#357 r3: a child that can end the supervisor is signalled between its
-#      launch and its tracking; the deferred signal is acted on after the PID
-#      is tracked, so the child is stopped and the PID file removed.
+#   8. cli#357 r3: a fixture launcher signals its parent supervisor as soon as it
+#      starts, targeting the window between a child's launch and its tracking;
+#      the child is stopped and the PID file removed.
 #   9. cli#357 r3: a child that ignores TERM is KILLed at the shutdown deadline
 #      and the supervisor exits; a second shutdown call signals no PID.
 #
@@ -109,11 +109,11 @@ fi
 # cli#357: reject termination shapes the source control cannot verify. A
 # multi-line quoted string or a heredoc is refused outright: a physical
 # `shutdown_children TERM` line inside one never runs, so it cannot be a guard.
-# The control covers explicit `exit`/`return` forms, a self-kill (`kill ... $$`,
-# any signal) and calls to supervisor functions that exit. A command that ends
-# the script through errexit, and termination by a signal, are the EXIT trap's
-# job: the behavioural cases for the bounded shutdown, the deferred signal and
-# the real-nono stop test prove those.
+# The control covers explicit `exit`/`return` forms, a self-kill (`kill $$` or
+# `kill -SIG $$`) and calls to supervisor functions that exit. A command that
+# ends the script through errexit, and termination by a signal, are the EXIT
+# trap's job: the Part B errexit, bounded-shutdown and deferred-signal cases and
+# the Part C stop case prove those.
 assert_seating_shutdown() { # <source>
   awk '
     function word(line, name) {
@@ -342,7 +342,7 @@ assert_exit_trap() { # <source>
 }
 
 if analysis="$(assert_exit_trap "$sup")"; then
-  ok "the EXIT trap is a whitelisted stop-then-remove sequence"
+  ok "the EXIT trap is a whitelisted sequence of recognised operations"
 else
   bad "EXIT-trap control: $analysis"
 fi
@@ -685,10 +685,10 @@ SH
   if [ "$terms" -eq 1 ]; then ok "idempotent shutdown: one TERM for two shutdown calls"; else bad "idempotent shutdown: the child saw $terms TERM(s), expected 1"; fi
   if [ ! -e /workspace/.tps/pids.json ]; then ok "bounded shutdown: the PID file is removed"; else bad "bounded shutdown: the PID file remains"; fi
 
-  # (3d) cli#357 r3 — a signal that lands between the launch and the tracking
-  # of the child. The fixture launcher signals its parent supervisor as soon as
-  # it starts; the signal handler must defer it, and the supervisor must stop
-  # the child and remove the PID file once the PID is tracked.
+  # (3d) cli#357 r3 — the fixture launcher signals its parent supervisor as soon
+  # as it starts, targeting the window between a child's launch and the tracking
+  # of its PID. The signal handler must defer the signal, and the supervisor
+  # must stop the child and remove the PID file once the PID is tracked.
   mksigsu() {
     local d="$1"
     mkshims "$d" yes
