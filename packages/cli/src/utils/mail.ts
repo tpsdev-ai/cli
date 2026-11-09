@@ -38,6 +38,10 @@ export interface MailMessage {
   checkedOutAt?: string;
   checkedOutBy?: string;
   deliveryAttempts?: number;
+  /** Number of lease-expired re-presentations, persisted so the count survives checks. */
+  redeliveryAttempts?: number;
+  /** Set by checkMessages() when it re-presents an unacked cur/ record whose lease expired. */
+  redelivered?: { reason: "lease-expired"; previousCheckout: string; attempt: number };
   retryAfter?: string;
   prNumber?: number;
   headers?: Record<string, string>;
@@ -71,7 +75,7 @@ export interface MailMessage {
 
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_INBOX_MESSAGES = 100;
-const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
+export const LEASE_TIMEOUT_MS = 30 * 60 * 1000;
 
 const VALID_ID = /^[a-zA-Z0-9._-]+$/;
 export function validateMessageId(id: string): void {
@@ -568,6 +572,8 @@ const MailRecordSchema = RelayPayloadSchema.extend({
   checkedOutAt: z.string().optional(),
   checkedOutBy: z.string().optional(),
   deliveryAttempts: z.number().int().nonnegative().optional(),
+  redeliveryAttempts: z.number().int().nonnegative().optional(),
+  redelivered: z.object({ reason: z.literal("lease-expired"), previousCheckout: z.string(), attempt: z.number().int().positive() }).optional(),
   retryAfter: z.string().optional(),
   prNumber: z.number().int().positive().optional(),
   headers: z.record(z.string(), z.string()).optional(),
@@ -1791,7 +1797,15 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
             holdsMessageSource(join(inbox.fresh, f), fresh.envelopeId) || holdsMessageSource(join(inbox.dlq, f), fresh.envelopeId)) return null;
           replay.finishPlacement(fresh.envelopeId, f);
         }
-        return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
+        const previousCheckout = fresh.checkedOutAt;
+        if (!previousCheckout) return Object.assign(fresh, recovered.message, { checkedOutAt: nowIso, checkedOutBy });
+        const attempt = (fresh.redeliveryAttempts ?? 0) + 1;
+        return Object.assign(fresh, recovered.message, {
+          checkedOutAt: nowIso,
+          checkedOutBy,
+          redeliveryAttempts: attempt,
+          redelivered: { reason: "lease-expired" as const, previousCheckout, attempt },
+        });
       }, { snapshot: recovered.snapshot, nonBlocking: true });
       if (result.status === "updated") messages.push(result.record);
     } catch { continue; }

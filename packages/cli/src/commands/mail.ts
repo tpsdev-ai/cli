@@ -1,5 +1,5 @@
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
+import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -442,6 +442,10 @@ export async function runMail(args: MailArgs): Promise<void> {
       } else {
         for (const m of messages) {
           console.log(`📬 ${m.from} → ${m.to}  ${m.timestamp}`);
+          if (m.redelivered) {
+            const minutes = Math.round(LEASE_TIMEOUT_MS / 60_000);
+            console.log(`[re-delivered: not acked within ${minutes} min — ack it with: tps mail ack ${m.id}]`);
+          }
           if (m.replyToId) console.log(`↳ reply-to: ${m.replyToId}`);
           const taskEnv = parseTaskEnvelope(m.body);
           console.log(taskEnv ? formatTaskEnvelope(taskEnv) : m.body);
