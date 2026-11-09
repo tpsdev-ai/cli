@@ -479,9 +479,9 @@ it.each([
 
 // The `??` row above covers BMP names. Bun's glob matches `?` and a class member
 // by code point, so one supplementary character is not two: measure what each
-// supported Bun install does with `packages/??` when `packages/😀` exists.
+// fetched Bun install does with `packages/??` when `packages/😀` exists.
 it(
-  "a non-BMP workspace directory: both supported Bun versions and the gate resolve it the same way",
+  "a non-BMP workspace directory: the gate and each measured Bun version resolve it the same way",
   async () => {
     const root = mkdtempSync(join(tmpdir(), "age-nonbmp-workspaces-"));
     let registry: ReturnType<typeof startRegistry> | undefined;

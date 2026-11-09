@@ -204,8 +204,8 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
   });
 
   // A supplementary character is one code point, so one `?` consumes it and `??`
-  // does not; a class member is a code point too. Measured against Bun's own
-  // glob and install in check-dep-ages-install-age-bun.test.ts.
+  // does not. The install parity case in check-dep-ages-install-age-bun.test.ts
+  // pins the `??` result against a real Bun.
   it.each([
     ["a ? pattern matches one non-BMP character", ["packages/?"], "packages/😀", true],
     ["a ?? pattern matches two BMP characters", ["packages/??"], "packages/ab", true],
