@@ -7,6 +7,11 @@
 # tool-cache path, so the checks below run before the action can use the file:
 # a failed download or a checksum mismatch fails the job, and the firewall is
 # never skipped.
+#
+# A verified binary is also cached through actions/cache (the restore step that
+# precedes this script in each job). A restored file is used only after its
+# sha256 matches the pin; a file that does not match is deleted and treated as
+# a cache miss.
 set -euo pipefail
 
 FIREWALL_VERSION="1.15.4"
@@ -47,6 +52,8 @@ esac
 URL="https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}"
 CACHE_DIR="${RUNNER_TOOL_CACHE}/socket-firewall-free/${FIREWALL_VERSION}/${ARCH}"
 CACHE_BINARY="${CACHE_DIR}/sfw"
+# actions/cache restores this workspace-relative path before the script runs.
+RESTORED_BINARY="${GITHUB_WORKSPACE:-$PWD}/.sfw-cache/sfw"
 
 # GNU coreutils on Linux; macOS carries shasum.
 sha256_of() {
@@ -57,20 +64,46 @@ sha256_of() {
   fi
 }
 
-if [ -f "${CACHE_BINARY}" ] && [ "$(sha256_of "${CACHE_BINARY}")" = "${SHA256}" ]; then
-  exit 0
+install_binary() {
+  mkdir -p "${CACHE_DIR}"
+  cp "$1" "${CACHE_BINARY}"
+  chmod 0755 "${CACHE_BINARY}"
+  : > "${CACHE_DIR}.complete"
+}
+
+# A binary already in the action's tool cache is used only when it matches the
+# pin.
+if [ -f "${CACHE_BINARY}" ]; then
+  if [ "$(sha256_of "${CACHE_BINARY}")" = "${SHA256}" ]; then
+    exit 0
+  fi
+  rm -f "${CACHE_BINARY}"
+fi
+
+# A restored cache entry is used only when its sha256 still matches the pin. A
+# mismatched file is never used: it is deleted and the download runs instead.
+if [ -f "${RESTORED_BINARY}" ]; then
+  if [ "$(sha256_of "${RESTORED_BINARY}")" = "${SHA256}" ]; then
+    install_binary "${RESTORED_BINARY}"
+    exit 0
+  fi
+  echo "Cached Socket Firewall binary does not match the pinned sha256; discarding it." >&2
+  rm -f "${RESTORED_BINARY}"
 fi
 
 tmp="$(mktemp "${RUNNER_TEMP:-/tmp}/sfw-prefetch.XXXXXX")"
 trap 'rm -f "${tmp}"' EXIT
 
-curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300 -o "${tmp}" "${URL}"
+# Cold cache: bounded exponential backoff (curl doubles its delay between
+# attempts), so an outage of a few minutes is ridden out but the job's timeout
+# still bounds the wait.
+curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 20 --max-time 60 -o "${tmp}" "${URL}"
 if [ "$(sha256_of "${tmp}")" != "${SHA256}" ]; then
   echo "::error::Socket Firewall binary checksum mismatch; refusing to install it" >&2
   exit 1
 fi
 
-mkdir -p "${CACHE_DIR}"
-cp "${tmp}" "${CACHE_BINARY}"
-chmod 0755 "${CACHE_BINARY}"
-: > "${CACHE_DIR}.complete"
+mkdir -p "$(dirname "${RESTORED_BINARY}")"
+cp "${tmp}" "${RESTORED_BINARY}"
+chmod 0755 "${RESTORED_BINARY}"
+install_binary "${tmp}"

@@ -139,16 +139,16 @@ describe("this repository's test job", () => {
     const t = jobOf(p, "test");
     expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
       [4, ".", false],
-      [5, ".", false],
-      [7, ".", false],
+      [6, ".", false],
       [8, ".", false],
       [9, ".", false],
       [10, ".", false],
       [11, ".", false],
-      [12, "plugins/openclaw-tps-mail", false],
-      [13, ".", false],
-      [14, "plugins/openclaw-github-review", false],
-      [15, ".", true],
+      [12, ".", false],
+      [13, "plugins/openclaw-tps-mail", false],
+      [14, ".", false],
+      [15, "plugins/openclaw-github-review", false],
+      [16, ".", true],
     ]);
     expect(t.steps[0].script).toBe("node scripts/check-dep-ages.mjs --ci");
     expect(t.steps[1].script).toBe("bash scripts/prefetch-socket-firewall.sh");
@@ -205,8 +205,7 @@ describe("this repository's test job", () => {
     const node = workflowNodePin(workflowText);
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
       [4, node],
-      [5, node],
-      [7, node],
+      [6, node],
       [8, node],
       [9, node],
       [10, node],
@@ -215,6 +214,7 @@ describe("this repository's test job", () => {
       [13, node],
       [14, node],
       [15, node],
+      [16, node],
     ]);
   });
 
