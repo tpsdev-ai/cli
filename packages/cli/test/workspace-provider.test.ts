@@ -48,7 +48,7 @@ test("snapshot and clean checkpoint reject an indeterminate HEAD naming its prob
   }
 });
 
-test("failure lifecycle writes the unborn ref without creating a commit", async () => {
+test("failure lifecycle on a clean unborn branch writes the unborn ref without creating a commit", async () => {
   const repo = unbornRepo();
   try {
     const provider = new GitWorkspaceProvider(repo);
