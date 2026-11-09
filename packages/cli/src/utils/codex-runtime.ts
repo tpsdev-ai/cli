@@ -34,9 +34,9 @@ import { externalDispatchRefusal } from "./mail-tier.js";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { formatTaskCompleteMailBody } from "./task-result-mail.js";
 import type { WorkspaceProvider, WorkspaceState } from "./workspace-provider.js";
+import { GIT_BIN, probeHead, type HeadProbe } from "./git-head.js";
 
-/** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
-const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
+export { probeHead, type HeadProbe } from "./git-head.js";
 
 function shouldSendTaskCompletion(recipient: string, reviewNotify?: string[]): boolean {
   return !(reviewNotify?.includes(recipient));
@@ -378,32 +378,6 @@ export function detectStaleRebase(
   return { state: "absent" };
 }
 
-export type HeadProbe =
-  | { state: "commit"; head: string }
-  | { state: "unborn" }
-  | { state: "indeterminate"; detail: "failed" | "returned no output" };
-
-/**
- * Classify the repository's HEAD. A commit is a successful `git rev-parse HEAD`
- * with output. An unborn HEAD is a symbolic HEAD naming a branch whose
- * `git rev-parse --verify -q HEAD` finds no commit (exit 1, no output). Any
- * other outcome is indeterminate.
- */
-export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): HeadProbe {
-  const head = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  const headText = String(head.stdout ?? "").trim();
-  if (head.status === 0) {
-    return headText ? { state: "commit", head: headText } : { state: "indeterminate", detail: "returned no output" };
-  }
-  const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  const branch = String(symbolic.stdout ?? "").trim();
-  if (symbolic.status === 0 && branch) {
-    const verify = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
-    if (verify.status === 1 && String(verify.stdout ?? "").trim() === "") return { state: "unborn" };
-  }
-  return { state: "indeterminate", detail: "failed" };
-}
-
 export type MailAutoCommitDecision =
   | { action: "commit" }
   | { action: "clean"; message: string }
@@ -420,13 +394,16 @@ export type MailAutoCommitDecision =
  * causes a commit attempt. That can be a commit made on that branch before the
  * rebase, not necessarily this task's.
  * A failed probe is indeterminate and yields a skip with its outcome reported,
- * and so does a final HEAD that differs from the restored one. An unborn HEAD
- * (a repository with no commits) has no pre-task value to compare, so workspace
- * changes or a new commit select the commit path, and neither is clean. For a
- * commit baseline, the clean decision establishes exactly this: Git status is
- * clean and the final HEAD matches its pre-task value — `git status --porcelain`
- * omits ignored files, and equal HEADs do not rule out a commit that was later
- * reset.
+ * and so does a final HEAD that differs from the restored one. An unborn HEAD is
+ * a branch with no commit yet (the repository may have other branches) and has
+ * no pre-task value to compare, so workspace changes or a new commit select the
+ * commit path, and neither is clean. "Workspace changes" means what
+ * `git status --porcelain` reports; ignored files are not changes. The clean
+ * outcome is returned only when the status probe and both HEAD probes succeed
+ * and any interrupted rebase was aborted: an indeterminate probe, or a rebase
+ * abort that fails, is reported and skipped, never clean. For a commit
+ * baseline, clean also establishes that the final HEAD matches its pre-task
+ * value — equal HEADs do not rule out a commit that was later reset.
  */
 export function evaluateMailAutoCommitGate(
   repo: string,
@@ -641,7 +618,7 @@ function openPullRequest(
 }
 
 export async function runAutoCommit(
-  config: Pick<CodexRuntimeConfig, "workspace">,
+  config: Pick<CodexRuntimeConfig, "workspace" | "agentId">,
   flair: AutoCommitFlair,
   options: AutoCommitOptions,
   deps: AutoCommitDeps = {},
@@ -714,7 +691,14 @@ export async function runAutoCommit(
     ...(prTitle && !(openPr && prRepo) ? ["--pr-title", prTitle] : []),
   ];
 
-  const result = runSync(tpsCmd, args, { cwd: repo, encoding: "utf-8" });
+  const result = runSync(tpsCmd, args, {
+    cwd: repo,
+    encoding: "utf-8",
+    // `tps agent commit` reads the agent id from TPS_AGENT_ID to name the
+    // scope-guard operator. Pass the configured id on this child's environment
+    // only; the runtime's own environment is not modified.
+    env: { ...process.env, TPS_AGENT_ID: config.agentId },
+  });
   const resultStdout = typeof result.stdout === "string" ? result.stdout.trim() : "";
   const resultStderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
   console.log(`[autoCommit] tps agent commit exit=${result.status} push=${push} branch=${branchName}`);
@@ -767,7 +751,7 @@ async function _runAutoCommitLegacy(
   console.log(`[${agentId}] Auto-commit: ${safeBranch} in ${workspace}`);
   try {
     const prUrl = await runAutoCommit(
-      { workspace },
+      { workspace, agentId },
       flair,
       {
         taskId,

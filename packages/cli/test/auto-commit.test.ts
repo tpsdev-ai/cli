@@ -304,7 +304,7 @@ describe("evaluateMailAutoCommitGate", () => {
       let moved = "";
       let headReads = 0;
       const runSync = ((command: any, args: any, options: any) => {
-        if ((args as string[]).join(" ") === "rev-parse HEAD") {
+        if ((args as string[]).join(" ") === "rev-parse --verify -q HEAD^{commit}") {
           headReads++;
           if (headReads === 1) {
             const read = spawnSync(command, args, options);
@@ -387,54 +387,16 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     return dir;
   }
 
-  test("commits the first change when the repository has no commits", async () => {
+  test("commits when the repository has no commits and the task leaves a change", () => {
     const repo = initUnbornRepo();
     try {
       const baseline = probeHead(repo);
       writeFileSync(join(repo, "file.txt"), "first\n");
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({ action: "commit" });
       expect(baseline).toEqual({ state: "unborn" });
-
-      // Run the mail commit wrapper with a tps stand-in that uses real git.
-      const tpsDir = mkdtempSync(join(tmpdir(), "cli835-tps-"));
-      try {
-        const tpsScript = join(tpsDir, "tps");
-        writeFileSync(
-          tpsScript,
-          [
-            "#!/usr/bin/env bash",
-            "set -e",
-            'REPO=""; MSG=""',
-            'while [ $# -gt 0 ]; do',
-            '  case "$1" in',
-            '    --repo) REPO="$2"; shift 2;;',
-            '    --message) MSG="$2"; shift 2;;',
-            '    --author|--branch) shift 2;;',
-            '    *) shift;;',
-            "  esac",
-            "done",
-            'git -C "$REPO" add -A',
-            'git -C "$REPO" commit -q -m "$MSG"',
-          ].join("\n"),
-        );
-        chmodSync(tpsScript, 0o755);
-        await runAutoCommit(
-          { workspace: repo },
-          { publishEvent: mock(async () => {}) },
-          {
-            taskId: "task-1",
-            branchName: "task/task-1",
-            commitMessage: "first task",
-            authorName: "agent-a",
-            authorEmail: "agent-a@example.com",
-          },
-          { tpsCommand: tpsScript },
-        );
-        expect(git(repo, "rev-list", "--count", "HEAD").trim()).toBe("1");
-        expect(git(repo, "show", "HEAD:file.txt")).toBe("first\n");
-      } finally {
-        rmSync(tpsDir, { recursive: true, force: true });
-      }
+      // The first-commit path through runAutoCommit and the real `tps agent
+      // commit` CLI is exercised end to end in codex-presence-444's runtime
+      // test; this file keeps the gate decision as a unit.
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -467,6 +429,26 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
         message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit",
       });
       expect(baseline).toEqual({ state: "indeterminate", detail: "failed" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic HEAD outside refs/heads/ is indeterminate", () => {
+    const repo = initUnbornRepo();
+    try {
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/x\n");
+      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "failed" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a branch ref that exists but does not resolve to a commit is indeterminate", () => {
+    const repo = initUnbornRepo();
+    try {
+      writeFileSync(join(repo, ".git", "refs", "heads", "main"), "not-a-sha\n");
+      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "failed" });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -581,7 +563,10 @@ describe("resolveAutoCommitRepo", () => {
 describe("runAutoCommit", () => {
   test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
-    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+    let tpsEnv: NodeJS.ProcessEnv | undefined;
+    const savedAgentId = process.env.TPS_AGENT_ID;
+    process.env.TPS_AGENT_ID = "parent-agent";
+    const spawnSyncImpl = mock((cmd: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
       calls.push({ cmd, args });
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 1, stdout: "", stderr: "" };
@@ -599,25 +584,36 @@ describe("runAutoCommit", () => {
         return { status: 0, stdout: "0\n", stderr: "" };
       }
       if (cmd === "tps") {
+        tpsEnv = opts?.env;
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
     });
 
-    await runAutoCommit(
-      config,
-      { publishEvent: mock(async () => {}) },
-      {
-        taskId: "task-123",
-        branchName: "feat/task-123",
-        commitMessage: "feat: ship task 123",
-        authorName: "ember",
-        authorEmail: "ember@tps.dev",
-        push: true,
-        prTitle: "feat: ship task 123",
-      },
-      { spawnSyncImpl },
-    );
+    try {
+      await runAutoCommit(
+        config,
+        { publishEvent: mock(async () => {}) },
+        {
+          taskId: "task-123",
+          branchName: "feat/task-123",
+          commitMessage: "feat: ship task 123",
+          authorName: "ember",
+          authorEmail: "ember@tps.dev",
+          push: true,
+          prTitle: "feat: ship task 123",
+        },
+        { spawnSyncImpl },
+      );
+    } finally {
+      if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
+      else process.env.TPS_AGENT_ID = savedAgentId;
+    }
+
+    // The commit child gets the configured id; the runtime's own environment is
+    // unchanged.
+    expect(tpsEnv?.TPS_AGENT_ID).toBe("ember");
+    expect(process.env.TPS_AGENT_ID).toBe(savedAgentId);
 
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },

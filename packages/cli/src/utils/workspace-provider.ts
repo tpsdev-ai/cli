@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import type { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord } from "./flair-client.js";
 import snooplogg from "snooplogg";
+import { probeHead } from "./git-head.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:workspace");
 
 
@@ -176,6 +177,12 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     const ref = resolveRef(to);
     this.assertKnownRef(ref);
 
+    // An unborn baseline has no commit to check out; the working tree is the
+    // baseline, so leave it untouched.
+    if (typeof to !== "string" && to.metadata?.unborn === true) {
+      return;
+    }
+
     // Auto-stash uncommitted work (S47: reset() finds uncommitted work)
     if (!this.isClean()) {
       const stashMsg = `auto-stash: pre-reset ${new Date().toISOString()}`;
@@ -260,9 +267,25 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       if (this.failureMode === "hard") {
         throw new Error(msg);
       }
-      // warn mode: proceed with last known state
+      // warn mode: proceed with last known state. An unborn HEAD (a branch
+      // with no commit yet; the repository may have other branches) is a valid
+      // baseline state, so startup proceeds; any other HEAD outcome throws.
       swarn(`[workspace] ⚠️ ${msg} — proceeding with current state`);
-      const sha = this.headSha();
+      const probe = probeHead(this.cwd);
+      if (probe.state === "unborn") {
+        this.registerRef("HEAD");
+        return {
+          ref: "HEAD",
+          label: "fallback-unborn",
+          timestamp: new Date().toISOString(),
+          provider: "git",
+          metadata: { fallback: true, unborn: true, fetchError: fetch.stderr },
+        };
+      }
+      if (probe.state !== "commit") {
+        throw new Error(`${msg} and HEAD is indeterminate (${probe.detail})`);
+      }
+      const sha = probe.head;
       this.registerRef(sha);
       return {
         ref: sha,
