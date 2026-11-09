@@ -1387,16 +1387,20 @@ function sandboxedAutoCommitRepo(
   configPath: string,
   workspace: string,
   runtime?: string,
+  sourceConfigPath = configPath,
 ): string | undefined {
   if (runtime !== "codex") return undefined;
   const document = yaml.load(readFileSync(configPath, "utf-8")) as Record<string, unknown> | null;
   const autoCommit = document?.autoCommit;
   if (autoCommit === null || typeof autoCommit !== "object" || Array.isArray(autoCommit)) return undefined;
   const configuredRepo = (autoCommit as Record<string, unknown>).repo;
-  if (configuredRepo !== undefined && configuredRepo !== null && typeof configuredRepo !== "string") return undefined;
+  if (Object.hasOwn(autoCommit, "repo") && configuredRepo !== null && typeof configuredRepo !== "string") {
+    const type = Array.isArray(configuredRepo) ? "array" : typeof configuredRepo;
+    throw new Error(`refusing to launch: autoCommit.repo in ${sourceConfigPath} must be a string or null (got ${type})`);
+  }
   return resolveCommitRepo({
     workspace,
-    autoCommit: { repo: resolveAutoCommitRepo(configuredRepo, configPath, false) },
+    autoCommit: { repo: resolveAutoCommitRepo(configuredRepo as string | null | undefined, configPath, false) },
   });
 }
 
@@ -1655,7 +1659,7 @@ async function runAgentCommand(
               worktreeCreated = start?.changed ?? worktreeCreated;
               cleanupBinding = start?.cleanupBinding;
               approval = approveLaunch();
-              const autoCommitRepo = sandboxedAutoCommitRepo(configPath, config.workspace, selectedRuntime);
+              const autoCommitRepo = sandboxedAutoCommitRepo(configPath, config.workspace, selectedRuntime, snapshot?.workspaceConfigPath);
               const autoCommitRefusal = autoCommitRepo === undefined
                 ? null
                 : autoCommitRepoGrantRefusal(autoCommitRepo, approval.options);
