@@ -22,12 +22,11 @@ position. An install-like line must be a helper call to
 `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
 literal `--via npm` or `--via sfw`, or an exact global tool install:
 `npm install -g <name>@<exact-version>` (also `--global`) with an optional
-`--registry=<https URL>`. Any other install-like line is refused as a raw npm
-install. An install-like line carrying a shell indirection (`$`, a backtick,
-`eval`, `bash -c`, `sh -c`, `env`, `command`, `exec`, `xargs` or a brace group)
-is refused as unclassifiable. This is a conservative match, not bash-equivalent
-parsing: a command named entirely through variables with no literal npm token on
-the line, such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
+`--registry=<https URL>`. Any other install-like line is refused: as a raw npm
+install, or as unclassifiable when it carries a shell indirection (`$`, a backtick,
+`eval`, `bash -c`, `sh -c`, `env`, `command`, `exec`, `xargs` or a brace group).
+This is a conservative match, not bash-equivalent parsing: a command named
+entirely through variables with no literal npm token on the line, such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
 Installs inside other script files or composite actions are not inspected. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including

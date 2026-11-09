@@ -9,10 +9,10 @@
   `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory and literal
   `--via npm` or `--via sfw`, or an exact global tool install:
   `npm install -g <name>@<exact-version>` (also `--global`) with an optional
-  `--registry=<https URL>`. Any other install-like line is refused as a raw npm
-  install. An install-like line carrying a shell indirection is refused as
-  unclassifiable. The match is conservative, not bash-equivalent: a command named
-  entirely through variables with no literal npm token on the line is not detected.
+  `--registry=<https URL>`. Any other install-like line is refused: as a raw npm
+  install, or as unclassifiable when it carries a shell indirection. The match is
+  conservative, not bash-equivalent: a command named entirely through variables
+  with no literal npm token on the line is not detected.
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with
   lowercase names, the literal heartbeat pin substitution, helper calls and
   `GITHUB_ENV` echoes. Other helper-step lines are refused.
