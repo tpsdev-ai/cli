@@ -483,6 +483,38 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
+  test("a branch ref created before HEAD verification has a specific indeterminate reason", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--orphan", "topic");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      const branch = "refs/heads/topic";
+      let refCreations = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === "rev-parse --verify -q HEAD") {
+          git(repo, "update-ref", branch, commit);
+          refCreations++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found a ref after HEAD^{commit} did not resolve",
+        probe: "git rev-parse --verify -q HEAD",
+      });
+      git(repo, "update-ref", "-d", branch);
+      expect(evaluateMailAutoCommitGate(repo, { state: "unborn" }, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD (after task) found a ref after HEAD^{commit} did not resolve — skipping autoCommit",
+      });
+      expect(refCreations).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("a clean orphan branch beside a committed branch reports an unborn HEAD", () => {
     const repo = initRepo();
     try {
@@ -541,12 +573,12 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
       const baseline = probeHead(repo);
       expect(baseline).toEqual({
         state: "indeterminate",
-        detail: "found a ref without a commit",
-        probe: "git rev-parse --verify -q HEAD^{commit}",
+        detail: "found a ref after HEAD^{commit} did not resolve",
+        probe: "git rev-parse --verify -q HEAD",
       });
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
         action: "skip",
-        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (before task) found a ref without a commit — skipping autoCommit",
+        message: "Change check could not run: git rev-parse --verify -q HEAD (before task) found a ref after HEAD^{commit} did not resolve — skipping autoCommit",
       });
     } finally {
       rmSync(repo, { recursive: true, force: true });
