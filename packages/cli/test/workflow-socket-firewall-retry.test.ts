@@ -374,6 +374,7 @@ describe("the pre-fetch cache and download paths", () => {
       const installed = join(root, "cache", "socket-firewall-free", FIREWALL_VERSION, archName(), "sfw");
       expect(existsSync(installed)).toBe(false);
       expect(existsSync(join(root, "workspace", ".sfw-cache", "sfw"))).toBe(false);
+      expect(existsSync(`${join(root, "cache", "socket-firewall-free", FIREWALL_VERSION, archName())}.complete`)).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
