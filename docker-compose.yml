@@ -17,6 +17,8 @@ services:
       - TPS_TEST_MODE=docker
       # cli#801: fail (not skip) when the root-only set-runtime real-owner case loses a prerequisite.
       - TPS_TEST_REQUIRE_REAL_OWNER=1
+      # cli#817: fail (not skip) when the set-runtime second-group case loses a prerequisite.
+      - TPS_TEST_REQUIRE_ALT_GROUP=1
     tmpfs:
       - /tmp:exec,size=64M
 

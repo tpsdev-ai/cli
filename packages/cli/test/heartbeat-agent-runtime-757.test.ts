@@ -6,11 +6,12 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import yaml from "js-yaml";
 import { loadAgentConfig } from "@tpsdev-ai/agent";
-import { parseRequireRealOwner } from "./helpers/real-owner-flag.js";
+import { parseRequireAltGroup, parseRequireRealOwner } from "./helpers/real-owner-flag.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const DEAD_FLAIR = "http://127.0.0.1:19926";
 const REQUIRE_REAL_OWNER = parseRequireRealOwner(process.env);
+const REQUIRE_ALT_GROUP = parseRequireAltGroup(process.env);
 
 let home: string;
 let fakeBin: string;
@@ -597,11 +598,18 @@ syncBuiltinESMExports();
   });
 
   const groupProbe = probeAlternateGroup();
+  const groupCaseTitle = "set-runtime keeps the config's group";
   if (groupProbe.skipReason !== undefined) {
-    test.skip(`set-runtime keeps the config's group (skipped: ${groupProbe.skipReason})`, () => {});
+    if (REQUIRE_ALT_GROUP) {
+      test(`${groupCaseTitle} (this lane requires it; missing ${groupProbe.skipReason})`, () => {
+        throw new Error(`the required case cannot run; ${groupProbe.skipReason}`);
+      });
+    } else {
+      test.skip(`${groupCaseTitle} (skipped: ${groupProbe.skipReason})`, () => {});
+    }
   } else {
     const alternateGroup = groupProbe.group;
-    test("set-runtime keeps the config's group", async () => {
+    test(groupCaseTitle, async () => {
       const agent = "runtime-group";
       const configPath = writeAgentConfig(agent, "openclaw");
       chownSync(configPath, -1, alternateGroup);

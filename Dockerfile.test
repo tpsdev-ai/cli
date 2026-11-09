@@ -24,6 +24,11 @@ RUN mkdir -p /home/tps/.openclaw/workspace-test \
 RUN useradd -m -s /bin/bash -u 1001 tps 2>/dev/null || useradd -m -s /bin/bash tps; \
     chown -R tps:tps /home/tps
 
+# cli#817: the `test` service runs as root; give it a fixed, neutral
+# supplementary group it can chown a file to, so the set-runtime second-group
+# case runs in this lane instead of skipping.
+RUN groupadd -g 1002 tps-alt && usermod -aG tps-alt root
+
 ENV HOME=/home/tps
 
 # Mock openclaw binary — returns canned JSON for common commands
