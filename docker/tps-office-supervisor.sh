@@ -381,10 +381,9 @@ for ((i=0; i<count; i++)); do
   if ! id "$user" >/dev/null 2>&1; then
     uid="$(first_free_id user)" || {
       echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
-      # All-or-nothing, exactly like the two sibling refusals in this loop: this
-      # fires mid-loop, so stop the agents launched in earlier iterations before
-      # exiting (the EXIT trap stops them too, and a second call signals
-      # nothing).
+      # Like the two sibling refusals in this loop: this fires mid-loop, so stop
+      # the agents launched in earlier iterations before exiting (the EXIT trap
+      # stops them too, and a second call signals nothing).
       shutdown_children TERM
       exit 1
     }
@@ -454,9 +453,8 @@ for ((i=0; i<count; i++)); do
     # refuses rather than running an agent unsandboxed.
     #
     # All-or-nothing (cli#352 r): the refusal fires mid-loop, so agents launched
-    # in earlier iterations are already backgrounded. Stop them before exiting so
-    # a refusal leaves NO agent running — a team is either whole or absent,
-    # never partial. (The EXIT trap stops them too.)
+    # in earlier iterations are already backgrounded. Stop them before exiting,
+    # as the sibling refusals above do. (The EXIT trap stops them too.)
     echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the profile at $NONO_PROFILE) — refusing to launch the agent without isolation" >&2
     shutdown_children TERM
     exit 1
