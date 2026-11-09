@@ -12,6 +12,7 @@ import {
   hostStateLockRoot,
   writeBranchState,
   readBranchState,
+  sweepStaleConnectionTemps,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
@@ -327,6 +328,37 @@ describe("connection-state", () => {
 
     expect(readlinkSync(link)).toBe(target);
     expect(readFileSync(target, "utf-8")).toBe("target");
+  });
+
+  test("a temp that vanishes between listing and removal is in neither list", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-vanish-temp-"));
+    process.env.HOME = home;
+    const dir = join(home, ".tps", "connections");
+    mkdirSync(dir, { recursive: true });
+    const stale = join(dir, tempName("branch-a.json"));
+    writeFileSync(stale, "partial");
+    const old = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    utimesSync(stale, old, old);
+
+    const lstat = fs.lstatSync;
+    const injected = spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof lstat>) => {
+      const stats = lstat(...args);
+      // Removed by another process after the listing and inspection, before ours.
+      if (String(args[0]) === stale) rmSync(stale);
+      return stats;
+    });
+    let sweep: ReturnType<typeof sweepStaleConnectionTemps>;
+    let inspections = 0;
+    try {
+      sweep = sweepStaleConnectionTemps();
+      inspections = injected.mock.calls.length;
+    } finally {
+      injected.mockRestore();
+    }
+
+    expect(inspections).toBeGreaterThan(0);
+    expect(sweep.removed).toEqual([]);
+    expect(sweep.left).toEqual([]);
   });
 
   test("a record tightened to 0600 keeps 0600 after a rewrite", () => {

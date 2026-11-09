@@ -44,28 +44,31 @@ export function hostStatePath(branch: string): string {
 
 /**
  * A `.<record>.<uuid>.tmp` name, the shape writeFileAtomic creates. The record
- * part is any non-empty name ending in `.json`; the trailing part is a UUID.
+ * part is any non-empty name ending in `.json`; the trailing part is hex groups
+ * in UUID layout.
  */
 const TEMP_FILE_PATTERN = /^\..+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 
 /**
- * A temp file older than this cannot belong to an in-progress write: the write
- * is synchronous and renamed immediately after fsync. One hour is far longer
- * than any such write can take.
+ * The age threshold for cleanup: an entry whose mtime is older than this is
+ * treated as abandoned. This is a heuristic; a suspended writer or a clock
+ * jump can cross the threshold while a write is still in progress.
  */
 const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
 
 export interface ConnectionTempSweep {
   removed: string[];
-  /** Matching entries left in place, with the reason. Never reported as removed. */
+  /** Matching entries the sweep did not remove, with the reason. */
   left: { path: string; reason: string }[];
 }
 
 /**
- * Remove stale temp files left by a crash between creating the temp file and
- * renaming it. Only names of exactly the writer's shape are considered, and
- * only regular files are removed: a symlink is never followed. An entry that
- * cannot be inspected or removed is reported in `left` and left in place.
+ * Remove temp files left by a crash between creating the temp file and
+ * renaming it. Only names matching the writer's temp shape are considered, and
+ * a regular file is removed. The inspection and the removal are separate steps:
+ * an entry replaced with a symlink in between is removed as the link it became,
+ * never followed. An entry that could not be inspected or removed is reported
+ * in `left`; an entry already gone is in neither list.
  */
 export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
   const dir = connectionsDir();
@@ -86,7 +89,8 @@ export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep
     try {
       stats = lstatSync(path);
     } catch (error) {
-      left.push({ path, reason: (error as NodeJS.ErrnoException).code ?? "unknown" });
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      if (code !== "ENOENT") left.push({ path, reason: code });
       continue;
     }
     if (!stats.isFile()) {
@@ -95,10 +99,11 @@ export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep
     }
     if (now - stats.mtimeMs <= STALE_TEMP_AGE_MS) continue;
     try {
-      rmSync(path, { force: true });
+      rmSync(path);
       removed.push(path);
     } catch (error) {
-      left.push({ path, reason: (error as NodeJS.ErrnoException).code ?? "unknown" });
+      const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+      if (code !== "ENOENT") left.push({ path, reason: code });
     }
   }
   return { removed, left };
@@ -108,7 +113,7 @@ export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
-  /** Stale temp entries that could not be inspected or removed. */
+  /** Matching temp entries that could not be inspected or removed. */
   tempCleanupLeft?: { path: string; reason: string }[];
 }
 
@@ -153,28 +158,28 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
  * Write a file atomically: a uniquely named temp file in the same directory is
- * created exclusively with an existing regular record's mode when one exists,
- * else `mode`, written through its descriptor, synced, and renamed over the
- * target, so a write or rename failure leaves the previous record intact. The
- * parent directory sync after the rename is best-effort: directory fsync is
- * not supported everywhere, and the rename is already atomic for readers. If a
- * temp-file operation or rename throws, the helper attempts to close any
- * still-open descriptor and remove the temp file, then rethrows the original
- * error; cleanup errors are swallowed.
+ * created exclusively with an existing regular record's observed permission
+ * bits when one exists, else `mode`, written through its descriptor, synced,
+ * and renamed over the target, so a write or rename failure leaves the
+ * previous record intact. The parent directory sync after the rename is
+ * best-effort: directory fsync is not supported everywhere, and the rename is
+ * already atomic for readers. If a temp-file operation or rename throws, the
+ * helper attempts to close any still-open descriptor and remove the temp file,
+ * then rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
-  // A sweep failure never blocks the write: the entry is left in place.
   sweepStaleConnectionTemps();
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
-  // A regular record's mode is preserved exactly; a symlinked record is treated
-  // as absent, as before (the rename replaces the link with a regular file).
+  // A regular record's observed permission bits are preserved; a symlinked
+  // record is treated as absent, as before (the rename replaces the link with a
+  // regular file).
   const existingMode = existingRecordMode(filePath);
   let fd: number | undefined;
   try {
     fd = openSync(tmpPath, "wx", existingMode ?? mode);
     if (existingMode !== undefined) {
-      // openSync applies the umask; set the record's mode explicitly so a
-      // rewrite never widens it.
+      // fchmodSync restores the permission bits observed before the temp file
+      // was opened (openSync applies the umask).
       fchmodSync(fd, existingMode);
     }
     writeFileSync(fd, content, "utf-8");
@@ -195,7 +200,8 @@ function writeFileAtomic(filePath: string, content: string, mode: number): void 
   } catch {}
 }
 
-/** The mode of an existing regular record, or undefined when there is none. */
+/** The observed permission bits (0o777) of an existing regular record, or
+ *  undefined when there is none. */
 function existingRecordMode(filePath: string): number | undefined {
   let stats;
   try {

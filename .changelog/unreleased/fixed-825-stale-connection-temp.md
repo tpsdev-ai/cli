@@ -1,1 +1,1 @@
-- **Stale connection-state temp files left by a crash are removed on the next read or write.**
+- **Stale connection-state temp files left by a crash are removed by a subsequent record write or host-record listing, which attempts cleanup after the age threshold.**
