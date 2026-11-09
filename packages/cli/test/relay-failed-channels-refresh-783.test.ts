@@ -1,5 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostStateLockRoot, hostStatePath } from "../src/utils/connection-state.js";
@@ -30,7 +30,7 @@ function fastReconnectBackoff() {
   }) as typeof setTimeout);
 }
 
-/** One macrotask, so every connect attempt is separated from the next by a real timer. */
+/** A microtask backoff with an immediate connect fake keeps the retry chain off the timer phase; this real-timer yield keeps it reachable. */
 function yieldRealTimer(): Promise<void> {
   return new Promise<void>((resolve) => { realSetTimeout(resolve, 1); });
 }
@@ -72,23 +72,37 @@ function holdHostLock(path: string): string {
   return root;
 }
 
-test("stop() attempts at most the retained bound of channel closes after many reconnect failures", async () => {
+const MAX_RETAINED_FAILED_CHANNELS = 4;
+
+test("the retained close bound matches relay's private constant", () => {
+  const source = readFileSync(new URL("../src/utils/relay.ts", import.meta.url), "utf8");
+  expect(source.match(/const MAX_RETAINED_FAILED_CHANNELS = (\d+);/)?.[1])
+    .toBe(String(MAX_RETAINED_FAILED_CHANNELS));
+});
+
+test("stop() retries the retained bound of channel closes after many reconnect failures", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-failed-channel-bound-783-"));
   const savedEnv = savedRelayEnv();
   const failures = 12;
-  const retainedBound = 4;
   let connects = 0;
   let closes = 0;
+  let stopping = false;
+  let inFlightConnectResidual = 0;
   const fastBackoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
     await yieldRealTimer();
+    const connectedAfterStop = stopping;
     return {
       async send() { throw new Error("initial heartbeat refused"); },
       onMessage() {},
       offMessage() {},
-      async close() { closes++; throw new Error("close refused persistently"); },
+      async close() {
+        if (connectedAfterStop) inFlightConnectResidual++;
+        closes++;
+        throw new Error("close refused persistently");
+      },
       isAlive() { return true; },
       peerFingerprint() { return "remote"; },
     };
@@ -106,10 +120,13 @@ test("stop() attempts at most the retained bound of channel closes after many re
     expect(closes).toBeGreaterThanOrEqual(failures);
     const beforeStop = closes;
     const stopStarted = performance.now();
+    stopping = true;
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
     expect(performance.now() - stopStarted).toBeLessThan(5_000);
-    expect(closes - beforeStop).toBeGreaterThan(0);
-    expect(closes - beforeStop).toBeLessThanOrEqual(retainedBound);
+    expect(closes, "eviction must bound stop's close retries").toBeLessThanOrEqual(connects + MAX_RETAINED_FAILED_CHANNELS);
+    expect(inFlightConnectResidual).toBeLessThanOrEqual(1);
+    expect(closes - beforeStop - inFlightConnectResidual, "retained retries excluding the in-flight connect close")
+      .toBe(MAX_RETAINED_FAILED_CHANNELS);
     expect(diagnostic).toHaveBeenCalled();
   } finally {
     await stop?.().catch(() => {});
