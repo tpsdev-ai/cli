@@ -85,14 +85,21 @@
 #                         successful promote (build the image yourself).
 #     --help              Show usage.
 #
-# Lock: $PROMOTE_ROOT/.promote-latest.lock (default: repo root); pid records the holder.
+# Lock: $PROMOTE_ROOT/.promote-latest.lock (default: repo root). `pid` records the
+# holder, or the refusal prints `unknown` if it sees the directory before that
+# file is written. A handled exit or a catchable signal (INT/TERM/HUP) releases
+# the lock; SIGKILL cannot run the EXIT trap. An uncertain run (exit 7) keeps the
+# lock on purpose, with a `reason` file naming the packages and the steps to
+# reconcile the registry by hand.
 #
 # ENVIRONMENT
 #
 #     NPM_BIN        npm binary to use (default: `npm`). Overridable so the
 #                    test harness can inject a fake registry.
-#     NPM_TIMEOUT_SECONDS  Per-call timeout in positive integer seconds (default: 120).
-#                    The bound includes time spent at an npm one-time-password prompt.
+#     NPM_TIMEOUT_SECONDS  Per-call deadline in positive integer seconds (default:
+#                    120). The deadline includes time spent at an npm
+#                    one-time-password prompt; on expiry the script sends TERM,
+#                    polls for up to 2 seconds, then sends KILL.
 #     NPM_REGISTRY   Registry to pin every npm call to (default
 #                    https://registry.npmjs.org).
 #     PROMOTE_ROOT   Repo root to read package.json files from (default: the
@@ -114,6 +121,9 @@
 #     5  the promote failed AND a rollback did not restore the registry
 #     6  the promote succeeded, but the Docker image dispatch failed; the move
 #        stands and is NOT rolled back — run the printed command by hand
+#     7  UNCERTAIN — a timed-out mutating call (npm dist-tag add) may still be
+#        applied by the registry. The rollback was attempted; the lock and its
+#        `reason` file remain so a later run refuses until tags are fixed by hand
 set -euo pipefail
 
 # ── bash version guard ───────────────────────────────────────────────────────
@@ -128,6 +138,9 @@ fi
 
 NPM_BIN="${NPM_BIN:-npm}"
 NPM_TIMEOUT_SECONDS="${NPM_TIMEOUT_SECONDS:-120}"
+# After TERM, poll this many seconds for the process to finish before KILL. Fixed
+# rather than an environment knob: the deadline already bounds the call.
+NPM_TERM_GRACE_SECONDS=2
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 GH_BIN="${GH_BIN:-gh}"
 root="${PROMOTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -143,13 +156,14 @@ EXIT_ABORTED=3
 EXIT_INCOMPLETE=4
 EXIT_ROLLBACK_FAILED=5
 EXIT_DISPATCH_FAILED=6
+EXIT_UNCERTAIN=7
 
 die() { printf 'promote-latest: %s\n' "$1" >&2; exit "${2:-$EXIT_USAGE}"; }
 
 release_lock() {
-  if [ "$lock_owned" -eq 1 ]; then
+  if [ "$lock_owned" -eq 1 ] && [ "$keep_lock" -eq 0 ]; then
     rm -f "$lock_dir/pid"
-    rmdir "$lock_dir"
+    rmdir "$lock_dir" 2>/dev/null || :
     lock_owned=0
   fi
 }
@@ -157,70 +171,91 @@ release_lock() {
 acquire_lock() {
   lock_dir="$root/.promote-latest.lock"
   lock_owned=0
+  keep_lock=0
   trap 'release_lock' EXIT
   trap 'exit "$EXIT_REFUSED"' INT TERM HUP
   if mkdir "$lock_dir" 2>/dev/null; then
     lock_owned=1
     printf '%s\n' "$$" >"$lock_dir/pid"
   else
-    holder="$(cat "$lock_dir/pid" 2>/dev/null || printf unknown)"
-    die "lock held: $lock_dir (PID $holder). Wait, or remove the directory if that PID is not running." "$EXIT_REFUSED"
+    # The directory appears before its pid file is written. Say unknown rather
+    # than print an empty PID.
+    holder="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    [ -n "$holder" ] || holder=unknown
+    {
+      printf 'promote-latest: lock held: %s (PID %s). Wait, or remove the directory if that PID is not running.\n' "$lock_dir" "$holder"
+      if [ -f "$lock_dir/reason" ]; then
+        printf '\nThe previous run left this reason for the lock:\n\n'
+        cat "$lock_dir/reason" 2>/dev/null || printf '(the reason file could not be read)\n'
+      fi
+    } >&2
+    exit "$EXIT_REFUSED"
   fi
 }
 
 run_npm() (
-  call_dir="$(mktemp -d)" || exit 1
   npm_pid=""
-  watchdog_pid=""
   cleanup_npm() {
-    if [ -n "$watchdog_pid" ]; then
-      kill -TERM "$watchdog_pid" 2>/dev/null || :
-      wait "$watchdog_pid" 2>/dev/null || :
-    fi
     if [ -n "$npm_pid" ]; then
       kill -KILL "$npm_pid" 2>/dev/null || :
       wait "$npm_pid" 2>/dev/null || :
+      npm_pid=""
     fi
-    rm -rf "$call_dir"
   }
   trap cleanup_npm EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
   trap 'exit 129' HUP
+  # Keep the caller's stdin, stdout and stderr exactly as they are: npm's 2FA
+  # prompt needs stdin and stdout to be the script's own TTYs.
   "$NPM_BIN" "$@" <&0 &
   npm_pid=$!
-  (
-    sleeper=""
-    stop_watchdog() {
-      if [ -n "$sleeper" ]; then
-        kill "$sleeper" 2>/dev/null || :
-        wait "$sleeper" 2>/dev/null || :
-      fi
-    }
-    trap stop_watchdog EXIT
-    trap 'exit 0' TERM INT HUP
-    sleep "$NPM_TIMEOUT_SECONDS" &
-    sleeper=$!
-    wait "$sleeper"
-    : >"$call_dir/timed-out"
-    kill -TERM "$npm_pid" 2>/dev/null || :
-    sleep 1 &
-    sleeper=$!
-    wait "$sleeper"
-    kill -KILL "$npm_pid" 2>/dev/null || :
-  ) &
-  watchdog_pid=$!
-  rc=0
-  wait "$npm_pid" || rc=$?
-  npm_pid=""
-  if [ -f "$call_dir/timed-out" ]; then
-    wait "$watchdog_pid" || :
-    watchdog_pid=""
+
+  # This subshell is the ONE owner of npm's PID. It polls npm's state without
+  # reaping it: an exited child that its parent has not waited for stays a zombie,
+  # so its PID cannot be reused while the poll still holds it. An empty `ps` line
+  # means the process is gone; a line starting with Z means it is a zombie.
+  # `sleep 0.2` is supported by both the macOS and the Linux sleep.
+  timed_out=0
+  finished=0
+  ticks=0
+  deadline_ticks=$((NPM_TIMEOUT_SECONDS * 5))
+  while [ "$ticks" -lt "$deadline_ticks" ]; do
+    state="$(ps -o stat= -p "$npm_pid" 2>/dev/null || true)"
+    case "$state" in
+      '' | Z*) finished=1; break ;;
+    esac
+    sleep 0.2
+    ticks=$((ticks + 1))
+  done
+
+  if [ "$finished" -eq 0 ]; then
+    timed_out=1
     printf 'promote-latest: npm command timed out after %s seconds: npm' "$NPM_TIMEOUT_SECONDS" >&2
     printf ' %q' "$@" >&2
     printf '\n' >&2
-    exit 124
+    # Deadline: TERM, then poll the same unreaped PID for a stated grace, then
+    # KILL only if it is still running, and only then reap.
+    kill -TERM "$npm_pid" 2>/dev/null || :
+    ticks=0
+    grace_ticks=$((NPM_TERM_GRACE_SECONDS * 5))
+    while [ "$ticks" -lt "$grace_ticks" ]; do
+      state="$(ps -o stat= -p "$npm_pid" 2>/dev/null || true)"
+      case "$state" in
+        '' | Z*) finished=1; break ;;
+      esac
+      sleep 0.2
+      ticks=$((ticks + 1))
+    done
+    if [ "$finished" -eq 0 ]; then
+      kill -KILL "$npm_pid" 2>/dev/null || :
+    fi
   fi
+
+  rc=0
+  wait "$npm_pid" || rc=$?
+  npm_pid=""
+  [ "$timed_out" -eq 0 ] || exit 124
   exit "$rc"
 )
 
@@ -261,7 +296,8 @@ GitHub CLI used for the dispatch.
 Exit codes: 0 promoted; 1 usage error or unsupported bash; 2 refused before
 acting; 3 not confirmed (or a non-forward promote not acknowledged); 4 promote
 did not complete (rolled back where possible); 5 rollback did not restore the
-registry; 6 promoted, but the Docker image dispatch failed.
+registry; 6 promoted, but the Docker image dispatch failed; 7 a timed-out
+mutating call left the registry unconfirmed (the lock is kept with a reason).
 EOF
 }
 
@@ -342,7 +378,10 @@ for ((i = 0; i < NPKG; i++)); do
   new_latest[i]=""
   view_out[i]=""
   moved[i]=0
+  uncertain[i]=0
 done
+uncertain_pkgs=()
+uncertain_any=0
 
 case "$NPM_TIMEOUT_SECONDS" in
   '' | *[!0-9]*) die "NPM_TIMEOUT_SECONDS must be a positive integer" ;;
@@ -480,6 +519,31 @@ fi
 # ── helpers used by the move loop, the failure path, and the signal handler ──
 rollback_failed=0
 
+# Record that one package's registry state cannot be confirmed. Repeated marks
+# for the same package do not duplicate it in the reason file.
+mark_uncertain() {
+  if [ "${uncertain[$1]}" -eq 0 ]; then
+    uncertain[$1]=1
+    uncertain_pkgs+=("$1")
+  fi
+  uncertain_any=1
+}
+
+write_uncertain_reason() {
+  {
+    printf 'promote-latest: a timed-out npm dist-tag add left the registry state unconfirmed.\n\n'
+    printf 'The npm client was stopped, but the registry may still have applied the change.\n'
+    printf 'Uncertain package(s):\n'
+    for i in "${uncertain_pkgs[@]}"; do
+      printf '  - %s: target %s, previous latest %s\n' "${names[i]}" "$version" "${prev_latest[i]}"
+    done
+    printf '\nReconcile by hand:\n'
+    printf '  1. Check each package above: npm view <package> dist-tags\n'
+    printf '  2. Move a wrong tag back: npm dist-tag add <package>@<version> latest\n'
+    printf '  3. Remove the lock directory: rm -rf %s\n' "$lock_dir"
+  } >"$lock_dir/reason"
+}
+
 rollback_moved() {
   printf '\npromote-latest: the promote did not complete — rolling back so the end state is all-six or none.\n' >&2
   # Reverse dependency order: restore the CLI first, then agent, then the platform
@@ -493,6 +557,15 @@ rollback_moved() {
     run_npm dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
     set -e
+    if [ "$rb_rc" -eq 124 ]; then
+      # The rollback's own mutating call timed out: the registry state is still
+      # unconfirmed, and no later read can prove which write won.
+      mark_uncertain "$i"
+      new_latest[i]="unconfirmed"
+      printf 'promote-latest: ROLLBACK UNCERTAIN for %s — its dist-tag add timed out; the registry state is unconfirmed. Check: npm view %s dist-tags\n' \
+        "${names[i]}" "${names[i]}" >&2
+      continue
+    fi
     set +e
     back="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     brc=$?
@@ -503,6 +576,11 @@ rollback_moved() {
       rollback_failed=1
       printf 'promote-latest: ROLLBACK FAILED for %s — it reports %s, expected %s. Restore it by hand: npm dist-tag add %s@%s latest\n' \
         "${names[i]}" "${back:-<unreadable>}" "${prev_latest[i]}" "${names[i]}" "${prev_latest[i]}" >&2
+    elif [ "${uncertain[i]}" -eq 1 ]; then
+      # The rollback add ran, but the promote write for this package timed out:
+      # it may still be applied, so never call this package restored.
+      printf 'promote-latest: rollback of %s cannot be confirmed — its promote call timed out and may still be applied. Check: npm view %s dist-tags\n' \
+        "${names[i]}" "${names[i]}" >&2
     else
       printf 'promote-latest: rolled back %s to %s\n' "${names[i]}" "${prev_latest[i]}" >&2
     fi
@@ -570,6 +648,15 @@ on_signal() {
   printf '\npromote-latest: received SIG%s — rolling back so the end state is all-six or none.\n' "$sig" >&2
   rollback_moved
   print_final_table
+  if [ "$uncertain_any" -ne 0 ]; then
+    write_uncertain_reason
+    keep_lock=1
+    if [ "$rollback_failed" -ne 0 ]; then
+      printf 'promote-latest: a rollback also reported failure; see ROLLBACK FAILED above.\n' >&2
+    fi
+    printf '\npromote-latest: UNCERTAIN — interrupted (SIG%s) and a timed-out mutating call may still be applied. The lock and its reason file remain: %s/reason\n' "$sig" "$lock_dir" >&2
+    exit "$EXIT_UNCERTAIN"
+  fi
   if [ "$rollback_failed" -ne 0 ]; then
     printf '\npromote-latest: FAILED — interrupted (SIG%s) and a rollback did not restore the registry. Manual action needed.\n' "$sig" >&2
     exit "$EXIT_ROLLBACK_FAILED"
@@ -606,6 +693,11 @@ for ((i = 0; i < NPKG; i++)); do
   run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?
   set -e
+  if [ "$rc" -eq 124 ]; then
+    # A timed-out MUTATING call may still be applied by the registry after the
+    # client is stopped. One later read cannot prove the tag's value.
+    mark_uncertain "$i"
+  fi
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
@@ -665,6 +757,16 @@ if [ "$failure" -eq 0 ] && [ "$all_ok" -eq 1 ]; then
   printf '\npromote-latest: OK — "latest" is now %s for all six packages (verified against the registry).\n' "$version"
   dispatch_docker
   exit 0
+fi
+
+if [ "$uncertain_any" -ne 0 ]; then
+  write_uncertain_reason
+  keep_lock=1
+  if [ "$rollback_failed" -ne 0 ]; then
+    printf 'promote-latest: a rollback also reported failure; see ROLLBACK FAILED above.\n' >&2
+  fi
+  printf '\npromote-latest: UNCERTAIN — a timed-out mutating call may still be applied by the registry. The lock and its reason file remain: %s/reason\n' "$lock_dir" >&2
+  exit "$EXIT_UNCERTAIN"
 fi
 
 if [ "$rollback_failed" -ne 0 ]; then

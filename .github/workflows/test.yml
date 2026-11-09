@@ -116,6 +116,9 @@ jobs:
       - name: Run the promote-latest fixtures under this runner's bash
         env:
           BASH_BIN: ${{ runner.os == 'macOS' && '/bin/bash' || 'bash' }}
+          # The real-npm case must run here: this job has npm, node and python3,
+          # and a missing tool is a failure, not a skip (cli#373).
+          TPS_TEST_REQUIRE_REAL_NPM: "1"
         run: |
           "$BASH_BIN" --version | head -n1
           if [ "$RUNNER_OS" = macOS ]; then
