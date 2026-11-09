@@ -294,7 +294,7 @@ export function parseExceptions(text, nowMs = Date.now()) {
     if (!t) continue;
     const line = i + 1;
     const m = t.match(
-      /^-\s+(\S+@\S+)\s*\|\s*expires:(\S+)\s*\|\s*reason:\s*(\S.*)$/,
+      /^-\s+(\S+@\S+)\s*\|\s*expires:([^\s|]+)\s*\|\s*reason:\s*(\S.*)$/,
     );
     if (!m) {
       errors.push({

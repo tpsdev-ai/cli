@@ -169,6 +169,15 @@ describe("parseExceptions", () => {
     expect(entries.get("dep-a@1.0.0")).toMatchObject({ expires: "2026-12-01" });
   });
 
+  it("accepts an entry without spaces around the separators", () => {
+    const { entries, errors } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0|expires:2026-12-01|reason:urgent"),
+      NOW,
+    );
+    expect(errors).toEqual([]);
+    expect(entries.get("dep-a@1.0.0")).toMatchObject({ expires: "2026-12-01" });
+  });
+
   it("rejects a single-hash Exceptions heading", () => {
     const { entries, errors } = parseExceptions(
       "# Exceptions\n- dep-a@1.0.0 | expires:2026-12-01 | reason: urgent\n", NOW,
