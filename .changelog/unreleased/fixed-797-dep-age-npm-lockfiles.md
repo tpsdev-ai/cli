@@ -6,9 +6,9 @@
   skipped. Each workflow `run:` block is split into physical lines; the gate does not
   join continuations, strip comments or track quote state. A physical line is
   npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
-  names npm with an install subcommand or an expanded subcommand, when a backtick
+  names npm and an install-subcommand token or an expanded subcommand, when a backtick
   appears on a line that names npm, when a line that names npm ends in a
-  continuation backslash, or when the raw line has npm inside `{...}`. Every
+  continuation backslash, or when the raw line names an install subcommand with npm inside a brace group. Every
   npm-bearing line must, after trimming leading and trailing whitespace, equal
   exactly one of: a helper call to `scripts/npm-ci-tracked-lock.sh` with a
   literal tracked directory and literal `--via npm` or `--via sfw`; `npm install

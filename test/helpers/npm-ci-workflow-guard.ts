@@ -101,10 +101,11 @@ function isInstallCommandLine(line: string): boolean {
 }
 
 /**
- * A physical line is npm-bearing when its normalized copy names npm with an
- * install subcommand, when a backtick appears on a line that names npm, when a
- * line that names npm ends in a continuation backslash, or when the raw line
- * has npm inside `{...}`.
+ * A physical line is npm-bearing when its normalized copy names npm and an
+ * install-subcommand token or an expanded subcommand, when a backtick appears
+ * on a line that names npm, when a line that names npm ends in a continuation
+ * backslash, or when the raw line names an install subcommand with npm inside
+ * a brace group.
  */
 function isNpmBearing(line: string): boolean {
   const normalized = normalizeShellLine(line);
@@ -191,9 +192,10 @@ export const EXACT_LINE_ALLOWLIST: readonly AllowlistEntry[] = [
  * Each run block is split into physical lines: no continuation is joined, no
  * comment is stripped and no quote state is tracked. A physical line is
  * npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
- * names npm with an install subcommand or an expanded subcommand, when a
+ * names npm and an install-subcommand token or an expanded subcommand, when a
  * backtick appears on a line that names npm, when a line that names npm ends in
- * a continuation backslash, or when the raw line has npm inside `{...}`.
+ * a continuation backslash, or when the raw line names an install subcommand
+ * with npm inside a brace group.
  *
  * After trimming leading and trailing whitespace, every npm-bearing physical
  * line must equal exactly one of: a tracked-lock helper call with a literal
