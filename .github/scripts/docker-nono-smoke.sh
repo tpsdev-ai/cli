@@ -6,7 +6,10 @@
 # The expected hash is read from docker/nono.sha256, which holds one line per
 # platform: "<sha256> <platform>". A platform with no line fails. The binary is
 # copied out of the image and hashed on the host, then executed in the image for
-# that platform (QEMU for a foreign platform); its exit status is required to be 0.
+# that platform (QEMU for a foreign platform). Its `--version` must print
+# exactly "nono <version>", with <version> read from .nono-version, and it must
+# exit 0. A red smoke therefore means a missing hash line, a hash mismatch, a
+# wrong version, or a failed run.
 set -euo pipefail
 
 platform="${1:?usage: docker-nono-smoke.sh <platform> <image>}"
@@ -16,6 +19,11 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 hash_file="$root/docker/nono.sha256"
 [ -f "$hash_file" ] || {
   echo "missing nono hash file: $hash_file" >&2
+  exit 1
+}
+version_file="$root/.nono-version"
+[ -f "$version_file" ] || {
+  echo "missing nono version file: $version_file" >&2
   exit 1
 }
 
@@ -28,6 +36,12 @@ while read -r hash p _; do
 done <"$hash_file"
 if [ -z "$expected" ]; then
   echo "no nono hash for platform $platform in $hash_file" >&2
+  exit 1
+fi
+
+expected_version="$(sed -n 's/^version=//p' "$version_file" | head -n 1)"
+if [ -z "$expected_version" ]; then
+  echo "no version= line in $version_file" >&2
   exit 1
 fi
 
@@ -49,4 +63,9 @@ if [ "$actual" != "$expected" ]; then
   exit 1
 fi
 
-docker run --rm --platform "$platform" --entrypoint /usr/local/bin/nono "$image" --version
+out="$(docker run --rm --platform "$platform" --entrypoint /usr/local/bin/nono "$image" --version)"
+if [ "$out" != "nono $expected_version" ]; then
+  echo "nono version mismatch for $platform: expected 'nono $expected_version', got '$out'" >&2
+  exit 1
+fi
+printf '%s\n' "$out"

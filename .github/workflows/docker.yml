@@ -17,13 +17,21 @@ permissions:
 
 jobs:
   build-and-push:
-    name: Build & Push
+    name: Build, smoke & push
     runs-on: ubuntu-latest
     timeout-minutes: 150
     env:
-      # The single platform list: the smoke loop below builds and smokes each
-      # one, and the push step publishes exactly this list (cli#353).
+      # The single platform list: one build produces the OCI archive for these
+      # platforms, the smoke loop loads each one from it, and the registry
+      # copies carry all of them (cli#353).
       PLATFORMS: linux/amd64,linux/arm64
+    services:
+      # The handoff target: the archive is copied here on every run, so the
+      # digest equality below is proven even when nothing is published.
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -50,43 +58,58 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build each platform (loaded locally, not pushed) and smoke it BEFORE
-      # anything is pushed (cli#345 r10, cli#353). The loop reads the same
-      # PLATFORMS list the push step publishes.
-      - name: Build and smoke each platform (load, no push)
-        env:
-          TPS_VERSION: ${{ steps.image.outputs.tps_version }}
+      # ONE build (cli#353): every platform into one OCI archive, never pushed
+      # here. The action supplies the cache runtime; the GHA cache is written on
+      # both publish=false and publish=true runs.
+      - name: Build every platform to one OCI archive
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: ${{ env.PLATFORMS }}
+          push: false
+          outputs: type=oci,dest=${{ runner.temp }}/tps-office.oci.tar
+          build-args: |
+            TPS_VERSION=${{ steps.image.outputs.tps_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Smoke the bytes in the archive, not a rebuild: each platform's instance
+      # is loaded from the same file into the local daemon and then checked
+      # against docker/nono.sha256 and .nono-version.
+      - name: Smoke each platform from the archive
         run: |
           set -eux
+          command -v skopeo >/dev/null || {
+            echo "skopeo is required to load a platform out of the OCI archive" >&2
+            exit 1
+          }
+          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
           for platform in ${PLATFORMS//,/ }; do
-            tag="tps-office-verify:${platform//\//-}"
-            docker buildx build \
-              --platform "$platform" \
-              --file docker/Dockerfile \
-              --build-arg "TPS_VERSION=$TPS_VERSION" \
-              --tag "$tag" \
-              --load \
-              --cache-from type=gha \
-              --cache-to type=gha,mode=max \
-              .
+            arch="${platform#linux/}"
+            tag="tps-office-verify:linux-${arch}"
+            skopeo copy --override-os linux --override-arch "$arch" \
+              "oci-archive:$archive" "docker-daemon:$tag"
             bash .github/scripts/docker-nono-smoke.sh "$platform" "$tag"
           done
       # cli#352 r3/r4 — the ship-red control (S1b/S4 "harness green, ship red"
-      # class). The byte smoke above proves the binary's BYTES; this proves the
-      # IMAGE can actually run an office agent. It runs the built image itself
-      # with a one-agent fixture roster and NO stand-in for tps-agent: the
-      # supervisor's `check` pre-flight AND its `start` launch both run the
-      # SHIPPED /usr/local/bin/tps-agent. Assertions: (1) the bundled profiles
-      # exist in the image at the path the supervisor resolves (a Dockerfile
-      # that forgets the COPY is red), (2) nono loads tps-office BY PATH there
-      # and the sandbox engages (exit 0), (3) the supervisor's pre-flight passes
-      # against the shipped agent and the fixture agent really runs under nono —
-      # readiness is the agent's OWN signal, the pid file `tps-agent start`
-      # writes — and (4) the supervisor exits 0. An image whose agent predates
-      # `check` (the published 0.5.4) goes red on (3): the supervisor refuses
-      # with its named pre-flight message, printed from /tmp/sup.log. No profile
-      # override is passed, so (1)-(3) cannot be satisfied by the harness
-      # supplying the profiles.
+      # class). The hash smoke above proves the binary's bytes, its version and
+      # that it runs; this proves the IMAGE can actually run an office agent. It
+      # runs the amd64 instance loaded from the same archive, with a one-agent
+      # fixture roster and NO stand-in for tps-agent: the supervisor's `check`
+      # pre-flight AND its `start` launch both run the SHIPPED
+      # /usr/local/bin/tps-agent. Assertions: (1) the bundled profiles exist in
+      # the image at the path the supervisor resolves (a Dockerfile that forgets
+      # the COPY is red), (2) nono loads tps-office BY PATH there and the sandbox
+      # engages (exit 0), (3) the supervisor's pre-flight passes against the
+      # shipped agent and the fixture agent really runs under nono — readiness is
+      # the agent's OWN signal, the pid file `tps-agent start` writes — and (4)
+      # the supervisor exits 0. An image whose agent predates `check` (the
+      # published 0.5.4) goes red on (3): the supervisor refuses with its named
+      # pre-flight message, printed from /tmp/sup.log. No profile override is
+      # passed, so (1)-(3) cannot be satisfied by the harness supplying the
+      # profiles.
       - name: Launch control — the built image resolves its profile and launches an agent
         run: |
           set -eux
@@ -141,16 +164,39 @@ jobs:
           chmod +x "$fx/.smoke.sh"
           docker run --rm -v "$fx:/workspace" --entrypoint /bin/bash tps-office-verify:linux-amd64 /workspace/.smoke.sh
 
-      - name: Build and push
+      # Prove the handoff before anything is published: the local registry must
+      # report the same index digest as the archive. Runs on publish=false too.
+      - name: Copy the archive into the local registry and check its digest
+        run: |
+          set -eux
+          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
+          skopeo copy --all --preserve-digests --dest-tls-verify=false "oci-archive:$archive" docker://localhost:5000/tps-office:verify
+          src="$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
+          dst="$(skopeo inspect --tls-verify=false --raw docker://localhost:5000/tps-office:verify | sha256sum | cut -d' ' -f1)"
+          test "$src" = "$dst" || {
+            echo "digest mismatch: archive $src, local registry $dst" >&2
+            exit 1
+          }
+          echo "local registry holds the archive index digest $src"
+
+      - name: Push the archive to GHCR
         if: ${{ inputs.publish }}
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          platforms: ${{ env.PLATFORMS }}
-          push: true
-          build-args: |
-            TPS_VERSION=${{ steps.image.outputs.tps_version }}
-          tags: ${{ steps.image.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+        env:
+          TAGS: ${{ steps.image.outputs.tags }}
+        run: |
+          set -eux
+          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
+          # skopeo reads docker/login-action's credentials from this file.
+          grep -q 'ghcr.io' "$HOME/.docker/config.json" || {
+            echo "no ghcr.io credentials in ~/.docker/config.json" >&2
+            exit 1
+          }
+          src="$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
+          for tag in $TAGS; do
+            skopeo copy --all --preserve-digests "oci-archive:$archive" "docker://$tag"
+            dst="$(skopeo inspect --raw "docker://$tag" | sha256sum | cut -d' ' -f1)"
+            test "$src" = "$dst" || {
+              echo "digest mismatch for $tag: archive $src, registry $dst" >&2
+              exit 1
+            }
+          done
