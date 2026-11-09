@@ -58,7 +58,7 @@ const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
 
 export interface ConnectionTempSweep {
   removed: string[];
-  /** Matching entries the sweep did not remove, with the reason; on a directory read error, the directory path. */
+  /** Matching entries the sweep did not remove, with the reason; on a directory read error other than ENOENT, the directory path. */
   left: { path: string; reason: string }[];
 }
 
@@ -114,7 +114,7 @@ export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
-  /** Matching temp entries that could not be inspected or removed; on a directory read error, the directory path. */
+  /** Matching temp entries that could not be inspected or removed. A directory read error is reported in `failure`, not here. */
   tempCleanupLeft?: { path: string; reason: string }[];
 }
 
