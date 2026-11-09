@@ -18,8 +18,9 @@ without editing a list.
 
 A literal `npm ci` command word in a workflow `run:` step must be a helper call
 to `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
-literal `--via npm` or `--via sfw`. Some escaped or quoted spellings evade classification,
-for example `n\pm ci` and `npm c\i` (deferred to #836). Installs inside other script
+literal `--via npm` or `--via sfw`. The guard unquotes the command word before
+classifying it and refuses an unresolved command position carrying an npm ci install.
+Installs inside other script
 files or composite actions are not inspected. Helper steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper

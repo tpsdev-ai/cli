@@ -1393,7 +1393,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* Literal npm ci command words and helper calls; some escaped or quoted spellings evade classification, for example `n\pm ci` and `npm c\i` (deferred to #836); script files and composite actions are not inspected. */
+/* npm ci command words and helper calls; command words are unquoted before classification, and an unresolved command position carrying an npm ci install is refused. Script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
@@ -1411,7 +1411,7 @@ it("checks literal npm ci command words and tracked-lock helper calls in workflo
   expect(workflows.length).toBeGreaterThan(0);
   let installs = 0;
   for (const name of workflows) {
-    installs += assertNpmCiLockfilesRead(readFileSync(join(workflowsDir, name), "utf8"), tracked);
+    installs += assertNpmCiLockfilesRead(readFileSync(join(workflowsDir, name), "utf8"), tracked, name);
   }
   expect(installs).toBeGreaterThan(0);
 });
@@ -1547,4 +1547,27 @@ describe("the workflow guard checks literal npm ci command words and helper call
       /job build step 1: cannot establish the npm ci directory/,
     );
   }, 30_000);
+});
+
+describe("the workflow guard unquotes command words before classifying them", () => {
+  const WORKFLOW = "workflow-a";
+  it.each(["n\\pm ci", "npm c\\i", "'npm' ci", '"npm" ci', "n'p'm ci"])(
+    "refuses the escaped or quoted raw npm ci spelling: %s", (run) => {
+      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
+        `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: raw npm ci is refused; use the tracked-lock helper: ${run}`,
+      );
+    }, 5_000,
+  );
+
+  it.each(['"$NPM" ci', "$(which npm) ci", "env npm ci"])(
+    "refuses an unresolvable command word: %s", (run) => {
+      let error: unknown;
+      try { assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW); } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain(`workflow ${WORKFLOW} job build step 1`);
+      expect(message).toContain("line 1");
+      expect(message).toContain(run);
+    }, 5_000,
+  );
 });
