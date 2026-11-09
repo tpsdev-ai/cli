@@ -737,9 +737,9 @@ function manualRemovalCommand(target: { baseWorkingTree: string; workspace: stri
 
 /**
  * Drop the manual-removal advice for `target` from an error message. A caller
- * uses this when the worktree the message names no longer exists when the
- * launch exits (cli#686), so the output never asks an operator to remove a
- * path that is already gone.
+ * uses this when the worktree the message names is gone when the launch exits
+ * (cli#686), so the output does not ask an operator to remove a path that is
+ * already gone.
  */
 export function withoutManualRemovalAdvice(
   message: string,

@@ -1682,10 +1682,10 @@ async function runAgentCommand(
                   cleanupError = cleanupErr as Error;
                 }
               }
-              // The manual-removal advice is printed only for a worktree that
-              // still exists when the launch exits (cli#686): a retry that
-              // removed it makes setup's advice stale. An unreadable path is
-              // not treated as removed, so its advice stays.
+              // The manual-removal advice is dropped when the worktree is gone
+              // when the launch exits (cli#686): a retry that removed it makes
+              // setup's advice stale. An unreadable path is not treated as
+              // gone, so its advice stays.
               let worktreeGone = false;
               if (createdWorktree) {
                 try {

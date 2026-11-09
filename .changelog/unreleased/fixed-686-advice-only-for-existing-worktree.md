@@ -1,1 +1,1 @@
-- **The manual worktree-removal advice prints only for a worktree that still exists when the launch exits.**
+- **The manual worktree-removal advice is dropped when the worktree is gone when the launch exits.**
