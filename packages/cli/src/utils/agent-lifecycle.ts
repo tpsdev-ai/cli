@@ -1396,10 +1396,10 @@ export async function onTaskStart(
 }
 
 /**
- * Task complete hook: checkpoint the workspace, write structured task memory to Flair.
- * When the pre-task HEAD was unborn, it records a snapshot instead (no commit and
- * no diff against a commit that does not exist); the auto-commit gate makes the
- * repository's first commit.
+ * Task complete hook: checkpoint the workspace, write a workspace-state record to
+ * Flair and publish a task_done OrgEvent. When the pre-task HEAD was unborn, it
+ * records a snapshot instead of a checkpoint (no commit, and no diff against a
+ * commit that does not exist).
  */
 export async function onTaskComplete(
   workspace: WorkspaceProvider,
