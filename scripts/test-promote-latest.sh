@@ -6,8 +6,8 @@
 # network, no real npm, and no real dist-tag is ever moved. Each such fixture
 # builds a fake repo tree plus a fake `npm` (injected via NPM_BIN) whose registry
 # state is a JSON file the test controls, then drives scripts/promote-latest.sh
-# and asserts its exit code, its text, and the resulting registry state. Two
-# cases (AI, AJ) run the REAL npm CLI against a registry the test starts on
+# and asserts its exit code, its text, and the resulting registry state. Three
+# cases (AI, AJ, AN) run the REAL npm CLI against a registry the test starts on
 # 127.0.0.1, so the 2FA prompt seam is exercised by the real client.
 #
 # Covered:
@@ -42,20 +42,29 @@
 #     trap, the pre-add attempt flag, and the trap-clear branch, restore the
 #     command substitution around `dist-tag add`, dispatch before the last
 #     post-check, skip the final all-package read, roll back on a gh failure,
-#     KILL at the deadline instead of after the grace, call an uncertain package
-#     restored, release its lock, and drop `<&0` from the npm launch; confirm a
-#     fixture catches each —
-#     a test that passes on both the fixed and the broken script is not a test.
+#     send KILL without the exit-code check, count sleeps instead of measuring
+#     elapsed time, move the keep_lock assignment after the reason write, drop
+#     rollback failures from the reason, release the lock on the delayed-commit
+#     path, call an uncertain package restored, and drop `<&0` from the npm
+#     launch; confirm a fixture catches each — a test that passes on both the
+#     fixed and the broken script is not a test.
 #   * a timed-out mutating call (`dist-tag add`) leaves the run UNCERTAIN: exit 7,
-#     no "restored" line for that package, and the lock plus its reason file
-#     remain; a later run refuses and prints the reason (AD, AE). A timed-out
-#     read keeps the ordinary failure path (AF). The lock refusal says `unknown`
-#     when it sees the directory before the `pid` file (AH).
-#   * npm exiting during the TERM grace ends the call without a KILL (AG)
+#     no "restored" line for that package, and the lock remains, with a reason
+#     file when it can be written (AD, AE); a later run refuses and prints the
+#     reason. A timed-out read keeps the ordinary failure path (AF). The lock
+#     refusal says `unknown` when it sees the directory before the `pid` file
+#     (AH). A reason file that cannot be written keeps the lock and prints one
+#     error (AM). A delayed commit is still listed by a later refusal (AN). An
+#     uncertain write and a rollback failure on different packages are both
+#     listed (AO).
+#   * npm exiting during the TERM grace ends the call without a KILL (AG); a
+#     child that ignores TERM is KILLed after the grace (AL)
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
-#     never answers makes the run uncertain (AJ). TPS_TEST_REQUIRE_REAL_NPM=1
-#     makes a missing npm, node or python3 a failure instead of a skip.
+#     never answers makes the run uncertain (AJ); a PUT the server applies after
+#     the client was killed is still listed by a later refusal (AN).
+#     TPS_TEST_REQUIRE_REAL_NPM=1 makes a missing npm, node or python3 a failure
+#     instead of a skip.
 #   * the fixtures run under bash 3.2 too (BASH_BIN; the macOS CI leg pins it),
 #     and the workflow still invokes this harness
 #
@@ -79,6 +88,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$here/.." && pwd)"
 tool="$here/promote-latest.sh"
 work="$(mktemp -d)"
+# Script mutants live beside a copy of the real supervisor, because the tool
+# resolves npm-supervisor.mjs from its own directory.
+cp "$here/npm-supervisor.mjs" "$work/npm-supervisor.mjs"
 trap 'rm -rf "$work"' EXIT
 
 # BASH_BIN is the bash the tool under test must run under. On the machine that
@@ -189,7 +201,8 @@ const names = ['cli-darwin-arm64', 'cli-darwin-x64', 'cli-linux-arm64', 'cli-lin
 const latest = {};
 for (const n of names) latest['@tpsdev-ai/' + n] = '0.5.3';
 const requests = [];
-function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests }, null, 2)); }
+const applied = [];
+function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied }, null, 2)); }
 function manifest(pkg, version) {
   return { name: pkg, version, dist: { tarball: 'http://127.0.0.1/' + pkg.replace('/', '-') + '-' + version + '.tgz', shasum: '0' } };
 }
@@ -212,6 +225,22 @@ const server = http.createServer((req, res) => {
       }
       if (req.method === 'PUT' && tag[2] === 'latest') {
         if (mode === 'hang-put') return; // never answer
+        if (mode === 'delayed-put') {
+          // Record the request now and apply the tag only after a delay longer
+          // than the client's deadline, so the write lands after the client is
+          // stopped.
+          const received = Date.now();
+          setTimeout(() => {
+            latest[pkg] = JSON.parse(body);
+            applied.push({ pkg, version: latest[pkg], received, at: Date.now() });
+            persist();
+            if (!res.writableEnded) {
+              res.writeHead(201, { 'content-type': 'application/json' });
+              res.end(JSON.stringify({ ok: true }));
+            }
+          }, 1500);
+          return;
+        }
         if (!req.headers['npm-otp']) {
           res.writeHead(401, { 'www-authenticate': 'OTP', 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: 'one-time password required' }));
@@ -441,6 +470,9 @@ if (cmd === 'view') {
   if (tag !== 'latest') fail('npm error only the latest tag is supported');
   const s = read();
   if ((s.failAdd || []).includes(spec.pkg)) fail('npm error code E401\nnpm error Unable to authenticate');
+  if (s.rollbackFailPkg === spec.pkg && spec.ver === s.rollbackFailVersion) {
+    fail('npm error code E401\nnpm error fake npm: rollback add refused');
+  }
   const willStall = s.stallAdd === spec.pkg && spec.ver !== s.stallRollbackVersion;
   // `noopAdd`: a command that exits 0 but never moves the tag. `stallNoCommit`:
   // the stalled add never applies its change.
@@ -596,17 +628,13 @@ const targets = {
     '  exit "$EXIT_DISPATCH_FAILED"\n',
     '  rollback_moved\n  exit "$EXIT_DISPATCH_FAILED"\n',
   ],
-  kill_no_grace: [
-    '    kill -TERM "$npm_pid" 2>/dev/null || :\n',
-    '    kill -KILL "$npm_pid" 2>/dev/null || :\n',
-  ],
   uncertain_restored: [
     '    elif [ "${uncertain[i]}" -eq 1 ]; then\n',
     '    elif false; then\n',
   ],
   drop_stdin: [
-    '  "$NPM_BIN" "$@" <&0 &\n',
-    '  "$NPM_BIN" "$@" &\n',
+    '  "$NODE_BIN" "$supervisor" "$NPM_TIMEOUT_SECONDS" "$NPM_TERM_GRACE_SECONDS" -- "$NPM_BIN" "$@" <&0 &\n',
+    '  "$NODE_BIN" "$supervisor" "$NPM_TIMEOUT_SECONDS" "$NPM_TERM_GRACE_SECONDS" -- "$NPM_BIN" "$@" &\n',
   ],
 };
 if (which === 'final_read') {
@@ -615,6 +643,30 @@ if (which === 'final_read') {
 }
 if (which === 'release_uncertain_lock') {
   fs.writeFileSync(dst, s.replaceAll('keep_lock=1', 'keep_lock=0'));
+  process.exit(0);
+}
+if (which === 'keep_lock_after_reason') {
+  const onSig = '    keep_lock=1\n    write_reconciliation_reason || :\n';
+  const main = '  keep_lock=1\n  write_reconciliation_reason || :\n';
+  if (!s.includes(onSig) || !s.includes(main)) {
+    console.error('keep_lock mutation target not found');
+    process.exit(3);
+  }
+  let out = s.replace(onSig, '    write_reconciliation_reason\n    keep_lock=1\n');
+  out = out.replace(main, '  write_reconciliation_reason\n  keep_lock=1\n');
+  fs.writeFileSync(dst, out);
+  process.exit(0);
+}
+if (which === 'drop_rollback_failures') {
+  const start = "  if [ \"${#rollback_failed_pkgs[@]}\" -gt 0 ]; then\n";
+  const end = "  fi\n  printf '\\nReconcile by hand, after the registry has settled:\\n'\n";
+  const a = s.indexOf(start);
+  const b = s.indexOf(end, a);
+  if (a < 0 || b < 0) {
+    console.error('rollback-failure mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.slice(0, a) + s.slice(b));
   process.exit(0);
 }
 const t = targets[which];
@@ -629,6 +681,71 @@ if (which === 'dispatch_early') {
 }
 fs.writeFileSync(dst, out);
 MUT
+
+# mutate-supervisor.mjs — break npm-supervisor.mjs so the fixtures must catch it.
+cat >"$work/mutate-supervisor.mjs" <<'MUTSUP'
+import fs from 'fs';
+const [src, dst, which] = process.argv.slice(2);
+const s = fs.readFileSync(src, 'utf8');
+
+if (which === 'kill_unchecked') {
+  const sendOld = `function send(signal) {
+  if (gone()) return false;
+  try {`;
+  const sendNew = `function send(signal) {
+  try {`;
+  const graceOld = `  graceTimer = setTimeout(() => {
+    graceDone = true;
+    if (!gone()) send('SIGKILL');`;
+  const graceNew = `  graceTimer = setTimeout(() => {
+    graceDone = true;
+    send('SIGKILL');`;
+  if (!s.includes(sendOld) || !s.includes(graceOld)) {
+    console.error('supervisor kill mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(sendOld, sendNew).replace(graceOld, graceNew));
+  process.exit(0);
+}
+
+if (which === 'count_sleeps') {
+  const start = 'deadlineTimer = setTimeout(() => {';
+  const end = '}, Math.round(deadlineSeconds * 1000));';
+  const a = s.indexOf(start);
+  const b = s.indexOf(end, a);
+  if (a < 0 || b < 0) {
+    console.error('supervisor sleeps mutation target not found');
+    process.exit(3);
+  }
+  const replacement = `const startupMs = Number(process.env.PROMOTE_MUTANT_STARTUP_MS || 0);
+// MUTANT: counts fixed 200 ms sleeps after an assumed startup delay instead of
+// measuring elapsed time from the call's start.
+setTimeout(() => {
+  let counted = 0;
+  const step = () => {
+    if (gone()) return;
+    if (counted * 200 >= Math.round(deadlineSeconds * 1000)) {
+      timedOut = true;
+      send('SIGTERM');
+      graceTimer = setTimeout(() => {
+        graceDone = true;
+        if (gone()) return;
+        send('SIGKILL');
+      }, Math.round(graceSeconds * 1000));
+      return;
+    }
+    counted += 1;
+    setTimeout(step, 200);
+  };
+  step();
+}, startupMs);`;
+  fs.writeFileSync(dst, s.slice(0, a) + replacement + s.slice(b + end.length));
+  process.exit(0);
+}
+
+console.error('unknown supervisor mutation: ' + which);
+process.exit(2);
+MUTSUP
 
 new_fixture() { # <name> -> prints the fixture dir
   local d="$work/$1"
@@ -666,7 +783,8 @@ invoke() { # [TOOL=...] <fixture-dir> [args...] — stdin and stdout on the pty;
   LOG="$d/log.txt"
   : >"$LOG"
   : >"$d/gh.log"
-  raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+  : >"$d/supervisor.log"
+  raw="$(PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="${NPM_BIN_OVERRIDE:-$fake_npm}" \
     GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
@@ -682,7 +800,8 @@ invoke_stdin() { # [TOOL=...] <fixture-dir> <reply> [args...] — the reply is t
   LOG="$d/log.txt"
   : >"$LOG"
   : >"$d/gh.log"
-  raw="$(printf '%s\n' "$reply" | FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+  : >"$d/supervisor.log"
+  raw="$(printf '%s\n' "$reply" | PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="${NPM_BIN_OVERRIDE:-$fake_npm}" \
     GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@")"
   RC=$?
@@ -697,8 +816,9 @@ invoke_stdin_not_tty() { # [TOOL=...] <fixture-dir> [args...] — stdout on the 
   LOG="$d/log.txt"
   : >"$LOG"
   : >"$d/gh.log"
+  : >"$d/supervisor.log"
   # shellcheck disable=SC2016  # "$@" is expanded by the inner bash, not here
-  raw="$(FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+  raw="$(PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="${NPM_BIN_OVERRIDE:-$fake_npm}" \
     GH_BIN="${GH_BIN_OVERRIDE:-$gh_stub}" GH_LOG="$d/gh.log" GH_NPM_LOG="$LOG" GH_STUB_FAIL="${GH_STUB_FAIL:-0}" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" -c 'exec "$@" </dev/null' stdin-null "$BASH_BIN" "$t" "$@" </dev/null)"
   RC=$?
@@ -731,9 +851,10 @@ start_held() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> [args...]
   HCOUNTER="$d/hold.count"
   rm -f "$HCOUNTER"
   rm -f "$d/tool.pid"
+  : >"$d/supervisor.log"
   local hv="$holdver"
   [ "$holdver" = "-" ] && hv=""
-  FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="$fake_npm" \
+  PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" FAKE_NPM_STATE="$d/state.json" FAKE_NPM_LOG="$LOG" PROMOTE_ROOT="$d/root" NPM_BIN="${NPM_BIN_OVERRIDE:-$fake_npm}" \
     FAKE_NPM_HOLD_PKG="@tpsdev-ai/$hold" FAKE_NPM_HOLD_VER="$hv" FAKE_NPM_MARKER="$HCOUNTER" \
     PTY_PIDFILE="$d/tool.pid" \
     python3 "$pty_runner" "$d/err.txt" "$BASH_BIN" "$t" "$@" </dev/null >"$d/out.txt" &
@@ -1181,6 +1302,10 @@ NPM_TIMEOUT_SECONDS=1 FAKE_NPM_PIDFILE="$d/npm.pid" FAKE_NPM_SIGNAL_LOG="$d/sign
 assert_eq "AG term-grace: exit" 7 "$RC"
 assert_contains "AG term-grace: TERM received" "$(cat "$d/signals" 2>/dev/null)" "TERM"
 assert_contains "AG term-grace: handler finished inside the grace" "$(cat "$d/signals" 2>/dev/null)" "TERM-EXIT"
+# The supervisor's own log is what it sent: TERM at the deadline, no KILL once
+# the child has exited during the grace.
+assert_contains "AG term-grace: supervisor sent TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
+assert_eq "AG term-grace: supervisor sent no KILL" 0 "$(grep -c '^KILL$' "$d/supervisor.log" 2>/dev/null || true)"
 if [ -s "$d/npm.pid" ]; then
   if kill -0 "$(cat "$d/npm.pid")" 2>/dev/null; then bad "AG term-grace: process gone" "npm still running"; else ok "AG term-grace: process gone" "npm is gone"; fi
 else
@@ -1263,6 +1388,90 @@ else
   fi
   stop_registry
 fi
+
+# ── AL. the supervisor's bound: a TERM-ignoring child is KILLed after the grace ─
+# The fake npm's default stalled add ignores TERM and would finish on its own
+# after 3.5 s. The call must end within the deadline (1 s) plus the grace (2 s);
+# the margin below is 5 s. The supervisor's own log records TERM and KILL.
+d="$(new_fixture supervisor-bound)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+t0="$(python3 -c 'import time; print(time.monotonic())')"
+NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
+t1="$(python3 -c 'import time; print(time.monotonic())')"
+elapsed="$(python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$t0" "$t1")"
+assert_eq "AL bound: exit" 7 "$RC"
+assert_contains "AL bound: supervisor sent TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
+assert_contains "AL bound: supervisor sent KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
+if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$elapsed" 8; then
+  ok "AL bound: inside deadline + grace + 5s" "${elapsed}s"
+else
+  bad "AL bound: inside deadline + grace + 5s" "${elapsed}s"
+fi
+
+# ── AM. an unwritable reason file: the lock is kept, exit 7, one error ───────
+# The lock directory exists while the add is held; a directory placed at
+# `<lock>/reason` makes the redirect fail for every uid, root included.
+d="$(new_fixture reason-write-fails)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+FAKE_NPM_RELEASE_FILE="$d/release" NPM_TIMEOUT_SECONDS=1 start_held "$d" cli-linux-arm64 0.5.4 0.5.4 --yes --no-docker
+if wait_count "$HCOUNTER" 1; then
+  mkdir "$d/root/.promote-latest.lock/reason"
+  : >"$d/release"
+  finish_held "$d"
+  assert_eq "AM reason-write: exit" 7 "$IRC"
+  assert_eq "AM reason-write: lock kept" yes "$(if [ -d "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+  assert_contains "AM reason-write: names the lock path" "$ERR" "$d/root/.promote-latest.lock/reason"
+  assert_contains "AM reason-write: says it could not be written" "$ERR" "reason file could not be written"
+else
+  : >"$d/release"
+  finish_held "$d"
+  bad "AM reason-write: first add held" "no marker"
+fi
+
+# ── AN. a delayed commit lands after the client stopped; next run refuses ────
+# The local registry applies the PUT 1.5 s after receiving it; the client's
+# deadline is 1 s, so the write lands after the client was killed.
+d="$(new_fixture delayed-commit)"
+if start_registry "$d" delayed-put; then
+  mkdir -p "$d/home" "$d/npm-cache"
+  raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
+    npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
+    NPM_TIMEOUT_SECONDS=1 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+    python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
+  RC=$?
+  OUT="$(printf '%s\n' "$raw" | strip_cr)"
+  ERR="$OUT"
+  assert_eq "AN delayed-commit: exit" 7 "$RC"
+  assert_contains "AN delayed-commit: reason names the package" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "@tpsdev-ai/cli-darwin-arm64: target 0.5.4"
+  sleep 2
+  if node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.exit((s.applied||[]).some((a)=>a.at-a.received>=1000)?0:1)' "$d/registry.state"; then
+    ok "AN delayed-commit: the write landed after the client stopped" "applied >= 1 s after receipt"
+  else
+    bad "AN delayed-commit: the write landed after the client stopped" "no delayed apply recorded"
+  fi
+  invoke "$d" 0.5.4 --yes --no-docker
+  assert_eq "AN delayed-commit: second run refuses" 2 "$RC"
+  assert_contains "AN delayed-commit: refusal prints the reason" "$ERR" "target 0.5.4, previous latest 0.5.3"
+else
+  bad "AN delayed-commit: registry started" "no port file"
+fi
+stop_registry
+
+# ── AO. an uncertain write on one package and a rollback failure on another ──
+d="$(new_fixture mixed-uncertain)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; s.rollbackFailPkg="@tpsdev-ai/cli-darwin-arm64"; s.rollbackFailVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "AO mixed: exit" 7 "$RC"
+reason="$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)"
+assert_contains "AO mixed: reason lists the uncertain write" "$reason" "@tpsdev-ai/cli-linux-arm64: target 0.5.4"
+assert_contains "AO mixed: reason lists the rollback failure" "$reason" "@tpsdev-ai/cli-darwin-arm64: rollback to 0.5.3 did not restore it"
+assert_contains "AO mixed: printed steps list the uncertain write" "$ERR" "@tpsdev-ai/cli-linux-arm64: target 0.5.4"
+assert_contains "AO mixed: printed steps list the rollback failure" "$ERR" "@tpsdev-ai/cli-darwin-arm64: rollback to 0.5.3 did not restore it"
+assert_contains "AO mixed: steps say confirm after the registry settled" "$reason" "after the registry has settled"
+assert_contains "AO mixed: steps say one read cannot prove the tag" "$reason" "A single read cannot prove"
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
@@ -1405,23 +1614,58 @@ else
   bad "M8 mutation: rollback on gh failure caught" "could not build the mutant"
 fi
 
-# ── M10. mutation: KILL at the deadline instead of after the grace ────────────
-# Fixture AG's fake logs TERM and TERM-EXIT from its own handler. KILL cannot be
-# caught, so a mutant that sends it before the grace leaves no such lines.
-mut="$work/tool-kill-no-grace.sh"
-if node "$work/mutate.mjs" "$tool" "$mut" kill_no_grace; then
-  d="$(new_fixture mut-kill-no-grace)"
+# ── M10. mutation (a): supervisor KILLs without the exit-code check ──────────
+# Fixture AG's child exits during the grace, so a checked supervisor sends no
+# KILL; the mutant sends one and records it in the supervisor log.
+m10="$work/mut-kill-unchecked"
+mkdir -p "$m10"
+cp "$tool" "$m10/promote-latest.sh"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10/npm-supervisor.mjs" kill_unchecked; then
+  d="$(new_fixture mut-kill-unchecked)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-  NPM_TIMEOUT_SECONDS=1 FAKE_NPM_PIDFILE="$d/npm.pid" FAKE_NPM_SIGNAL_LOG="$d/signals" FAKE_NPM_TERM_GRACE_EXIT=1 TOOL="$mut" invoke "$d" 0.5.4 --yes --no-docker
-  if [ -s "$d/signals" ] && grep -qF 'TERM-EXIT' "$d/signals"; then
-    bad "M10 mutation: no KILL during the grace caught" "mutant let the handler finish — fixture AG is blind"
+  NPM_TIMEOUT_SECONDS=1 FAKE_NPM_PIDFILE="$d/npm.pid" FAKE_NPM_SIGNAL_LOG="$d/signals" FAKE_NPM_TERM_GRACE_EXIT=1 TOOL="$m10/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  if [ "$(grep -c '^KILL$' "$d/supervisor.log" 2>/dev/null || true)" -eq 0 ]; then
+    bad "M10 mutation (a): unchecked KILL caught" "mutant sent no KILL — fixture AG is blind"
   else
-    ok "M10 mutation: no KILL during the grace caught" "mutant left no TERM-EXIT line (fixture AG catches it)"
+    ok "M10 mutation (a): unchecked KILL caught" "mutant sent KILL after the child exited (fixture AG catches it)"
   fi
   TOOL=""
 else
-  bad "M10 mutation: no KILL during the grace caught" "could not build the mutant"
+  bad "M10 mutation (a): unchecked KILL caught" "could not build the mutant supervisor"
+fi
+
+# ── M10b. mutation (b): count sleeps from an assumed startup, not elapsed ────
+# A slow child-spawn stub sleeps 5 s before exec; the mutant starts its sleep
+# counter after 5 s, so the call runs past deadline + grace + the 5 s margin.
+slow_npm="$work/slow-npm"
+cat >"$slow_npm" <<'SLOW_NPM'
+#!/bin/bash
+if [ "${1:-}" = "dist-tag" ] && [ "${2:-}" = "add" ]; then
+  case "${3:-}" in *@0.5.4) sleep 5 ;; esac
+fi
+exec "$REAL_NPM" "$@"
+SLOW_NPM
+chmod +x "$slow_npm"
+m10b="$work/mut-count-sleeps"
+mkdir -p "$m10b"
+cp "$tool" "$m10b/promote-latest.sh"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10b/npm-supervisor.mjs" count_sleeps; then
+  d="$(new_fixture mut-count-sleeps)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-darwin-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  t0="$(python3 -c 'import time; print(time.monotonic())')"
+  NPM_TIMEOUT_SECONDS=1 NPM_BIN_OVERRIDE="$slow_npm" REAL_NPM="$fake_npm" PROMOTE_MUTANT_STARTUP_MS=5000 TOOL="$m10b/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  t1="$(python3 -c 'import time; print(time.monotonic())')"
+  elapsed="$(python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$t0" "$t1")"
+  if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$elapsed" 8; then
+    ok "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s, past deadline + grace + 5s"
+  else
+    bad "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s — fixture AL is blind"
+  fi
+  TOOL=""
+else
+  bad "M10b mutation (b): sleep counting caught" "could not build the mutant supervisor"
 fi
 
 # ── M11. mutation: call an uncertain package restored; AE must catch it ───────
@@ -1441,21 +1685,35 @@ else
   bad "M11 mutation: restored for an uncertain package caught" "could not build the mutant"
 fi
 
-# ── M12. mutation: release the lock on an uncertain run; AD must catch it ────
+# ── M12. mutation (e): release the lock on the delayed-commit path ──────────
+# Fixture AN's delayed PUT lands after the client stopped. The mutant releases
+# the uncertain lock, so the next run would not refuse. AN expects the lock.
 mut="$work/tool-release-uncertain-lock.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
-  d="$(new_fixture mut-release-uncertain-lock)"
-  write_state "$d/state.json" "0.5.4" "0.5.3"
-  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-  NPM_TIMEOUT_SECONDS=1 TOOL="$mut" invoke "$d" 0.5.4 --yes --no-docker
-  if [ -f "$d/root/.promote-latest.lock/pid" ]; then
-    bad "M12 mutation: uncertain lock release caught" "mutant kept the lock — AD is blind"
+  if [ "$real_ready" -eq 1 ]; then
+    d="$(new_fixture mut-release-uncertain-lock)"
+    if start_registry "$d" delayed-put; then
+      mkdir -p "$d/home" "$d/npm-cache"
+      raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
+        npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
+        NPM_TIMEOUT_SECONDS=1 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+        python3 "$real_pty_runner" "$BASH_BIN" "$mut" 0.5.4 --yes --no-docker)"
+      RC=$?
+      if [ -f "$d/root/.promote-latest.lock/pid" ]; then
+        bad "M12 mutation (e): lock release on delayed commit caught" "mutant kept the lock — AN is blind"
+      else
+        ok "M12 mutation (e): lock release on delayed commit caught" "mutant removed the pid file (AN catches it)"
+      fi
+    else
+      bad "M12 mutation (e): lock release on delayed commit caught" "registry did not start"
+    fi
+    stop_registry
   else
-    ok "M12 mutation: uncertain lock release caught" "mutant removed the pid file (AD catches it)"
+    printf 'SKIP  %-42s npm/node/python3 not installed\n' "M12 mutation (e): lock release on delayed commit caught"
   fi
   TOOL=""
 else
-  bad "M12 mutation: uncertain lock release caught" "could not build the mutant"
+  bad "M12 mutation (e): lock release on delayed commit caught" "could not build the mutant"
 fi
 
 # ── M13. mutation: drop <&0 from the npm launch; AI must catch it ─────────────
@@ -1488,6 +1746,54 @@ if node "$work/mutate.mjs" "$tool" "$mut" drop_stdin; then
   TOOL=""
 else
   bad "M13 mutation: dropped stdin caught" "could not build the mutant"
+fi
+
+# ── M14. mutation (c): set keep_lock AFTER the reason write ─────────────────
+# Fixture AM makes the reason write fail. The mutant writes first and lets the
+# failure abort under `set -e`, so keep_lock is still 0 and the lock is released.
+mut="$work/tool-keep-lock-after-reason.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" keep_lock_after_reason; then
+  d="$(new_fixture mut-keep-lock-after-reason)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  FAKE_NPM_RELEASE_FILE="$d/release" NPM_TIMEOUT_SECONDS=1 TOOL="$mut" start_held "$d" cli-linux-arm64 0.5.4 0.5.4 --yes --no-docker
+  if wait_count "$HCOUNTER" 1; then
+    mkdir "$d/root/.promote-latest.lock/reason"
+    : >"$d/release"
+    finish_held "$d"
+    if [ -f "$d/root/.promote-latest.lock/pid" ]; then
+      bad "M14 mutation (c): keep_lock after reason write caught" "mutant kept the lock — AM is blind"
+    else
+      ok "M14 mutation (c): keep_lock after reason write caught" "mutant removed the pid file when the reason write failed (AM catches it)"
+    fi
+  else
+    : >"$d/release"
+    finish_held "$d"
+    bad "M14 mutation (c): keep_lock after reason write caught" "first add was not held"
+  fi
+  TOOL=""
+else
+  bad "M14 mutation (c): keep_lock after reason write caught" "could not build the mutant"
+fi
+
+# ── M15. mutation (d): drop rollback failures from the reason ───────────────
+# Fixture AO has an uncertain write on one package and a rollback failure on
+# another; the mutant lists only the uncertain write.
+mut="$work/tool-drop-rollback-failures.sh"
+if node "$work/mutate.mjs" "$tool" "$mut" drop_rollback_failures; then
+  d="$(new_fixture mut-drop-rollback-failures)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; s.rollbackFailPkg="@tpsdev-ai/cli-darwin-arm64"; s.rollbackFailVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  NPM_TIMEOUT_SECONDS=1 TOOL="$mut" invoke "$d" 0.5.4 --yes --no-docker
+  reason="$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)"
+  if printf '%s' "$reason" | grep -qF 'rollback to 0.5.3 did not restore it'; then
+    bad "M15 mutation (d): dropped rollback failure caught" "mutant listed the rollback failure — AO is blind"
+  else
+    ok "M15 mutation (d): dropped rollback failure caught" "mutant omitted the rollback failure (AO catches it)"
+  fi
+  TOOL=""
+else
+  bad "M15 mutation (d): dropped rollback failure caught" "could not build the mutant"
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
