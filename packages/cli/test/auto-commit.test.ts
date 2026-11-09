@@ -515,6 +515,37 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
+  test("HEAD moves from a detached commit to an unborn branch before commit verification", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--detach", commit);
+      const branch = "refs/heads/empty";
+      let switches = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === "rev-parse --verify -q HEAD^{commit}") {
+          git(repo, "symbolic-ref", "HEAD", branch);
+          switches++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found no commit after symbolic-ref reported a detached HEAD",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      git(repo, "checkout", "-q", "--detach", commit);
+      expect(evaluateMailAutoCommitGate(repo, { state: "commit", head: commit }, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) found no commit after symbolic-ref reported a detached HEAD — skipping autoCommit",
+      });
+      expect(switches).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("a clean orphan branch beside a committed branch reports an unborn HEAD", () => {
     const repo = initRepo();
     try {
