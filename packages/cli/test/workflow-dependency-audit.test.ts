@@ -174,7 +174,7 @@ function expectBody(args: string[]) {
 }
 
 describe("audit notification with a gh fixture", () => {
-  test("opens an issue when the tracking title has no open issue", () => {
+  test("opens an issue when no open issue with the tracking title was opened by github-actions[bot]", () => {
     const { result, calls } = fakeGh(false);
     expect(result.status, result.stderr).toBe(0);
     expect(calls).toHaveLength(2);

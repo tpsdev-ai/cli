@@ -1,7 +1,8 @@
 /**
- * The flags the Docker lane sets to require a set-runtime case: the
- * root-only real-owner case (cli#801, cli#816) and the second-group case
- * (cli#817).
+ * The flags a CI lane sets to require a case that needs its runtime: the
+ * Docker lane sets the root-only real-owner case (cli#801, cli#816) and the
+ * second-group case (cli#817); the Unit + integration lane sets the real-gh
+ * notification case (cli#332).
  */
 export const REAL_OWNER_FLAG = "TPS_TEST_REQUIRE_REAL_OWNER";
 export const ALT_GROUP_FLAG = "TPS_TEST_REQUIRE_ALT_GROUP";
