@@ -58,14 +58,15 @@ const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
 
 export interface ConnectionTempSweep {
   removed: string[];
-  /** Matching entries the sweep did not remove, with the reason. */
+  /** Matching entries the sweep did not remove, with the reason; on a directory read error, the directory path. */
   left: { path: string; reason: string }[];
 }
 
 /**
- * Remove temp files left by a crash between creating the temp file and
- * renaming it. Only names matching the writer's temp shape are considered, and
- * a regular file is removed. The inspection and the removal are separate steps:
+ * Attempt to remove temp files left by a crash between creating the temp file
+ * and renaming it. Only names matching the writer's temp shape are considered,
+ * and removal is attempted for a matching regular file older than the threshold.
+ * The inspection and the removal are separate steps:
  * an entry replaced with a symlink in between is removed as the link it became,
  * never followed. An entry that could not be inspected or removed is reported
  * in `left`; an entry already gone is in neither list.
@@ -113,7 +114,7 @@ export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
-  /** Matching temp entries that could not be inspected or removed. */
+  /** Matching temp entries that could not be inspected or removed; on a directory read error, the directory path. */
   tempCleanupLeft?: { path: string; reason: string }[];
 }
 
