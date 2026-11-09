@@ -3,6 +3,10 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import yaml from "js-yaml";
+import { GH_FLAG, parseRequireGh } from "./helpers/real-owner-flag.js";
+
+const requireGh = parseRequireGh(process.env);
+const gh = Bun.which("gh");
 
 const workflow = yaml.load(readFileSync(
   join(import.meta.dir, "../../../.github/workflows/dependency-audit.yml"), "utf8",
@@ -10,9 +14,8 @@ const workflow = yaml.load(readFileSync(
 const title = "Dependency audit failure on main";
 
 for (const mode of ["create", "comment", "list-failure", "write-failure"]) {
-  test(`notification through real gh API: ${mode}`, async () => {
-    const gh = Bun.which("gh");
-    expect(gh, "GitHub CLI must be installed in this lane").not.toBeNull();
+  test.skipIf(!gh && !requireGh)(`notification through real gh API: ${mode}`, async () => {
+    expect(gh, `${GH_FLAG}=1 requires the gh CLI, but gh is missing`).not.toBeNull();
     const requests: Array<{ method: string; path: string; body?: Record<string, string> }> = [];
     const server = Bun.serve({
       hostname: "127.0.0.1",

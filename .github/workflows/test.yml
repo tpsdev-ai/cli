@@ -158,6 +158,8 @@ jobs:
       - run: |
           chmod +x packages/cli/test/fakes/nono/bin/nono 2>/dev/null || true
       - name: Unit + integration tests, HOME-isolated (cli#430)
+        env:
+          TPS_TEST_REQUIRE_GH: "1"
         # The suite used to resolve the real ~/.tps (identity, credentials, auth,
         # agents, run, mail); on a host that runs production agents under the same
         # user that is a real write. Run it with HOME pointed at an EMPTY directory

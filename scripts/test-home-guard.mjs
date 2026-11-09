@@ -75,6 +75,7 @@ export const PASSED_ENV = {
   TPS_TEST_FLAIR_OPS_PORT: "scratch operator-API port; flairTarget validates it before building a loopback URL",
   TPS_TEST_REQUIRE_REAL_OWNER: "the Docker Integration lane requires the root-only set-runtime owner case to run (cli#801)",
   TPS_TEST_REQUIRE_ALT_GROUP: "the Docker Integration lane requires the set-runtime second-group case to run (cli#817)",
+  TPS_TEST_REQUIRE_GH: "the Unit & Integration Tests lane requires the real gh notification test to run (cli#332)",
   PATH: "bun, node, git and the other tools the tests spawn are found through it",
   LANG: "locale: the language and encoding of the tools the tests spawn",
   LANGUAGE: "locale: message-language preference of the tools the tests spawn",

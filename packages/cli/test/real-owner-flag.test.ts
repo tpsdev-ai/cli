@@ -10,7 +10,7 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { load } from "js-yaml";
-import { parseRequireRealOwner, REAL_OWNER_FLAG } from "./helpers/real-owner-flag.js";
+import { GH_FLAG, parseRequireGh, parseRequireRealOwner, REAL_OWNER_FLAG } from "./helpers/real-owner-flag.js";
 
 const repo = resolve(import.meta.dir, "../../..");
 
@@ -41,4 +41,27 @@ test("docker-compose.yml sets a value the real-owner case honours as required", 
   expect(parseRequireRealOwner({ [REAL_OWNER_FLAG]: value })).toBe(true);
   // This service does not override the launcher's default report directory.
   expect(environment.some((entry) => entry.startsWith("TPS_TEST_REPORT_DIR="))).toBe(false);
+});
+
+test("the gh flag accepts unset, empty, zero and one; other values throw", () => {
+  for (const value of [undefined, "", "0"]) {
+    expect(parseRequireGh({ [GH_FLAG]: value })).toBe(false);
+  }
+  expect(parseRequireGh({ [GH_FLAG]: "1" })).toBe(true);
+  for (const value of ["true", "yes", "2", " 1", "01", "0 "]) {
+    expect(() => parseRequireGh({ [GH_FLAG]: value })).toThrow(GH_FLAG);
+    expect(() => parseRequireGh({ [GH_FLAG]: value })).toThrow("{0,1}");
+  }
+});
+
+test("the Unit test step requires gh and the Docker job does not", () => {
+  const workflow = load(readFileSync(join(repo, ".github/workflows/test.yml"), "utf8")) as {
+    jobs: Record<string, { env?: Record<string, string>; steps: Array<{ name?: string; env?: Record<string, string> }> }>;
+  };
+  const unitSteps = Object.values(workflow.jobs).flatMap((job) => job.steps)
+    .filter((step) => step.name === "Unit + integration tests, HOME-isolated (cli#430)");
+  expect(unitSteps).toHaveLength(1);
+  expect(unitSteps[0].env?.[GH_FLAG]).toBe("1");
+  expect(workflow.jobs.docker.env?.[GH_FLAG]).toBeUndefined();
+  for (const step of workflow.jobs.docker.steps) expect(step.env?.[GH_FLAG]).toBeUndefined();
 });

@@ -266,6 +266,17 @@ describe("test-home-guard: the environment ALLOWLIST", () => {
     expect(dropped).toEqual(["TPS_TEST_REQUIRE_ALT_GROUP_EXTRA"]);
   });
 
+  test("the gh flag reaches the test child and a near-miss name is dropped", () => {
+    const { env, dropped } = sanitizedTestEnv({
+      PATH: "/usr/bin",
+      TPS_TEST_REQUIRE_GH: "1",
+      TPS_TEST_REQUIRE_GH_EXTRA: "1",
+    });
+    expect(Object.keys(env).sort()).toEqual(["PATH", "TPS_TEST_REQUIRE_GH"]);
+    expect(env.TPS_TEST_REQUIRE_GH).toBe("1");
+    expect(dropped).toEqual(["TPS_TEST_REQUIRE_GH_EXTRA"]);
+  });
+
   test("every allowlisted name states why it is passed", () => {
     for (const [name, reason] of Object.entries(PASSED_ENV)) {
       expect(typeof reason, name).toBe("string");

@@ -156,8 +156,7 @@ describe("this repository's test job", () => {
     // cli#430: the monorepo suite runs with HOME at an empty mktemp dir, and the
     // step fails if that dir gains a `.tps`. Pinned whole: the planner hands the
     // script to bash unchanged, so every line of it is what the review build
-    // runs. HOME is set inside the script, not by an env: key (the launcher owns
-    // HOME and refuses a workflow that sets it), so the step carries no env.
+    // runs.
     expect(t.steps[5].name).toBe("Unit + integration tests, HOME-isolated (cli#430)");
     expect(t.steps[5].script).toBe(
       [
@@ -170,11 +169,8 @@ describe("this repository's test job", () => {
         "",
       ].join("\n"),
     );
-    expect(t.steps[5].env).toEqual({});
-    // The planner maps an absent env: and an empty `env: {}` to the same {}, so
-    // the planned env alone cannot show the step declares none: parse the
-    // workflow the way the planner does and require no env key on the step.
-    expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(false);
+    expect(t.steps[5].env).toEqual({ TPS_TEST_REQUIRE_GH: "1" });
+    expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(true);
     expect(t.steps[6].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts");
     expect(t.steps[7].script).toContain("bun run test");
     expect(t.steps[8].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts");
@@ -182,13 +178,16 @@ describe("this repository's test job", () => {
     expect(t.steps[10].script).toBe("node scripts/check-test-reports.mjs");
   });
 
-  test("the no-env check on the HOME-isolated step sees every YAML spelling of an env key", () => {
+  test("the HOME-isolated step env check detects alternate YAML env keys", () => {
     const base = readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8");
+    const noEnv = base.replace('        env:\n          TPS_TEST_REQUIRE_GH: "1"\n', "");
+    expect(noEnv).not.toBe(base);
     const at = "        run: |\n          iso_home=";
     expect(base.split(at).length).toBe(2);
-    expect(suiteStepDeclaresEnv(base)).toBe(false);
+    expect(suiteStepDeclaresEnv(base)).toBe(true);
+    expect(suiteStepDeclaresEnv(noEnv)).toBe(false);
     for (const spelling of ["env: {}", '"env": {}', "env : {}", "'env': {}", "env: {FOO: bar}"]) {
-      expect(suiteStepDeclaresEnv(base.replace(at, `        ${spelling}\n${at}`))).toBe(true);
+      expect(suiteStepDeclaresEnv(noEnv.replace(at, `        ${spelling}\n${at}`))).toBe(true);
     }
   });
 
