@@ -465,7 +465,7 @@ it.each([
   60000,
 );
 
-// The `??` row above covers BMP names. Bun's glob matches `?` and a class member
+// Bun's glob matches `?` and a class member
 // by code point, so one supplementary character is not two: with the running Bun
 // and `packages/??` over `packages/ab` and `packages/😀`, the lockfile and the
 // gate both take `packages/ab` only.
