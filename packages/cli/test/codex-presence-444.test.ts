@@ -34,7 +34,7 @@ import { InvalidLoopIdError, startTaskLoop } from "../src/utils/flair-task-loop.
 import * as taskLoops from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import { homeDir } from "../src/utils/home.js";
-import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
+import type { WorkspaceProvider, WorkspaceState } from "../src/utils/workspace-provider.js";
 import { GitWorkspaceProvider } from "../src/utils/workspace-provider.js";
 
 afterEach(() => { mock.restore(); });
@@ -155,6 +155,7 @@ async function driveRuntime(
   let prepared = 0;
   let resets = 0;
   const state = { ref: "fixture", timestamp: new Date().toISOString(), provider: "test" };
+  const workspaceSnapshots: WorkspaceState[] = [];
   const workspaceProvider: WorkspaceProvider = opts.realWorkspaceProvider
     ? new GitWorkspaceProvider(workspace)
     : {
@@ -169,6 +170,14 @@ async function driveRuntime(
         diff: async () => ({ summary: "" }),
         baseline: async () => state,
       };
+  if (opts.realWorkspaceProvider) {
+    const snapshot = workspaceProvider.snapshot.bind(workspaceProvider);
+    workspaceProvider.snapshot = async (label) => {
+      const captured = await snapshot(label);
+      workspaceSnapshots.push(captured);
+      return captured;
+    };
+  }
   const taskGit = opts.lateMail ? spyOn(childProcess, "spawnSync").mockImplementation(() => ({ status: 1, stdout: "", stderr: "fixture" }) as never) : undefined;
   const taskSpawn = opts.lateMail ? spyOn(childProcess, "spawn").mockImplementation(() => { throw new Error("unexpected task launch"); }) : undefined;
   const warnings: string[] = [];
@@ -271,6 +280,7 @@ async function driveRuntime(
   const savedSigterm = process.listeners("SIGTERM");
   const savedSigint = process.listeners("SIGINT");
   const http: string[] = [];
+  const workspaceStateWrites: Array<{ phase?: string; ref: string }> = [];
   const presenceBodies: string[] = [];
   let exitCode: number | undefined;
   let exits = 0;
@@ -323,6 +333,9 @@ async function driveRuntime(
     const method = init?.method ?? "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     http.push(`${method} ${path}`);
+    if (method === "PUT" && path.startsWith("/WorkspaceState/")) {
+      workspaceStateWrites.push(JSON.parse(String(init?.body ?? "{}")));
+    }
     if (method === "POST" && path === "/Presence") {
       const body = String(init?.body ?? "");
       presenceBodies.push(body);
@@ -496,7 +509,7 @@ await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
 
-  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits, tpsCommit, tpsShimMarker };
+  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits, tpsCommit, tpsShimMarker, workspaceSnapshots, workspaceStateWrites };
 }
 
 async function withLoopClient(
@@ -676,6 +689,14 @@ describe("mail auto-commit checks", () => {
         ? `tps agent commit exit=${result.tpsCommit.status} stderr=${JSON.stringify(result.tpsCommit.stderr)}${result.tpsCommit.error ? ` error=${JSON.stringify(result.tpsCommit.error)}` : ""}`
         : "tps agent commit was never spawned";
       expect(result.rejected, `runtime rejected at startup: ${result.rejected?.message ?? ""}`).toBeUndefined();
+      expect(result.warnings.join("\n")).not.toContain("Pre-task lifecycle failed");
+      expect(result.workspaceSnapshots).toHaveLength(2);
+      expect(result.workspaceSnapshots[0]).toMatchObject({ ref: "HEAD", provider: "git", metadata: { unborn: true } });
+      expect(result.workspaceStateWrites).toContainEqual(expect.objectContaining({ phase: "pre-task", ref: "HEAD" }));
+      expect(result.workspaceSnapshots[1]).toMatchObject({ ref: "HEAD", provider: "git", metadata: { unborn: true, dirty: true } });
+      const postTaskWrite = result.workspaceStateWrites.find((write) => write.phase === "post-task");
+      expect(postTaskWrite).toMatchObject({ ref: "HEAD" });
+      expect(postTaskWrite).not.toHaveProperty("summary");
       expect(result.autoCommits, "auto-commit did not reach the commit command").toBe(1);
       expect(existsSync(result.tpsShimMarker!), `the built-CLI shim did not run (${tpsOutcome})`).toBe(true);
       expect(result.tpsCommit?.status, `the commit command failed (${tpsOutcome})`).toBe(0);

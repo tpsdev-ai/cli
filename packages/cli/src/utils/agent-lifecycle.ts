@@ -1396,7 +1396,10 @@ export async function onTaskStart(
 }
 
 /**
- * Task complete hook: checkpoint workspace, write structured task memory to Flair.
+ * Task complete hook: checkpoint the workspace, write structured task memory to Flair.
+ * When the pre-task HEAD was unborn, it records a snapshot instead (no commit and
+ * no diff against a commit that does not exist); the auto-commit gate makes the
+ * repository's first commit.
  */
 export async function onTaskComplete(
   workspace: WorkspaceProvider,
@@ -1407,18 +1410,17 @@ export async function onTaskComplete(
 ): Promise<void> {
   const agentId = (flair as any).agentId;
 
-  // Checkpoint current state
-  const postState = await workspace.checkpoint(
-    `task-done-${taskId}`,
-    `task complete: ${taskId}`,
-  );
+  const postState = preTaskState.metadata?.unborn === true
+    ? await workspace.snapshot(`task-done-${taskId}`)
+    : await workspace.checkpoint(`task-done-${taskId}`, `task complete: ${taskId}`);
 
-  // Diff from pre-task state
   let changes: { files?: string[]; summary?: string } = {};
-  try {
-    changes = await workspace.diff(preTaskState);
-  } catch {
-    // non-fatal
+  if (preTaskState.metadata?.unborn !== true) {
+    try {
+      changes = await workspace.diff(preTaskState);
+    } catch {
+      // non-fatal
+    }
   }
 
   // Write workspace state record to Flair
@@ -1481,12 +1483,13 @@ export async function onTaskFailure(
     // non-fatal
   }
 
-  // Diff from pre-task state
   let changes: { files?: string[]; summary?: string } = {};
-  try {
-    changes = await workspace.diff(preTaskState);
-  } catch {
-    // non-fatal
+  if (preTaskState.metadata?.unborn !== true) {
+    try {
+      changes = await workspace.diff(preTaskState);
+    } catch {
+      // non-fatal
+    }
   }
 
   // Write workspace state record

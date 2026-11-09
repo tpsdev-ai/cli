@@ -155,7 +155,11 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   // ── WorkspaceProvider ──────────────────────────────────────────────────
 
   async snapshot(label?: string): Promise<WorkspaceState> {
-    const sha = this.headSha();
+    const probe = probeHead(this.cwd);
+    if (probe.state === "indeterminate") {
+      throw new Error(`workspace HEAD is indeterminate: ${probe.probe} ${probe.detail}`);
+    }
+    const sha = probe.state === "unborn" ? "HEAD" : probe.head;
     const branch = this.currentBranch();
     const dirty = !this.isClean();
 
@@ -169,6 +173,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       metadata: {
         branch,
         dirty,
+        ...(probe.state === "unborn" ? { unborn: true } : {}),
       },
     };
   }
@@ -211,14 +216,18 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   async checkpoint(label: string, message?: string): Promise<WorkspaceState> {
     // No-op if working tree is clean
     if (this.isClean()) {
-      const sha = this.headSha();
+      const probe = probeHead(this.cwd);
+      if (probe.state === "indeterminate") {
+        throw new Error(`workspace HEAD is indeterminate: ${probe.probe} ${probe.detail}`);
+      }
+      const sha = probe.state === "unborn" ? "HEAD" : probe.head;
       this.registerRef(sha);
       return {
         ref: sha,
         label,
         timestamp: new Date().toISOString(),
         provider: "git",
-        metadata: { branch: this.currentBranch(), noop: true },
+        metadata: { branch: this.currentBranch(), noop: true, ...(probe.state === "unborn" ? { unborn: true } : {}) },
       };
     }
 
