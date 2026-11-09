@@ -1027,14 +1027,14 @@ SH
     sess5_after=""
     if [ -n "$sess5_id" ] || [ -n "$sess5_name" ]; then
       for _ in $(seq 1 20); do
-        sess5_after="$(ps_as_agent 2>/dev/null | jq -c --arg id "${sess5_id:-}" --arg name "${sess5_name:-}" '[.[] | select(.status == "running" and (($id != "" and .session_id == $id) or ($name != "" and .name == $name)))]' 2>/dev/null || printf '[]')"
+        sess5_after="$(ps_as_agent 2>/dev/null | jq -c --arg id "${sess5_id:-}" --arg name "${sess5_name:-}" '[.[] | select(.status == "running" and (($id != "" and .session_id == $id) or ($name != "" and .name == $name)))]' 2>/dev/null)"
         [ "$sess5_after" = "[]" ] && break
         sleep 0.5
       done
     else
       sess5_after="[unrecorded]"
     fi
-    if [ "$sess5_after" = "[]" ]; then ok "real-nono stop: the recorded session ($sess5_name $sess5_id) is no longer running in nono ps"; else bad "real-nono stop: the recorded session ($sess5_name ${sess5_id:-none}) still appears as running in nono ps: $sess5_after"; fi
+    if [ "$sess5_after" = "[]" ]; then ok "real-nono stop: the recorded session ($sess5_name $sess5_id) is no longer running in nono ps"; else bad "real-nono stop: nono ps did not confirm the recorded session ($sess5_name ${sess5_id:-none}) gone (raw='$sess5_after')"; fi
     if [ ! -e /workspace/.tps/pids.json ]; then ok "real-nono stop: the PID file is removed"; else bad "real-nono stop: the PID file remains"; fi
     export AGENT_SLEEP=6
   fi
