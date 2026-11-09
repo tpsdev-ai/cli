@@ -16,29 +16,23 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-Each workflow `run:` block is split into physical lines; the gate does not join
-continuations, strip comments or track quote state. A physical line is
-npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
-names npm and an install-subcommand token or an expanded subcommand, when a backtick
-appears on a line that names npm, when a line that names npm ends in a
-continuation backslash, or when the raw line names an install subcommand with npm inside a brace group.
+Each workflow `run:` block is split into physical lines. A line containing
+`npm` anywhere, in any case, must match an approved whole-line shape.
 
-Every npm-bearing physical line must, after trimming leading and trailing
+Every such physical line must, after trimming leading and trailing
 whitespace, equal exactly one of:
 
 - a helper call to `scripts/npm-ci-tracked-lock.sh` with a literal relative
   tracked directory and literal `--via npm` or `--via sfw`;
 - `npm install -g` or `--global` followed by `<name>@<MAJOR.MINOR.PATCH>`, where
   each part is `0` or `[1-9][0-9]{0,8}`, with an optional literal
-  `--registry=https://<host>[/<path>]`; that line may not contain `$`, a backtick,
+  `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
   a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`;
-- an exact-line allowlist entry in the guard, each with a one-line reason, for
-  a real workflow line that cannot execute npm.
+- an exact-line allowlist entry in the guard, each with a reason, for a real workflow line.
 
-Any other npm-bearing line is refused, naming the workflow, job, step and
-physical line. This is a conservative match, not bash-equivalent parsing: a
-command named entirely through variables with no literal npm token on the line,
-such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
+Any other line containing `npm` is refused with its workflow, job, step and
+physical line. A command named entirely through variables with no `npm`
+characters on its line is outside this check.
 Installs inside other script files or composite actions are not inspected. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including

@@ -57,92 +57,11 @@ function physicalLines(run: string): PhysicalLine[] {
   return lines;
 }
 
-/**
- * Install subcommands and their aliases. npm's command docs list the install
- * aliases i, in, ins, inst, insta, instal, isntall and add
- * (docs/content/commands/npm-install.md); `npm ci` is its own command
- * (docs/content/commands/npm-ci.md); install-test and install-ci-test are
- * install subcommands (docs/content/commands/npm-install-test.md and
- * npm-install-ci-test.md). Short aliases are matched only in the subcommand
- * position to avoid matching prose; the long spellings are matched anywhere
- * after the npm word.
- */
-const INSTALL_ALIASES = new Set([
-  "ci", "install", "i", "add", "isntall", "in", "ins", "inst", "insta", "instal",
-  "it", "install-test", "install-ci-test",
-]);
-const UNAMBIGUOUS_INSTALL_ALIASES = new Set(["ci", "install", "isntall", "install-test", "install-ci-test"]);
-
-/** Delete quote characters, backslashes and `$'` prefixes. No quote state is tracked. */
-function normalizeShellLine(text: string): string {
-  return text.replace(/\$'/g, "").replace(/['"\\]/g, "");
-}
-
-/** Split a normalized line into tokens; whitespace and shell separators delimit them. */
-function normalizedTokens(normalized: string): string[] {
-  return normalized.split(/[\s;&|()<>`]+/).filter((token) => token !== "");
-}
-
-function bracedNpm(line: string): boolean {
-  return /\{[^{}]*\bnpm\b[^{}]*\}/.test(line);
-}
-
-/** The line's normalized tokens name npm and an install-subcommand token after it, or an expansion in the subcommand position. */
-function isInstallCommandLine(line: string): boolean {
-  const normalized = normalizeShellLine(line);
-  const tokens = normalizedTokens(normalized);
-  const npm = tokens.indexOf("npm");
-  if (npm >= 0) {
-    const next = tokens[npm + 1];
-    if (next !== undefined && (INSTALL_ALIASES.has(next) || next.startsWith("$"))) return true;
-    return tokens.slice(npm + 1).some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
-  }
-  return bracedNpm(line) && tokens.some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
-}
-
-/**
- * A physical line is npm-bearing when its normalized copy names npm and an
- * install-subcommand token or an expanded subcommand, when a backtick appears
- * on a line that names npm, when a line that names npm ends in a continuation
- * backslash, or when the raw line names an install subcommand with npm inside
- * a brace group.
- */
-function isNpmBearing(line: string): boolean {
-  const normalized = normalizeShellLine(line);
-  const tokens = normalizedTokens(normalized);
-  const npm = tokens.indexOf("npm");
-  if (npm < 0) return bracedNpm(line) && isInstallCommandLine(line);
-  if (/\\$/.test(line)) return true;
-  if (line.includes("`")) return true;
-  return isInstallCommandLine(line);
-}
-
-/**
- * An install-like spelling the guard cannot classify: it carries a shell marker
- * (substitution, backtick, eval, bash/sh -c, env, command, exec, xargs or a
- * brace group) together with an install subcommand or an expanded subcommand.
- */
-function isUnclassifiableInstall(line: string): boolean {
-  const normalized = normalizeShellLine(line);
-  const tokens = normalizedTokens(normalized);
-  const npm = tokens.indexOf("npm");
-  if (npm < 0 && !bracedNpm(line)) return false;
-  if (line.includes("`") && tokens.includes("npm")) return true;
-  const next = npm >= 0 ? tokens[npm + 1] : undefined;
-  const expansionSubcommand = next !== undefined && next.startsWith("$");
-  const marker = /\$|`/.test(line) || /\beval\b/.test(line) ||
-    /\bbash\s+-c\b/.test(line) || /\bsh\s+-c\b/.test(line) ||
-    /(?:^|\s)env(?:\s|$)/.test(line) || /(?:^|\s)command(?:\s|$)/.test(line) ||
-    /(?:^|\s)exec(?:\s|$)/.test(line) || /(?:^|\s)xargs(?:\s|$)/.test(line) ||
-    /\{[^{}]*\}/.test(line);
-  return marker && (isInstallCommandLine(line) || expansionSubcommand);
-}
-
 const PACKAGE_NAME = String.raw`(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*`;
 const VERSION_SEGMENT = "(?:0|[1-9][0-9]{0,8})";
 const EXACT_VERSION = `${VERSION_SEGMENT}\\.${VERSION_SEGMENT}\\.${VERSION_SEGMENT}`;
 const GLOBAL_TOOL_INSTALL = new RegExp(
-  `^npm install (?:-g|--global) (${PACKAGE_NAME})@(${EXACT_VERSION})(?: --registry=https:\\/\\/[A-Za-z0-9._~\\/:-]+)?$`,
+  `^npm install (?:-g|--global) (${PACKAGE_NAME})@(${EXACT_VERSION})(?: --registry=https:\\/\\/[A-Za-z0-9._~-]+(?:\\:[0-9]+)?(?:\\/[A-Za-z0-9._~\\/:-]*)?)?$`,
 );
 
 /** Accept only a fully anchored global install with a bounded exact version. */
@@ -162,11 +81,41 @@ const HELPER_CALL = new RegExp(
 type AllowlistEntry = { text: string; reason: string };
 
 /**
- * Exact real workflow lines that carry an npm token but cannot execute npm.
+ * Approved real workflow lines containing `npm`.
  * Each entry is matched literally against a trimmed physical line. The
- * all-workflows test checks that every entry still matches one real line.
+ * all-workflows test checks that every entry still matches a real line.
  */
 export const EXACT_LINE_ALLOWLIST: readonly AllowlistEntry[] = [
+  { text: "bun --no-install scripts/check-npm-pin-release-age.mjs", reason: "approved release-age gate" },
+  { text: "# fails, packages 1-3 stay staged; npm offers no cleanup, no resume and", reason: "shell comment" },
+  { text: "echo \"::error::RECOVERY, from a machine logged in to npm:\"", reason: "approved release message" },
+  { text: "echo \"::error::  npm stage list                        # see what is pending\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::error::  npm stage view <stage-id>              # confirm version + contents\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::error::  npm stage reject <stage-id>            # for each staged package\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::group::npm stage publish — $nm (packages/$p)\"", reason: "approved release message" },
+  { text: "# Capture npm's OWN output, so the failure branch below can branch on the", reason: "shell comment" },
+  { text: "# error CODE npm reports rather than on the exit status alone. Exit status", reason: "shell comment" },
+  { text: "out=\"$( cd \"packages/$p\" && npm stage publish --tag staged --access public 2>&1 )\"", reason: "approved staged release publish" },
+  { text: "elif npm view \"$nm@$VERSION\" version >/dev/null 2>&1; then", reason: "approved published-version check" },
+  { text: "codes=\"$(printf '%s\\n' \"$out\" | awk '/npm error code /{print $4}' | sort -u | paste -sd, -)\"", reason: "approved npm error parsing" },
+  { text: "# Authentication failure for THIS package: npm never got far enough to", reason: "shell comment" },
+  { text: "echo \"::error::npm reported an authentication failure (${codes:-no error code parsed}) — OIDC\"", reason: "approved release message" },
+  { text: "echo \"::error::  - a Trusted Publisher registration exists for $nm on npmjs.com,\"", reason: "approved release message" },
+  { text: "echo \"::error::    OIDC token npm swaps for a short-lived publish credential)\"", reason: "approved release message" },
+  { text: "echo \"::error::  - npm is new enough — OIDC trusted publishing needs >= 11.5.1 and\"", reason: "approved release message" },
+  { text: "# npm-stage(1): staged versions share the semver unique index with", reason: "shell comment" },
+  { text: "# separate rule from 2FA — per npm-stage(1) only approve and reject", reason: "shell comment" },
+  { text: "echo \"::error::npm reported ${codes:-a conflict} — most likely it is ALREADY STAGED from\"", reason: "approved release message" },
+  { text: "echo \"::error::Why CI cannot resolve this itself: npm-stage(1) shares the semver\"", reason: "approved release message" },
+  { text: "echo \"::error::npm error code(s): ${codes:-none reported in npm output}\"", reason: "approved release message" },
+  { text: "echo \"::error::code. Read the npm output above and diagnose from it; do not assume a\"", reason: "approved release message" },
+  { text: "echo \"**Approve:** a maintainer approves the staged release in npm (2FA). The version\"", reason: "approved release message" },
+  { text: "HOME=\"$iso_home\" TPS_TEST_REQUIRE_NPM=1 bun run test", reason: "approved test command" },
+  { text: "npm run build             # tsc — REQUIRED: the node-load tests read the built dist/src/index.js", reason: "approved plugin build or typecheck" },
+  { text: "npm run build", reason: "approved plugin build or typecheck" },
+  { text: "npm run typecheck:test", reason: "approved plugin build or typecheck" },
+  { text: "npm run build           # tsc is GREEN after cli#393 — a compile failure MUST fail the job, never be swallowed", reason: "approved plugin build or typecheck" },
+
   {
     text: "# `npm stage` subcommands (list/view/reject/approve) AT ALL. That is a",
     reason: "a shell comment executes nothing",
@@ -185,64 +134,27 @@ export const EXACT_LINE_ALLOWLIST: readonly AllowlistEntry[] = [
   },
 ];
 
-/**
- * Inspect npm install command words and tracked-lock helper calls in workflow
- * run text.
- *
- * Each run block is split into physical lines: no continuation is joined, no
- * comment is stripped and no quote state is tracked. A physical line is
- * npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
- * names npm and an install-subcommand token or an expanded subcommand, when a
- * backtick appears on a line that names npm, when a line that names npm ends in
- * a continuation backslash, or when the raw line names an install subcommand
- * with npm inside a brace group.
- *
- * After trimming leading and trailing whitespace, every npm-bearing physical
- * line must equal exactly one of: a tracked-lock helper call with a literal
- * relative directory (the shape accepted on main); the global tool shape
- * `npm install -g|--global <name>@<MAJOR.MINOR.PATCH>` with an optional literal
- * `--registry=https://...`; or an entry in EXACT_LINE_ALLOWLIST. Any other
- * npm-bearing line is refused, naming the workflow, job, step and physical
- * line.
- *
- * A command named entirely through variables with no literal npm token on the
- * line is not detected: the guard does not follow variable values. Scripts and
- * composite actions are outside this guard.
- */
+/** Check physical run-step lines containing `npm` against exact approved lines and shapes. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = physicalLines(run);
-  const refuse = (reason: string): never => {
-    throw new Error(`${label}: cannot establish the npm ci directory: ${reason}`);
+  const refuse = (entry: PhysicalLine, reason: string): never => {
+    throw new Error(`${label}: cannot establish the npm ci directory: ${reason}: ${entry.text} (physical line ${entry.line})`);
   };
   const allowlist = new Map(EXACT_LINE_ALLOWLIST.map((entry) => [entry.text, entry]));
-  let unclassifiable: PhysicalLine | null = null;
-  let rawInstall: PhysicalLine | null = null;
-  let hasHelper = false;
+  const helpers: PhysicalLine[] = [];
   for (const entry of lines) {
-    if (entry.text.includes("npm-ci-tracked-lock.sh")) hasHelper = true;
-  }
-  for (const entry of lines) {
-    // Helper call lines are validated by the helper-step pass below.
-    if (entry.text.includes("npm-ci-tracked-lock.sh")) continue;
-    if (!isNpmBearing(entry.text)) continue;
-    if (isAcceptedGlobalToolInstall(entry.text)) continue;
+    if (!/npm/i.test(entry.text)) continue;
     if (allowlist.has(entry.text)) continue;
-    if (isUnclassifiableInstall(entry.text)) {
-      if (unclassifiable === null) unclassifiable = entry;
+    if (isAcceptedGlobalToolInstall(entry.text)) continue;
+    if (HELPER_CALL.test(entry.text)) {
+      helpers.push(entry);
       continue;
     }
-    if (rawInstall === null) rawInstall = entry;
+    refuse(entry, "raw npm install is refused; use the tracked-lock helper");
   }
-  if (unclassifiable !== null) {
-    refuse(`unclassifiable npm install-like line at physical line ${unclassifiable.line}: ${unclassifiable.text}`);
-  }
-  if (rawInstall !== null) {
-    refuse(`raw npm install is refused; use the tracked-lock helper: ${rawInstall.text} (physical line ${rawInstall.line})`);
-  }
-  if (!hasHelper) return [];
-  if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
-  const texts = lines.map((entry) => entry.text);
-  if (texts.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
+  if (helpers.length === 0) return [];
+  if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse(helpers[0], "non-literal working-directory");
+  {
     const allowedSubstitutions = new Set(['"$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"']);
     const assigned = new Set<string>(["RUNNER_TEMP"]);
     const quotedValue = (value: string): boolean => {
@@ -250,16 +162,17 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
       return names !== null && names.every((name) => assigned.has(name));
     };
     const dirs: string[] = [];
-    for (const line of texts) {
+    for (const entry of lines) {
+      const line = entry.text;
       if (line === "set -euo pipefail") continue;
       const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       if (assignment !== null) {
         const [, name, value] = assignment;
         if (!/^[a-z][a-z0-9_]*$/.test(name) || /^(?:PATH|NODE_.*|NPM_.*|GIT_.*|BASH.*|ENV|SHELLOPTS|SHELL|CDPATH|IFS|HOME|TMPDIR|TMP|TEMP|LANG|LANGUAGE|LC_.*|XDG_.*|SFW_.*|SOCKET_.*|LD_.*|DYLD_.*|SSL_.*|OPENSSL_.*|.*_PROXY|COREPACK_.*|GITHUB_.*|RUNNER_.*)$/i.test(name)) {
-          refuse(`tool environment assignment is refused: ${line}`);
+          refuse(entry, "tool environment assignment is refused");
         }
         if (!quotedValue(value) && !allowedSubstitutions.has(value)) {
-          refuse(`unsupported helper-step line: ${line}`);
+          refuse(entry, "unsupported helper-step line");
         }
         assigned.add(name);
         continue;
@@ -267,17 +180,16 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
       const helper = line.match(HELPER_CALL);
       if (helper !== null && !helper[3].startsWith("/") && helper[3] !== "-" &&
           (helper[2] === "--in-place" ? helper[4] === undefined : helper[4] !== undefined && quotedValue(helper[4])) &&
-          resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", label) === "scripts/npm-ci-tracked-lock.sh") {
-        dirs.push(resolveRepoDir(workdir, helper[3], label));
+          resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", `${label} physical line ${entry.line}`) === "scripts/npm-ci-tracked-lock.sh") {
+        dirs.push(resolveRepoDir(workdir, helper[3], `${label} physical line ${entry.line}`));
         continue;
       }
       const echo = line.match(/^echo ("[A-Z_][A-Z0-9_]*=[^"\r\n]*") >> "\$GITHUB_ENV"$/);
       if (echo !== null && quotedValue(echo[1].replace(/^"[A-Z_][A-Z0-9_]*=/, '"'))) continue;
-      refuse(`unsupported helper-step line (helper requires a literal relative fixture directory and repository-root invocation): ${line}`);
+      refuse(entry, "unsupported helper-step line (helper requires a literal relative fixture directory and repository-root invocation)");
     }
     return dirs;
   }
-  refuse(`raw npm install is refused; use the tracked-lock helper: ${texts.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line))}`);
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, workflowName?: string): number {
@@ -288,10 +200,14 @@ export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, w
     for (const [index, step] of job.steps.entries()) {
       if (step.run === undefined) continue;
       const label = `${workflowName === undefined ? "" : `workflow ${workflowName} `}job ${jobName} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
-      for (const dir of npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label)) {
+      const dirs = npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label);
+      const helperLines = physicalLines(step.run).filter((entry) => HELPER_CALL.test(entry.text));
+      for (const [installIndex, dir] of dirs.entries()) {
         installs++;
         const lockfile = dir === "" ? "package-lock.json" : `${dir}/package-lock.json`;
-        if (!tracked.has(lockfile)) throw new Error(`${label}: ${lockfile} is not a tracked lockfile the gate reads`);
+        if (!tracked.has(lockfile)) {
+          throw new Error(`${label}: ${lockfile} is not a tracked lockfile the gate reads (physical line ${helperLines[installIndex].line})`);
+        }
       }
     }
   }
