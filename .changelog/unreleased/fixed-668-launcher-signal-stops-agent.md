@@ -1,1 +1,1 @@
-- **A signal to the sandboxed launcher stops the nono supervisor and the released agent before the launcher exits.**
+- **A signal to the sandboxed launcher stops the nono supervisor it spawned and the released agent, and exits non-zero when either cannot be verified stopped.**

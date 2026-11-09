@@ -1632,10 +1632,29 @@ async function runAgentCommand(
               }
               return result;
             };
-            const { onStart, onStop, removeCreatedWorktree, withoutManualRemovalAdvice } = await import("../utils/agent-lifecycle.js");
+            const { onStart, onStop, removeCreatedWorktree, removeWorktreeAfterStop, withoutRemovalAdvice } = await import("../utils/agent-lifecycle.js");
             let worktreeCreated = false;
             let createdWorktree: import("../utils/agent-lifecycle.js").WorktreeCreation | undefined;
             let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
+            let keepWorktree = false;
+            /** The worktree facts an error's removal advice names, when this
+             * launch created one. */
+            const adviceTarget = () =>
+              createdWorktree ?? cleanupBinding;
+            /** Print an error from this launch path, dropping the removal advice
+             * whose clause names a worktree path that is gone at print time. An
+             * unreadable path is not treated as gone. */
+            const printLaunchError = (err: Error, target?: { baseWorkingTree: string; workspace: string }) => {
+              let gone = false;
+              if (target) {
+                try {
+                  lstatSync(target.workspace);
+                } catch (probeErr) {
+                  gone = (probeErr as NodeJS.ErrnoException).code === "ENOENT";
+                }
+              }
+              console.error(`❌ ${withoutRemovalAdvice(err.message, gone ? target : undefined)}`);
+            };
             let approval: ReturnType<typeof agentLaunchOptions>;
             try {
               approval = approveLaunch();
@@ -1682,23 +1701,11 @@ async function runAgentCommand(
                   cleanupError = cleanupErr as Error;
                 }
               }
-              // The manual-removal advice is dropped when the worktree is gone
-              // when the launch exits (cli#686): a retry that removed it makes
-              // setup's advice stale. An unreadable path is not treated as
-              // gone, so its advice stays.
-              let worktreeGone = false;
-              if (createdWorktree) {
-                try {
-                  lstatSync(createdWorktree.workspace);
-                } catch (probeErr) {
-                  worktreeGone = (probeErr as NodeJS.ErrnoException).code === "ENOENT";
-                }
-              }
-              const message = worktreeGone && createdWorktree
-                ? withoutManualRemovalAdvice(setupError.message, createdWorktree)
-                : setupError.message;
-              console.error(`❌ ${message}`);
-              if (cleanupError) console.error(`❌ ${cleanupError.message}`);
+              // Removal advice is printed only when the path it names exists at
+              // print time (cli#686): setup, retry and teardown errors all pass
+              // through printLaunchError.
+              printLaunchError(setupError, adviceTarget());
+              if (cleanupError) printLaunchError(cleanupError, adviceTarget());
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
             }
             // The child checks the worktree out only when THIS launch created
@@ -1720,21 +1727,26 @@ async function runAgentCommand(
                   worktreeBinding: approval.worktreeBinding,
                   env: launchEnv,
                   // A signal to the launcher removes a worktree THIS launch
-                  // created, only after the supervisor and released child are
-                  // gone; a pre-existing worktree is never touched (cli#672).
-                  onInterrupt: () => {
+                  // created only when the supervisor and the released child are
+                  // verified stopped; otherwise the worktree is kept and the
+                  // launcher exits non-zero. A pre-existing worktree is never
+                  // touched (cli#672).
+                  onInterrupt: (_signal, stop) => {
                     if (!worktreeCreated) return;
-                    onStop(launchId, config.workspace, cleanupBinding);
+                    keepWorktree = removeWorktreeAfterStop(stop, () =>
+                      onStop(launchId, config.workspace, cleanupBinding)
+                    );
                   },
+                  worktreePath: worktreeCreated ? cleanupBinding?.workspace ?? createdWorktree?.workspace : undefined,
                 },
               );
             } finally {
               // Attempt cleanup only after this launch created a worktree (cli#516).
-              if (worktreeCreated) {
+              if (worktreeCreated && !keepWorktree) {
                 try {
                   onStop(launchId, config.workspace, cleanupBinding);
                 } catch (err) {
-                  console.error(`❌ ${(err as Error).message}`);
+                  printLaunchError(err as Error, adviceTarget());
                   process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
                 }
               }

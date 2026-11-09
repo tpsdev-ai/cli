@@ -44,7 +44,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, write
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { pidState } from "@tpsdev-ai/agent";
+import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import {
   buildNonoArgs,
   approveRuntimeNonoOptions,
@@ -70,11 +70,24 @@ export const LAUNCH_SOCK_ENV = "TPS_LAUNCH_SOCK";
 export const INTERRUPT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
 /** How long a signalled launcher waits for the supervisor and the released
- * child to exit before it sends SIGKILL, by the pids this launch holds. */
+ * child to stop before it escalates, by the handle and the identity this
+ * launch holds. */
 export const SIGNAL_STOP_BOUND_MS = 5_000;
 
 function sleepMs(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
+}
+
+/** NEVER pid 0 (the whole process group, including the launcher itself), never
+ * this process, never a non-positive/non-finite value: a stop must reach the
+ * session, not the caller. */
+function killPidQuietly(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
+  if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) return;
+  try {
+    process.kill(pid, signal);
+  } catch {
+    /* already gone */
+  }
 }
 
 /** The pinned nono binary — ABSOLUTE, never resolved through PATH. The same
@@ -684,6 +697,123 @@ export function pidAlive(pid: number): boolean {
   return pidState(pid) === "alive";
 }
 
+/** Read a pid's process start token. The default is the same
+ * `/proc/<pid>/stat`-then-`ps -o lstart= -p <pid>` source the rest of the CLI
+ * uses (`processStartToken`); an in-process fixture may replace it. */
+export type StartTokenReader = (pid: number) => string | null;
+
+/** The identity recorded for the released child when the release was written. */
+export interface ReleasedAgent {
+  pid: number;
+  startToken: string | null;
+}
+
+/** "same": the pid is alive and carries the recorded start token. "gone": the
+ * pid names no process. "different": the pid is alive under a different start
+ * token (pid reuse). "unknown": the identity cannot be read. */
+export type ProcessIdentity = "same" | "gone" | "different" | "unknown";
+
+/** Compare a live pid to the identity recorded at release. */
+export function releasedAgentIdentity(
+  agent: ReleasedAgent,
+  read: StartTokenReader = processStartToken
+): ProcessIdentity {
+  const state = pidState(agent.pid);
+  if (state === "gone") return "gone";
+  if (state !== "alive" || agent.startToken === null) return "unknown";
+  const current = read(agent.pid);
+  if (current === null) return "unknown";
+  return current === agent.startToken ? "same" : "different";
+}
+
+/** The two processes a signalled launch stops. The supervisor is this
+ * process's child; the released agent is not. */
+export interface LaunchStopTargets {
+  supervisor: ChildProcess | null;
+  agent: ReleasedAgent | null;
+}
+
+export interface LaunchStopResult {
+  /** True only when both are verified stopped: the supervisor has exited, and
+   * the agent is gone or its pid now names a different process. */
+  stopped: boolean;
+  /** The pids that may still run (the supervisor and/or the agent). */
+  survivors: number[];
+}
+
+/** IN-PROCESS test seam only: no control under bin/ or src/commands/ passes
+ * this, so no environment variable, flag or config reaches it. */
+export interface LaunchStopHooks {
+  /** Observe each signal just before it is delivered. */
+  onSignal?: (pid: number, signal: NodeJS.Signals, target: "supervisor" | "agent") => void;
+  /** Replace the process start-token reader. */
+  startToken?: StartTokenReader;
+}
+
+function supervisorExited(supervisor: ChildProcess | null): boolean {
+  return supervisor === null || supervisor.exitCode !== null || supervisor.signalCode !== null;
+}
+
+/** Signal the supervisor through its own handle, and only while it has not
+ * exited: its pid is never signalled bare after the handle says it is gone. */
+function signalSupervisor(
+  supervisor: ChildProcess | null,
+  signal: NodeJS.Signals,
+  hooks: LaunchStopHooks | undefined
+): void {
+  if (supervisorExited(supervisor) || supervisor === null || supervisor.pid === undefined) return;
+  hooks?.onSignal?.(supervisor.pid, signal, "supervisor");
+  try {
+    supervisor.kill(signal);
+  } catch {
+    /* already gone */
+  }
+}
+
+/** Stop the supervisor and the released child within `boundMs`, escalating to
+ * SIGKILL. Every signal to the agent is preceded by a fresh identity read: a
+ * pid that is gone or now names a different process is treated as stopped and
+ * is not signalled. A pid whose identity cannot be read is a survivor. */
+export async function stopLaunchProcesses(
+  targets: LaunchStopTargets,
+  signal: NodeJS.Signals,
+  options: { boundMs: number; hooks?: LaunchStopHooks }
+): Promise<LaunchStopResult> {
+  const hooks = options.hooks;
+  const read = hooks?.startToken ?? processStartToken;
+  const identity = (): ProcessIdentity =>
+    targets.agent ? releasedAgentIdentity(targets.agent, read) : "gone";
+  const settled = (state: ProcessIdentity): boolean => state === "gone" || state === "different";
+  const allStopped = (): boolean => supervisorExited(targets.supervisor) && settled(identity());
+
+  signalSupervisor(targets.supervisor, signal, hooks);
+  if (identity() === "same" && targets.agent) {
+    hooks?.onSignal?.(targets.agent.pid, "SIGTERM", "agent");
+    killPidQuietly(targets.agent.pid, "SIGTERM");
+  }
+
+  const deadline = Date.now() + options.boundMs;
+  while (!allStopped() && Date.now() < deadline) await sleepMs(50);
+
+  if (!supervisorExited(targets.supervisor)) {
+    signalSupervisor(targets.supervisor, "SIGKILL", hooks);
+  }
+  if (identity() === "same" && targets.agent) {
+    hooks?.onSignal?.(targets.agent.pid, "SIGKILL", "agent");
+    killPidQuietly(targets.agent.pid, "SIGKILL");
+  }
+
+  const reapDeadline = Date.now() + 500;
+  while (!allStopped() && Date.now() < reapDeadline) await sleepMs(25);
+
+  const survivors: number[] = [];
+  if (!supervisorExited(targets.supervisor) && targets.supervisor?.pid) {
+    survivors.push(targets.supervisor.pid);
+  }
+  if (targets.agent && !settled(identity())) survivors.push(targets.agent.pid);
+  return { stopped: survivors.length === 0, survivors };
+}
+
 /** The nono session record the launcher requires, from `nono ps --all --json`. */
 export interface NonoSession {
   session_id?: string;
@@ -767,12 +897,19 @@ export interface LaunchOptions {
     disableCanaryCheck?: boolean;
     disablePidBinding?: boolean;
   };
-  /** Called when a termination signal arrives, after the supervisor and the
-   * released child have been stopped and before the launcher re-raises it.
-   * The launcher's own worktree cleanup runs here. */
-  onInterrupt?: (signal: NodeJS.Signals) => void;
+  /** Called when a termination signal arrives, with what the stop verified.
+   * `stopped` is true only when the supervisor and the released child are both
+   * gone or the child's pid no longer names that process. The launcher's own
+   * worktree cleanup runs here when `stopped`; otherwise the caller keeps it. */
+  onInterrupt?: (signal: NodeJS.Signals, stop: LaunchStopResult) => void;
+  /** The worktree this launch created, named in the error when a survivor
+   * keeps it. */
+  worktreePath?: string;
   /** Test seam: the bounded wait for the stopped pids (default SIGNAL_STOP_BOUND_MS). */
   signalStopTimeoutMs?: number;
+  /** IN-PROCESS test seam only: observe signals and replace the process
+   * start-token reader. See `LaunchStopHooks`. */
+  interruptTestHooks?: LaunchStopHooks;
 }
 
 /**
@@ -819,48 +956,51 @@ export async function launchAttested(
   let child: ChildProcess | null = null;
   let sessionId: string | undefined;
   let childPid = 0;
-  let supervisorPid = 0;
+  let childStartToken: string | null = null;
+  let keepLaunchState = false;
 
-  const killQuietly = (pid: number, signal: NodeJS.Signals = "SIGTERM") => {
-    // NEVER pid 0 (the whole process group, including the launcher itself),
-    // never our own pid, never a non-positive/non-finite value: a refused
-    // launch must stop the session and the child, not the caller.
-    if (!Number.isFinite(pid) || pid <= 1 || pid === process.pid) return;
-    try {
-      process.kill(pid, signal);
-    } catch {
-      /* already gone */
-    }
-  };
+  const killQuietly = killPidQuietly;
 
   // A signal to the launcher stops the session it started, cleans up what only
   // this launch created, and only then re-raises so the exit status still says
-  // it was signalled. A second signal is ignored: it must not abandon cleanup.
+  // it was signalled. The supervisor is signalled through its own child handle
+  // while it has not exited; the released child only after its recorded pid
+  // and start token still match. Cleanup runs only when both are verified
+  // stopped. A second signal is recorded and ignored: it must not re-enter the
+  // stop or cleanup path.
   let stopping = false;
   let interruptDone: Promise<void> | undefined;
+  let interruptOutcome: number | undefined;
   const beginInterrupt = (signal: NodeJS.Signals): void => {
-    if (stopping) return;
+    if (stopping) {
+      log.push(`second_signal=${signal}`);
+      return;
+    }
     stopping = true;
     interruptDone = (async () => {
-      // Forward the signal to the nono supervisor the launcher spawned: it
-      // stops its child. Stop the released child too, by the pid this launch
-      // holds — never by name or pattern.
-      if (supervisorPid > 1) killQuietly(supervisorPid, signal);
-      if (childPid > 1) killQuietly(childPid, "SIGTERM");
-      const bound = opts.signalStopTimeoutMs ?? SIGNAL_STOP_BOUND_MS;
-      const deadline = Date.now() + bound;
-      const alive = () =>
-        [supervisorPid, childPid].some((pid) => pid > 1 && pidAlive(pid));
-      while (alive() && Date.now() < deadline) await sleepMs(50);
-      if (supervisorPid > 1) killQuietly(supervisorPid, "SIGKILL");
-      if (childPid > 1) killQuietly(childPid, "SIGKILL");
-      const reapDeadline = Date.now() + 500;
-      while (alive() && Date.now() < reapDeadline) await sleepMs(25);
+      const stop = await stopLaunchProcesses(
+        { supervisor: child, agent: childPid > 1 ? { pid: childPid, startToken: childStartToken } : null },
+        signal,
+        { boundMs: opts.signalStopTimeoutMs ?? SIGNAL_STOP_BOUND_MS, hooks: opts.interruptTestHooks }
+      );
+      let cleanupError: Error | undefined;
       try {
-        opts.onInterrupt?.(signal);
+        opts.onInterrupt?.(signal, stop);
       } catch (err) {
-        console.error(`❌ ${(err as Error).message}`);
+        cleanupError = err as Error;
       }
+      if (!stop.stopped) {
+        // A survivor may still be writing to the worktree and the launch state:
+        // keep both, name what may still run, and exit non-zero without
+        // re-raising the signal.
+        const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
+        console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
+        keepLaunchState = true;
+        for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
+        interruptOutcome = REFUSAL_EXIT_CODE;
+        return;
+      }
+      if (cleanupError) console.error(`❌ ${cleanupError.message}`);
       if (server) closeServer(server);
       removePrivateLaunchDir(priv);
       log.push(`cleaned=${!existsSync(priv.root)}`);
@@ -875,8 +1015,9 @@ export async function launchAttested(
     process.on(signal, handler);
     return { signal, handler };
   });
-  const settleInterrupt = async (): Promise<never> => {
+  const settleInterrupt = async (): Promise<number> => {
     if (interruptDone) await interruptDone;
+    if (interruptOutcome !== undefined) return interruptOutcome;
     await new Promise<void>(() => {});
     throw new Error("unreachable: the launcher re-raises the signal");
   };
@@ -933,7 +1074,6 @@ export async function launchAttested(
     log.push(`spawn=${bin} ${args.join(" ")}`);
     child = spawn(bin, args, { stdio: "inherit", env: spawnEnv });
     const P = child.pid;
-    supervisorPid = P ?? 0;
     if (!P) return refuse(`could not spawn ${bin}`);
     log.push(`nono_pid=${P}`);
 
@@ -1005,6 +1145,7 @@ export async function launchAttested(
     // (8) released: the release line was written above for this pid.
     sessionId = verdict.session.session_id;
     childPid = verdict.pid;
+    childStartToken = (opts.interruptTestHooks?.startToken ?? processStartToken)(childPid);
     log.push(`CONFINED ${sessionId} ${childPid}`);
     if (server) closeServer(server);
     console.error(
@@ -1043,8 +1184,10 @@ export async function launchAttested(
   } finally {
     for (const { signal, handler } of interruptHandlers) process.removeListener(signal, handler);
     if (server) closeServer(server);
-    removePrivateLaunchDir(priv);
-    log.push(`cleaned=${!existsSync(priv.root)}`);
+    if (!keepLaunchState) {
+      removePrivateLaunchDir(priv);
+      log.push(`cleaned=${!existsSync(priv.root)}`);
+    }
   }
 }
 

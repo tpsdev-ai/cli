@@ -735,21 +735,103 @@ function manualRemovalCommand(target: { baseWorkingTree: string; workspace: stri
   return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
 }
 
+/** Read one POSIX single-quoted token (the quoting `shellQuote` writes). */
+function readShellQuoted(text: string): { value: string; rest: string } | null {
+  if (!text.startsWith("'")) return null;
+  let value = "";
+  let i = 1;
+  while (i < text.length) {
+    if (text[i] === "'") {
+      if (text.startsWith("'\\''", i)) {
+        value += "'";
+        i += 4;
+        continue;
+      }
+      return { value, rest: text.slice(i + 1) };
+    }
+    value += text[i++];
+  }
+  return null;
+}
+
+/** The worktree path named by a `git -C <base> worktree remove --force <path>`
+ * command, or null when the text is not that command. */
+function manualCommandPath(command: string): string | null {
+  const prefix = "git -C ";
+  if (!command.startsWith(prefix)) return null;
+  const base = readShellQuoted(command.slice(prefix.length));
+  if (!base || !base.rest.startsWith(" worktree remove --force ")) return null;
+  const path = readShellQuoted(base.rest.slice(" worktree remove --force ".length));
+  if (!path || path.rest !== "") return null;
+  return path.value;
+}
+
+/** The trailing removal-advice clause of `message`: where it starts and the
+ * worktree path it names. */
+function trailingRemovalAdvice(message: string): { start: number; path: string } | null {
+  for (const marker of ["; remove it manually with: ", "; inspect it and remove it manually with: "]) {
+    const at = message.lastIndexOf(marker);
+    if (at < 0) continue;
+    const path = manualCommandPath(message.slice(at + marker.length));
+    if (path !== null) return { start: at, path };
+  }
+  const guidance = /; ([\s\S]+) is no longer a registered worktree of [\s\S]+; inspect it and remove it yourself if it is yours$/.exec(message);
+  if (guidance) return { start: guidance.index, path: guidance[1]! };
+  const inspectAt = /; inspect it at ([\s\S]+) and remove it yourself if it is yours$/.exec(message);
+  if (inspectAt) return { start: inspectAt.index, path: inspectAt[1]! };
+  return null;
+}
+
+/** True only when the path is absent (ENOENT). An unreadable path is not
+ * absent, and its advice is kept. */
+function advicePathGone(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
 /**
- * Drop the manual-removal advice for `target` from an error message. A caller
- * uses this when the worktree the message names is gone when the launch exits
- * (cli#686), so the output does not ask an operator to remove a path that is
- * already gone.
+ * At a launcher signal, remove the worktree only when the launcher verified
+ * that the supervisor and the released child are stopped; otherwise keep it
+ * and report true. The caller turns `true` into a kept-worktree message and a
+ * non-zero exit.
  */
-export function withoutManualRemovalAdvice(
+export function removeWorktreeAfterStop(stop: { stopped: boolean }, remove: () => void): boolean {
+  if (!stop.stopped) return true;
+  remove();
+  return false;
+}
+
+/**
+ * Drop the removal advice from an error message when the worktree path it
+ * names is gone. A caller prints every error on the launch path through this
+ * (cli#686): setup, retry and teardown errors carry the same advice clauses,
+ * and a removal that reports failure after it removed the worktree is not
+ * followed by a command for an absent path. An unreadable path keeps its
+ * advice.
+ */
+export function withoutRemovalAdvice(
   message: string,
-  target: { baseWorkingTree: string; workspace: string },
+  target?: { baseWorkingTree: string; workspace: string },
 ): string {
-  const advice = `remove it manually with: ${manualRemovalCommand(target)}`;
-  const clause = `; ${advice}`;
-  const at = message.indexOf(clause);
-  if (at >= 0) return message.slice(0, at) + message.slice(at + clause.length);
-  return message.replace(advice, "").replace(/[;\s]+$/, "");
+  let out = message;
+  if (target) {
+    for (const clause of [`remove it manually with: ${manualRemovalCommand(target)}`, unregisteredGuidance(target)]) {
+      const withSeparator = `; ${clause}`;
+      const at = out.indexOf(withSeparator);
+      if (at >= 0) out = out.slice(0, at) + out.slice(at + withSeparator.length);
+      else out = out.replace(clause, "");
+    }
+  }
+  for (;;) {
+    const tail = trailingRemovalAdvice(out);
+    if (!tail || !advicePathGone(tail.path)) break;
+    out = out.slice(0, tail.start);
+  }
+  return out.replace(/[;\s]+$/, "");
 }
 
 /** Guidance for a path the recorded base does not list as its worktree: no Git command. */

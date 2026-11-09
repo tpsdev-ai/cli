@@ -60,15 +60,6 @@ async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): 
   return false;
 }
 
-async function waitForPidsGone(pids: readonly number[], timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  const gone = () => pids.every((pid) => !pidAlive(pid));
-  while (!gone() && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return gone();
-}
-
 const SANDBOX_REQUIRED = "--sandbox-required";
 
 // cli#350 r4g — these tests wait on a real release window (up to 45s / 60s);
@@ -322,19 +313,28 @@ real("4e positive — the attested launch against the pinned nono", () => {
 
       const signalledAt = Date.now();
       process.kill(launcher.pid!, "SIGTERM");
-      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveExit) => {
+      // Sample liveness at the exit event itself: the launcher may return only
+      // once it has verified both processes stopped, so nothing may be alive at
+      // the moment its exit is observed.
+      const exit = await new Promise<{
+        code: number | null;
+        signal: NodeJS.Signals | null;
+        aliveAtExit: number[];
+      }>((resolveExit) => {
+        const settle = (code: number | null, signal: NodeJS.Signals | null) =>
+          resolveExit({ code, signal, aliveAtExit: [childPid, supervisorPid].filter((pid) => pidAlive(pid)) });
         if (launcher.exitCode !== null || launcher.signalCode !== null) {
-          resolveExit({ code: launcher.exitCode, signal: launcher.signalCode });
+          settle(launcher.exitCode, launcher.signalCode);
         } else {
-          launcher.once("exit", (code, signal) => resolveExit({ code, signal }));
+          launcher.once("exit", (code, signal) => settle(code, signal));
         }
       });
       const elapsed = Date.now() - signalledAt;
-      // Signal-shaped: the launcher re-raised the signal after cleanup.
+      // Signal-shaped: the launcher re-raised the signal after it verified the
+      // supervisor and the released child had stopped.
       expect(exit.signal, text).toBe("SIGTERM");
-      // The released child and the supervisor are gone within the bound.
-      const gone = await waitForPidsGone([childPid, supervisorPid], SIGNAL_STOP_BOUND_MS + 2_000);
-      expect(gone, `${text}\nchild=${childPid} supervisor=${supervisorPid}`).toBe(true);
+      // Both were already gone when the launcher's exit was observed.
+      expect(exit.aliveAtExit, `${text}\nchild=${childPid} supervisor=${supervisorPid}`).toEqual([]);
       expect(elapsed).toBeLessThan(SIGNAL_STOP_BOUND_MS + 4_000);
     } finally {
       const stopped = !child || await stopRealLaunch(child, text);

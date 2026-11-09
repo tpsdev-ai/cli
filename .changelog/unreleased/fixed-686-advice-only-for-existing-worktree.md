@@ -1,1 +1,1 @@
-- **The manual worktree-removal advice is dropped when the worktree is gone when the launch exits.**
+- **Removal advice is printed only when the worktree path it names exists.**

@@ -1,1 +1,1 @@
-- **A signal after worktree creation removes the worktree this launch created and leaves a pre-existing worktree untouched.**
+- **A signal removes a worktree this launch created once the launched processes are verified stopped, and never a pre-existing worktree.**
