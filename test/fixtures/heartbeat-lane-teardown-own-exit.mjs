@@ -1,6 +1,5 @@
-// Teardown fixture for heartbeat-lane-fixture-teardown.test.ts: the stub
-// gateway exits on its own before the fixture is signalled, so the teardown
-// must find nothing to signal. Every `process.kill` call the teardown makes is
+// Teardown fixture for heartbeat-lane-fixture-teardown.test.ts.
+// Every `process.kill` call the teardown makes is
 // appended to `kill.log`, so the test can check that no SIGTERM or SIGKILL
 // reached the group. With TEARDOWN_EXIT=normal the fixture exits 0 on its own;
 // otherwise it waits for the test to signal it.

@@ -185,7 +185,7 @@ describe("a heartbeat-lane fixture stops its detached stub gateway when terminat
 });
 
 describe("a heartbeat-lane fixture checks the group before signalling", () => {
-  test("a group that exits before the fixture is signalled is not signalled", async () => {
+  test("the own-exit fixture records no group signals and removes teardown handlers", async () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
       env: { ...process.env, TEARDOWN_DIR: root },
@@ -272,10 +272,10 @@ async function unconfirmedFixture(exit: "signal" | "normal") {
     expect(signalName).toBeNull();
     expect(code).toBe(1);
     await waitFor(
-      () => (stderr.includes("still has a member after SIGKILL") ? true : null),
+      () => (stderr.includes("could not be confirmed") ? true : null),
       "the unconfirmed-cleanup line",
     );
-    expect(stderr).toContain(`process group ${gatewayPid} still has a member after SIGKILL: ${gatewayPid}`);
+    expect(stderr).toContain(`cleanup of process group ${gatewayPid} could not be confirmed: ${gatewayPid}`);
   } finally {
     await stopFixture(fixture);
     if (gatewayPid !== null) killRecordedGroup(gatewayPid);
