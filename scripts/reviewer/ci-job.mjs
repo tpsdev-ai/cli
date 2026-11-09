@@ -278,8 +278,9 @@ export const SKIPPED_ACTIONS = {
     refs: { ba6de6cc0565af1f42295590380973573297e31f: "v1.3.2" },
     reason: "Socket Firewall is not reproduced in the sandbox; `sfw <cmd>` runs <cmd> unwrapped",
     // firewall-free installs the `sfw` wrapper and nothing else; `patch` mode
-    // rewrites dependencies and cannot be skipped.
-    inputs: { mode: oneOf("firewall-free") },
+    // rewrites dependencies and cannot be skipped. `firewall-version` is the
+    // pin the pre-fetch step installs; the skipped action installs nothing.
+    inputs: { mode: oneOf("firewall-free"), "firewall-version": oneOf("1.15.4") },
     required: ["mode"],
     shim: "sfw",
   },

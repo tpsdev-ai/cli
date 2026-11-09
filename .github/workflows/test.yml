@@ -43,9 +43,11 @@ jobs:
         run: node scripts/check-dep-ages.mjs --ci
       - name: npm pin release-age gate (cli#865)
         run: bun --no-install scripts/check-npm-pin-release-age.mjs
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
 
@@ -70,9 +72,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run lint:ci
       # The changelog fragment gate (cli#449): refuses a malformed fragment, and
@@ -129,9 +133,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - run: |
@@ -213,9 +219,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - name: Show the node that the gateway analog runs under
@@ -261,9 +269,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - name: Install the pinned OpenClaw into a temp prefix
@@ -307,9 +317,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - run: bun run build
       - name: Install openclaw-github-review dependencies
@@ -399,9 +411,11 @@ jobs:
           bun-version: "1.3.10"
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - name: Check for known vulnerabilities
         run: bun audit
@@ -551,9 +565,11 @@ jobs:
           bun-version: 1.3.10
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - run: sfw bun install --frozen-lockfile
       - name: Build CLI package (required by agent compile)
         run: cd packages/cli && bun run build || true
@@ -592,9 +608,11 @@ jobs:
       # published @tpsdev-ai/agent instead of this tree's.
       - name: Dependency release-age gate (cli#529)
         run: node scripts/check-dep-ages.mjs --ci
+      - run: bash scripts/prefetch-socket-firewall.sh
       - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
         with:
           mode: firewall-free
+          firewall-version: "1.15.4"
       - name: Install workspace dependencies
         run: sfw bun install --frozen-lockfile
       - name: Build agent package
