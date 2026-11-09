@@ -1,6 +1,7 @@
 /**
  * cli#340: `mail check` says WHY an unacked cur/ record is re-delivered
- * (its checkout lease expired) and how to stop it (ack it).
+ * (its checkout lease expired) and, for ackable mail, how to stop it (ack it
+ * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -260,7 +261,7 @@ describe("mail check re-delivery reason (cli#340)", () => {
 
     const printed = await runCheck([OWNER], SENDER);
     expect(printed.status).toBe(0);
-    expect(printed.stdout).toContain("external-tier mail cannot be acknowledged or nacked by an internal consumer");
+    expect(printed.stdout).toContain("external-tier mail: the ack and nack commands refuse it");
     expect(printed.stdout).not.toContain("tps mail ack");
 
     const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], SENDER);
