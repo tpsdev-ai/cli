@@ -288,6 +288,11 @@ jobs:
             echo "  ok pin @tpsdev-ai/$p @ $pin"
           done
 
+      # PARTIAL STAGE IS POSSIBLE AND IS NOT SELF-HEALING — a later package's auth
+      # failure, an E409 collision, or the job timeout ending mid-publish. npm stages
+      # offer no cleanup, no resume and no idempotency, and a timeout terminates the
+      # job without running any error path, so the recovery procedure prints BEFORE
+      # staging, unconditionally; the failure branches restate it in detail.
       - name: Stage interruption recovery
         run: |
           echo "::notice::If stage publishing is interrupted, check pending packages before re-running:"
