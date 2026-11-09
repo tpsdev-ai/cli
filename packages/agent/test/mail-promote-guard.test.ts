@@ -117,6 +117,28 @@ describe("agent MailClient promotion is fail-closed (cli#380 F1)", () => {
     writeFileSync(join(inbox("new"), name), JSON.stringify(wrapperObj), "utf-8");
   };
 
+  for (const method of ["checkNewMail", "deliverNext"] as const) {
+    test(`${method} leaves a dot-file beside a promoted message (cli#870)`, async () => {
+      const env = signedEnvelope("flint", AGENT, "hello", { flint: FLINT });
+      plant(wrapper("flint", env));
+      const scratch = join(inbox("new"), ".x.json");
+      writeFileSync(scratch, "{ not mail");
+      const client = new MailClient(tmpDir, undefined, AGENT, flairClient({ flint: pub(FLINT) }));
+
+      if (method === "checkNewMail") {
+        expect((await client.checkNewMail()).map((message) => message.filename)).toEqual(["m1.json"]);
+      } else {
+        const result = await client.deliverNext();
+        expect(result.status).toBe("delivered");
+      }
+
+      expect(readdirSync(inbox("new"))).toEqual([".x.json"]);
+      expect(readFileSync(scratch, "utf8")).toBe("{ not mail");
+      expect(files("cur")).toEqual(["m1.json"]);
+      expect(files("dlq")).toEqual([]);
+    });
+  }
+
   // ── F1 defect 1: verification was optional (no client ⇒ unverified promote) ─
   test("NO verifier: construction throws", () => {
     expect(() => new MailClient(tmpDir, undefined, AGENT)).toThrow(/requires a Flair verifier/);

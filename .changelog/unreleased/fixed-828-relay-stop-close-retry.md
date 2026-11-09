@@ -1,0 +1,1 @@
+- **Relay stop retries retained failed closes and attempts to clear its host record when no close remains unconfirmed**.

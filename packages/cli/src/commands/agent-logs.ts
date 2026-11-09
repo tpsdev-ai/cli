@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -69,7 +70,7 @@ function readMailTimeline(mailDir: string, agentId: string): TimelineItem[] {
     const dir = join(mailboxRoot, folder);
     if (!existsSync(dir)) continue;
     for (const entry of readdirSync(dir)) {
-      if (!entry.endsWith(".json")) continue;
+      if (folder === "new" ? !isMailboxMessageFile(entry) : !entry.endsWith(".json")) continue;
       try {
         const raw = readFileSync(join(dir, entry), "utf-8");
         const parsed = JSON.parse(raw) as MailRecord;

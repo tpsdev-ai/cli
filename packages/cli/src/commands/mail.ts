@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
@@ -249,10 +250,10 @@ function signOutboundOrFail(
   }
 }
 
-function newestJsonMtime(dir: string): string | null {
+function newestJsonMtime(dir: string, fresh = false): string | null {
   if (!existsSync(dir)) return null;
   const newest = readdirSync(dir)
-    .filter((file) => file.endsWith(".json"))
+    .filter((file) => fresh ? isMailboxMessageFile(file) : file.endsWith(".json"))
     .map((file) => join(dir, file))
     .filter((file) => existsSync(file))
     .sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs)[0];
@@ -513,8 +514,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       const sentDir = join(inbox.root, "sent");
       const payload = {
         agent,
-        inboxCount: readdirSync(inbox.fresh).filter((file) => file.endsWith(".json")).length,
-        lastReceived: newestJsonMtime(inbox.fresh),
+        inboxCount: readdirSync(inbox.fresh).filter(isMailboxMessageFile).length,
+        lastReceived: newestJsonMtime(inbox.fresh, true),
         lastSent: newestJsonMtime(sentDir),
       };
       if (args.json) {
@@ -542,7 +543,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       let foundPath = "";
       for (const [dir, loc] of dirs) {
         if (!existsSync(dir)) continue;
-        const files = readdirSync(dir).filter(f => f.endsWith(".json"));
+        const files = readdirSync(dir).filter(f => loc === "new" ? isMailboxMessageFile(f) : f.endsWith(".json"));
         for (const f of files) {
           try {
             const msg = JSON.parse(readFileSync(join(dir, f), "utf-8")) as MailMessage;

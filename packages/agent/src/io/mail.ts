@@ -1,4 +1,5 @@
 import { closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, renameSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { isMailboxMessageFile } from "../lib/mailbox-filename.js";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { EventLogger } from "../telemetry/events.js";
@@ -311,7 +312,7 @@ export class MailClient {
     const inboxNew = join(roots.mailbox, "new");
     if (!existsSync(inboxNew)) return messages;
 
-    const files = readdirSync(inboxNew).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\"));
+    const files = readdirSync(inboxNew).filter(isMailboxMessageFile);
 
     for (const file of files) {
       const started = Date.now();
@@ -746,7 +747,7 @@ export class MailClient {
     let files: string[];
     try {
       files = existsSync(join(roots.mailbox, "new"))
-        ? readdirSync(join(roots.mailbox, "new")).filter((f) => !f.startsWith(".") && !f.includes("/") && !f.includes("\\")).sort()
+        ? readdirSync(join(roots.mailbox, "new")).filter(isMailboxMessageFile).sort()
         : [];
     } catch (err) {
       this.emitRecoveryError(err);

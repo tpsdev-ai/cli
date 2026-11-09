@@ -6,6 +6,7 @@
  * - Outbound: watch bridge mailbox → adapter.send()
  */
 
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import {
   existsSync,
   mkdirSync,
@@ -200,7 +201,7 @@ Message: ${envelope.content}`;
     };
 
     const promoteFile = async (file: string, recovery = false) => {
-      if (!file.endsWith(".json")) return;
+      if (recovery ? !file.endsWith(".json") : !isMailboxMessageFile(file)) return;
       const fullPath = join(recovery ? cur : fresh, file);
       if (!existsSync(fullPath)) return;
       try {
@@ -219,7 +220,7 @@ Message: ${envelope.content}`;
 
     const processFile = (file: string, recovery = false) => {
       const fullPath = join(recovery ? cur : fresh, file);
-      if (!file.endsWith(".json") || pending.has(fullPath) || stopped) return;
+      if ((recovery ? !file.endsWith(".json") : !isMailboxMessageFile(file)) || pending.has(fullPath) || stopped) return;
       pending.add(fullPath);
       void enqueue(async () => {
         try {
@@ -245,7 +246,7 @@ Message: ${envelope.content}`;
     };
 
     try {
-      for (const f of readdirSync(fresh).filter((name) => name.endsWith(".json"))) processFile(f);
+      for (const f of readdirSync(fresh).filter(isMailboxMessageFile)) processFile(f);
       for (const f of readdirSync(cur).filter((name) => name.endsWith(".json"))) processFile(f, true);
     } catch {}
 
