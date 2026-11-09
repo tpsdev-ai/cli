@@ -20,6 +20,7 @@ import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -251,6 +252,32 @@ function runArchiveSetCheck(step: Step, archives: string[]): Run {
 }
 
 describe("docker.yml", () => {
+  test("repo scripts exist and run after a checkout that includes them", () => {
+    for (const [jobName, job] of Object.entries(jobs)) {
+      let checkout: Step | undefined;
+      for (const step of job.steps ?? []) {
+        if (step.uses?.startsWith("actions/checkout@")) checkout = step;
+        const paths = [...(step.run ?? "").matchAll(/(?:^|[\s"'`])((?:\.github\/scripts|scripts)\/[\w./-]+)/gm)]
+          .map((match) => match[1]);
+        for (const path of paths) {
+          const label = `${jobName}: ${step.name ?? step.id ?? "unnamed step"}: ${path}`;
+          expect(checkout, `${label} requires an earlier checkout`).toBeDefined();
+          expect(existsSync(join(REPO, path)), `${label} must exist in the repository`).toBe(true);
+          if (jobName === "publish") {
+            expect(checkout?.with?.["persist-credentials"], `${label} must not persist credentials`).toBe(false);
+          }
+          const sparse = checkout?.with?.["sparse-checkout"];
+          if (sparse !== undefined || jobName === "publish") {
+            const included = String(sparse ?? "").split("\n").map((entry) => entry.trim())
+              .filter(Boolean)
+              .some((entry) => path.startsWith(`${entry.replace(/^\//, "").replace(/\/$/, "")}/`));
+            expect(included, `${label} must be in the sparse checkout`).toBe(true);
+          }
+        }
+      }
+    }
+  });
+
   test("meta feeds the build, and publish needs the build and meta", () => {
     expect(Object.keys(jobs)).toEqual(["meta", "build", "publish"]);
     expect(jobs.build?.needs).toBe("meta");

@@ -206,6 +206,13 @@ jobs:
         ports:
           - 5000:5000
     steps:
+      # Registry steps run the repo script; only .github/scripts is needed, and checkout credentials must not persist in this packages: write job.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/scripts/
+          sparse-checkout-cone-mode: false
+
       # Only the platform archives: without a pattern the download fetches every
       # artifact in the run, build records included.
       - name: Download the platform archives
