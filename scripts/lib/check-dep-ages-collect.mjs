@@ -226,6 +226,34 @@ export function collectNpmLockDeps(lock, lockfile) {
 const SEMVER_RE =
   /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*))?(?:\+([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?$/;
 
+/** The expiry grammar: four digits for the year, then a two-digit month and day. */
+const EXPIRY_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * The UTC instant at the start of an expiry day, or null when the value is not
+ * a real calendar day (a month outside 01-12, or a day the month lacks).
+ *
+ * @returns {number | null}
+ */
+function expiryDayMs(value) {
+  if (!EXPIRY_DATE_RE.test(value)) return null;
+  const [year, month, day] = value.split("-").map(Number);
+  if (month < 1 || month > 12 || day < 1) return null;
+  const date = new Date(0);
+  date.setUTCHours(0, 0, 0, 0);
+  // An overflowing day (2023-02-29) rolls into the next month; the component
+  // round-trip below rejects it instead of accepting the rolled-over date.
+  date.setUTCFullYear(year, month - 1, day);
+  if (
+    date.getUTCFullYear() !== year ||
+    date.getUTCMonth() !== month - 1 ||
+    date.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return date.getTime();
+}
+
 /**
  * Parse entries after `## Exceptions`; validate every subsequent nonblank line.
  * Expiry dates include their UTC day.
@@ -238,7 +266,8 @@ const SEMVER_RE =
 export function parseExceptions(text, nowMs = Date.now()) {
   const entries = new Map();
   const errors = [];
-  const today = new Date(nowMs).toISOString().slice(0, 10);
+  const now = new Date(nowMs);
+  const todayMs = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
   const lines = String(text).split(/\r?\n/);
   const HEADING = /^## Exceptions$/;
   let start = -1;
@@ -265,7 +294,7 @@ export function parseExceptions(text, nowMs = Date.now()) {
     if (!t) continue;
     const line = i + 1;
     const m = t.match(
-      /^-\s+(\S+@\S+)\s*\|\s*expires:(\d{4}-\d{2}-\d{2})\s*\|\s*reason:\s*(\S.*)$/,
+      /^-\s+(\S+@\S+)\s*\|\s*expires:(\S+)\s*\|\s*reason:\s*(\S.*)$/,
     );
     if (!m) {
       errors.push({
@@ -283,14 +312,12 @@ export function parseExceptions(text, nowMs = Date.now()) {
       errors.push({ line, text: t, key, message: `invalid semver: ${key}` });
       continue;
     }
-    // `Date.parse` accepts rollovers (2026-02-30 → 2026-03-02), so round-trip
-    // the date to reject one that is not a real calendar day.
-    const parsed = Date.parse(`${date}T00:00:00Z`);
-    if (Number.isNaN(parsed) || new Date(parsed).toISOString().slice(0, 10) !== date) {
+    const expiresMs = expiryDayMs(date);
+    if (expiresMs === null) {
       errors.push({ line, text: t, key, message: `invalid expiry date: ${date}` });
       continue;
     }
-    if (date < today) {
+    if (expiresMs < todayMs) {
       errors.push({ line, text: t, key, message: `exception expired on ${date}` });
       continue;
     }

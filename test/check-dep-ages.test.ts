@@ -230,6 +230,49 @@ describe("parseExceptions", () => {
     expect(errors[0]?.message).toContain("invalid expiry date");
   });
 
+  it("accepts the last four-digit day", () => {
+    const { entries, errors } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:9999-12-31 | reason: far future"),
+      NOW,
+    );
+    expect(errors).toEqual([]);
+    expect(entries.get("dep-a@1.0.0")).toMatchObject({ expires: "9999-12-31" });
+  });
+
+  it("accepts 29 February in a leap year", () => {
+    const { entries, errors } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2024-02-29 | reason: leap day"),
+      Date.parse("2024-02-28T12:00:00Z"),
+    );
+    expect(errors).toEqual([]);
+    expect(entries.get("dep-a@1.0.0")).toMatchObject({ expires: "2024-02-29" });
+  });
+
+  it("rejects 29 February in a non-leap year and names the value", () => {
+    const { entries, errors } = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2023-02-29 | reason: not a leap year"),
+      Date.parse("2023-01-01T00:00:00Z"),
+    );
+    expect(entries.size).toBe(0);
+    expect(errors[0]?.message).toBe("invalid expiry date: 2023-02-29");
+  });
+
+  it("treats yesterday as expired and today as valid", () => {
+    const yesterday = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2026-10-06 | reason: boundary"),
+      NOW,
+    );
+    expect(yesterday.entries.size).toBe(0);
+    expect(yesterday.errors[0]?.message).toBe("exception expired on 2026-10-06");
+
+    const today = parseExceptions(
+      exceptionsDoc("- dep-a@1.0.0 | expires:2026-10-07 | reason: boundary"),
+      NOW,
+    );
+    expect(today.errors).toEqual([]);
+    expect(today.entries.get("dep-a@1.0.0")).toMatchObject({ expires: "2026-10-07" });
+  });
+
   it("rejects an entry with no reason", () => {
     const { errors } = parseExceptions(
       exceptionsDoc("- dep-a@1.0.0 | expires:2026-12-01 | reason:"),
@@ -539,6 +582,27 @@ describe("CLI — a version younger than the gate fails", () => {
     } finally {
       registry.stop();
     }
+  }, 30_000);
+});
+
+describe("CLI — the expiry grammar is exact", () => {
+  it.each([
+    "2023-02-29",
+    "2026-13-01",
+    "26-01-01",
+    "+010000-01-01",
+    "2026-1-01",
+    "2026-01-01T00:00Z",
+  ])("exits 2 naming the value for %s", async (value) => {
+    const root = writeFixtureRepo(join(scratch, `expiry-${value.replace(/[^a-z0-9]/gi, "-")}`), {
+      exceptions: `## Exceptions\n- dep-a@1.0.0 | expires:${value} | reason: test\n`,
+    });
+    const { exitCode, output } = await runGate({
+      TPS_DEP_AGES_ROOT: root,
+      TPS_DEP_AGES_REGISTRY: "http://127.0.0.1:1",
+    });
+    expect(exitCode).toBe(2);
+    expect(output).toContain(`line 2: invalid expiry date: ${value}`);
   }, 30_000);
 });
 
