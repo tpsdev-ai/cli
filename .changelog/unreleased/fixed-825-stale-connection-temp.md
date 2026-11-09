@@ -1,0 +1,1 @@
+- **Stale connection-state temp files left by a crash are removed on the next read or write.**

@@ -1,0 +1,1 @@
+- **Rewriting a connection-state record keeps its existing file mode, so a record tightened to 0600 stays 0600.**

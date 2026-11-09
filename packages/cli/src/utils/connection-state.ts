@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
@@ -42,17 +42,82 @@ export function hostStatePath(branch: string): string {
   return join(connectionsDir(), `${branch}.json`);
 }
 
+/**
+ * A `.<record>.<uuid>.tmp` name, the shape writeFileAtomic creates. The record
+ * part is any non-empty name ending in `.json`; the trailing part is a UUID.
+ */
+const TEMP_FILE_PATTERN = /^\..+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+/**
+ * A temp file older than this cannot belong to an in-progress write: the write
+ * is synchronous and renamed immediately after fsync. One hour is far longer
+ * than any such write can take.
+ */
+const STALE_TEMP_AGE_MS = 60 * 60 * 1000;
+
+export interface ConnectionTempSweep {
+  removed: string[];
+  /** Matching entries left in place, with the reason. Never reported as removed. */
+  left: { path: string; reason: string }[];
+}
+
+/**
+ * Remove stale temp files left by a crash between creating the temp file and
+ * renaming it. Only names of exactly the writer's shape are considered, and
+ * only regular files are removed: a symlink is never followed. An entry that
+ * cannot be inspected or removed is reported in `left` and left in place.
+ */
+export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
+  const dir = connectionsDir();
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return { removed: [], left: [] };
+    return { removed: [], left: [{ path: dir, reason: code }] };
+  }
+  const removed: string[] = [];
+  const left: { path: string; reason: string }[] = [];
+  for (const name of entries) {
+    if (!TEMP_FILE_PATTERN.test(name)) continue;
+    const path = join(dir, name);
+    let stats;
+    try {
+      stats = lstatSync(path);
+    } catch (error) {
+      left.push({ path, reason: (error as NodeJS.ErrnoException).code ?? "unknown" });
+      continue;
+    }
+    if (!stats.isFile()) {
+      left.push({ path, reason: "not a regular file" });
+      continue;
+    }
+    if (now - stats.mtimeMs <= STALE_TEMP_AGE_MS) continue;
+    try {
+      rmSync(path, { force: true });
+      removed.push(path);
+    } catch (error) {
+      left.push({ path, reason: (error as NodeJS.ErrnoException).code ?? "unknown" });
+    }
+  }
+  return { removed, left };
+}
+
 export interface HostStatePathListing {
   paths: string[];
   /** Set for a listing error other than ENOENT. */
   failure?: { path: string; code: string };
+  /** Stale temp entries that could not be inspected or removed. */
+  tempCleanupLeft?: { path: string; reason: string }[];
 }
 
 /** Connections directory `*.json` paths. A `host.json` object with neither
  *  `pid` nor `branch` is treated as branch state and skipped. A listing
- *  error other than ENOENT is reported. */
+ *  error other than ENOENT is reported, as is a stale temp file left in place. */
 export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
+  const sweep = sweepStaleConnectionTemps();
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -62,6 +127,7 @@ export function listHostStatePaths(): HostStatePathListing {
     return { paths: [], failure: { path: dir, code } };
   }
   return {
+    ...(sweep.left.length > 0 ? { tempCleanupLeft: sweep.left } : {}),
     paths: entries
       .filter((f) => {
         if (!f.endsWith(".json")) return false;
@@ -87,8 +153,8 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
  * Write a file atomically: a uniquely named temp file in the same directory is
- * created exclusively with `mode`, written through its descriptor, synced, and
- * renamed over the target, so a write or rename failure leaves the previous
+ * created exclusively with the existing record's mode when one exists, else
+ * `mode`, written through its descriptor, synced, and renamed over the target, so a write or rename failure leaves the previous
  * record intact. The parent directory sync after the rename is best-effort:
  * directory fsync is not supported everywhere, and the rename is already
  * atomic for readers. If a temp-file operation or rename throws, the helper
@@ -96,10 +162,20 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
+  // A sweep failure never blocks the write: the entry is left in place.
+  sweepStaleConnectionTemps();
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
+  // A regular record's mode is preserved exactly; a symlinked record is treated
+  // as absent, as before (the rename replaces the link with a regular file).
+  const existingMode = existingRecordMode(filePath);
   let fd: number | undefined;
   try {
-    fd = openSync(tmpPath, "wx", mode);
+    fd = openSync(tmpPath, "wx", existingMode ?? mode);
+    if (existingMode !== undefined) {
+      // openSync applies the umask; set the record's mode explicitly so a
+      // rewrite never widens it.
+      fchmodSync(fd, existingMode);
+    }
     writeFileSync(fd, content, "utf-8");
     fsyncSync(fd);
     closeSync(fd);
@@ -116,6 +192,21 @@ function writeFileAtomic(filePath: string, content: string, mode: number): void 
     const dirFd = openSync(dirname(filePath), "r");
     try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
   } catch {}
+}
+
+/** The mode of an existing regular record, or undefined when there is none. */
+function existingRecordMode(filePath: string): number | undefined {
+  let stats;
+  try {
+    stats = lstatSync(filePath);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+    if (code === "ENOENT") return undefined;
+    // An unreadable record must not be replaced with a broader default.
+    throw error;
+  }
+  if (!stats.isFile()) return undefined;
+  return stats.mode & 0o777;
 }
 
 /** Root of the inter-process lock that owns one host state record. */
