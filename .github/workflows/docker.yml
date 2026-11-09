@@ -76,6 +76,10 @@ jobs:
       - name: Build ${{ matrix.platform }} to an OCI archive
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        env:
+          # docker/build-push-action uploads a build-record artifact of its own
+          # unless told not to; the publish job must hand off only the archives.
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
         with:
           context: .
           file: docker/Dockerfile
@@ -202,10 +206,33 @@ jobs:
         ports:
           - 5000:5000
     steps:
+      # Only the platform archives: without a pattern the download fetches every
+      # artifact in the run, build records included.
       - name: Download the platform archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: tps-office-*
+          merge-multiple: false
           path: ${{ runner.temp }}/archives
+
+      - name: Require exactly one archive per PLATFORMS entry
+        run: |
+          set -eux
+          archives="${RUNNER_TEMP:-/tmp}/archives"
+          expected="$(for platform in ${PLATFORMS//,/ }; do printf 'tps-office-%s.oci.tar\n' "${platform#linux/}"; done | sort)"
+          found="$(find "$archives" -type f -name 'tps-office-*.oci.tar' -exec basename {} \; | sort)"
+          if [ -z "$found" ]; then
+            echo "no tps-office-* archives were downloaded" >&2
+            exit 1
+          fi
+          missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$found"))"
+          extra="$(comm -13 <(printf '%s\n' "$expected") <(printf '%s\n' "$found"))"
+          if [ -n "$missing" ] || [ -n "$extra" ]; then
+            [ -z "$missing" ] || printf 'missing archive(s):\n%s\n' "$missing" >&2
+            [ -z "$extra" ] || printf 'unexpected archive(s):\n%s\n' "$extra" >&2
+            exit 1
+          fi
+          printf '%s\n' "$found"
 
       # Each single-platform archive is copied with `--preserve-digests` and its
       # manifest digest recorded; the local registry must report the same digest.

@@ -9,9 +9,11 @@
  * run. The workflow tests read the real `docker.yml`: one job checks the
  * version and tags, each platform is built on its own native runner (no QEMU)
  * into one OCI archive, that leg's smoke loads its own archive, the publish job
- * copies each archive with `--preserve-digests` and checks its digest,
- * assembles the index from those digests and checks it against `PLATFORMS`, and
- * only the GHCR login and copy are gated on `inputs.publish`.
+ * downloads only the `tps-office-*` artifacts and refuses a set that is not one
+ * archive per platform, copies each archive with `--preserve-digests` and
+ * checks its digest, assembles the index from those digests and checks it
+ * against `PLATFORMS`, and only the GHCR login and copy are gated on
+ * `inputs.publish`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -225,6 +227,29 @@ const platformList = (): string[] =>
     .map((s) => s.trim())
     .filter(Boolean);
 
+/** Runs a workflow step's `run` in a temp dir holding the named archive files. */
+function runArchiveSetCheck(step: Step, archives: string[]): Run {
+  const dir = join(work, `archives-${++caseNo}`);
+  const archivesDir = join(dir, "archives");
+  mkdirSync(archivesDir, { recursive: true });
+  for (const name of archives) {
+    const sub = join(archivesDir, name.replace(/\.oci\.tar$/, ""));
+    mkdirSync(sub, { recursive: true });
+    writeFileSync(join(sub, name), "fixture");
+  }
+  const r = spawnSync("bash", ["-c", step.run ?? ""], {
+    env: {
+      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      PLATFORMS: platformList().join(","),
+      RUNNER_TEMP: dir,
+    },
+    encoding: "utf8",
+    timeout: 30_000,
+  });
+  if (r.error) throw r.error;
+  return { status: r.status ?? -1, stdout: r.stdout, stderr: r.stderr };
+}
+
 describe("docker.yml", () => {
   test("meta feeds the build, and publish needs the build and meta", () => {
     expect(Object.keys(jobs)).toEqual(["meta", "build", "publish"]);
@@ -316,13 +341,44 @@ describe("docker.yml", () => {
     expect(login?.if).toBe("${{ inputs.publish }}");
   });
 
-  test("publish downloads both archives with the pinned action", () => {
+  test("publish downloads only the platform archives with the pinned action", () => {
     const download = (jobs.publish?.steps ?? []).find((s) =>
       s.uses?.startsWith("actions/download-artifact@"),
     );
     expect(download?.uses).toBe(
       "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
     );
+    expect(download?.with?.pattern).toBe("tps-office-*");
+    expect(download?.with?.["merge-multiple"]).toBe(false);
+  });
+
+  test("the publish job refuses a downloaded set that is not one archive per PLATFORMS", () => {
+    const steps = jobs.publish?.steps ?? [];
+    const check = steps.find((s) => s.name?.startsWith("Require exactly one archive"));
+    expect(check).toBeDefined();
+    const copy = steps.findIndex((s) => s.run?.includes("skopeo copy"));
+    expect(steps.indexOf(check as Step)).toBeLessThan(copy);
+
+    const expected = platformList().map((p) => `tps-office-${p.replace("linux/", "")}.oci.tar`);
+    const ok = runArchiveSetCheck(check as Step, expected);
+    expect(ok.status).toBe(0);
+    for (const name of expected) expect(ok.stdout).toContain(name);
+
+    const missing = runArchiveSetCheck(check as Step, expected.slice(1));
+    expect(missing.status).toBe(1);
+    expect(missing.stderr).toContain(`missing archive(s):\n${expected[0]}`);
+
+    const extra = runArchiveSetCheck(check as Step, [...expected, "tps-office-riscv64.oci.tar"]);
+    expect(extra.status).toBe(1);
+    expect(extra.stderr).toContain("unexpected archive(s):\ntps-office-riscv64.oci.tar");
+  });
+
+  test("each build step disables the build-record upload", () => {
+    const builds = (jobs.build?.steps ?? []).filter((s) =>
+      s.uses?.includes("docker/build-push-action"),
+    );
+    expect(builds.length).toBe(1);
+    expect(builds[0].env?.DOCKER_BUILD_RECORD_UPLOAD).toBe("false");
   });
 
   test("every registry copy preserves digests and is followed by a digest check", () => {
