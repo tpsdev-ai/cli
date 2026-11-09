@@ -269,7 +269,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       }
       // warn mode: proceed with last known state. An unborn HEAD (a branch
       // with no commit yet; the repository may have other branches) is a valid
-      // baseline state, so startup proceeds; any other HEAD outcome throws.
+      // baseline state, so startup proceeds; an indeterminate HEAD throws.
       swarn(`[workspace] ⚠️ ${msg} — proceeding with current state`);
       const probe = probeHead(this.cwd);
       if (probe.state === "unborn") {

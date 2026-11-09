@@ -362,6 +362,7 @@ describe("evaluateMailAutoCommitGate", () => {
         dir,
         [
           'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "${SHIM_ROOT}/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
           'if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then exit 0; fi',
           'if [ "$1" = "status" ]; then exit 0; fi',
           'exit 0',
@@ -387,7 +388,7 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     return dir;
   }
 
-  test("commits when the repository has no commits and the task leaves a change", () => {
+  test("selects the commit path when the repository has no commits and the task leaves a change", () => {
     const repo = initUnbornRepo();
     try {
       const baseline = probeHead(repo);
@@ -444,11 +445,28 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
-  test("a branch ref that exists but does not resolve to a commit is indeterminate", () => {
-    const repo = initUnbornRepo();
+  test("a symbolic HEAD that points at an existing tag on a commit is indeterminate and skips at the gate", () => {
+    const repo = initRepo();
     try {
-      writeFileSync(join(repo, ".git", "refs", "heads", "main"), "not-a-sha\n");
-      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "failed" });
+      git(repo, "tag", "v1");
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/v1\n");
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed" });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit",
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a detached HEAD at a commit is a commit baseline", () => {
+    const repo = initRepo();
+    try {
+      const sha = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--detach", sha);
+      expect(probeHead(repo)).toEqual({ state: "commit", head: sha });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -605,15 +623,15 @@ describe("runAutoCommit", () => {
         },
         { spawnSyncImpl },
       );
+
+      // The commit child gets the configured id; the runtime's own environment is
+      // unchanged.
+      expect(tpsEnv?.TPS_AGENT_ID).toBe("ember");
+      expect(process.env.TPS_AGENT_ID).toBe("parent-agent");
     } finally {
       if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
       else process.env.TPS_AGENT_ID = savedAgentId;
     }
-
-    // The commit child gets the configured id; the runtime's own environment is
-    // unchanged.
-    expect(tpsEnv?.TPS_AGENT_ID).toBe("ember");
-    expect(process.env.TPS_AGENT_ID).toBe(savedAgentId);
 
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },

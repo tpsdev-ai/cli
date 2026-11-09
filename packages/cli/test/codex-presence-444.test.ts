@@ -217,6 +217,7 @@ async function driveRuntime(
       if (opts.autoCommitFailure === "rebaseProbe") return { status: 128, stdout: "", stderr: "fixture probe failure" } as never;
       return { status: 0, stdout: `${join(workspace, ".git", probe.split(" ").pop()!)}\n`, stderr: "" } as never;
     }
+    if (probe === "symbolic-ref -q HEAD") return runRealGit(command, args, options) as never;
     if (probe === "rev-parse --verify -q HEAD^{commit}") {
       headReads++;
       if ((opts.autoCommitFailure === "baseline" && headReads === 1) || (opts.autoCommitFailure === "head" && headReads === 2)) {

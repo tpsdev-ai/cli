@@ -390,8 +390,9 @@ export type MailAutoCommitDecision =
  * commit, and an interrupted rebase is detected and aborted there too. For a
  * commit baseline the comparison is always the HEAD read before the task: a
  * successful abort restores the pre-rebase checkout/HEAD (a rebase can start
- * from a detached HEAD), so a restored HEAD different from the pre-task HEAD
- * causes a commit attempt. That can be a commit made on that branch before the
+ * from a detached HEAD), so a restored HEAD different from the pre-task HEAD,
+ * or workspace changes, select a commit attempt unless a later probe fails or
+ * the gate skips. That can be a commit made on that branch before the
  * rebase, not necessarily this task's.
  * A failed probe is indeterminate and yields a skip with its outcome reported,
  * and so does a final HEAD that differs from the restored one. An unborn HEAD is

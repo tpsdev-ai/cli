@@ -7,7 +7,7 @@
 
 import { spawnSync } from "node:child_process";
 
-/** Real git binary path — bypasses codex-tools wrapper that blocks commit/push */
+/** Git binary for the probes: `/usr/bin/git` by default; `TPS_GIT_BIN` overrides it. */
 export const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
 
 export type HeadProbe =
@@ -18,7 +18,9 @@ export type HeadProbe =
 /**
  * Classify the repository's HEAD.
  *
- * "commit" requires `git rev-parse --verify -q HEAD^{commit}` to succeed.
+ * "commit" requires `git symbolic-ref -q HEAD` to fail or to name a ref under
+ * `refs/heads/`, and `git rev-parse --verify -q HEAD^{commit}` to succeed; a
+ * symbolic HEAD outside refs/heads/ is indeterminate before any commit check.
  * "unborn" requires all of: `git symbolic-ref -q HEAD` prints a ref under
  * `refs/heads/`, `git rev-parse --verify -q HEAD` finds nothing, and that
  * branch ref does not exist (`git show-ref --verify -q <ref>` exits 1). An
@@ -28,18 +30,19 @@ export type HeadProbe =
  * outcome.
  */
 export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): HeadProbe {
+  const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  const branch = symbolic.status === 0 ? String(symbolic.stdout ?? "").trim() : undefined;
+  if (branch !== undefined && !branch.startsWith("refs/heads/")) {
+    return { state: "indeterminate", detail: "failed" };
+  }
+
   const head = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: repo, encoding: "utf-8" });
   if (head.status === 0) {
     const headText = String(head.stdout ?? "").trim();
     return headText ? { state: "commit", head: headText } : { state: "indeterminate", detail: "returned no output" };
   }
   if (head.status !== 1) return { state: "indeterminate", detail: "failed" };
-
-  const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  const branch = String(symbolic.stdout ?? "").trim();
-  if (symbolic.status !== 0 || !branch.startsWith("refs/heads/")) {
-    return { state: "indeterminate", detail: "failed" };
-  }
+  if (branch === undefined) return { state: "indeterminate", detail: "failed" };
 
   const verify = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
   if (verify.status !== 1 || String(verify.stdout ?? "").trim() !== "") {
