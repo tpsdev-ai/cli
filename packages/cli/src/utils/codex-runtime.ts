@@ -378,6 +378,32 @@ export function detectStaleRebase(
   return { state: "absent" };
 }
 
+export type HeadProbe =
+  | { state: "commit"; head: string }
+  | { state: "unborn" }
+  | { state: "indeterminate"; detail: "failed" | "returned no output" };
+
+/**
+ * Classify the repository's HEAD. A commit is a successful `git rev-parse HEAD`
+ * with output. An unborn HEAD is a symbolic HEAD naming a branch whose
+ * `git rev-parse --verify -q HEAD` finds no commit (exit 1, no output). Any
+ * other outcome is indeterminate.
+ */
+export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): HeadProbe {
+  const head = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  const headText = String(head.stdout ?? "").trim();
+  if (head.status === 0) {
+    return headText ? { state: "commit", head: headText } : { state: "indeterminate", detail: "returned no output" };
+  }
+  const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  const branch = String(symbolic.stdout ?? "").trim();
+  if (symbolic.status === 0 && branch) {
+    const verify = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+    if (verify.status === 1 && String(verify.stdout ?? "").trim() === "") return { state: "unborn" };
+  }
+  return { state: "indeterminate", detail: "failed" };
+}
+
 export type MailAutoCommitDecision =
   | { action: "commit" }
   | { action: "clean"; message: string }
@@ -387,30 +413,37 @@ export type MailAutoCommitDecision =
  * Decide whether a mail task left changes worth committing in `repo`.
  *
  * Every probe runs against the one repository the caller resolved for the
- * commit, and an interrupted rebase is detected and aborted there too. The
- * comparison is always the HEAD read before the task: a successful abort
- * restores the pre-rebase checkout/HEAD (a rebase can start from a detached
- * HEAD), so a restored HEAD different from the pre-task HEAD causes a commit
- * attempt. That can be a commit made on that branch before the rebase, not
- * necessarily this task's.
+ * commit, and an interrupted rebase is detected and aborted there too. For a
+ * commit baseline the comparison is always the HEAD read before the task: a
+ * successful abort restores the pre-rebase checkout/HEAD (a rebase can start
+ * from a detached HEAD), so a restored HEAD different from the pre-task HEAD
+ * causes a commit attempt. That can be a commit made on that branch before the
+ * rebase, not necessarily this task's.
  * A failed probe is indeterminate and yields a skip with its outcome reported,
- * and so does a final HEAD that differs from the restored one. The clean
- * decision establishes exactly this: Git status is clean and the final HEAD
- * matches its pre-task value — `git status --porcelain` omits ignored files,
- * and equal HEADs do not rule out a commit that was later reset.
+ * and so does a final HEAD that differs from the restored one. An unborn HEAD
+ * (a repository with no commits) has no pre-task value to compare, so the
+ * workspace status decides: changes commit the repository's first commit, and
+ * a clean status is clean. For a commit baseline, the clean decision
+ * establishes exactly this: Git status is clean and the final HEAD matches its
+ * pre-task value — `git status --porcelain` omits ignored files, and equal
+ * HEADs do not rule out a commit that was later reset.
  */
 export function evaluateMailAutoCommitGate(
   repo: string,
-  baseline: string | undefined,
+  baseline: string | HeadProbe | undefined,
   deps: { runSync?: typeof spawnSync } = {},
 ): MailAutoCommitDecision {
   const runSync = deps.runSync ?? spawnSync;
+  const baselineProbe: HeadProbe =
+    typeof baseline === "string"
+      ? { state: "commit", head: baseline }
+      : (baseline ?? { state: "indeterminate", detail: "failed" });
   const staleRebase = detectStaleRebase(repo, runSync);
   if (staleRebase.state === "indeterminate") {
     const detail = staleRebase.output !== undefined ? ` returned '${staleRebase.output}'` : " failed";
     return { action: "skip", message: `Stale rebase check could not run: ${staleRebase.probe}${detail} — skipping autoCommit` };
   }
-  if (baseline === undefined) {
+  if (baselineProbe.state === "indeterminate") {
     return { action: "skip", message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit" };
   }
 
@@ -421,35 +454,44 @@ export function evaluateMailAutoCommitGate(
       const firstLine = String(abortResult.stderr ?? "").trim().split("\n")[0] ?? "";
       return { action: "skip", message: `Stale rebase abort failed (exit ${abortResult.status}): ${firstLine} — skipping autoCommit` };
     }
-    const restored = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
-    restoredHead = String(restored.stdout ?? "").trim();
-    if (restored.status !== 0 || !restoredHead) {
+    const restored = probeHead(repo, runSync);
+    if (restored.state !== "commit") {
       return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after rebase abort) failed — skipping autoCommit" };
     }
+    restoredHead = restored.head;
   }
 
   const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
   if (statusResult.status !== 0) {
     return { action: "skip", message: "Change check could not run: git status --porcelain failed — skipping autoCommit" };
   }
-  const headResult = runSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  if (headResult.status !== 0) {
-    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) failed — skipping autoCommit" };
+  const finalProbe = probeHead(repo, runSync);
+  if (finalProbe.state === "indeterminate") {
+    const detail = finalProbe.detail === "returned no output" ? "returned no output" : "failed";
+    return { action: "skip", message: `Change check could not run: git rev-parse HEAD (after task) ${detail} — skipping autoCommit` };
   }
-  const finalHead = String(headResult.stdout ?? "").trim();
-  if (!finalHead) {
-    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) returned no output — skipping autoCommit" };
+  if (finalProbe.state === "unborn") {
+    if (baselineProbe.state === "commit") {
+      return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after task) failed — skipping autoCommit" };
+    }
+    const changed = String(statusResult.stdout ?? "").trim().length > 0;
+    if (changed) return { action: "commit" };
+    return { action: "clean", message: "Git status is clean and the repository has no commits — skipping autoCommit" };
   }
+  const finalHead = finalProbe.head;
   if (restoredHead !== undefined && finalHead !== restoredHead) {
     return {
       action: "skip",
       message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restoredHead}, final ${finalHead}) — skipping autoCommit`,
     };
   }
+  if (baselineProbe.state === "unborn") {
+    return { action: "commit" };
+  }
 
   const changed = hasWorkspaceChangesOrNewCommit(
     String(statusResult.stdout ?? ""),
-    baseline,
+    baselineProbe.head,
     finalHead,
   );
   if (changed) return { action: "commit" };
@@ -1116,11 +1158,7 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           // below run against this repository, so a configured override is used
           // for all of them.
           const commitRepo = config.autoCommit ? resolveCommitRepo(config) : undefined;
-          const baselineResult = commitRepo
-            ? spawnSync(GIT_BIN, ["rev-parse", "HEAD"], { cwd: commitRepo, encoding: "utf-8" })
-            : undefined;
-          const baselineHead = String(baselineResult?.stdout ?? "").trim();
-          const baseline = baselineResult?.status === 0 && baselineHead ? baselineHead : undefined;
+          const baseline = commitRepo ? probeHead(commitRepo) : undefined;
           const result = await runCodex(msg, taskConfig, config.taskTimeoutMs ?? 30 * 60 * 1000, {
             flairPublisher: flairPub2,
             onStall: () => { notify(msg.from, `Task stalled: no Codex output for ${Math.round((config.watchdogTimeoutMs ?? 300000) / 60000)}m — process killed. Please resend the task.`); },
@@ -1144,9 +1182,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           }
           // Auto-commit after a mail task. Unlike the Flair task path above,
           // the mail path detects and aborts an interrupted rebase in the
-          // commit repository, keeps the pre-task baseline as the comparison
-          // (a restored HEAD different from it causes a commit attempt), and
-          // probes Git status and HEAD before deciding.
+          // commit repository, keeps the pre-task HEAD as the comparison when
+          // the repository has one (a restored HEAD different from it causes a
+          // commit attempt), and probes Git status and HEAD before deciding.
           if (config.autoCommit && commitRepo !== undefined) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }

@@ -1,0 +1,1 @@
+- **The first mail task in a repository with no commits is committed.**

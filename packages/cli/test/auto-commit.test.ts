@@ -10,6 +10,7 @@ import {
   detectStaleRebase,
   evaluateMailAutoCommitGate,
   hasWorkspaceChangesOrNewCommit,
+  probeHead,
   publishTaskOutcomeEvent,
   resolveCommitRepo,
   runAutoCommit,
@@ -372,6 +373,102 @@ describe("evaluateMailAutoCommitGate", () => {
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("evaluateMailAutoCommitGate unborn HEAD", () => {
+  /** A repository with no commits on `main`, in a fresh temp dir. */
+  function initUnbornRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-unborn-"));
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "agent-a@example.com");
+    git(dir, "config", "user.name", "agent-a");
+    return dir;
+  }
+
+  test("commits the first change when the repository has no commits", async () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      writeFileSync(join(repo, "file.txt"), "first\n");
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({ action: "commit" });
+      expect(baseline).toEqual({ state: "unborn" });
+
+      // Run the mail commit wrapper with a tps stand-in that uses real git.
+      const tpsDir = mkdtempSync(join(tmpdir(), "cli835-tps-"));
+      try {
+        const tpsScript = join(tpsDir, "tps");
+        writeFileSync(
+          tpsScript,
+          [
+            "#!/usr/bin/env bash",
+            "set -e",
+            'REPO=""; MSG=""',
+            'while [ $# -gt 0 ]; do',
+            '  case "$1" in',
+            '    --repo) REPO="$2"; shift 2;;',
+            '    --message) MSG="$2"; shift 2;;',
+            '    --author|--branch) shift 2;;',
+            '    *) shift;;',
+            "  esac",
+            "done",
+            'git -C "$REPO" add -A',
+            'git -C "$REPO" commit -q -m "$MSG"',
+          ].join("\n"),
+        );
+        chmodSync(tpsScript, 0o755);
+        await runAutoCommit(
+          { workspace: repo },
+          { publishEvent: mock(async () => {}) },
+          {
+            taskId: "task-1",
+            branchName: "task/task-1",
+            commitMessage: "first task",
+            authorName: "agent-a",
+            authorEmail: "agent-a@example.com",
+          },
+          { tpsCommand: tpsScript },
+        );
+        expect(git(repo, "rev-list", "--count", "HEAD").trim()).toBe("1");
+        expect(git(repo, "show", "HEAD:file.txt")).toBe("first\n");
+      } finally {
+        rmSync(tpsDir, { recursive: true, force: true });
+      }
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unborn repository with no changes is clean", () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "clean",
+        message: "Git status is clean and the repository has no commits — skipping autoCommit",
+      });
+      expect(baseline).toEqual({ state: "unborn" });
+      const head = spawnSync(GIT, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+      expect(head.status).toBe(1);
+      expect(String(head.stdout ?? "").trim()).toBe("");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a corrupted HEAD is an indeterminate skip naming the probe", () => {
+    const repo = initUnbornRepo();
+    try {
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/bad..name\n");
+      const baseline = probeHead(repo);
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit",
+      });
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
     }
   }, 30_000);
 });
