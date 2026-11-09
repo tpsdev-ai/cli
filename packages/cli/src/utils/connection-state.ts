@@ -114,7 +114,7 @@ export interface HostStatePathListing {
 
 /** Connections directory `*.json` paths. A `host.json` object with neither
  *  `pid` nor `branch` is treated as branch state and skipped. A listing
- *  error other than ENOENT is reported, as is a stale temp file left in place. */
+ *  error other than ENOENT is reported. */
 export function listHostStatePaths(): HostStatePathListing {
   const dir = connectionsDir();
   const sweep = sweepStaleConnectionTemps();
@@ -153,13 +153,14 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
 
 /**
  * Write a file atomically: a uniquely named temp file in the same directory is
- * created exclusively with the existing record's mode when one exists, else
- * `mode`, written through its descriptor, synced, and renamed over the target, so a write or rename failure leaves the previous
- * record intact. The parent directory sync after the rename is best-effort:
- * directory fsync is not supported everywhere, and the rename is already
- * atomic for readers. If a temp-file operation or rename throws, the helper
- * attempts to close any still-open descriptor and remove the temp file, then
- * rethrows the original error; cleanup errors are swallowed.
+ * created exclusively with an existing regular record's mode when one exists,
+ * else `mode`, written through its descriptor, synced, and renamed over the
+ * target, so a write or rename failure leaves the previous record intact. The
+ * parent directory sync after the rename is best-effort: directory fsync is
+ * not supported everywhere, and the rename is already atomic for readers. If a
+ * temp-file operation or rename throws, the helper attempts to close any
+ * still-open descriptor and remove the temp file, then rethrows the original
+ * error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
   // A sweep failure never blocks the write: the entry is left in place.
