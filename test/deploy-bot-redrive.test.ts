@@ -1,5 +1,5 @@
 import { afterEach, beforeAll, beforeEach, expect, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { FlairClient } from "../packages/cli/src/utils/flair-client.js";
@@ -57,3 +57,23 @@ for (const index of [0, 1]) {
     expect(await bot.pollNewMail()).toEqual([]);
   });
 }
+
+test("packaged deploy bot leaves non-message files in new/ beside promoted mail", async () => {
+  const newDir = join(ROOT, "new");
+  mkdirSync(newDir, { recursive: true });
+  const envelope = buildSignedEnvelope("flint", BOT, "status", { flint: SEED });
+  writeFileSync(join(newDir, ".x.json"), "{ not mail");
+  writeFileSync(join(newDir, "message.txt"), "not mail");
+  writeFileSync(join(newDir, "message.json"), JSON.stringify({
+    id: "message", from: "flint", to: BOT, body: JSON.stringify(envelope),
+  }));
+
+  const rows = await bots[1]![1].pollNewMail();
+
+  expect(rows.map((row) => row.body)).toEqual(["status"]);
+  expect(readdirSync(newDir).sort()).toEqual([".x.json", "message.txt"]);
+  expect(readFileSync(join(newDir, ".x.json"), "utf8")).toBe("{ not mail");
+  expect(readFileSync(join(newDir, "message.txt"), "utf8")).toBe("not mail");
+  expect(existsSync(join(ROOT, "cur", "message.json"))).toBe(true);
+  expect(readdirSync(join(ROOT, "dlq"))).toEqual([]);
+});
