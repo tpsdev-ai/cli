@@ -22,6 +22,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -79,6 +80,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -140,6 +142,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
@@ -204,6 +207,7 @@ jobs:
     name: Publish npm packages
     needs: [build-binaries, smoke-compiled-binary]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # contents: read — actions/checkout (the artifact downloads are same-run,
     # so they need no scope of their own).
     # id-token: write — the ONLY grant in this workflow that mints an OIDC
@@ -536,6 +540,7 @@ jobs:
     # release advertises a version `npm install` will not yet give you.
     needs: [build-binaries, publish-packages]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # contents: write — the one repository write in this workflow, and the step
     # that needs it is "Publish checksums to GitHub release":
     # softprops/action-gh-release creates the release and attaches the binaries
