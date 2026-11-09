@@ -15,7 +15,7 @@ export type HeadProbe =
   | { state: "unborn" }
   | {
       state: "indeterminate";
-      detail: "failed" | "returned no output" | "returned a ref outside refs/heads/" | "found no commit on detached HEAD" | "found a ref without a commit";
+      detail: "failed" | "returned no output" | "returned a ref outside refs/heads/" | "found no commit on detached HEAD" | "found a ref without a commit" | "found a ref after HEAD did not resolve";
       probe: string;
     };
 
@@ -58,6 +58,9 @@ export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): 
 
   const branchRef = runSync(GIT_BIN, ["show-ref", "--verify", "-q", branch], { cwd: repo, encoding: "utf-8" });
   if (quietExitOne(branchRef)) return { state: "unborn" };
+  if (branchRef.status === 0) {
+    return { state: "indeterminate", detail: "found a ref after HEAD did not resolve", probe: `git show-ref --verify -q ${branch}` };
+  }
 
   return { state: "indeterminate", detail: "failed", probe: `git show-ref --verify -q ${branch}` };
 }

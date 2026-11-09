@@ -451,6 +451,38 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
+  test("a branch ref created before show-ref has a specific indeterminate reason", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--orphan", "topic");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      const branch = "refs/heads/topic";
+      let refCreations = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === `show-ref --verify -q ${branch}`) {
+          git(repo, "update-ref", branch, commit);
+          refCreations++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found a ref after HEAD did not resolve",
+        probe: `git show-ref --verify -q ${branch}`,
+      });
+      git(repo, "update-ref", "-d", branch);
+      expect(evaluateMailAutoCommitGate(repo, { state: "unborn" }, { runSync })).toEqual({
+        action: "skip",
+        message: `Change check could not run: git show-ref --verify -q ${branch} (after task) found a ref after HEAD did not resolve — skipping autoCommit`,
+      });
+      expect(refCreations).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("a clean orphan branch beside a committed branch reports an unborn HEAD", () => {
     const repo = initRepo();
     try {
