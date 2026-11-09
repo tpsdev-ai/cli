@@ -52,7 +52,7 @@ jobs:
     needs: audit
     if: ${{ failure() && needs.audit.result == 'failure' }}
     permissions:
-      issues: write # Report audit failure opens or comments on the tracking issue
+      issues: write # Notification attempts to open or comment on the tracking issue
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

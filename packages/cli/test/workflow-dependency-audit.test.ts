@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import yaml from "js-yaml";
 
-interface Step {
+interface Step extends Record<string, unknown> {
   id?: string;
   uses?: string;
   with?: Record<string, unknown>;
@@ -15,7 +15,7 @@ interface Step {
   "continue-on-error"?: unknown;
 }
 
-interface Job {
+interface Job extends Record<string, unknown> {
   steps: Step[];
   permissions: Record<string, string>;
   needs?: string;
@@ -51,10 +51,6 @@ function notificationScript(): string {
   return notify.run;
 }
 
-function auditSteps(steps: Step[]) {
-  return steps.map(({ uses, with: options, run }) => ({ uses, with: options, run }));
-}
-
 describe("scheduled dependency audit (cli#332)", () => {
   test("daily schedule and manual dispatch", () => {
     expect(Object.keys(scheduled.on).sort()).toEqual(["schedule", "workflow_dispatch"]);
@@ -66,11 +62,15 @@ describe("scheduled dependency audit (cli#332)", () => {
   });
 
   test("audit setup and checks match the PR audit in order", () => {
-    expect(auditSteps(scheduled.jobs.audit.steps.slice(2)))
-      .toEqual(auditSteps(source.jobs.audit.steps.slice(1)));
+    expect(scheduled.jobs.audit.steps.slice(2)).toEqual(source.jobs.audit.steps.slice(1));
     const checkout = scheduled.jobs.audit.steps[0];
-    expect(checkout.uses).toBe(source.jobs.audit.steps[0].uses);
-    expect(checkout.with).toEqual({ ...source.jobs.audit.steps[0].with, ref: "main" });
+    expect(checkout).toEqual({
+      ...source.jobs.audit.steps[0],
+      with: { ...source.jobs.audit.steps[0].with, ref: "main" },
+    });
+    for (const field of ["runs-on", "env", "defaults", "timeout-minutes"]) {
+      expect(scheduled.jobs.audit[field]).toEqual(source.jobs.audit[field]);
+    }
     const capture = scheduled.jobs.audit.steps[1];
     expect(capture.id).toBe("main");
     expect(capture.run).toBe('git rev-parse HEAD | sed \'s/^/sha=/\' >> "$GITHUB_OUTPUT"');

@@ -1,1 +1,1 @@
-- **Run dependency audits daily on main and open or update one issue on failure.**
+- **Audit main daily; on failure, attempt to comment on or open the tracking issue, leaving the run failed if listing or writing fails.**
