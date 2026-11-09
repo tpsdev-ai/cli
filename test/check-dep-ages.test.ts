@@ -1675,6 +1675,17 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
 });
 
 const npmRequire = createRequire(import.meta.url);
+const npmAvailable = Bun.which("npm") !== null;
+
+it("validates TPS_TEST_REQUIRE_NPM and requires npm on PATH when set", () => {
+  const value = process.env.TPS_TEST_REQUIRE_NPM;
+  if (value !== undefined && value !== "1") {
+    throw new Error(`invalid TPS_TEST_REQUIRE_NPM=${JSON.stringify(value)}; expected unset or 1`);
+  }
+  if (value === "1" && !npmAvailable) {
+    throw new Error("TPS_TEST_REQUIRE_NPM=1 requires executable npm on PATH");
+  }
+});
 
 /** Locate a module npm itself bundles, preferring npm's global root. */
 function npmBundledModule(name: string): string {
@@ -1745,7 +1756,7 @@ describe("the workflow guard bounds global tool versions", () => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
   }, 5_000);
 
-  it("accepts tool@1.2.3 and checks every refused spec against npm's own parser", () => {
+  it.skipIf(!npmAvailable)("accepts tool@1.2.3 and checks every refused spec against npm's own parser (needs npm on PATH)", () => {
     expect(assertNpmCiLockfilesRead(workflowStep("npm install -g tool@1.2.3"), READ_TRACKED, WORKFLOW)).toBe(0);
     const npa = npmRequire(npmBundledModule("npm-package-arg")) as {
       resolve: (name: string, spec: string) => { type: string };
@@ -1762,7 +1773,7 @@ describe("the workflow guard bounds global tool versions", () => {
 });
 
 describe("the workflow guard uses npm's own option parser", () => {
-  it("shows the expanded registry arguments change global and prefix", () => {
+  it.skipIf(!npmAvailable)("shows the expanded registry arguments change global and prefix (needs npm on PATH)", () => {
     const expanded = runWithStubNpm("npm install -g tool@1.2.3 --registry=https://a/$REG", {
       REG: "x --global=false --prefix=plugins/unread tool@latest",
     });
