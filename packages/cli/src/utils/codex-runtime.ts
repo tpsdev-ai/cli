@@ -421,12 +421,12 @@ export type MailAutoCommitDecision =
  * rebase, not necessarily this task's.
  * A failed probe is indeterminate and yields a skip with its outcome reported,
  * and so does a final HEAD that differs from the restored one. An unborn HEAD
- * (a repository with no commits) has no pre-task value to compare, so the
- * workspace status decides: changes commit the repository's first commit, and
- * a clean status is clean. For a commit baseline, the clean decision
- * establishes exactly this: Git status is clean and the final HEAD matches its
- * pre-task value — `git status --porcelain` omits ignored files, and equal
- * HEADs do not rule out a commit that was later reset.
+ * (a repository with no commits) has no pre-task value to compare, so workspace
+ * changes or a new commit select the commit path, and neither is clean. For a
+ * commit baseline, the clean decision establishes exactly this: Git status is
+ * clean and the final HEAD matches its pre-task value — `git status --porcelain`
+ * omits ignored files, and equal HEADs do not rule out a commit that was later
+ * reset.
  */
 export function evaluateMailAutoCommitGate(
   repo: string,
