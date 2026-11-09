@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import {
   appendFileSync,
   existsSync,
@@ -209,6 +210,7 @@ function checkQueueAge(workspace: string): string[] {
 
   const now = Date.now();
   const stale = readdirSync(inbox)
+    .filter(isMailboxMessageFile)
     .map((name) => join(inbox, name))
     .filter((path) => existsSync(path))
     .filter((path) => now - statSync(path).mtimeMs > 60 * 60 * 1000);

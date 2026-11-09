@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -178,7 +179,7 @@ export async function healthMail(teamId: string, senderId: string): Promise<bool
   const mailRoot = resolveAgentMailRoot(teamId);
   const freshDir = join(mailRoot, "new");
   mkdirSync(freshDir, { recursive: true });
-  const before = new Set(readdirSync(freshDir).filter((f) => f.endsWith(".json")));
+  const before = new Set(readdirSync(freshDir).filter(isMailboxMessageFile));
 
   // Sign the probe as the CLI's own identity (the same signing path
   // `tps mail send` uses). With no key this refuses and the check reports
@@ -196,7 +197,7 @@ export async function healthMail(teamId: string, senderId: string): Promise<bool
   // Use the recipient's actual verification and promotion policy. Only the
   // newly written probe counts, and a wrong Flair key fails the health check.
   try {
-    const files = readdirSync(freshDir).filter((f) => f.endsWith(".json") && !before.has(f));
+    const files = readdirSync(freshDir).filter((f) => isMailboxMessageFile(f) && !before.has(f));
     if (files.length !== 1) return false;
     return (await promote(teamId, join(freshDir, files[0]!))).ok;
   } catch {

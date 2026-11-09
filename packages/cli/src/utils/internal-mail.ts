@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -71,7 +72,7 @@ export function checkInternalMessages(officeDir: string, agent: string): Interna
   const safe = sanitizeIdentifier(agent);
   if (!agent || safe !== agent) throw new Error(`Invalid agent id: ${agent}`);
   const inbox = getInternalInbox(officeDir, agent);
-  const files = readdirSync(inbox.fresh).filter((f) => f.endsWith(".json"));
+  const files = readdirSync(inbox.fresh).filter(isMailboxMessageFile);
   const messages: InternalMessage[] = [];
 
   for (const f of files) {

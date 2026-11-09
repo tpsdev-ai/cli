@@ -57,7 +57,7 @@ import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
-import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath } from "@tpsdev-ai/agent";
+import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath, isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
 import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
@@ -1869,10 +1869,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
 
     async function processNewFile(recipient: string, filePath: string, source?: "rescan"): Promise<void> {
       if (!isLive() || seenFiles.has(filePath)) return;
-      // This plugin skips dot-files in new/ (scratch/editor files; the agent
-      // package's reader skips them too): no path here — watcher, startup sweep
-      // or rescan — promotes or dead-letters one.
-      if (basename(filePath).startsWith(".")) return;
+      if (!isMailboxMessageFile(basename(filePath))) return;
       const identity = sourceIdentity(filePath);
       if (identity === undefined) return;
       if ((transientFailures.get(identity)?.failures ?? 0) >= MAX_NEW_FILE_TRANSIENT_FAILURES) return;

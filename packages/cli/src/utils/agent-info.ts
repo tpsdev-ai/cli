@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 /**
  * Agent info enrichment — reads workspace files and mail stats
  * to provide richer context for roster show and review commands.
@@ -76,7 +77,7 @@ export function getMailStats(agentId: string): MailStats {
   try {
     const inbox = getInbox(agentId);
     const unread = existsSync(inbox.fresh)
-      ? readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length
+      ? readdirSync(inbox.fresh).filter(isMailboxMessageFile).length
       : 0;
     const read = existsSync(inbox.cur)
       ? readdirSync(inbox.cur).filter((f) => f.endsWith(".json")).length

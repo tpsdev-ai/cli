@@ -406,6 +406,22 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(promoteSpy).toHaveBeenCalledTimes(1 + MAX_NEW_FILE_TRANSIENT_FAILURES);
   });
 
+  it("startup leaves a dot-file beside a promoted message (cli#870)", async () => {
+    const scratch = join(newDir, ".x.json");
+    fs.writeFileSync(scratch, "{ not mail");
+    const path = plant("startup-with-dotfile");
+
+    await boot();
+
+    expect(await until(() => dispatches.length === 1)).toBe(true);
+    expect(dispatches).toEqual(["startup-with-dotfile"]);
+    expect(fs.readdirSync(newDir)).toEqual([".x.json"]);
+    expect(fs.readFileSync(scratch, "utf8")).toBe("{ not mail");
+    expect(promoteSpy.mock.calls.map((c: any[]) => String(c[1]))).toEqual([path]);
+    expect(fs.existsSync(join(root, "recipient", "dlq", ".x.json"))).toBe(false);
+    expect(logs.filter((line) => line.includes("promoted by rescan"))).toEqual([]);
+  });
+
   it("skips dot-files in new/ while promoting a missed message", async () => {
     await boot();
     const scratch = join(newDir, ".scratch-editor.json");
@@ -414,7 +430,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(await until(() => dispatches.length === 1, intervalMs * 2)).toBe(true);
     await sleep(intervalMs);
     expect(dispatches).toEqual(["missed-with-dotfile"]);
-    expect(fs.existsSync(scratch)).toBe(true);
+    expect(fs.readFileSync(scratch, "utf8")).toBe("{ not mail");
     expect(promoteSpy.mock.calls.map((c: any[]) => String(c[1]))).toEqual([path]);
     expect(fs.existsSync(join(root, "recipient", "dlq"))
       ? fs.readdirSync(join(root, "recipient", "dlq")).filter((f) => f.includes("scratch")) : []).toEqual([]);
@@ -429,7 +445,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     const path = plant("watched-after-dotfile");
     expect(await until(() => dispatches.length === 1)).toBe(true);
     await sleep(intervalMs);
-    expect(fs.existsSync(scratch)).toBe(true);
+    expect(fs.readFileSync(scratch, "utf8")).toBe("{ not mail");
     expect(promoteSpy.mock.calls.map((c: any[]) => String(c[1]))).toEqual([path]);
   });
 
