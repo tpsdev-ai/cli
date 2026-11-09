@@ -196,10 +196,12 @@ write_pids_file() {
   chmod 644 "$PIDS_FILE"
 }
 
-# cli#357 r3 — bounded, idempotent shutdown. Signal the tracked children, then
-# poll for them up to SHUTDOWN_GRACE_SECONDS; KILL whatever is left, reap it,
-# clear the tracked list and only then remove the PID file. A second call
-# therefore signals no PID: it sees an empty list.
+# cli#357 r4 — a ~10 s TERM grace (counted 0.1 s sleeps), then a KILL attempt.
+# Signal the tracked children, poll for them against SHUTDOWN_GRACE_SECONDS,
+# attempt KILL for every tracked PID still alive, clear the tracked list and
+# only then remove the PID file. A second call therefore signals no PID: it
+# sees an empty list. `wait` reaps this shell's children only, so neither step
+# proves that every survivor is reaped.
 SHUTDOWN_GRACE_SECONDS=10
 
 shutdown_children() {
@@ -247,6 +249,18 @@ shutdown_children() {
   cleanup_pids_file
 }
 
+# cli#357 r4 — TEST-ONLY seam: when TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH is
+# set, pause briefly so the launched child can start, then send ourselves that
+# signal. The regression calls this between a child's background launch and the
+# tracking of its PID, so the signal always lands inside the window; it does
+# nothing when the variable is unset.
+test_signal_after_launch() {
+  if [[ -n "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" ]]; then
+    sleep 0.5
+    kill -"$TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" "$$"
+  fi
+}
+
 # cli#357 r3 — a signal that arrives between the launch and the moment the PID
 # is tracked would be handled with an empty list, so the handler records it
 # instead and the loop acts on it right after registration.
@@ -267,10 +281,10 @@ on_signal() {
 trap 'on_signal TERM' SIGTERM
 trap 'on_signal INT' SIGINT
 # An explicit exit, an errexit failure in the supervised work or a handled
-# signal calls shutdown_children: TERM, a poll of up to SHUTDOWN_GRACE_SECONDS,
-# then KILL for any survivor, and the PID file is removed last. The seating
-# loop stops earlier iterations' children the same way before an explicit
-# exit, so that path does not depend on this trap.
+# signal calls shutdown_children: a ~10 s TERM grace (counted sleeps), then a
+# KILL attempt, and the PID file is removed last. The seating loop stops
+# earlier iterations' children the same way before an explicit exit, so that
+# path does not depend on this trap.
 trap 'shutdown_children TERM' EXIT
 
 kill_stale_pids
@@ -446,6 +460,9 @@ for ((i=0; i<count; i++)); do
     # with the passwd HOME for the same user, so both sites agree.
     defer_signals=1
     su -m -s /bin/bash "$user" -c "HOME='$AGENT_HOME' exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
+    # cli#357 r4 — TEST-ONLY: the regression sets the variable, so the signal
+    # lands between the background launch and the tracking of its PID.
+    test_signal_after_launch
   else
     # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
     # with NO nono isolation; that path is deleted. If nono cannot engage (it is
