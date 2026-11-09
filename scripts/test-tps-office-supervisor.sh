@@ -94,41 +94,163 @@ else
   bad "test.yml does not invoke scripts/test-tps-office-supervisor.sh"
 fi
 
-# cli#352 r7 (Sherlock): every refusal that fires INSIDE the agent seating loop
-# must stop the agents already launched before it exits — a team is either whole
-# or absent, never partial. `write_pids_file` runs only AFTER the loop and the
-# EXIT trap only removes the file, so an exit that skips `shutdown_children`
-# orphans earlier sandboxed agents with nothing durable to reap them. Asserted
-# over the SOURCE (not a fixture for one branch) so a new exit cannot
-# reintroduce the class.
-loop_start="$(grep -n 'for ((i=0; i<count; i++)); do' "$sup" | head -n1 | cut -d: -f1)"
-loop_end=""
-[ -n "$loop_start" ] && loop_end="$(awk -v s="$loop_start" 'NR>s && /^done$/ { print NR; exit }' "$sup")"
-if [ -z "$loop_start" ] || [ -z "$loop_end" ]; then
-  bad "could not bound the agent seating loop in $sup — cannot assert the all-or-nothing refusal invariant"
-else
-  unguarded="$(awk -v s="$loop_start" -v e="$loop_end" '
-    { L[NR]=$0 }
-    END {
-      for (j=s; j<e; j++) {
-        if (L[j] !~ /^[[:space:]]*exit[[:space:]]+1[[:space:]]*$/) continue
-        guarded=0
-        for (k=j-1; k>=s; k--) {
-          l=L[k]
-          if (index(l,"shutdown_children")>0) { guarded=1; break }
-          if (l ~ /^[[:space:]]*(fi|else|done|exit|[}])/) break
-          if (l ~ /^[[:space:]]*(if|elif)[[:space:]]/) break
-          if (l ~ /\|[[:space:]]*\{[[:space:]]*$/) break
-        }
-        if (!guarded) print j
+# cli#357: reject termination shapes the source control cannot verify.
+assert_seating_shutdown() { # <source>
+  awk '
+    function word(line, name) {
+      return line ~ ("(^|[^[:alnum:]_])" name "([^[:alnum:]_]|$)")
+    }
+    function unknown(line, continued, commands) {
+      commands=line
+      gsub(/\[\[.*\]\]/, "TEST", commands)
+      return word(line, "eval") || word(line, "source") ||
+        commands ~ /(^|[;&|({])[[:space:]]*((if|elif|then|else|!)[[:space:]]+)*(exec|builtin|command|\.)[[:space:]]/ ||
+        line ~ /^[[:space:]]*((if|elif|then|else|!)[[:space:]]+)*["\047]?\$/ ||
+        commands ~ /[;&|][[:space:]]*[^[:space:]=]*["\047]?\$/ ||
+        line ~ /\$\([[:space:]]*["\047]?\$/ ||
+        line ~ /^[[:space:]]*((if|elif|then|else|!)[[:space:]]+)*[^[:space:]=]+\$/ ||
+        (line ~ /\\[[:space:]]*$/ && line !~ /^[[:space:]]*echo[[:space:]]/ && !continued) ||
+        line ~ /<<|`/ || line ~ /\(\)[[:space:]]*\{/
+    }
+    function fail(line, reason) {
+      print "line " line ": " reason ": " L[line]
+      failed=1
+    }
+    function guarded(line, k, text) {
+      for (k=line-1; k>s; k--) {
+        text=L[k]
+        if (text ~ /^[[:space:]]*shutdown_children[[:space:]]+TERM[[:space:]]*$/) return 1
+        if (text ~ /^[[:space:]]*(fi|else|done|exit|return|[}])/) break
+        if (text ~ /^[[:space:]]*(if|elif)[[:space:]]/ || text ~ /[;&|{}]/) break
       }
-    }' "$sup")"
-  if [ -z "$unguarded" ]; then
-    ok "every exit in the agent seating loop stops the launched agents first (all-or-nothing)"
-  else
-    bad "seating-loop refusal(s) exit without shutdown_children TERM, orphaning earlier agents: line(s) $(printf '%s' "$unguarded" | tr '\n' ' ')"
-  fi
+      return 0
+    }
+    {
+      L[NR]=$0
+      if (L[NR] ~ /^[[:space:]]*#/) L[NR]=""
+      continuation[NR]=(L[NR-1] ~ /\\[[:space:]]*$/ &&
+        (L[NR-1] ~ /^[[:space:]]*echo[[:space:]]/ || continuation[NR-1]))
+      if ($0 == "for ((i=0; i<count; i++)); do") { s=NR; starts++ }
+      if (s && NR>s && $0 == "done") { e=NR; ends++ }
+      definition_shape=L[NR]
+      gsub(/=[[:space:]]*\([[:space:]]*\)/, "=ARRAY", definition_shape)
+      if ($0 ~ /^[[:space:]]*(function[[:space:]]+)?[[:alnum:]_]+[[:space:]]*\(\)[[:space:]]*\{/) {
+        if (fn != "") fail(NR, "unanalysable function boundary")
+        name=$0
+        sub(/^[[:space:]]*function[[:space:]]+/, "", name)
+        sub(/^[[:space:]]*/, "", name)
+        sub(/[[:space:]]*\(.*/, "", name)
+        fn=name
+        definition=NR
+        functions[fn]=1
+      } else if (L[NR] ~ /^[[:space:]]*function[[:space:]]/ || definition_shape ~ /\([[:space:]]*\)/) {
+        fail(NR, "unanalysable function definition")
+      }
+      if (fn != "") {
+        text=L[NR]
+        if (NR == definition) sub(/^[^{]*\{/, "", text)
+        normalized=text
+        gsub(/["\047\\]/, "", normalized)
+        body[fn]=body[fn] "\n" normalized
+        if (unknown(text, continuation[NR]) || unknown(normalized)) opaque[fn]=1
+        if ($0 ~ /^}/ || (NR == definition && $0 ~ /\{.*}[[:space:]]*$/)) fn=""
+      } else if ($0 ~ /^}/) fail(NR, "unanalysable function boundary")
+    }
+    END {
+      if (!s || !e || starts != 1 || ends != 1) {
+        print "could not bound the agent seating loop"
+        exit 1
+      }
+      if (fn != "") fail(NR, "unanalysable function boundary")
+      for (name in functions) {
+        if (word(body[name], "exit")) exits[name]=1
+        if (name in opaque) exits[name]=1
+      }
+      changed=1
+      while (changed) {
+        changed=0
+        for (name in functions) for (callee in exits) {
+          if (word(body[name], callee)) {
+            if (!(name in exits)) { exits[name]=1; changed=1 }
+            if ((callee in opaque) && !(name in opaque)) { opaque[name]=1; changed=1 }
+          }
+        }
+      }
+      status="([[:space:]]+([0-9]+|\\$[[:alpha:]_][[:alnum:]_]*|\"\\$[[:alpha:]_][[:alnum:]_]*\"))?"
+      direct="exit" status
+      for (j=s+1; j<e; j++) {
+        text=L[j]
+        if (text ~ /^[[:space:]]*$/) continue
+        normalized=text
+        gsub(/["\047\\]/, "", normalized)
+        if (unknown(text, continuation[j]) || unknown(normalized) || word(normalized, "return")) {
+          fail(j, "unanalysable termination shape")
+          continue
+        }
+        terminates=word(normalized, "exit")
+        recognized=(text ~ ("^[[:space:]]*" direct "[[:space:]]*$") ||
+          text ~ ("^[[:space:]]*[[:alnum:]_]+[[:space:]]*&&[[:space:]]*" direct "[[:space:]]*$") ||
+          text ~ ("^[[:space:]]*\\{[[:space:]]*(:|echo[[:space:]]+[^;&|{}]+|shutdown_children TERM);[[:space:]]*" direct ";[[:space:]]*}[[:space:]]*$"))
+        for (name in exits) if (word(normalized, name)) {
+          terminates=1
+          if (name in opaque) { recognized=0; break }
+          if (text ~ ("^[[:space:]]*" name "([[:space:]]+[^;&|(){}]+)?[[:space:]]*$")) recognized=1
+          else recognized=0
+        }
+        if (!terminates) continue
+        if (!recognized) fail(j, "unanalysable termination shape")
+        else if (!guarded(j) && text !~ ("^[[:space:]]*\\{[[:space:]]*shutdown_children TERM;[[:space:]]*" direct ";[[:space:]]*}[[:space:]]*$")) fail(j, "termination without shutdown_children TERM")
+      }
+      exit failed ? 1 : 0
+    }
+  ' "$1"
+}
+
+if analysis="$(assert_seating_shutdown "$sup")"; then
+  ok "seating-loop termination forms have verified shutdown guards"
+else
+  bad "seating-loop source control: $analysis"
 fi
+
+seating_fixtures="$(mktemp -d)"
+check_seating_fixture() { # <label> <expected:pass|unguarded|unanalysable> <loop body> [<helpers>]
+  local label="$1" expected="$2" body="$3" helpers="${4:-}" result rc
+  printf '%s\n%s\n%s\n%s\n' "$helpers" 'for ((i=0; i<count; i++)); do' "$body" 'done' >"$seating_fixtures/source.sh"
+  result="$(assert_seating_shutdown "$seating_fixtures/source.sh")"
+  rc=$?
+  case "$expected:$rc:$result" in
+    pass:0:) ok "$label" ;;
+    unguarded:1:*line*"termination without shutdown_children TERM"*) ok "$label" ;;
+    unanalysable:1:*line*"unanalysable "*) ok "$label" ;;
+    *) bad "$label (expected $expected, got status $rc: $result)" ;;
+  esac
+}
+for termination in 'exit 1' 'exit 2' "exit \"\$rc\"" exit; do
+  check_seating_fixture "guarded $termination passes" pass "$(printf '  shutdown_children TERM\n  %s' "$termination")"
+  check_seating_fixture "unguarded $termination fails" unguarded "  $termination"
+done
+for termination in 'cond && exit 1' '{ echo refusal; exit 1; }'; do
+  check_seating_fixture "unguarded $termination fails" unguarded "  $termination"
+  check_seating_fixture "guarded $termination passes" pass "$(printf '  shutdown_children TERM\n  %s' "$termination")"
+done
+check_seating_fixture "inline group shutdown passes" pass '  { shutdown_children TERM; exit 1; }'
+helper="$(printf 'refuse() {\n  exit 2\n}')"
+check_seating_fixture "unguarded exiting helper fails" unguarded '  refuse' "$helper"
+check_seating_fixture "guarded exiting helper passes" pass "$(printf '  shutdown_children TERM\n  refuse')" "$helper"
+check_seating_fixture "transitive exiting helper fails" unguarded '  indirect' "$(printf '%s\nindirect() {\n  refuse\n}' "$helper")"
+check_seating_fixture "unsupported helper declaration fails as unanalysable" unanalysable '  refuse' "$(printf '\047refuse\047() {\n  exit 2\n}')"
+check_seating_fixture "eval fails as unanalysable" unanalysable '  eval "exit 1"'
+check_seating_fixture "guarded eval fails as unanalysable" unanalysable "$(printf '  shutdown_children TERM\n  eval "exit 1"')"
+check_seating_fixture "opaque helper fails as unanalysable" unanalysable "$(printf '  shutdown_children TERM\n  refuse')" "$(printf 'refuse() {\n  eval "exit 1"\n}')"
+check_seating_fixture "joined-word exiting helper fails" unguarded '  refuse' "$(printf 'refuse() {\n  ex"it" 1\n}')"
+check_seating_fixture "return fails as unanalysable" unanalysable '  return'
+check_seating_fixture "compound return fails as unanalysable" unanalysable '  cond && return 1'
+check_seating_fixture "conditional shutdown is not a guard" unguarded "$(printf '  cond && shutdown_children TERM\n  exit 1')"
+check_seating_fixture "comment is not a guard" unguarded "$(printf '  # shutdown_children TERM\n  exit 1')"
+check_seating_fixture "split-word exiting helper fails as unanalysable" unanalysable '  refuse' "$(printf 'refuse() {\n  ex\\\nit 1\n}')"
+check_seating_fixture "dynamic command fails as unanalysable" unanalysable "  \"\$cmd\""
+check_seating_fixture "conditional dynamic command fails as unanalysable" unanalysable "  [[ \"\$ok\" ]] && \"\$cmd\""
+rm -rf "$seating_fixtures"
 
 # ── Part B — behavioural, fake nono ──────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then

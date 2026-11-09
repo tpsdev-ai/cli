@@ -1,0 +1,1 @@
+- **Seating-loop control** now fails on exit forms it cannot verify.
