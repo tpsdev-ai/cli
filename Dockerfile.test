@@ -12,7 +12,7 @@ WORKDIR /app
 # bun inside a nono sandbox sees an EMPTY environment (measured — see
 # packages/cli/test/launch-attestation-real-nono.test.ts), so the launcher's
 # socket locator never reaches a bun child.
-RUN apt-get update && apt-get install -y git jq procps nodejs && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y git jq procps nodejs curl && rm -rf /var/lib/apt/lists/*
 
 # Create fake home directory with OpenClaw structure
 RUN mkdir -p /home/tps/.openclaw/workspace-test \

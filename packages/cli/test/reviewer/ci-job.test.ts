@@ -140,24 +140,26 @@ describe("this repository's test job", () => {
     expect(t.steps.map((s: { index: number; workingDirectory: string; always: boolean }) => [s.index, s.workingDirectory, s.always])).toEqual([
       [4, ".", false],
       [6, ".", false],
-      [7, ".", false],
       [8, ".", false],
       [9, ".", false],
       [10, ".", false],
-      [11, "plugins/openclaw-tps-mail", false],
+      [11, ".", false],
       [12, ".", false],
-      [13, "plugins/openclaw-github-review", false],
-      [14, ".", true],
+      [13, "plugins/openclaw-tps-mail", false],
+      [14, ".", false],
+      [15, "plugins/openclaw-github-review", false],
+      [16, ".", true],
     ]);
     expect(t.steps[0].script).toBe("node scripts/check-dep-ages.mjs --ci");
-    expect(t.steps[1].script).toBe("sfw bun install --frozen-lockfile");
+    expect(t.steps[1].script).toBe("bash scripts/prefetch-socket-firewall.sh");
+    expect(t.steps[2].script).toBe("sfw bun install --frozen-lockfile");
     // cli#430: the monorepo suite runs with HOME at an empty mktemp dir, and the
     // step fails if that dir gains a `.tps`. Pinned whole: the planner hands the
     // script to bash unchanged, so every line of it is what the review build
     // runs. HOME is set inside the script, not by an env: key (the launcher owns
     // HOME and refuses a workflow that sets it), so the step carries no env.
-    expect(t.steps[4].name).toBe("Unit + integration tests, HOME-isolated (cli#430)");
-    expect(t.steps[4].script).toBe(
+    expect(t.steps[5].name).toBe("Unit + integration tests, HOME-isolated (cli#430)");
+    expect(t.steps[5].script).toBe(
       [
         `iso_home="$(mktemp -d)"`,
         `HOME="$iso_home" bun run test`,
@@ -168,16 +170,16 @@ describe("this repository's test job", () => {
         "",
       ].join("\n"),
     );
-    expect(t.steps[4].env).toEqual({});
+    expect(t.steps[5].env).toEqual({});
     // The planner maps an absent env: and an empty `env: {}` to the same {}, so
     // the planned env alone cannot show the step declares none: parse the
     // workflow the way the planner does and require no env key on the step.
     expect(suiteStepDeclaresEnv(readFileSync(resolve(repo, ".github", "workflows", "test.yml"), "utf8"))).toBe(false);
-    expect(t.steps[5].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts");
-    expect(t.steps[6].script).toContain("bun run test");
-    expect(t.steps[7].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts");
-    expect(t.steps[8].script).toContain("bun run test");
-    expect(t.steps[9].script).toBe("node scripts/check-test-reports.mjs");
+    expect(t.steps[6].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-tps-mail --ignore-scripts");
+    expect(t.steps[7].script).toContain("bun run test");
+    expect(t.steps[8].script).toBe("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/openclaw-github-review --ignore-scripts");
+    expect(t.steps[9].script).toContain("bun run test");
+    expect(t.steps[10].script).toBe("node scripts/check-test-reports.mjs");
   });
 
   test("the no-env check on the HOME-isolated step sees every YAML spelling of an env key", () => {
@@ -204,7 +206,6 @@ describe("this repository's test job", () => {
     expect(t.steps.map((s: { index: number; node: string }) => [s.index, s.node])).toEqual([
       [4, node],
       [6, node],
-      [7, node],
       [8, node],
       [9, node],
       [10, node],
@@ -212,6 +213,8 @@ describe("this repository's test job", () => {
       [12, node],
       [13, node],
       [14, node],
+      [15, node],
+      [16, node],
     ]);
   });
 
