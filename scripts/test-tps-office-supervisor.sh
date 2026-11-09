@@ -974,10 +974,12 @@ SH
     if [ "$rc4r" -ne 0 ]; then ok "fails-first: resolver reverted to the bare name → the C.1 setup now refuses (exit $rc4r)"; else bad "the bare-name supervisor still launched — the resolver control is untested"; fi
     if [ ! -e "$AGENT_MARKER" ]; then ok "nothing launched with the resolver reverted"; else bad "an agent launched with the bare-name resolver"; fi
 
-    # C.5 — cli#357 r4: bind to the session the supervisor launched (the PID it
-    # recorded in the PID file), record that session's id/name, signal that
+    # C.5 — cli#357 r4: bind to the session the supervisor launched: the one
+    # running session whose nono supervisor descends from the PID it recorded in
+    # the PID file (that PID is the launch above nono, as C.2 checks, so it is
+    # never nono's own supervisor_pid). Record that session's id/name, signal the
     # supervisor, then ask real `nono ps` whether that exact session is gone,
-    # along with its child and the PID file.
+    # along with its child and the PID file. Zero or several matches fail.
     seed
     rm -f "$AGENT_MARKER" "$AGENT_GIT_LOG"
     export AGENT_SLEEP=30
@@ -998,7 +1000,13 @@ SH
     done
     sess5=""
     for _ in $(seq 1 40); do
-      sess5="$(ps_as_agent 2>/dev/null | jq -c --argjson sup "${launched5:-0}" '[.[] | select(.status == "running" and .supervisor_pid == $sup)]' 2>/dev/null || true)"
+      sess5="[]"
+      if [ -n "$launched5" ]; then
+        sess5="$(ps_as_agent 2>/dev/null | jq -c '.[] | select(.status == "running")' 2>/dev/null | while IFS= read -r s; do
+          sp="$(printf '%s' "$s" | jq -r '.supervisor_pid // empty' 2>/dev/null)"
+          if [ -n "$sp" ] && is_descendant_of "$sp" "$launched5"; then printf '%s\n' "$s"; fi
+        done | jq -cs '.' 2>/dev/null || echo '[]')"
+      fi
       [ -n "$sess5" ] && [ "$sess5" != "[]" ] && break
       kill -0 "$sup5" 2>/dev/null || break
       sleep 0.5
@@ -1007,7 +1015,8 @@ SH
     sess5_name="$(printf '%s' "$sess5" | jq -r '.[0].name // empty' 2>/dev/null || true)"
     child5="$(printf '%s' "$sess5" | jq -r '.[0].child_pid // empty' 2>/dev/null || true)"
     sess5_sup="$(printf '%s' "$sess5" | jq -r '.[0].supervisor_pid // empty' 2>/dev/null || true)"
-    if [ "$up5" -eq 1 ] && [ -n "$launched5" ] && [ -n "$sess5_id" ] && [ -n "$child5" ]; then ok "real-nono stop: the session launched by $launched5 ($sess5_name $sess5_id) runs before the signal (agent $child5)"; else bad "real-nono stop: no recorded running session to signal (up=$up5 launched='${launched5:-}' sess='$sess5')"; fi
+    n_sess5="$(printf '%s' "$sess5" | jq 'length' 2>/dev/null || echo 0)"
+    if [ "$up5" -eq 1 ] && [ -n "$launched5" ] && [ "${n_sess5:-0}" -eq 1 ] && [ -n "$sess5_id" ] && [ -n "$child5" ]; then ok "real-nono stop: the session launched by $launched5 ($sess5_name $sess5_id) runs before the signal (agent $child5)"; else bad "real-nono stop: not exactly one running session under the recorded launch (up=$up5 launched='${launched5:-}' matches=${n_sess5:-0} sess='$sess5')"; fi
     kill -TERM "$sup5" 2>/dev/null || true
     rc5r=99; fin5=0
     for _ in $(seq 1 60); do
