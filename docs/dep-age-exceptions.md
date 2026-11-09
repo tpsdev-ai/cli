@@ -16,15 +16,17 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-A normalized `run:` line is install-like when the conservative match finds npm
-with an install subcommand, or npm followed by an expansion in the subcommand
-position. An install-like line must be a helper call to
+A `run:` line is joined with the next line when it ends in a backslash. The gate
+finds the npm word and the install subcommand after deleting quotes, backslashes
+and `$'` prefixes from the line. It accepts a helper call to
 `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
-literal `--via npm` or `--via sfw`, or an exact global tool install:
-`npm install -g <name>@<exact-version>` (also `--global`) with an optional
-`--registry=<https URL>`. Any other install-like line is refused: as a raw npm
-install, or as unclassifiable when it carries a shell indirection (`$`, a backtick,
-`eval`, `bash -c`, `sh -c`, `env`, `command`, `exec`, `xargs` or a brace group).
+literal `--via npm` or `--via sfw`, or a global tool install whose raw line is
+exactly `npm install -g` or `--global` followed by `<name>@<exact-version>` and
+an optional literal `--registry=https://...`; that line may not contain `$`, a
+backtick, a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`. Other
+npm install lines are refused. A non-comment line that carries a backtick and
+names npm is refused, except an `echo "..."` line whose backticks are all
+escaped and which has no `$(`; whole-line shell comments are not inspected.
 This is a conservative match, not bash-equivalent parsing: a command named
 entirely through variables with no literal npm token on the line, such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
 Installs inside other script files or composite actions are not inspected. Helper

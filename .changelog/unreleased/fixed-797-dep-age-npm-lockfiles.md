@@ -3,16 +3,19 @@
   without `resolved`, regardless of `inBundle`. It refuses versionless entries,
   URL/name/version disagreement, non-canonical registry URLs (including query
   strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
-  skipped. A workflow `run:` line is install-like when the conservative match
-  finds npm with an install subcommand, or npm followed by an expansion in the
-  subcommand position. An install-like line must be a helper call to
+  skipped. A workflow `run:` line is joined with the next when it ends in a backslash.
+  The gate finds the npm word and install subcommand after deleting quotes,
+  backslashes and `$'` prefixes. It accepts a helper call to
   `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory and literal
-  `--via npm` or `--via sfw`, or an exact global tool install:
-  `npm install -g <name>@<exact-version>` (also `--global`) with an optional
-  `--registry=<https URL>`. Any other install-like line is refused: as a raw npm
-  install, or as unclassifiable when it carries a shell indirection. The match is
-  conservative, not bash-equivalent: a command named entirely through variables
-  with no literal npm token on the line is not detected.
+  `--via npm` or `--via sfw`, or a global tool install whose raw line is exactly
+  `npm install -g|--global <name>@<exact-version>` with an optional literal
+  `--registry=https://...`; that line may not contain `$`, a backtick, a quote,
+  `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`. Other npm install lines
+  are refused. A non-comment line that carries a backtick and names npm is
+  refused, except an `echo "..."` line whose backticks are all escaped and which
+  has no `$(`; whole-line shell comments are not inspected.
+  The match is conservative, not bash-equivalent: a command named entirely
+  through variables with no literal npm token on the line is not detected.
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with
   lowercase names, the literal heartbeat pin substitution, helper calls and
   `GITHUB_ENV` echoes. Other helper-step lines are refused.

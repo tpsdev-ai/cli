@@ -111,6 +111,7 @@ describe("isExactVersionPin", () => {
       "workspace:*",
       "file:../dep",
       "npm:other@1.0.0",
+      "1.2.3-..",
     ]) {
       expect(isExactVersionPin(spec)).toBe(false);
     }
@@ -1393,7 +1394,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* npm install command words and helper calls; command words are normalized by deleting quotes, backslashes and `$'` prefixes, an install candidate must be an accepted helper call or an exact global tool install, and an install-like line carrying an expansion or indirection is refused. Script files and composite actions are not inspected. */
+/* npm install command words and helper calls. Lines are joined on backslash-newline continuations; the npm word and install subcommand are found after deleting quotes, backslashes and `$'` prefixes. An npm install line is accepted only as a tracked-lock helper call or an exact global tool install; otherwise it is refused, and a non-comment line that carries a backtick and names npm is refused unless it is an inert `echo` line. Script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
@@ -1591,6 +1592,10 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     "printf \"%s\" \"x\\\" # y\"; 'npm' ci",
     "printf '%s\\n' 'starts here\n'npm' ci",
     "$(case x in x) printf npm;; esac) ci",
+    'printf \'%s\' "\\`$(npm ci)\\`"',
+    "printf '%s' '\\`'; npm ci",
+    "printf '%s' '\\`' ; npm `printf i`",
+    "npm install -g tool@1.2.3 --registry=https://a/$REG",
   ])("refuses the install-like spelling: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
       new RegExp(`workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory`),
@@ -1602,7 +1607,15 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     try {
       const argvFile = join(stubDir, "argv");
       writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
-      for (const line of ["{npm,} ci", "$'npm' $'ci'", "npm </dev/null ci", 'printf "%s" "$(npm ci)"']) {
+      for (const [line, expected] of [
+        ["{npm,} ci", "ci"],
+        ["$'npm' $'ci'", "ci"],
+        ["npm </dev/null ci", "ci"],
+        ['printf "%s" "$(npm ci)"', "ci"],
+        ['printf \'%s\' "\\`$(npm ci)\\`"', "ci"],
+        ["printf '%s' '\\`'; npm ci", "ci"],
+        ["printf '%s' '\\`' ; npm `printf i`", "i"],
+      ] as const) {
         rmSync(argvFile, { force: true });
         const result = spawnSync("bash", ["-c", line], {
           env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
@@ -1610,8 +1623,33 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
           timeout: 5_000,
         });
         expect(result.status).toBe(0);
-        expect(readFileSync(argvFile, "utf8")).toBe("ci");
+        expect(readFileSync(argvFile, "utf8")).toBe(expected);
       }
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("shows real bash splits a registry expansion into separate npm options", () => {
+    const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+    try {
+      const argvFile = join(stubDir, "argv");
+      writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_ARGV"\n', { mode: 0o755 });
+      const result = spawnSync("bash", ["-c", "npm install -g tool@1.2.3 --registry=https://a/$REG"], {
+        env: {
+          ...process.env,
+          PATH: `${stubDir}:${process.env.PATH ?? ""}`,
+          STUB_ARGV: argvFile,
+          REG: "x --global=false --prefix=plugins/unread tool@latest",
+        },
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      expect(result.status).toBe(0);
+      expect(readFileSync(argvFile, "utf8").trim().split("\n")).toEqual([
+        "install", "-g", "tool@1.2.3", "--registry=https://a/x",
+        "--global=false", "--prefix=plugins/unread", "tool@latest",
+      ]);
     } finally {
       rmSync(stubDir, { recursive: true, force: true });
     }
@@ -1629,6 +1667,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     "npm install -g npm@^11.21.1",
     "npm install -g npm@latest",
     "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org extra",
+    "npm install -g tool@1.2.3-..",
   ])("refuses a global install outside the exact pinned shape: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
   }, 5_000);
