@@ -487,8 +487,8 @@ jobs:
         # everything, no profile at all is a named refusal, a bare-name resolver
         # refuses the same setup that otherwise launches (cli#352 r2/r3), and a
         # handled signal ends the session that supervisor launched (cli#357).
-        # TPS_TEST_REQUIRE_NONO=1 makes the real-nono half FAIL, not skip, when
-        # the mounted binary is absent or not the pinned version.
+        # TPS_TEST_REQUIRE_NONO=1 fails if root, jq, writable /workspace,
+        # nono, or the pinned nono version is missing.
         run: docker compose run --rm -e TPS_TEST_REQUIRE_NONO=1 -v "$HOME/.local/nono-pin-bookworm/nono:/usr/local/bin/nono:ro" test bash scripts/test-tps-office-supervisor.sh
 
       # cli#350 round 4e — the attested-launch POSITIVE, as a NON-ROOT lane user,

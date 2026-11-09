@@ -201,7 +201,6 @@ write_pids_file() {
   chmod 644 "$PIDS_FILE"
 }
 
-# cli#357 r4 — a ~10 s TERM grace (counted 0.1 s sleeps), then a KILL attempt.
 # Signal the tracked children, poll for them against SHUTDOWN_GRACE_SECONDS,
 # attempt KILL for every tracked PID still alive, clear the tracked list and
 # only then remove the PID file. `wait` reaps this shell's children only, so neither step
@@ -291,8 +290,7 @@ trap 'on_signal TERM' SIGTERM
 trap 'on_signal INT' SIGINT
 trap 'on_signal HUP' SIGHUP
 # An explicit exit, an errexit failure in the supervised work or a handled
-# signal calls shutdown_children: a ~10 s TERM grace (counted sleeps), then a
-# KILL attempt, and the PID file is removed last. The seating loop stops
+# signal calls shutdown_children, and the PID file is removed last. The seating loop stops
 # earlier iterations' children the same way before an explicit exit, so that
 # path does not depend on this trap.
 trap 'shutdown_children TERM' EXIT

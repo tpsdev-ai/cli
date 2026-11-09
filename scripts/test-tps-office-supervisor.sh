@@ -34,7 +34,7 @@
 #   9. cli#357 r4: a child that ignores TERM is KILLed after the ~10 s TERM grace
 #      (counted sleeps) and the supervisor exits; the EXIT trap sends no second TERM.
 #
-# Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
+# Part C (behavioural, requires root, jq, writable /workspace, and the S4-pinned nono):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
 #      supervisor resolves the profile from the BUNDLED dir the image ships,
 #      passes the ABSOLUTE PATH to nono, the Landlock probe passes, the office
@@ -73,13 +73,39 @@ nfail=0
 ok()  { printf 'PASS  %s\n' "$1"; npass=$((npass + 1)); }
 bad() { printf 'FAIL  %s\n' "$1" >&2; nfail=$((nfail + 1)); }
 
+required_part_c_prerequisite() {
+  if [ "$(id -u)" -ne 0 ]; then
+    printf 'Part C requires root\n' >&2; return 1
+  elif ! command -v jq >/dev/null 2>&1; then
+    printf 'Part C requires jq\n' >&2; return 1
+  elif [ ! -d /workspace ] || [ ! -w /workspace ]; then
+    printf 'Part C requires a writable /workspace\n' >&2; return 1
+  fi
+  local real_nono pinned_nono_version have_nono_version
+  real_nono="${NONO_BIN:-$(command -v nono 2>/dev/null || true)}"
+  if [ -z "$real_nono" ] || [ ! -x "$real_nono" ]; then
+    printf 'Part C requires nono\n' >&2; return 1
+  fi
+  pinned_nono_version="$(sed -n 's/^version=//p' "$repo_root/.nono-version" 2>/dev/null | head -n1)"
+  have_nono_version="$("$real_nono" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+  if [ -z "$pinned_nono_version" ] || [ "$have_nono_version" != "$pinned_nono_version" ]; then
+    printf 'Part C requires the pinned nono version %s (got %s)\n' "${pinned_nono_version:-missing pin}" "${have_nono_version:-none}" >&2
+    return 1
+  fi
+}
+if [ "${TPS_TEST_REQUIRE_NONO:-}" = 1 ]; then
+  required_part_c_prerequisite || exit 1
+fi
 session_gone_in() { # <ps-output-file> <ps-status> <id> <name>
   local output="$1" status="$2" id="$3" name="$4"
   [ "$status" -eq 0 ] || return 1
   [ -n "$id" ] || [ -n "$name" ] || return 1
-  jq -e -s 'length == 1 and (.[0] | type == "array")' "$output" >/dev/null 2>&1 || return 1
-  jq -e --arg id "$id" --arg name "$name" \
-    'all(.[]; .status != "running" or (($id == "" or .session_id != $id) and ($name == "" or .name != $name)))' \
+  jq -e -s --arg id "$id" --arg name "$name" \
+    'length == 1 and (.[0] | type == "array" and all(.[];
+      type == "object" and (.status | type == "string") and
+      (.status != "running" or
+        (((.session_id | type == "string" and length > 0) or (.name | type == "string" and length > 0)) and
+         ($id == "" or .session_id != $id) and ($name == "" or .name != $name)))))' \
     "$output" >/dev/null 2>&1
 }
 
@@ -95,7 +121,26 @@ check_session_gone_fixture "failed ps with an empty array does not confirm a sto
 check_session_gone_fixture "non-JSON ps output does not confirm a stop" 'bad-json' 0 no
 check_session_gone_fixture "multiple ps JSON values do not confirm a stop" $'[{"status":"running","session_id":"fixture-id"}]\n[]' 0 no
 check_session_gone_fixture "a matching running session does not confirm a stop" '[{"status":"running","session_id":"fixture-id"}]' 0 no
+check_session_gone_fixture "a row without status does not confirm a stop" '[{}]' 0 no
+check_session_gone_fixture "a running row without identity does not confirm a stop" '[{"status":"running"}]' 0 no
+check_session_gone_fixture "a non-object row does not confirm a stop" '[1]' 0 no
+check_session_gone_fixture "a non-string status does not confirm a stop" '[{"status":5}]' 0 no
 check_session_gone_fixture "successful empty ps array confirms a stop" '[]' 0 yes
+check_session_gone_fixture "a different identified running session confirms a stop" '[{"status":"running","name":"other"}]' 0 yes
+check_session_gone_fixture "a stopped session row confirms a stop" '[{"status":"stopped"}]' 0 yes
+
+if [ "${TPS_TEST_NONROOT_GATE_FIXTURE:-}" != 1 ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    part_c_gate_output="$(su -s /bin/bash nobody -c "TPS_TEST_REQUIRE_NONO=1 TPS_TEST_NONROOT_GATE_FIXTURE=1 bash '$repo_root/scripts/test-tps-office-supervisor.sh'" 2>&1)"; part_c_gate_status=$?
+  else
+    part_c_gate_output="$(TPS_TEST_REQUIRE_NONO=1 TPS_TEST_NONROOT_GATE_FIXTURE=1 bash "$repo_root/scripts/test-tps-office-supervisor.sh" 2>&1)"; part_c_gate_status=$?
+  fi
+  if [ "$part_c_gate_status" -ne 0 ] && [[ "$part_c_gate_output" == *"Part C requires root"* ]]; then
+    ok "required Part C refuses a non-root entry"
+  else
+    bad "required Part C non-root entry (status=$part_c_gate_status)"
+  fi
+fi
 rm -f "$session_fixture"
 
 hook_fixture="$(mktemp -d)"
@@ -381,7 +426,7 @@ else
   bad "seating-loop source control: $analysis"
 fi
 
-# cli#357 r4: pin the literal trap statements and reject eval.
+# cli#357 r4: pin the literal trap statements and reject a literal eval token.
 assert_exit_trap() { # <source>
   awk '
     function trim(s) {
@@ -876,9 +921,7 @@ SH
   fi
 
   # ── Part C — behavioural, REAL nono ────────────────────────────────────────
-  # cli#357 r4 — the real-nono cases cannot skip where the lane requires them.
-  # With TPS_TEST_REQUIRE_NONO=1 an absent binary or a version other than the
-  # pin record's version is a FAIL, not a SKIP.
+  # TPS_TEST_REQUIRE_NONO=1 requires root, jq, writable /workspace, and pinned nono.
   real_nono="${NONO_BIN:-$(command -v nono 2>/dev/null || true)}"
   pinned_nono_version="$(sed -n 's/^version=//p' "$repo_root/.nono-version" 2>/dev/null | head -n1)"
   nonready=""
@@ -1126,7 +1169,7 @@ SH
     fi
     if [ -n "$sess5_id" ] || [ -n "$sess5_name" ]; then
       if session_gone_in "$real/ps5.after.json" "$ps5_status" "$sess5_id" "$sess5_name"; then
-        ok "real-nono stop: the recorded session ($sess5_name $sess5_id) is no longer running in nono ps"
+        ok "real-nono stop: ps exited 0; exactly one JSON array; every row is an object with string status; every running row has non-empty string session_id or name and matches neither recorded id nor name ($sess5_name $sess5_id)"
       else
         bad "real-nono stop: nono ps did not confirm the recorded session ($sess5_name ${sess5_id:-none}) gone (status=$ps5_status raw='$(cat "$real/ps5.after.json" 2>/dev/null)')"
       fi
