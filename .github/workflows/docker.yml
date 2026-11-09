@@ -26,6 +26,7 @@ jobs:
   meta:
     name: Version and tags
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
     outputs:
@@ -195,6 +196,7 @@ jobs:
     name: Publish the multi-platform index
     needs: [build, meta]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write # the "Log in to ghcr.io" and "Push the index to GHCR" steps
