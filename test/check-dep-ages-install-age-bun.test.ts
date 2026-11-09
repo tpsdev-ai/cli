@@ -465,6 +465,41 @@ it.each([
   60000,
 );
 
+// Bun's glob matches `?` and a class member
+// by code point, so one supplementary character is not two: with the running Bun
+// and `packages/??` over `packages/ab` and `packages/😀`, the lockfile and the
+// gate both take `packages/ab` only.
+it(
+  `a non-BMP workspace directory: the gate and Bun ${process.versions.bun} resolve it the same way`,
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "age-nonbmp-workspaces-"));
+    try {
+      const manifests: Record<string, unknown> = {
+        "package.json": { name: "fixture", workspaces: ["packages/??"] },
+        "packages/ab/package.json": { name: "w-ab" },
+        "packages/😀/package.json": { name: "w-emoji" },
+      };
+      const project = writeProject(root, manifests, "http://127.0.0.1:1");
+      const install = await bunInstall(project, ["--no-cache"]);
+      expect({ exit: install.exit, output: install.output }).toMatchObject({ exit: 0 });
+      const lockPath = join(project, "bun.lock");
+      const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
+      const installed = Object.keys(lock.workspaces).filter((key) => key !== "").sort();
+      expect(installed).toEqual(["packages/ab"]);
+
+      const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
+      const resolved = appliedManifestPaths(packageJsons);
+      expect(resolved.error).toBeNull();
+      expect([...resolved.applied].filter((path) => path !== "package.json").sort()).toEqual([
+        "packages/ab/package.json",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60000,
+);
+
 // A real install of an empty brace alternative: the lockfile says which manifests
 // Bun took, and the gate refuses the same tree.
 it(
