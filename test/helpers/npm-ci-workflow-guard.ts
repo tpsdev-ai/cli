@@ -1,5 +1,4 @@
 import { load } from "js-yaml";
-import { isExactVersionPin } from "../../scripts/lib/check-dep-ages-collect.mjs";
 
 type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string };
 type WorkflowJob = {
@@ -44,41 +43,18 @@ function resolveRepoDir(base: string, target: string, label: string): string {
   return parts.join("/");
 }
 
-type LogicalLine = { text: string; line: number };
+type PhysicalLine = { text: string; line: number };
 
-/** Join backslash-newline continuations, including CRLF; keep each logical line's first physical line number. */
-function logicalLines(run: string): LogicalLine[] {
-  const lines: LogicalLine[] = [];
-  let text = "";
-  let start = 1;
-  let physical = 1;
-  for (let index = 0; index < run.length; index++) {
-    const char = run[index];
-    if (char === "\\" && run[index + 1] === "\r" && run[index + 2] === "\n") {
-      index += 2;
-      physical++;
-      continue;
-    }
-    if (char === "\\" && run[index + 1] === "\n") {
-      index++;
-      physical++;
-      continue;
-    }
-    if (char === "\n") {
-      lines.push({ text, line: start });
-      text = "";
-      physical++;
-      start = physical;
-      continue;
-    }
-    text += char;
+/** Split a run block into physical lines. No continuation is joined and no comment is stripped. */
+function physicalLines(run: string): PhysicalLine[] {
+  const lines: PhysicalLine[] = [];
+  const parts = run.split("\n");
+  for (let index = 0; index < parts.length; index++) {
+    const text = parts[index].replace(/\r$/, "").trim();
+    if (text === "") continue;
+    lines.push({ text, line: index + 1 });
   }
-  lines.push({ text, line: start });
   return lines;
-}
-
-function stripShellComment(line: string): string {
-  return line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "");
 }
 
 /**
@@ -111,119 +87,160 @@ function bracedNpm(line: string): boolean {
   return /\{[^{}]*\bnpm\b[^{}]*\}/.test(line);
 }
 
-function isInstallCandidate(line: string): boolean {
+/** The line's normalized tokens name npm and an install subcommand or an expansion in that position. */
+function isInstallCommandLine(line: string): boolean {
   const normalized = normalizeShellLine(line);
   const tokens = normalizedTokens(normalized);
   const npm = tokens.indexOf("npm");
-  const npmPresent = npm >= 0 || bracedNpm(line);
-  if (!npmPresent) return false;
   if (npm >= 0) {
     const next = tokens[npm + 1];
-    if (next !== undefined && INSTALL_ALIASES.has(next)) return true;
+    if (next !== undefined && (INSTALL_ALIASES.has(next) || next.startsWith("$"))) return true;
     return tokens.slice(npm + 1).some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
   }
-  return tokens.some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
+  return bracedNpm(line) && tokens.some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
 }
 
 /**
- * An `echo "..."` line whose backticks are all escaped and which carries no
- * `$(`. Inside double quotes an escaped backtick is literal text, and without
- * command substitution `echo` only prints its argument.
+ * A physical line is npm-bearing when its normalized copy names npm with an
+ * install subcommand, when a backtick appears on a line that names npm, when a
+ * line that names npm ends in a continuation backslash, or when the raw line
+ * has npm inside `{...}`.
  */
-function isInertEscapedBacktickEcho(line: string): boolean {
-  const match = line.match(/^echo "([^"\r\n]*)"$/);
-  if (match === null) return false;
-  const body = match[1];
-  if (body.includes("$(")) return false;
-  let backtick = 0;
-  for (let index = 0; index < body.length; index++) {
-    if (body[index] !== "`") continue;
-    let backslashes = 0;
-    for (let before = index - 1; before >= 0 && body[before] === "\\"; before--) backslashes++;
-    if (backslashes % 2 === 0) return false;
-    backtick++;
-  }
-  return backtick > 0;
+function isNpmBearing(line: string): boolean {
+  const normalized = normalizeShellLine(line);
+  const tokens = normalizedTokens(normalized);
+  const npm = tokens.indexOf("npm");
+  if (npm < 0) return bracedNpm(line) && isInstallCommandLine(line);
+  if (/\\$/.test(line)) return true;
+  if (line.includes("`")) return true;
+  return isInstallCommandLine(line);
 }
 
-/** A whole-line shell comment. */
-function isShellCommentLine(line: string): boolean {
-  return line.startsWith("#");
-}
-
+/**
+ * An install-like spelling the guard cannot classify: it carries a shell marker
+ * (substitution, backtick, eval, bash/sh -c, env, command, exec, xargs or a
+ * brace group) together with an install subcommand or an expanded subcommand.
+ */
 function isUnclassifiableInstall(line: string): boolean {
   const normalized = normalizeShellLine(line);
   const tokens = normalizedTokens(normalized);
   const npm = tokens.indexOf("npm");
-  const npmPresent = npm >= 0 || bracedNpm(line);
-  if (!npmPresent) return false;
+  if (npm < 0 && !bracedNpm(line)) return false;
   if (line.includes("`") && tokens.includes("npm")) return true;
   const next = npm >= 0 ? tokens[npm + 1] : undefined;
-  const expansionSubcommand = next !== undefined && (next.startsWith("$") || next.includes("`"));
+  const expansionSubcommand = next !== undefined && next.startsWith("$");
   const marker = /\$|`/.test(line) || /\beval\b/.test(line) ||
     /\bbash\s+-c\b/.test(line) || /\bsh\s+-c\b/.test(line) ||
     /(?:^|\s)env(?:\s|$)/.test(line) || /(?:^|\s)command(?:\s|$)/.test(line) ||
     /(?:^|\s)exec(?:\s|$)/.test(line) || /(?:^|\s)xargs(?:\s|$)/.test(line) ||
     /\{[^{}]*\}/.test(line);
-  return marker && (isInstallCandidate(line) || expansionSubcommand);
+  return marker && (isInstallCommandLine(line) || expansionSubcommand);
 }
 
 const PACKAGE_NAME = String.raw`(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*`;
+const VERSION_SEGMENT = "(?:0|[1-9][0-9]{0,8})";
+const EXACT_VERSION = `${VERSION_SEGMENT}\\.${VERSION_SEGMENT}\\.${VERSION_SEGMENT}`;
 const GLOBAL_TOOL_INSTALL = new RegExp(
-  `^npm install (?:-g|--global) (${PACKAGE_NAME})@(\\S+)(?: --registry=https:\\/\\/[A-Za-z0-9._~\\/:-]+)?$`,
+  `^npm install (?:-g|--global) (${PACKAGE_NAME})@(${EXACT_VERSION})(?: --registry=https:\\/\\/[A-Za-z0-9._~\\/:-]+)?$`,
 );
 
+/** Accept only a fully anchored global install with a bounded exact version. */
 function isAcceptedGlobalToolInstall(line: string): boolean {
   const raw = line.trim();
   if (/[$`'"';&|<>(){}]|\\/.test(raw)) return false;
-  const match = GLOBAL_TOOL_INSTALL.exec(raw);
-  return match !== null && isExactVersionPin(match[2]);
+  return GLOBAL_TOOL_INSTALL.test(raw);
 }
 
-/** Accept only a tracked-lock helper call: the shape accepted on main, with literal options. */
-const HELPER_CALL = /^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: ("[^"\r\n]*"|'[^'\r\n]*'))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/;
+const QUOTED_VALUE = String.raw`(?:"(?:[A-Za-z0-9_./ :+-]|\$[A-Za-z_][A-Za-z0-9_]*|\$\{[A-Za-z_][A-Za-z0-9_]*\})*"|'[A-Za-z0-9_./ :+-]*')`;
 
-/** Inspect npm install command words and helper calls in workflow run text.
- * Lines are joined on backslash-newline continuations. The npm word and install
- * subcommand are found after deleting quotes, backslashes and `$'` prefixes. An
- * npm install line is accepted only as a tracked-lock helper call or an exact
- * global tool install (`npm install -g|--global <name>@<exact-version>`, optional
- * literal `--registry=https://...`); otherwise it is refused. A non-comment line
- * that carries a backtick and names npm is refused, except an `echo "..."` line
- * whose backticks are all escaped and which has no `$(`. A command named entirely
- * through variables with no literal npm token on the line is not detected: the guard
- * does not follow variable values. Scripts and composite actions are outside this guard. */
+/** Accept only a tracked-lock helper call: the shape accepted on main, with literal options. */
+const HELPER_CALL = new RegExp(
+  String.raw`^bash (?:\./)?scripts/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: (${QUOTED_VALUE}))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$`,
+);
+
+type AllowlistEntry = { text: string; reason: string };
+
+/**
+ * Exact real workflow lines that carry an npm token but cannot execute npm.
+ * Each entry is matched literally against a trimmed physical line. The
+ * all-workflows test checks that every entry still matches one real line.
+ */
+export const EXACT_LINE_ALLOWLIST: readonly AllowlistEntry[] = [
+  {
+    text: "# `npm stage` subcommands (list/view/reject/approve) AT ALL. That is a",
+    reason: "a shell comment executes nothing",
+  },
+  {
+    text: 'echo "**Promote:** to make \\`npm install\\` serve this version, a maintainer runs, per package:"',
+    reason: "echo prints its argument; the backticks are escaped and no command substitution runs",
+  },
+  {
+    text: 'echo "  \\`npm dist-tag add @tpsdev-ai/cli@$VERSION latest\\`"',
+    reason: "echo prints its argument; the backticks are escaped and no command substitution runs",
+  },
+  {
+    text: 'echo "Until that promote, \\`npm install -g @tpsdev-ai/cli\\` keeps serving the previous version."',
+    reason: "echo prints its argument; the backticks are escaped and no command substitution runs",
+  },
+];
+
+/**
+ * Inspect npm install command words and tracked-lock helper calls in workflow
+ * run text.
+ *
+ * Each run block is split into physical lines: no continuation is joined, no
+ * comment is stripped and no quote state is tracked. A physical line is
+ * npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
+ * names npm with an install subcommand or an expanded subcommand, when a
+ * backtick appears on a line that names npm, when a line that names npm ends in
+ * a continuation backslash, or when the raw line has npm inside `{...}`.
+ *
+ * After trimming leading and trailing whitespace, every npm-bearing physical
+ * line must equal exactly one of: a tracked-lock helper call with a literal
+ * relative directory (the shape accepted on main); the global tool shape
+ * `npm install -g|--global <name>@<MAJOR.MINOR.PATCH>` with an optional literal
+ * `--registry=https://...`; or an entry in EXACT_LINE_ALLOWLIST. Any other
+ * npm-bearing line is refused, naming the workflow, job, step and physical
+ * line.
+ *
+ * A command named entirely through variables with no literal npm token on the
+ * line is not detected: the guard does not follow variable values. Scripts and
+ * composite actions are outside this guard.
+ */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
-  const rawLogical = logicalLines(run).map(({ text, line }) => ({ text: text.trim(), line }))
-    .filter((entry) => entry.text !== "");
-  const logical = rawLogical.map(({ text, line }) => ({ text: stripShellComment(text).trim(), line }))
-    .filter((entry) => entry.text !== "" && !entry.text.startsWith("#"));
-  const lines = logical.map((entry) => entry.text);
+  const lines = physicalLines(run);
   const refuse = (reason: string): never => {
     throw new Error(`${label}: cannot establish the npm ci directory: ${reason}`);
   };
-  let unclassifiable: LogicalLine | null = null;
-  let rawInstall: LogicalLine | null = null;
+  const allowlist = new Map(EXACT_LINE_ALLOWLIST.map((entry) => [entry.text, entry]));
+  let unclassifiable: PhysicalLine | null = null;
+  let rawInstall: PhysicalLine | null = null;
   let hasHelper = false;
-  for (const entry of logical) {
+  for (const entry of lines) {
     if (entry.text.includes("npm-ci-tracked-lock.sh")) hasHelper = true;
   }
-  for (const entry of rawLogical) {
-    if (isShellCommentLine(entry.text)) continue;
-    if (HELPER_CALL.test(entry.text)) continue;
+  for (const entry of lines) {
+    // Helper call lines are validated by the helper-step pass below.
+    if (entry.text.includes("npm-ci-tracked-lock.sh")) continue;
+    if (!isNpmBearing(entry.text)) continue;
     if (isAcceptedGlobalToolInstall(entry.text)) continue;
-    if (isInertEscapedBacktickEcho(entry.text)) continue;
+    if (allowlist.has(entry.text)) continue;
     if (isUnclassifiableInstall(entry.text)) {
       if (unclassifiable === null) unclassifiable = entry;
       continue;
     }
-    if (isInstallCandidate(entry.text) && rawInstall === null) rawInstall = entry;
+    if (rawInstall === null) rawInstall = entry;
   }
-  if (unclassifiable !== null) refuse(`unclassifiable npm install-like line at line ${unclassifiable.line}: ${unclassifiable.text}`);
-  if (rawInstall !== null) refuse(`raw npm install is refused; use the tracked-lock helper: ${rawInstall.text}`);
+  if (unclassifiable !== null) {
+    refuse(`unclassifiable npm install-like line at physical line ${unclassifiable.line}: ${unclassifiable.text}`);
+  }
+  if (rawInstall !== null) {
+    refuse(`raw npm install is refused; use the tracked-lock helper: ${rawInstall.text} (physical line ${rawInstall.line})`);
+  }
   if (!hasHelper) return [];
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
-  if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
+  const texts = lines.map((entry) => entry.text);
+  if (texts.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
     const allowedSubstitutions = new Set(['"$(node scripts/heartbeat-real-openclaw-lane.mjs --pin)"']);
     const assigned = new Set<string>(["RUNNER_TEMP"]);
     const quotedValue = (value: string): boolean => {
@@ -231,7 +248,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
       return names !== null && names.every((name) => assigned.has(name));
     };
     const dirs: string[] = [];
-    for (const line of lines) {
+    for (const line of texts) {
       if (line === "set -euo pipefail") continue;
       const assignment = line.match(/^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/);
       if (assignment !== null) {
@@ -258,7 +275,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     }
     return dirs;
   }
-  refuse(`raw npm install is refused; use the tracked-lock helper: ${lines.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line))}`);
+  refuse(`raw npm install is refused; use the tracked-lock helper: ${texts.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line))}`);
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, workflowName?: string): number {

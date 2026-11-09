@@ -8,12 +8,13 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, EXACT_LINE_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -1394,7 +1395,7 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* npm install command words and helper calls. Lines are joined on backslash-newline continuations; the npm word and install subcommand are found after deleting quotes, backslashes and `$'` prefixes. An npm install line is accepted only as a tracked-lock helper call or an exact global tool install; otherwise it is refused, and a non-comment line that carries a backtick and names npm is refused unless it is an inert `echo` line. Script files and composite actions are not inspected. */
+/* npm install command words and helper calls. Each run block is split into physical lines; no continuation is joined and no comment is stripped. An npm-bearing line must equal a tracked-lock helper call, a bounded exact global tool install, or one exact allowlisted line that cannot execute npm; every other npm-bearing line is refused. Script files and composite actions are not inspected. */
 
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
@@ -1671,4 +1672,141 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
   ])("refuses a global install outside the exact pinned shape: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
   }, 5_000);
+});
+
+const npmRequire = createRequire(import.meta.url);
+
+/** Locate a module npm itself bundles, preferring npm's global root. */
+function npmBundledModule(name: string): string {
+  const candidates: string[] = [];
+  const root = execFileSync("npm", ["root", "-g"], { encoding: "utf8", timeout: 10_000 }).trim();
+  if (root !== "") candidates.push(join(root, "npm", "node_modules", name));
+  const npmBin = execFileSync("which", ["npm"], { encoding: "utf8", timeout: 10_000 }).trim();
+  if (npmBin !== "") {
+    const real = realpathSync(npmBin);
+    candidates.push(join(dirname(real), "..", "node_modules", name));
+    candidates.push(join(dirname(real), "..", "..", "node_modules", name));
+  }
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, "package.json"))) return candidate;
+  }
+  throw new Error(`npm's bundled ${name} was not found; looked under: ${candidates.join(", ")}`);
+}
+
+/** Run a shell line with a stub npm that records its argv. */
+function runWithStubNpm(script: string, extraEnv: Record<string, string> = {}): string[] {
+  const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+  try {
+    const argvFile = join(stubDir, "argv");
+    writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s\\n" "$@" > "$STUB_ARGV"\n', { mode: 0o755 });
+    const result = spawnSync("bash", ["-c", script], {
+      env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile, ...extraEnv },
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.status).toBe(0);
+    return readFileSync(argvFile, "utf8").trim().split("\n");
+  } finally {
+    rmSync(stubDir, { recursive: true, force: true });
+  }
+}
+
+describe("the physical-line whitelist refuses folded and quoted comment spellings", () => {
+  const WORKFLOW = "workflow-c";
+
+  it("refuses both comment counterexamples and shows real bash runs npm in each", () => {
+    const commentContinuation = "# comment \\\nnpm ci";
+    const quotedComment = 'echo "\n# $(npm ci)\n"';
+    let error: unknown;
+    try { assertNpmCiLockfilesRead(workflowStep(commentContinuation), READ_TRACKED, WORKFLOW); } catch (caught) { error = caught; }
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toContain(`workflow ${WORKFLOW} job build step 1`);
+    expect((error as Error).message).toContain("npm ci (physical line 2)");
+    expect(() => assertNpmCiLockfilesRead(workflowStep(quotedComment), READ_TRACKED, WORKFLOW)).toThrow(
+      /unclassifiable npm install-like line at physical line 2/,
+    );
+    for (const line of [commentContinuation, quotedComment]) {
+      expect(runWithStubNpm(line)).toEqual(["ci"]);
+    }
+  }, 15_000);
+});
+
+describe("the workflow guard bounds global tool versions", () => {
+  const WORKFLOW = "workflow-v";
+  const refused = [
+    "npm install -g tool@9007199254740992.2.3",
+    "npm install -g tool@1.2.3-rc.1",
+    "npm install -g tool@1.2.3+b",
+    "npm install -g tool@01.2.3",
+    "npm install -g tool@1.2.3-..",
+  ];
+
+  it.each(refused)("refuses a global install outside the bounded exact shape: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
+  }, 5_000);
+
+  it("accepts tool@1.2.3 and checks every refused spec against npm's own parser", () => {
+    expect(assertNpmCiLockfilesRead(workflowStep("npm install -g tool@1.2.3"), READ_TRACKED, WORKFLOW)).toBe(0);
+    const npa = npmRequire(npmBundledModule("npm-package-arg")) as {
+      resolve: (name: string, spec: string) => { type: string };
+    };
+    const bounded = (spec: string): boolean =>
+      /^(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})$/.test(spec);
+    expect(npa.resolve("tool", "1.2.3").type).toBe("version");
+    for (const run of refused) {
+      const spec = run.slice(run.lastIndexOf("@") + 1);
+      const parsed = npa.resolve("tool", spec);
+      expect(parsed.type !== "version" || !bounded(spec)).toBe(true);
+    }
+  }, 15_000);
+});
+
+describe("the workflow guard uses npm's own option parser", () => {
+  it("shows the expanded registry arguments change global and prefix", () => {
+    const expanded = runWithStubNpm("npm install -g tool@1.2.3 --registry=https://a/$REG", {
+      REG: "x --global=false --prefix=plugins/unread tool@latest",
+    });
+    expect(expanded).toEqual([
+      "install", "-g", "tool@1.2.3", "--registry=https://a/x",
+      "--global=false", "--prefix=plugins/unread", "tool@latest",
+    ]);
+    const nopt = npmRequire(npmBundledModule("nopt")) as (
+      types: Record<string, unknown>,
+      shorthands: Record<string, string[]>,
+      args: string[],
+      slice: number,
+    ) => Record<string, unknown>;
+    const types = { global: [Boolean, false], prefix: [String, ""], registry: [String, ""] };
+    const shorthands = { g: ["--global"] };
+    const base = nopt(types, shorthands, ["install", "-g", "tool@1.2.3", "--registry=https://a/x"], 0);
+    const parsed = nopt(types, shorthands, expanded, 0);
+    expect(base.global).toBe(true);
+    expect(base.prefix).not.toBe("plugins/unread");
+    expect(parsed.global).toBe(false);
+    expect(parsed.prefix).toBe("plugins/unread");
+  }, 15_000);
+});
+
+describe("the exact-line allowlist", () => {
+  it("matches every entry to exactly one real workflow line", () => {
+    const workflowLines: string[] = [];
+    const workflowsDir = join(REPO, ".github", "workflows");
+    for (const name of readdirSync(workflowsDir).filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"))) {
+      const workflow = parseWorkflow(readFileSync(join(workflowsDir, name), "utf8"));
+      for (const job of Object.values(workflow.jobs ?? {})) {
+        for (const step of job.steps) {
+          if (step.run === undefined) continue;
+          for (const line of step.run.split(/\r?\n/)) {
+            const text = line.trim();
+            if (text !== "") workflowLines.push(text);
+          }
+        }
+      }
+    }
+    expect(EXACT_LINE_ALLOWLIST.length).toBeGreaterThan(0);
+    for (const entry of EXACT_LINE_ALLOWLIST) {
+      expect(entry.reason.length).toBeGreaterThan(0);
+      expect(workflowLines.filter((line) => line === entry.text)).toHaveLength(1);
+    }
+  }, 30_000);
 });

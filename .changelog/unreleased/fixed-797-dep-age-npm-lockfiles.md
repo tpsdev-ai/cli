@@ -3,17 +3,19 @@
   without `resolved`, regardless of `inBundle`. It refuses versionless entries,
   URL/name/version disagreement, non-canonical registry URLs (including query
   strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
-  skipped. A workflow `run:` line is joined with the next when it ends in a backslash.
-  The gate finds the npm word and install subcommand after deleting quotes,
-  backslashes and `$'` prefixes. It accepts a helper call to
-  `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory and literal
-  `--via npm` or `--via sfw`, or a global tool install whose raw line is exactly
-  `npm install -g|--global <name>@<exact-version>` with an optional literal
-  `--registry=https://...`; that line may not contain `$`, a backtick, a quote,
-  `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`. Other npm install lines
-  are refused. A non-comment line that carries a backtick and names npm is
-  refused, except an `echo "..."` line whose backticks are all escaped and which
-  has no `$(`; whole-line shell comments are not inspected.
+  skipped. Each workflow `run:` block is split into physical lines; the gate does not
+  join continuations, strip comments or track quote state. A physical line is
+  npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
+  names npm with an install subcommand or an expanded subcommand, when a backtick
+  appears on a line that names npm, when a line that names npm ends in a
+  continuation backslash, or when the raw line has npm inside `{...}`. Every
+  npm-bearing line must, after trimming leading and trailing whitespace, equal
+  exactly one of: a helper call to `scripts/npm-ci-tracked-lock.sh` with a
+  literal tracked directory and literal `--via npm` or `--via sfw`; `npm install
+  -g|--global <name>@<MAJOR.MINOR.PATCH>`, where each part is `0` or
+  `[1-9][0-9]{0,8}`, with an optional literal `--registry=https://...`; or an
+  exact-line allowlist entry for a real line that cannot execute npm. Any other
+  npm-bearing line is refused, naming the workflow, job, step and physical line.
   The match is conservative, not bash-equivalent: a command named entirely
   through variables with no literal npm token on the line is not detected.
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with

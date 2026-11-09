@@ -16,19 +16,29 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-A `run:` line is joined with the next line when it ends in a backslash. The gate
-finds the npm word and the install subcommand after deleting quotes, backslashes
-and `$'` prefixes from the line. It accepts a helper call to
-`scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
-literal `--via npm` or `--via sfw`, or a global tool install whose raw line is
-exactly `npm install -g` or `--global` followed by `<name>@<exact-version>` and
-an optional literal `--registry=https://...`; that line may not contain `$`, a
-backtick, a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`. Other
-npm install lines are refused. A non-comment line that carries a backtick and
-names npm is refused, except an `echo "..."` line whose backticks are all
-escaped and which has no `$(`; whole-line shell comments are not inspected.
-This is a conservative match, not bash-equivalent parsing: a command named
-entirely through variables with no literal npm token on the line, such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
+Each workflow `run:` block is split into physical lines; the gate does not join
+continuations, strip comments or track quote state. A physical line is
+npm-bearing when its normalized copy (quotes, backslashes and `$'` deleted)
+names npm with an install subcommand or an expanded subcommand, when a backtick
+appears on a line that names npm, when a line that names npm ends in a
+continuation backslash, or when the raw line has npm inside `{...}`.
+
+Every npm-bearing physical line must, after trimming leading and trailing
+whitespace, equal exactly one of:
+
+- a helper call to `scripts/npm-ci-tracked-lock.sh` with a literal relative
+  tracked directory and literal `--via npm` or `--via sfw`;
+- `npm install -g` or `--global` followed by `<name>@<MAJOR.MINOR.PATCH>`, where
+  each part is `0` or `[1-9][0-9]{0,8}`, with an optional literal
+  `--registry=https://<host>[/<path>]`; that line may not contain `$`, a backtick,
+  a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`;
+- an exact-line allowlist entry in the guard, each with a one-line reason, for
+  a real workflow line that cannot execute npm.
+
+Any other npm-bearing line is refused, naming the workflow, job, step and
+physical line. This is a conservative match, not bash-equivalent parsing: a
+command named entirely through variables with no literal npm token on the line,
+such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
 Installs inside other script files or composite actions are not inspected. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
