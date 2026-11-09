@@ -87,11 +87,13 @@ type AllowlistEntry = { text: string; reason: string };
  */
 export const EXACT_LINE_ALLOWLIST: readonly AllowlistEntry[] = [
   { text: "bun --no-install scripts/check-npm-pin-release-age.mjs", reason: "approved release-age gate" },
-  { text: "# fails, packages 1-3 stay staged; npm offers no cleanup, no resume and", reason: "shell comment" },
   { text: "echo \"::error::RECOVERY, from a machine logged in to npm:\"", reason: "approved release message" },
   { text: "echo \"::error::  npm stage list                        # see what is pending\"", reason: "release guidance printed by echo" },
   { text: "echo \"::error::  npm stage view <stage-id>              # confirm version + contents\"", reason: "release guidance printed by echo" },
   { text: "echo \"::error::  npm stage reject <stage-id>            # for each staged package\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::notice::  npm stage list\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::notice::  npm stage view <stage-id>\"", reason: "release guidance printed by echo" },
+  { text: "echo \"::notice::Reject pending stages for this version with npm stage reject <stage-id> before re-running,\"", reason: "release guidance printed by echo" },
   { text: "echo \"::group::npm stage publish — $nm (packages/$p)\"", reason: "approved release message" },
   { text: "# Capture npm's OWN output, so the failure branch below can branch on the", reason: "shell comment" },
   { text: "# error CODE npm reports rather than on the exit status alone. Exit status", reason: "shell comment" },
