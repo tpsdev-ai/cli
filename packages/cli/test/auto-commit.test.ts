@@ -368,9 +368,43 @@ describe("evaluateMailAutoCommitGate", () => {
           'exit 0',
         ].join("\n"),
       );
-      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync: shimRunner(shim, { SHIM_ROOT: dir }) })).toEqual({
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir });
+      expect(probeHead(dir, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "returned no output",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync })).toEqual({
         action: "skip",
-        message: "Change check could not run: git rev-parse HEAD (after task) returned no output — skipping autoCommit",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) returned no output — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("names HEAD^{commit} when its successful probe has empty output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-empty-commit-probe-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then exit 0; fi',
+          'if [ "$1" = "status" ]; then exit 0; fi',
+          'exit 128',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir });
+      expect(probeHead(dir, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "returned no output",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) returned no output — skipping autoCommit",
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -395,9 +429,6 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
       writeFileSync(join(repo, "file.txt"), "first\n");
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({ action: "commit" });
       expect(baseline).toEqual({ state: "unborn" });
-      // The first-commit path through runAutoCommit and the real `tps agent
-      // commit` CLI is exercised end to end in codex-presence-444's runtime
-      // test; this file keeps the gate decision as a unit.
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -457,7 +488,7 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     const repo = initUnbornRepo();
     try {
       writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/x\n");
-      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "failed" });
+      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "returned a ref outside refs/heads/", probe: "git symbolic-ref -q HEAD" });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -469,10 +500,10 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
       git(repo, "tag", "v1");
       writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/v1\n");
       const baseline = probeHead(repo);
-      expect(baseline).toEqual({ state: "indeterminate", detail: "failed" });
+      expect(baseline).toEqual({ state: "indeterminate", detail: "returned a ref outside refs/heads/", probe: "git symbolic-ref -q HEAD" });
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
         action: "skip",
-        message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) returned a ref outside refs/heads/ — skipping autoCommit",
       });
     } finally {
       rmSync(repo, { recursive: true, force: true });
