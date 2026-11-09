@@ -289,10 +289,12 @@ jobs:
           done
 
       # PARTIAL STAGE IS POSSIBLE AND IS NOT SELF-HEALING — a later package's auth
-      # failure, an E409 collision, or the job timeout ending mid-publish. npm stages
-      # offer no cleanup, no resume and no idempotency, and a timeout terminates the
-      # job without running any error path, so the recovery procedure prints BEFORE
-      # staging, unconditionally; the failure branches restate it in detail.
+      # failure, an E409 collision, or the job timeout ending mid-publish. npm does
+      # not automatically clear pending stages, and offers no resume and no
+      # idempotency; a timeout terminates the job without running any error path,
+      # so the recovery procedure prints BEFORE staging, unconditionally. The
+      # collision branch restates it in detail; the auth and unclassified branches
+      # restate it when packages were already staged.
       - name: Stage interruption recovery
         run: |
           echo "::notice::If stage publishing is interrupted, check pending packages before re-running:"
