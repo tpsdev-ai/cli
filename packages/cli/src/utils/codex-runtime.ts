@@ -395,11 +395,9 @@ export type MailAutoCommitDecision =
  * the gate skips. That can be a commit made on that branch before the
  * rebase, not necessarily this task's.
  * A failed probe is indeterminate and yields a skip with its outcome reported,
- * and so does a final HEAD that differs from the restored one. An unborn HEAD is
- * a branch with no commit yet (the repository may have other branches) and has
- * no pre-task value to compare, so workspace changes or a new commit select the
- * commit path, and neither is clean, unless an aborted rebase restored a
- * different HEAD. "Workspace changes" means what
+ * and so does a final HEAD that differs from the restored one. An unborn pre-task
+ * baseline has no HEAD value to compare. Workspace changes or a new commit can
+ * select the commit path. "Workspace changes" means what
  * `git status --porcelain` reports; ignored files are not changes. The clean
  * outcome is returned only when the status probe and both HEAD probes succeed
  * and any interrupted rebase was aborted: an indeterminate probe, or a rebase

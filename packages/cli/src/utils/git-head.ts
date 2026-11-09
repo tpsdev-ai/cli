@@ -18,7 +18,7 @@ export type HeadProbe =
 /**
  * Classify the repository's HEAD.
  *
- * "commit" requires `git symbolic-ref -q HEAD` to exit 1 with no output
+ * "commit" requires `git symbolic-ref -q HEAD` to exit 1 with empty stdout and stderr
  * (detached) or to name a ref under `refs/heads/`, and `git rev-parse --verify
  * -q HEAD^{commit}` to succeed; a symbolic-ref error, or a symbolic HEAD
  * outside refs/heads/, is indeterminate before any commit check.
@@ -33,11 +33,17 @@ export type HeadProbe =
 export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): HeadProbe {
   const symbolicProbe = "git symbolic-ref -q HEAD";
   const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  const quietExitOne = (result: typeof symbolic): boolean =>
+    result.status === 1 &&
+    String(result.stdout ?? "") === "" &&
+    String(result.stderr ?? "") === "" &&
+    !result.error &&
+    !result.signal;
   const symbolicOutput = String(symbolic.stdout ?? "").trim();
   if (symbolic.status === 0 && !symbolicOutput.startsWith("refs/heads/")) {
     return { state: "indeterminate", detail: "failed" };
   }
-  if (symbolic.status !== 0 && !(symbolic.status === 1 && symbolicOutput === "")) {
+  if (symbolic.status !== 0 && !quietExitOne(symbolic)) {
     return { state: "indeterminate", detail: "failed", probe: symbolicProbe };
   }
   const branch = symbolic.status === 0 ? symbolicOutput : undefined;
@@ -47,16 +53,18 @@ export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): 
     const headText = String(head.stdout ?? "").trim();
     return headText ? { state: "commit", head: headText } : { state: "indeterminate", detail: "returned no output" };
   }
-  if (head.status !== 1) return { state: "indeterminate", detail: "failed" };
+  if (!quietExitOne(head)) {
+    return { state: "indeterminate", detail: "failed", probe: "git rev-parse --verify -q HEAD^{commit}" };
+  }
   if (branch === undefined) return { state: "indeterminate", detail: "failed" };
 
   const verify = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  if (verify.status !== 1 || String(verify.stdout ?? "").trim() !== "") {
-    return { state: "indeterminate", detail: "failed" };
+  if (!quietExitOne(verify)) {
+    return { state: "indeterminate", detail: "failed", probe: "git rev-parse --verify -q HEAD" };
   }
 
   const branchRef = runSync(GIT_BIN, ["show-ref", "--verify", "-q", branch], { cwd: repo, encoding: "utf-8" });
-  if (branchRef.status === 1 && String(branchRef.stdout ?? "").trim() === "") return { state: "unborn" };
+  if (quietExitOne(branchRef)) return { state: "unborn" };
 
-  return { state: "indeterminate", detail: "failed" };
+  return { state: "indeterminate", detail: "failed", probe: `git show-ref --verify -q ${branch}` };
 }

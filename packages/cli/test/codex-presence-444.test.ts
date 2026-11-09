@@ -700,8 +700,8 @@ describe("mail auto-commit checks", () => {
 
   for (const [failure, probe] of [
     ["status", "git status --porcelain"],
-    ["baseline", "git rev-parse HEAD (before task)"],
-    ["head", "git rev-parse HEAD (after task)"],
+    ["baseline", "git rev-parse --verify -q HEAD^{commit} (before task)"],
+    ["head", "git rev-parse --verify -q HEAD^{commit} (after task)"],
   ] as const) {
     it(`reports an indeterminate change check when ${probe} fails`, async () => {
       const result = await driveRuntime("SIGTERM", undefined, { autoCommitFailure: failure });

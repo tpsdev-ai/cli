@@ -496,6 +496,62 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
+  test("symbolic-ref exit 1 with stderr is indeterminate and skips naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-symbolic-stderr-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "fatal: probe failed" >&2; exit 1; fi',
+          'if [ "$1" = "rev-parse" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("missing-ref probes with exit 1 and stderr are indeterminate and skip naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-missing-stderr-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
+          'if [ "$*" = "$SHIM_FAIL_ARGS" ]; then echo "fatal: probe failed" >&2; exit 1; fi',
+          'if [ "$1" = "rev-parse" ] || [ "$1" = "show-ref" ]; then exit 1; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      for (const args of [
+        "rev-parse --verify -q HEAD^{commit}",
+        "rev-parse --verify -q HEAD",
+        "show-ref --verify -q refs/heads/main",
+      ]) {
+        const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_FAIL_ARGS: args });
+        const probe = `git ${args}`;
+        const baseline = probeHead(dir, runSync);
+        expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe });
+        expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+          action: "skip",
+          message: `Change check could not run: ${probe} (before task) failed — skipping autoCommit`,
+        });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("skips naming the restored and final HEADs when an aborted rebase leaves an unborn final HEAD", () => {
     const repo = initUnbornRepo();
     try {

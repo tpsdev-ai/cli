@@ -177,8 +177,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
     const ref = resolveRef(to);
     this.assertKnownRef(ref);
 
-    // An unborn baseline has no commit to check out; the working tree is the
-    // baseline, so leave it untouched.
+    // An unborn baseline has no commit to check out.
     if (typeof to !== "string" && to.metadata?.unborn === true) {
       return;
     }
