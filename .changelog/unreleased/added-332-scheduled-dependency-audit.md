@@ -1,0 +1,1 @@
+- **Run dependency audits daily on main and open or update one issue on failure.**

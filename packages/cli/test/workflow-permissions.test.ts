@@ -82,6 +82,7 @@ const PR_EXCLUDED: Record<string, string> = {
 
 /** Workflows that do not run PR-controlled code, and why they are out of scope. */
 const NOT_PR: Record<string, string> = {
+  "dependency-audit.yml": "scheduled or manually dispatched audit of main; no pull request trigger",
   "docker.yml": "its only trigger is `workflow_dispatch`; no `pull_request` trigger",
   "release.yml": "triggered by a `push` of `v*` tags, never `pull_request`",
 };
