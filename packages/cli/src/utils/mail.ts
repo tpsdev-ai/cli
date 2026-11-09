@@ -1288,8 +1288,8 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       checkedOutAt: new Date().toISOString(),
       checkedOutBy: agent,
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
-      // Delivery bookkeeping is OUR lease state, never the sender's: discard an
-      // incoming redelivery marker or attempt count and start both locally.
+      // The re-delivery marker and count are OUR lease state: discard any
+      // incoming values and start both locally.
       redelivered: undefined,
       redeliveryAttempts: undefined,
     };

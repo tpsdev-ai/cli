@@ -249,7 +249,7 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(readdirSync(getInbox(OWNER).cur).filter((f) => f.endsWith(".json"))).toEqual([]);
   });
 
-  test("external-tier re-delivery names the refusal, never an ack command", async () => {
+  test("external-tier re-delivery names the refusal instead of an ack command", async () => {
     const sent = sendMessage(
       OWNER,
       JSON.stringify(buildSignedEnvelope(SENDER, OWNER, "external mail", SEEDS, { trust: "external" })),

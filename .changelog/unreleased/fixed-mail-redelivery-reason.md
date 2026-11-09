@@ -1,4 +1,4 @@
-- **`tps mail check` says why a message is re-delivered and how to stop it.**
+- **`tps mail check` says why a message is re-delivered.**
 
   An unacked `cur/` record whose checkout is older than the 30-minute lease is
   marked as re-delivered. For ackable mail it prints
