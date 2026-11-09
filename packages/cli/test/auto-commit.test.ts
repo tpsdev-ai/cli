@@ -494,6 +494,33 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
+  test("a branch ref to a missing object skips auto-commit with the failed commit probe", () => {
+    const repo = initUnbornRepo();
+    try {
+      const missingObject = "de".repeat(20);
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/x\n");
+      writeFileSync(join(repo, ".git", "refs", "heads", "x"), `${missingObject}\n`);
+      const commitProbe = spawnSync(GIT, ["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: repo, encoding: "utf-8" });
+      expect(commitProbe.status).toBe(1);
+      expect(String(commitProbe.stdout ?? "")).toBe("");
+      expect(String(commitProbe.stderr ?? "")).toBe("");
+      expect(git(repo, "rev-parse", "--verify", "-q", "HEAD").trim()).toBe(missingObject);
+
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({
+        state: "indeterminate",
+        detail: "found a ref without a commit",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (before task) found a ref without a commit — skipping autoCommit",
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("a symbolic HEAD that points at an existing tag on a commit is indeterminate and skips at the gate", () => {
     const repo = initRepo();
     try {

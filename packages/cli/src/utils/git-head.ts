@@ -49,6 +49,9 @@ export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): 
   if (branch === undefined) return { state: "indeterminate", detail: "found no commit on detached HEAD", probe: "git rev-parse --verify -q HEAD^{commit}" };
 
   const verify = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+  if (verify.status === 0) {
+    return { state: "indeterminate", detail: "found a ref without a commit", probe: "git rev-parse --verify -q HEAD^{commit}" };
+  }
   if (!quietExitOne(verify)) {
     return { state: "indeterminate", detail: "failed", probe: "git rev-parse --verify -q HEAD" };
   }
@@ -56,5 +59,5 @@ export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): 
   const branchRef = runSync(GIT_BIN, ["show-ref", "--verify", "-q", branch], { cwd: repo, encoding: "utf-8" });
   if (quietExitOne(branchRef)) return { state: "unborn" };
 
-  return { state: "indeterminate", detail: branchRef.status === 0 ? "found a ref without a commit" : "failed", probe: `git show-ref --verify -q ${branch}` };
+  return { state: "indeterminate", detail: "failed", probe: `git show-ref --verify -q ${branch}` };
 }
