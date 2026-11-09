@@ -428,8 +428,8 @@ jobs:
                 echo "::error::  - this job declares permissions: id-token: write (it mints the"
                 echo "::error::    OIDC token npm swaps for a short-lived publish credential)"
                 echo "::error::  - npm is new enough — OIDC trusted publishing needs >= 11.5.1 and"
-                echo "::error::    the stage subcommands need >= 11.15.0 (the upgrade step pins"
-                echo "::error::    ^11.15.0)"
+                echo "::error::    the stage subcommands need >= 11.15.0 (see the npm upgrade step"
+                echo "::error::    for the current pin)"
                 echo "::error::"
                 echo "::error::Fix the registration or the OIDC claim, then re-run this tag."
                 exit 1
