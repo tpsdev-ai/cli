@@ -1,10 +1,12 @@
 /**
- * The flags the Docker lane sets to require a set-runtime case: the
- * root-only real-owner case (cli#801, cli#816) and the second-group case
- * (cli#817).
+ * The flags a CI lane sets to require a case that needs its runtime: the
+ * Docker lane sets the root-only real-owner case (cli#801, cli#816) and the
+ * second-group case (cli#817); the Unit + integration lane sets the real-gh
+ * notification case (cli#332).
  */
 export const REAL_OWNER_FLAG = "TPS_TEST_REQUIRE_REAL_OWNER";
 export const ALT_GROUP_FLAG = "TPS_TEST_REQUIRE_ALT_GROUP";
+export const GH_FLAG = "TPS_TEST_REQUIRE_GH";
 
 /**
  * Parse one require flag once, at module load. Unset, "" and "0" mean the case
@@ -24,4 +26,8 @@ export function parseRequireRealOwner(env: Record<string, string | undefined>): 
 
 export function parseRequireAltGroup(env: Record<string, string | undefined>): boolean {
   return parseRequireFlag(env, ALT_GROUP_FLAG);
+}
+
+export function parseRequireGh(env: Record<string, string | undefined>): boolean {
+  return parseRequireFlag(env, GH_FLAG);
 }

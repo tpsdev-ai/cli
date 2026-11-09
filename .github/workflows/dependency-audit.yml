@@ -1,0 +1,78 @@
+name: Scheduled Dependency Audit
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: scheduled-dependency-audit
+  cancel-in-progress: false
+
+jobs:
+  audit:
+    name: Dependency Audit
+    permissions:
+      contents: read # actions/checkout reads the repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      main-sha: ${{ steps.main.outputs.sha }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          persist-credentials: false
+          ref: main
+      - name: Record audited main SHA
+        id: main
+        run: git rev-parse HEAD | sed 's/^/sha=/' >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@735343b667d3e6f658f44d0eca948eb6282f2b76 # v2
+        with:
+          bun-version: "1.3.10"
+      - name: Dependency release-age gate (cli#529)
+        run: node scripts/check-dep-ages.mjs --ci
+      - name: Attempt cache restore of the verified Socket Firewall binary (cli#898)
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .sfw-cache
+          key: sfw-free-1.15.4-Linux-X64-cf9f55b8343e1ef6e6dcccdb09b99c70c0430a22ed7d0079286eccddeaf72670-c8c80aa582829f24f5d633f2c3f2ccd0b070bbee80bf3b956e5e2a9880184e20-b19f96f0dd3ebc4ecc7111dbc43cc2b095f37bf759273c0bd9c0c4784ea24731-1b705ea7c399727ee41aa93f63e0469d2c3787c50e1dd8842cb8ff5ceec9eb99
+      - run: bash scripts/prefetch-socket-firewall.sh
+      - uses: socketdev/action@ba6de6cc0565af1f42295590380973573297e31f # v1.3.2
+        with:
+          mode: firewall-free
+          firewall-version: "1.15.4"
+      - run: sfw bun install --frozen-lockfile
+      - name: Check for known vulnerabilities
+        run: bun audit
+
+  notify:
+    name: Report audit failure
+    needs: audit
+    if: ${{ failure() && needs.audit.result == 'failure' }}
+    permissions:
+      issues: write # Notification attempts to open or comment on the tracking issue
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Report audit failure
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          SERVER_URL: ${{ github.server_url }}
+          RUN_ID: ${{ github.run_id }}
+          MAIN_SHA: ${{ needs.audit.outputs.main-sha }}
+          ISSUE_TITLE: Dependency audit failure on main
+        run: |
+          set -euo pipefail
+          issues="$(gh api --paginate "repos/$REPOSITORY/issues?state=open&per_page=100" \
+            --jq '.[] | select(.pull_request == null and .title == env.ISSUE_TITLE and .user.login == "github-actions[bot]") | .number')"
+          issue="${issues%%$'\n'*}"
+          body="Dependency audit failed: $SERVER_URL/$REPOSITORY/actions/runs/$RUN_ID
+          Main SHA: ${MAIN_SHA:-unavailable}"
+          if [ -n "$issue" ]; then
+            gh api --method POST "repos/$REPOSITORY/issues/$issue/comments" -f body="$body" > /dev/null
+          else
+            gh api --method POST "repos/$REPOSITORY/issues" -f title="$ISSUE_TITLE" -f body="$body" > /dev/null
+          fi
