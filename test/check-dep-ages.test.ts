@@ -1629,7 +1629,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     "npm install -g npm@^11.21.1",
     "npm install -g npm@latest",
     "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org extra",
-  ])("refuses a global install that is not exact and pinned: %s", (run) => {
+  ])("refuses a global install outside the exact pinned shape: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
   }, 5_000);
 });

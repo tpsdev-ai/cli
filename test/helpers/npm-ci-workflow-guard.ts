@@ -45,7 +45,7 @@ function resolveRepoDir(base: string, target: string, label: string): string {
 
 type LogicalLine = { text: string; line: number };
 
-/** Join `\`-newline continuations as bash does; keep each logical line's first physical line number. */
+/** Join backslash-newline continuations, including CRLF; keep each logical line's first physical line number. */
 function logicalLines(run: string): LogicalLine[] {
   const lines: LogicalLine[] = [];
   let text = "";
@@ -87,9 +87,9 @@ function stripShellComment(line: string): string {
  * (docs/content/commands/npm-install.md); `npm ci` is its own command
  * (docs/content/commands/npm-ci.md); install-test and install-ci-test are
  * install subcommands (docs/content/commands/npm-install-test.md and
- * npm-install-ci-test.md). The short aliases are English words, so the guard
- * matches them only in the subcommand position; the long spellings are
- * matched anywhere after the npm word.
+ * npm-install-ci-test.md). Short aliases are matched only in the subcommand
+ * position to avoid matching prose; the long spellings are matched anywhere
+ * after the npm word.
  */
 const INSTALL_ALIASES = new Set([
   "ci", "install", "i", "add", "isntall", "in", "ins", "inst", "insta", "instal",
@@ -102,7 +102,7 @@ function normalizeShellLine(text: string): string {
   return text.replace(/\$'/g, "").replace(/['"\\]/g, "");
 }
 
-/** Split a normalized line into shell words; separators delimit tokens. */
+/** Split a normalized line into tokens; whitespace and shell separators delimit them. */
 function normalizedTokens(normalized: string): string[] {
   return normalized.split(/[\s;&|()<>`]+/).filter((token) => token !== "");
 }
@@ -117,7 +117,8 @@ function stripEscapedBackticks(line: string): string {
   return line.replace(/\\`[\s\S]*?\\`/g, "");
 }
 
-/** A normalized line carrying an npm word and an install subcommand. */
+/** Classify a line as an install candidate: npm with an install subcommand in the
+ * subcommand position, or a long alias anywhere after the npm word. */
 function isInstallCandidate(line: string): boolean {
   const normalized = normalizeShellLine(stripEscapedBackticks(line));
   const tokens = normalizedTokens(normalized);
@@ -132,7 +133,7 @@ function isInstallCandidate(line: string): boolean {
   return tokens.some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
 }
 
-/** A normalized line carrying an npm word, an install subcommand and a shell indirection. */
+/** Refuse an install-like line that carries a shell indirection. */
 function isUnclassifiableInstall(line: string): boolean {
   const normalized = normalizeShellLine(stripEscapedBackticks(line));
   const tokens = normalizedTokens(normalized);
