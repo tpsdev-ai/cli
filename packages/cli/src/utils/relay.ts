@@ -639,7 +639,7 @@ function undoNewRelayRecord(root: string, delivery: { branchId: string; id: stri
     const parent = join(root, dir);
     if (!existsSync(parent)) continue;
     for (const entry of readdirSync(parent, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      if (!entry.isFile() || (dir === "new" ? !isMailboxMessageFile(entry.name) : !entry.name.endsWith(".json"))) continue;
       const path = join(parent, entry.name);
       let record: { relayDelivery?: { branchId?: string; id?: string } };
       try { record = JSON.parse(readFileSync(path, "utf8")); }
