@@ -3,6 +3,7 @@ import { execSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { promote, redriveRetryable } from "../packages/cli/src/utils/mail.js";
 
 const HOME = homedir();
@@ -52,7 +53,7 @@ function log(msg: string) {
  */
 export async function pollNewMail(): Promise<MailRow[]> {
   const out: MailRow[] = [];
-  for (const file of existsSync(MAIL_NEW_DIR) ? readdirSync(MAIL_NEW_DIR).sort() : []) {
+  for (const file of existsSync(MAIL_NEW_DIR) ? readdirSync(MAIL_NEW_DIR).filter(isMailboxMessageFile).sort() : []) {
     const src = join(MAIL_NEW_DIR, file);
     try {
       const result = await promote(AGENT_ID, src);

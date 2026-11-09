@@ -49,6 +49,8 @@ export { signEnvelope, verifyEnvelope } from "./lib/signEnvelope.js";
 export type { Envelope, ChainEntry, FlairClient, VerifyOk, VerifyReject } from "./lib/signEnvelope.js";
 export { parseFlairPublicKey, PublicKeyFormatError } from "./lib/public-key.js";
 
+export { isMailboxMessageFile } from "./lib/mailbox-filename.js";
+
 // Mailbox policy (cli#380)
 export {
   ENVELOPE_ID_SHAPE, ENVELOPE_ID_SHAPE_TEXT, isValidEnvelopeId, tryParseEnvelope, parseSignedEnvelope,

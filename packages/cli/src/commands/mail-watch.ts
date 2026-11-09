@@ -27,6 +27,7 @@
  *   only mail variables this module vouches for.
  */
 
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { execSync, spawn } from "node:child_process";
 import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -114,7 +115,7 @@ export function validateAgentId(agentId: string): void {
  */
 function listNewFiles(dir: string): string[] | null {
   try {
-    return readdirSync(dir).filter((f) => f.endsWith(".json"));
+    return readdirSync(dir).filter(isMailboxMessageFile);
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
   }

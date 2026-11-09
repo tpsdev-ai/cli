@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { spawn, spawnSync } from "node:child_process";
 import { closeSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -124,9 +125,9 @@ function relayPidFile(agentId: string): string {
 function outboxCounts(agentId: string): { newCount: number; curCount: number; failedCount: number } {
   const ws = workspacePath(agentId);
   const root = join(ws, "mail", "outbox");
-  const countDir = (dir: string) => existsSync(dir) ? readdirSync(dir).filter(f => f.endsWith(".json")).length : 0;
+  const countDir = (dir: string, fresh = false) => existsSync(dir) ? readdirSync(dir).filter(f => fresh ? isMailboxMessageFile(f) : f.endsWith(".json")).length : 0;
   return {
-    newCount: countDir(join(root, "new")),
+    newCount: countDir(join(root, "new"), true),
     curCount: countDir(join(root, "cur")),
     failedCount: countDir(join(root, "failed")),
   };

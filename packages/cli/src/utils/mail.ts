@@ -9,7 +9,7 @@ import {
   decideEnvelopeForMailbox as decideEnvelope,
   type Envelope, PublicKeyFormatError, verifiedMailTier, bridgePrincipalIds,
   mailboxReplayStore, hasCommittedMessageId, type PlacementPhase, type ReplayStore,
-  parseSignedEnvelope,
+  parseSignedEnvelope, isMailboxMessageFile,
   peekConsumedForMailboxRoot,
   placeCurRecord, fileIdentity, matchesFileIdentity, pendingPlacementEntries, relayAcceptanceLockRoot, tryAcquireRelayMoveLock, mailboxLockRoot,
 } from "@tpsdev-ai/agent";
@@ -208,7 +208,7 @@ function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur"
   if (!existsSync(dir)) return [];
   const messages: MailMessage[] = [];
   for (const f of readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isFile() && e.name.endsWith(".json"))
+    .filter((e) => e.isFile() && (location === "new" ? isMailboxMessageFile(e.name) : e.name.endsWith(".json")))
     .map((e) => e.name)) {
     try {
       const raw = readFileSync(join(dir, f), "utf-8");
@@ -230,12 +230,12 @@ function readMessagesFromDir(dir: string, read: boolean, location: "new" | "cur"
   return messages.sort((a, b) => ((a.receivedAt ?? a.timestamp) < (b.receivedAt ?? b.timestamp) ? 1 : -1));
 }
 
-function listMessageFiles(dir: string): string[] {
+function listMessageFiles(dir: string, fresh = false): string[] {
   if (!existsSync(dir)) return [];
   // Files only — a directory named `*.json` (e.g. a fault injection or a
   // stray artifact) must never be handed to a reader and throw EISDIR.
   return readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isFile() && e.name.endsWith(".json"))
+    .filter((e) => e.isFile() && (fresh ? isMailboxMessageFile(e.name) : e.name.endsWith(".json")))
     .map((e) => e.name);
 }
 
@@ -403,7 +403,7 @@ function messagePathById(agent: string, id: string, mailRoot?: string): string |
   };
   let prefixMatch: string | null = null;
   for (const dir of [resolvedInbox.fresh, resolvedInbox.cur, resolvedInbox.dlq]) {
-    for (const file of listMessageFiles(dir)) {
+    for (const file of listMessageFiles(dir, dir === resolvedInbox.fresh)) {
       const full = join(dir, file);
       const msg = readMessageFile(full);
       if (msg.id === id) return full;
@@ -425,7 +425,7 @@ function messagePathById(agent: string, id: string, mailRoot?: string): string |
  */
 export function countInboxMessages(agent: string): number {
   const inbox = getInbox(agent);
-  return readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length;
+  return readdirSync(inbox.fresh).filter(isMailboxMessageFile).length;
 }
 
 /**
@@ -613,7 +613,7 @@ export function relayScanRoots(recipientRoot: string): string[] {
 export function relayConflictRoots(roots: readonly string[], delivery: { branchId: string; id: string }): string[] {
   return roots.filter((root) => {
     for (const dir of ["new", "dlq", "cur", "tmp"]) {
-      for (const file of listMessageFiles(join(root, dir))) {
+      for (const file of listMessageFiles(join(root, dir), dir === "new")) {
         let raw: string;
         try { raw = readFileSync(join(root, dir, file), "utf-8"); }
         catch (error) {
@@ -655,7 +655,7 @@ export function findRelayedRecord(agent: string, delivery: { branchId: string; i
         // is read in this directory. Otherwise every listed record is read, as
         // before, which covers records written before the key existed.
         const keyedFile = relayRecordFileName(delivery.branchId, delivery.id);
-        const listed = listMessageFiles(path);
+        const listed = listMessageFiles(path, dir === "new");
         const files = listed.includes(keyedFile) ? [keyedFile] : listed;
         for (const file of files) {
           const keyed = file === keyedFile;
@@ -759,7 +759,7 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
   }
 
   const inbox = inboxRoot === undefined ? getInbox(to) : inboxAtRoot(inboxRoot);
-  const quotaCount = readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")).length;
+  const quotaCount = readdirSync(inbox.fresh).filter(isMailboxMessageFile).length;
   if (quotaCount >= MAX_INBOX_MESSAGES) {
     throw new MailInboxFullError(inboxFullMessage(to, quotaCount));
   }
@@ -1729,7 +1729,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
   const nowMs = Date.now();
 
   // 1. Promote new/ → cur/ through the single enforcement point.
-  for (const f of listMessageFiles(inbox.fresh)) {
+  for (const f of listMessageFiles(inbox.fresh, true)) {
     const result = await promote(agent, join(inbox.fresh, f), verify);
     if (result.ok) messages.push(result.message);
   }
@@ -1922,7 +1922,7 @@ export function gcMessages(agent?: string, maxAge = "24h", prNumber?: number, ha
     if (!lock) continue;
     try {
       for (const dir of [inbox.fresh, inbox.cur, inbox.dlq]) {
-        for (const file of listMessageFiles(dir)) {
+        for (const file of listMessageFiles(dir, dir === inbox.fresh)) {
           if (mailboxReplayStore(inbox.root).hasPendingFile(file)) continue;
           const full = join(dir, file);
           const msg = readMessageFile(full);

@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
@@ -133,7 +134,7 @@ export function drainOutbox(archive = true): OutboxMessage[] {
   mkdirSync(newDir, { recursive: true });
   mkdirSync(sentDir, { recursive: true });
 
-  const files = readdirSync(newDir).filter((f) => f.endsWith(".json") && !f.startsWith("."));
+  const files = readdirSync(newDir).filter(isMailboxMessageFile);
   const out: OutboxMessage[] = [];
   for (const f of files) {
     const src = join(newDir, f);
@@ -170,7 +171,7 @@ export function acknowledgeOutbox(id: string): void {
   const sentDir = outboxDir("sent");
   mkdirSync(sentDir, { recursive: true });
   mkdirSync(newDir, { recursive: true });
-  for (const filename of readdirSync(newDir).filter((f) => f.endsWith(".json") && !f.startsWith("."))) {
+  for (const filename of readdirSync(newDir).filter(isMailboxMessageFile)) {
     const path = join(newDir, filename);
     let record: OutboxMessage;
     try {

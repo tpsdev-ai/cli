@@ -85,7 +85,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
-import { acquireMailLockSync, type Envelope, type MailLock } from "@tpsdev-ai/agent";
+import { isMailboxMessageFile, acquireMailLockSync, type Envelope, type MailLock } from "@tpsdev-ai/agent";
 
 export type ObligationState =
   | "pending"
@@ -1187,8 +1187,7 @@ export async function scanForReceipt(
         }
         continue;
       }
-      if (name.startsWith(".")) continue; // staging temp
-      if (!name.endsWith(".json")) continue;
+      if (!isMailboxMessageFile(name)) continue;
       const path = resolve(dir, name);
       let record: any;
       try {

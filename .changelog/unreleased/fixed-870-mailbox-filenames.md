@@ -1,0 +1,1 @@
+- **Skip mailbox dot-files.** Use a shared filename predicate for `new/` consumers.

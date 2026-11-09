@@ -1,3 +1,4 @@
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import { homedir } from "node:os";
@@ -170,7 +171,7 @@ export async function processOutboxOnce(agentId: string): Promise<{ processed: n
   ensureDir(outCur);
   ensureDir(outFailed);
 
-  const files = readdirSync(outNew).filter((f) => f.endsWith(".json"));
+  const files = readdirSync(outNew).filter(isMailboxMessageFile);
   let processed = 0;
   let failed = 0;
 
@@ -638,7 +639,7 @@ function undoNewRelayRecord(root: string, delivery: { branchId: string; id: stri
     const parent = join(root, dir);
     if (!existsSync(parent)) continue;
     for (const entry of readdirSync(parent, { withFileTypes: true })) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+      if (!entry.isFile() || (dir === "new" ? !isMailboxMessageFile(entry.name) : !entry.name.endsWith(".json"))) continue;
       const path = join(parent, entry.name);
       let record: { relayDelivery?: { branchId?: string; id?: string } };
       try { record = JSON.parse(readFileSync(path, "utf8")); }
@@ -1426,7 +1427,7 @@ function migrateOrphanedInboxMessages(mailRoot: string): void {
   if (!existsSync(legacyDir)) return;
   const freshDir = join(mailRoot, "new");
   try {
-    const files = readdirSync(legacyDir).filter((f) => f.endsWith(".json"));
+    const files = readdirSync(legacyDir).filter(isMailboxMessageFile);
     for (const f of files) {
       const src = join(legacyDir, f);
       const dst = join(freshDir, f);
