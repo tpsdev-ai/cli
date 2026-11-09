@@ -100,6 +100,7 @@ there first, so a caller can signal the command itself rather than this wrapper.
 """
 import os
 import select
+import signal
 import subprocess
 import sys
 import termios
@@ -115,7 +116,8 @@ veof = attrs[6][termios.VEOF]
 if isinstance(veof, int):
     veof = bytes([veof])
 err_fd = os.open(err_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=err_fd)
+proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=err_fd,
+                        preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
 os.close(slave)
 os.close(err_fd)
 pidfile = os.environ.get('PTY_PIDFILE')
@@ -257,7 +259,17 @@ if (cmd === 'view') {
     try { n = parseInt(fs.readFileSync(counter, 'utf8'), 10) || 0; } catch (e) { n = 0; }
     fs.writeFileSync(counter, String(n + 1));
     const t0 = Date.now();
-    while (Date.now() - t0 < 1200) { /* hold */ }
+    if (process.env.FAKE_NPM_RELEASE_FILE) {
+      while (!fs.existsSync(process.env.FAKE_NPM_RELEASE_FILE) && Date.now() - t0 < 15000) { /* hold */ }
+    } else {
+      while (Date.now() - t0 < 1200) { /* hold */ }
+    }
+  }
+  if (s.stallAdd === spec.pkg && spec.ver !== s.stallRollbackVersion) {
+    fs.writeFileSync(process.env.FAKE_NPM_PIDFILE, String(process.pid));
+    process.on('SIGTERM', () => {});
+    setTimeout(() => { process.stdout.write('+latest: stalled add completed\n'); }, 3500);
+    return;
   }
   process.stdout.write('+latest: ' + spec.pkg + '@' + spec.ver + '\n');
   process.exit(0);
@@ -348,16 +360,16 @@ const targets = {
     "trap - TERM INT HUP\nif [ \"$failure\" -ne 0 ]; then\n  rollback_moved\nfi\n",
   ],
   reorder: [
-    '  moved[i]=1\n  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
-    '  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  moved[i]=1\n  set -e\n',
+    '  moved[i]=1\n  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
+    '  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  moved[i]=1\n  set -e\n',
   ],
   capture: [
-    '  set +e\n  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
-    '  set +e\n  out="$("$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"\n  rc=$?\n  set -e\n  [ -z "$out" ] || printf \'%s\\n\' "$out"\n',
+    '  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
+    '  set +e\n  out="$(run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"\n  rc=$?\n  set -e\n  [ -z "$out" ] || printf \'%s\\n\' "$out"\n',
   ],
   dispatch_early: [
-    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
-    '  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  if [ "$i" -eq $((NPKG - 1)) ]; then dispatch_docker; fi\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+    '  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+    '  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  if [ "$i" -eq $((NPKG - 1)) ]; then dispatch_docker; fi\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
   ],
   dispatch_rollback: [
     '  exit "$EXIT_DISPATCH_FAILED"\n',
@@ -587,6 +599,7 @@ d="$(new_fixture move-all)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 invoke "$d" 0.5.4 --yes
 assert_eq "E move-all: exit" 0 "$RC"
+assert_eq "E move-all: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
 assert_eq "E move-all: six dist-tag adds" 6 "$(adds_count)"
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "E move-all: registry end state" "latest=0.5.4 for all six"; else bad "E move-all: registry end state" "not all 0.5.4"; fi
 assert_eq "E move-all: six 'yes' in final table" 6 "$(printf '%s\n' "$OUT" | grep -cE 'yes$')"
@@ -605,6 +618,7 @@ d="$(new_fixture noop-rollback)"
 write_state "$d/state.json" "0.5.4" "0.5.3" "cli-linux-arm64"
 invoke "$d" 0.5.4 --yes
 assert_eq "G noop-rollback: exit" 4 "$RC"
+assert_eq "G noop-rollback: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
 assert_contains "G noop-rollback: reports the rollback" "$ERR" "rolling back"
 assert_contains "G noop-rollback: final table flags NO" "$OUT" "NO"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "G noop-rollback: registry restored" "latest=0.5.3 for all six"; else bad "G noop-rollback: registry restored" "a partial promote was left behind"; fi
@@ -661,6 +675,17 @@ assert_eq "Q build-metadata: exit" 0 "$RC"
 if printf '%s' "$ERR" | grep -qF 'PRE-RELEASE'; then bad "Q build-metadata: not a pre-release" "flagged a stable build as a pre-release"; else ok "Q build-metadata: not a pre-release" "treated as stable"; fi
 assert_eq "Q build-metadata: six dist-tag adds" 6 "$(adds_count)"
 if all_latest_eq "$d/state.json" "1.2.3+build-abc"; then ok "Q build-metadata: moved" "latest=1.2.3+build-abc for all six"; else bad "Q build-metadata: moved" "not all moved to 1.2.3+build-abc"; fi
+
+d="$(new_fixture prerelease-build)"
+write_state "$d/state.json" "1.2.3-rc.1+build-abc" "1.2.2"
+invoke "$d" 1.2.3-rc.1+build-abc --yes
+assert_eq "Q prerelease-build: acknowledgement" 3 "$RC"
+assert_contains "Q prerelease-build: classified" "$ERR" "PRE-RELEASE"
+assert_eq "Q prerelease-build: no adds" 0 "$(adds_count)"
+invoke "$d" 1.2.3-rc.1+build-abc --yes --allow-downgrade
+assert_eq "Q prerelease-build: exit" 0 "$RC"
+assert_eq "Q prerelease-build: six adds" 6 "$(adds_count)"
+if all_latest_eq "$d/state.json" "1.2.3-rc.1+build-abc"; then ok "Q prerelease-build: registry" ""; else bad "Q prerelease-build: registry" "wrong latest"; fi
 
 # ── L. a DOWNGRADE is allowed but needs --allow-downgrade, not --yes ──────────
 d="$(new_fixture downgrade)"
@@ -820,6 +845,58 @@ assert_contains "X gh-missing: status unconfirmed" "$ERR" "Docker image dispatch
 assert_contains "X gh-missing: names the missing binary" "$ERR" "gh not found"
 if all_latest_eq "$d/state.json" "0.5.4"; then ok "X gh-missing: no rollback" "latest=0.5.4 for all six"; else bad "X gh-missing: no rollback" "the promote was rolled back"; fi
 GH_BIN_OVERRIDE=""
+
+d="$(new_fixture lock-held)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+FAKE_NPM_RELEASE_FILE="$d/release" start_held "$d" cli-linux-arm64 0.5.4 0.5.4 --yes --no-docker
+wait_count "$HCOUNTER" 1 || bad "AB first run held" "no marker"
+first_pid="$(cat "$d/tool.pid")"
+second="$(new_fixture lock-second)"
+rm -rf "$second/root"
+ln -s "$d/root" "$second/root"
+cp "$d/state.json" "$second/state.json"
+invoke "$second" 0.5.4 --yes --no-docker
+assert_eq "AB held lock: refuses" 2 "$RC"
+assert_eq "AB held lock: no moves" 0 "$(adds_count)"
+assert_contains "AB held lock: path" "$ERR" "$second/root/.promote-latest.lock"
+assert_contains "AB held lock: PID" "$ERR" "PID $first_pid"
+assert_contains "AB held lock: remedy" "$ERR" "if that PID is not running"
+assert_eq "AB first lock retained" "$first_pid" "$(cat "$d/root/.promote-latest.lock/pid" 2>/dev/null)"
+: >"$d/release"
+finish_held "$d"
+assert_eq "AB first run completes" 0 "$IRC"
+
+d="$(new_fixture lock-int)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+run_interrupt "$d" cli-linux-arm64 0.5.4 INT 0.5.4 --yes --no-docker
+assert_eq "AC INT: exit" 4 "$IRC"
+assert_contains "AC INT: signal" "$ERR" "SIGINT"
+assert_eq "AC INT: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "AC INT: restored" ""; else bad "AC INT: restored" "partial promote"; fi
+
+d="$(new_fixture timeout)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+timeout_tool="$work/tool-timeout-observed.sh"
+node - "$tool" "$timeout_tool" <<'OBSERVE'
+const fs = require('fs');
+let s = fs.readFileSync(process.argv[2], 'utf8');
+s = s.replace('  watchdog_pid=$!', '  watchdog_pid=$!\n  printf \'%s\\n\' "$watchdog_pid" >>"$FAKE_WATCHDOG_PIDFILE"');
+s = s.replaceAll('    sleeper=$!', '    sleeper=$!\n    printf \'%s\\n\' "$sleeper" >>"$FAKE_WATCHDOG_PIDFILE"');
+fs.writeFileSync(process.argv[3], s);
+OBSERVE
+NPM_TIMEOUT_SECONDS=1 FAKE_NPM_PIDFILE="$d/npm.pid" FAKE_WATCHDOG_PIDFILE="$d/watchdogs" TOOL="$timeout_tool" invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "AD timeout: exit" 4 "$RC"
+assert_contains "AD timeout: command and bound" "$ERR" "timed out after 1 seconds: npm dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.4"
+assert_contains "AD timeout: distinct call status" "$ERR" "dist-tag add exited 124"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "AD timeout: restored" ""; else bad "AD timeout: restored" "partial promote"; fi
+assert_eq "AD timeout: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+for pidfile in "$d/npm.pid" "$d/watchdogs"; do
+  if [ ! -s "$pidfile" ]; then bad "AD timeout: PID recorded" "$pidfile"; continue; fi
+  while IFS= read -r pid || [ -n "$pid" ]; do
+    if kill -0 "$pid" 2>/dev/null; then bad "AD timeout: process gone" "PID $pid still running"; else ok "AD timeout: process gone" "PID $pid"; fi
+  done <"$pidfile"
+done
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"

@@ -1,0 +1,1 @@
+- **Promotion locking, npm timeouts, and combined SemVer suffixes.** `promote-latest.sh` serializes runs, bounds npm calls, and accepts prerelease plus build metadata.

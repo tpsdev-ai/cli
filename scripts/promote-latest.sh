@@ -85,10 +85,14 @@
 #                         successful promote (build the image yourself).
 #     --help              Show usage.
 #
+# Lock: $PROMOTE_ROOT/.promote-latest.lock (default: repo root); pid records the holder.
+#
 # ENVIRONMENT
 #
 #     NPM_BIN        npm binary to use (default: `npm`). Overridable so the
 #                    test harness can inject a fake registry.
+#     NPM_TIMEOUT_SECONDS  Per-call timeout in positive integer seconds (default: 120).
+#                    The bound includes time spent at an npm one-time-password prompt.
 #     NPM_REGISTRY   Registry to pin every npm call to (default
 #                    https://registry.npmjs.org).
 #     PROMOTE_ROOT   Repo root to read package.json files from (default: the
@@ -123,6 +127,7 @@ if [ "$BASH_MAJOR" -lt 3 ] || { [ "$BASH_MAJOR" -eq 3 ] && [ "$BASH_MINOR" -lt 2
 fi
 
 NPM_BIN="${NPM_BIN:-npm}"
+NPM_TIMEOUT_SECONDS="${NPM_TIMEOUT_SECONDS:-120}"
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 GH_BIN="${GH_BIN:-gh}"
 root="${PROMOTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
@@ -140,6 +145,84 @@ EXIT_ROLLBACK_FAILED=5
 EXIT_DISPATCH_FAILED=6
 
 die() { printf 'promote-latest: %s\n' "$1" >&2; exit "${2:-$EXIT_USAGE}"; }
+
+release_lock() {
+  if [ "$lock_owned" -eq 1 ]; then
+    rm -f "$lock_dir/pid"
+    rmdir "$lock_dir"
+    lock_owned=0
+  fi
+}
+
+acquire_lock() {
+  lock_dir="$root/.promote-latest.lock"
+  lock_owned=0
+  trap 'release_lock' EXIT
+  trap 'exit "$EXIT_REFUSED"' INT TERM HUP
+  if mkdir "$lock_dir" 2>/dev/null; then
+    lock_owned=1
+    printf '%s\n' "$$" >"$lock_dir/pid"
+  else
+    holder="$(cat "$lock_dir/pid" 2>/dev/null || printf unknown)"
+    die "lock held: $lock_dir (PID $holder). Wait, or remove the directory if that PID is not running." "$EXIT_REFUSED"
+  fi
+}
+
+run_npm() (
+  call_dir="$(mktemp -d)" || exit 1
+  npm_pid=""
+  watchdog_pid=""
+  cleanup_npm() {
+    if [ -n "$watchdog_pid" ]; then
+      kill -TERM "$watchdog_pid" 2>/dev/null || :
+      wait "$watchdog_pid" 2>/dev/null || :
+    fi
+    if [ -n "$npm_pid" ]; then
+      kill -KILL "$npm_pid" 2>/dev/null || :
+      wait "$npm_pid" 2>/dev/null || :
+    fi
+    rm -rf "$call_dir"
+  }
+  trap cleanup_npm EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+  "$NPM_BIN" "$@" <&0 &
+  npm_pid=$!
+  (
+    sleeper=""
+    stop_watchdog() {
+      if [ -n "$sleeper" ]; then
+        kill "$sleeper" 2>/dev/null || :
+        wait "$sleeper" 2>/dev/null || :
+      fi
+    }
+    trap stop_watchdog EXIT
+    trap 'exit 0' TERM INT HUP
+    sleep "$NPM_TIMEOUT_SECONDS" &
+    sleeper=$!
+    wait "$sleeper"
+    : >"$call_dir/timed-out"
+    kill -TERM "$npm_pid" 2>/dev/null || :
+    sleep 1 &
+    sleeper=$!
+    wait "$sleeper"
+    kill -KILL "$npm_pid" 2>/dev/null || :
+  ) &
+  watchdog_pid=$!
+  rc=0
+  wait "$npm_pid" || rc=$?
+  npm_pid=""
+  if [ -f "$call_dir/timed-out" ]; then
+    wait "$watchdog_pid" || :
+    watchdog_pid=""
+    printf 'promote-latest: npm command timed out after %s seconds: npm' "$NPM_TIMEOUT_SECONDS" >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+    exit 124
+  fi
+  exit "$rc"
+)
 
 usage() {
   cat <<'EOF'
@@ -239,7 +322,7 @@ if [ -z "$version" ]; then
 fi
 
 # Reject anything that is not a plausible semver, so a typo cannot reach npm.
-if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   die "invalid version: $version"
 fi
 
@@ -261,13 +344,19 @@ for ((i = 0; i < NPKG; i++)); do
   moved[i]=0
 done
 
+case "$NPM_TIMEOUT_SECONDS" in
+  '' | *[!0-9]*) die "NPM_TIMEOUT_SECONDS must be a positive integer" ;;
+esac
+[ "$NPM_TIMEOUT_SECONDS" -gt 0 ] 2>/dev/null || die "NPM_TIMEOUT_SECONDS must be a positive integer"
+acquire_lock
+
 printf 'Promoting the "latest" dist-tag to %s\n' "$version"
 
 # ── 1. verify BEFORE acting: all six exist at this version ───────────────────
 missing=()
 for ((i = 0; i < NPKG; i++)); do
   set +e
-  out="$("$NPM_BIN" view "${names[i]}@${version}" version --registry "$NPM_REGISTRY" 2>&1)"
+  out="$(run_npm view "${names[i]}@${version}" version --registry "$NPM_REGISTRY" 2>&1)"
   rc=$?
   set -e
   view_out[i]="$out"
@@ -305,7 +394,7 @@ plan_moves=0
 downgrades=()
 for ((i = 0; i < NPKG; i++)); do
   set +e
-  cur="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+  cur="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
   rc=$?
   set -e
   cur="$(trim "$cur")"
@@ -401,11 +490,11 @@ rollback_moved() {
     # also needs the script's own stdin/stdout/stderr (not captured): captured
     # output loses stdout's TTY, so npm cannot prompt for 2FA.
     set +e
-    "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
+    run_npm dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
     set -e
     set +e
-    back="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    back="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     brc=$?
     set -e
     back="$(trim "$back")"
@@ -514,13 +603,13 @@ for ((i = 0; i < NPKG; i++)); do
   # are both TTYs; captured output loses stdout's TTY, and npm then exits EOTP
   # without moving the tag.
   set +e
-  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
+  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?
   set -e
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
-  post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+  post="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
   prc=$?
   set -e
   post="$(trim "$post")"
@@ -539,7 +628,7 @@ done
 if [ "$failure" -eq 0 ]; then
   for ((i = 0; i < NPKG; i++)); do
     set +e
-    post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    post="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     prc=$?
     set -e
     post="$(trim "$post")"
