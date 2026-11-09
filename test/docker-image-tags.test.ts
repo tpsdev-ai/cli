@@ -340,10 +340,13 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
 
   test("every build takes the checked version, and the one push takes only the computed tags", () => {
     const builds = steps.filter((s) => s.uses?.includes("docker/build-push-action"));
-    expect(builds.length).toBe(2);
+    expect(builds.length, "one action step builds and pushes").toBe(1);
     for (const b of builds) {
       expect(String(b.with?.["build-args"]).trim()).toBe("TPS_VERSION=${{ steps.image.outputs.tps_version }}");
     }
+    const smoke = steps.find((s) => s.run?.includes("docker-nono-smoke.sh"));
+    expect(smoke?.env?.TPS_VERSION).toBe("${{ steps.image.outputs.tps_version }}");
+    expect(smoke?.run).toContain('--build-arg "TPS_VERSION=$TPS_VERSION"');
     const pushes = steps.filter((s) => s.with?.push === true);
     expect(pushes.length, "one step pushes").toBe(1);
     expect(pushes[0].with?.tags).toBe("${{ steps.image.outputs.tags }}");
