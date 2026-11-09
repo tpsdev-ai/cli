@@ -223,7 +223,12 @@ on_signal() {
 
 trap 'on_signal TERM' SIGTERM
 trap 'on_signal INT' SIGINT
-trap cleanup_pids_file EXIT
+# An explicit exit, an errexit failure or a handled signal keeps the team
+# whole-or-absent: stop the launched children (TERM, then the same bounded
+# wait) BEFORE the PID file goes away. shutdown_children removes the PID file
+# itself, and every step tolerates a second call, so this is safe to run after
+# a loop refusal that already stopped the children.
+trap 'shutdown_children TERM' EXIT
 
 kill_stale_pids
 
@@ -321,8 +326,9 @@ for ((i=0; i<count; i++)); do
   # cli#352 r (a) — the launch id is the ROSTER entry's (validated above). The
   # agent's config can be rewritten by the agent itself, so it may only VETO:
   # `tps-agent check` applies the same rule the launch does (charset, traversal,
-  # and config.agentId must agree — refusing names both) and refuses BEFORE
-  # anything is launched, so a refusal cannot leave a partial team running.
+  # and config.agentId must agree — refusing names both) and refuses before THIS
+  # agent is launched. At i>0 earlier iterations' agents are already running, so
+  # the refusal below stops them before exiting.
   # Fail closed when tps-agent is missing too (the launch would 127 anyway).
   if ! check_out="$(tps-agent check --id "$id" --config "$config_path" 2>&1)"; then
     echo "❌ agent '$id': refusing to launch — ${check_out:-tps-agent check failed}" >&2
@@ -335,8 +341,7 @@ for ((i=0; i<count; i++)); do
       echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
       # All-or-nothing, exactly like the two sibling refusals in this loop: this
       # fires mid-loop, so stop the agents launched in earlier iterations before
-      # exiting (pids.json is written only after the loop, and the EXIT trap just
-      # removes it — nothing durable would reap them).
+      # exiting (the EXIT trap does the same, and both are safe to repeat).
       shutdown_children TERM
       exit 1
     }
@@ -407,7 +412,7 @@ for ((i=0; i<count; i++)); do
     # All-or-nothing (cli#352 r): the refusal fires mid-loop, so agents launched
     # in earlier iterations are already backgrounded. Stop them before exiting so
     # a refusal leaves NO agent running — a team is either whole or absent,
-    # never partial. (The EXIT trap only removes pids.json.)
+    # never partial. (The EXIT trap stops them too.)
     echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the profile at $NONO_PROFILE) — refusing to launch the agent without isolation" >&2
     shutdown_children TERM
     exit 1

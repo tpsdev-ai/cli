@@ -1,1 +1,1 @@
-- **Seating-loop control** now fails on exit forms it cannot verify.
+- **Office supervisor**: the EXIT trap stops the launched agents (TERM, then the bounded wait) before removing the PID file, so an explicit exit, an errexit failure or a handled signal leaves no partial team; the seating-loop control refuses a loop containing a multi-line quoted string or heredoc and fails an EXIT trap that removes the PID file before stopping the children.

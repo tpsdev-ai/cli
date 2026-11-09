@@ -22,6 +22,9 @@
 #      the supervisor steps over it and still seats every agent. This fails
 #      against the pre-r6 code, which seats from a hardcoded uid=1001 and never
 #      probes.
+#   7. cli#357: a fallible step (useradd) fails while seating the SECOND agent,
+#      after the first has launched. `set -e` ends the script; the EXIT trap
+#      stops the first agent and no PID file remains.
 #
 # Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
@@ -94,7 +97,9 @@ else
   bad "test.yml does not invoke scripts/test-tps-office-supervisor.sh"
 fi
 
-# cli#357: reject termination shapes the source control cannot verify.
+# cli#357: reject termination shapes the source control cannot verify. A
+# multi-line quoted string or a heredoc is refused outright: a physical
+# `shutdown_children TERM` line inside one never runs, so it cannot be a guard.
 assert_seating_shutdown() { # <source>
   awk '
     function word(line, name) {
@@ -161,6 +166,45 @@ assert_seating_shutdown() { # <source>
         print "could not bound the agent seating loop"
         exit 1
       }
+      # Fail closed on a loop containing a multi-line quoted string or a
+      # heredoc: the lines inside them are data, not commands, so a physical
+      # `shutdown_children TERM` line inside one is not executed and cannot
+      # serve as a guard.
+      qstate=0    # 0 none, 1 single-quoted, 2 double-quoted
+      heredoc=""
+      for (j=s+1; j<e; j++) {
+        t=L[j]
+        if (heredoc != "") {
+          if (t == heredoc) heredoc=""
+          continue
+        }
+        if (qstate == 0 && t ~ /<</) {
+          fail(j, "unanalysable heredoc")
+          if (match(t, /<<-?[[:space:]]*["\047]?[[:alnum:]_]+/) > 0) {
+            delim=substr(t, RSTART, RLENGTH)
+            sub(/^<<-?[[:space:]]*["\047]?/, "", delim)
+            gsub(/["\047]/, "", delim)
+            heredoc=delim
+          }
+          continue
+        }
+        n=length(t); k=1
+        while (k<=n) {
+          ch=substr(t,k,1)
+          if (qstate == 0) {
+            if (ch == "\047") qstate=1
+            else if (ch == "\"") qstate=2
+            else if (ch == "#" && (k == 1 || substr(t,k-1,1) ~ /[[:space:];]/)) break
+          } else if (qstate == 1) {
+            if (ch == "\047") qstate=0
+          } else {
+            if (ch == "\\") k++
+            else if (ch == "\"") qstate=0
+          }
+          k++
+        }
+        if (qstate != 0) fail(j, "unanalysable multi-line quoted string")
+      }
       if (fn != "") fail(NR, "unanalysable function boundary")
       for (name in functions) {
         if (word(body[name], "exit")) exits[name]=1
@@ -207,9 +251,105 @@ assert_seating_shutdown() { # <source>
 }
 
 if analysis="$(assert_seating_shutdown "$sup")"; then
-  ok "seating-loop termination forms have verified shutdown guards"
+  ok "seating-loop exits are guarded and analysable"
 else
   bad "seating-loop source control: $analysis"
+fi
+
+# cli#357: the EXIT trap must stop the launched children BEFORE it removes the
+# PID file. Fail closed when the trap cannot be analysed.
+assert_exit_trap() { # <source>
+  awk '
+    function trim(s) {
+      sub(/^[[:space:]]+/, "", s)
+      sub(/[[:space:]]+$/, "", s)
+      return s
+    }
+    function addop(text,   w) {
+      split(trim(text), w, /[[:space:]]+/)
+      optext[++nops]=trim(text)
+      opcmd[nops]=w[1]
+    }
+    function expand(text, depth,   n, i, segs, seg, rest) {
+      if (depth > 8) { opaque=1; return }
+      gsub(/\n/, ";", text)
+      n=split(text, segs, /[;&|]+/)
+      for (i=1; i<=n; i++) {
+        seg=trim(segs[i])
+        if (seg == "") continue
+        if (seg ~ /`/ || seg ~ /\$\(/) { opaque=1; return }
+        rest=seg
+        while (rest ~ /^(if|elif|then|else|while|until|do|for|!)[[:space:]]+/) sub(/^(if|elif|then|else|while|until|do|for|!)[[:space:]]+/, "", rest)
+        while (rest ~ /^[[:alnum:]_]+=[^[:space:]]*[[:space:]]+/) sub(/^[[:alnum:]_]+=[^[:space:]]*[[:space:]]+/, "", rest)
+        rest=trim(rest)
+        if (rest == "" || rest ~ /^(fi|done|esac|\}|\{)$/) continue
+        addop(rest)
+        if (opcmd[nops] !~ /^[[:alnum:]_]+$/ && opcmd[nops] != "[[" && opcmd[nops] != "[") {
+          opaque=1
+          return
+        }
+        if (opcmd[nops] in fbody) expand(fbody[opcmd[nops]], depth+1)
+      }
+    }
+    { lines[NR]=$0 }
+    END {
+      fn=""; depth=0; body=""
+      for (i=1; i<=NR; i++) {
+        line=lines[i]
+        if (fn == "") {
+          if (line ~ /^[[:space:]]*(function[[:space:]]+)?[[:alnum:]_]+[[:space:]]*\(\)[[:space:]]*\{/) {
+            name=line
+            sub(/^[[:space:]]*(function[[:space:]]+)?/, "", name)
+            sub(/[[:space:]]*\(.*/, "", name)
+            fn=name; body=""
+            tmp=line; sub(/^[^{]*\{/, "", tmp)
+            o=gsub(/\{/, "{", tmp); c=gsub(/\}/, "}", tmp)
+            depth=1+o-c
+            if (depth <= 0) {
+              sub(/\}.*$/, "", tmp)
+              fbody[fn]=body "\n" tmp
+              fn=""
+            } else body=body "\n" tmp
+          }
+          if (line ~ /^[[:space:]]*trap[[:space:]]/ && line ~ /[[:space:]]EXIT[[:space:]]*$/) {
+            trapline=line; ntrap++
+          }
+          continue
+        }
+        tmp=line
+        o=gsub(/\{/, "{", tmp); c=gsub(/\}/, "}", tmp)
+        depth += o-c
+        if (depth <= 0) {
+          sub(/\}.*$/, "", tmp)
+          fbody[fn]=body "\n" tmp
+          fn=""
+        } else body=body "\n" tmp
+      }
+      if (ntrap != 1) { print "expected exactly one EXIT trap, found " ntrap; exit 1 }
+      cmd=trapline
+      sub(/^[[:space:]]*trap[[:space:]]+/, "", cmd)
+      sub(/[[:space:]]+EXIT[[:space:]]*$/, "", cmd)
+      if (cmd ~ /^\047/) { sub(/^\047/, "", cmd); sub(/\047$/, "", cmd) }
+      expand(cmd, 0)
+      if (opaque) { print "EXIT trap is not analysable: " trapline; exit 1 }
+      if (nops == 0) { print "EXIT trap runs no command: " trapline; exit 1 }
+      stop_at=0; cleanup_at=0
+      for (i=1; i<=nops; i++) {
+        if (stop_at == 0 && (opcmd[i] == "kill" || opcmd[i] == "shutdown_children")) stop_at=i
+        if (cleanup_at == 0 && (opcmd[i] == "cleanup_pids_file" || (opcmd[i] == "rm" && optext[i] ~ /PIDS_FILE/))) cleanup_at=i
+      }
+      if (stop_at == 0) { print "EXIT trap does not stop the launched children: " trapline; exit 1 }
+      if (cleanup_at == 0) { print "EXIT trap does not remove the PID file: " trapline; exit 1 }
+      if (cleanup_at < stop_at) { print "EXIT trap removes the PID file before stopping the children: " trapline; exit 1 }
+      exit 0
+    }
+  ' "$1"
+}
+
+if analysis="$(assert_exit_trap "$sup")"; then
+  ok "the EXIT trap stops the launched children before removing the PID file"
+else
+  bad "EXIT-trap control: $analysis"
 fi
 
 seating_fixtures="$(mktemp -d)"
@@ -250,6 +390,30 @@ check_seating_fixture "comment is not a guard" unguarded "$(printf '  # shutdown
 check_seating_fixture "split-word exiting helper fails as unanalysable" unanalysable '  refuse' "$(printf 'refuse() {\n  ex\\\nit 1\n}')"
 check_seating_fixture "dynamic command fails as unanalysable" unanalysable "  \"\$cmd\""
 check_seating_fixture "conditional dynamic command fails as unanalysable" unanalysable "  [[ \"\$ok\" ]] && \"\$cmd\""
+check_seating_fixture "multi-line quoted guard lookalike fails as unanalysable" unanalysable "$(printf '  msg="warning:\nshutdown_children TERM\n"\n  exit 1')"
+check_seating_fixture "here-doc guard lookalike fails as unanalysable" unanalysable "$(printf '  cat <<EOF\nshutdown_children TERM\nEOF\n  exit 1')"
+
+check_exit_trap_fixture() { # <label> <expected:pass|fail> <source>
+  local label="$1" expected="$2" src="$3" result rc
+  printf '%s\n' "$src" >"$seating_fixtures/trap.sh"
+  result="$(assert_exit_trap "$seating_fixtures/trap.sh")"; rc=$?
+  case "$expected:$rc" in
+    pass:0) ok "$label" ;;
+    fail:1) ok "$label" ;;
+    *) bad "$label (expected $expected, got status $rc: $result)" ;;
+  esac
+}
+check_exit_trap_fixture "EXIT trap that stops children first passes" pass "$(printf '%s\n' \
+  'cleanup_pids_file() {' '  rm -f "$PIDS_FILE"' '}' \
+  'shutdown_children() {' '  kill -TERM "$1" 2>/dev/null || true' '  cleanup_pids_file' '}' \
+  "trap 'shutdown_children TERM' EXIT")"
+check_exit_trap_fixture "EXIT trap that only removes the PID file fails" fail "$(printf '%s\n' \
+  'cleanup_pids_file() {' '  rm -f "$PIDS_FILE"' '}' \
+  "trap 'cleanup_pids_file' EXIT")"
+check_exit_trap_fixture "EXIT trap that removes the PID file before stopping fails" fail "$(printf '%s\n' \
+  'cleanup_pids_file() { rm -f "$PIDS_FILE"; }' \
+  'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; cleanup_pids_file; }' \
+  "trap 'cleanup_pids_file; shutdown_children TERM' EXIT")"
 rm -rf "$seating_fixtures"
 
 # ── Part B — behavioural, fake nono ──────────────────────────────────────────
@@ -339,6 +503,35 @@ SH
   }
   mkorphan "$tmp/bin-orphan"
 
+  # Fake nono + useradd for the errexit case: every probe passes and agent 1
+  # runs until TERMed; seating the SECOND agent fails at useradd.
+  mkuseraddfail() {
+    local d="$1"
+    mkshims "$d" no
+    cat >"$d/nono" <<'SH'
+#!/usr/bin/env bash
+printf 'NONO-ARGV nono %s\n' "$*" >> "${NONO_ARGV_LOG:?}"
+case "$*" in
+  *tps-agent*start*)
+    echo "started $$" >> "${USERADD_MARKER:?}"
+    trap 'echo "stopped $$" >> "${USERADD_MARKER:?}"; exit 0' TERM INT
+    i=0; while [ "$i" -lt 15 ]; do sleep 1; i=$((i + 1)); done
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+    cat >"$d/useradd" <<'SH'
+#!/usr/bin/env bash
+for a in "$@"; do last="$a"; done
+case "$last" in
+  agent-probe2) sleep 1; exit 1 ;;
+esac
+exit 0
+SH
+    chmod +x "$d"/*
+  }
+  mkuseraddfail "$tmp/bin-useradd-fail2"
+
   # A roster + config + identity key the supervisor can act on (cli#352 r).
   seed() { # <config-agent-id> [<roster-id>]
     local cfg_id="${1:-probe}" roster_id="${2:-probe}"
@@ -408,6 +601,25 @@ SH
   if grep -q 'tps-agent start --id probe --config /workspace/probe/agent.yaml' "$NONO_ARGV_LOG"; then ok "first agent had launched before the refusal"; else bad "first agent never launched (case invalid)"; fi
   if grep -q '^started' "$ORPHAN_MARKER"; then ok "first agent started"; else bad "first agent never started"; fi
   if grep -q '^stopped' "$ORPHAN_MARKER"; then ok "first agent STOPPED on refusal (no orphan)"; else bad "ORPHAN: the first agent was not stopped on refusal"; fi
+
+  # (3b) errexit orphan (cli#357): seating the SECOND agent fails at useradd —
+  # a fallible step after the first agent launched. `set -e` ends the script;
+  # the EXIT trap must stop agent 1 and leave no PID file.
+  mkdir -p /workspace/.tps /run/secrets /workspace/probe2
+  printf '[{"id":"probe","configPath":"/workspace/probe/agent.yaml"},{"id":"probe2","configPath":"/workspace/probe2/agent.yaml"}]\n' >/workspace/.tps/team.json
+  printf 'agentId: probe\n' >/workspace/probe/agent.yaml
+  printf 'agentId: probe2\n' >/workspace/probe2/agent.yaml
+  printf 'x' >/run/secrets/.ready
+  rm -f /workspace/.tps/pids.json
+  export NONO_ARGV_LOG="$tmp/argv3b.log"; : >"$NONO_ARGV_LOG"
+  export USERADD_MARKER="$tmp/useradd.log"; : >"$USERADD_MARKER"
+  PATH="$tmp/bin-useradd-fail2:$cleanpath" timeout 20 bash "$sup" >"$tmp/out3b.log" 2>&1; rc3b=$?
+  if [ "$rc3b" -ne 0 ]; then ok "errexit after an earlier launch exits non-zero ($rc3b)"; else bad "errexit run exited 0 (should fail)"; fi
+  if grep -q 'tps-agent start --id probe --config /workspace/probe/agent.yaml' "$NONO_ARGV_LOG"; then ok "first agent had launched before the errexit"; else bad "first agent never launched (case invalid)"; fi
+  launched_pid="$(sed -n 's/^started //p' "$USERADD_MARKER" | head -n1)"
+  if grep -q '^stopped' "$USERADD_MARKER"; then ok "first agent STOPPED on errexit (no orphan)"; else bad "ORPHAN: the first agent was not stopped when useradd failed"; fi
+  if [ -n "$launched_pid" ] && ! kill -0 "$launched_pid" 2>/dev/null; then ok "first agent process $launched_pid is gone afterwards"; else bad "first agent process '${launched_pid:-unknown}' is still running after the errexit"; fi
+  if [ ! -e /workspace/.tps/pids.json ]; then ok "no PID file remains after the errexit"; else bad "the PID file remains after the errexit"; fi
 
   # (4) traversal-shaped roster id → refused before anything runs (cli#352 r)
   mkdir -p /workspace/.tps /run/secrets
