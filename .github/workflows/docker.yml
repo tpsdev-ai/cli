@@ -11,88 +11,100 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
+
+env:
+  # The single platform list: the build matrix mirrors it, each leg smokes its
+  # own entry, and the publish job's index check reads it (cli#353).
+  PLATFORMS: linux/amd64,linux/arm64
 
 jobs:
-  build-and-push:
-    name: Build, smoke & push
+  # Before any build: the required version shape, whether npm has published
+  # @tpsdev-ai/agent at that version, and the tags to push (cli#420). The
+  # script and its tests: .github/scripts/docker-image-tags.sh,
+  # test/docker-image-tags.test.ts.
+  meta:
+    name: Version and tags
     runs-on: ubuntu-latest
-    timeout-minutes: 150
-    env:
-      # The single platform list: one build produces the OCI archive for these
-      # platforms, the smoke loop loads each one from it, and the registry
-      # copies carry all of them (cli#353).
-      PLATFORMS: linux/amd64,linux/arm64
-    services:
-      # The handoff target: the archive is copied here on every run, so the
-      # digest equality below is proven even when nothing is published.
-      registry:
-        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
-        ports:
-          - 5000:5000
+    permissions:
+      contents: read
+    outputs:
+      tps_version: ${{ steps.image.outputs.tps_version }}
+      tags: ${{ steps.image.outputs.tags }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
-      # Before any build: the required version shape, whether npm has
-      # published @tpsdev-ai/agent at that version, and the tags to push
-      # (cli#420). The script and its tests: .github/scripts/docker-image-tags.sh,
-      # test/docker-image-tags.test.ts.
       - name: Check the version and compute the tags
         id: image
         env:
           INPUT_VERSION: ${{ inputs.version }}
         run: bash .github/scripts/docker-image-tags.sh
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+  # One native build per platform: an arm64 nono build does not fit the job
+  # under QEMU (cli#353), so each leg runs on its own architecture.
+  build:
+    name: Build and smoke ${{ matrix.platform }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
 
-      - name: Log in to ghcr.io
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve the platform's architecture
+        id: platform
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "arch=${PLATFORM#linux/}" >>"$GITHUB_OUTPUT"
 
-      # ONE build (cli#353): every platform into one OCI archive, never pushed
-      # here. The action supplies the cache runtime; the GHA cache is written on
-      # both publish=false and publish=true runs.
-      - name: Build every platform to one OCI archive
+      # ONE build per leg, to an OCI archive that is never pushed here: the
+      # smoke below and the publish job use these bytes (cli#353). The GHA
+      # cache is written on both publish=false and publish=true runs, scoped
+      # per platform so the legs never share layers.
+      - name: Build ${{ matrix.platform }} to an OCI archive
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: docker/Dockerfile
-          platforms: ${{ env.PLATFORMS }}
+          platforms: ${{ matrix.platform }}
           push: false
-          outputs: type=oci,dest=${{ runner.temp }}/tps-office.oci.tar
+          outputs: type=oci,dest=${{ runner.temp }}/tps-office-${{ steps.platform.outputs.arch }}.oci.tar
           build-args: |
-            TPS_VERSION=${{ steps.image.outputs.tps_version }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            TPS_VERSION=${{ needs.meta.outputs.tps_version }}
+          cache-from: type=gha,scope=${{ steps.platform.outputs.arch }}
+          cache-to: type=gha,mode=max,scope=${{ steps.platform.outputs.arch }}
 
-      # Smoke the bytes in the archive, not a rebuild: each platform's instance
-      # is loaded from the same file into the local daemon and then checked
-      # against docker/nono.sha256 and .nono-version.
-      - name: Smoke each platform from the archive
+      # Smoke the bytes in the archive, not a rebuild: this leg's platform is
+      # loaded from the same file into the local daemon and then checked
+      # against docker/nono.sha256 and .nono-version, natively (no QEMU).
+      - name: Smoke ${{ matrix.platform }} from the archive
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          ARCH: ${{ steps.platform.outputs.arch }}
         run: |
           set -eux
           command -v skopeo >/dev/null || {
             echo "skopeo is required to load a platform out of the OCI archive" >&2
             exit 1
           }
-          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
-          for platform in ${PLATFORMS//,/ }; do
-            arch="${platform#linux/}"
-            tag="tps-office-verify:linux-${arch}"
-            skopeo copy --override-os linux --override-arch "$arch" \
-              "oci-archive:$archive" "docker-daemon:$tag"
-            bash .github/scripts/docker-nono-smoke.sh "$platform" "$tag"
-          done
+          archive="${RUNNER_TEMP:-/tmp}/tps-office-$ARCH.oci.tar"
+          tag="tps-office-verify:linux-$ARCH"
+          skopeo copy --override-os linux --override-arch "$ARCH" \
+            "oci-archive:$archive" "docker-daemon:$tag"
+          bash .github/scripts/docker-nono-smoke.sh "$PLATFORM" "$tag"
       # cli#352 r3/r4 — the ship-red control (S1b/S4 "harness green, ship red"
       # class). The hash smoke above proves the binary's bytes, its version and
       # that it runs; this proves the IMAGE can actually run an office agent. It
@@ -111,6 +123,7 @@ jobs:
       # passed, so (1)-(3) cannot be satisfied by the harness supplying the
       # profiles.
       - name: Launch control — the built image resolves its profile and launches an agent
+        if: matrix.platform == 'linux/amd64'
         run: |
           set -eux
           fx="$(mktemp -d "${RUNNER_TEMP:-/tmp}/office-smoke.XXXXXX")"
@@ -164,39 +177,122 @@ jobs:
           chmod +x "$fx/.smoke.sh"
           docker run --rm -v "$fx:/workspace" --entrypoint /bin/bash tps-office-verify:linux-amd64 /workspace/.smoke.sh
 
-      # Prove the handoff before anything is published: the local registry must
-      # report the same index digest as the archive. Runs on publish=false too.
-      - name: Copy the archive into the local registry and check its digest
+      - name: Upload the ${{ matrix.platform }} archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tps-office-${{ steps.platform.outputs.arch }}
+          path: ${{ runner.temp }}/tps-office-${{ steps.platform.outputs.arch }}.oci.tar
+          retention-days: 1
+
+  # The only job that may write packages: it hands the two smoked archives to
+  # a local registry, assembles their index, and (only on publish=true) pushes
+  # that index to GHCR unchanged.
+  publish:
+    name: Publish the multi-platform index
+    needs: [build, meta]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # the "Log in to ghcr.io" and "Push the index to GHCR" steps
+    services:
+      # The handoff target: the archives are copied here on every run, so the
+      # index and its digest equality are proven even when nothing is published.
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
+    steps:
+      - name: Download the platform archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: ${{ runner.temp }}/archives
+
+      # Each single-platform archive is copied with `--preserve-digests` and its
+      # manifest digest recorded; the local registry must report the same digest.
+      - name: Copy each platform into the local registry and record its digest
         run: |
           set -eux
-          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
-          skopeo copy --all --preserve-digests --dest-tls-verify=false "oci-archive:$archive" docker://localhost:5000/tps-office:verify
-          src="$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
-          dst="$(skopeo inspect --tls-verify=false --raw docker://localhost:5000/tps-office:verify | sha256sum | cut -d' ' -f1)"
-          test "$src" = "$dst" || {
-            echo "digest mismatch: archive $src, local registry $dst" >&2
+          archives="${RUNNER_TEMP:-/tmp}/archives"
+          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
+          : >"$digests"
+          for platform in ${PLATFORMS//,/ }; do
+            arch="${platform#linux/}"
+            archive="$(find "$archives" -type f -name "tps-office-$arch.oci.tar")"
+            test -n "$archive"
+            src="sha256:$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
+            skopeo copy --preserve-digests --dest-tls-verify=false \
+              "oci-archive:$archive" "docker://localhost:5000/tps-office:$arch"
+            dst="sha256:$(skopeo inspect --tls-verify=false --raw "docker://localhost:5000/tps-office:$arch" | sha256sum | cut -d' ' -f1)"
+            test "$src" = "$dst" || {
+              echo "digest mismatch for $platform: archive $src, local registry $dst" >&2
+              exit 1
+            }
+            printf '%s %s %s\n' "$platform" "$arch" "$dst" >>"$digests"
+          done
+
+      - name: Assemble the multi-platform index from the recorded digests
+        run: |
+          set -eux
+          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
+          set --
+          while read -r _ _ digest; do
+            set -- "$@" "localhost:5000/tps-office@$digest"
+          done <"$digests"
+          docker buildx imagetools create -t localhost:5000/tps-office:verify "$@"
+
+      # The index must list exactly PLATFORMS, and each entry must be the
+      # manifest digest the leg smoked (recorded above).
+      - name: Verify the index lists exactly PLATFORMS with the smoked digests
+        run: |
+          set -eux
+          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
+          raw="${RUNNER_TEMP:-/tmp}/index.json"
+          skopeo inspect --tls-verify=false --raw docker://localhost:5000/tps-office:verify >"$raw"
+          jq -e '.manifests | length > 0' "$raw" >/dev/null
+          actual="$(jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "$raw" | sort)"
+          set --
+          for platform in ${PLATFORMS//,/ }; do
+            digest="$(awk -v p="$platform" '$1 == p { print $3 }' "$digests")"
+            test -n "$digest"
+            set -- "$@" "$platform $digest"
+          done
+          expected="$(printf '%s\n' "$@" | sort)"
+          test "$actual" = "$expected" || {
+            echo "index entries do not match the smoked manifests:" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
             exit 1
           }
-          echo "local registry holds the archive index digest $src"
+          printf '%s\n' "$actual"
+          sha256sum "$raw" | cut -d' ' -f1 >"${RUNNER_TEMP:-/tmp}/index-digest"
 
-      - name: Push the archive to GHCR
+      - name: Log in to ghcr.io
+        if: ${{ inputs.publish }}
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only on publish=true, and only after the local index proved: the same
+      # index is copied to every computed tag, each followed by a digest check.
+      - name: Push the index to GHCR
         if: ${{ inputs.publish }}
         env:
-          TAGS: ${{ steps.image.outputs.tags }}
+          TAGS: ${{ needs.meta.outputs.tags }}
         run: |
           set -eux
-          archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"
           # skopeo reads docker/login-action's credentials from this file.
           grep -q 'ghcr.io' "$HOME/.docker/config.json" || {
             echo "no ghcr.io credentials in ~/.docker/config.json" >&2
             exit 1
           }
-          src="$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
+          local_index="$(cat "${RUNNER_TEMP:-/tmp}/index-digest")"
+          test -n "$local_index"
           for tag in $TAGS; do
-            skopeo copy --all --preserve-digests "oci-archive:$archive" "docker://$tag"
-            dst="$(skopeo inspect --raw "docker://$tag" | sha256sum | cut -d' ' -f1)"
-            test "$src" = "$dst" || {
-              echo "digest mismatch for $tag: archive $src, registry $dst" >&2
+            skopeo copy --all --preserve-digests "docker://localhost:5000/tps-office:verify" "docker://$tag"
+            remote="$(skopeo inspect --raw "docker://$tag" | sha256sum | cut -d' ' -f1)"
+            test "$local_index" = "$remote" || {
+              echo "digest mismatch for $tag: local index $local_index, registry $remote" >&2
               exit 1
             }
           done

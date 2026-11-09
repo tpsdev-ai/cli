@@ -6,11 +6,12 @@
  * passes, a wrong hash fails printing both hashes, a missing platform line
  * fails naming the platform, and a failed `nono --version` fails. A smoke is
  * red on a missing hash line, a hash mismatch, a wrong version, or a failed
- * run. The workflow tests read the real `docker.yml`: one build step writes the
- * OCI archive, the smoke loop loads each PLATFORMS instance from that same
- * archive, every registry copy uses `--all --preserve-digests` from it and is
- * followed by a digest check, and only the GHCR copy is gated on
- * `inputs.publish`.
+ * run. The workflow tests read the real `docker.yml`: one job checks the
+ * version and tags, each platform is built on its own native runner (no QEMU)
+ * into one OCI archive, that leg's smoke loads its own archive, the publish job
+ * copies each archive with `--preserve-digests` and checks its digest,
+ * assembles the index from those digests and checks it against `PLATFORMS`, and
+ * only the GHCR login and copy are gated on `inputs.publish`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -195,120 +196,192 @@ interface Step {
   env?: Record<string, string>;
   with?: Record<string, unknown>;
 }
+interface Job {
+  needs?: string | string[];
+  permissions?: Record<string, string>;
+  "timeout-minutes"?: number;
+  "runs-on"?: string;
+  strategy?: { matrix?: { include?: Array<Record<string, string>> } };
+  services?: Record<string, { image?: string }>;
+  steps?: Step[];
+}
 interface Workflow {
   on?: {
     workflow_dispatch?: {
       inputs?: Record<string, { type?: string; default?: boolean }>;
     };
   };
-  jobs?: Record<
-    string,
-    { env?: Record<string, string>; services?: Record<string, { image?: string }>; steps?: Step[] }
-  >;
+  env?: Record<string, string>;
+  permissions?: Record<string, string>;
+  jobs?: Record<string, Job>;
 }
 
 const workflow = yaml.load(readFileSync(WORKFLOW, "utf8")) as Workflow;
-const job = workflow.jobs?.["build-and-push"];
-const steps = job?.steps ?? [];
+const jobs = workflow.jobs ?? {};
+const allSteps = (): Step[] => Object.values(jobs).flatMap((j) => j.steps ?? []);
+const platformList = (): string[] =>
+  (workflow.env?.PLATFORMS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
 
 describe("docker.yml", () => {
-  test("one build step writes the OCI archive and no shell build remains", () => {
-    const builds = steps.filter((s) => s.uses?.includes("docker/build-push-action"));
+  test("meta feeds the build, and publish needs the build and meta", () => {
+    expect(Object.keys(jobs)).toEqual(["meta", "build", "publish"]);
+    expect(jobs.build?.needs).toBe("meta");
+    expect([jobs.publish?.needs ?? []].flat()).toContain("build");
+    expect(jobs.meta?.permissions).toEqual({ contents: "read" });
+    expect(jobs.build?.permissions).toEqual({ contents: "read" });
+  });
+
+  test("no job sets up QEMU", () => {
+    expect(allSteps().filter((s) => s.uses?.includes("setup-qemu"))).toEqual([]);
+  });
+
+  test("the build matrix is PLATFORMS, and every arm64 entry runs on an arm runner", () => {
+    const platforms = platformList();
+    expect(platforms).toEqual(["linux/amd64", "linux/arm64"]);
+
+    const include = jobs.build?.strategy?.matrix?.include ?? [];
+    expect(include.map((entry) => entry.platform)).toEqual(platforms);
+    expect(jobs.build?.["runs-on"]).toBe("${{ matrix.runner }}");
+    expect(jobs.build?.["timeout-minutes"]).toBe(60);
+    for (const entry of include) {
+      if (entry.platform === "linux/arm64") expect(entry.runner).toMatch(/arm/);
+      else expect(entry.runner).not.toMatch(/arm/);
+    }
+  });
+
+  test("each leg has one build step writing its OCI archive and smokes that archive", () => {
+    const builds = (jobs.build?.steps ?? []).filter((s) =>
+      s.uses?.includes("docker/build-push-action"),
+    );
     expect(builds.length).toBe(1);
     const build = builds[0];
+    expect(build.if).toBeUndefined();
     expect(build.with?.push).toBe(false);
-    expect(build.with?.platforms).toBe("${{ env.PLATFORMS }}");
-    expect(String(build.with?.outputs)).toBe("type=oci,dest=${{ runner.temp }}/tps-office.oci.tar");
-    expect(String(build.with?.["cache-from"])).toBe("type=gha");
-    expect(String(build.with?.["cache-to"])).toBe("type=gha,mode=max");
+    expect(build.with?.platforms).toBe("${{ matrix.platform }}");
+    expect(String(build.with?.outputs)).toContain("type=oci,dest=");
+    expect(String(build.with?.outputs)).toContain("tps-office-");
+    expect(String(build.with?.outputs)).toContain(".oci.tar");
+    for (const key of ["cache-from", "cache-to"]) {
+      expect(String(build.with?.[key]), key).toContain("scope=");
+      expect(String(build.with?.[key]), key).toContain("arch");
+    }
 
-    expect(steps.filter((s) => s.run?.includes("docker buildx build"))).toEqual([]);
-    expect(steps.filter((s) => s.with?.push === true)).toEqual([]);
-    expect(steps.filter((s) => s.run?.includes("docker push "))).toEqual([]);
-  });
+    expect((jobs.build?.steps ?? []).filter((s) => s.run?.includes("docker buildx build"))).toEqual(
+      [],
+    );
+    expect(allSteps().filter((s) => s.with?.push === true)).toEqual([]);
 
-  test("PLATFORMS drives the build and the smoke loop", () => {
-    const all = (job?.env?.PLATFORMS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    expect(all).toEqual(["linux/amd64", "linux/arm64"]);
-
-    const smoke = steps.find((s) => s.run?.includes("docker-nono-smoke.sh"));
-    expect(smoke).toBeDefined();
-    const found = /for platform in ([^;]+); do/.exec(smoke?.run ?? "");
-    expect(found).not.toBeNull();
-    const iter = found?.[1].trim() ?? "";
-    // The only accepted expansion is the whole list; anything else is read as
-    // the literal platforms it names, so a loop that drops one is visible here.
-    const smoked = iter === "${PLATFORMS//,/ }" ? all : iter.split(/\s+/).filter(Boolean);
-    expect(smoked).toEqual(all);
-  });
-
-  test("the smoke loads each platform from the archive and requires skopeo", () => {
-    const smoke = steps.find((s) => s.run?.includes("docker-nono-smoke.sh"));
+    const smoke = (jobs.build?.steps ?? []).find((s) => s.run?.includes("docker-nono-smoke.sh"));
     const run = smoke?.run ?? "";
-    expect(run).toContain('archive="${RUNNER_TEMP:-/tmp}/tps-office.oci.tar"');
-    expect(run).toContain("command -v skopeo");
+    expect(run).toContain('archive="${RUNNER_TEMP:-/tmp}/tps-office-$ARCH.oci.tar"');
     expect(run).toContain('"oci-archive:$archive"');
     expect(run).toContain('"docker-daemon:$tag"');
+    expect(run).toContain('bash .github/scripts/docker-nono-smoke.sh "$PLATFORM" "$tag"');
+    expect(smoke?.env?.PLATFORM).toBe("${{ matrix.platform }}");
   });
 
-  test("every registry copy uses --all --preserve-digests from the archive, then checks the digest", () => {
-    const withCopies = steps.filter(
+  test("the amd64 leg runs the launch control on its archive-loaded image", () => {
+    const launch = (jobs.build?.steps ?? []).find((s) => s.run?.includes("tps-office-supervisor"));
+    expect(launch).toBeDefined();
+    expect(launch?.if).toBe("matrix.platform == 'linux/amd64'");
+    expect(launch?.run).toContain("tps-office-verify:linux-amd64");
+  });
+
+  test("each leg uploads its archive with the pinned action for one day", () => {
+    const uploads = (jobs.build?.steps ?? []).filter((s) =>
+      s.uses?.startsWith("actions/upload-artifact@"),
+    );
+    expect(uploads.length).toBe(1);
+    expect(uploads[0].uses).toBe(
+      "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+    );
+    expect(uploads[0].with?.["retention-days"]).toBe(1);
+  });
+
+  test("only the publish job can write packages, and its login is gated on publish", () => {
+    const writers = Object.entries(jobs)
+      .filter(([, job]) => job.permissions?.["packages"] === "write")
+      .map(([name]) => name);
+    expect(writers).toEqual(["publish"]);
+    expect(workflow.permissions?.["packages"]).not.toBe("write");
+    expect(jobs.publish?.permissions?.["contents"]).toBe("read");
+
+    const login = (jobs.publish?.steps ?? []).find((s) =>
+      s.uses?.includes("docker/login-action"),
+    );
+    expect(login?.with?.registry).toBe("ghcr.io");
+    expect(login?.if).toBe("${{ inputs.publish }}");
+  });
+
+  test("publish downloads both archives with the pinned action", () => {
+    const download = (jobs.publish?.steps ?? []).find((s) =>
+      s.uses?.startsWith("actions/download-artifact@"),
+    );
+    expect(download?.uses).toBe(
+      "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+    );
+  });
+
+  test("every registry copy preserves digests and is followed by a digest check", () => {
+    const copySteps = allSteps().filter(
       (s) => s.run?.includes("skopeo copy") && s.run.includes("docker://"),
     );
-    expect(withCopies.length).toBe(2);
-    const lines = withCopies.flatMap((s) =>
-      (s.run ?? "").split("\n").filter((l) => l.includes("skopeo copy")),
+    expect(copySteps.length).toBe(2);
+    const lines = copySteps.flatMap((s) =>
+      (s.run ?? "").split("\n").filter((line) => line.includes("skopeo copy")),
     );
     expect(lines.length).toBe(2);
-    for (const line of lines) {
-      expect(line).toContain("--all");
-      expect(line).toContain("--preserve-digests");
-      expect(line).toContain("oci-archive:$archive");
-    }
-    for (const step of withCopies) {
+    for (const line of lines) expect(line).toContain("--preserve-digests");
+    for (const step of copySteps) {
       const run = step.run ?? "";
       const copy = run.indexOf("skopeo copy");
-      const check = run.indexOf('test "$src" = "$dst"');
       expect(copy).toBeGreaterThan(-1);
-      expect(check).toBeGreaterThan(copy);
-      expect(run).toContain('skopeo inspect --raw "oci-archive:$archive"');
+      expect(run.slice(copy), step.name).toMatch(/test "\$\w+" = "\$\w+"/);
     }
   });
 
-  test("the local-registry handoff runs always and the GHCR copy is gated on publish", () => {
-    const local = steps.find((s) => s.run?.includes("docker://localhost:5000/"));
-    expect(local).toBeDefined();
-    expect(local?.if).toBeUndefined();
-    // The job's registry service is plain HTTP on localhost.
-    expect(local?.run).toContain("--dest-tls-verify=false");
-    expect(local?.run).toContain("skopeo inspect --tls-verify=false");
+  test("the index is assembled from the per-platform digests and checked against PLATFORMS", () => {
+    const assemble = (jobs.publish?.steps ?? []).find((s) =>
+      s.run?.includes("docker buildx imagetools create"),
+    );
+    expect(assemble).toBeDefined();
+    const a = assemble?.run ?? "";
+    expect(a).toContain("platform-digests");
+    expect(a).toContain('"localhost:5000/tps-office@$digest"');
 
-    const ghcr = steps.find((s) => s.run?.includes('"docker://$tag"'));
+    const verify = (jobs.publish?.steps ?? []).find((s) => s.run?.includes("index.json"));
+    expect(verify).toBeDefined();
+    const v = verify?.run ?? "";
+    expect(v).toContain("for platform in ${PLATFORMS//,/ }");
+    expect(v).toContain(".manifests[]");
+    expect(v).toContain(".digest");
+    expect(v).toContain('test "$actual" = "$expected"');
+  });
+
+  test("the GHCR copy runs only on publish", () => {
+    const ghcr = (jobs.publish?.steps ?? []).find((s) => s.run?.includes('"docker://$tag"'));
     expect(ghcr).toBeDefined();
-    expect(ghcr?.if).toContain("inputs.publish");
+    expect(ghcr?.if).toBe("${{ inputs.publish }}");
+    expect(ghcr?.env?.TAGS).toBe("${{ needs.meta.outputs.tags }}");
+    expect(ghcr?.run).toContain("skopeo copy --all --preserve-digests");
     expect(ghcr?.run).not.toContain("tls-verify=false");
-    expect(ghcr?.env?.TAGS).toBe("${{ steps.image.outputs.tags }}");
     expect(workflow.on?.workflow_dispatch?.inputs?.publish?.type).toBe("boolean");
   });
 
   test("the local registry service is pinned by digest", () => {
-    expect(job?.services?.registry?.image).toMatch(/^registry:2@sha256:[0-9a-f]{64}$/);
+    expect(jobs.publish?.services?.registry?.image).toMatch(/^registry:2@sha256:[0-9a-f]{64}$/);
   });
 
   test("every pushed platform has a nono hash line", () => {
-    const all = (job?.env?.PLATFORMS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
     const lines = readFileSync(HASHES, "utf8")
       .split("\n")
       .map((l) => l.trim())
       .filter(Boolean)
       .map((l) => l.split(/\s+/));
-    for (const platform of all) {
+    for (const platform of platformList()) {
       expect(lines.some(([hash, p]) => p === platform && /^[0-9a-f]{64}$/.test(hash))).toBe(true);
     }
   });

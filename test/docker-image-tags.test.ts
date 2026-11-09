@@ -308,7 +308,8 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
   const wf = yaml.load(yml) as Record<string, unknown> & {
     jobs: Record<string, { steps: Step[] }>;
   };
-  const steps = wf.jobs["build-and-push"].steps;
+  const jobs = wf.jobs;
+  const steps = jobs.meta.steps;
   const scriptSteps = steps.filter((s) => s.run?.includes(".github/scripts/docker-image-tags.sh"));
 
   test("workflow_dispatch is the only trigger, with a required version input", () => {
@@ -325,7 +326,7 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
     expect(dispatch.inputs.version.required).toBe(true);
   });
 
-  test("the script step runs on the dispatch input, unconditionally, before every docker step", () => {
+  test("the script step runs on the dispatch input, unconditionally, in the job every build needs", () => {
     expect(scriptSteps.length, "exactly one step runs the script").toBe(1);
     const step = scriptSteps[0];
     expect(step.run?.trim()).toBe("bash .github/scripts/docker-image-tags.sh");
@@ -333,24 +334,26 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
     expect(step.env?.INPUT_VERSION).toBe("${{ inputs.version }}");
     expect(step.if, "no if: on the script step").toBeUndefined();
     expect(step["continue-on-error"], "no continue-on-error on the script step").toBeUndefined();
-    const firstDocker = steps.findIndex((s) => s.uses?.startsWith("docker/"));
-    expect(firstDocker, "the workflow has docker steps").toBeGreaterThan(-1);
-    expect(steps.indexOf(step)).toBeLessThan(firstDocker);
+    expect(steps.filter((s) => s.run), "meta runs only the script").toEqual([step]);
+    expect(jobs.build.needs, "the build needs the checked version").toBe("meta");
   });
 
   test("the one build takes the checked version, and the GHCR copy uses only the computed tags", () => {
-    const builds = steps.filter((s) => s.uses?.includes("docker/build-push-action"));
-    expect(builds.length, "one action step builds").toBe(1);
+    const builds = jobs.build.steps.filter((s) => s.uses?.includes("docker/build-push-action"));
+    expect(builds.length, "one action step per platform leg builds").toBe(1);
     expect(String(builds[0].with?.["build-args"]).trim()).toBe(
-      "TPS_VERSION=${{ steps.image.outputs.tps_version }}",
+      "TPS_VERSION=${{ needs.meta.outputs.tps_version }}",
     );
-    const ghcr = steps.find((s) => s.run?.includes('"docker://$tag"'));
-    expect(ghcr?.env?.TAGS).toBe("${{ steps.image.outputs.tags }}");
-    expect(steps.filter((s) => s.with?.push === true).length, "no action pushes").toBe(0);
+    const ghcr = jobs.publish.steps.find((s) => s.run?.includes('"docker://$tag"'));
+    expect(ghcr?.env?.TAGS).toBe("${{ needs.meta.outputs.tags }}");
+    expect(
+      Object.values(jobs).flatMap((j) => j.steps).filter((s) => s.with?.push === true).length,
+      "no action pushes",
+    ).toBe(0);
   });
 
   test("values reach run: through env, and the dispatch input is read in one place", () => {
-    for (const s of steps) {
+    for (const s of Object.values(jobs).flatMap((j) => j.steps)) {
       if (s.run) expect(s.run, `step ${s.name ?? s.id}`).not.toContain("${{");
     }
     expect(yml.split("inputs.version").length - 1, "inputs.version appears once").toBe(1);
