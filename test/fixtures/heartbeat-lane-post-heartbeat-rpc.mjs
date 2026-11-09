@@ -3,6 +3,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "heartbeat-post-rpc-"));
 const binDir = join(root, "bin");
@@ -29,6 +30,7 @@ try {
     allocatePort: async () => 18999,
     probeTimeoutMs: 321,
     rpcTimeoutMs: 123,
+    onGatewaySpawn: (gateway) => installGatewayTeardown(gateway.pid),
     runStatus: ({ testCase, timeout, rpcTimeout }) => {
       probes++;
       if (probes === 1) {

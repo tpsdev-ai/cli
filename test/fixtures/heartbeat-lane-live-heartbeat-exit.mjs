@@ -6,6 +6,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
 
 const { assertGatewaySurvivedHeartbeat, finishWithCleanup, waitForRpc } = await import(
   pathToFileURL(process.argv[2]).href
@@ -18,8 +19,10 @@ const stubSource = `import net from "node:net";import { existsSync } from "node:
 const stub = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: ["ignore", "pipe", "inherit"],
   env: { ...process.env, TRIGGER: trigger },
+  detached: true,
 });
 if (!stub.pid) throw new Error("stub gateway did not start");
+installGatewayTeardown(stub.pid);
 const port = await new Promise((resolvePort, rejectPort) => {
   stub.stdout.once("data", (chunk) => resolvePort(Number(String(chunk).trim())));
   stub.once("error", rejectPort);

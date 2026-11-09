@@ -14,6 +14,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "heartbeat-live-case-"));
 const binDir = join(root, "bin");
@@ -98,7 +99,9 @@ process.env.TPS_HEARTBEAT_BIN = tpsStub;
 const { runLiveCase } = await import(pathToFileURL(process.argv[2]).href);
 
 try {
-  await runLiveCase(root, binDir);
+  await runLiveCase(root, binDir, {
+    onGatewaySpawn: (gateway) => installGatewayTeardown(gateway.pid),
+  });
   console.log("LIVE_CASE_ACCEPTED");
   process.exitCode = 2;
 } catch (error) {
