@@ -1633,7 +1633,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   );
 
   it.each(["$(which npm) ci", "env npm ci"])(
-    "refuses an unresolvable command word: %s", (run) => {
+    "refuses npm-bearing commands outside approved shapes: %s", (run) => {
       let error: unknown;
       try { assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW); } catch (caught) { error = caught; }
       expect(error).toBeInstanceOf(Error);
