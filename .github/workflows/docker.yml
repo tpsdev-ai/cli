@@ -234,63 +234,32 @@ jobs:
           fi
           printf '%s\n' "$found"
 
-      # Each single-platform archive is copied with `--preserve-digests` and its
-      # manifest digest recorded; the local registry must report the same digest.
-      - name: Copy each platform into the local registry and record its digest
+      # The registry work lives in .github/scripts/docker-publish-index.sh
+      # (test/docker-publish-index.test.ts runs the same script). Each archive is
+      # copied with --all --preserve-digests, its raw digest must equal the
+      # registry tag's, and its PLATFORM image-manifest digest is recorded: a
+      # build with provenance is an index (image manifest + attestation), and the
+      # recorded digest is the index entry for the platform itself.
+      - name: Copy each platform into the local registry and record its digests
         run: |
           set -eux
-          archives="${RUNNER_TEMP:-/tmp}/archives"
-          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
-          : >"$digests"
-          for platform in ${PLATFORMS//,/ }; do
-            arch="${platform#linux/}"
-            archive="$(find "$archives" -type f -name "tps-office-$arch.oci.tar")"
-            test -n "$archive"
-            src="sha256:$(skopeo inspect --raw "oci-archive:$archive" | sha256sum | cut -d' ' -f1)"
-            skopeo copy --preserve-digests --dest-tls-verify=false \
-              "oci-archive:$archive" "docker://localhost:5000/tps-office:$arch"
-            dst="sha256:$(skopeo inspect --tls-verify=false --raw "docker://localhost:5000/tps-office:$arch" | sha256sum | cut -d' ' -f1)"
-            test "$src" = "$dst" || {
-              echo "digest mismatch for $platform: archive $src, local registry $dst" >&2
-              exit 1
-            }
-            printf '%s %s %s\n' "$platform" "$arch" "$dst" >>"$digests"
-          done
+          bash .github/scripts/docker-publish-index.sh copy \
+            "${RUNNER_TEMP:-/tmp}/archives" "${RUNNER_TEMP:-/tmp}/platform-digests"
 
       - name: Assemble the multi-platform index from the recorded digests
         run: |
           set -eux
-          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
-          set --
-          while read -r _ _ digest; do
-            set -- "$@" "localhost:5000/tps-office@$digest"
-          done <"$digests"
-          docker buildx imagetools create -t localhost:5000/tps-office:verify "$@"
+          bash .github/scripts/docker-publish-index.sh assemble \
+            "${RUNNER_TEMP:-/tmp}/platform-digests"
 
-      # The index must list exactly PLATFORMS, and each entry must be the
-      # manifest digest the leg smoked (recorded above).
-      - name: Verify the index lists exactly PLATFORMS with the smoked digests
+      # The index must list exactly PLATFORMS, each with the image-manifest
+      # digest recorded above.
+      - name: Verify the index lists exactly PLATFORMS with the platform manifests
         run: |
           set -eux
-          digests="${RUNNER_TEMP:-/tmp}/platform-digests"
-          raw="${RUNNER_TEMP:-/tmp}/index.json"
-          skopeo inspect --tls-verify=false --raw docker://localhost:5000/tps-office:verify >"$raw"
-          jq -e '.manifests | length > 0' "$raw" >/dev/null
-          actual="$(jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' "$raw" | sort)"
-          set --
-          for platform in ${PLATFORMS//,/ }; do
-            digest="$(awk -v p="$platform" '$1 == p { print $3 }' "$digests")"
-            test -n "$digest"
-            set -- "$@" "$platform $digest"
-          done
-          expected="$(printf '%s\n' "$@" | sort)"
-          test "$actual" = "$expected" || {
-            echo "index entries do not match the smoked manifests:" >&2
-            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
-            exit 1
-          }
-          printf '%s\n' "$actual"
-          sha256sum "$raw" | cut -d' ' -f1 >"${RUNNER_TEMP:-/tmp}/index-digest"
+          bash .github/scripts/docker-publish-index.sh verify \
+            "${RUNNER_TEMP:-/tmp}/platform-digests" "${RUNNER_TEMP:-/tmp}/index.json"
+          sha256sum "${RUNNER_TEMP:-/tmp}/index.json" | cut -d' ' -f1 >"${RUNNER_TEMP:-/tmp}/index-digest"
 
       - name: Log in to ghcr.io
         if: ${{ inputs.publish }}

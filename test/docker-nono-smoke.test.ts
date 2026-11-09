@@ -10,10 +10,10 @@
  * version and tags, each platform is built on its own native runner (no QEMU)
  * into one OCI archive, that leg's smoke loads its own archive, the publish job
  * downloads only the `tps-office-*` artifacts and refuses a set that is not one
- * archive per platform, copies each archive with `--preserve-digests` and
- * checks its digest, assembles the index from those digests and checks it
- * against `PLATFORMS`, and only the GHCR login and copy are gated on
- * `inputs.publish`.
+ * archive per platform, and runs the tested `.github/scripts/docker-publish-index.sh`
+ * to copy each archive with `--all --preserve-digests`, assemble the index from
+ * the recorded platform manifests and verify it against `PLATFORMS`; only the
+ * GHCR login and copy are gated on `inputs.publish`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -385,11 +385,13 @@ describe("docker.yml", () => {
     const copySteps = allSteps().filter(
       (s) => s.run?.includes("skopeo copy") && s.run.includes("docker://"),
     );
-    expect(copySteps.length).toBe(2);
+    // The local-registry copies live in docker-publish-index.sh (tested in
+    // test/docker-publish-index.test.ts); the GHCR copy is the step here.
+    expect(copySteps.length).toBe(1);
     const lines = copySteps.flatMap((s) =>
       (s.run ?? "").split("\n").filter((line) => line.includes("skopeo copy")),
     );
-    expect(lines.length).toBe(2);
+    expect(lines.length).toBe(1);
     for (const line of lines) expect(line).toContain("--preserve-digests");
     for (const step of copySteps) {
       const run = step.run ?? "";
@@ -399,22 +401,23 @@ describe("docker.yml", () => {
     }
   });
 
-  test("the index is assembled from the per-platform digests and checked against PLATFORMS", () => {
-    const assemble = (jobs.publish?.steps ?? []).find((s) =>
-      s.run?.includes("docker buildx imagetools create"),
-    );
-    expect(assemble).toBeDefined();
-    const a = assemble?.run ?? "";
-    expect(a).toContain("platform-digests");
-    expect(a).toContain('"localhost:5000/tps-office@$digest"');
-
-    const verify = (jobs.publish?.steps ?? []).find((s) => s.run?.includes("index.json"));
-    expect(verify).toBeDefined();
-    const v = verify?.run ?? "";
-    expect(v).toContain("for platform in ${PLATFORMS//,/ }");
-    expect(v).toContain(".manifests[]");
-    expect(v).toContain(".digest");
-    expect(v).toContain('test "$actual" = "$expected"');
+  test("the publish job runs the tested script for copy, assemble and verify", () => {
+    const steps = jobs.publish?.steps ?? [];
+    const calls = steps
+      .map((s) => ({ name: s.name, run: s.run ?? "" }))
+      .filter((s) => s.run.includes("docker-publish-index.sh"));
+    expect(calls.map((s) => s.run.match(/docker-publish-index\.sh (\w+)/)?.[1])).toEqual([
+      "copy",
+      "assemble",
+      "verify",
+    ]);
+    expect(calls[0].run).toContain('"${RUNNER_TEMP:-/tmp}/archives"');
+    expect(calls[0].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
+    expect(calls[1].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
+    expect(calls[2].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
+    expect(calls[2].run).toContain('"${RUNNER_TEMP:-/tmp}/index.json"');
+    expect(steps.some((s) => s.run?.includes("skopeo inspect --raw oci-archive:"))).toBe(false);
+    expect(steps.some((s) => s.run?.includes("docker buildx imagetools create"))).toBe(false);
   });
 
   test("the GHCR copy runs only on publish", () => {
