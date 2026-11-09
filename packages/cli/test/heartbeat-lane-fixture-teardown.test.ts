@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -29,7 +29,48 @@ function readText(path: string): string | null {
   }
 }
 
+/** Fields 3 and 5 of a Linux `/proc/<pid>/stat` line. Field 2 (comm) may
+ *  contain spaces and parentheses, so both follow the space after the last
+ *  `)`. Null when the pid has no entry; other read errors are rethrown. */
+function procStat(pid: number): { state: string; pgrp: number } | null {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
+  const state = fields[0];
+  const pgrp = Number(fields[2]);
+  if (!state || !Number.isInteger(pgrp)) throw new Error(`unreadable /proc/${pid}/stat`);
+  return { state, pgrp };
+}
+
+/** Live (non-zombie) members of the process group on Linux, or null when
+ *  `/proc` is unavailable. A member in state `Z` has exited but still answers
+ *  `kill(-pgid, 0)` until its parent reaps it, and a container's PID 1 need
+ *  not reap. */
+function procGroupAlive(pid: number): boolean | null {
+  let entries: string[];
+  try {
+    entries = readdirSync("/proc");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+  return entries.some((entry) => {
+    if (!/^\d+$/.test(entry)) return false;
+    const info = procStat(Number(entry));
+    return info !== null && info.pgrp === pid && info.state !== "Z";
+  });
+}
+
 function pidAlive(pid: number): boolean {
+  if (process.platform === "linux") {
+    const info = procStat(pid);
+    if (info) return info.state !== "Z";
+  }
   try {
     process.kill(pid, 0);
     return true;
@@ -39,6 +80,10 @@ function pidAlive(pid: number): boolean {
 }
 
 function groupAlive(pid: number): boolean {
+  if (process.platform === "linux") {
+    const alive = procGroupAlive(pid);
+    if (alive !== null) return alive;
+  }
   try {
     process.kill(-pid, 0);
     return true;

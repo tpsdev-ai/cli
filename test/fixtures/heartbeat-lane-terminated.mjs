@@ -29,7 +29,7 @@ const gateway = spawn(process.execPath, ["--input-type=module", "-e", stubSource
   env: { ...process.env, STUB_CHILD_PID_FILE: childPidFile, STUB_PORT_FILE: portFile },
 });
 if (!gateway.pid) throw new Error("stub gateway did not start");
-installGatewayTeardown(gateway.pid);
+installGatewayTeardown(gateway);
 writeFileSync(join(root, "gateway.pid"), String(gateway.pid));
 
 console.log("TEARDOWN_FIXTURE_READY");

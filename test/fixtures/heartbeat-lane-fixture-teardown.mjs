@@ -3,13 +3,15 @@
 // the gateway's process group is stopped from the fixture's SIGTERM, SIGINT and
 // `exit` handlers instead.
 //
-// The pid passed here is the detached gateway's own pid, recorded when the
-// fixture spawned it. Because the gateway was started with `detached: true`, it
-// leads its own process group, so `-pid` names that group and nothing else: the
-// fixture's own group is never signalled.
+// The pid passed here may be the detached gateway's own pid, recorded when the
+// fixture spawned it, or that gateway's ChildProcess. Because the gateway was
+// started with `detached: true`, it leads its own process group, so `-pid`
+// names that group and nothing else: the fixture's own group is never
+// signalled.
 const SIGNAL_EXIT_STATUS = { SIGTERM: 143, SIGINT: 130 };
 const TERM_WAIT_MS = 2000;
 const KILL_WAIT_MS = 1000;
+const CHILD_WAIT_MS = 3000;
 const POLL_MS = 25;
 
 function groupExists(pid) {
@@ -64,13 +66,38 @@ function stopGroupSync(pid, termWaitMs, killWaitMs, pollMs) {
   return waitForGroupExitSync(pid, killWaitMs, pollMs);
 }
 
+/** Wait, bounded, for the fixture's own gateway child to be reaped. A child
+ *  that is still unreaped keeps the group answering `kill(-pgid, 0)` even
+ *  after it has exited. */
+function waitForChildExit(child, waitMs) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      child.removeListener("exit", onExit);
+      resolve(false);
+    }, waitMs);
+    function onExit() {
+      clearTimeout(timer);
+      resolve(true);
+    }
+    child.once("exit", onExit);
+  });
+}
+
 /**
  * Stop the detached gateway group when the fixture is terminated. Idempotent:
  * a group that already exited is a no-op, and the exit handler after a signal
  * handler finds nothing to stop.
  */
-export function installGatewayTeardown(pid, options = {}) {
-  const { termWaitMs = TERM_WAIT_MS, killWaitMs = KILL_WAIT_MS, pollMs = POLL_MS } = options;
+export function installGatewayTeardown(target, options = {}) {
+  const {
+    termWaitMs = TERM_WAIT_MS,
+    killWaitMs = KILL_WAIT_MS,
+    pollMs = POLL_MS,
+    childWaitMs = CHILD_WAIT_MS,
+  } = options;
+  const pid = typeof target === "number" ? target : target?.pid;
+  const child = typeof target === "number" ? null : target;
   if (!Number.isInteger(pid) || pid <= 0) return;
   let stopped = false;
 
@@ -79,6 +106,7 @@ export function installGatewayTeardown(pid, options = {}) {
       void (async () => {
         try {
           await stopGroup(pid, termWaitMs, killWaitMs, pollMs);
+          await waitForChildExit(child, childWaitMs);
         } finally {
           stopped = true;
           process.exit(SIGNAL_EXIT_STATUS[signal]);
