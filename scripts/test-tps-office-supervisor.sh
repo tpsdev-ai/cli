@@ -17,7 +17,9 @@
 #   3. a refusal mid-run stops the agents launched earlier (no orphan);
 #   4. a traversal-shaped roster id is refused before anything runs;
 #   5. a config whose agentId disagrees with the roster id is refused, naming
-#      both, before anything runs;
+#      both, before THIS agent is launched; a later iteration runs the same
+#      check after earlier agents have launched, and the supervisor stops them
+#      before exiting;
 #   6. cli#352 r6: the allocation base uid is ALREADY TAKEN (a decoy account) →
 #      the supervisor steps over it and still seats every agent. This fails
 #      against the pre-r6 code, which seats from a hardcoded uid=1001 and never
@@ -25,6 +27,11 @@
 #   7. cli#357: a fallible step (useradd) fails while seating the SECOND agent,
 #      after the first has launched. `set -e` ends the script; the EXIT trap
 #      stops the first agent and no PID file remains.
+#   8. cli#357 r3: a child that can end the supervisor is signalled between its
+#      launch and its tracking; the deferred signal is acted on after the PID
+#      is tracked, so the child is stopped and the PID file removed.
+#   9. cli#357 r3: a child that ignores TERM is KILLed at the shutdown deadline
+#      and the supervisor exits; a second shutdown call signals no PID.
 #
 # Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
@@ -46,6 +53,8 @@
 #      the same setup that launches in C.1 refuses, because nono can only report
 #      "Profile not found" (the wrong reason) for a bare name against an empty
 #      config dir. A Dockerfile that forgets the COPY turns these red.
+#   5. cli#357 r3: a handled signal while the first agent's REAL session runs →
+#      the session and its child are gone and the PID file is removed.
 #
 #   docker run --rm -v "$PWD":/repo -w /repo --entrypoint bash <image> \
 #     scripts/test-tps-office-supervisor.sh
@@ -100,6 +109,11 @@ fi
 # cli#357: reject termination shapes the source control cannot verify. A
 # multi-line quoted string or a heredoc is refused outright: a physical
 # `shutdown_children TERM` line inside one never runs, so it cannot be a guard.
+# The control covers explicit `exit`/`return` forms, a self-kill (`kill ... $$`,
+# any signal) and calls to supervisor functions that exit. A command that ends
+# the script through errexit, and termination by a signal, are the EXIT trap's
+# job: the behavioural cases for the bounded shutdown, the deferred signal and
+# the real-nono stop test prove those.
 assert_seating_shutdown() { # <source>
   awk '
     function word(line, name) {
@@ -231,10 +245,12 @@ assert_seating_shutdown() { # <source>
           fail(j, "unanalysable termination shape")
           continue
         }
-        terminates=word(normalized, "exit")
+        killself=(word(normalized, "kill") && normalized ~ /(^|[^[:alnum:]_])\$\$([^[:alnum:]_]|$)/)
+        terminates=(word(normalized, "exit") || killself)
         recognized=(text ~ ("^[[:space:]]*" direct "[[:space:]]*$") ||
           text ~ ("^[[:space:]]*[[:alnum:]_]+[[:space:]]*&&[[:space:]]*" direct "[[:space:]]*$") ||
           text ~ ("^[[:space:]]*\\{[[:space:]]*(:|echo[[:space:]]+[^;&|{}]+|shutdown_children TERM);[[:space:]]*" direct ";[[:space:]]*}[[:space:]]*$"))
+        if (killself && normalized ~ /^[[:space:]]*kill([[:space:]]+-[[:alnum:]]+)?[[:space:]]+\$\$[[:space:]]*$/) recognized=1
         for (name in exits) if (word(normalized, name)) {
           terminates=1
           if (name in opaque) { recognized=0; break }
@@ -251,103 +267,82 @@ assert_seating_shutdown() { # <source>
 }
 
 if analysis="$(assert_seating_shutdown "$sup")"; then
-  ok "seating-loop exits are guarded and analysable"
+  ok "seating-loop explicit exit forms are guarded and analysable"
 else
   bad "seating-loop source control: $analysis"
 fi
 
-# cli#357: the EXIT trap must stop the launched children BEFORE it removes the
-# PID file. Fail closed when the trap cannot be analysed.
+# cli#357 r3: the EXIT trap is a whitelist. Every operation must be a
+# recognised stop form (shutdown_children with an optional signal, kill with a
+# signal and one target) or a recognised PID-file removal (cleanup_pids_file,
+# rm of $PIDS_FILE or of the literal path), and a removal must come after a
+# stop. Anything conditional, or any operation the list does not name, fails.
 assert_exit_trap() { # <source>
-  awk '
+  local pids_literal
+  pids_literal="$(sed -n 's/^PIDS_FILE="\([^"]*\)"$/\1/p' "$1" | head -n1)"
+  [ -n "$pids_literal" ] || pids_literal="/workspace/.tps/pids.json"
+  awk -v pids_literal="$pids_literal" '
     function trim(s) {
       sub(/^[[:space:]]+/, "", s)
       sub(/[[:space:]]+$/, "", s)
       return s
     }
-    function addop(text,   w) {
-      split(trim(text), w, /[[:space:]]+/)
-      optext[++nops]=trim(text)
-      opcmd[nops]=w[1]
+    function bare(s) {
+      gsub(/["\047\\]/, "", s)
+      return s
     }
-    function expand(text, depth,   n, i, segs, seg, rest) {
-      if (depth > 8) { opaque=1; return }
-      gsub(/\n/, ";", text)
-      n=split(text, segs, /[;&|]+/)
-      for (i=1; i<=n; i++) {
-        seg=trim(segs[i])
-        if (seg == "") continue
-        if (seg ~ /`/ || seg ~ /\$\(/) { opaque=1; return }
-        rest=seg
-        while (rest ~ /^(if|elif|then|else|while|until|do|for|!)[[:space:]]+/) sub(/^(if|elif|then|else|while|until|do|for|!)[[:space:]]+/, "", rest)
-        while (rest ~ /^[[:alnum:]_]+=[^[:space:]]*[[:space:]]+/) sub(/^[[:alnum:]_]+=[^[:space:]]*[[:space:]]+/, "", rest)
-        rest=trim(rest)
-        if (rest == "" || rest ~ /^(fi|done|esac|\}|\{)$/) continue
-        addop(rest)
-        if (opcmd[nops] !~ /^[[:alnum:]_]+$/ && opcmd[nops] != "[[" && opcmd[nops] != "[") {
-          opaque=1
-          return
-        }
-        if (opcmd[nops] in fbody) expand(fbody[opcmd[nops]], depth+1)
-      }
+    function opfail(msg) {
+      print msg ": " trapline
+      exit 1
     }
     { lines[NR]=$0 }
     END {
-      fn=""; depth=0; body=""
+      ntrap=0
       for (i=1; i<=NR; i++) {
-        line=lines[i]
-        if (fn == "") {
-          if (line ~ /^[[:space:]]*(function[[:space:]]+)?[[:alnum:]_]+[[:space:]]*\(\)[[:space:]]*\{/) {
-            name=line
-            sub(/^[[:space:]]*(function[[:space:]]+)?/, "", name)
-            sub(/[[:space:]]*\(.*/, "", name)
-            fn=name; body=""
-            tmp=line; sub(/^[^{]*\{/, "", tmp)
-            o=gsub(/\{/, "{", tmp); c=gsub(/\}/, "}", tmp)
-            depth=1+o-c
-            if (depth <= 0) {
-              sub(/\}.*$/, "", tmp)
-              fbody[fn]=body "\n" tmp
-              fn=""
-            } else body=body "\n" tmp
-          }
-          if (line ~ /^[[:space:]]*trap[[:space:]]/ && line ~ /[[:space:]]EXIT[[:space:]]*$/) {
-            trapline=line; ntrap++
-          }
-          continue
+        if (lines[i] ~ /^[[:space:]]*trap[[:space:]]/ && lines[i] ~ /[[:space:]]EXIT[[:space:]]*$/) {
+          trapline=lines[i]; ntrap++
         }
-        tmp=line
-        o=gsub(/\{/, "{", tmp); c=gsub(/\}/, "}", tmp)
-        depth += o-c
-        if (depth <= 0) {
-          sub(/\}.*$/, "", tmp)
-          fbody[fn]=body "\n" tmp
-          fn=""
-        } else body=body "\n" tmp
       }
-      if (ntrap != 1) { print "expected exactly one EXIT trap, found " ntrap; exit 1 }
+      if (ntrap != 1) opfail("expected exactly one EXIT trap, found " ntrap)
       cmd=trapline
       sub(/^[[:space:]]*trap[[:space:]]+/, "", cmd)
       sub(/[[:space:]]+EXIT[[:space:]]*$/, "", cmd)
-      if (cmd ~ /^\047/) { sub(/^\047/, "", cmd); sub(/\047$/, "", cmd) }
-      expand(cmd, 0)
-      if (opaque) { print "EXIT trap is not analysable: " trapline; exit 1 }
-      if (nops == 0) { print "EXIT trap runs no command: " trapline; exit 1 }
+      cmd=trim(cmd)
+      quote=substr(cmd, 1, 1)
+      if (quote != "\047" && quote != "\"") opfail("EXIT trap command is not quoted")
+      if (substr(cmd, length(cmd), 1) != quote) opfail("EXIT trap command is not a single quoted string")
+      cmd=substr(cmd, 2, length(cmd) - 2)
+      if (cmd ~ /`/ || cmd ~ /\$\(/) opfail("EXIT trap is not analysable")
+      nops=split(cmd, op, ";")
       stop_at=0; cleanup_at=0
       for (i=1; i<=nops; i++) {
-        if (stop_at == 0 && (opcmd[i] == "kill" || opcmd[i] == "shutdown_children")) stop_at=i
-        if (cleanup_at == 0 && (opcmd[i] == "cleanup_pids_file" || (opcmd[i] == "rm" && optext[i] ~ /PIDS_FILE/))) cleanup_at=i
+        text=trim(op[i])
+        if (text == "") continue
+        if (text ~ /&&|\|\|/ || text ~ /^[[:space:]]*(if|elif|then|else|do|while|until|for|!)[[:space:]]/ || text == "fi" || text == "done")
+          opfail("EXIT trap runs a conditional operation")
+        b=bare(text)
+        nw=split(b, w, /[[:space:]]+/)
+        kind=""
+        if (w[1] == "shutdown_children" && (nw == 1 || (nw == 2 && w[2] ~ /^[A-Za-z0-9_]+$/))) kind="stop"
+        else if (w[1] == "kill" && nw == 3 && w[2] ~ /^-[A-Za-z0-9]+$/) kind="stop"
+        else if (w[1] == "cleanup_pids_file" && nw == 1) kind="cleanup"
+        else if (w[1] == "rm" && nw >= 2) {
+          target=w[nw]
+          if (target == "$PIDS_FILE" || target == "${PIDS_FILE}" || target == pids_literal) kind="cleanup"
+        }
+        if (kind == "") opfail("EXIT trap runs an operation that is not a recognised form: " text)
+        if (kind == "stop" && stop_at == 0) stop_at=i
+        if (kind == "cleanup" && cleanup_at == 0) cleanup_at=i
       }
-      if (stop_at == 0) { print "EXIT trap does not stop the launched children: " trapline; exit 1 }
-      if (cleanup_at == 0) { print "EXIT trap does not remove the PID file: " trapline; exit 1 }
-      if (cleanup_at < stop_at) { print "EXIT trap removes the PID file before stopping the children: " trapline; exit 1 }
+      if (stop_at == 0) opfail("EXIT trap does not stop the launched children")
+      if (cleanup_at != 0 && cleanup_at < stop_at) opfail("EXIT trap removes the PID file before stopping the children")
       exit 0
     }
   ' "$1"
 }
 
 if analysis="$(assert_exit_trap "$sup")"; then
-  ok "the EXIT trap stops the launched children before removing the PID file"
+  ok "the EXIT trap is a whitelisted stop-then-remove sequence"
 else
   bad "EXIT-trap control: $analysis"
 fi
@@ -374,6 +369,10 @@ for termination in 'cond && exit 1' '{ echo refusal; exit 1; }'; do
   check_seating_fixture "guarded $termination passes" pass "$(printf '  shutdown_children TERM\n  %s' "$termination")"
 done
 check_seating_fixture "inline group shutdown passes" pass '  { shutdown_children TERM; exit 1; }'
+for termination in 'kill $$' 'kill -TERM $$' 'kill -KILL "$$"'; do
+  check_seating_fixture "guarded self-kill $termination passes" pass "$(printf '  shutdown_children TERM\n  %s' "$termination")"
+  check_seating_fixture "unguarded self-kill $termination fails" unguarded "  $termination"
+done
 helper="$(printf 'refuse() {\n  exit 2\n}')"
 check_seating_fixture "unguarded exiting helper fails" unguarded '  refuse' "$helper"
 check_seating_fixture "guarded exiting helper passes" pass "$(printf '  shutdown_children TERM\n  refuse')" "$helper"
@@ -414,6 +413,16 @@ check_exit_trap_fixture "EXIT trap that removes the PID file before stopping fai
   'cleanup_pids_file() { rm -f "$PIDS_FILE"; }' \
   'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; cleanup_pids_file; }' \
   "trap 'cleanup_pids_file; shutdown_children TERM' EXIT")"
+check_exit_trap_fixture "EXIT trap with a conditional stop fails" fail "$(printf '%s\n' \
+  'cleanup_pids_file() { rm -f "$PIDS_FILE"; }' \
+  'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; cleanup_pids_file; }' \
+  "trap 'false && kill -TERM 4242; cleanup_pids_file' EXIT")"
+check_exit_trap_fixture "EXIT trap that removes the literal PID path before stopping fails" fail "$(printf '%s\n' \
+  'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; }' \
+  "trap 'rm -f /workspace/.tps/pids.json; kill -TERM 4242' EXIT")"
+check_exit_trap_fixture "EXIT trap that stops then removes the PID file passes" pass "$(printf '%s\n' \
+  'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; }' \
+  "trap 'shutdown_children TERM; rm -f \"\$PIDS_FILE\"' EXIT")"
 rm -rf "$seating_fixtures"
 
 # ── Part B — behavioural, fake nono ──────────────────────────────────────────
@@ -620,6 +629,111 @@ SH
   if grep -q '^stopped' "$USERADD_MARKER"; then ok "first agent STOPPED on errexit (no orphan)"; else bad "ORPHAN: the first agent was not stopped when useradd failed"; fi
   if [ -n "$launched_pid" ] && ! kill -0 "$launched_pid" 2>/dev/null; then ok "first agent process $launched_pid is gone afterwards"; else bad "first agent process '${launched_pid:-unknown}' is still running after the errexit"; fi
   if [ ! -e /workspace/.tps/pids.json ]; then ok "no PID file remains after the errexit"; else bad "the PID file remains after the errexit"; fi
+
+  # (3c) cli#357 r3 — bounded, idempotent shutdown. The child ignores TERM; the
+  # supervisor must KILL it at the deadline and exit. It sees exactly one TERM:
+  # the second shutdown call (the EXIT trap) signals no PID.
+  mkshutdown() {
+    local d="$1"
+    mkshims "$d" no
+    cat >"$d/nono" <<'SH'
+#!/usr/bin/env bash
+case "$*" in
+  *tps-agent*start*)
+    echo "started $$" >>"${SHUTDOWN_MARKER:?}"
+    trap 'echo term >>"${SHUTDOWN_MARKER:?}"' TERM
+    i=0; while [ "$i" -lt 400 ]; do sleep 0.1; i=$((i + 1)); done
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+SH
+    chmod +x "$d"/*
+  }
+  mkshutdown "$tmp/bin-shutdown"
+  seed
+  export SHUTDOWN_MARKER="$tmp/shutdown.log"; : >"$SHUTDOWN_MARKER"
+  PATH="$tmp/bin-shutdown:$cleanpath" bash "$sup" >"$tmp/out3c.log" 2>&1 &
+  sup3c=$!
+  up=0
+  for _ in $(seq 1 100); do
+    if grep -q '^started' "$SHUTDOWN_MARKER" 2>/dev/null; then up=1; break; fi
+    kill -0 "$sup3c" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$up" -eq 1 ]; then ok "bounded shutdown: the TERM-ignoring child started"; else bad "bounded shutdown: the child never started — $(tail -n 5 "$tmp/out3c.log" | tr '\n' ' ')"; fi
+  kill -TERM "$sup3c" 2>/dev/null || true
+  t0=$(date +%s)
+  fin=0
+  for _ in $(seq 1 250); do
+    if ! kill -0 "$sup3c" 2>/dev/null; then fin=1; break; fi
+    sleep 0.1
+  done
+  t1=$(date +%s)
+  rc3c=99
+  if [ "$fin" -eq 1 ]; then
+    wait "$sup3c" 2>/dev/null; rc3c=$?
+  else
+    kill -KILL "$sup3c" 2>/dev/null || true
+    bad "bounded shutdown: the supervisor did not exit within 25 s"
+  fi
+  elapsed=$((t1 - t0))
+  if [ "$rc3c" -eq 0 ]; then ok "bounded shutdown: the supervisor exits 0 after the deadline"; else bad "bounded shutdown: the supervisor exited $rc3c"; fi
+  if [ "$elapsed" -ge 10 ] && [ "$elapsed" -le 20 ]; then ok "bounded shutdown: TERM was followed by the ~10 s deadline before KILL ($elapsed s)"; else bad "bounded shutdown: the deadline was not the ~10 s constant ($elapsed s)"; fi
+  shut_pid="$(sed -n 's/^started //p' "$SHUTDOWN_MARKER" | head -n1)"
+  if [ -n "$shut_pid" ] && ! kill -0 "$shut_pid" 2>/dev/null; then ok "bounded shutdown: the TERM-ignoring child $shut_pid is gone"; else bad "bounded shutdown: the child '${shut_pid:-unknown}' survived"; fi
+  terms="$(grep -c '^term$' "$SHUTDOWN_MARKER" || true)"
+  if [ "$terms" -eq 1 ]; then ok "idempotent shutdown: one TERM for two shutdown calls"; else bad "idempotent shutdown: the child saw $terms TERM(s), expected 1"; fi
+  if [ ! -e /workspace/.tps/pids.json ]; then ok "bounded shutdown: the PID file is removed"; else bad "bounded shutdown: the PID file remains"; fi
+
+  # (3d) cli#357 r3 — a signal that lands between the launch and the tracking
+  # of the child. The fixture launcher signals its parent supervisor as soon as
+  # it starts; the signal handler must defer it, and the supervisor must stop
+  # the child and remove the PID file once the PID is tracked.
+  mksigsu() {
+    local d="$1"
+    mkshims "$d" yes
+    cat >"$d/su" <<'SH'
+#!/bin/sh
+case "$*" in
+  *"tps-agent start"*)
+    trap 'echo "stopped $$" >>"$SIGNAL_MARKER"; exit 0' TERM
+    echo "started $$" >>"$SIGNAL_MARKER"
+    kill -TERM "$PPID"
+    sleep 2
+    exit 0 ;;
+esac
+cmd=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-c" ] && cmd="$a"
+  prev="$a"
+done
+exec /bin/bash -c "$cmd"
+SH
+    chmod +x "$d"/*
+  }
+  mksigsu "$tmp/bin-sigsu"
+  export SIGNAL_MARKER="$tmp/signal.log" SIGNAL_SU_PIDS="$tmp/signal.pids"
+  sig_runs=0; sig_noup=0; sig_missed=0; sig_pidfile=0; sig_alive=0
+  for _ in $(seq 1 40); do
+    seed
+    : >"$SIGNAL_MARKER"; : >"$SIGNAL_SU_PIDS"
+    PATH="$tmp/bin-sigsu:$cleanpath" bash "$sup" >"$tmp/out3d.log" 2>&1 &
+    spid=$!
+    for _ in $(seq 1 200); do kill -0 "$spid" 2>/dev/null || break; sleep 0.1; done
+    if kill -0 "$spid" 2>/dev/null; then kill -KILL "$spid" 2>/dev/null || true; fi
+    wait "$spid" 2>/dev/null || true
+    sig_runs=$((sig_runs + 1))
+    grep -q '^started' "$SIGNAL_MARKER" || { sig_noup=$((sig_noup + 1)); continue; }
+    grep -q '^stopped' "$SIGNAL_MARKER" || sig_missed=$((sig_missed + 1))
+    [ -e /workspace/.tps/pids.json ] && sig_pidfile=$((sig_pidfile + 1))
+    sig_child="$(sed -n 's/^started //p' "$SIGNAL_MARKER" | head -n1)"
+    if [ -n "$sig_child" ] && kill -0 "$sig_child" 2>/dev/null; then sig_alive=$((sig_alive + 1)); fi
+  done
+  while IFS= read -r sp; do [ -n "$sp" ] && kill -KILL "$sp" 2>/dev/null || true; done <"$SIGNAL_SU_PIDS"
+  if [ "$sig_runs" -eq 40 ] && [ "$sig_noup" -eq 0 ]; then ok "deferred signal: the launcher signalled its parent in all 40 runs"; else bad "deferred signal: $sig_noup of $sig_runs runs never launched the child"; fi
+  if [ "$sig_missed" -eq 0 ]; then ok "deferred signal: the child was stopped in all 40 runs"; else bad "deferred signal: the child survived the signal in $sig_missed of 40 runs"; fi
+  if [ "$sig_alive" -eq 0 ]; then ok "deferred signal: no launched child outlived the supervisor"; else bad "deferred signal: $sig_alive child process(es) outlived the supervisor"; fi
+  if [ "$sig_pidfile" -eq 0 ]; then ok "deferred signal: the PID file is removed in all 40 runs"; else bad "deferred signal: the PID file remained in $sig_pidfile of 40 runs"; fi
 
   # (4) traversal-shaped roster id → refused before anything runs (cli#352 r)
   mkdir -p /workspace/.tps /run/secrets
@@ -838,6 +952,48 @@ SH
       PATH="$real/bin:$PATH" timeout 60 bash "$bare_sup" >"$real/out4.log" 2>&1; rc4r=$?
     if [ "$rc4r" -ne 0 ]; then ok "fails-first: resolver reverted to the bare name → the C.1 setup now refuses (exit $rc4r)"; else bad "the bare-name supervisor still launched — the resolver control is untested"; fi
     if [ ! -e "$AGENT_MARKER" ]; then ok "nothing launched with the resolver reverted"; else bad "an agent launched with the bare-name resolver"; fi
+
+    # C.5 — cli#357 r3: a handled signal while the first agent's REAL session
+    # runs stops the session and its child, and removes the PID file.
+    seed
+    rm -f "$AGENT_MARKER" "$AGENT_GIT_LOG"
+    export AGENT_SLEEP=30
+    XDG_CONFIG_HOME="$empty_xdg" TPS_NONO_PROFILES_DIR="$profiles_src" PATH="$real/bin:$PATH" bash "$sup" >"$real/out5.log" 2>&1 &
+    sup5=$!
+    up5=0
+    for _ in $(seq 1 60); do
+      if grep -q 'AGENT-UP' "$AGENT_MARKER" 2>/dev/null; then up5=1; break; fi
+      kill -0 "$sup5" 2>/dev/null || break
+      sleep 0.5
+    done
+    sess5=""
+    for _ in $(seq 1 40); do
+      sess5="$(ps_as_agent 2>/dev/null | jq -c '[.[] | select((.profile == "tps-office" or (.profile // "" | endswith("/tps-office.json"))) and .status == "running")]' 2>/dev/null || true)"
+      [ -n "$sess5" ] && [ "$sess5" != "[]" ] && break
+      kill -0 "$sup5" 2>/dev/null || break
+      sleep 0.5
+    done
+    child5="$(printf '%s' "$sess5" | jq -r '.[0].child_pid // empty' 2>/dev/null || true)"
+    sup5_child="$(printf '%s' "$sess5" | jq -r '.[0].supervisor_pid // empty' 2>/dev/null || true)"
+    if [ "$up5" -eq 1 ] && [ -n "$child5" ]; then ok "real-nono stop: the session runs before the signal (agent $child5)"; else bad "real-nono stop: no running session to signal (up=$up5 sess='$sess5')"; fi
+    kill -TERM "$sup5" 2>/dev/null || true
+    rc5r=99; fin5=0
+    for _ in $(seq 1 60); do
+      if ! kill -0 "$sup5" 2>/dev/null; then fin5=1; break; fi
+      sleep 0.5
+    done
+    if [ "$fin5" -eq 1 ]; then wait "$sup5" 2>/dev/null; rc5r=$?; else kill -KILL "$sup5" 2>/dev/null || true; bad "real-nono stop: the supervisor did not exit after the signal"; fi
+    if [ "$rc5r" -eq 0 ]; then ok "real-nono stop: the supervisor exits 0 on the handled signal"; else bad "real-nono stop: the supervisor exited $rc5r"; fi
+    gone5=0
+    for _ in $(seq 1 20); do
+      gone5=1
+      for p in $child5 $sup5_child; do [ -n "$p" ] && kill -0 "$p" 2>/dev/null && gone5=0; done
+      [ "$gone5" -eq 1 ] && break
+      sleep 0.5
+    done
+    if [ "$gone5" -eq 1 ]; then ok "real-nono stop: the session child and its nono supervisor are gone"; else bad "real-nono stop: the session child '$child5' or its nono supervisor '$sup5_child' survived"; fi
+    if [ ! -e /workspace/.tps/pids.json ]; then ok "real-nono stop: the PID file is removed"; else bad "real-nono stop: the PID file remains"; fi
+    export AGENT_SLEEP=6
   fi
 fi
 

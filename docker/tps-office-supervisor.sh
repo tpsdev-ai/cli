@@ -196,26 +196,69 @@ write_pids_file() {
   chmod 644 "$PIDS_FILE"
 }
 
+# cli#357 r3 — bounded, idempotent shutdown. Signal the tracked children, then
+# poll for them up to SHUTDOWN_GRACE_SECONDS; KILL whatever is left, reap it,
+# clear the tracked list and only then remove the PID file. A second call
+# therefore signals no PID: it sees an empty list.
+SHUTDOWN_GRACE_SECONDS=10
+
 shutdown_children() {
-  local signal="${1:-TERM}"
+  local signal="${1:-TERM}" pid alive waited
 
-  if [[ ${#AGENT_PIDS[@]} -gt 0 ]]; then
-    for pid in "${AGENT_PIDS[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -"$signal" "$pid" 2>/dev/null || true
-      fi
-    done
-
-    for pid in "${AGENT_PIDS[@]}"; do
-      wait "$pid" 2>/dev/null || true
-    done
+  if [[ ${#AGENT_PIDS[@]} -eq 0 ]]; then
+    cleanup_pids_file
+    return 0
   fi
 
+  for pid in "${AGENT_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -"$signal" "$pid" 2>/dev/null || true
+    fi
+  done
+
+  waited=0
+  while [[ $waited -lt $((SHUTDOWN_GRACE_SECONDS * 10)) ]]; do
+    alive=0
+    for pid in "${AGENT_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    if [[ $alive -eq 0 ]]; then
+      break
+    fi
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+
+  for pid in "${AGENT_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+
+  for pid in "${AGENT_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  AGENT_PIDS=()
+  AGENT_IDS=()
   cleanup_pids_file
 }
 
+# cli#357 r3 — a signal that arrives between the launch and the moment the PID
+# is tracked would be handled with an empty list, so the handler records it
+# instead and the loop acts on it right after registration.
+defer_signals=0
+pending_signal=""
+
 on_signal() {
   local signal="$1"
+  if [[ "$defer_signals" -eq 1 ]]; then
+    pending_signal="$signal"
+    return 0
+  fi
   trap - SIGTERM SIGINT
   shutdown_children "$signal"
   exit 0
@@ -223,11 +266,11 @@ on_signal() {
 
 trap 'on_signal TERM' SIGTERM
 trap 'on_signal INT' SIGINT
-# An explicit exit, an errexit failure or a handled signal keeps the team
-# whole-or-absent: stop the launched children (TERM, then the same bounded
-# wait) BEFORE the PID file goes away. shutdown_children removes the PID file
-# itself, and every step tolerates a second call, so this is safe to run after
-# a loop refusal that already stopped the children.
+# An explicit exit, an errexit failure in the supervised work or a handled
+# signal calls shutdown_children: TERM, a poll of up to SHUTDOWN_GRACE_SECONDS,
+# then KILL for any survivor, and the PID file is removed last. The seating
+# loop stops earlier iterations' children the same way before an explicit
+# exit, so that path does not depend on this trap.
 trap 'shutdown_children TERM' EXIT
 
 kill_stale_pids
@@ -291,10 +334,9 @@ for ((i=0; i<count; i++)); do
   config_path=$(echo "$agents_json" | jq -r ".[$i].configPath")
 
   # cli#352 r7 — these roster-shape checks fire INSIDE the loop too, so at i>0
-  # agents from earlier iterations are already backgrounded. They obey the same
-  # all-or-nothing rule as the launch refusals below: stop the children before
-  # exiting, never leave a partial team. (Bounded by the Part A source control
-  # "every exit in the seating loop is preceded by shutdown_children".)
+  # agents from earlier iterations are already backgrounded. Stop them before
+  # exiting, like the launch refusals below. (The Part A control checks that an
+  # explicit exit form in this loop is preceded by shutdown_children.)
   if [[ -z "$id" || "$id" == "null" ]]; then
     echo "Agent missing id at index $i" >&2
     shutdown_children TERM
@@ -341,7 +383,8 @@ for ((i=0; i<count; i++)); do
       echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
       # All-or-nothing, exactly like the two sibling refusals in this loop: this
       # fires mid-loop, so stop the agents launched in earlier iterations before
-      # exiting (the EXIT trap does the same, and both are safe to repeat).
+      # exiting (the EXIT trap stops them too, and a second call signals
+      # nothing).
       shutdown_children TERM
       exit 1
     }
@@ -402,6 +445,7 @@ for ((i=0; i<count; i++)); do
     # reach the agent binary, SBOX_ENV) but must not hand the agent the
     # supervisor's HOME (see AGENT_HOME above). The probe one call earlier runs
     # with the passwd HOME for the same user, so both sites agree.
+    defer_signals=1
     su -m -s /bin/bash "$user" -c "HOME='$AGENT_HOME' exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
   else
     # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
@@ -421,6 +465,12 @@ for ((i=0; i<count; i++)); do
   pid=$!
   AGENT_IDS+=("$id")
   AGENT_PIDS+=("$pid")
+  defer_signals=0
+  if [[ -n "$pending_signal" ]]; then
+    trap - SIGTERM SIGINT
+    shutdown_children TERM
+    exit 0
+  fi
 done
 
 write_pids_file
