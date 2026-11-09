@@ -9,11 +9,11 @@
  * run. The workflow tests read the real `docker.yml`: one job checks the
  * version and tags, each platform is built on its own native runner (no QEMU)
  * into one OCI archive, that leg's smoke loads its own archive, the publish job
- * downloads only the `tps-office-*` artifacts and refuses a set that is not one
- * archive per platform, and runs the tested `.github/scripts/docker-publish-index.sh`
+ * downloads the `tps-office-*` artifacts and refuses files outside one archive
+ * per platform, and runs the tested `.github/scripts/docker-publish-index.sh`
  * to copy each archive with `--all --preserve-digests`, assemble the index from
- * the recorded platform manifests and verify it against `PLATFORMS`; only the
- * GHCR login and copy are gated on `inputs.publish`.
+ * the recorded platform manifests, verify it against `PLATFORMS`, and rehearse
+ * the push; only the GHCR login and push are gated on `inputs.publish`.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -383,7 +383,7 @@ describe("docker.yml", () => {
     const steps = jobs.publish?.steps ?? [];
     const check = steps.find((s) => s.name?.startsWith("Require exactly one archive"));
     expect(check).toBeDefined();
-    const copy = steps.findIndex((s) => s.run?.includes("skopeo copy"));
+    const copy = steps.findIndex((s) => s.run?.includes("docker-publish-index.sh copy"));
     expect(steps.indexOf(check as Step)).toBeLessThan(copy);
 
     const expected = platformList().map((p) => `tps-office-${p.replace("linux/", "")}.oci.tar`);
@@ -398,6 +398,11 @@ describe("docker.yml", () => {
     const extra = runArchiveSetCheck(check as Step, [...expected, "tps-office-riscv64.oci.tar"]);
     expect(extra.status).toBe(1);
     expect(extra.stderr).toContain("unexpected archive(s):\ntps-office-riscv64.oci.tar");
+    for (const name of ["other.oci.tar", "stray.txt"]) {
+      const stray = runArchiveSetCheck(check as Step, [...expected, name]);
+      expect(stray.status).toBe(1);
+      expect(stray.stderr).toContain(`unexpected archive(s):\n${name}`);
+    }
   });
 
   test("each build step disables the build-record upload", () => {
@@ -408,23 +413,13 @@ describe("docker.yml", () => {
     expect(builds[0].env?.DOCKER_BUILD_RECORD_UPLOAD).toBe("false");
   });
 
-  test("every registry copy preserves digests and is followed by a digest check", () => {
-    const copySteps = allSteps().filter(
-      (s) => s.run?.includes("skopeo copy") && s.run.includes("docker://"),
-    );
-    // The local-registry copies live in docker-publish-index.sh (tested in
-    // test/docker-publish-index.test.ts); the GHCR copy is the step here.
-    expect(copySteps.length).toBe(1);
-    const lines = copySteps.flatMap((s) =>
-      (s.run ?? "").split("\n").filter((line) => line.includes("skopeo copy")),
-    );
-    expect(lines.length).toBe(1);
-    for (const line of lines) expect(line).toContain("--preserve-digests");
-    for (const step of copySteps) {
-      const run = step.run ?? "";
-      const copy = run.indexOf("skopeo copy");
-      expect(copy).toBeGreaterThan(-1);
-      expect(run.slice(copy), step.name).toMatch(/test "\$\w+" = "\$\w+"/);
+  test("every registry copy in the publish script preserves digests", () => {
+    const script = readFileSync(join(REPO, ".github/scripts/docker-publish-index.sh"), "utf8");
+    const lines = script.split("\n").filter((line) => /^\s*skopeo copy\b/.test(line));
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line).toContain("--all");
+      expect(line).toContain("--preserve-digests");
     }
   });
 
@@ -437,28 +432,42 @@ describe("docker.yml", () => {
       "copy",
       "assemble",
       "verify",
+      "push",
+      "push",
     ]);
     expect(calls[0].run).toContain('"${RUNNER_TEMP:-/tmp}/archives"');
     expect(calls[0].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
     expect(calls[1].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
     expect(calls[2].run).toContain('"${RUNNER_TEMP:-/tmp}/platform-digests"');
     expect(calls[2].run).toContain('"${RUNNER_TEMP:-/tmp}/index.json"');
+    expect(calls[3].run).toContain("--rehearsal");
+    expect(calls[4].run).not.toContain("--rehearsal");
     expect(steps.some((s) => s.run?.includes("skopeo inspect --raw oci-archive:"))).toBe(false);
     expect(steps.some((s) => s.run?.includes("docker buildx imagetools create"))).toBe(false);
   });
 
-  test("the GHCR copy runs only on publish", () => {
-    const ghcr = (jobs.publish?.steps ?? []).find((s) => s.run?.includes('"docker://$tag"'));
+  test("the rehearsal and GHCR steps use push with destination TLS enabled for GHCR", () => {
+    const steps = jobs.publish?.steps ?? [];
+    const rehearsal = steps.find((s) => s.name === "Rehearse the GHCR copy against a second local registry");
+    const ghcr = steps.find((s) => s.name === "Push the index to GHCR");
+    const login = steps.findIndex((s) => s.name === "Log in to ghcr.io");
+    expect(rehearsal).toBeDefined();
+    expect(rehearsal?.if).toBeUndefined();
+    expect(steps.indexOf(rehearsal as Step)).toBeLessThan(login);
+    expect(rehearsal?.run).toContain("docker-publish-index.sh push localhost:5001/tps-office:rehearsal --rehearsal");
     expect(ghcr).toBeDefined();
     expect(ghcr?.if).toBe("${{ inputs.publish }}");
     expect(ghcr?.env?.TAGS).toBe("${{ needs.meta.outputs.tags }}");
-    expect(ghcr?.run).toContain("skopeo copy --all --preserve-digests");
+    expect(ghcr?.run).toContain('docker-publish-index.sh push "$tag"');
+    expect(ghcr?.run).not.toContain("--rehearsal");
     expect(ghcr?.run).not.toContain("tls-verify=false");
+    expect(readFileSync(WORKFLOW, "utf8")).not.toContain("--dest-tls-verify=false");
     expect(workflow.on?.workflow_dispatch?.inputs?.publish?.type).toBe("boolean");
   });
 
   test("the local registry service is pinned by digest", () => {
     expect(jobs.publish?.services?.registry?.image).toMatch(/^registry:2@sha256:[0-9a-f]{64}$/);
+    expect(jobs.publish?.services?.["rehearsal-registry"]?.image).toBe(jobs.publish?.services?.registry?.image);
   });
 
   test("every pushed platform has a nono hash line", () => {

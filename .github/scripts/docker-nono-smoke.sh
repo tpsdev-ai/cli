@@ -6,7 +6,7 @@
 # The expected hash is read from docker/nono.sha256, which holds one line per
 # platform: "<sha256> <platform>". A platform with no line fails. The binary is
 # copied out of the image and hashed on the host, then executed in the image for
-# that platform (QEMU for a foreign platform). Its `--version` must print
+# that platform. Its `--version` must print
 # exactly "nono <version>", with <version> read from .nono-version, and it must
 # exit 0. A red smoke therefore means a missing hash line, a hash mismatch, a
 # wrong version, or a failed run.

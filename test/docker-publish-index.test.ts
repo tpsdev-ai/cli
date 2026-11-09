@@ -29,9 +29,7 @@ const tagKey = (ref: string): string => ref.replace(/[/:]/g, "_");
 /**
  * A skopeo stub. `inspect --raw` reads the archive's index.json, or a tag
  * recorded by an earlier copy. `copy` registers the tag and every referenced
- * manifest; without `--all` it registers only the platform image manifest,
- * which is what CI's failing run observed (the tag's digest then differs from
- * the archive's index digest).
+ * manifest. Both copy paths require `--all --preserve-digests`.
  */
 const STUB_SKOPEO = `#!/usr/bin/env bash
 set -euo pipefail
@@ -41,10 +39,11 @@ shift
 case "$sub" in
   inspect)
     raw=0
+    tls=0
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --raw) raw=1; shift ;;
-        --tls-verify=false|--dest-tls-verify=false) shift ;;
+        --tls-verify=false) tls=1; shift ;;
         *) break ;;
       esac
     done
@@ -54,6 +53,10 @@ case "$sub" in
       oci-archive:*)
         tar -xOf "\${ref#oci-archive:}" index.json ;;
       docker://*)
+        case "$ref" in
+          docker://localhost:*) [ "$tls" -eq 1 ] || { echo "stub skopeo: local inspect requires --tls-verify=false" >&2; exit 97; } ;;
+          *) [ "$tls" -eq 0 ] || { echo "stub skopeo: destination inspect disabled TLS" >&2; exit 97; } ;;
+        esac
         key="$(printf '%s' "\${ref#docker://}" | tr '/:' '__')"
         [ -f "$state/tags/$key" ] || { echo "stub skopeo: no tag $ref" >&2; exit 1; }
         cat "$state/tags/$key" ;;
@@ -61,20 +64,26 @@ case "$sub" in
     esac ;;
   copy)
     all=0
+    preserve=0
+    src_tls=0
+    dest_tls=0
     src=""
     dst=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --all) all=1; shift ;;
-        --preserve-digests) shift ;;
-        --dest-tls-verify=false) shift ;;
+        --preserve-digests) preserve=1; shift ;;
+        --src-tls-verify=false) src_tls=1; shift ;;
+        --dest-tls-verify=false) dest_tls=1; shift ;;
         -*) echo "stub skopeo: unsupported flag $1" >&2; exit 97 ;;
         *) if [ -z "$src" ]; then src="$1"; else dst="$1"; fi; shift ;;
       esac
     done
     [ -n "$src" ] && [ -n "$dst" ] || exit 97
+    [ "$all" -eq 1 ] && [ "$preserve" -eq 1 ] || { echo "stub skopeo: copy requires --all --preserve-digests" >&2; exit 97; }
     case "$src:$dst" in
       oci-archive:*:docker://*)
+        [ "$src_tls" -eq 0 ] && [ "$dest_tls" -eq 1 ] || { echo "stub skopeo: wrong local copy TLS flags" >&2; exit 97; }
         archive="\${src#oci-archive:}"
         raw="$(tar -xOf "$archive" index.json)"
         key="$(printf '%s' "\${dst#docker://}" | tr '/:' '__')"
@@ -85,15 +94,20 @@ case "$sub" in
           tar -xOf "$archive" "blobs/sha256/\${digest#sha256:}" >"$state/blobs/\${digest#sha256:}"
           printf '%s' "$platform" >"$state/platforms/\${digest#sha256:}"
         done < <(printf '%s' "$raw" | jq -r '.manifests[]? | "\\(.digest) \\(.platform.os)/\\(.platform.architecture)"')
-        if [ "$all" -eq 1 ]; then
-          printf '%s' "$raw" >"$state/tags/$key"
+        printf '%s' "$raw" >"$state/tags/$key" ;;
+      docker://localhost:5000/*:docker://*)
+        [ "$src_tls" -eq 1 ] || { echo "stub skopeo: push requires --src-tls-verify=false" >&2; exit 97; }
+        case "$dst" in
+          docker://localhost:5001/*) [ "$dest_tls" -eq 1 ] || { echo "stub skopeo: rehearsal requires --dest-tls-verify=false" >&2; exit 97; } ;;
+          *) [ "$dest_tls" -eq 0 ] || { echo "stub skopeo: destination TLS disabled" >&2; exit 97; } ;;
+        esac
+        source_key="$(printf '%s' "\${src#docker://}" | tr '/:' '__')"
+        target_key="$(printf '%s' "\${dst#docker://}" | tr '/:' '__')"
+        [ -f "$state/tags/$source_key" ] || exit 97
+        if [ "\${STUB_MISMATCH:-0}" = 1 ]; then
+          printf 'changed' >"$state/tags/$target_key"
         else
-          digest="$(printf '%s' "$raw" | jq -r '[.manifests[] | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest") | select((.platform.os // "") != "unknown")][0].digest')"
-          if [ -z "$digest" ] || [ "$digest" = null ]; then
-            printf '%s' "$raw" >"$state/tags/$key"
-          else
-            cp "$state/blobs/\${digest#sha256:}" "$state/tags/$key"
-          fi
+          cp "$state/tags/$source_key" "$state/tags/$target_key"
         fi ;;
       *) echo "stub skopeo: unsupported copy $src -> $dst" >&2; exit 97 ;;
     esac ;;
@@ -367,6 +381,22 @@ describe("docker-publish-index.sh assemble and verify", () => {
     expect(r.stderr).toContain("unexpected platform linux/riscv64");
   });
 
+  test("fails naming an unmarked unknown/unknown entry", () => {
+    const c = newCase();
+    makeArchive(c, "linux/amd64", true);
+    makeArchive(c, "linux/arm64", false);
+    expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
+    seedIndex(c, [
+      { platform: "linux/amd64", digest: recorded(c, "linux/amd64")[3] },
+      { platform: "linux/arm64", digest: recorded(c, "linux/arm64")[3] },
+      { platform: "unknown/unknown", digest: `sha256:${sha256("unmarked")}` },
+    ]);
+
+    const r = runScript(c, ["verify", c.digests]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("unexpected platform unknown/unknown");
+  });
+
   test("fails naming a wrong digest", () => {
     const c = newCase();
     makeArchive(c, "linux/amd64", true);
@@ -381,5 +411,24 @@ describe("docker-publish-index.sh assemble and verify", () => {
     const r = runScript(c, ["verify", c.digests]);
     expect(r.status).toBe(1);
     expect(r.stderr).toContain(`wrong digest for linux/amd64: expected ${recorded(c, "linux/amd64")[3]}, index has ${wrong}`);
+  });
+});
+
+describe("docker-publish-index.sh push", () => {
+  test("rehearsal and GHCR copies preserve the local index digest", () => {
+    const c = newCase();
+    makeArchive(c, "linux/amd64", true);
+    makeArchive(c, "linux/arm64", false);
+    expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
+    expect(runScript(c, ["assemble", c.digests]).status).toBe(0);
+    const raw = join(c.dir, "index.json");
+    expect(runScript(c, ["verify", c.digests, raw]).status).toBe(0);
+    writeFileSync(join(c.dir, "index-digest"), sha256(readFileSync(raw, "utf8")));
+
+    expect(runScript(c, ["push", "localhost:5001/tps-office:rehearsal", "--rehearsal"], { RUNNER_TEMP: c.dir }).status).toBe(0);
+    expect(runScript(c, ["push", "ghcr.io/tpsdev-ai/tps-office:test"], { RUNNER_TEMP: c.dir }).status).toBe(0);
+    const mismatch = runScript(c, ["push", "ghcr.io/tpsdev-ai/tps-office:test"], { RUNNER_TEMP: c.dir, STUB_MISMATCH: "1" });
+    expect(mismatch.status).toBe(1);
+    expect(mismatch.stderr).toContain("digest mismatch for ghcr.io/tpsdev-ai/tps-office:test");
   });
 });

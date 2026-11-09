@@ -207,6 +207,10 @@ jobs:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports:
           - 5000:5000
+      rehearsal-registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5001:5000
     steps:
       # Registry steps run the repo script; only .github/scripts is needed, and checkout credentials must not persist in this packages: write job.
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -215,8 +219,7 @@ jobs:
           sparse-checkout: .github/scripts/
           sparse-checkout-cone-mode: false
 
-      # Only the platform archives: without a pattern the download fetches every
-      # artifact in the run, build records included.
+      # Download artifacts named tps-office-*.
       - name: Download the platform archives
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -229,9 +232,9 @@ jobs:
           set -eux
           archives="${RUNNER_TEMP:-/tmp}/archives"
           expected="$(for platform in ${PLATFORMS//,/ }; do printf 'tps-office-%s.oci.tar\n' "${platform#linux/}"; done | sort)"
-          found="$(find "$archives" -type f -name 'tps-office-*.oci.tar' -exec basename {} \; | sort)"
+          found="$(find "$archives" ! -type d -exec basename {} \; | sort)"
           if [ -z "$found" ]; then
-            echo "no tps-office-* archives were downloaded" >&2
+            echo "no files were downloaded" >&2
             exit 1
           fi
           missing="$(comm -23 <(printf '%s\n' "$expected") <(printf '%s\n' "$found"))"
@@ -270,6 +273,11 @@ jobs:
             "${RUNNER_TEMP:-/tmp}/platform-digests" "${RUNNER_TEMP:-/tmp}/index.json"
           sha256sum "${RUNNER_TEMP:-/tmp}/index.json" | cut -d' ' -f1 >"${RUNNER_TEMP:-/tmp}/index-digest"
 
+      - name: Rehearse the GHCR copy against a second local registry
+        run: |
+          set -eux
+          bash .github/scripts/docker-publish-index.sh push localhost:5001/tps-office:rehearsal --rehearsal
+
       - name: Log in to ghcr.io
         if: ${{ inputs.publish }}
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
@@ -291,13 +299,6 @@ jobs:
             echo "no ghcr.io credentials in ~/.docker/config.json" >&2
             exit 1
           }
-          local_index="$(cat "${RUNNER_TEMP:-/tmp}/index-digest")"
-          test -n "$local_index"
           for tag in $TAGS; do
-            skopeo copy --all --preserve-digests "docker://localhost:5000/tps-office:verify" "docker://$tag"
-            remote="$(skopeo inspect --raw "docker://$tag" | sha256sum | cut -d' ' -f1)"
-            test "$local_index" = "$remote" || {
-              echo "digest mismatch for $tag: local index $local_index, registry $remote" >&2
-              exit 1
-            }
+            bash .github/scripts/docker-publish-index.sh push "$tag"
           done

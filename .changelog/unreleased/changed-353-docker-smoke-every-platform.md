@@ -6,5 +6,6 @@
   the archive. A `publish` job copies each archive with `--all
   --preserve-digests` into a local `registry:2`, records the platform's
   image-manifest digest, assembles the index from those digests, and checks the
-  index's non-attestation entries are exactly `PLATFORMS`. Only `publish=true`
-  logs in to ghcr.io and copies that index to the computed tags.
+  index's non-attestation entries are exactly `PLATFORMS`. A second local
+  registry rehearses the index copy on each run. Only `publish=true` logs in to
+  ghcr.io and copies that index to the computed tags.

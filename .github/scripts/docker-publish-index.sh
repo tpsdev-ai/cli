@@ -6,6 +6,7 @@
 #   docker-publish-index.sh copy <archives-dir> <digests-file>
 #   docker-publish-index.sh assemble <digests-file>
 #   docker-publish-index.sh verify <digests-file> [raw-index-file]
+#   docker-publish-index.sh push <dest-ref> [--rehearsal]
 #
 # Env:
 #   PLATFORMS   comma-separated platform list (default linux/amd64,linux/arm64)
@@ -31,6 +32,8 @@
 # platform image, so they are not part of the platform set this index promises.
 # The checked entries are printed, and the raw index is written to
 # [raw-index-file] when given.
+# push: copy the local index and compare the destination's raw digest
+# with the recorded local index digest. --rehearsal permits a local HTTP target.
 #
 # `skopeo` and `docker` come from PATH. test/docker-publish-index.test.ts runs
 # this script with stubs of both.
@@ -39,7 +42,7 @@ set -euo pipefail
 platforms="${PLATFORMS:-linux/amd64,linux/arm64}"
 registry="${REGISTRY:-localhost:5000}"
 repository="${REPOSITORY:-tps-office}"
-command="${1:?usage: docker-publish-index.sh <copy|assemble|verify> ...}"
+command="${1:?usage: docker-publish-index.sh <copy|assemble|verify|push> ...}"
 
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -64,7 +67,6 @@ platform_manifest_digest() {
     jq -r --arg p "$platform" '
       .manifests[]
       | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-      | select((.platform.os // "") != "unknown")
       | select("\(.platform.os)/\(.platform.architecture)" == $p)
       | .digest
     ' "$raw" | head -n 1
@@ -146,7 +148,6 @@ verify)
   actual="$(jq -r '
     .manifests[]
     | select((.annotations["vnd.docker.reference.type"] // "") != "attestation-manifest")
-    | select((.platform.os // "") != "unknown")
     | "\(.platform.os)/\(.platform.architecture) \(.digest)"
   ' "$raw" | sort)"
   expected="$(awk '{ print $1, $4 }' "$digests" | sort)"
@@ -180,8 +181,31 @@ verify)
   fi
   printf '%s\n' "$actual"
   ;;
+push)
+  dest="${2:?usage: docker-publish-index.sh push <dest-ref> [--rehearsal]}"
+  tls_args=()
+  inspect_args=()
+  case "${3-}" in
+    "") ;;
+    --rehearsal) tls_args=(--dest-tls-verify=false); inspect_args=(--tls-verify=false) ;;
+    *) echo "unknown push option: $3" >&2; exit 1 ;;
+  esac
+  [ "$#" -le 3 ] || { echo "too many push arguments" >&2; exit 1; }
+  digest_file="${RUNNER_TEMP:-/tmp}/index-digest"
+  [ -s "$digest_file" ] || { echo "missing local index digest: $digest_file" >&2; exit 1; }
+  expected="$(cat "$digest_file")"
+  skopeo copy --all --preserve-digests --src-tls-verify=false "${tls_args[@]}" \
+    "docker://$registry/$repository:verify" "docker://$dest"
+  target_raw="$tmp/pushed-index.json"
+  skopeo inspect "${inspect_args[@]}" --raw "docker://$dest" >"$target_raw"
+  actual="$(sha256sum "$target_raw" | cut -d' ' -f1)"
+  if [ "$expected" != "$actual" ]; then
+    echo "digest mismatch for $dest: local index $expected, registry $actual" >&2
+    exit 1
+  fi
+  ;;
 *)
-  echo "unknown command: $command (expected copy, assemble or verify)" >&2
+  echo "unknown command: $command (expected copy, assemble, verify or push)" >&2
   exit 1
   ;;
 esac
