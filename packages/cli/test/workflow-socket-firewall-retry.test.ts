@@ -13,7 +13,9 @@
  * download or a checksum mismatch fails the job.
  */
 import { describe, expect, test } from "bun:test";
-import { readdirSync, readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import yaml from "js-yaml";
 
@@ -104,15 +106,61 @@ describe("every Socket Firewall action step", () => {
       "--retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 300",
     );
     expect(script).toContain(
-      "https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-linux-x86_64",
+      "https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}",
     );
-    expect(script).toContain("cf9f55b8343e1ef6e6dcccdb09b99c70c0430a22ed7d0079286eccddeaf72670");
+    for (const sha of [
+      "cf9f55b8343e1ef6e6dcccdb09b99c70c0430a22ed7d0079286eccddeaf72670",
+      "c8c80aa582829f24f5d633f2c3f2ccd0b070bbee80bf3b956e5e2a9880184e20",
+      "b19f96f0dd3ebc4ecc7111dbc43cc2b095f37bf759273c0bd9c0c4784ea24731",
+      "1b705ea7c399727ee41aa93f63e0469d2c3787c50e1dd8842cb8ff5ceec9eb99",
+    ]) {
+      expect(script).toContain(sha);
+    }
+    expect(script).toContain("shasum -a 256");
 
     // The checksum check runs on the downloaded file before that file is copied
     // into the tool-cache path the action reads.
-    const verify = script.indexOf('echo "${SHA256}  ${tmp}" | sha256sum -c -');
+    const verify = script.indexOf('if [ "$(sha256_of "${tmp}")" != "${SHA256}" ]; then');
     const install = script.indexOf('cp "${tmp}" "${CACHE_BINARY}"');
     expect(verify).toBeGreaterThan(-1);
     expect(install).toBeGreaterThan(verify);
+  });
+
+  test("a download that does not match the pinned sha256 is not installed", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-test-"));
+    try {
+      const fakeBin = join(root, "bin");
+      mkdirSync(fakeBin);
+      const fakeCurl = join(fakeBin, "curl");
+      writeFileSync(
+        fakeCurl,
+        [
+          "#!/bin/sh",
+          'out=""',
+          'while [ $# -gt 0 ]; do',
+          '  case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac',
+          "done",
+          'printf "not the binary" > "$out"',
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          RUNNER_TOOL_CACHE: join(root, "cache"),
+          RUNNER_TEMP: root,
+        },
+        encoding: "utf8",
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("checksum mismatch");
+      expect(existsSync(join(root, "cache", "socket-firewall-free", "1.15.4", "x64", "sfw"))).toBe(false);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
