@@ -39,6 +39,6 @@ test("docker-compose.yml sets a value the real-owner case honours as required", 
   expect(set).toHaveLength(1);
   const value = set[0].slice(REAL_OWNER_FLAG.length + 1);
   expect(parseRequireRealOwner({ [REAL_OWNER_FLAG]: value })).toBe(true);
-  // The lane is judged by the container's exit status, so it wires no report directory.
+  // This service does not override the launcher's default report directory.
   expect(environment.some((entry) => entry.startsWith("TPS_TEST_REPORT_DIR="))).toBe(false);
 });
