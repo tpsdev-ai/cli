@@ -203,6 +203,33 @@ describe("the exclusion audit counts only the declarations Bun applies", () => {
     });
   });
 
+  // A supplementary character is one code point, so one `?` consumes it and `??`
+  // does not; a class member is a code point too. Measured against Bun's own
+  // glob and install in check-dep-ages-install-age-bun.test.ts.
+  it.each([
+    ["a ? pattern matches one non-BMP character", ["packages/?"], "packages/😀", true],
+    ["a ?? pattern matches two BMP characters", ["packages/??"], "packages/ab", true],
+    ["a ?? pattern does not match one non-BMP character", ["packages/??"], "packages/😀", false],
+    ["a class with a non-BMP member matches it", ["packages/[😀]"], "packages/😀", true],
+    ["a class with a non-BMP member does not match a BMP name", ["packages/[😀]"], "packages/a", false],
+    ["a class with a BMP member does not match a non-BMP name", ["packages/[a]"], "packages/😀", false],
+    ["a negated class with a non-BMP member excludes it", ["packages/[!😀]"], "packages/😀", false],
+  ])("%s", (_label, workspaces, dir, expectApplied) => {
+    appliedFixture((root) => {
+      writeManifest(root, "package.json", { name: "fixture", workspaces });
+      writeManifest(root, join(dir, "package.json"), { name: "w", dependencies: { "dep-a": "1.0.0" } });
+      const output = runGate(root);
+      if (expectApplied) {
+        expect(output).toContain("bun.lock is not parseable");
+      } else {
+        expect(output).toContain(
+          `${dir}/package.json: \`dep-a\` is declared exactly here, but this manifest is neither the root package.json nor a workspace`,
+        );
+        expect(output).not.toContain("Checking");
+      }
+    });
+  });
+
   it.each([
     ["a negation removes a * match", ["packages/*", "!packages/x"]],
     ["a negation leaves other * matches", ["packages/*", "!packages/x"]],

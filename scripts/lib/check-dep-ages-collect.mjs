@@ -483,9 +483,23 @@ function expandBraces(pattern) {
 const REGEX_SPECIAL = /[.+^${}()|[\]\\]/;
 
 /**
+ * One class member, escaped for a `u`-mode regex: a `]` is literal once the class
+ * scanner has taken it as the first member, a backslash is doubled, and a
+ * non-ASCII code point is an explicit code-point escape. `[...members]` in the
+ * caller walks code points, so a supplementary character is one member.
+ */
+function classMember(ch) {
+  if (ch === "\\") return "\\\\";
+  if (ch === "]") return "\\]";
+  const codePoint = ch.codePointAt(0);
+  return codePoint >= 0x80 ? `\\u{${codePoint.toString(16)}}` : ch;
+}
+
+/**
  * Whether one glob segment matches one path segment: `*` and `?` stay inside the
  * segment, `[...]` is a character class (`[!...]`/`[^...]` negate it, `a-z` is a
- * range) and `\` escapes the next character.
+ * range) and `\` escapes the next character. The regex is compiled with `u`, so
+ * `?` and a class member each match one code point, as Bun's glob does.
  */
 function segmentRegex(pattern) {
   let source = "^";
@@ -511,7 +525,7 @@ function segmentRegex(pattern) {
       const body = pattern.slice(i + 1, end);
       const negated = body.startsWith("!") || body.startsWith("^");
       const members = negated ? body.slice(1) : body;
-      source += `[${negated ? "^" : ""}${members.replace(/\\/g, "\\\\")}]`;
+      source += `[${negated ? "^" : ""}${[...members].map(classMember).join("")}]`;
       i = end + 1;
     } else if (ch === "\\" && i + 1 < pattern.length) {
       const next = pattern[i + 1];
@@ -522,7 +536,7 @@ function segmentRegex(pattern) {
       i++;
     }
   }
-  return new RegExp(`${source}$`);
+  return new RegExp(`${source}$`, "u");
 }
 
 function matchGlobSegment(value, pattern) {

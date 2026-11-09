@@ -132,14 +132,14 @@ function writeProject(
   return project;
 }
 
-async function bunInstall(project: string, args: string[]) {
+async function bunInstall(project: string, args: string[], binary = process.execPath) {
   const env = {
     PATH: process.env.PATH ?? "",
     HOME: join(project, "..", "home"),
     TMPDIR: join(project, ".."),
     BUN_INSTALL_CACHE_DIR: join(project, "..", "cache"),
   };
-  const install = Bun.spawn([process.execPath, "install", "--ignore-scripts", ...args], {
+  const install = Bun.spawn([binary, "install", "--ignore-scripts", ...args], {
     cwd: project,
     env,
     stdout: "pipe",
@@ -153,6 +153,18 @@ async function bunInstall(project: string, args: string[]) {
 function lockVersions(project: string) {
   const path = join(project, "bun.lock");
   return existsSync(path) ? collectResolvedDeps(parseBunLock(readFileSync(path, "utf8"))) : [];
+}
+
+/** The executable for one supported Bun version, or null when it cannot be fetched. */
+function bunBinaryFor(version: string): string | null {
+  if (process.versions.bun === version) return process.execPath;
+  const probe = spawnSync(process.execPath, ["x", `bun@${version}`, "-e", "console.log(process.execPath)"], {
+    encoding: "utf8",
+    timeout: 180000,
+  });
+  if (probe.status !== 0) return null;
+  const path = probe.stdout.trim().split("\n").filter(Boolean).pop();
+  return path !== undefined && existsSync(path) ? path : null;
 }
 
 it(
@@ -463,6 +475,64 @@ it.each([
     }
   },
   60000,
+);
+
+// The `??` row above covers BMP names. Bun's glob matches `?` and a class member
+// by code point, so one supplementary character is not two: measure what each
+// supported Bun install does with `packages/??` when `packages/😀` exists.
+it(
+  "a non-BMP workspace directory: both supported Bun versions and the gate resolve it the same way",
+  async () => {
+    const root = mkdtempSync(join(tmpdir(), "age-nonbmp-workspaces-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      registry = startRegistry(root);
+      const measured: string[] = [];
+      const unmeasured: string[] = [];
+      for (const version of ["1.3.10", "1.4.4"]) {
+        const binary = bunBinaryFor(version);
+        if (binary === null) {
+          unmeasured.push(version);
+          continue;
+        }
+        const versionRoot = join(root, `bun-${version}`);
+        mkdirSync(versionRoot, { recursive: true });
+        const manifests: Record<string, unknown> = {
+          "package.json": { name: "fixture", workspaces: ["packages/??"] },
+          "packages/ab/package.json": { name: "w-ab" },
+          "packages/😀/package.json": { name: "w-emoji" },
+        };
+        const project = writeProject(versionRoot, manifests, registry.url);
+        const install = await bunInstall(project, ["--no-cache"], binary);
+        expect({ version, exit: install.exit, output: install.output }).toMatchObject({ version, exit: 0 });
+        const lockPath = join(project, "bun.lock");
+        const lock = existsSync(lockPath) ? parseBunLock(readFileSync(lockPath, "utf8")) : { workspaces: {} };
+        const installed = Object.keys(lock.workspaces).filter((key) => key !== "").sort();
+        expect({ version, installed }).toEqual({ version, installed: ["packages/ab"] });
+
+        const packageJsons = Object.entries(manifests).map(([path, json]) => ({ path, json }));
+        const resolved = appliedManifestPaths(packageJsons);
+        expect(resolved.error).toBeNull();
+        expect([...resolved.applied].filter((path) => path !== "package.json").sort()).toEqual([
+          "packages/ab/package.json",
+        ]);
+        measured.push(version);
+      }
+      if (unmeasured.length > 0) {
+        console.warn(
+          `workspace non-BMP parity: Bun ${unmeasured.join(", ")} could not be fetched, so this run measured ${measured.join(", ")}`,
+        );
+      }
+      expect(measured.length).toBeGreaterThan(0);
+    } finally {
+      try {
+        registry?.stop();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  },
+  300000,
 );
 
 // A real install of an empty brace alternative: the lockfile says which manifests
