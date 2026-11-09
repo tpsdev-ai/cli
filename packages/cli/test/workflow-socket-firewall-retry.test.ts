@@ -5,14 +5,16 @@
  *
  * The pinned action (v1.3.2) makes one un-retried download of the Socket
  * Firewall binary and verifies no checksum of its own, so a transient 504 from
- * the release host failed every job before its own steps. Each job now attempts
- * to restore the verified binary from actions/cache, and runs
+ * the release host failed a job using it before its own steps. Each job now
+ * attempts to restore the verified binary from actions/cache, and runs
  * scripts/prefetch-socket-firewall.sh immediately before the action: a restored
- * entry that does not match the pin is discarded and the script downloads the
- * exact version the action is told to use with a bounded curl backoff, checks
- * the pinned sha256, and only then writes the tool-cache entry the action
- * reuses. The action still runs, so the firewall is installed; a downloaded
- * binary that does not match the pin, or a failed download, fails the job.
+ * entry whose checksum, read with the checksum tool found on the job's PATH,
+ * does not match the pin is discarded and the script downloads the exact
+ * version the action is told to use with a bounded curl backoff, checks the
+ * pinned sha256 with that same tool, and only then writes the tool-cache entry
+ * the action reuses. The action still runs, so in an Actions job the firewall
+ * is installed when the action completes; a downloaded binary whose checksum
+ * does not match, or a failed download, fails the job.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
@@ -375,7 +377,7 @@ describe("the pre-fetch cache and download paths", () => {
     }
   });
 
-  test("environment values cannot change the download URL or the pin", () => {
+  test("SFW_PREFETCH_* environment values cannot change the download URL or the pin", () => {
     const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-env-"));
     try {
       const fakeBin = join(root, "bin");
@@ -430,6 +432,79 @@ describe("the pre-fetch cache and download paths", () => {
 
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("unknown argument");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an Actions job without RUNNER_TOOL_CACHE fails naming the variable", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-actions-"));
+    try {
+      const env: Record<string, string | undefined> = { ...process.env, GITHUB_ACTIONS: "true", RUNNER_TEMP: root };
+      delete env.RUNNER_TOOL_CACHE;
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
+        env,
+        encoding: "utf8",
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("RUNNER_TOOL_CACHE");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("the review sandbox path (no Actions, no tool cache) exits 0", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-sandbox-"));
+    try {
+      const env: Record<string, string | undefined> = { ...process.env, RUNNER_TEMP: root };
+      delete env.GITHUB_ACTIONS;
+      delete env.RUNNER_TOOL_CACHE;
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
+        env,
+        encoding: "utf8",
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toContain("nothing to pre-fetch");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an unsupported platform fails on the Actions path", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-platform-"));
+    try {
+      const fakeBin = join(root, "bin");
+      mkdirSync(fakeBin);
+      writeFileSync(
+        join(fakeBin, "uname"),
+        [
+          "#!/bin/sh",
+          'case "$1" in',
+          '  -s) echo FreeBSD ;;',
+          '  -m) echo riscv64 ;;',
+          '  *) echo "FreeBSD riscv64" ;;',
+          "esac",
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          GITHUB_ACTIONS: "true",
+          RUNNER_TOOL_CACHE: join(root, "cache"),
+          RUNNER_TEMP: root,
+        },
+        encoding: "utf8",
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("no Socket Firewall");
+      expect(result.stderr).toContain("FreeBSD-riscv64");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

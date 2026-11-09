@@ -5,18 +5,23 @@
 # The pinned action (v1.3.2) makes one un-retried download of this binary and
 # verifies no checksum of its own. It reuses a binary already present at its
 # tool-cache path, so the checks below run before the action can use the file:
-# a downloaded binary that does not match the pin, or a failed download, fails
-# the job, and the firewall is never skipped.
+# in an Actions job, a downloaded binary whose checksum does not match the pin,
+# or a failed download, fails the job, so the action does not install a missing
+# or unverified binary. The review sandbox skips the action and runs this script
+# with RUNNER_TOOL_CACHE unset, so there it exits before the platform and
+# checksum checks.
 #
 # Each job also attempts to restore a verified binary through actions/cache (the
-# restore step that precedes this script). A restored entry that does not match
-# the pin is discarded; the script downloads instead.
+# restore step that precedes this script). A restored entry whose checksum does
+# not match the pin is discarded; the script downloads instead.
 set -euo pipefail
 
 # Test overrides are command-line flags only, which a workflow step cannot
 # inject: workflow steps invoke this script with no arguments, so no
-# environment value can change the download URL or the pinned sha256. Clear any
-# SFW_PREFETCH_* variable inherited from the job environment.
+# SFW_PREFETCH_* variable can change the download URL or the pinned sha256.
+# Clear any such variable inherited from the job environment. The rest of the
+# job's shell environment (PATH, BASH_ENV) is trusted, as for any other step in
+# the job.
 for sfw_env_name in $(compgen -e); do
   case "${sfw_env_name}" in
     SFW_PREFETCH_*) unset "${sfw_env_name}" ;;
@@ -61,11 +66,17 @@ done
 
 FIREWALL_VERSION="1.15.4"
 
-# The action runs only on an Actions runner, where RUNNER_TOOL_CACHE is set.
-# The review sandbox runs run: steps without it and skips the action, so there
-# is no cache to populate there.
+# Two environments reach this script. An Actions job sets GITHUB_ACTIONS=true
+# and the runner sets RUNNER_TOOL_CACHE; there a missing tool cache is a job
+# error, because the action has no place to install the binary. The review
+# sandbox sets neither, runs run: steps but skips the action, so there is no
+# tool cache to populate and nothing to check.
 if [ -z "${RUNNER_TOOL_CACHE:-}" ]; then
-  echo "RUNNER_TOOL_CACHE is unset; the firewall action is not installed here, nothing to pre-fetch."
+  if [ "${GITHUB_ACTIONS:-}" = "true" ]; then
+    echo "::error::RUNNER_TOOL_CACHE is unset in an Actions job; the Socket Firewall action has no tool cache to install into." >&2
+    exit 1
+  fi
+  echo "RUNNER_TOOL_CACHE is unset and GITHUB_ACTIONS is not true; the review sandbox skips the firewall action, nothing to pre-fetch."
   exit 0
 fi
 
@@ -124,8 +135,8 @@ install_binary() {
   : > "${CACHE_DIR}.complete"
 }
 
-# A binary already in the action's tool cache is used only when it matches the
-# pin.
+# A binary already in the action's tool cache is used only when the checksum
+# tool found on the job's PATH reports the pinned sha256.
 if [ -f "${CACHE_BINARY}" ]; then
   if [ "$(sha256_of "${CACHE_BINARY}")" = "${SHA256}" ]; then
     : > "${CACHE_DIR}.complete"
@@ -134,8 +145,9 @@ if [ -f "${CACHE_BINARY}" ]; then
   rm -f "${CACHE_BINARY}" "${CACHE_DIR}.complete"
 fi
 
-# A restored cache entry is used only when its sha256 still matches the pin. A
-# mismatched file is never used: it is deleted and the download runs instead.
+# A restored cache entry is used only when the checksum tool found on the job's
+# PATH reports the pinned sha256. A mismatched file is deleted and the download
+# runs instead.
 if [ -f "${RESTORED_BINARY}" ]; then
   if [ "$(sha256_of "${RESTORED_BINARY}")" = "${SHA256}" ]; then
     install_binary "${RESTORED_BINARY}"
