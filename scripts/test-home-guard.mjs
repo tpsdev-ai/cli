@@ -105,7 +105,7 @@ export function sanitizedTestEnv(env) {
   const dropped = [];
   for (const [name, value] of Object.entries(env)) {
     if (value === undefined) continue;
-    if (name === "TPS_TEST_REQUIRE_NPM" && !isPathFree(value)) {
+    if (name === "TPS_TEST_REQUIRE_NPM" && value !== "1") {
       throw new IsolationRefusal("invalid TPS_TEST_REQUIRE_NPM; expected unset or 1");
     }
     const passed = Object.hasOwn(PASSED_ENV, name) && (name === "PATH" || isPathFree(value));

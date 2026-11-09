@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { load } from "js-yaml";
@@ -53,6 +53,34 @@ test.each([
     expect(result.error).toBeUndefined();
     expect(result.status, result.stdout + result.stderr).toBe(status);
     if (diagnostic) expect(result.stdout + result.stderr).toContain(diagnostic);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test.each(["0", "yes", ""])("the launcher rejects TPS_TEST_REQUIRE_NPM=%j when validation is excluded", (value) => {
+  const root = mkdtempSync(join(tmpdir(), "npm-requirement-filtered-"));
+  try {
+    const bin = join(root, "bin");
+    const home = join(root, "home");
+    const invoked = join(root, "bun-invoked");
+    mkdirSync(bin);
+    mkdirSync(home);
+    const node = Bun.which("node");
+    if (!node) throw new Error("node is required to run the test launcher");
+    writeFileSync(join(bin, "bun"), `#!/bin/sh\nprintf invoked > "${invoked}"\nexit 99\n`, { mode: 0o755 });
+    const result = spawnSync(node, [
+      join(import.meta.dir, "../scripts/test-suite.mjs"), "npm-requirement-filtered",
+      join(import.meta.dir, "check-dep-ages.test.ts"),
+      "--test-name-pattern", "this pattern excludes the npm requirement validation",
+    ], {
+      env: { PATH: bin, HOME: home, TMPDIR: "/tmp", TPS_TEST_REPORT_DIR: join(root, "reports"), TPS_TEST_REQUIRE_NPM: value },
+      encoding: "utf8", timeout: 30_000,
+    });
+    expect(result.error).toBeUndefined();
+    expect(result.status, result.stdout + result.stderr).toBe(1);
+    expect(result.stdout + result.stderr).toContain("invalid TPS_TEST_REQUIRE_NPM");
+    expect(existsSync(invoked)).toBe(false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
