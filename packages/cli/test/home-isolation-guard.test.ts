@@ -244,6 +244,17 @@ describe("test-home-guard: the environment ALLOWLIST", () => {
     expect(dropped).toEqual(["LANG", "LC_ALL", "TERM"]);
   });
 
+  test("the real-owner flag entry reaches the test child and an unlisted variable is still dropped", () => {
+    const { env, dropped } = sanitizedTestEnv({
+      PATH: "/usr/bin",
+      TPS_TEST_REQUIRE_REAL_OWNER: "1",
+      TPS_TEST_REQUIRE_REAL_OWNER_EXTRA: "1",
+    });
+    expect(Object.keys(env).sort()).toEqual(["PATH", "TPS_TEST_REQUIRE_REAL_OWNER"]);
+    expect(env.TPS_TEST_REQUIRE_REAL_OWNER).toBe("1");
+    expect(dropped).toEqual(["TPS_TEST_REQUIRE_REAL_OWNER_EXTRA"]);
+  });
+
   test("every allowlisted name states why it is passed", () => {
     for (const [name, reason] of Object.entries(PASSED_ENV)) {
       expect(typeof reason, name).toBe("string");

@@ -6,9 +6,11 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import yaml from "js-yaml";
 import { loadAgentConfig } from "@tpsdev-ai/agent";
+import { parseRequireRealOwner } from "./helpers/real-owner-flag.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const DEAD_FLAIR = "http://127.0.0.1:19926";
+const REQUIRE_REAL_OWNER = parseRequireRealOwner(process.env);
 
 let home: string;
 let fakeBin: string;
@@ -905,7 +907,7 @@ syncBuiltinESMExports();
   const canOwnAnotherUid = missingOwnerPrerequisites.length === 0;
   if (!canOwnAnotherUid) {
     const ownerCaseTitle = "set-runtime warns after a real replacement keeps only the group";
-    if (process.env.TPS_TEST_REQUIRE_REAL_OWNER === "1") {
+    if (REQUIRE_REAL_OWNER) {
       test(`${ownerCaseTitle} (this lane requires it; missing ${missingOwnerPrerequisites.join(", ")})`, () => {
         throw new Error(`the required case cannot run; missing ${missingOwnerPrerequisites.join(", ")}`);
       });
