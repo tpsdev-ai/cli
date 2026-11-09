@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead, EXACT_LINE_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, EXACT_BLOCK_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -1468,8 +1468,6 @@ it("rejects a workflow gate whose run line is only a YAML comment", () => {
   expect(() => assertInstallGates(commented)).toThrow();
 });
 
-/* Run-step lines containing `npm` must match an approved whole-line shape. */
-
 function trackedLockfiles(): string[] {
   const listed = execFileSync("git", ["ls-files", "-z"], { cwd: REPO, encoding: "utf8" });
   const files = listed.split("\0").filter(Boolean);
@@ -1479,7 +1477,7 @@ function trackedLockfiles(): string[] {
   return lockfiles;
 }
 
-it("checks workflow run steps against the npm line whitelist", () => {
+it("checks workflow run steps against the npm block whitelist", () => {
   const tracked = new Set(trackedLockfiles());
   const workflowsDir = join(REPO, ".github", "workflows");
   const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
@@ -1502,7 +1500,7 @@ const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/pa
 describe("the workflow guard checks lines containing npm and helper calls", () => {
   it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a literal npm ci command word outside the helper: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
-      `job build step 1: cannot establish the npm ci directory: a run line containing npm is refused unless the whole line is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), a tracked-lock helper call, or the bounded global tool install: ${run}`,
+      `job build step 1: cannot establish the npm ci directory: a run block containing npm is refused unless the whole block is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), or its flagged lines are tracked-lock helper calls or bounded global tool installs: ${run}`,
     );
   }, 5_000);
 
@@ -1523,7 +1521,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
     'bash scripts/npm-ci-tracked-lock.sh --via sfw /absolute "$prefix"',
     'bash scripts/npm-ci-tracked-lock.sh --via sfw plugins/unread "$prefix"',
   ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile|run line containing npm)/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile|run block containing npm|shell wrapper)/);
   }, 30_000);
 
   it.each([
@@ -1548,7 +1546,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
   it("refuses the unrelated-copy and raw-prefix probe", () => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(
       "cp ../good/package-lock.json /tmp/dummy/package-lock.json\nnpm ci --prefix ../unread",
-    ), READ_TRACKED)).toThrow(/job build step 1.*run line containing npm is refused unless/);
+    ), READ_TRACKED)).toThrow(/job build step 1.*run block containing npm is refused unless/);
   });
 
   it.each([
@@ -1595,7 +1593,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
 
   it.each(["cd ../good && npm ci", "cd plugins/x && npm ci", "cd ../unread && npm ci"])(
     "refuses a leading cd before literal npm ci command words: %s", (run) => {
-      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/run line containing npm is refused unless/);
+      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/run block containing npm is refused unless/);
     }, 5_000,
   );
 
@@ -1629,7 +1627,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   it.each(["npm c\\i", "'npm' ci", '"npm" ci'])(
     "refuses the escaped or quoted raw npm ci spelling: %s", (run) => {
       expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
-        `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: a run line containing npm is refused unless the whole line is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), a tracked-lock helper call, or the bounded global tool install: ${run} (physical line 1)`,
+        `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: a run block containing npm is refused unless the whole block is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), or its flagged lines are tracked-lock helper calls or bounded global tool installs: ${run} (physical line 1)`,
       );
     }, 5_000,
   );
@@ -1742,7 +1740,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org extra",
     "npm install -g tool@1.2.3-..",
   ])("refuses a global install outside the exact pinned shape: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run line containing npm is refused unless/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run block containing npm is refused unless/);
   }, 5_000);
 });
 
@@ -1794,7 +1792,7 @@ function runWithStubNpm(script: string, extraEnv: Record<string, string> = {}): 
   }
 }
 
-describe("the physical-line whitelist refuses folded and quoted comment spellings", () => {
+describe("the run-block guard refuses folded and quoted comment spellings", () => {
   const WORKFLOW = "workflow-c";
 
   it("refuses both comment counterexamples and shows real bash runs npm in each", () => {
@@ -1819,7 +1817,7 @@ it.each([
   ["echo npm; npm i", "i"],
   ["{npm,} i", "i"],
   ["npm ci # npm-ci-tracked-lock.sh", "ci"],
-])("refuses a physical line and verifies Bash invokes npm: %s", (run, argument) => {
+])("refuses a run block and verifies Bash invokes npm: %s", (run, argument) => {
   expect(() => assertNpmCiLockfilesRead(workflowStep(`echo ready\n${run}`), READ_TRACKED, "workflow-r6")).toThrow(
     /workflow workflow-r6 job build step 1.*physical line 2/,
   );
@@ -1838,7 +1836,7 @@ describe("the workflow guard bounds global tool versions", () => {
   ];
 
   it.each(refused)("refuses a global install outside the bounded exact shape: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run line containing npm is refused unless/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run block containing npm is refused unless/);
   }, 5_000);
 
   it.skipIf(!npmAvailable)("accepts tool@1.2.3 and checks every refused spec against npm's own parser (needs npm on PATH)", () => {
@@ -1883,26 +1881,73 @@ describe("the test checks guard refusals against npm's bundled nopt", () => {
   }, 15_000);
 });
 
-describe("the exact-line allowlist", () => {
-  it("matches every entry to a real workflow line", () => {
-    const workflowLines: string[] = [];
+describe("whole run-block approvals", () => {
+  const WORKFLOW = "workflow-block";
+  const promotion = EXACT_BLOCK_ALLOWLIST.find((entry) => entry.text.includes('echo "**Promote:**'));
+  const publish = EXACT_BLOCK_ALLOWLIST.find((entry) => entry.text.includes("# `npm stage` subcommands"));
+  const recovery = EXACT_BLOCK_ALLOWLIST.find((entry) => entry.text.includes("::notice::  npm stage list"));
+
+  it("refuses an outer backtick wrapper and Bash invokes npm install", () => {
+    expect(promotion).toBeDefined();
+    const echo = promotion?.text.split("\n").find((line) => line.includes('echo "**Promote:**'));
+    expect(echo).toBeDefined();
+    const run = `out=\`\n${echo}\n\``;
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
+      /workflow workflow-block job build step 1.*physical line 2/,
+    );
+    expect(runWithStubNpm(run)).toEqual(["install"]);
+  });
+
+  it("refuses a multiline double-quote wrapper and Bash invokes npm stage", () => {
+    expect(publish).toBeDefined();
+    const comment = publish?.text.split("\n").find((line) => line.includes("# `npm stage` subcommands"));
+    expect(comment).toBeDefined();
+    const run = `echo "\n${comment}\n"`;
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
+      /workflow workflow-block job build step 1.*physical line 2/,
+    );
+    expect(runWithStubNpm(run)).toEqual(["stage"]);
+  });
+
+  it("refuses a one-character edit to an approved block", () => {
+    expect(recovery).toBeDefined();
+    const run = `${recovery?.text}x`;
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
+      /workflow workflow-block job build step 1.*physical line/,
+    );
+  });
+});
+
+it.each([
+  String.raw`n\pm ci`,
+  'n""pm ci',
+  "'n'pm ci",
+  String.raw`npm c\i`,
+  "'npm' ci",
+  '"$NPM" ci',
+])("refuses an escaped or quoted npm spelling in real YAML and Bash: %s", (run) => {
+  expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, "workflow-spelling")).toThrow(
+    new RegExp(`workflow workflow-spelling job build step 1.*physical line 1`),
+  );
+  expect(runWithStubNpm(run, { NPM: "npm" })).toEqual(["ci"]);
+});
+
+describe("the exact-block allowlist", () => {
+  it("matches every entry to a real workflow block", () => {
+    const workflowBlocks: string[] = [];
     const workflowsDir = join(REPO, ".github", "workflows");
     for (const name of readdirSync(workflowsDir).filter((entry) => entry.endsWith(".yml") || entry.endsWith(".yaml"))) {
       const workflow = parseWorkflow(readFileSync(join(workflowsDir, name), "utf8"));
       for (const job of Object.values(workflow.jobs ?? {})) {
         for (const step of job.steps) {
-          if (step.run === undefined) continue;
-          for (const line of step.run.split(/\r?\n/)) {
-            const text = line.trim();
-            if (text !== "") workflowLines.push(text);
-          }
+          if (step.run !== undefined) workflowBlocks.push(step.run.replace(/\n+$/, ""));
         }
       }
     }
-    expect(EXACT_LINE_ALLOWLIST.length).toBeGreaterThan(0);
-    for (const entry of EXACT_LINE_ALLOWLIST) {
+    expect(EXACT_BLOCK_ALLOWLIST.length).toBeGreaterThan(0);
+    for (const entry of EXACT_BLOCK_ALLOWLIST) {
       expect(entry.reason.length).toBeGreaterThan(0);
-      expect(workflowLines.filter((line) => line === entry.text).length).toBeGreaterThan(0);
+      expect(workflowBlocks.filter((block) => block === entry.text).length).toBeGreaterThan(0);
     }
   }, 30_000);
 });

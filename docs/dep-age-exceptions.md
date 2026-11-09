@@ -16,23 +16,20 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-Each workflow `run:` block is split into physical lines. A line containing
-`npm` anywhere, in any case, must match an approved whole-line shape.
-
-Every such physical line must, after trimming leading and trailing
-whitespace, equal exactly one of:
+Each workflow `run:` block is split into physical lines. A line is flagged if
+lowercasing and deleting backslashes and quotes reveals `npm`. A flagged block
+must match a complete block pinned in the guard, after trailing-newline
+normalization, or use these shapes without backticks, `$(` or multiline quotes:
 
 - a helper call to `scripts/npm-ci-tracked-lock.sh` with a literal relative
   tracked directory and literal `--via npm` or `--via sfw`;
 - `npm install -g` or `--global` followed by `<name>@<MAJOR.MINOR.PATCH>`, where
   each part is `0` or `[1-9][0-9]{0,8}`, with an optional literal
   `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
-  a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`;
-- an exact-line allowlist entry in the guard, each with a reason, for a real workflow line.
+  a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
 
-Any other line containing `npm` is refused with its workflow, job, step and
-physical line. A command named entirely through variables with no `npm`
-characters on its line is outside this check.
+Refusals name the workflow, job, step and physical line. Variable or substitution
+indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
 Installs inside other script files or composite actions are not inspected. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
