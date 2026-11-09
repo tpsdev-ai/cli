@@ -1,0 +1,1 @@
+- **Relay stop clears the host record when its retry closes every channel**.

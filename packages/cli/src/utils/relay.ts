@@ -1218,7 +1218,6 @@ export async function connectAndKeepAlive(
       } catch (error) {
         console.error(channelCloseFailure(error));
         retainFailedChannel(channel);
-        if (stopped) unconfirmedChannelClose = true;
       }
     })();
     await pendingChannelClose;

@@ -238,13 +238,9 @@ for (const outcome of ["rejects", "resolves"] as const) {
       const settledBeforeClose = stopSettled;
       settleClose();
       const error = await stopping;
-      if (outcome === "rejects") {
-        expect(error).toMatchObject({ name: "HostChannelCloseError" });
-        expect(existsSync(path)).toBe(true);
-      } else {
-        expect(error).toBeNull();
-        expect(existsSync(path)).toBe(false);
-      }
+      expect(error).toBeNull();
+      expect(existsSync(path)).toBe(false);
+      expect(closes).toBe(outcome === "rejects" ? 2 : 1);
       expect(settledBeforeClose).toBe(false);
     } finally {
       settleClose();
@@ -255,6 +251,91 @@ for (const outcome of ["rejects", "resolves"] as const) {
       rmSync(root, { recursive: true, force: true });
     }
   }, 20_000);
+}
+
+for (const closePath of ["reconnect", "graceful"] as const) {
+  for (const rejectionTiming of ["before stop", "during stop"] as const) {
+    for (const retry of ["resolves", "rejects"] as const) {
+      test(`${closePath} close rejects ${rejectionTiming}; stop retry ${retry}`, async () => {
+        const root = mkdtempSync(join(tmpdir(), "tps-relay-close-retry-828-"));
+        const savedEnv = savedRelayEnv();
+        let rejectClose!: () => void;
+        let closeStarted!: () => void;
+        const closing = new Promise<void>((_resolve, reject) => {
+          rejectClose = () => reject(new Error("first close refused"));
+        });
+        const started = new Promise<void>((resolve) => { closeStarted = resolve; });
+        let closes = 0;
+        let handlers = 0;
+        const channel: TransportChannel = {
+          async send() {
+            if (closePath === "reconnect") throw new Error("initial heartbeat refused");
+          },
+          onMessage() { handlers++; },
+          offMessage() {},
+          async close() {
+            if (++closes === 1) {
+              closeStarted();
+              await closing;
+            } else if (retry === "rejects") {
+              throw new Error("retry close refused");
+            }
+          },
+          isAlive() { return false; },
+          peerFingerprint() { return "remote"; },
+        };
+        const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+        const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+          await yieldRealTimer();
+          return channel;
+        });
+        let stop: (() => Promise<void>) | undefined;
+        try {
+          const branch = await prepareBranch(root);
+          const path = hostStatePath(branch);
+          stop = await connectAndKeepAlive(branch);
+          await started;
+          expect(handlers).toBe(closePath === "graceful" ? 2 : 0);
+          expect(existsSync(path)).toBe(true);
+          if (rejectionTiming === "before stop") {
+            rejectClose();
+            await yieldRealTimer();
+            expect(diagnostic).toHaveBeenCalledTimes(1);
+          }
+          let stopSettled = false;
+          const stopping = stop().then(
+            () => { stopSettled = true; return null; },
+            (error: unknown) => { stopSettled = true; return error; },
+          );
+          if (rejectionTiming === "during stop") {
+            await Bun.sleep(10);
+            const settledBeforeClose = stopSettled;
+            rejectClose();
+            expect(settledBeforeClose).toBe(false);
+          }
+          const error = await stopping;
+          expect(closes).toBe(2);
+          expect(connect).toHaveBeenCalledTimes(1);
+          if (retry === "resolves") {
+            expect(error).toBeNull();
+            expect(existsSync(path)).toBe(false);
+            expect(diagnostic).toHaveBeenCalledTimes(1);
+          } else {
+            expect(error).toMatchObject({ name: "HostChannelCloseError" });
+            expect(existsSync(path)).toBe(true);
+            expect(diagnostic).toHaveBeenCalledTimes(2);
+          }
+        } finally {
+          rejectClose();
+          await stop?.().catch(() => {});
+          connect.mockRestore();
+          diagnostic.mockRestore();
+          restoreRelayEnv(savedEnv);
+          rmSync(root, { recursive: true, force: true });
+        }
+      }, 20_000);
+    }
+  }
 }
 
 test("a failed host record refresh is reported once per connection until a write succeeds", async () => {
