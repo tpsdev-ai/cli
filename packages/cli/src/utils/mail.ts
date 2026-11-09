@@ -40,7 +40,10 @@ export interface MailMessage {
   deliveryAttempts?: number;
   /** Number of lease-expired re-presentations, persisted so the count survives checks. */
   redeliveryAttempts?: number;
-  /** Set by checkMessages() when it re-presents an unacked cur/ record whose lease expired. */
+  /**
+   * Set by checkMessages() when it re-presents an unacked cur/ record whose
+   * checkout (checkedOutAt) is older than LEASE_TIMEOUT_MS.
+   */
   redelivered?: { reason: "lease-expired"; previousCheckout: string; attempt: number };
   retryAfter?: string;
   prNumber?: number;
@@ -1283,8 +1286,12 @@ export async function promote(agent: string, filePath: string, verify: MailVerif
       // show a reply-to that is not the one that was signed.
       replyToId: envelope.replyToId,
       checkedOutAt: new Date().toISOString(),
-      checkedOutBy: msg.checkedOutBy ?? agent,
+      checkedOutBy: agent,
       deliveryAttempts: (msg.deliveryAttempts ?? 0) + 1,
+      // Delivery bookkeeping is OUR lease state, never the sender's: discard an
+      // incoming redelivery marker or attempt count and start both locally.
+      redelivered: undefined,
+      redeliveryAttempts: undefined,
     };
 
     let pendingPlacement: boolean;
@@ -1775,7 +1782,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
     } catch { continue; }
     if (msg.read || msg.nackedAt) continue;
     if (msg.retryAfter && Date.parse(msg.retryAfter) > nowMs) continue;
-    if (msg.checkedOutBy && !isLeaseExpired(msg, nowMs)) continue;
+    if (!isLeaseExpired(msg, nowMs)) continue;
     let recovered: Awaited<ReturnType<typeof recoverPromoted>>;
     try {
       recovered = await recoverPromoted(agent, full, verify);
@@ -1788,7 +1795,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
       const result = updateExistingRecord<MailMessage>(full, (fresh) => {
         if (fresh.read || fresh.ackedAt || fresh.nackedAt) return null;
         if (fresh.retryAfter && Date.parse(fresh.retryAfter) > nowMs) return null;
-        if (fresh.checkedOutBy && !isLeaseExpired(fresh, nowMs)) return null;
+        if (!isLeaseExpired(fresh, nowMs)) return null;
         const replay = mailboxReplayStore(inbox.root);
         if (withheldByPlacementPhase(replay, f)) return null;
         if (replay.hasPendingFile(f)) {

@@ -3,7 +3,7 @@
  * (its checkout lease expired) and how to stop it (ack it).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ackMessage, checkMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
@@ -67,14 +67,18 @@ describe("mail check re-delivery reason (cli#340)", () => {
     return previousCheckout;
   }
 
-  async function runCheck(args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
-    const proc = Bun.spawn(["bun", TPS_BIN, "mail", "check", ...args], {
+  async function runCheck(args: string[], agentId = OWNER): Promise<{ status: number; stdout: string; stderr: string }> {
+    return runCli(["mail", "check", ...args], agentId);
+  }
+
+  async function runCli(args: string[], agentId: string): Promise<{ status: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(["bun", TPS_BIN, ...args], {
       cwd: tempRoot,
       env: {
         ...process.env,
         HOME: tempRoot,
         TPS_MAIL_DIR: join(tempRoot, "mail"),
-        TPS_AGENT_ID: OWNER,
+        TPS_AGENT_ID: agentId,
         FLAIR_URL: stub.url,
         FLAIR_KEY_PATH: join(keysDir, `${OWNER}.key`),
       },
@@ -87,6 +91,27 @@ describe("mail check re-delivery reason (cli#340)", () => {
       proc.exited,
     ]);
     return { status, stdout, stderr };
+  }
+
+  /** A `tps` on PATH so a printed command can be run exactly as printed. */
+  function tpsOnPath(): string {
+    const dir = join(tempRoot, "bin");
+    const script = join(dir, "tps");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(script, `#!/bin/sh\nexec bun "${TPS_BIN}" "$@"\n`, "utf-8");
+    chmodSync(script, 0o755);
+    return `${dir}:${process.env.PATH ?? ""}`;
+  }
+
+  /** Put extra fields on the incoming new/ wrapper, as a sender could. */
+  function plantOnNew(fields: Record<string, unknown>): void {
+    const inbox = getInbox(OWNER);
+    const file = readdirSync(inbox.fresh).find((f) => f.endsWith(".json"));
+    expect(file).toBeDefined();
+    const path = join(inbox.fresh, file!);
+    const record = JSON.parse(readFileSync(path, "utf-8"));
+    Object.assign(record, fields);
+    writeFileSync(path, JSON.stringify(record, null, 2), "utf-8");
   }
 
   test("an expired lease is re-delivered with the reason and a persisted attempt count", async () => {
@@ -137,7 +162,7 @@ describe("mail check re-delivery reason (cli#340)", () => {
     const human = await runCheck([OWNER]);
     expect(human.status).toBe(0);
     const minutes = Math.round(LEASE_TIMEOUT_MS / 60_000);
-    expect(human.stdout).toContain(`[re-delivered: not acked within ${minutes} min — ack it with: tps mail ack ${sent.id}]`);
+    expect(human.stdout).toContain(`[re-delivered: not acked within ${minutes} min — ack it with: tps mail ack ${sent.id} --agent ${OWNER}]`);
     expect(human.stdout.match(/re-delivered/g)?.length).toBe(1);
 
     ageLease();
@@ -148,5 +173,98 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(messages[0].redelivered.reason).toBe("lease-expired");
     expect(messages[0].redelivered.previousCheckout).toEqual(expect.any(String));
     expect(messages[0].redelivered.attempt).toBe(2);
+  });
+
+  test("sender-supplied redelivery bookkeeping is discarded at promotion", async () => {
+    sendMessage(OWNER, signedBody("spoofed bookkeeping"), SENDER);
+    plantOnNew({
+      redelivered: { reason: "lease-expired", previousCheckout: new Date(0).toISOString(), attempt: 7 },
+      redeliveryAttempts: 99,
+    });
+
+    const first = await checkMessages(OWNER);
+    expect(first.length).toBe(1);
+    expect(first[0]!.redelivered).toBeUndefined();
+    expect(first[0]!.redeliveryAttempts).toBeUndefined();
+
+    ageLease();
+    const second = await checkMessages(OWNER);
+    expect(second[0]!.redelivered).toEqual({
+      reason: "lease-expired",
+      previousCheckout: expect.any(String),
+      attempt: 1,
+    });
+  });
+
+  test("an empty checkedOutBy does not re-deliver a fresh checkout", async () => {
+    sendMessage(OWNER, signedBody("spoofed lease"), SENDER);
+    plantOnNew({ checkedOutBy: "" });
+
+    const first = await checkMessages(OWNER);
+    expect(first.length).toBe(1);
+    expect(first[0]!.checkedOutBy).toBe(OWNER);
+    expect(first[0]!.redelivered).toBeUndefined();
+
+    // A record whose lease-holder field is empty still holds a fresh checkout:
+    // the sweep tests the lease age, not checkedOutBy's truthiness.
+    const path = curPath();
+    const record = JSON.parse(readFileSync(path, "utf-8"));
+    record.checkedOutBy = "";
+    writeFileSync(path, JSON.stringify(record, null, 2), "utf-8");
+
+    expect(await checkMessages(OWNER)).toEqual([]);
+  });
+
+  test("another agent's inbox names --agent and that exact command acks", async () => {
+    const sent = sendMessage(OWNER, signedBody("ack from another identity"), SENDER);
+    await checkMessages(OWNER);
+    ageLease();
+
+    const printed = await runCheck([OWNER], SENDER);
+    expect(printed.status).toBe(0);
+    const match = /ack it with: (tps mail ack [^\]]+)\]/.exec(printed.stdout);
+    expect(match).not.toBeNull();
+    expect(match![1]).toBe(`tps mail ack ${sent.id} --agent ${OWNER}`);
+
+    const acks = Bun.spawn(["/bin/sh", "-c", match![1]!], {
+      cwd: tempRoot,
+      env: {
+        ...process.env,
+        HOME: tempRoot,
+        TPS_MAIL_DIR: join(tempRoot, "mail"),
+        TPS_AGENT_ID: SENDER,
+        FLAIR_URL: stub.url,
+        FLAIR_KEY_PATH: join(keysDir, `${OWNER}.key`),
+        PATH: tpsOnPath(),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, status] = await Promise.all([
+      new Response(acks.stdout).text(),
+      new Response(acks.stderr).text(),
+      acks.exited,
+    ]);
+    expect({ status, stdout, stderr }).toEqual({ status: 0, stdout: expect.any(String), stderr: "" });
+    expect(readdirSync(getInbox(OWNER).cur).filter((f) => f.endsWith(".json"))).toEqual([]);
+  });
+
+  test("external-tier re-delivery names the refusal, never an ack command", async () => {
+    const sent = sendMessage(
+      OWNER,
+      JSON.stringify(buildSignedEnvelope(SENDER, OWNER, "external mail", SEEDS, { trust: "external" })),
+      SENDER,
+    );
+    await checkMessages(OWNER);
+    ageLease();
+
+    const printed = await runCheck([OWNER], SENDER);
+    expect(printed.status).toBe(0);
+    expect(printed.stdout).toContain("external-tier mail cannot be acknowledged or nacked by an internal consumer");
+    expect(printed.stdout).not.toContain("tps mail ack");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], SENDER);
+    expect(ack.status).not.toBe(0);
+    expect(ack.stderr).toContain("external-tier mail cannot be acknowledged");
   });
 });

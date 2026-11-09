@@ -444,7 +444,10 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log(`📬 ${m.from} → ${m.to}  ${m.timestamp}`);
           if (m.redelivered) {
             const minutes = Math.round(LEASE_TIMEOUT_MS / 60_000);
-            console.log(`[re-delivered: not acked within ${minutes} min — ack it with: tps mail ack ${m.id}]`);
+            const remedy = m.trustTier === "external"
+              ? "external-tier mail cannot be acknowledged or nacked by an internal consumer"
+              : `ack it with: tps mail ack ${m.id} --agent ${agent}`;
+            console.log(`[re-delivered: not acked within ${minutes} min — ${remedy}]`);
           }
           if (m.replyToId) console.log(`↳ reply-to: ${m.replyToId}`);
           const taskEnv = parseTaskEnvelope(m.body);

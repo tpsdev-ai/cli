@@ -1,5 +1,6 @@
 - **`tps mail check` says why a message is re-delivered and how to stop it.**
 
-  An unacked `cur/` record whose checkout lease expired is marked as
-  re-delivered, names the ack command, and `--json` carries the `redelivered`
-  field.
+  An unacked `cur/` record whose checkout is older than the 30-minute lease is
+  marked as re-delivered. For ackable mail it prints
+  `tps mail ack <id> --agent <agent>`; external-tier mail is reported as not
+  ackable by an internal consumer. `--json` carries the `redelivered` field.
