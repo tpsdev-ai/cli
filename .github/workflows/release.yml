@@ -260,12 +260,6 @@ jobs:
         env:
           GITHUB_REF_NAME: ${{ github.ref_name }}
         run: |
-          # PARTIAL STAGE IS POSSIBLE AND IS NOT SELF-HEALING. If package 4 of 6
-          # fails, packages 1-3 stay staged; npm offers no cleanup, no resume and
-          # no idempotency, and CI cannot inspect or reject stages over OIDC. The
-          # error path below therefore carries the operator recovery procedure
-          # rather than telling someone to "inspect the staging area" and leaving
-          # them to work out how. Automating it is tracked in cli#366.
           set -euo pipefail
           VERSION="${GITHUB_REF_NAME#v}"
           PKGS=(cli agent cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 cli-linux-x64)
@@ -293,6 +287,14 @@ jobs:
             fi
             echo "  ok pin @tpsdev-ai/$p @ $pin"
           done
+
+      - name: Stage interruption recovery
+        run: |
+          echo "::notice::If stage publishing is interrupted, check pending packages before re-running:"
+          echo "::notice::  npm stage list"
+          echo "::notice::  npm stage view <stage-id>"
+          echo "::notice::Reject pending stages for this version with npm stage reject <stage-id> before re-running,"
+          echo "::notice::or approve them and re-run to stage the remaining packages."
 
       - name: Stage-publish all packages (OIDC trusted publishing)
         id: stage
@@ -349,9 +351,6 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           STAGED=()
           SKIPPED=()
-          # A partial stage can be produced by EITHER a later package's auth failure OR an
-          # E409 collision, so both failure branches hand the operator the same recovery
-          # procedure. Keeping it in one place stops the two paths drifting apart.
           stage_recovery() {
             echo "::error::RECOVERY, from a machine logged in to npm:"
             echo "::error::  npm stage list                        # see what is pending"
@@ -366,12 +365,6 @@ jobs:
             echo "::error::binaries at exact versions, so a half-approved set publishes a CLI"
             echo "::error::whose dependencies do not exist. All six go together."
           }
-          # Discloses, for ANY terminal failure, the packages this run already staged.
-          # That fact is cause-independent, so every terminal branch calls this FIRST and
-          # the collision DIAGNOSIS stays confined to the collision branch. Printing
-          # nothing when STAGED is empty keeps it silent on the clean cases. A terminal
-          # branch added later cannot forget it by accident — forgetting it means
-          # deleting a call, not failing to add one.
           disclose_pending() {
             if [ "${#STAGED[@]}" -gt 0 ]; then
               echo "::error::PARTIAL STAGE: ${#STAGED[@]} package(s) were staged before this failure and"

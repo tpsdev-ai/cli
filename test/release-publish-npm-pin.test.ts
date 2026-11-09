@@ -36,6 +36,20 @@ test("publish-packages checks npm age immediately before upgrading without a con
   expect(readNpmPin(readFileSync(join(REPO, ".github/workflows/release.yml"), "utf8"))).toBe("11.21.1");
 });
 
+test("publish-packages prints interruption recovery before staging", () => {
+  const job = jobs("release.yml")["publish-packages"];
+  const stage = job.steps.findIndex((step) => step.name === "Stage-publish all packages (OIDC trusted publishing)");
+  expect(stage).toBeGreaterThan(0);
+  const guidance = job.steps[stage - 1];
+  expect(guidance.name).toBe("Stage interruption recovery");
+  expect(guidance).not.toHaveProperty("if");
+  expect(guidance).not.toHaveProperty("continue-on-error");
+  for (const command of ["npm stage list", "npm stage view <stage-id>", "npm stage reject <stage-id>"]) {
+    expect(guidance.run).toContain(command);
+  }
+  expect(guidance.run).toContain("approve them and re-run");
+});
+
 test("CI build runs the npm pin age check alongside the dependency age check", () => {
   const job = jobs("test.yml").build;
   assertGates(job, false);
