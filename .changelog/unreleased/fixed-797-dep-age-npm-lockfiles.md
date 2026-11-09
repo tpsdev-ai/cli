@@ -3,10 +3,16 @@
   without `resolved`, regardless of `inBundle`. It refuses versionless entries,
   URL/name/version disagreement, non-canonical registry URLs (including query
   strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
-  skipped. A literal `npm ci` command word in a workflow `run:` step must be a
-  helper call to `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory
-  and literal `--via npm` or `--via sfw`. The guard unquotes the command word before
-  classifying it and refuses an unresolved command position carrying an npm ci install.
+  skipped. A workflow `run:` line is install-like when the conservative match
+  finds npm with an install subcommand, or npm followed by an expansion in the
+  subcommand position. An install-like line must be a helper call to
+  `scripts/npm-ci-tracked-lock.sh` with a literal tracked directory and literal
+  `--via npm` or `--via sfw`, or an exact global tool install:
+  `npm install -g <name>@<exact-version>` (also `--global`) with an optional
+  `--registry=<https URL>`. Any other install-like line is refused as a raw npm
+  install. An install-like line carrying a shell indirection is refused as
+  unclassifiable. The match is conservative, not bash-equivalent: a command named
+  entirely through variables with no literal npm token on the line is not detected.
   Helper steps allow `set -euo pipefail`, allowlisted quoted assignments with
   lowercase names, the literal heartbeat pin substitution, helper calls and
   `GITHUB_ENV` echoes. Other helper-step lines are refused.

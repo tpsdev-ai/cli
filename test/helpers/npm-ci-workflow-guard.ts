@@ -43,7 +43,6 @@ function resolveRepoDir(base: string, target: string, label: string): string {
   return parts.join("/");
 }
 
-type ShellWord = { raw: string; value: string | null };
 type LogicalLine = { text: string; line: number };
 
 /** Join `\`-newline continuations as bash does; keep each logical line's first physical line number. */
@@ -82,188 +81,123 @@ function stripShellComment(line: string): string {
   return line.replace(/("[^"]*"|'[^']*')|\s+#.*$/g, (_whole, quoted: string | undefined) => quoted ?? "");
 }
 
-/** Consume `$VAR`, `${...}`, `$(...)` or a backtick substitution and return the index after it. */
-function consumeSubstitution(line: string, start: number): number {
-  if (line[start] === "`") {
-    let index = start + 1;
-    while (index < line.length) {
-      if (line[index] === "\\") { index += 2; continue; }
-      if (line[index] === "`") return index + 1;
-      index++;
-    }
-    return line.length;
-  }
-  if (line[start] !== "$") return start + 1;
-  if (line[start + 1] === "(") {
-    let depth = 0;
-    let quote: string | null = null;
-    for (let index = start + 1; index < line.length; index++) {
-      const char = line[index];
-      if (quote !== null) {
-        if (char === "\\" && quote === '"') { index++; continue; }
-        if (char === quote) quote = null;
-      } else if (char === "'" || char === '"' || char === "`") quote = char;
-      else if (char === "(") depth++;
-      else if (char === ")" && --depth === 0) return index + 1;
-    }
-    return line.length;
-  }
-  if (line[start + 1] === "{") {
-    let depth = 1;
-    for (let index = start + 2; index < line.length; index++) {
-      if (line[index] === "\\") { index++; continue; }
-      if (line[index] === "{") depth++;
-      else if (line[index] === "}" && --depth === 0) return index + 1;
-    }
-    return line.length;
-  }
-  let index = start + 1;
-  if (index < line.length && /[0-9@*#?$!-]/.test(line[index])) return index + 1;
-  while (index < line.length && /[A-Za-z0-9_]/.test(line[index])) index++;
-  return index;
+/**
+ * Install subcommands and their aliases. npm's command docs list the install
+ * aliases i, in, ins, inst, insta, instal, isntall and add
+ * (docs/content/commands/npm-install.md); `npm ci` is its own command
+ * (docs/content/commands/npm-ci.md); install-test and install-ci-test are
+ * install subcommands (docs/content/commands/npm-install-test.md and
+ * npm-install-ci-test.md). The short aliases are English words, so the guard
+ * matches them only in the subcommand position; the long spellings are
+ * matched anywhere after the npm word.
+ */
+const INSTALL_ALIASES = new Set([
+  "ci", "install", "i", "add", "isntall", "in", "ins", "inst", "insta", "instal",
+  "it", "install-test", "install-ci-test",
+]);
+const UNAMBIGUOUS_INSTALL_ALIASES = new Set(["ci", "install", "isntall", "install-test", "install-ci-test"]);
+
+/** Delete quote characters, backslashes and `$'` prefixes. No quote state is tracked. */
+function normalizeShellLine(text: string): string {
+  return text.replace(/\$'/g, "").replace(/['"\\]/g, "");
 }
 
-/** Split one word with bash's single-quote, double-quote, backslash and concatenation rules. */
-function parseShellWord(line: string, start: number): { word: ShellWord; next: number } {
-  let index = start;
-  let raw = "";
-  let value = "";
-  let resolvable = true;
-  while (index < line.length) {
-    const char = line[index];
-    if (/\s/.test(char) || /[;&|()<>]/.test(char)) break;
-    if (char === "'") {
-      const end = line.indexOf("'", index + 1);
-      if (end < 0) {
-        raw += line.slice(index);
-        index = line.length;
-        resolvable = false;
-        break;
-      }
-      raw += line.slice(index, end + 1);
-      value += line.slice(index + 1, end);
-      index = end + 1;
-      continue;
-    }
-    if (char === '"') {
-      let end = index + 1;
-      let closed = false;
-      let inside = "";
-      while (end < line.length) {
-        const inner = line[end];
-        if (inner === '"') { closed = true; end++; break; }
-        if (inner === "\\" && (line[end + 1] === "$" || line[end + 1] === "`" || line[end + 1] === '"' || line[end + 1] === "\\")) {
-          inside += line[end + 1];
-          end += 2;
-          continue;
-        }
-        if (inner === "$" || inner === "`") {
-          const next = consumeSubstitution(line, end);
-          inside += line.slice(end, next);
-          end = next;
-          resolvable = false;
-          continue;
-        }
-        inside += inner;
-        end++;
-      }
-      raw += line.slice(index, end);
-      value += inside;
-      if (!closed) resolvable = false;
-      index = end;
-      continue;
-    }
-    if (char === "\\") {
-      const escaped = line[index + 1];
-      if (escaped === undefined) { raw += char; index++; resolvable = false; break; }
-      raw += char + escaped;
-      value += escaped;
-      index += 2;
-      continue;
-    }
-    if (char === "$" || char === "`") {
-      const end = consumeSubstitution(line, index);
-      raw += line.slice(index, end);
-      value += " ";
-      index = end;
-      resolvable = false;
-      continue;
-    }
-    if (char === "*" || char === "?" || char === "[") resolvable = false;
-    raw += char;
-    value += char;
-    index++;
-  }
-  return { word: { raw, value: resolvable ? value : null }, next: index };
+/** Split a normalized line into shell words; separators delimit tokens. */
+function normalizedTokens(normalized: string): string[] {
+  return normalized.split(/[\s;&|()<>`]+/).filter((token) => token !== "");
 }
 
-/** Split a logical run-step line into simple commands by unquoted shell separators. */
-function shellCommands(line: string): ShellWord[][] {
-  const commands: ShellWord[][] = [];
-  let words: ShellWord[] = [];
-  let index = 0;
-  while (index < line.length) {
-    const char = line[index];
-    if (/\s/.test(char)) { index++; continue; }
-    if (char === "#") break;
-    if (/[;&|()<>]/.test(char)) {
-      if (words.length > 0) { commands.push(words); words = []; }
-      index++;
-      while (index < line.length && /[;&|<>]/.test(line[index])) index++;
-      continue;
-    }
-    const parsed = parseShellWord(line, index);
-    if (parsed.word.raw !== "") words.push(parsed.word);
-    index = parsed.next;
-  }
-  if (words.length > 0) commands.push(words);
-  return commands;
+/** An npm word that bash builds through brace expansion, such as `{npm,}`. */
+function bracedNpm(line: string): boolean {
+  return /\{[^{}]*\bnpm\b[^{}]*\}/.test(line);
 }
 
-const RESOLVER_PREFIXES = new Set(["env", "command", "exec", "eval"]);
-
-/** Classify a run-step line after unquoting: an npm install, or an unresolvable command position. */
-function classifyShellLine(line: string): { install: boolean; unresolved: boolean } {
-  let install = false;
-  let unresolved = false;
-  for (const words of shellCommands(line)) {
-    let command = 0;
-    while (command < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[command].raw)) command++;
-    if (command >= words.length) continue;
-    const first = words[command];
-    const rest = words.slice(command + 1);
-    const firstCi = rest.findIndex((word) => word.value === "ci");
-    const firstNpm = rest.findIndex((word) => word.value === "npm");
-    if (first.value === null && firstCi >= 0) unresolved = true;
-    if (first.value !== null && RESOLVER_PREFIXES.has(first.value) && firstNpm >= 0 && firstCi > firstNpm) unresolved = true;
-    for (let index = command; index < words.length; index++) {
-      if (words[index].value !== "npm") continue;
-      if (words.slice(index + 1).some((word) => word.value === "ci")) install = true;
-    }
-  }
-  return { install, unresolved };
+/** Remove escaped backticks and their literal content; bash does not execute them. */
+function stripEscapedBackticks(line: string): string {
+  return line.replace(/\\`[\s\S]*?\\`/g, "");
 }
 
-/** Inspect npm ci command words and helper calls in workflow run text.
- * Command words are unquoted before classification; an unresolvable command position carrying an npm ci install is refused. Scripts and composite actions are outside this guard. */
+/** A normalized line carrying an npm word and an install subcommand. */
+function isInstallCandidate(line: string): boolean {
+  const normalized = normalizeShellLine(stripEscapedBackticks(line));
+  const tokens = normalizedTokens(normalized);
+  const npm = tokens.indexOf("npm");
+  const npmPresent = npm >= 0 || bracedNpm(line);
+  if (!npmPresent) return false;
+  if (npm >= 0) {
+    const next = tokens[npm + 1];
+    if (next !== undefined && INSTALL_ALIASES.has(next)) return true;
+    return tokens.slice(npm + 1).some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
+  }
+  return tokens.some((token) => UNAMBIGUOUS_INSTALL_ALIASES.has(token));
+}
+
+/** A normalized line carrying an npm word, an install subcommand and a shell indirection. */
+function isUnclassifiableInstall(line: string): boolean {
+  const normalized = normalizeShellLine(stripEscapedBackticks(line));
+  const tokens = normalizedTokens(normalized);
+  const npm = tokens.indexOf("npm");
+  const npmPresent = npm >= 0 || bracedNpm(line);
+  if (!npmPresent) return false;
+  const next = npm >= 0 ? tokens[npm + 1] : undefined;
+  const expansionSubcommand = next !== undefined && (next.startsWith("$") || next.includes("`"));
+  const marker = /\$|`/.test(normalized) || /\beval\b/.test(normalized) ||
+    /\bbash\s+-c\b/.test(normalized) || /\bsh\s+-c\b/.test(normalized) ||
+    /(?:^|\s)env(?:\s|$)/.test(normalized) || /(?:^|\s)command(?:\s|$)/.test(normalized) ||
+    /(?:^|\s)exec(?:\s|$)/.test(normalized) || /(?:^|\s)xargs(?:\s|$)/.test(normalized) ||
+    /\{[^{}]*\}/.test(normalized);
+  return marker && (isInstallCandidate(line) || expansionSubcommand);
+}
+
+/** An exact, version-pinned global tool install, which does not read a lockfile. */
+const EXACT_VERSION = String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?`;
+const PACKAGE_NAME = String.raw`(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*`;
+const GLOBAL_TOOL_INSTALL = new RegExp(
+  `^npm install (?:-g|--global) (?:${PACKAGE_NAME})@(?:${EXACT_VERSION})(?: --registry=https:\\/\\/[A-Za-z0-9._~:\\/?#@!$+,=%-]+)?$`,
+);
+
+function isAcceptedGlobalToolInstall(line: string): boolean {
+  const normalized = normalizeShellLine(line).trim();
+  if (/[;|<>()`{}]|&&/.test(normalized)) return false;
+  return GLOBAL_TOOL_INSTALL.test(normalized);
+}
+
+/** Accept only a tracked-lock helper call: the shape accepted on main, with literal options. */
+const HELPER_CALL = /^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: ("[^"\r\n]*"|'[^'\r\n]*'))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/;
+
+/** Inspect npm install command words and helper calls in workflow run text.
+ * Each logical line is normalized by deleting quotes, backslashes and `$'` prefixes,
+ * then matched conservatively: an install candidate must be an accepted tracked-lock
+ * helper call or an exact global tool install, and an install-like line carrying an
+ * expansion or indirection is refused as unclassifiable. A command named entirely
+ * through variables with no literal npm token on the line is not detected: the guard
+ * does not follow variable values. Scripts and composite actions are outside this guard. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
-  const logical = logicalLines(run).map(({ text, line }) => ({ text: stripShellComment(text).trim(), line }))
+  const rawLogical = logicalLines(run).map(({ text, line }) => ({ text: text.trim(), line }))
+    .filter((entry) => entry.text !== "");
+  const logical = rawLogical.map(({ text, line }) => ({ text: stripShellComment(text).trim(), line }))
     .filter((entry) => entry.text !== "" && !entry.text.startsWith("#"));
   const lines = logical.map((entry) => entry.text);
   const refuse = (reason: string): never => {
     throw new Error(`${label}: cannot establish the npm ci directory: ${reason}`);
   };
-  let unresolved: LogicalLine | null = null;
-  let rawInstall: string | null = null;
+  let unclassifiable: LogicalLine | null = null;
+  let rawInstall: LogicalLine | null = null;
   let hasHelper = false;
   for (const entry of logical) {
     if (entry.text.includes("npm-ci-tracked-lock.sh")) hasHelper = true;
-    const classified = classifyShellLine(entry.text);
-    if (classified.unresolved && unresolved === null) unresolved = entry;
-    if (classified.install && rawInstall === null) rawInstall = entry.text;
   }
-  if (unresolved !== null) refuse(`unclassifiable command word at line ${unresolved.line}: ${unresolved.text}`);
-  if (rawInstall !== null) refuse(`raw npm ci is refused; use the tracked-lock helper: ${rawInstall}`);
+  for (const entry of rawLogical) {
+    if (HELPER_CALL.test(entry.text)) continue;
+    if (isAcceptedGlobalToolInstall(entry.text)) continue;
+    if (isUnclassifiableInstall(entry.text)) {
+      if (unclassifiable === null) unclassifiable = entry;
+      continue;
+    }
+    if (isInstallCandidate(entry.text) && rawInstall === null) rawInstall = entry;
+  }
+  if (unclassifiable !== null) refuse(`unclassifiable npm install-like line at line ${unclassifiable.line}: ${unclassifiable.text}`);
+  if (rawInstall !== null) refuse(`raw npm install is refused; use the tracked-lock helper: ${rawInstall.text}`);
   if (!hasHelper) return [];
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse("non-literal working-directory");
   if (lines.some((line) => line.includes("npm-ci-tracked-lock.sh"))) {
@@ -288,7 +222,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         assigned.add(name);
         continue;
       }
-      const helper = line.match(/^bash (?:\.\/)?scripts\/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: ("[^"\r\n]*"|'[^'\r\n]*'))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$/);
+      const helper = line.match(HELPER_CALL);
       if (helper !== null && !helper[3].startsWith("/") && helper[3] !== "-" &&
           (helper[2] === "--in-place" ? helper[4] === undefined : helper[4] !== undefined && quotedValue(helper[4])) &&
           resolveRepoDir(workdir, "scripts/npm-ci-tracked-lock.sh", label) === "scripts/npm-ci-tracked-lock.sh") {
@@ -301,7 +235,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     }
     return dirs;
   }
-  refuse(`raw npm ci is refused; use the tracked-lock helper: ${lines.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line))}`);
+  refuse(`raw npm install is refused; use the tracked-lock helper: ${lines.find((line) => /\bnpm\b(?!-).*\bci\b/.test(line))}`);
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, workflowName?: string): number {

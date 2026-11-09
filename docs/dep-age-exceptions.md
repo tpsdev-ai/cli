@@ -16,12 +16,20 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-A literal `npm ci` command word in a workflow `run:` step must be a helper call
-to `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
-literal `--via npm` or `--via sfw`. The guard unquotes the command word before
-classifying it and refuses an unresolved command position carrying an npm ci install.
-Installs inside other script
-files or composite actions are not inspected. Helper steps allow
+A normalized `run:` line is install-like when the conservative match finds npm
+with an install subcommand, or npm followed by an expansion in the subcommand
+position. An install-like line must be a helper call to
+`scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
+literal `--via npm` or `--via sfw`, or an exact global tool install:
+`npm install -g <name>@<exact-version>` (also `--global`) with an optional
+`--registry=<https URL>`. Any other install-like line is refused as a raw npm
+install. An install-like line carrying a shell indirection (`$`, a backtick,
+`eval`, `bash -c`, `sh -c`, `env`, `command`, `exec`, `xargs` or a brace group)
+is refused as unclassifiable. This is a conservative match, not bash-equivalent
+parsing: a command named entirely through variables with no literal npm token on
+the line, such as `"$NPM" "$SUB"` with `NPM=npm` and `SUB=ci`, is not detected.
+Installs inside other script files or composite actions are not inspected. Helper
+steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
 calls and `GITHUB_ENV` echoes. Other helper-step lines are refused. The helper
