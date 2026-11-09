@@ -16,11 +16,22 @@ A v2 or v3 npm lockfile is required. The tracked `package-lock.json` files are:
 The gate lists them with `git ls-files`, so a new tracked `package-lock.json` is read
 without editing a list.
 
-A literal `npm ci` command word in a workflow `run:` step must be a helper call
-to `scripts/npm-ci-tracked-lock.sh` with a literal relative tracked directory and
-literal `--via npm` or `--via sfw`. Some escaped or quoted spellings evade classification,
-for example `n\pm ci` and `npm c\i` (deferred to #836). Installs inside other script
-files or composite actions are not inspected. Helper steps allow
+Each workflow `run:` block is split into physical lines. A line is flagged if
+lowercasing and deleting backslashes and quotes reveals `npm`. A flagged block
+must match a complete block pinned in the guard, after trailing-newline
+normalization, or use these shapes without backticks, `$(` or multiline quotes:
+
+- a helper call to `scripts/npm-ci-tracked-lock.sh` with a literal relative
+  tracked directory and literal `--via npm` or `--via sfw`;
+- `npm install -g` or `--global` followed by `<name>@<MAJOR.MINOR.PATCH>`, where
+  each part is `0` or `[1-9][0-9]{0,8}`, with an optional literal
+  `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
+  a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
+
+Refusals name the workflow, job, step and physical line. Variable or substitution
+indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
+Installs inside other script files or composite actions are not inspected. Helper
+steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
 calls and `GITHUB_ENV` echoes. Other helper-step lines are refused. The helper
