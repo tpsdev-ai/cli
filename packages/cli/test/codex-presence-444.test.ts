@@ -6,7 +6,7 @@ const patchShared = createPatchShared();
 // agent.
 import { afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { generateKeyPairSync, verify as edVerify } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync, appendFileSync } from "node:fs";
 import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
@@ -34,7 +34,8 @@ import { InvalidLoopIdError, startTaskLoop } from "../src/utils/flair-task-loop.
 import * as taskLoops from "../src/utils/flair-task-loop.js";
 import { startReviewTriggerLoop } from "../src/utils/pr-review-trigger.js";
 import { homeDir } from "../src/utils/home.js";
-import type { WorkspaceProvider } from "../src/utils/workspace-provider.js";
+import type { WorkspaceProvider, WorkspaceState } from "../src/utils/workspace-provider.js";
+import { GitWorkspaceProvider } from "../src/utils/workspace-provider.js";
 
 afterEach(() => { mock.restore(); });
 
@@ -128,6 +129,12 @@ async function driveRuntime(
     /** Start the conflicting rebase in the override repository while the task runs. */
     rebaseDuringTask?: boolean;
     realAutoCommit?: boolean;
+    /** Use the built CLI instead of the source tree for the tps shim. */
+    builtCli?: boolean;
+    /** Run the real GitWorkspaceProvider against the workspace. */
+    realWorkspaceProvider?: boolean;
+    /** Make the workspace an unborn git repository with the runtime fixtures ignored. */
+    unbornWorkspace?: boolean;
     /** Make every sender notice throw, as a failed signed send does. */
     sendFailure?: boolean;
   } = {},
@@ -148,18 +155,29 @@ async function driveRuntime(
   let prepared = 0;
   let resets = 0;
   const state = { ref: "fixture", timestamp: new Date().toISOString(), provider: "test" };
-  const workspaceProvider: WorkspaceProvider = {
-    type: "test",
-    snapshot: async () => {
-      prepared++;
-      if (opts.lateMail === "preparation") await new Promise<void>((resolve) => { releasePreparation = resolve; });
-      return state;
-    },
-    reset: async () => { resets++; },
-    checkpoint: async () => state,
-    diff: async () => ({ summary: "" }),
-    baseline: async () => state,
-  };
+  const workspaceSnapshots: WorkspaceState[] = [];
+  const workspaceProvider: WorkspaceProvider = opts.realWorkspaceProvider
+    ? new GitWorkspaceProvider(workspace)
+    : {
+        type: "test",
+        snapshot: async () => {
+          prepared++;
+          if (opts.lateMail === "preparation") await new Promise<void>((resolve) => { releasePreparation = resolve; });
+          return state;
+        },
+        reset: async () => { resets++; },
+        checkpoint: async () => state,
+        diff: async () => ({ summary: "" }),
+        baseline: async () => state,
+      };
+  if (opts.realWorkspaceProvider) {
+    const snapshot = workspaceProvider.snapshot.bind(workspaceProvider);
+    workspaceProvider.snapshot = async (label) => {
+      const captured = await snapshot(label);
+      workspaceSnapshots.push(captured);
+      return captured;
+    };
+  }
   const taskGit = opts.lateMail ? spyOn(childProcess, "spawnSync").mockImplementation(() => ({ status: 1, stdout: "", stderr: "fixture" }) as never) : undefined;
   const taskSpawn = opts.lateMail ? spyOn(childProcess, "spawn").mockImplementation(() => { throw new Error("unexpected task launch"); }) : undefined;
   const warnings: string[] = [];
@@ -208,7 +226,8 @@ async function driveRuntime(
       if (opts.autoCommitFailure === "rebaseProbe") return { status: 128, stdout: "", stderr: "fixture probe failure" } as never;
       return { status: 0, stdout: `${join(workspace, ".git", probe.split(" ").pop()!)}\n`, stderr: "" } as never;
     }
-    if (probe === "rev-parse HEAD") {
+    if (probe === "symbolic-ref -q HEAD") return runRealGit(command, args, options) as never;
+    if (probe === "rev-parse --verify -q HEAD^{commit}") {
       headReads++;
       if ((opts.autoCommitFailure === "baseline" && headReads === 1) || (opts.autoCommitFailure === "head" && headReads === 2)) {
         return { status: 128, stdout: "", stderr: "fixture HEAD failure" } as never;
@@ -261,6 +280,7 @@ async function driveRuntime(
   const savedSigterm = process.listeners("SIGTERM");
   const savedSigint = process.listeners("SIGINT");
   const http: string[] = [];
+  const workspaceStateWrites: Array<{ phase?: string; ref: string }> = [];
   const presenceBodies: string[] = [];
   let exitCode: number | undefined;
   let exits = 0;
@@ -281,6 +301,14 @@ async function driveRuntime(
     writeFileSync(join(workspace, "tracked.txt"), "fixture\n");
     gitIn(workspace, "add", ".gitignore", "tracked.txt");
     gitIn(workspace, "commit", "-q", "-m", "fixture baseline");
+  }
+  if (opts.unbornWorkspace) {
+    gitIn(workspace, "init", "-q", "-b", "main");
+    gitIn(workspace, "config", "user.email", "agent-a@example.com");
+    gitIn(workspace, "config", "user.name", "agent-a");
+    // The runtime's own files are ignored so onBoot sees a clean tree and
+    // startup reaches the baseline fallback with an unborn HEAD.
+    appendFileSync(join(workspace, ".git", "info", "exclude"), "\n.tps-agent.pid\nSOUL.md\n");
   }
   if (captureAutoCommit && !opts.ignoredFileChange) writeFileSync(join(workspace, "SOUL.md"), "fixture instructions");
   if (opts.lateMail || captureAutoCommit) {
@@ -305,6 +333,9 @@ async function driveRuntime(
     const method = init?.method ?? "GET";
     const path = url.replace(/^https?:\/\/[^/]+/, "");
     http.push(`${method} ${path}`);
+    if (method === "PUT" && path.startsWith("/WorkspaceState/")) {
+      workspaceStateWrites.push(JSON.parse(String(init?.body ?? "{}")));
+    }
     if (method === "POST" && path === "/Presence") {
       const body = String(init?.body ?? "");
       presenceBodies.push(body);
@@ -344,12 +375,16 @@ async function driveRuntime(
       const binDir = join(dir, ".tps", "bin");
       mkdirSync(binDir, { recursive: true });
       tpsShimMarker = join(dir, "tps-shim-ran");
-      writeFileSync(join(binDir, "tps"), `#!/usr/bin/env bun
+      if (opts.builtCli) {
+        const builtCli = resolve(import.meta.dir, "../dist/bin/tps.js");
+        writeFileSync(join(binDir, "tps"), `#!/usr/bin/env bash\n: > ${JSON.stringify(tpsShimMarker)}\nexec bun ${JSON.stringify(builtCli)} "$@"\n`, { mode: 0o755 });
+      } else {
+        writeFileSync(join(binDir, "tps"), `#!/usr/bin/env bun
 import { writeFileSync } from "node:fs";
-process.env.TPS_AGENT_ID = "testbot";
 writeFileSync(${JSON.stringify(tpsShimMarker)}, "ran\\n");
 await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
 `, { mode: 0o755 });
+      }
     }
     // A pre-seeded cursor makes the review-trigger loop's reads distinguishable
     // from the task loop's, both of which read /OrgEventCatchup/testbot.
@@ -371,7 +406,7 @@ await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
       reviewTrigger: opts.reviewTrigger,
       autoCommit: captureAutoCommit ? (opts.autoCommitRepo ? { repo: opts.autoCommitRepo } : {}) : undefined,
       sessionLogPath: captureAutoCommit ? join(dir, "session.log") : undefined,
-      workspaceProvider: opts.lateMail ? workspaceProvider : undefined,
+      workspaceProvider: opts.lateMail || opts.realWorkspaceProvider ? workspaceProvider : undefined,
     }).then(() => { runtimeFinished = true; }).catch((e: Error) => {
       rejected = e;
     });
@@ -474,7 +509,7 @@ await import(${JSON.stringify(resolve(import.meta.dir, "../bin/tps.ts"))});
     for (const l of process.listeners("SIGINT")) if (!savedSigint.includes(l)) process.off("SIGINT", l);
   }
 
-  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits, tpsCommit, tpsShimMarker };
+  return { http, presenceBodies, exitCode, exits, drains, signalResults, rejected, ticked, successfulReads, warnings, logs, mails, autoCommits, tpsCommit, tpsShimMarker, workspaceSnapshots, workspaceStateWrites };
 }
 
 async function withLoopClient(
@@ -635,6 +670,47 @@ describe("mail auto-commit checks", () => {
     }
   }, 20_000);
 
+  it("commits a mail task's first change on an unborn HEAD through the real provider and built CLI", async () => {
+    const root = mkdtempSync(join(tmpdir(), "cli835-e2e-"));
+    const workspace = join(root, "workspace");
+    const savedAgentId = process.env.TPS_AGENT_ID;
+    delete process.env.TPS_AGENT_ID;
+    try {
+      mkdirSync(workspace, { recursive: true });
+      const result = await driveRuntime("SIGTERM", undefined, {
+        dir: root,
+        autoCommitRepo: workspace,
+        realAutoCommit: true,
+        realWorkspaceProvider: true,
+        builtCli: true,
+        unbornWorkspace: true,
+      });
+      const tpsOutcome = result.tpsCommit
+        ? `tps agent commit exit=${result.tpsCommit.status} stderr=${JSON.stringify(result.tpsCommit.stderr)}${result.tpsCommit.error ? ` error=${JSON.stringify(result.tpsCommit.error)}` : ""}`
+        : "tps agent commit was never spawned";
+      expect(result.rejected, `runtime rejected at startup: ${result.rejected?.message ?? ""}`).toBeUndefined();
+      expect(result.warnings.join("\n")).not.toContain("Pre-task lifecycle failed");
+      expect(result.workspaceSnapshots).toHaveLength(2);
+      expect(result.workspaceSnapshots[0]).toMatchObject({ ref: "HEAD", provider: "git", metadata: { unborn: true } });
+      expect(result.workspaceStateWrites).toContainEqual(expect.objectContaining({ phase: "pre-task", ref: "HEAD" }));
+      expect(result.workspaceSnapshots[1]).toMatchObject({ ref: "HEAD", provider: "git", metadata: { unborn: true, dirty: true } });
+      const postTaskWrite = result.workspaceStateWrites.find((write) => write.phase === "post-task");
+      expect(postTaskWrite).toMatchObject({ ref: "HEAD" });
+      expect(postTaskWrite).not.toHaveProperty("summary");
+      expect(result.autoCommits, "auto-commit did not reach the commit command").toBe(1);
+      expect(existsSync(result.tpsShimMarker!), `the built-CLI shim did not run (${tpsOutcome})`).toBe(true);
+      expect(result.tpsCommit?.status, `the commit command failed (${tpsOutcome})`).toBe(0);
+      expect(gitIn(workspace, "rev-list", "--count", "HEAD").trim()).toBe("1");
+      expect(gitIn(workspace, "show", "HEAD:file.txt")).toBe("task change\n");
+      expect(gitIn(workspace, "status", "--porcelain")).toBe("");
+      expect(process.env.TPS_AGENT_ID, "the parent environment was modified").toBeUndefined();
+    } finally {
+      if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
+      else process.env.TPS_AGENT_ID = savedAgentId;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   it("attempts acknowledgement when a sender notice cannot be sent", async () => {
     const result = await driveRuntime("SIGTERM", undefined, { sendFailure: true });
     expect(result.autoCommits).toBe(0);
@@ -645,8 +721,8 @@ describe("mail auto-commit checks", () => {
 
   for (const [failure, probe] of [
     ["status", "git status --porcelain"],
-    ["baseline", "git rev-parse HEAD (before task)"],
-    ["head", "git rev-parse HEAD (after task)"],
+    ["baseline", "git rev-parse --verify -q HEAD^{commit} (before task)"],
+    ["head", "git rev-parse --verify -q HEAD^{commit} (after task)"],
   ] as const) {
     it(`reports an indeterminate change check when ${probe} fails`, async () => {
       const result = await driveRuntime("SIGTERM", undefined, { autoCommitFailure: failure });

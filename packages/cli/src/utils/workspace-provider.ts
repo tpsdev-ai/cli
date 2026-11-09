@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import type { FlairClient } from "./flair-client.js";
 import type { WorkspaceStateRecord } from "./flair-client.js";
 import snooplogg from "snooplogg";
+import { probeHead } from "./git-head.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:workspace");
 
 
@@ -154,7 +155,11 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   // ── WorkspaceProvider ──────────────────────────────────────────────────
 
   async snapshot(label?: string): Promise<WorkspaceState> {
-    const sha = this.headSha();
+    const probe = probeHead(this.cwd);
+    if (probe.state === "indeterminate") {
+      throw new Error(`workspace HEAD is indeterminate: ${probe.probe} ${probe.detail}`);
+    }
+    const sha = probe.state === "unborn" ? "HEAD" : probe.head;
     const branch = this.currentBranch();
     const dirty = !this.isClean();
 
@@ -168,6 +173,7 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       metadata: {
         branch,
         dirty,
+        ...(probe.state === "unborn" ? { unborn: true } : {}),
       },
     };
   }
@@ -175,6 +181,11 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   async reset(to: StateRef): Promise<void> {
     const ref = resolveRef(to);
     this.assertKnownRef(ref);
+
+    // An unborn baseline has no commit to check out.
+    if (typeof to !== "string" && to.metadata?.unborn === true) {
+      return;
+    }
 
     // Auto-stash uncommitted work (S47: reset() finds uncommitted work)
     if (!this.isClean()) {
@@ -205,14 +216,18 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
   async checkpoint(label: string, message?: string): Promise<WorkspaceState> {
     // No-op if working tree is clean
     if (this.isClean()) {
-      const sha = this.headSha();
+      const probe = probeHead(this.cwd);
+      if (probe.state === "indeterminate") {
+        throw new Error(`workspace HEAD is indeterminate: ${probe.probe} ${probe.detail}`);
+      }
+      const sha = probe.state === "unborn" ? "HEAD" : probe.head;
       this.registerRef(sha);
       return {
         ref: sha,
         label,
         timestamp: new Date().toISOString(),
         provider: "git",
-        metadata: { branch: this.currentBranch(), noop: true },
+        metadata: { branch: this.currentBranch(), noop: true, ...(probe.state === "unborn" ? { unborn: true } : {}) },
       };
     }
 
@@ -260,9 +275,25 @@ export class GitWorkspaceProvider implements WorkspaceProvider {
       if (this.failureMode === "hard") {
         throw new Error(msg);
       }
-      // warn mode: proceed with last known state
+      // warn mode: proceed with last known state. An unborn HEAD (a branch
+      // with no commit yet; the repository may have other branches) is a valid
+      // baseline state, so startup proceeds; an indeterminate HEAD throws.
       swarn(`[workspace] ⚠️ ${msg} — proceeding with current state`);
-      const sha = this.headSha();
+      const probe = probeHead(this.cwd);
+      if (probe.state === "unborn") {
+        this.registerRef("HEAD");
+        return {
+          ref: "HEAD",
+          label: "fallback-unborn",
+          timestamp: new Date().toISOString(),
+          provider: "git",
+          metadata: { fallback: true, unborn: true, fetchError: fetch.stderr },
+        };
+      }
+      if (probe.state !== "commit") {
+        throw new Error(`${msg} and HEAD is indeterminate (${probe.detail})`);
+      }
+      const sha = probe.head;
       this.registerRef(sha);
       return {
         ref: sha,

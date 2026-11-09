@@ -10,6 +10,7 @@ import {
   detectStaleRebase,
   evaluateMailAutoCommitGate,
   hasWorkspaceChangesOrNewCommit,
+  probeHead,
   publishTaskOutcomeEvent,
   resolveCommitRepo,
   runAutoCommit,
@@ -303,7 +304,7 @@ describe("evaluateMailAutoCommitGate", () => {
       let moved = "";
       let headReads = 0;
       const runSync = ((command: any, args: any, options: any) => {
-        if ((args as string[]).join(" ") === "rev-parse HEAD") {
+        if ((args as string[]).join(" ") === "rev-parse --verify -q HEAD^{commit}") {
           headReads++;
           if (headReads === 1) {
             const read = spawnSync(command, args, options);
@@ -361,17 +362,434 @@ describe("evaluateMailAutoCommitGate", () => {
         dir,
         [
           'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "${SHIM_ROOT}/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
           'if [ "$1" = "rev-parse" ] && [ "$2" = "HEAD" ]; then exit 0; fi',
           'if [ "$1" = "status" ]; then exit 0; fi',
           'exit 0',
         ].join("\n"),
       );
-      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync: shimRunner(shim, { SHIM_ROOT: dir }) })).toEqual({
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir });
+      expect(probeHead(dir, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "returned no output",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync })).toEqual({
         action: "skip",
-        message: "Change check could not run: git rev-parse HEAD (after task) returned no output — skipping autoCommit",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) returned no output — skipping autoCommit",
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("names HEAD^{commit} when its successful probe has empty output", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-empty-commit-probe-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then exit 0; fi',
+          'if [ "$1" = "status" ]; then exit 0; fi',
+          'exit 128',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir });
+      expect(probeHead(dir, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "returned no output",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      expect(evaluateMailAutoCommitGate(dir, "abc123", { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) returned no output — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+describe("evaluateMailAutoCommitGate unborn HEAD", () => {
+  /** A fresh repository with an unborn `main` HEAD. */
+  function initUnbornRepo(): string {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-unborn-"));
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "agent-a@example.com");
+    git(dir, "config", "user.name", "agent-a");
+    return dir;
+  }
+
+  test("selects the commit path when HEAD is unborn and the task leaves a change", () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      writeFileSync(join(repo, "file.txt"), "first\n");
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({ action: "commit" });
+      expect(baseline).toEqual({ state: "unborn" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unborn HEAD with no changes is clean", () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "clean",
+        message: "Git status is clean and HEAD is unborn — skipping autoCommit",
+      });
+      expect(baseline).toEqual({ state: "unborn" });
+      const head = spawnSync(GIT, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
+      expect(head.status).toBe(1);
+      expect(String(head.stdout ?? "").trim()).toBe("");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a branch ref created before show-ref has a specific indeterminate reason", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--orphan", "topic");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      const branch = "refs/heads/topic";
+      let refCreations = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === `show-ref --verify -q ${branch}`) {
+          git(repo, "update-ref", branch, commit);
+          refCreations++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found a ref after HEAD did not resolve",
+        probe: `git show-ref --verify -q ${branch}`,
+      });
+      git(repo, "update-ref", "-d", branch);
+      expect(evaluateMailAutoCommitGate(repo, { state: "unborn" }, { runSync })).toEqual({
+        action: "skip",
+        message: `Change check could not run: git show-ref --verify -q ${branch} (after task) found a ref after HEAD did not resolve — skipping autoCommit`,
+      });
+      expect(refCreations).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a branch ref created before HEAD verification has a specific indeterminate reason", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--orphan", "topic");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      const branch = "refs/heads/topic";
+      let refCreations = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === "rev-parse --verify -q HEAD") {
+          git(repo, "update-ref", branch, commit);
+          refCreations++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found a ref after HEAD^{commit} did not resolve",
+        probe: "git rev-parse --verify -q HEAD",
+      });
+      git(repo, "update-ref", "-d", branch);
+      expect(evaluateMailAutoCommitGate(repo, { state: "unborn" }, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD (after task) found a ref after HEAD^{commit} did not resolve — skipping autoCommit",
+      });
+      expect(refCreations).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("HEAD moves from a detached commit to an unborn branch before commit verification", () => {
+    const repo = initRepo();
+    try {
+      const commit = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--detach", commit);
+      const branch = "refs/heads/empty";
+      let switches = 0;
+      const runSync = ((command: string, args: string[], options: Parameters<typeof spawnSync>[2]) => {
+        if (args.join(" ") === "rev-parse --verify -q HEAD^{commit}") {
+          git(repo, "symbolic-ref", "HEAD", branch);
+          switches++;
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(probeHead(repo, runSync)).toEqual({
+        state: "indeterminate",
+        detail: "found no commit after symbolic-ref reported a detached HEAD",
+        probe: "git rev-parse --verify -q HEAD^{commit}",
+      });
+      git(repo, "checkout", "-q", "--detach", commit);
+      expect(evaluateMailAutoCommitGate(repo, { state: "commit", head: commit }, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD^{commit} (after task) found no commit after symbolic-ref reported a detached HEAD — skipping autoCommit",
+      });
+      expect(switches).toBe(2);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a clean orphan branch beside a committed branch reports an unborn HEAD", () => {
+    const repo = initRepo();
+    try {
+      git(repo, "checkout", "-q", "--orphan", "empty");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      expect(git(repo, "status", "--porcelain")).toBe("");
+      expect(git(repo, "log", "-1", "--format=%H", "main").trim()).not.toBe("");
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "unborn" });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "clean",
+        message: "Git status is clean and HEAD is unborn — skipping autoCommit",
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a corrupted HEAD is an indeterminate skip naming the probe", () => {
+    const repo = initUnbornRepo();
+    try {
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/bad..name\n");
+      const baseline = probeHead(repo);
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
+      });
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic HEAD outside refs/heads/ is indeterminate", () => {
+    const repo = initUnbornRepo();
+    try {
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/x\n");
+      expect(probeHead(repo)).toEqual({ state: "indeterminate", detail: "returned a ref outside refs/heads/", probe: "git symbolic-ref -q HEAD" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a branch ref to a missing object skips auto-commit with the failed commit probe", () => {
+    const repo = initUnbornRepo();
+    try {
+      const missingObject = "de".repeat(20);
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/heads/x\n");
+      writeFileSync(join(repo, ".git", "refs", "heads", "x"), `${missingObject}\n`);
+      const commitProbe = spawnSync(GIT, ["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: repo, encoding: "utf-8" });
+      expect(commitProbe.status).toBe(1);
+      expect(String(commitProbe.stdout ?? "")).toBe("");
+      expect(String(commitProbe.stderr ?? "")).toBe("");
+      expect(git(repo, "rev-parse", "--verify", "-q", "HEAD").trim()).toBe(missingObject);
+
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({
+        state: "indeterminate",
+        detail: "found a ref after HEAD^{commit} did not resolve",
+        probe: "git rev-parse --verify -q HEAD",
+      });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git rev-parse --verify -q HEAD (before task) found a ref after HEAD^{commit} did not resolve — skipping autoCommit",
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic HEAD that points at an existing tag on a commit is indeterminate and skips at the gate", () => {
+    const repo = initRepo();
+    try {
+      git(repo, "tag", "v1");
+      writeFileSync(join(repo, ".git", "HEAD"), "ref: refs/tags/v1\n");
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "returned a ref outside refs/heads/", probe: "git symbolic-ref -q HEAD" });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) returned a ref outside refs/heads/ — skipping autoCommit",
+      });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a detached HEAD at a commit is a commit baseline", () => {
+    const repo = initRepo();
+    try {
+      const sha = git(repo, "rev-parse", "HEAD").trim();
+      git(repo, "checkout", "-q", "--detach", sha);
+      expect(probeHead(repo)).toEqual({ state: "commit", head: sha });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic-ref error with a resolvable commit is indeterminate and skips naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-symbolic-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "symbolic-ref" ]; then exit 128; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "${SHIM_ROOT}/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("symbolic-ref exit 1 with stderr is indeterminate and skips naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-symbolic-stderr-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "fatal: probe failed" >&2; exit 1; fi',
+          'if [ "$1" = "rev-parse" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic-ref failure after rebase abort names the failed probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-post-abort-symbolic-"));
+    try {
+      mkdirSync(join(dir, "rebase-merge"));
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "rebase" ] && [ "$2" = "--abort" ]; then touch "$SHIM_ROOT/aborted"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then if [ -f "$SHIM_ROOT/aborted" ]; then echo "fatal: probe failed" >&2; exit 128; fi; echo "refs/heads/main"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "commit", head: "a".repeat(40) });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (after rebase abort) failed — skipping autoCommit",
+      });
+      expect(existsSync(join(dir, "aborted"))).toBe(true);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("missing-ref probes with exit 1 and stderr are indeterminate and skip naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-missing-stderr-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then echo "refs/heads/main"; exit 0; fi',
+          'if [ "$*" = "$SHIM_FAIL_ARGS" ]; then echo "fatal: probe failed" >&2; exit 1; fi',
+          'if [ "$1" = "rev-parse" ] || [ "$1" = "show-ref" ]; then exit 1; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      for (const args of [
+        "rev-parse --verify -q HEAD^{commit}",
+        "rev-parse --verify -q HEAD",
+        "show-ref --verify -q refs/heads/main",
+      ]) {
+        const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_FAIL_ARGS: args });
+        const probe = `git ${args}`;
+        const baseline = probeHead(dir, runSync);
+        expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe });
+        expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+          action: "skip",
+          message: `Change check could not run: ${probe} (before task) failed — skipping autoCommit`,
+        });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("skips naming the restored and final HEADs when an aborted rebase leaves an unborn final HEAD", () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "unborn" });
+      // The task commits on `topic`, branches a conflicting commit on `other`,
+      // and starts a rebase it leaves interrupted.
+      git(repo, "checkout", "-q", "-b", "topic");
+      writeFileSync(join(repo, "file.txt"), "task\n");
+      git(repo, "add", "file.txt");
+      git(repo, "commit", "-q", "-m", "task");
+      git(repo, "checkout", "-q", "-b", "other");
+      writeFileSync(join(repo, "file.txt"), "other\n");
+      git(repo, "commit", "-q", "-am", "other");
+      git(repo, "checkout", "-q", "topic");
+      writeFileSync(join(repo, "file.txt"), "task follow-up\n");
+      git(repo, "commit", "-q", "-am", "follow-up");
+      const restored = git(repo, "rev-parse", "HEAD").trim();
+      expect(spawnSync(GIT, ["rebase", "other"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
+
+      // The abort restores `topic` at the task's tip; deleting that ref before
+      // the final read makes HEAD unborn again.
+      let deleted = false;
+      const runSync = ((command: any, args: any, options: any) => {
+        if (!deleted && (args as string[]).join(" ") === "status --porcelain") {
+          deleted = true;
+          const drop = spawnSync(GIT, ["update-ref", "-d", "refs/heads/topic"], { cwd: repo, encoding: "utf-8" });
+          if (drop.status !== 0) throw new Error(String(drop.stderr));
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(evaluateMailAutoCommitGate(repo, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restored}, final unborn) — skipping autoCommit`,
+      });
+      expect(deleted).toBe(true);
+      expect(probeHead(repo)).toEqual({ state: "unborn" });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
     }
   }, 30_000);
 });
@@ -484,7 +902,10 @@ describe("resolveAutoCommitRepo", () => {
 describe("runAutoCommit", () => {
   test("creates the branch before invoking tps agent commit when HEAD is detached", async () => {
     const calls: Array<{ cmd: string; args: string[] }> = [];
-    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+    let tpsEnv: NodeJS.ProcessEnv | undefined;
+    const savedAgentId = process.env.TPS_AGENT_ID;
+    process.env.TPS_AGENT_ID = "parent-agent";
+    const spawnSyncImpl = mock((cmd: string, args: string[], opts?: { env?: NodeJS.ProcessEnv }) => {
       calls.push({ cmd, args });
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 1, stdout: "", stderr: "" };
@@ -502,25 +923,36 @@ describe("runAutoCommit", () => {
         return { status: 0, stdout: "0\n", stderr: "" };
       }
       if (cmd === "tps") {
+        tpsEnv = opts?.env;
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
     });
 
-    await runAutoCommit(
-      config,
-      { publishEvent: mock(async () => {}) },
-      {
-        taskId: "task-123",
-        branchName: "feat/task-123",
-        commitMessage: "feat: ship task 123",
-        authorName: "ember",
-        authorEmail: "ember@tps.dev",
-        push: true,
-        prTitle: "feat: ship task 123",
-      },
-      { spawnSyncImpl },
-    );
+    try {
+      await runAutoCommit(
+        config,
+        { publishEvent: mock(async () => {}) },
+        {
+          taskId: "task-123",
+          branchName: "feat/task-123",
+          commitMessage: "feat: ship task 123",
+          authorName: "ember",
+          authorEmail: "ember@tps.dev",
+          push: true,
+          prTitle: "feat: ship task 123",
+        },
+        { spawnSyncImpl },
+      );
+
+      // The commit child gets the configured id; the runtime's own environment is
+      // unchanged.
+      expect(tpsEnv?.TPS_AGENT_ID).toBe("ember");
+      expect(process.env.TPS_AGENT_ID).toBe("parent-agent");
+    } finally {
+      if (savedAgentId === undefined) delete process.env.TPS_AGENT_ID;
+      else process.env.TPS_AGENT_ID = savedAgentId;
+    }
 
     expect(calls).toEqual([
       { cmd: "/usr/bin/git", args: ["symbolic-ref", "--quiet", "HEAD"] },
