@@ -1,5 +1,5 @@
 /**
- * The flags the Docker lane sets to require a lane-only set-runtime case: the
+ * The flags the Docker lane sets to require a set-runtime case: the
  * root-only real-owner case (cli#801, cli#816) and the second-group case
  * (cli#817).
  */
