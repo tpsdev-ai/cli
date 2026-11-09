@@ -379,7 +379,7 @@ describe("evaluateMailAutoCommitGate", () => {
 });
 
 describe("evaluateMailAutoCommitGate unborn HEAD", () => {
-  /** A repository with no commits on `main`, in a fresh temp dir. */
+  /** A fresh repository with an unborn `main` HEAD. */
   function initUnbornRepo(): string {
     const dir = mkdtempSync(join(tmpdir(), "cli835-unborn-"));
     git(dir, "init", "-q", "-b", "main");
@@ -388,7 +388,7 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     return dir;
   }
 
-  test("selects the commit path when the repository has no commits and the task leaves a change", () => {
+  test("selects the commit path when HEAD is unborn and the task leaves a change", () => {
     const repo = initUnbornRepo();
     try {
       const baseline = probeHead(repo);
@@ -403,18 +403,36 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
     }
   }, 30_000);
 
-  test("an unborn repository with no changes is clean", () => {
+  test("an unborn HEAD with no changes is clean", () => {
     const repo = initUnbornRepo();
     try {
       const baseline = probeHead(repo);
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
         action: "clean",
-        message: "Git status is clean and the repository has no commits — skipping autoCommit",
+        message: "Git status is clean and HEAD is unborn — skipping autoCommit",
       });
       expect(baseline).toEqual({ state: "unborn" });
       const head = spawnSync(GIT, ["rev-parse", "--verify", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
       expect(head.status).toBe(1);
       expect(String(head.stdout ?? "").trim()).toBe("");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a clean orphan branch beside a committed branch reports an unborn HEAD", () => {
+    const repo = initRepo();
+    try {
+      git(repo, "checkout", "-q", "--orphan", "empty");
+      git(repo, "rm", "-q", "-f", "file.txt");
+      expect(git(repo, "status", "--porcelain")).toBe("");
+      expect(git(repo, "log", "-1", "--format=%H", "main").trim()).not.toBe("");
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "unborn" });
+      expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
+        action: "clean",
+        message: "Git status is clean and HEAD is unborn — skipping autoCommit",
+      });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -515,6 +533,33 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
         action: "skip",
         message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
       });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic-ref failure after rebase abort names the failed probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-post-abort-symbolic-"));
+    try {
+      mkdirSync(join(dir, "rebase-merge"));
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "$SHIM_ROOT/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "rebase" ] && [ "$2" = "--abort" ]; then touch "$SHIM_ROOT/aborted"; exit 0; fi',
+          'if [ "$1" = "symbolic-ref" ]; then if [ -f "$SHIM_ROOT/aborted" ]; then echo "fatal: probe failed" >&2; exit 128; fi; echo "refs/heads/main"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "commit", head: "a".repeat(40) });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (after rebase abort) failed — skipping autoCommit",
+      });
+      expect(existsSync(join(dir, "aborted"))).toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

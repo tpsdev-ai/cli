@@ -433,7 +433,12 @@ export function evaluateMailAutoCommitGate(
       return { action: "skip", message: `Stale rebase abort failed (exit ${abortResult.status}): ${firstLine} — skipping autoCommit` };
     }
     const restored = probeHead(repo, runSync);
-    if (restored.state !== "commit") {
+    if (restored.state === "indeterminate") {
+      const probe = restored.probe ?? "git rev-parse HEAD";
+      const detail = restored.detail === "returned no output" ? "returned no output" : "failed";
+      return { action: "skip", message: `Change check could not run: ${probe} (after rebase abort) ${detail} — skipping autoCommit` };
+    }
+    if (restored.state === "unborn") {
       return { action: "skip", message: "Change check could not run: git rev-parse HEAD (after rebase abort) failed — skipping autoCommit" };
     }
     restoredHead = restored.head;
@@ -464,7 +469,7 @@ export function evaluateMailAutoCommitGate(
     }
     const changed = String(statusResult.stdout ?? "").trim().length > 0;
     if (changed) return { action: "commit" };
-    return { action: "clean", message: "Git status is clean and the repository has no commits — skipping autoCommit" };
+    return { action: "clean", message: "Git status is clean and HEAD is unborn — skipping autoCommit" };
   }
   const finalHead = finalProbe.head;
   if (baselineProbe.state === "unborn") {

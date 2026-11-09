@@ -657,7 +657,7 @@ describe("mail auto-commit checks", () => {
     }
   }, 20_000);
 
-  it("commits a mail task's first change in an unborn repository through the real provider and built CLI", async () => {
+  it("commits a mail task's first change on an unborn HEAD through the real provider and built CLI", async () => {
     const root = mkdtempSync(join(tmpdir(), "cli835-e2e-"));
     const workspace = join(root, "workspace");
     const savedAgentId = process.env.TPS_AGENT_ID;
