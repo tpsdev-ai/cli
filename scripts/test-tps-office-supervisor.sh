@@ -27,13 +27,12 @@
 #   7. cli#357: a fallible step (useradd) fails while seating the SECOND agent,
 #      after the first has launched. `set -e` ends the script; the EXIT trap
 #      stops the first agent and no PID file remains.
-#   8. cli#357 r4: the supervisor's test-only launch seam sends it a signal right
+#   8. cli#357 r4: the launch hook sends the supervisor TERM right
 #      after a child's background launch and before its PID is tracked, so the
 #      window is exercised on every run; the child is stopped and the PID file
 #      removed.
 #   9. cli#357 r4: a child that ignores TERM is KILLed after the ~10 s TERM grace
-#      (counted sleeps) and the supervisor exits; a second shutdown call signals
-#      no PID.
+#      (counted sleeps) and the supervisor exits; the EXIT trap sends no second TERM.
 #
 # Part C (behavioural, needs a REAL nono — the S4-pinned build — root, jq):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
@@ -55,7 +54,7 @@
 #      the same setup that launches in C.1 refuses, because nono can only report
 #      "Profile not found" (the wrong reason) for a bare name against an empty
 #      config dir. A Dockerfile that forgets the COPY turns these red.
-#   5. cli#357 r4: the session the supervisor launched is recorded at launch; a
+#   5. cli#357 r4: the session the supervisor launched is queried after launch; a
 #      handled signal while it runs ends that session and its child, and removes
 #      the PID file.
 #
@@ -73,6 +72,112 @@ npass=0
 nfail=0
 ok()  { printf 'PASS  %s\n' "$1"; npass=$((npass + 1)); }
 bad() { printf 'FAIL  %s\n' "$1" >&2; nfail=$((nfail + 1)); }
+
+session_gone_in() { # <ps-output-file> <ps-status> <id> <name>
+  local output="$1" status="$2" id="$3" name="$4"
+  [ "$status" -eq 0 ] || return 1
+  [ -n "$id" ] || [ -n "$name" ] || return 1
+  jq -e -s 'length == 1 and (.[0] | type == "array")' "$output" >/dev/null 2>&1 || return 1
+  jq -e --arg id "$id" --arg name "$name" \
+    'all(.[]; .status != "running" or (($id == "" or .session_id != $id) and ($name == "" or .name != $name)))' \
+    "$output" >/dev/null 2>&1
+}
+
+session_fixture="$(mktemp)"
+check_session_gone_fixture() { # <label> <ps-output> <status> <expected:yes|no>
+  local label="$1" output="$2" status="$3" expected="$4" actual=no ps_status
+  ps_as_agent() { printf '%s\n' "$output"; return "$status"; }
+  if ps_as_agent >"$session_fixture"; then ps_status=0; else ps_status=$?; fi
+  if session_gone_in "$session_fixture" "$ps_status" fixture-id fixture-name; then actual=yes; fi
+  if [ "$actual" = "$expected" ]; then ok "$label"; else bad "$label (expected $expected, got $actual)"; fi
+}
+check_session_gone_fixture "failed ps with an empty array does not confirm a stop" '[]' 7 no
+check_session_gone_fixture "non-JSON ps output does not confirm a stop" 'bad-json' 0 no
+check_session_gone_fixture "multiple ps JSON values do not confirm a stop" $'[{"status":"running","session_id":"fixture-id"}]\n[]' 0 no
+check_session_gone_fixture "a matching running session does not confirm a stop" '[{"status":"running","session_id":"fixture-id"}]' 0 no
+check_session_gone_fixture "successful empty ps array confirms a stop" '[]' 0 yes
+rm -f "$session_fixture"
+
+hook_fixture="$(mktemp -d)"
+sed -n '1,/^esac$/p' "$sup" >"$hook_fixture/startup.sh"
+printf 'printf launched >>"%s"\n' "$hook_fixture/launched" >>"$hook_fixture/startup.sh"
+for hook_value in BOGUS KILL; do
+  hook_output="$(TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH="$hook_value" bash "$hook_fixture/startup.sh" 2>&1)"; hook_status=$?
+  if [ "$hook_status" -eq 1 ] && [[ "$hook_output" == *"$hook_value"* ]] && [ ! -e "$hook_fixture/launched" ]; then
+    ok "unlisted launch hook $hook_value refuses before launch"
+  else
+    bad "unlisted launch hook $hook_value (status=$hook_status output=$hook_output)"
+  fi
+done
+rm -rf "$hook_fixture"
+
+shutdown_fixture="$(mktemp -d)"
+sed -n '/^SHUTDOWN_GRACE_SECONDS=10$/,/^# cli#357 r4 —/p' "$sup" | sed '$d' >"$shutdown_fixture/functions.sh"
+sed -n '/^on_signal() {/,/^}/p' "$sup" >>"$shutdown_fixture/functions.sh"
+cat >"$shutdown_fixture/child.sh" <<'CHILD'
+#!/usr/bin/env bash
+trap 'echo TERM >>"${SHUTDOWN_FIXTURE:?}/terms"' TERM
+echo ready >"${SHUTDOWN_FIXTURE:?}/ready"
+while :; do sleep 0.1; done
+CHILD
+cat >"$shutdown_fixture/run.sh" <<'RUN'
+#!/usr/bin/env bash
+set -u
+PIDS_FILE="$SHUTDOWN_FIXTURE/pids.json"
+cleanup_pids_file() { rm -f "$PIDS_FILE"; }
+AGENT_IDS=(fixture)
+AGENT_PIDS=()
+defer_signals=0
+pending_signal=""
+source "$SHUTDOWN_FIXTURE/functions.sh"
+sleep() { if [ "$1" = 0.1 ]; then echo tick >>"$SHUTDOWN_FIXTURE/ticks"; fi; command sleep "$@"; }
+SHUTDOWN_GRACE_SECONDS=1
+trap 'on_signal TERM' SIGTERM
+trap 'on_signal HUP' SIGHUP
+trap 'shutdown_children TERM' EXIT
+bash "$SHUTDOWN_FIXTURE/child.sh" &
+AGENT_PIDS=($!)
+printf '%s\n' "$!" >"$SHUTDOWN_FIXTURE/child-pid"
+wait "${AGENT_PIDS[0]}"
+RUN
+SHUTDOWN_FIXTURE="$shutdown_fixture" bash "$shutdown_fixture/run.sh" >"$shutdown_fixture/out" 2>&1 &
+shutdown_supervisor=$!
+shutdown_ready=0
+for _ in $(seq 1 100); do
+  if [ -e "$shutdown_fixture/ready" ] && [ -s "$shutdown_fixture/child-pid" ]; then shutdown_ready=1; break; fi
+  kill -0 "$shutdown_supervisor" 2>/dev/null || break
+  sleep 0.05
+done
+if [ "$shutdown_ready" -eq 1 ]; then
+  kill -TERM "$shutdown_supervisor" 2>/dev/null || true
+  first_term=0
+  for _ in $(seq 1 100); do
+    if [ -s "$shutdown_fixture/terms" ]; then first_term=1; break; fi
+    kill -0 "$shutdown_supervisor" 2>/dev/null || break
+    sleep 0.05
+  done
+  if [ "$first_term" -eq 1 ]; then kill -TERM "$shutdown_supervisor" 2>/dev/null || true; fi
+  shutdown_finished=0
+  for _ in $(seq 1 100); do
+    if ! kill -0 "$shutdown_supervisor" 2>/dev/null; then shutdown_finished=1; break; fi
+    sleep 0.05
+  done
+  if [ "$shutdown_finished" -eq 0 ]; then kill -KILL "$shutdown_supervisor" 2>/dev/null || true; fi
+  wait "$shutdown_supervisor" 2>/dev/null; shutdown_status=$?
+  term_count="$(grep -c '^TERM$' "$shutdown_fixture/terms" 2>/dev/null || true)"
+  tick_count="$(grep -c '^tick$' "$shutdown_fixture/ticks" 2>/dev/null || true)"
+  child_pid="$(cat "$shutdown_fixture/child-pid")"
+  if [ "$first_term" -eq 1 ] && [ "$shutdown_finished" -eq 1 ] && [ "$shutdown_status" -eq 0 ] && [ "$term_count" -eq 1 ] && [ "$tick_count" -eq 10 ] && ! kill -0 "$child_pid" 2>/dev/null; then
+    ok "second handled signal during grace sends one TERM and still escalates to KILL"
+  else
+    bad "shutdown re-entry (first=$first_term finished=$shutdown_finished status=$shutdown_status terms=$term_count ticks=$tick_count child=$child_pid)"
+  fi
+else
+  kill -KILL "$shutdown_supervisor" 2>/dev/null || true
+  wait "$shutdown_supervisor" 2>/dev/null || true
+  bad "shutdown re-entry fixture child did not start"
+fi
+rm -rf "$shutdown_fixture"
 
 # ── Part A — static shape ────────────────────────────────────────────────────
 profiles="$(grep -cE -- '--profile \\?"?\$NONO_PROFILE' "$sup" || true)"
@@ -276,14 +381,9 @@ else
   bad "seating-loop source control: $analysis"
 fi
 
-# cli#357 r4: pin the EXIT trap exactly. The supervisor must contain EXACTLY
-# ONE trap statement whose signal list includes EXIT, 0 or SIGEXIT — counting
-# resets (`trap - EXIT`) and empties (`trap '' 0`) — and its action text must
-# equal the pinned action below. A second trap (bash replaces the EXIT trap), an
-# arbitrary-PID kill, or a rewritten action therefore fails.
-EXIT_TRAP_ACTION='shutdown_children TERM'
+# cli#357 r4: pin the literal trap statements and reject eval.
 assert_exit_trap() { # <source>
-  awk -v pinned="$EXIT_TRAP_ACTION" '
+  awk '
     function trim(s) {
       sub(/^[[:space:]]+/, "", s)
       sub(/[[:space:]]+$/, "", s)
@@ -291,58 +391,36 @@ assert_exit_trap() { # <source>
     }
     function fail(msg) {
       print msg
+      failed=1
       exit 1
     }
     { lines[NR]=$0 }
     END {
-      ntrap=0; found_action=""; found_line=""
+      if (failed) exit 1
+      ntrap=0
       for (i=1; i<=NR; i++) {
         line=trim(lines[i])
         if (line ~ /^#/) continue
-        if (line !~ /^trap[[:space:]]+/) continue
-        if (line ~ /\\[[:space:]]*$/) fail("trap statement spans lines: " line)
-        rest=line
-        sub(/^trap[[:space:]]+/, "", rest)
-        rest=trim(rest)
-        quote=substr(rest, 1, 1)
-        if (quote == "\047") {
-          end=index(substr(rest, 2), "\047")
-          if (end == 0) fail("unterminated single-quoted trap action: " line)
-          action=substr(rest, 2, end - 1)
-          remain=substr(rest, end + 2)
-        } else if (quote == "\"") {
-          end=index(substr(rest, 2), "\"")
-          if (end == 0) fail("unterminated double-quoted trap action: " line)
-          action=substr(rest, 2, end - 1)
-          remain=substr(rest, end + 2)
-        } else {
-          split(rest, first, /[[:space:]]+/)
-          action=first[1]
-          remain=substr(rest, length(action) + 1)
+        if (line ~ /(^|[^[:alnum:]_])eval([^[:alnum:]_]|$)/) fail("eval in supervisor: " line)
+        if (line !~ /(^|[^[:alnum:]_])trap([^[:alnum:]_]|$)/) continue
+        if (line == "trap \047shutdown_children TERM\047 EXIT") {
+          ntrap++
+          if (ntrap > 1) fail("more than one pinned EXIT trap")
+          continue
         }
-        sigs=toupper(trim(remain))
-        ns=split(sigs, sig, /[[:space:]]+/)
-        hit=0
-        for (j=1; j<=ns; j++) {
-          if (sig[j] == "EXIT" || sig[j] == "0" || sig[j] == "SIGEXIT") hit=1
-        }
-        if (!hit) continue
-        ntrap++
-        if (ntrap > 1) fail("found more than one EXIT trap (second: " line ")")
-        found_action=action
-        found_line=line
+        if (line == "trap \047on_signal TERM\047 SIGTERM" ||
+            line == "trap \047on_signal INT\047 SIGINT" ||
+            line == "trap \047on_signal HUP\047 SIGHUP") continue
+        fail("unlisted trap statement: " line)
       }
       if (ntrap == 0) fail("found no EXIT trap")
-      if (found_action != pinned) {
-        fail("EXIT trap action is not the pinned action: got [" found_action "] expected [" pinned "] in: " found_line)
-      }
       exit 0
     }
   ' "$1"
 }
 
 if analysis="$(assert_exit_trap "$sup")"; then
-  ok "the EXIT trap is exactly the pinned action, and the only EXIT/0/SIGEXIT trap"
+  ok "the literal signal traps and pinned EXIT trap pass the trap control"
 else
   bad "EXIT-trap control: $analysis"
 fi
@@ -413,6 +491,12 @@ check_exit_trap_fixture "a second trap ... 0 after the real one fails" fail "$(p
   'shutdown_children() { kill -TERM "$1" 2>/dev/null || true; }' \
   "trap 'shutdown_children TERM' EXIT" \
   "trap 'cleanup_pids_file' 0")"
+check_exit_trap_fixture "an eval trap override fails" fail "$(printf '%s\n' \
+  "trap 'shutdown_children TERM' EXIT" \
+  "eval \"trap 'cleanup_pids_file' 0\"")"
+check_exit_trap_fixture "an eval with no trap word fails" fail "$(printf '%s\n' \
+  "trap 'shutdown_children TERM' EXIT" \
+  'eval "$cmd"')"
 check_exit_trap_fixture "trap - EXIT fails" fail "trap - EXIT"
 check_exit_trap_fixture "trap '' EXIT fails" fail "trap '' EXIT"
 check_exit_trap_fixture "trap '' 0 fails" fail "trap '' 0"
@@ -642,8 +726,7 @@ SH
 
   # (3c) cli#357 r4 — a ~10 s TERM grace (counted sleeps), then a KILL attempt.
   # The child ignores TERM; the supervisor attempts KILL after the grace and
-  # exits. It sees exactly one TERM: the second shutdown call (the EXIT trap)
-  # signals no PID.
+  # exits. It sees exactly one TERM.
   mkshutdown() {
     local d="$1"
     mkshims "$d" no
@@ -693,14 +776,11 @@ SH
   shut_pid="$(sed -n 's/^started //p' "$SHUTDOWN_MARKER" | head -n1)"
   if [ -n "$shut_pid" ] && ! kill -0 "$shut_pid" 2>/dev/null; then ok "TERM grace then KILL: the TERM-ignoring child $shut_pid is gone"; else bad "TERM grace then KILL: the child '${shut_pid:-unknown}' survived"; fi
   terms="$(grep -c '^term$' "$SHUTDOWN_MARKER" || true)"
-  if [ "$terms" -eq 1 ]; then ok "TERM grace then KILL: one TERM for two shutdown calls"; else bad "TERM grace then KILL: the child saw $terms TERM(s), expected 1"; fi
+  if [ "$terms" -eq 1 ]; then ok "TERM grace then KILL: one TERM through signal and EXIT traps"; else bad "TERM grace then KILL: the child saw $terms TERM(s), expected 1"; fi
   if [ ! -e /workspace/.tps/pids.json ]; then ok "TERM grace then KILL: the PID file is removed"; else bad "TERM grace then KILL: the PID file remains"; fi
 
-  # (3d) cli#357 r4 — the launch-window deferral, deterministically. The
-  # supervisor's test-only seam pauses briefly (so the child can start), then
-  # sends it the signal right after the background launch and before `pid=$!`,
-  # so every run lands inside the window. The child must be stopped and the PID
-  # file removed.
+  # (3d) cli#357 r4 — the hook sends TERM to the supervisor between launch
+  # and `pid=$!`. The child must be stopped and the PID file removed.
   mksignalseam() {
     local d="$1"
     mkshims "$d" no
@@ -976,7 +1056,7 @@ SH
 
     # C.5 — cli#357 r4: bind to the session the supervisor launched: the one
     # running session whose nono supervisor descends from the PID it recorded in
-    # the PID file (that PID is the launch above nono, as C.2 checks, so it is
+    # the PID file (that PID is the launch above nono, as C.1 checks, so it is
     # never nono's own supervisor_pid). Record that session's id/name, signal the
     # supervisor, then ask real `nono ps` whether that exact session is gone,
     # along with its child and the PID file. Zero or several matches fail.
@@ -1000,12 +1080,15 @@ SH
     done
     sess5=""
     for _ in $(seq 1 40); do
-      sess5="[]"
+      sess5=""
       if [ -n "$launched5" ]; then
-        sess5="$(ps_as_agent 2>/dev/null | jq -c '.[] | select(.status == "running")' 2>/dev/null | while IFS= read -r s; do
-          sp="$(printf '%s' "$s" | jq -r '.supervisor_pid // empty' 2>/dev/null)"
-          if [ -n "$sp" ] && is_descendant_of "$sp" "$launched5"; then printf '%s\n' "$s"; fi
-        done | jq -cs '.' 2>/dev/null || echo '[]')"
+        if ps_as_agent >"$real/ps5.before.json" 2>/dev/null; then ps5_status=0; else ps5_status=$?; fi
+        if [ "$ps5_status" -eq 0 ] && jq -e -s 'length == 1 and (.[0] | type == "array")' "$real/ps5.before.json" >/dev/null 2>&1; then
+          sess5="$(jq -c '.[] | select(.status == "running")' "$real/ps5.before.json" | while IFS= read -r s; do
+            sp="$(printf '%s' "$s" | jq -r '.supervisor_pid // empty' 2>/dev/null)"
+            if [ -n "$sp" ] && is_descendant_of "$sp" "$launched5"; then printf '%s\n' "$s"; fi
+          done | jq -cs '.')"
+        fi
       fi
       [ -n "$sess5" ] && [ "$sess5" != "[]" ] && break
       kill -0 "$sup5" 2>/dev/null || break
@@ -1033,17 +1116,23 @@ SH
       sleep 0.5
     done
     if [ "$gone5" -eq 1 ]; then ok "real-nono stop: the session child and its nono supervisor are gone"; else bad "real-nono stop: the session child '$child5' or its nono supervisor '$sess5_sup' survived"; fi
-    sess5_after=""
+    ps5_status=1
     if [ -n "$sess5_id" ] || [ -n "$sess5_name" ]; then
       for _ in $(seq 1 20); do
-        sess5_after="$(ps_as_agent 2>/dev/null | jq -c --arg id "${sess5_id:-}" --arg name "${sess5_name:-}" '[.[] | select(.status == "running" and (($id != "" and .session_id == $id) or ($name != "" and .name == $name)))]' 2>/dev/null)"
-        [ "$sess5_after" = "[]" ] && break
+        if ps_as_agent >"$real/ps5.after.json" 2>/dev/null; then ps5_status=0; else ps5_status=$?; fi
+        if session_gone_in "$real/ps5.after.json" "$ps5_status" "$sess5_id" "$sess5_name"; then break; fi
         sleep 0.5
       done
-    else
-      sess5_after="[unrecorded]"
     fi
-    if [ "$sess5_after" = "[]" ]; then ok "real-nono stop: the recorded session ($sess5_name $sess5_id) is no longer running in nono ps"; else bad "real-nono stop: nono ps did not confirm the recorded session ($sess5_name ${sess5_id:-none}) gone (raw='$sess5_after')"; fi
+    if [ -n "$sess5_id" ] || [ -n "$sess5_name" ]; then
+      if session_gone_in "$real/ps5.after.json" "$ps5_status" "$sess5_id" "$sess5_name"; then
+        ok "real-nono stop: the recorded session ($sess5_name $sess5_id) is no longer running in nono ps"
+      else
+        bad "real-nono stop: nono ps did not confirm the recorded session ($sess5_name ${sess5_id:-none}) gone (status=$ps5_status raw='$(cat "$real/ps5.after.json" 2>/dev/null)')"
+      fi
+    else
+      bad "real-nono stop: no recorded session id or name"
+    fi
     if [ ! -e /workspace/.tps/pids.json ]; then ok "real-nono stop: the PID file is removed"; else bad "real-nono stop: the PID file remains"; fi
     export AGENT_SLEEP=6
   fi
