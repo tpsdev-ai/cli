@@ -137,6 +137,30 @@ describe("every Socket Firewall action step", () => {
     });
   });
 
+  test("every workflow step that runs it passes no arguments", () => {
+    const violations: string[] = [];
+    let total = 0;
+
+    for (const file of workflowFiles()) {
+      const workflow = loadWorkflow(file);
+      for (const [jobId, job] of Object.entries(workflow.jobs ?? {})) {
+        const steps = Array.isArray(job.steps) ? job.steps : [];
+        steps.forEach((step, index) => {
+          if (typeof step.run !== "string" || !step.run.includes("prefetch-socket-firewall.sh")) return;
+          total += 1;
+          if (step.run !== PREFETCH) {
+            violations.push(
+              `${file} job ${jobId} step ${index + 1} runs ${JSON.stringify(step.run)}, not \`${PREFETCH}\``,
+            );
+          }
+        });
+      }
+    }
+
+    expect(violations).toEqual([]);
+    expect(total).toBe(14);
+  });
+
   test("the pre-fetch verifies the pinned binary before it can be used", () => {
     const script = readFileSync(join(REPO, "scripts", "prefetch-socket-firewall.sh"), "utf8");
 
@@ -350,6 +374,66 @@ describe("the pre-fetch cache and download paths", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("environment values cannot change the download URL or the pin", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-env-"));
+    try {
+      const fakeBin = join(root, "bin");
+      mkdirSync(fakeBin);
+      const argvLog = join(root, "curl.argv");
+      writeFileSync(
+        join(fakeBin, "curl"),
+        [
+          "#!/bin/sh",
+          'printf "%s\\n" "$*" >> "$CURL_ARGV_LOG"',
+          'out=""',
+          'while [ $# -gt 0 ]; do',
+          '  case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac',
+          "done",
+          'printf "injected-payload" > "$out"',
+          "",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
+        env: {
+          ...process.env,
+          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+          RUNNER_TOOL_CACHE: join(root, "cache"),
+          RUNNER_TEMP: root,
+          GITHUB_WORKSPACE: join(root, "workspace"),
+          CURL_ARGV_LOG: argvLog,
+          SFW_PREFETCH_URL: "https://example.invalid/sfw",
+          SFW_PREFETCH_TEST_SHA256: sha256("injected-payload"),
+        },
+        encoding: "utf8",
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("checksum mismatch");
+      const attempted = readFileSync(argvLog, "utf8");
+      expect(attempted).toContain("https://github.com/SocketDev/sfw-free/releases/download/v1.15.4/sfw-free-");
+      expect(attempted).not.toContain("example.invalid");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("refuses an unknown argument", () => {
+    const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-args-"));
+    try {
+      const result = spawnSync("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh"), "--unknown-flag"], {
+        env: { ...process.env, RUNNER_TOOL_CACHE: join(root, "cache"), RUNNER_TEMP: root },
+        encoding: "utf8",
+      });
+
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("unknown argument");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
 
 function archName(): string {
@@ -461,17 +545,26 @@ describe("the pre-fetch retry against a local HTTP server", () => {
       });
       const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-retry-"));
       try {
-        const result = await runProcess("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
-          env: testEnv({
-            RUNNER_TOOL_CACHE: join(root, "cache"),
-            RUNNER_TEMP: root,
-            GITHUB_WORKSPACE: join(root, "workspace"),
-            SFW_PREFETCH_URL: `${server.url}/sfw-free-linux-x86_64`,
-            SFW_PREFETCH_TEST_SHA256: sha256(payload),
-            SFW_PREFETCH_RETRY_DELAY: "1",
-          }),
-          timeoutMs: 25_000,
-        });
+        const result = await runProcess(
+          "bash",
+          [
+            join(REPO, "scripts", "prefetch-socket-firewall.sh"),
+            "--test-url",
+            `${server.url}/sfw-free-linux-x86_64`,
+            "--test-sha256",
+            sha256(payload),
+            "--test-retry-delay",
+            "1",
+          ],
+          {
+            env: testEnv({
+              RUNNER_TOOL_CACHE: join(root, "cache"),
+              RUNNER_TEMP: root,
+              GITHUB_WORKSPACE: join(root, "workspace"),
+            }),
+            timeoutMs: 25_000,
+          },
+        );
 
         expect(result.status).toBe(0);
         expect(attempts).toBe(2);
@@ -495,17 +588,26 @@ describe("the pre-fetch retry against a local HTTP server", () => {
       });
       const root = mkdtempSync(join(tmpdir(), "sfw-prefetch-retry-"));
       try {
-        const result = await runProcess("bash", [join(REPO, "scripts", "prefetch-socket-firewall.sh")], {
-          env: testEnv({
-            RUNNER_TOOL_CACHE: join(root, "cache"),
-            RUNNER_TEMP: root,
-            GITHUB_WORKSPACE: join(root, "workspace"),
-            SFW_PREFETCH_URL: `${server.url}/sfw-free-linux-x86_64`,
-            SFW_PREFETCH_TEST_SHA256: sha256("never-served"),
-            SFW_PREFETCH_RETRY_DELAY: "1",
-          }),
-          timeoutMs: 25_000,
-        });
+        const result = await runProcess(
+          "bash",
+          [
+            join(REPO, "scripts", "prefetch-socket-firewall.sh"),
+            "--test-url",
+            `${server.url}/sfw-free-linux-x86_64`,
+            "--test-sha256",
+            sha256("never-served"),
+            "--test-retry-delay",
+            "1",
+          ],
+          {
+            env: testEnv({
+              RUNNER_TOOL_CACHE: join(root, "cache"),
+              RUNNER_TEMP: root,
+              GITHUB_WORKSPACE: join(root, "workspace"),
+            }),
+            timeoutMs: 25_000,
+          },
+        );
 
         expect(result.status).not.toBe(0);
         expect(server.requests.length).toBe(9);

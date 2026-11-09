@@ -13,6 +13,52 @@
 # the pin is discarded; the script downloads instead.
 set -euo pipefail
 
+# Test overrides are command-line flags only, which a workflow step cannot
+# inject: workflow steps invoke this script with no arguments, so no
+# environment value can change the download URL or the pinned sha256. Clear any
+# SFW_PREFETCH_* variable inherited from the job environment.
+for sfw_env_name in $(compgen -e); do
+  case "${sfw_env_name}" in
+    SFW_PREFETCH_*) unset "${sfw_env_name}" ;;
+  esac
+done
+
+test_url=""
+test_sha256=""
+test_retry_delay=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --test-url)
+      if [ $# -lt 2 ]; then
+        echo "::error::--test-url requires a value" >&2
+        exit 2
+      fi
+      test_url="$2"
+      shift 2
+      ;;
+    --test-sha256)
+      if [ $# -lt 2 ]; then
+        echo "::error::--test-sha256 requires a value" >&2
+        exit 2
+      fi
+      test_sha256="$2"
+      shift 2
+      ;;
+    --test-retry-delay)
+      if [ $# -lt 2 ]; then
+        echo "::error::--test-retry-delay requires a value" >&2
+        exit 2
+      fi
+      test_retry_delay="$2"
+      shift 2
+      ;;
+    *)
+      echo "::error::unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
 FIREWALL_VERSION="1.15.4"
 
 # The action runs only on an Actions runner, where RUNNER_TOOL_CACHE is set.
@@ -48,13 +94,14 @@ case "$(uname -s)-$(uname -m)" in
     ;;
 esac
 
-# Test-only seams, unset in CI: the retry test points the real curl at a local
-# server, overrides the pin to that server's payload, and shortens the backoff.
-# Unset, the URL and sha256 are the production values and curl uses its own
-# backoff.
-URL="${SFW_PREFETCH_URL:-https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}}"
-if [ -n "${SFW_PREFETCH_TEST_SHA256:-}" ]; then
-  SHA256="${SFW_PREFETCH_TEST_SHA256}"
+# The production URL and sha256 are the values above. Test flags may replace
+# them; no workflow step passes one.
+URL="https://github.com/SocketDev/sfw-free/releases/download/v${FIREWALL_VERSION}/sfw-free-${ASSET}"
+if [ -n "${test_url}" ]; then
+  URL="${test_url}"
+fi
+if [ -n "${test_sha256}" ]; then
+  SHA256="${test_sha256}"
 fi
 CACHE_DIR="${RUNNER_TOOL_CACHE}/socket-firewall-free/${FIREWALL_VERSION}/${ARCH}"
 CACHE_BINARY="${CACHE_DIR}/sfw"
@@ -103,11 +150,11 @@ trap 'rm -f "${tmp}"' EXIT
 
 # Cold cache: bounded exponential backoff (curl doubles its delay between
 # attempts), so an outage of a few minutes is ridden out but the job's timeout
-# still bounds the wait. SFW_PREFETCH_RETRY_DELAY is test-only: unset in CI,
-# where curl keeps its own backoff.
+# still bounds the wait. --test-retry-delay replaces curl's backoff in the
+# tests only.
 retry_delay_args=()
-if [ -n "${SFW_PREFETCH_RETRY_DELAY:-}" ]; then
-  retry_delay_args=(--retry-delay "${SFW_PREFETCH_RETRY_DELAY}")
+if [ -n "${test_retry_delay}" ]; then
+  retry_delay_args=(--retry-delay "${test_retry_delay}")
 fi
 curl -fsSL --retry 8 --retry-all-errors --retry-max-time 300 --connect-timeout 20 --max-time 60 "${retry_delay_args[@]+"${retry_delay_args[@]}"}" -o "${tmp}" "${URL}"
 if [ "$(sha256_of "${tmp}")" != "${SHA256}" ]; then
