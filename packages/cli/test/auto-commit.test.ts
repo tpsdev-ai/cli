@@ -427,9 +427,9 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
       const baseline = probeHead(repo);
       expect(evaluateMailAutoCommitGate(repo, baseline)).toEqual({
         action: "skip",
-        message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
       });
-      expect(baseline).toEqual({ state: "indeterminate", detail: "failed" });
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -467,6 +467,73 @@ describe("evaluateMailAutoCommitGate unborn HEAD", () => {
       const sha = git(repo, "rev-parse", "HEAD").trim();
       git(repo, "checkout", "-q", "--detach", sha);
       expect(probeHead(repo)).toEqual({ state: "commit", head: sha });
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a symbolic-ref error with a resolvable commit is indeterminate and skips naming the probe", () => {
+    const dir = mkdtempSync(join(tmpdir(), "cli835-symbolic-"));
+    try {
+      const shim = gitShim(
+        dir,
+        [
+          'if [ "$1" = "symbolic-ref" ]; then exit 128; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--path-format=absolute" ]; then echo "${SHIM_ROOT}/rebase-merge"; exit 0; fi',
+          'if [ "$1" = "rev-parse" ] && [ "$2" = "--verify" ]; then echo "$SHIM_HEAD"; exit 0; fi',
+          'exit 0',
+        ].join("\n"),
+      );
+      const runSync = shimRunner(shim, { SHIM_ROOT: dir, SHIM_HEAD: "a".repeat(40) });
+      const baseline = probeHead(dir, runSync);
+      expect(baseline).toEqual({ state: "indeterminate", detail: "failed", probe: "git symbolic-ref -q HEAD" });
+      expect(evaluateMailAutoCommitGate(dir, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: "Change check could not run: git symbolic-ref -q HEAD (before task) failed — skipping autoCommit",
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("skips naming the restored and final HEADs when an aborted rebase leaves an unborn final HEAD", () => {
+    const repo = initUnbornRepo();
+    try {
+      const baseline = probeHead(repo);
+      expect(baseline).toEqual({ state: "unborn" });
+      // The task commits on `topic`, branches a conflicting commit on `other`,
+      // and starts a rebase it leaves interrupted.
+      git(repo, "checkout", "-q", "-b", "topic");
+      writeFileSync(join(repo, "file.txt"), "task\n");
+      git(repo, "add", "file.txt");
+      git(repo, "commit", "-q", "-m", "task");
+      git(repo, "checkout", "-q", "-b", "other");
+      writeFileSync(join(repo, "file.txt"), "other\n");
+      git(repo, "commit", "-q", "-am", "other");
+      git(repo, "checkout", "-q", "topic");
+      writeFileSync(join(repo, "file.txt"), "task follow-up\n");
+      git(repo, "commit", "-q", "-am", "follow-up");
+      const restored = git(repo, "rev-parse", "HEAD").trim();
+      expect(spawnSync(GIT, ["rebase", "other"], { cwd: repo, encoding: "utf-8" }).status).not.toBe(0);
+
+      // The abort restores `topic` at the task's tip; deleting that ref before
+      // the final read makes HEAD unborn again.
+      let deleted = false;
+      const runSync = ((command: any, args: any, options: any) => {
+        if (!deleted && (args as string[]).join(" ") === "status --porcelain") {
+          deleted = true;
+          const drop = spawnSync(GIT, ["update-ref", "-d", "refs/heads/topic"], { cwd: repo, encoding: "utf-8" });
+          if (drop.status !== 0) throw new Error(String(drop.stderr));
+        }
+        return spawnSync(command, args, options);
+      }) as typeof spawnSync;
+
+      expect(evaluateMailAutoCommitGate(repo, baseline, { runSync })).toEqual({
+        action: "skip",
+        message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restored}, final unborn) — skipping autoCommit`,
+      });
+      expect(deleted).toBe(true);
+      expect(probeHead(repo)).toEqual({ state: "unborn" });
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

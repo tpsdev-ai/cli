@@ -13,14 +13,15 @@ export const GIT_BIN = process.env.TPS_GIT_BIN ?? "/usr/bin/git";
 export type HeadProbe =
   | { state: "commit"; head: string }
   | { state: "unborn" }
-  | { state: "indeterminate"; detail: "failed" | "returned no output" };
+  | { state: "indeterminate"; detail: "failed" | "returned no output"; probe?: string };
 
 /**
  * Classify the repository's HEAD.
  *
- * "commit" requires `git symbolic-ref -q HEAD` to fail or to name a ref under
- * `refs/heads/`, and `git rev-parse --verify -q HEAD^{commit}` to succeed; a
- * symbolic HEAD outside refs/heads/ is indeterminate before any commit check.
+ * "commit" requires `git symbolic-ref -q HEAD` to exit 1 with no output
+ * (detached) or to name a ref under `refs/heads/`, and `git rev-parse --verify
+ * -q HEAD^{commit}` to succeed; a symbolic-ref error, or a symbolic HEAD
+ * outside refs/heads/, is indeterminate before any commit check.
  * "unborn" requires all of: `git symbolic-ref -q HEAD` prints a ref under
  * `refs/heads/`, `git rev-parse --verify -q HEAD` finds nothing, and that
  * branch ref does not exist (`git show-ref --verify -q <ref>` exits 1). An
@@ -30,11 +31,16 @@ export type HeadProbe =
  * outcome.
  */
 export function probeHead(repo: string, runSync: typeof spawnSync = spawnSync): HeadProbe {
+  const symbolicProbe = "git symbolic-ref -q HEAD";
   const symbolic = runSync(GIT_BIN, ["symbolic-ref", "-q", "HEAD"], { cwd: repo, encoding: "utf-8" });
-  const branch = symbolic.status === 0 ? String(symbolic.stdout ?? "").trim() : undefined;
-  if (branch !== undefined && !branch.startsWith("refs/heads/")) {
+  const symbolicOutput = String(symbolic.stdout ?? "").trim();
+  if (symbolic.status === 0 && !symbolicOutput.startsWith("refs/heads/")) {
     return { state: "indeterminate", detail: "failed" };
   }
+  if (symbolic.status !== 0 && !(symbolic.status === 1 && symbolicOutput === "")) {
+    return { state: "indeterminate", detail: "failed", probe: symbolicProbe };
+  }
+  const branch = symbolic.status === 0 ? symbolicOutput : undefined;
 
   const head = runSync(GIT_BIN, ["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: repo, encoding: "utf-8" });
   if (head.status === 0) {

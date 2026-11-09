@@ -398,7 +398,8 @@ export type MailAutoCommitDecision =
  * and so does a final HEAD that differs from the restored one. An unborn HEAD is
  * a branch with no commit yet (the repository may have other branches) and has
  * no pre-task value to compare, so workspace changes or a new commit select the
- * commit path, and neither is clean. "Workspace changes" means what
+ * commit path, and neither is clean, unless an aborted rebase restored a
+ * different HEAD. "Workspace changes" means what
  * `git status --porcelain` reports; ignored files are not changes. The clean
  * outcome is returned only when the status probe and both HEAD probes succeed
  * and any interrupted rebase was aborted: an indeterminate probe, or a rebase
@@ -422,7 +423,8 @@ export function evaluateMailAutoCommitGate(
     return { action: "skip", message: `Stale rebase check could not run: ${staleRebase.probe}${detail} — skipping autoCommit` };
   }
   if (baselineProbe.state === "indeterminate") {
-    return { action: "skip", message: "Change check could not run: git rev-parse HEAD (before task) failed — skipping autoCommit" };
+    const probe = baselineProbe.probe ?? "git rev-parse HEAD";
+    return { action: "skip", message: `Change check could not run: ${probe} (before task) failed — skipping autoCommit` };
   }
 
   let restoredHead: string | undefined;
@@ -446,7 +448,17 @@ export function evaluateMailAutoCommitGate(
   const finalProbe = probeHead(repo, runSync);
   if (finalProbe.state === "indeterminate") {
     const detail = finalProbe.detail === "returned no output" ? "returned no output" : "failed";
-    return { action: "skip", message: `Change check could not run: git rev-parse HEAD (after task) ${detail} — skipping autoCommit` };
+    const probe = finalProbe.probe ?? "git rev-parse HEAD";
+    return { action: "skip", message: `Change check could not run: ${probe} (after task) ${detail} — skipping autoCommit` };
+  }
+  if (restoredHead !== undefined) {
+    const finalValue = finalProbe.state === "commit" ? finalProbe.head : "unborn";
+    if (finalValue !== restoredHead) {
+      return {
+        action: "skip",
+        message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restoredHead}, final ${finalValue}) — skipping autoCommit`,
+      };
+    }
   }
   if (finalProbe.state === "unborn") {
     if (baselineProbe.state === "commit") {
@@ -457,12 +469,6 @@ export function evaluateMailAutoCommitGate(
     return { action: "clean", message: "Git status is clean and the repository has no commits — skipping autoCommit" };
   }
   const finalHead = finalProbe.head;
-  if (restoredHead !== undefined && finalHead !== restoredHead) {
-    return {
-      action: "skip",
-      message: `Change check could not run: HEAD changed between the restored read and the final read (restored ${restoredHead}, final ${finalHead}) — skipping autoCommit`,
-    };
-  }
   if (baselineProbe.state === "unborn") {
     return { action: "commit" };
   }
@@ -1168,8 +1174,9 @@ export async function runCodexRuntime(config: CodexRuntimeConfig): Promise<void>
           // Auto-commit after a mail task. Unlike the Flair task path above,
           // the mail path detects and aborts an interrupted rebase in the
           // commit repository, keeps the pre-task HEAD as the comparison when
-          // the repository has one (a restored HEAD different from it causes a
-          // commit attempt), and probes Git status and HEAD before deciding.
+          // the repository has one (a restored HEAD different from it can
+          // select a commit attempt when the later status and HEAD probes
+          // succeed), and probes Git status and HEAD before deciding.
           if (config.autoCommit && commitRepo !== undefined) {
             const flairPublisher = { publishEvent: async (ev: Record<string, unknown>) => {
               try { await (flair as any).request("POST", "/OrgEvent", { ...ev, authorId: agentId }); } catch { /* non-fatal */ }
