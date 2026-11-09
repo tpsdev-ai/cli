@@ -344,7 +344,7 @@ describe("docker.yml runs docker-image-tags.sh before any build and pushes only 
     expect(String(builds[0].with?.["build-args"]).trim()).toBe(
       "TPS_VERSION=${{ needs.meta.outputs.tps_version }}",
     );
-    const ghcr = jobs.publish.steps.find((s) => s.run?.includes('"docker://$tag"'));
+    const ghcr = jobs.publish.steps.find((s) => s.run?.includes('docker-publish-index.sh push "$tag"'));
     expect(ghcr?.env?.TAGS).toBe("${{ needs.meta.outputs.tags }}");
     expect(
       Object.values(jobs).flatMap((j) => j.steps).filter((s) => s.with?.push === true).length,
