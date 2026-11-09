@@ -1429,7 +1429,7 @@ const READ_TRACKED = new Set(["plugins/read/package-lock.json", "plugins/good/pa
 describe("the workflow guard checks lines containing npm and helper calls", () => {
   it.each(["npm ci", "sfw npm ci --ignore-scripts --no-audit --no-fund"])("refuses a literal npm ci command word outside the helper: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(
-      `job build step 1: cannot establish the npm ci directory: raw npm install is refused; use the tracked-lock helper: ${run}`,
+      `job build step 1: cannot establish the npm ci directory: a run line containing npm is refused unless the whole line is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), a tracked-lock helper call, or the bounded global tool install: ${run}`,
     );
   }, 5_000);
 
@@ -1450,7 +1450,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
     'bash scripts/npm-ci-tracked-lock.sh --via sfw /absolute "$prefix"',
     'bash scripts/npm-ci-tracked-lock.sh --via sfw plugins/unread "$prefix"',
   ])("refuses a helper fixture outside its literal tracked contract: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile|raw npm install)/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run, "."), READ_TRACKED)).toThrow(/job build step 1.*(?:literal relative|not a tracked lockfile|run line containing npm)/);
   }, 30_000);
 
   it.each([
@@ -1475,7 +1475,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
   it("refuses the unrelated-copy and raw-prefix probe", () => {
     expect(() => assertNpmCiLockfilesRead(workflowStep(
       "cp ../good/package-lock.json /tmp/dummy/package-lock.json\nnpm ci --prefix ../unread",
-    ), READ_TRACKED)).toThrow(/job build step 1.*raw npm install is refused/);
+    ), READ_TRACKED)).toThrow(/job build step 1.*run line containing npm is refused unless/);
   });
 
   it.each([
@@ -1522,7 +1522,7 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
 
   it.each(["cd ../good && npm ci", "cd plugins/x && npm ci", "cd ../unread && npm ci"])(
     "refuses a leading cd before literal npm ci command words: %s", (run) => {
-      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/raw npm install is refused/);
+      expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED)).toThrow(/run line containing npm is refused unless/);
     }, 5_000,
   );
 
@@ -1556,7 +1556,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   it.each(["npm c\\i", "'npm' ci", '"npm" ci'])(
     "refuses the escaped or quoted raw npm ci spelling: %s", (run) => {
       expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(
-        `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: raw npm install is refused; use the tracked-lock helper: ${run} (physical line 1)`,
+        `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: a run line containing npm is refused unless the whole line is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), a tracked-lock helper call, or the bounded global tool install: ${run} (physical line 1)`,
       );
     }, 5_000,
   );
@@ -1669,7 +1669,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
     "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org extra",
     "npm install -g tool@1.2.3-..",
   ])("refuses a global install outside the exact pinned shape: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run line containing npm is refused unless/);
   }, 5_000);
 });
 
@@ -1765,7 +1765,7 @@ describe("the workflow guard bounds global tool versions", () => {
   ];
 
   it.each(refused)("refuses a global install outside the bounded exact shape: %s", (run) => {
-    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/raw npm install is refused/);
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(/run line containing npm is refused unless/);
   }, 5_000);
 
   it.skipIf(!npmAvailable)("accepts tool@1.2.3 and checks every refused spec against npm's own parser (needs npm on PATH)", () => {

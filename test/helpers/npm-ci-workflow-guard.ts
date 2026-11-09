@@ -150,7 +150,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
       helpers.push(entry);
       continue;
     }
-    refuse(entry, "raw npm install is refused; use the tracked-lock helper");
+    refuse(entry, "a run line containing npm is refused unless the whole line is an exact allowlist entry in test/helpers/npm-ci-workflow-guard.ts (add one with its reason), a tracked-lock helper call, or the bounded global tool install");
   }
   if (helpers.length === 0) return [];
   if (!/^(?!\/)[A-Za-z0-9_./-]*$/.test(workdir)) refuse(helpers[0], "non-literal working-directory");
