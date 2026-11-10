@@ -284,7 +284,7 @@ test.each([["close resolves", false], ["close rejects", true]] as const)("a host
 test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejects keeps the record and fails %s", async (mode) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-stop-close-748-"));
   const savedEnv = savedRelayEnv();
-  const listeners = new Set(process.listeners("SIGINT"));
+  const listeners = new Set([...process.listeners("SIGINT"), ...process.listeners("SIGTERM")]);
   let stop: (() => Promise<void>) | undefined;
   let sigint: (() => Promise<void>) | undefined;
   let closes = 0;
@@ -331,8 +331,10 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
     rejectClose = false;
     await stop?.();
     await sigint?.().catch((error) => { if (error !== exited) throw error; });
-    for (const listener of process.listeners("SIGINT")) {
-      if (!listeners.has(listener)) process.off("SIGINT", listener);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      for (const listener of process.listeners(signal)) {
+        if (!listeners.has(listener)) process.off(signal, listener);
+      }
     }
     exit.mockRestore();
     output.mockRestore();
