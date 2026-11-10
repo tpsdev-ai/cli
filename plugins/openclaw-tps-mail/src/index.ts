@@ -1025,8 +1025,10 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
  * A definitive non-delivery verdict is a REFUSAL DECIDED BEFORE THE DELIVERY
  * CALL (no route, a named route failure such as `gal-without-remote`), or the
  * outbox drain quarantining THIS reply's own record (attributed by its reply
- * id, once it has stayed malformed past the partial-write grace). A THROW FROM
- * THE DELIVERY CALL IS NOT A VERDICT (cli#389 round 9, item 1): once `delivering` is persisted the bytes may already have left, so a throw
+ * id, once it has stayed malformed past the partial-write grace, or was dated
+ * in the future). A THROW FROM THE DELIVERY CALL IS NOT A VERDICT (cli#389
+ * round 9, item 1): once `delivering` is persisted the bytes may already have
+ * left, so a throw
  * — and any evidence step that threw — resolves by evidence or deadline, never
  * to `failed`. An unrelated `.malformed-*` marker is not a verdict either.
  *
@@ -1389,11 +1391,11 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
   if (!isLiveContext(ctx)) return;
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
-  // record after it stayed malformed past the partial-write grace) is a
-  // definitive non-delivery: the obligation fails and nacks even though its
-  // delivery committed. With no evidence and no verdict, a committed record
-  // becomes `unconfirmed` (no nack mail, no nack stamp) and only a record that
-  // never committed fails and is announced to the sender.
+  // record once it had stayed malformed past the partial-write grace, or was
+  // dated in the future) is a definitive non-delivery: the obligation fails and
+  // nacks even though its delivery committed. With no evidence and no verdict, a
+  // committed record becomes `unconfirmed` (no nack mail, no nack stamp) and only
+  // a record that never committed fails and is announced to the sender.
   const reason = "yielded-without-resumption";
   const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
   // cli#389 round 9, item 2: the VERB announces a failure — this caller does not
@@ -2338,12 +2340,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         } else if (receipt.status === "malformed" && receipt.ownRecord) {
           // cli#398 T4(e) RESTORED (cli#389 round 8) as ATTRIBUTABLE quarantine.
           // The drain quarantined THIS reply's own record — the quarantined name
-          // still carries the reply id this obligation posted — after it stayed
-          // malformed past the partial-write grace, so its non-delivery is
-          // DEFINITIVE: the obligation fails and nacks, even though the delivery
-          // call returned. An unrelated `.malformed-*` (a quarantine that cannot
-          // be tied to this reply) is NOT a verdict: that falls through and
-          // resolves at the deadline.
+          // still carries the reply id this obligation posted — once it had
+          // stayed malformed past the partial-write grace, or was dated in the
+          // future, so its non-delivery is DEFINITIVE: the obligation fails and
+          // nacks, even though the delivery call returned. An unrelated
+          // `.malformed-*` (a quarantine that cannot be tied to this reply) is
+          // NOT a verdict: that falls through and resolves at the deadline.
           yieldCtx.step = "receipt-quarantined";
           await settleObligation(yieldCtx, obId, { receipt: "none", verdict: "receipt-malformed", reason: "receipt-malformed" });
         } else if (postFailure) {
