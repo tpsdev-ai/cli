@@ -33,8 +33,9 @@ indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
-tracks `cd` through one resolution state, scans command substitutions (each with
-its own `cd` and nested state), resolves wrapped interpreters and literal
+tracks `cd` through one resolution state, scans command substitutions (`$(...)`
+and backtick spans, each with its own `cd` and nested state; a backtick span it
+cannot parse reliably is refused), resolves wrapped interpreters and literal
 invocations, and applies the install classifier; a run block and a followed
 script differ only in their initial state. Here-document bodies are install-screened;
 a here-document passed to a shell is refused rather than executed. It is a fail-closed

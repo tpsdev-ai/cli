@@ -845,40 +845,142 @@ function firstNonFlag(tokens: ShellToken[]): ShellToken | undefined {
   return undefined;
 }
 
-/** Command substitutions in one line, with balanced parentheses and quotes. */
-function commandSubstitutions(line: string): string[] {
-  const bodies: string[] = [];
-  for (let index = 0; index + 1 < line.length; index++) {
-    if (line[index] !== "$" || line[index + 1] !== "(") continue;
-    const start = index + 2;
-    let depth = 0;
-    let quote = "";
-    for (let scan = index + 1; scan < line.length; scan++) {
-      const char = line[scan];
-      if (quote !== "") {
-        if (char === "\\" && quote === '"') {
-          scan++;
-          continue;
-        }
-        if (char === quote) quote = "";
+type SpanMatch = { end: number } | { unparsed: string };
+
+/**
+ * One backtick command substitution starting at `start`: its closing backtick,
+ * with `\`` and `\\` escaped and `$(...)` spans skipped. A span with no
+ * reliable close is returned as unparsed, never guessed.
+ */
+function backtickSpan(line: string, start: number): SpanMatch {
+  let index = start + 1;
+  while (index < line.length) {
+    const char = line[index];
+    if (char === "\\") {
+      if (index + 1 >= line.length) return { unparsed: line.slice(start) };
+      index += 2;
+      continue;
+    }
+    if (char === "$" && line[index + 1] === "(") {
+      const inner = parenSpan(line, index + 1);
+      if (inner === null) return { unparsed: line.slice(start) };
+      if ("unparsed" in inner) return inner;
+      index = inner.end + 1;
+      continue;
+    }
+    if (char === "`") return { end: index };
+    index++;
+  }
+  return { unparsed: line.slice(start) };
+}
+
+/** One `$(...)` span starting at its `(`, skipping backtick spans inside it. */
+function parenSpan(line: string, open: number): SpanMatch | null {
+  let depth = 0;
+  let quote = "";
+  for (let index = open; index < line.length; index++) {
+    const char = line[index];
+    if (quote !== "") {
+      if (char === "\\" && quote === '"') {
+        index++;
         continue;
       }
-      if (char === "'" || char === '"') {
-        quote = char;
+      if (char === "`" && quote === '"') {
+        const inner = backtickSpan(line, index);
+        if ("unparsed" in inner) return inner;
+        index = inner.end;
         continue;
       }
-      if (char === "(") depth++;
-      else if (char === ")") {
-        depth--;
-        if (depth === 0) {
-          bodies.push(line.slice(start, scan));
-          index = scan;
-          break;
-        }
-      }
+      if (char === quote) quote = "";
+      continue;
+    }
+    if (char === "\\") {
+      index++;
+      continue;
+    }
+    if (char === "'" || char === '"') {
+      quote = char;
+      continue;
+    }
+    if (char === "`") {
+      const inner = backtickSpan(line, index);
+      if ("unparsed" in inner) return inner;
+      index = inner.end;
+      continue;
+    }
+    if (char === "(") depth++;
+    else if (char === ")") {
+      depth--;
+      if (depth === 0) return { end: index };
     }
   }
-  return bodies;
+  return null;
+}
+
+/** Positions inside a single-quoted span, where a backtick is literal. */
+function singleQuoteMask(line: string): boolean[] {
+  const mask: boolean[] = [];
+  let quote = "";
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    mask.push(quote === "'");
+    if (quote === "'") {
+      if (char === "'") quote = "";
+      continue;
+    }
+    if (char === "\\") {
+      index++;
+      if (index < line.length) mask.push(false);
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') quote = "";
+      continue;
+    }
+    if (char === "'" || char === '"') quote = char;
+  }
+  return mask;
+}
+
+/**
+ * Command substitution bodies in one line: `$(...)` at any depth of nesting
+ * and backtick spans, each returned once at this level; nested bodies are left
+ * to the recursive scan of the body. A backtick span with no reliable close is
+ * returned as unparsed so the caller can refuse it.
+ */
+function commandSubstitutions(line: string): { bodies: string[]; unparsed: string[] } {
+  const bodies: string[] = [];
+  const unparsed: string[] = [];
+  const singleQuoted = singleQuoteMask(line);
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index];
+    if (char === "\\") {
+      index++;
+      continue;
+    }
+    if (char === "$" && line[index + 1] === "(") {
+      const match = parenSpan(line, index + 1);
+      if (match === null) continue;
+      if ("unparsed" in match) {
+        unparsed.push(match.unparsed);
+        break;
+      }
+      bodies.push(line.slice(index + 2, match.end));
+      index = match.end;
+      continue;
+    }
+    if (char === "`" && !singleQuoted[index]) {
+      const match = backtickSpan(line, index);
+      if ("unparsed" in match) {
+        unparsed.push(match.unparsed);
+        break;
+      }
+      // Inside backticks, `\`` becomes a nested delimiter and `\\` a backslash.
+      bodies.push(line.slice(index + 1, match.end).replace(/\\([$`\\])/g, "$1"));
+      index = match.end;
+    }
+  }
+  return { bodies, unparsed };
 }
 
 function pushUnresolved(ctx: TreeContext, rel: string, line: number, token: string, label: string, chain: string[]) {
@@ -1423,8 +1525,19 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     }
     if (state.depth >= 8) continue;
     // A command substitution runs in its own subshell: it starts from the
-    // enclosing state and keeps its own cd and nested substitutions.
-    for (const body of commandSubstitutions(entry.text)) {
+    // enclosing state and keeps its own cd and nested substitutions. A backtick
+    // span the line cannot parse reliably is refused, never skipped.
+    const substitutions = commandSubstitutions(entry.text);
+    for (const token of substitutions.unparsed) {
+      if (state.source === "followed-script") {
+        pushUnresolved(ctx, state.file, number, token, state.label, state.chain);
+      } else {
+        throw new Error(
+          `${state.label}: unresolved backtick command substitution: ${entry.text} (physical line ${number})`,
+        );
+      }
+    }
+    for (const body of substitutions.bodies) {
       scanShellText(ctx, { ...state, depth: state.depth + 1, classifyInstalls: false, lineOverride: number }, body);
     }
   }

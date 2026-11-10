@@ -3057,6 +3057,41 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
       installs: 1,
     },
     {
+      label: "backtick substitution",
+      text: "echo `bash scripts/inst.sh`",
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "wrapped interpreter in backticks",
+      text: "echo `timeout 5 bash scripts/inst.sh`",
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "backticks nested inside a substitution",
+      text: 'echo "$(echo `bash scripts/inst.sh`)"',
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "a substitution nested inside backticks",
+      text: "echo `echo $(bash scripts/inst.sh)`",
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "backticks after an unknown cd",
+      text: 'X="$(mktemp -d)"\ncd "$X"\necho `bash scripts/noop.sh`',
+      files: { "scripts/noop.sh": "echo clean\n" },
+      tracked: new Set(),
+      installs: null,
+    },
+    {
       label: "nested substitution with its own cd",
       text: 'echo "$(cd sub && echo "$(bash inst.sh)")"',
       files: { "sub/inst.sh": "npm ci\n" },
@@ -3176,6 +3211,57 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
       const message = (error as Error).message;
       expect(message).toContain("workflow workflow-chain job build step 1");
       expect(message).toContain("scripts/outer.sh -> scripts/mid.sh -> scripts/inner.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a plain backtick substitution", "y=`bash scripts/inst.sh`"],
+    ["a wrapped interpreter in backticks", "y=`timeout 5 bash scripts/inst.sh`"],
+  ])("refuses %s in a run block and in a followed script", (_label, line) => {
+    for (const asScript of [false, true]) {
+      const root = makeTreeFixture({
+        "scripts/inst.sh": "npm ci\n",
+        ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+      });
+      try {
+        expect(() => assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+          new Set(),
+          root,
+          "workflow-backtick-probe",
+        )).toThrow(/cannot bind the npm install to a tracked lockfile/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("refuses an unbalanced backtick line instead of skipping it", () => {
+    const line = "y=`bash scripts/inst.sh";
+    const root = makeTreeFixture({ "scripts/inst.sh": "echo clean\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(),
+        root,
+        "workflow-backtick-unparsed",
+      )).toThrow(/unresolved backtick command substitution/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an unbalanced backtick in a followed script as unresolved", () => {
+    const root = makeTreeFixture({ "scripts/inner.sh": "y=`bash scripts/inst.sh\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(),
+        root,
+        "workflow-backtick-unparsed-script",
+      )).toThrow(/unresolved script invocation in scripts\/inner\.sh/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
