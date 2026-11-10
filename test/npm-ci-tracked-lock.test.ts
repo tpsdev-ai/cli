@@ -1,6 +1,7 @@
 import { expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -12,7 +13,41 @@ const HELPER = join(REPO, "scripts/npm-ci-tracked-lock.sh");
 const NODE = Bun.which("node");
 if (NODE === null) throw new Error("test setup requires node");
 
-type Recorded = { argv: string[]; cwd: string; lock: string; manifest: string };
+// The real-npm cases need npm. The Unit & Integration lane sets
+// TPS_TEST_REQUIRE_NPM=1, so a missing npm fails there; the Docker Integration
+// image has no npm and skips these cases by name.
+const npmProbe = spawnSync("npm", ["--version"], { encoding: "utf8", timeout: 10_000 });
+const npmAvailable = npmProbe.error === undefined && npmProbe.status === 0;
+if (!npmAvailable && process.env.TPS_TEST_REQUIRE_NPM === "1") {
+  throw new Error("the Unit & Integration lane requires npm on PATH");
+}
+
+type Recorded = {
+  argv: string[];
+  cwd: string;
+  lock: string;
+  manifest: string;
+  registry: string | null;
+  userconfigEmpty: boolean;
+  globalconfigEmpty: boolean;
+  noUpdateNotifier: boolean;
+};
+
+/** The install args without the flags the helper chooses (registry, empty configs). */
+function installerArgs(record: Recorded): string[] {
+  return record.argv.filter((arg) =>
+    !arg.startsWith("--registry=")
+    && !arg.startsWith("--userconfig=")
+    && !arg.startsWith("--globalconfig=")
+    && arg !== "--no-update-notifier");
+}
+
+function expectInstallFlags(record: Recorded, registry = "https://registry.npmjs.org") {
+  expect(record.registry).toBe(registry);
+  expect(record.userconfigEmpty).toBe(true);
+  expect(record.globalconfigEmpty).toBe(true);
+  expect(record.noUpdateNotifier).toBe(true);
+}
 
 function harness(action: (h: ReturnType<typeof makeHarness>) => void, sfw = true) {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-"));
@@ -32,13 +67,24 @@ function makeHarness(root: string, sfw: boolean) {
     symlinkSync(path, join(bin, name));
   }
   const recorder = `#!${NODE}
-const { readFileSync, writeFileSync } = require("node:fs");
+const { readFileSync, writeFileSync, existsSync } = require("node:fs");
 const { join, basename } = require("node:path");
 const argv = process.argv.slice(2);
 if (basename(process.argv[1]) === "npm") writeFileSync(process.env.RECORD + ".npm-call", JSON.stringify({ argv, cwd: process.cwd() }));
 const prefix = argv.includes("--prefix") ? argv[argv.indexOf("--prefix") + 1] : process.cwd();
 const lockPath = join(prefix, "package-lock.json");
-const record = { argv, cwd: process.cwd(), lock: readFileSync(lockPath, "utf8"), manifest: readFileSync(join(prefix, "package.json"), "utf8") };
+const flag = (name) => {
+  const found = argv.find((arg) => arg.startsWith(name + "="));
+  return found === undefined ? null : found.slice(name.length + 1);
+};
+const empty = (path) => path !== null && existsSync(path) && readFileSync(path, "utf8") === "";
+const record = {
+  argv, cwd: process.cwd(), lock: readFileSync(lockPath, "utf8"), manifest: readFileSync(join(prefix, "package.json"), "utf8"),
+  registry: flag("--registry"),
+  userconfigEmpty: empty(flag("--userconfig")),
+  globalconfigEmpty: empty(flag("--globalconfig")),
+  noUpdateNotifier: argv.includes("--no-update-notifier"),
+};
 `;
   writeFileSync(join(bin, "npm"), `${recorder}
 writeFileSync(process.env.RECORD + ".npm", JSON.stringify(record));
@@ -73,8 +119,18 @@ it("the helper copies the committed fixture and invokes npm ci through sfw with 
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
     expect(result.stdout).toContain("reading fixture files from HEAD");
     const args = ["ci", "--prefix", h.prefix, "--ignore-scripts", "--no-audit", "--no-fund"];
-    expect(h.installed()).toEqual({ argv: args, cwd: REPO.replace(/\/$/, ""), lock, manifest });
-    expect(h.firewalled()).toEqual({ argv: ["npm", ...args], cwd: REPO.replace(/\/$/, ""), lock, manifest });
+    const installed = h.installed();
+    expect(installerArgs(installed)).toEqual(args);
+    expectInstallFlags(installed);
+    expect(installed.cwd).toBe(REPO.replace(/\/$/, ""));
+    expect(installed.lock).toBe(lock);
+    expect(installed.manifest).toBe(manifest);
+    const firewalled = h.firewalled();
+    expect(installerArgs(firewalled)).toEqual(["npm", ...args]);
+    expectInstallFlags(firewalled);
+    expect(firewalled.cwd).toBe(REPO.replace(/\/$/, ""));
+    expect(firewalled.lock).toBe(lock);
+    expect(firewalled.manifest).toBe(manifest);
     expect(readFileSync(join(h.prefix, "package-lock.json"), "utf8")).toBe(lock);
   });
 }, 30_000);
@@ -158,6 +214,98 @@ function workingFixture(h: ReturnType<typeof makeHarness>) {
   return repo;
 }
 
+const DEP = "fixture-dep";
+const DEP_TARBALL = `${DEP}-1.0.0.tgz`;
+const DEP_PATH = `/${DEP}/-/${DEP_TARBALL}`;
+
+/** A git repo whose tracked fixture has one installable lock entry. */
+function depFixtureRepo(root: string, entry: Record<string, unknown>) {
+  const repo = join(root, "repo");
+  const dir = join(repo, FIXTURE);
+  mkdirSync(dir, { recursive: true });
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", args, { cwd: repo, env: process.env, encoding: "utf8", timeout: 10_000 });
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    return result.stdout.trim();
+  };
+  git("init", "-q");
+  git("config", "user.name", "Fixture Author");
+  git("config", "user.email", "fixture@example.test");
+  writeFileSync(join(dir, "package.json"), JSON.stringify({
+    name: "fixture", version: "1.0.0", dependencies: { [DEP]: "^1.0.0" },
+  }));
+  writeFileSync(join(dir, "package-lock.json"), JSON.stringify({
+    name: "fixture", version: "1.0.0", lockfileVersion: 3, requires: true,
+    packages: {
+      "": { name: "fixture", version: "1.0.0", dependencies: { [DEP]: "^1.0.0" } },
+      [`node_modules/${DEP}`]: entry,
+    },
+  }));
+  git("add", ".");
+  git("commit", "-qm", "fixture initial");
+  return repo;
+}
+
+/** Pack a one-file package without touching the network; returns its bytes and integrity. */
+function packedTarball(root: string): { bytes: Uint8Array; integrity: string } {
+  const src = join(root, "pkg-src");
+  const tar = join(root, "tar");
+  const home = join(root, "pack-home");
+  const cache = join(root, "pack-cache");
+  for (const dir of [src, tar, home, cache]) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(src, "package.json"), JSON.stringify({ name: DEP, version: "1.0.0" }));
+  const pack = spawnSync("npm", ["pack", "--pack-destination", tar, "--silent"], {
+    cwd: src, env: { PATH: process.env.PATH ?? "", HOME: home, npm_config_cache: cache },
+    encoding: "utf8", timeout: 60_000,
+  });
+  expect({ status: pack.status, stderr: pack.stderr }).toMatchObject({ status: 0 });
+  const files = readdirSync(tar).filter((file) => file.endsWith(".tgz"));
+  expect(files).toEqual([DEP_TARBALL]);
+  const bytes = readFileSync(join(tar, files[0]));
+  return { bytes, integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}` };
+}
+
+/** A loopback registry that records every request and answers only the tarball. */
+function startRegistry(bytes: Uint8Array) {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (path === DEP_PATH) return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
+      return new Response("unexpected request", { status: 404 });
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+}
+
+/** A second loopback server that records every request; any request is a leak. */
+function startEvil() {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requests.push(`${request.method} ${new URL(request.url).pathname}`);
+      return new Response("unexpected proxy request", { status: 404 });
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+}
+
+async function runHelper(args: string[], cwd: string, extra: Record<string, string>) {
+  const env = { PATH: process.env.PATH ?? "", ...extra };
+  const proc = Bun.spawn(["/bin/bash", HELPER, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
+  const [stdout, stderr, status] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { status, stdout, stderr };
+}
+
 it.each(["npm-shrinkwrap.json", "package-lock.json", "package.json"])(
   "in-place install refuses a prior workflow step writing %s before the installer runs", (file) => {
     harness((h) => {
@@ -191,9 +339,16 @@ it.each(["npm", "sfw"])("in-place install uses the literal %s installer and pres
     const manifest = readFileSync(join(repo, FIXTURE, "package.json"), "utf8");
     const result = h.run([HELPER, "--via", via, "--in-place", FIXTURE, "--ignore-scripts"], {}, repo);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
-    expect(h.installed()).toEqual({ argv: ["ci", "--ignore-scripts"], cwd: join(repo, FIXTURE), lock, manifest });
-    if (via === "sfw") expect(h.firewalled().argv).toEqual(["npm", "ci", "--ignore-scripts"]);
-    else expect(() => h.firewalled()).toThrow(/ENOENT/);
+    const installed = h.installed();
+    expect(installerArgs(installed)).toEqual(["ci", "--ignore-scripts"]);
+    expectInstallFlags(installed);
+    expect(installed.cwd).toBe(join(repo, FIXTURE));
+    expect(installed.lock).toBe(lock);
+    expect(installed.manifest).toBe(manifest);
+    if (via === "sfw") {
+      expect(installerArgs(h.firewalled())).toEqual(["npm", "ci", "--ignore-scripts"]);
+      expectInstallFlags(h.firewalled());
+    } else expect(() => h.firewalled()).toThrow(/ENOENT/);
     expect(readFileSync(join(repo, FIXTURE, "package-lock.json"), "utf8")).toBe(lock);
   }, via === "sfw");
 }, 30_000);
@@ -213,7 +368,7 @@ it("in-place install refuses a lock rewritten by the installer", () => {
   harness((h) => {
     const repo = workingFixture(h);
     const result = h.run([HELPER, "--via", "npm", "--in-place", FIXTURE], { REWRITE_LOCK: "1" }, repo);
-    expect(h.installed().argv).toEqual(["ci"]);
+    expect(installerArgs(h.installed())).toEqual(["ci"]);
     expect(result.status).not.toBe(0);
   });
 }, 30_000);
@@ -372,11 +527,435 @@ it("the real workflow step passes the tracked fixture selected independently by 
     expect(installed.cwd).toBe(REPO.replace(/\/$/, ""));
     const pin = JSON.parse(readFileSync(join(REPO, FIXTURE, "package.json"), "utf8")).dependencies.openclaw;
     const prefix = join(h.root, `openclaw-${pin}`);
-    expect(installed.argv).toEqual(["ci", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund"]);
-    expect(h.firewalled().argv).toEqual(["npm", ...installed.argv]);
+    expect(installerArgs(installed)).toEqual(["ci", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund"]);
+    expectInstallFlags(installed);
+    expect(installerArgs(h.firewalled())).toEqual(["npm", ...installerArgs(installed)]);
+    expectInstallFlags(h.firewalled());
     expect(readFileSync(join(h.root, "github-env"), "utf8")).toBe(`OPENCLAW_BIN_DIR=${prefix}/node_modules/.bin\n`);
   });
 }, 30_000);
+
+it("the helper installs only from TPS_DEP_AGES_REGISTRY through empty npm configs", () => {
+  harness((h) => {
+    const registry = "http://127.0.0.1:9";
+    const repo = depFixtureRepo(h.root, {
+      version: "1.0.0",
+      resolved: `${registry}${DEP_PATH}`,
+      integrity: "sha512-deadbeef",
+    });
+    const result = h.run([HELPER, "--via", "npm", FIXTURE, h.prefix], { TPS_DEP_AGES_REGISTRY: registry }, repo);
+    expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
+    const installed = h.installed();
+    expect(installerArgs(installed)).toEqual(["ci", "--prefix", h.prefix]);
+    expectInstallFlags(installed, registry);
+  });
+}, 30_000);
+
+it.skipIf(!npmAvailable)("a clean fixture installs through the local registry the gate checked", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-registry-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const home = join(root, "home");
+    const cache = join(root, "npm-cache");
+    const prefix = join(root, "prefix");
+    for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, prefix, "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache });
+    expect(result.status, result.stderr).toBe(0);
+    const installed = JSON.parse(readFileSync(join(prefix, "node_modules", DEP, "package.json"), "utf8"));
+    expect(installed.name).toBe(DEP);
+    const expected = new Set([`GET ${DEP_PATH}`, `GET /${DEP}`]);
+    for (const request of registry.requests) expect(expected.has(request)).toBe(true);
+    expect(registry.requests).toContain(`GET ${DEP_PATH}`);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+const userConfigSources = ["$HOME/.npmrc", "npm_config_userconfig"] as const;
+
+it.skipIf(!npmAvailable).each(userConfigSources)(
+  "a user npmrc supplied via %s cannot route the install",
+  async (source) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-userconfig-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    let evil: ReturnType<typeof startEvil> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      evil = startEvil();
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      const prefix = join(root, "prefix");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const contents = `proxy=${evil.url}/\nhttps-proxy=${evil.url}/\nregistry=${evil.url}/\n`;
+      const extra: Record<string, string> = {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+      };
+      if (source === "$HOME/.npmrc") {
+        writeFileSync(join(home, ".npmrc"), contents);
+      } else {
+        const named = join(root, "named-userconfig");
+        writeFileSync(named, contents);
+        extra.npm_config_userconfig = named;
+      }
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, prefix, "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, extra);
+      expect(result.status, result.stderr).toBe(0);
+      const installed = JSON.parse(readFileSync(join(prefix, "node_modules", DEP, "package.json"), "utf8"));
+      expect(installed.name).toBe(DEP);
+      expect(registry.requests).toContain(`GET ${DEP_PATH}`);
+      expect(evil.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      evil?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "PROXY", "proxy", "ALL_PROXY", "all_proxy"] as const)(
+  "an environment %s is refused with zero registry requests",
+  async (name) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-proxy-env-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    let evil: ReturnType<typeof startEvil> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      evil = startEvil();
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+        [name]: evil.url,
+      });
+      expect(result.status, result.stderr).toBe(3);
+      expect(result.stderr).toContain(JSON.stringify(name));
+      expect(result.stderr).toContain("unset them for this install");
+      expect(registry.requests).toEqual([]);
+      expect(evil.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      evil?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+it.skipIf(!npmAvailable)("NODE_EXTRA_CA_CERTS set in the environment is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-extra-ca-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const home = join(root, "home");
+    const cache = join(root, "npm-cache");
+    for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, {
+      HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+      NODE_EXTRA_CA_CERTS: join(root, "extra-ca.pem"),
+    });
+    expect(result.status, result.stderr).toBe(3);
+    expect(result.stderr).toContain(JSON.stringify("NODE_EXTRA_CA_CERTS"));
+    expect(result.stderr).toContain("unset them for this install");
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+for (const { name, value, title } of [
+  { name: "NODE_OPTIONS", value: "--max-old-space-size=128", title: "a non-empty NODE_OPTIONS" },
+  { name: "NODE_TLS_REJECT_UNAUTHORIZED", value: "0", title: "NODE_TLS_REJECT_UNAUTHORIZED" },
+] as const) {
+  it.skipIf(!npmAvailable)(`${title} in the environment is refused with zero registry requests`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-node-env-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+        [name]: value,
+      });
+      expect(result.status, result.stderr).toBe(3);
+      expect(result.stderr).toContain(JSON.stringify(name));
+      expect(result.stderr).toContain("unset them for this install");
+      expect(registry.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+}
+
+it.skipIf(!npmAvailable)("a lock entry under the registry without integrity is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-integrity-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, { version: "1.0.0", resolved: `${registry.url}${DEP_PATH}` });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(`node_modules/${DEP}: no integrity`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("a lock entry under the registry without sha512 integrity is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-integrity-alg-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: `sha1-${createHash("sha1").update(tarball.bytes).digest("base64")}`,
+    });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(`node_modules/${DEP}: integrity algorithm is not sha512`);
+    expect(result.stderr).toContain(`: sha1`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("an .npmrc in the tracked fixture directory is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-npmrc-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    writeFileSync(join(repo, FIXTURE, ".npmrc"), "registry=http://127.0.0.1:1/\n");
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`.npmrc refused: ${FIXTURE}/.npmrc`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("an .npmrc in the install directory is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-npmrc-prefix-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const prefix = join(root, "prefix");
+    mkdirSync(prefix);
+    writeFileSync(join(prefix, ".npmrc"), "registry=http://127.0.0.1:1/\n");
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, prefix, "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`.npmrc refused: ${prefix}/.npmrc`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+for (const name of ["npm_config_registry", "npm_config_@scope:registry", "npm_config_prefix", "npm_config_node_gyp", "NPM_CONFIG_REGISTRY"]) {
+  it.skipIf(!npmAvailable)(`the helper refuses ${name} before any registry request`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-env-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, {
+        HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url,
+        [name]: "http://127.0.0.1:1/",
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing npm_config_* variables");
+      expect(result.stderr).toContain(JSON.stringify(name));
+      expect(registry.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+}
+
+it.skipIf(!npmAvailable)("an env-named global config is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-globalconfig-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const globalconfig = join(root, "globalconfig");
+    writeFileSync(globalconfig, `registry=${registry.url}/\n`);
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, {
+      HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url,
+      npm_config_globalconfig: globalconfig,
+    });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain("refusing npm_config_* variables");
+    expect(result.stderr).toContain(JSON.stringify("npm_config_globalconfig"));
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("a lock entry without a resolved URL is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-resolved-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, { version: "1.0.0" });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain(`node_modules/${DEP}: no resolved URL`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+const foreignResolvedUrls: [string, (registry: string) => string][] = [
+  ["a different host", () => `https://other.example${DEP_PATH}`],
+  ["a host-suffix trick", (registry) => `${registry}.evil.test${DEP_PATH}`],
+  ["a userinfo trick", (registry) => `${registry}@evil.test${DEP_PATH}`],
+];
+
+it.skipIf(!npmAvailable).each(foreignResolvedUrls)(
+  "a lock entry whose resolved URL is %s is refused with zero registry requests",
+  async (_label, resolved) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-resolved-host-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      const repo = depFixtureRepo(root, { version: "1.0.0", resolved: resolved(registry.url) });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+      expect(result.status).toBe(3);
+      expect(result.stderr).toContain(`node_modules/${DEP}: resolved URL is not under ${registry.url}`);
+      expect(registry.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+it.skipIf(!npmAvailable)("TPS_DEP_AGES_REGISTRY is refused under the CI signal with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-ci-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, {
+      HOME: join(root, "home"), GITHUB_ACTIONS: "true", TPS_DEP_AGES_REGISTRY: registry.url,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("Refusing TPS_DEP_AGES_REGISTRY under GitHub Actions");
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 const quotedValues: [string, string[] | null][] = [
   ["\"\"", []],
