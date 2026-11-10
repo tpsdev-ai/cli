@@ -1747,8 +1747,10 @@ async function runAgentCommand(
                         onStop(launchId, config.workspace, cleanupBinding)
                       );
                     } catch (err) {
-                      // Removal is unconfirmed: the launcher refuses and keeps
-                      // the launch state, so the teardown below must not retry.
+                      // The removal threw: the launcher refuses and keeps the
+                      // launch state unless it confirms the original path, the
+                      // moved-aside path and the registration are gone. The
+                      // teardown below must not retry.
                       keepWorktree = true;
                       const pinnedPath = (err as { pinnedPath?: unknown }).pinnedPath;
                       if (cleanupFacts && typeof pinnedPath === "string") cleanupFacts.pinnedPath = pinnedPath;

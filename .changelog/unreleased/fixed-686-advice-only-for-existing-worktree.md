@@ -1,3 +1,3 @@
 - **Removal advice naming an absent worktree path is dropped.**
 
-  An unconfirmed removal keeps the worktree and exits non-zero.
+  An unconfirmed removal keeps the launch state, names what remains (the original path, the moved-aside path or the registration), and exits 78.

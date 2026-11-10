@@ -1026,8 +1026,9 @@ export async function launchAttested(
 
   // A signal to the launcher TERMs the supervisor through its child handle and
   // checks the agent read-only. Cleanup of what this launch created runs only
-  // after the stop check; an unconfirmed removal keeps the worktree and the
-  // launch state and exits 78. A stop that began before the release write
+  // after the stop check; an unconfirmed removal keeps the launch state, names
+  // what remains (the original path, the moved-aside path or the registration),
+  // and exits 78. A stop that began before the release write
   // prevents that write. The supervisor is signalled through its own child
   // handle while it has not exited; the released agent is never signalled, only
   // read back by the identity recorded before its release. A second signal is
@@ -1066,10 +1067,8 @@ export async function launchAttested(
       }
       if (cleanupError) {
         // The caller's removal threw. Print it through the caller's advice
-        // filter. The removal is unconfirmed unless the original path, the
-        // path it was moved to, and the base repository's registration are all
-        // gone; then the launcher keeps the launch state and refuses instead of
-        // re-raising the signal.
+        // filter. If any remains, the launcher keeps the launch state and
+        // refuses instead of re-raising the signal.
         const message = (opts.formatCleanupError ?? ((err: Error) => err.message))(cleanupError);
         console.error(`❌ ${message}`);
         const remaining = opts.worktreeCleanup
@@ -1080,8 +1079,19 @@ export async function launchAttested(
                 : "the worktree path was not named",
             ];
         if (remaining.length > 0) {
-          const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-          console.error(`❌ the worktree removal was not confirmed; kept ${kept} and the launch state (${remaining.join("; ")})`);
+          let worktreePresent = false;
+          if (opts.worktreePath) {
+            try {
+              lstatSync(opts.worktreePath);
+              worktreePresent = true;
+            } catch {
+              worktreePresent = false;
+            }
+          }
+          const kept = worktreePresent
+            ? `kept the worktree ${opts.worktreePath} and the launch state`
+            : "kept the launch state";
+          console.error(`❌ the worktree removal was not confirmed; ${kept} (${remaining.join("; ")})`);
           keepLaunchState = true;
           for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
           interruptOutcome = REFUSAL_EXIT_CODE;

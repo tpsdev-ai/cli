@@ -2141,8 +2141,7 @@ exit 0
       const result = start(f.sb, `${bin}:${process.env.PATH}`);
       const text = output(result);
       expect(result.status, text).toBe(REFUSAL_EXIT_CODE);
-      // Both errors name the path they failed on; neither adds removal advice
-      // for a worktree that is gone at print time.
+      // Neither error adds removal advice for the absent worktree.
       expect(errorLines(text).length).toBeGreaterThan(0);
       expect(text).not.toContain("remove it manually with:");
       expect(text).not.toContain("inspect it and remove it yourself");
@@ -2286,8 +2285,10 @@ exit 0
   // -------------------------------------------------------------------------
   // cli#672 — a signal after worktree creation removes what THIS launch made
   // once the supervisor has exited and the released agent is gone or its pid
-  // names another process; a surviving agent or an unconfirmed removal keeps
-  // the worktree and the launch state; a pre-existing worktree is never removed
+  // names another process; a surviving agent keeps the worktree, and an
+  // unconfirmed removal keeps the launch state, names what remains (the
+  // original path, the moved-aside path or the registration), and exits 78;
+  // a pre-existing worktree is never removed
   // -------------------------------------------------------------------------
 
   /** A fake nono that never releases and stays alive until a signal arrives. */
@@ -2626,7 +2627,7 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
   interface StopFixture {
     sb: Sandbox;
     base: string;
-    /** A git wrapper that logs every call and delays the fake nono's exit. */
+    /** A git wrapper that logs every call and can inject a removal failure. */
     gitPath: string;
     gitLog: string;
     observe: string;
@@ -2916,7 +2917,7 @@ process.exit(typeof code === "number" ? code : 1);
         launcher.once("exit", (code, signal) => r({ code, signal }));
       });
       expect(exit.signal, text()).toBe("SIGTERM");
-      // The agent received nothing: its recorded identity no longer matched.
+      // The agent received nothing; the changed identity counts as stopped.
       expect(observed(f.observe).filter((line) => line.endsWith(" agent"))).toEqual([]);
       expect(observed(f.peerLog)).toEqual([]);
       expect(alive(peerPid)).toBe(true);
@@ -3000,8 +3001,9 @@ process.exit(typeof code === "number" ? code : 1);
       D_HELD: held,
       D_RELEASE_GO: go,
       D_RESUMED: resumed,
-      // The supervisor is held after its TERM until the test lets it exit, so
-      // the launcher is alive when the held handshake resumes.
+      // The supervisor is held after its TERM until the test lets it exit or
+      // the launcher's SIGKILL after D_BOUND, so the launcher is alive when the
+      // held handshake resumes.
       FAKE_NONO_KILL_CHILD: "0",
       FAKE_NONO_DELAY_MS: "1",
       FAKE_NONO_HOLD_EXIT: supervisorGo,
@@ -3118,7 +3120,8 @@ process.exit(typeof code === "number" ? code : 1);
       expect(exit.signal, text()).toBeNull();
       expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
       expect(text()).toContain("the worktree removal was not confirmed");
-      expect(text()).toContain("the base repository still registers");
+      expect(text()).not.toContain(`kept the worktree ${f.sb.ws}`);
+      expect(text()).toContain("the worktree removal was not confirmed; kept the launch state (the base repository still registers");
       expect(text()).not.toContain("remove it manually with:");
       expect(text()).not.toContain("inspect it and remove it yourself");
       expect(existsSync(f.sb.ws)).toBe(false);
@@ -3152,7 +3155,8 @@ process.exit(typeof code === "number" ? code : 1);
       expect(exit.signal, text()).toBeNull();
       expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
       expect(text()).toContain("the worktree removal was not confirmed");
-      expect(text()).toContain("the worktree moved aside to");
+      expect(text()).not.toContain(`kept the worktree ${f.sb.ws}`);
+      expect(text()).toContain("the worktree removal was not confirmed; kept the launch state (the worktree moved aside to");
       expect(existsSync(f.sb.ws)).toBe(false);
       expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
       expect(
@@ -3257,8 +3261,8 @@ describe("cli#668 round 4 — a refusal after release keeps a surviving agent's 
     "",
   ].join("\n");
 
-  /** The released child: it stays alive and ignores the supervisor and the
-   * launcher socket going away, so it survives its supervisor. */
+  /** The released child: it stays alive when its supervisor exits; it exits
+   * only on a socket error. */
   const SURVIVOR_PEER = `const { connect } = require("node:net");
 const { readFileSync, writeFileSync } = require("node:fs");
 const { dirname, join } = require("node:path");
