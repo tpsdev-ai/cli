@@ -244,12 +244,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
   // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
   // came from. Within ONE watcher instance an entry is dropped only when a scan
-  // observes that file absent from `new/`; while the file stays, it is presented
-  // once.
+  // observes that file absent from `new/` (the trim loop in `processNew`, below);
+  // while the file stays, it is presented once. Nothing else removes an entry.
   const presented = new Map<string, string>();
   // Files already classified this residence (presented, or skipped as
   // unverifiable), keyed on the filename, so a later pass does not re-verify or
-  // re-log a file still sitting in `new/`. Dropped when the file leaves `new/`.
+  // re-log a file still sitting in `new/`. Like `presented`, it is trimmed ONLY
+  // when a scan finds the file gone (the same trim loop below).
   const classified = new Map<string, string>();
 
   // Verified records waiting for a free slot. The concurrency cap must hold
@@ -315,7 +316,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         return;
       }
       const present = new Set(files);
-      // Forget records whose file has left `new/`.
+      // Forget records whose file has left `new/`. This is the ONLY place either
+      // dedup map is trimmed: a file that is still present keeps its entry, and a
+      // failed listing above returns before this point (state kept).
       for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
       for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
 
