@@ -31,11 +31,21 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
 Refusals name the workflow, job, step and physical line. Variable or substitution
 indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
 The guard follows repository scripts a workflow invokes by a literal path,
-recursively, and local composite actions (`uses: ./...`); an npm install found
-there must bind to a tracked lockfile or the scan refuses it, naming the
-invocation path. Installs inside followed JavaScript or TypeScript scripts are
-not inspected; a computed script path is refused unless it is on the reviewed
-allowlist. Helper
+recursively, and local composite actions (`uses: ./...`). In a followed shell
+script, a logical line (continuations joined, word-boundary comments stripped,
+here-document bodies kept) is an install when, after lowercasing and deleting
+backslashes and quotes, it contains `npx` as a word, or `npm` as a word followed
+later by `ci`, `install`, `i`, `add`, `exec` or `x`. An install must use the
+tracked-lock helper, a bounded global install, or bind to a tracked lockfile,
+and `--no-package-lock` is refused. `scripts/npm-ci-tracked-lock.sh` is the
+approved install implementation: its own lines are not screened by that
+classifier, though its invocations are followed. An interpreter invocation is
+followed when its script argument resolves to a repository file; a computed,
+external, `-c`/`-s` or here-document-to-shell invocation is refused unless it is
+on the reviewed allowlist, whose entries pin the assignment text and target.
+Installs inside followed JavaScript or TypeScript scripts, and node `-e`/`-p`
+or node here-document payloads, are not inspected; their here-document bodies
+are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper

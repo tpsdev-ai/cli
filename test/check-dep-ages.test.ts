@@ -2120,7 +2120,7 @@ describe("the workflow guard follows invoked scripts and local composite actions
       for (const entry of report.unresolved) unresolved.add(entry);
     }
     expect(installs).toBe(5);
-    expect(followed.size).toBe(21);
+    expect(followed.size).toBe(28);
     const allowed = new Set(
       UNRESOLVED_INVOCATION_ALLOWLIST.map((entry) => `${entry.script} (line ${entry.line}): ${entry.token}`),
     );
@@ -2138,4 +2138,171 @@ describe("the workflow guard follows invoked scripts and local composite actions
     }
     expect([...followed].some((rel) => rel.startsWith(".github/actions/"))).toBe(false);
   }, 30_000);
+});
+
+describe("the install classifier in a followed shell script refuses wrapper shapes", () => {
+  function probeTree(files: Record<string, string>, tracked: Set<string> = new Set()) {
+    const root = makeTreeFixture(files);
+    try {
+      return assertNpmCiWorkflowTree(workflowStep("bash scripts/install.sh", "."), tracked, root, "workflow-probe");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["env prefix", "env npm ci\n"],
+    ["command prefix", "command npm ci\n"],
+    ["sudo prefix", "sudo npm ci\n"],
+    ["xargs prefix", "xargs npm ci\n"],
+    ["sh -c payload", "sh -c 'npm ci'\n"],
+    ["single-quoted word", "'npm' ci\n"],
+    ["double-quoted word", "\"npm\" ci\n"],
+    ["if condition", "if npm ci; then echo ok; fi\n"],
+    ["backslash continuation", "npm \\\nci\n"],
+    ["same-line cd with &&", "cd packages/other && npm ci\n"],
+    ["same-line cd with ;", "cd packages/other; npm ci\n"],
+    ["subshell cd", "(cd packages/other && npm ci)\n"],
+    ["npx", "npx some-tool\n"],
+  ])("refuses %s in a followed script", (_label, script) => {
+    expect(() => probeTree({ "scripts/install.sh": script })).toThrow(/scripts\/install\.sh \(invocation [^)]*\), line 1/);
+  });
+
+  it("names the new directory for a same-line cd and install", () => {
+    expect(() => probeTree(
+      { "scripts/install.sh": "cd packages/other && npm ci\n", "package-lock.json": "{}\n" },
+      new Set(["package-lock.json"]),
+    )).toThrow(/packages\/other\/package-lock\.json/);
+  });
+
+  it("refuses npm install --no-package-lock even when the lockfile is tracked", () => {
+    expect(() => probeTree(
+      { "scripts/install.sh": "npm install --no-package-lock\n", "package-lock.json": "{}\n" },
+      new Set(["package-lock.json"]),
+    )).toThrow(/--no-package-lock is refused/);
+  });
+
+  it("passes an npm mention with no install verb", () => {
+    const report = probeTree({ "scripts/install.sh": "echo \"packageManager: npm@10\"\n" });
+    expect(report.installs).toBe(0);
+  });
+
+  it.each([
+    ["double-quoted literal", "bash \"scripts/install.sh\"\n"],
+    ["flagged literal", "bash -e scripts/install.sh\n"],
+    ["absolute interpreter", "/bin/bash scripts/install.sh\n"],
+    ["unprefixed script word", "scripts/install.sh\n"],
+  ])("follows a %s path and judges its install", (_label, run) => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(["package-lock.json"]), root, "workflow-path");
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a literal interpreter path outside the repository", () => {
+    expect(() => probeTree({ "scripts/install.sh": "bash /tmp/gen.sh\n" })).toThrow(
+      /unresolved script invocation in scripts\/install\.sh \(line 1\) token \/tmp\/gen\.sh/,
+    );
+  });
+
+  it("refuses a here-document fed to a shell", () => {
+    expect(() => probeTree({ "scripts/install.sh": "bash <<'EOF'\nnpm ci\nEOF\n" })).toThrow(
+      /scripts\/install\.sh/,
+    );
+  });
+
+  it("scans an allowlisted token's target and refuses an install there", () => {
+    const root = makeTreeFixture({
+      "scripts/invoke.sh": "gate=\"scripts/evil.sh\"\nbash \"$gate\"\n",
+      "scripts/evil.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/invoke.sh", "."),
+        new Set(),
+        root,
+        "workflow-target",
+        [{
+          script: "scripts/invoke.sh",
+          line: 2,
+          token: "\"$gate\"",
+          target: "scripts/evil.sh",
+          assignment: "gate=\"scripts/evil.sh\"",
+          reason: "probe",
+        }],
+      )).toThrow(/scripts\/evil\.sh.*cannot bind the npm install/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a changed allowlist assignment as stale", () => {
+    const root = makeTreeFixture({
+      "scripts/invoke.sh": "gate=\"scripts/evil.sh\"\nbash \"$gate\"\n",
+      "scripts/good.sh": "",
+      "scripts/evil.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/invoke.sh", "."),
+        new Set(),
+        root,
+        "workflow-assignment",
+        [{
+          script: "scripts/invoke.sh",
+          line: 2,
+          token: "\"$gate\"",
+          target: "scripts/good.sh",
+          assignment: "gate=\"scripts/good.sh\"",
+          reason: "probe",
+        }],
+      )).toThrow(/stale UNRESOLVED_INVOCATION_ALLOWLIST entry.*assignment text/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("guards a self-using local composite action against recursion", () => {
+    const root = makeTreeFixture({
+      ".github/actions/self/action.yml": [
+        "name: self",
+        "runs:",
+        "  using: composite",
+        "  steps:",
+        "    - uses: ./.github/actions/self",
+      ].join("\n"),
+    });
+    const workflow = "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/self\n";
+    try {
+      const report = assertNpmCiWorkflowTree(workflow, new Set(), root, "workflow-self");
+      expect(report.followed).toContain(".github/actions/self");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat << in a followed .mjs as a here-document", () => {
+    const root = makeTreeFixture({
+      "scripts/run.sh": "node scripts/tool.mjs\n",
+      "scripts/tool.mjs": "const f = flags << MASK;\nnode \"$tool/build.sh\";\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/run.sh", "."),
+        new Set(),
+        root,
+        "workflow-mjs",
+        undefined,
+      )).toThrow(/cannot resolve a dynamic script path|unresolved script invocation/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
