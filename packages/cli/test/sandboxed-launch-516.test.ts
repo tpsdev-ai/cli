@@ -2285,8 +2285,9 @@ exit 0
 
   // -------------------------------------------------------------------------
   // cli#672 — a signal after worktree creation removes what THIS launch made
-  // once the launched processes are verified stopped, and never a pre-existing
-  // worktree
+  // once the supervisor has exited and the released agent is gone or its pid
+  // names another process; a surviving agent or an unconfirmed removal keeps
+  // the worktree and the launch state; a pre-existing worktree is never removed
   // -------------------------------------------------------------------------
 
   /** A fake nono that never releases and stays alive until a signal arrives. */
@@ -2650,7 +2651,7 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
     "  child=$!",
     '  prof=""; args=("$@"); for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
     '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
-    '  trap \'sleep "${FAKE_NONO_DELAY_MS:-0}"; exit 0\' TERM INT HUP',
+    '  trap \'if [ "${FAKE_NONO_KILL_CHILD:-1}" = 1 ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; sleep "${FAKE_NONO_DELAY_MS:-0}"; exit 0\' TERM INT HUP',
     "  while :; do sleep 0.05; done",
     "fi",
     "exit 0",
@@ -2694,9 +2695,9 @@ attempt();
    * observe every signal. It plays the shipped caller's cleanup contract: remove
    * the worktree only when the launcher reports both processes stopped. */
   const STOP_DRIVER = `
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { launchAttested } from ${JSON.stringify(resolve(import.meta.dir, "../dist/src/utils/launch-attestation.js"))};
-import { onStart, onStop, removeWorktreeAfterStop } from ${JSON.stringify(resolve(import.meta.dir, "../dist/src/utils/agent-lifecycle.js"))};
+import { onStart, onStop, removeWorktreeAfterStop, withoutRemovalAdvice } from ${JSON.stringify(resolve(import.meta.dir, "../dist/src/utils/agent-lifecycle.js"))};
 
 const ws = process.env.D_WS;
 let calls = 0;
@@ -2704,12 +2705,25 @@ const hooks = {
   onSignal: (pid, signal, target) => appendFileSync(process.env.D_OBSERVE, pid + " " + signal + " " + target + "\\n"),
 };
 const tokens = process.env.D_TOKENS;
-if (tokens) {
+if (tokens === "release-relative") {
+  hooks.startToken = () => existsSync(process.env.D_RELEASE_TOKEN_FLAG) ? "proc:after" : "proc:before";
+} else if (tokens) {
   hooks.startToken = () => {
     if (tokens === "null") return null;
     return calls++ === 0 ? "proc:recorded" : "proc:different";
   };
 }
+const releaseTestHooks = process.env.D_HOLD_RELEASE === "1" ? {
+  beforeReleaseWrite: async () => {
+    writeFileSync(process.env.D_HELD, "1");
+    const deadline = Date.now() + 15000;
+    while (!existsSync(process.env.D_RELEASE_GO) && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+  },
+} : tokens === "release-relative" ? {
+  afterReleaseWrite: () => writeFileSync(process.env.D_RELEASE_TOKEN_FLAG, "1"),
+} : undefined;
 let binding;
 let kept = false;
 if (process.env.D_WORKTREE === "1") {
@@ -2727,6 +2741,8 @@ const code = await launchAttested(
     worktreePath: ws,
     signalStopTimeoutMs: Number(process.env.D_BOUND ?? "5000"),
     interruptTestHooks: hooks,
+    releaseTestHooks,
+    formatCleanupError: (err) => withoutRemovalAdvice(err.message),
     onInterrupt: (_signal, stop) => {
       writeFileSync(process.env.D_RESULT, JSON.stringify(stop));
       if (binding) kept = removeWorktreeAfterStop(stop, () => onStop("probe", ws, binding));
@@ -2736,7 +2752,7 @@ const code = await launchAttested(
 process.exit(typeof code === "number" ? code : 1);
 `;
 
-  function stopFixture(): StopFixture {
+  function stopFixture(gitRemove?: "fail-gone" | "fail-keep"): StopFixture {
     const sb = makeSandbox();
     const base = join(sb.home, "ops", "tps");
     mkdirSync(base, { recursive: true });
@@ -2755,9 +2771,19 @@ process.exit(typeof code === "number" ? code : 1);
     const bin = join(sb.root, "git-bin");
     mkdirSync(bin);
     const gitLog = join(sb.root, "git-calls.log");
+    const removeFailure =
+      gitRemove === undefined
+        ? ""
+        : [
+            'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+            ...(gitRemove === "fail-gone" ? ['  rm -rf "$4"'] : []),
+            '  echo "fatal: injected removal failure" >&2',
+            "  exit 1",
+            "fi",
+          ].join("\n");
     writeFileSync(
       join(bin, "git"),
-      ["#!/bin/sh", `printf '%s\\n' "$*" >> "${gitLog}"`, `exec "${GIT}" "$@"`, ""].join("\n"),
+      ["#!/bin/sh", `printf '%s\\n' "$*" >> "${gitLog}"`, removeFailure, `exec "${GIT}" "$@"`, ""].join("\n"),
     );
     chmodSync(join(bin, "git"), 0o755);
     const observe = join(sb.root, "signals.log");
@@ -2855,7 +2881,7 @@ process.exit(typeof code === "number" ? code : 1);
 
   test("a pid that now names a different process is not signalled and is treated as stopped", async () => {
     const f = stopFixture();
-    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "different" });
+    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "different", FAKE_NONO_KILL_CHILD: "0" });
     let peerPid: number | undefined;
     try {
       expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
@@ -2882,7 +2908,7 @@ process.exit(typeof code === "number" ? code : 1);
 
   test("an unverifiable agent keeps the worktree, reports the pid and exits non-zero", async () => {
     const f = stopFixture();
-    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "null", D_WORKTREE: "1" });
+    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "null", D_WORKTREE: "1", FAKE_NONO_KILL_CHILD: "0" });
     let peerPid: number | undefined;
     try {
       expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
@@ -2928,10 +2954,162 @@ process.exit(typeof code === "number" ? code : 1);
       expect(exit.signal, text()).toBe("SIGTERM");
       const lines = observed(f.observe);
       expect(lines.filter((line) => line.includes(" SIGTERM supervisor"))).toHaveLength(1);
-      expect(lines.filter((line) => line.endsWith(" agent"))).toHaveLength(1);
+      // The launcher never signals the agent's pid: the supervisor stops it.
+      expect(lines.filter((line) => line.includes(" agent"))).toEqual([]);
       const removes = readFileSync(f.gitLog, "utf-8").split("\n").filter((call) => call.startsWith("worktree remove"));
       expect(removes).toHaveLength(1);
       expect(existsSync(f.sb.ws)).toBe(false);
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a signal during the handshake writes no release after the stop began", async () => {
+    const f = stopFixture();
+    const held = join(f.sb.root, "release-held");
+    const go = join(f.sb.root, "release-go");
+    const { launcher, text } = spawnStopDriver(f, {
+      D_HOLD_RELEASE: "1",
+      D_HELD: held,
+      D_RELEASE_GO: go,
+      // The supervisor exits without stopping its child, and only after a
+      // delay, so a release written after the stop began would be observable.
+      FAKE_NONO_KILL_CHILD: "0",
+      FAKE_NONO_DELAY_MS: "1",
+      D_BOUND: "3000",
+    });
+    try {
+      expect(await waitFor(() => existsSync(held), 20_000), text()).toBe(true);
+      process.kill(launcher.pid!, "SIGTERM");
+      // Let the release gate close while the supervisor is still stopping, then
+      // let the handshake proceed.
+      await new Promise((r) => setTimeout(r, 250));
+      writeFileSync(go, "1");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBe("SIGTERM");
+      // No release was written: the child never learned it was confined, and
+      // the stop reported only the supervisor it actually stopped.
+      expect(existsSync(f.peerPid), text()).toBe(false);
+      expect(text()).not.toMatch(/CONFINED fixture \d+/);
+      expect(observed(f.observe)).toEqual([expect.stringMatching(/ SIGTERM supervisor$/)]);
+      const result = JSON.parse(readFileSync(f.result, "utf-8"));
+      expect(result).toEqual({ stopped: true, survivors: [] });
+    } finally {
+      try {
+        if (existsSync(f.peerPid)) process.kill(Number(readFileSync(f.peerPid, "utf-8").trim()), "SIGKILL");
+      } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a supervisor that exits while the agent survives keeps the worktree and exits non-zero", async () => {
+    const f = stopFixture();
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1", FAKE_NONO_KILL_CHILD: "0" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      // No signal was sent to the agent's pid, by the launcher or the fixture.
+      expect(observed(f.observe).filter((line) => line.includes(" agent"))).toEqual([]);
+      expect(observed(f.peerLog)).toEqual([]);
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      expect(text()).toContain(`❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws}`);
+      expect(alive(peerPid!)).toBe(true);
+      expect(existsSync(f.sb.ws)).toBe(true);
+      expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(`worktree ${f.sb.ws}\n`);
+      expect(JSON.parse(readFileSync(f.result, "utf-8"))).toEqual({ stopped: false, survivors: [peerPid] });
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an agent identity that changes between capture and the post-stop check is treated as stopped", async () => {
+    const f = stopFixture();
+    // The token reader answers from whether the release has been written: a
+    // capture taken before the write sees 'before'.
+    const flag = join(f.sb.root, "release-token");
+    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "release-relative", D_RELEASE_TOKEN_FLAG: flag, FAKE_NONO_KILL_CHILD: "0" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBe("SIGTERM");
+      expect(observed(f.observe).filter((line) => line.includes(" agent"))).toEqual([]);
+      expect(observed(f.peerLog)).toEqual([]);
+      expect(alive(peerPid!)).toBe(true);
+      expect(JSON.parse(readFileSync(f.result, "utf-8"))).toEqual({ stopped: true, survivors: [] });
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a signal-path removal that reports failure after the directory is gone prints no advice for it", async () => {
+    const f = stopFixture("fail-gone");
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      // The directory is gone, so the removal is confirmed: the launcher keeps
+      // its signal-shaped exit, without advice naming the absent path.
+      expect(exit.signal, text()).toBe("SIGTERM");
+      expect(text()).not.toContain("remove it manually with:");
+      expect(text()).not.toContain("inspect it and remove it yourself");
+      expect(existsSync(f.sb.ws)).toBe(false);
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a signal-path removal whose directory remains refuses and keeps the launch state", async () => {
+    const f = stopFixture("fail-keep");
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      expect(text()).toContain(`the worktree removal was not confirmed; kept the worktree ${f.sb.ws} and the launch state`);
+      expect(existsSync(f.sb.ws)).toBe(true);
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
     } finally {
       try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }

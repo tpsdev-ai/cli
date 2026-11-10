@@ -265,6 +265,10 @@ real("4e positive — the attested launch against the pinned nono", () => {
     }
   });
 
+  // A signal during the handshake is covered in-process by
+  // sandboxed-launch-516.test.ts. It cannot be made deterministic here: the
+  // shipped CLI exposes no pause point between the child's report and the
+  // release write, so the window is a race.
   test("SIGTERM to the launcher stops the released child and the supervisor, and exits signalled", async () => {
     const sb = sandbox();
     let child: ReturnType<typeof spawn> | undefined;

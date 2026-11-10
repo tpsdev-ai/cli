@@ -807,11 +807,10 @@ export function removeWorktreeAfterStop(stop: { stopped: boolean }, remove: () =
 
 /**
  * Drop the removal advice from an error message when the worktree path it
- * names is gone. A caller prints every error on the launch path through this
- * (cli#686): setup, retry and teardown errors carry the same advice clauses,
- * and a removal that reports failure after it removed the worktree is not
- * followed by a command for an absent path. An unreadable path keeps its
- * advice.
+ * names is gone. Setup, retry, teardown and signal-path cleanup errors carry
+ * the same advice clauses and are printed through this (cli#686): a removal
+ * that reports failure after it removed the worktree is not followed by a
+ * command for an absent path. An unreadable path keeps its advice.
  */
 export function withoutRemovalAdvice(
   message: string,

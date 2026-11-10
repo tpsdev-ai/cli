@@ -1702,8 +1702,8 @@ async function runAgentCommand(
                 }
               }
               // Removal advice is printed only when the path it names exists at
-              // print time (cli#686): setup, retry and teardown errors all pass
-              // through printLaunchError.
+              // print time (cli#686): setup, retry, teardown and signal-path
+              // cleanup errors all pass through this filter.
               printLaunchError(setupError, adviceTarget());
               if (cleanupError) printLaunchError(cleanupError, adviceTarget());
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
@@ -1738,6 +1738,20 @@ async function runAgentCommand(
                     );
                   },
                   worktreePath: worktreeCreated ? cleanupBinding?.workspace ?? createdWorktree?.workspace : undefined,
+                  // The same path-aware advice filter as printLaunchError, for
+                  // a cleanup error on the signal path (cli#686).
+                  formatCleanupError: (err) => {
+                    const target = adviceTarget();
+                    let gone = false;
+                    if (target) {
+                      try {
+                        lstatSync(target.workspace);
+                      } catch (probeErr) {
+                        gone = (probeErr as NodeJS.ErrnoException).code === "ENOENT";
+                      }
+                    }
+                    return withoutRemovalAdvice(err.message, gone ? target : undefined);
+                  },
                 },
               );
             } finally {
