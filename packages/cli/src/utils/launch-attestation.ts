@@ -898,8 +898,8 @@ export interface LaunchOptions {
   };
   /** Called when a termination signal arrives, with what the stop verified.
    * `stopped` is true only when the supervisor has exited and the released
-   * child is gone or its pid no longer names that process. The launcher's own
-   * worktree cleanup runs here when `stopped`; otherwise the caller keeps it.
+   * child is gone or its pid no longer names that process. The caller's
+   * worktree removal runs here when `stopped`; otherwise the caller keeps it.
    * A throw here means the worktree removal is unconfirmed. */
   onInterrupt?: (signal: NodeJS.Signals, stop: LaunchStopResult) => void;
   /** The worktree this launch created, named in the error when a survivor
