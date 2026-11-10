@@ -22,7 +22,7 @@ const MAIL_BRIDGE_URL = new URL("../src/utils/mail-bridge.js", import.meta.url).
 const BUILT_PID_FILE_URL = new URL("../dist/src/utils/pid-file.js", import.meta.url).href;
 const BUILT_MAIL_BRIDGE_URL = new URL("../dist/src/utils/mail-bridge.js", import.meta.url).href;
 const BUILT_COMMANDS_URL = new URL("../dist/src/commands/bridge.js", import.meta.url).href;
-const FIFO_DEADLINE = 2_000;
+const FIFO_DEADLINE = TIMEOUT - 5_000;
 
 function cannotListRestrictedDirectory(): boolean {
   const directory = mkdtempSync(join(tmpdir(), "tps-bridge-717-mode-"));
@@ -420,6 +420,14 @@ describe("bridge status names the adapter of each running record", () => {
         port: 7891,
         adapter: "openclaw",
         bridges: [{ adapter: "openclaw", pid: child.pid, port: 7891 }],
+        records: [
+          {
+            adapter: "openclaw",
+            path: join(runDir, "bridge-openclaw.pid"),
+            state: "running",
+            pid: child.pid,
+          },
+        ],
       });
     },
     TIMEOUT,
@@ -474,6 +482,14 @@ describe("bridge status names the adapter of each running record", () => {
       expect(JSON.parse(lines[0])).toEqual({
         running: false,
         bridges: [{ adapter: "discord", pid: discord.pid }],
+        records: [
+          {
+            adapter: "discord",
+            path: join(runDir, "bridge-discord.pid"),
+            state: "running",
+            pid: discord.pid,
+          },
+        ],
       });
     },
     TIMEOUT,

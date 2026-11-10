@@ -76,12 +76,23 @@ function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntr
   return { path, state, port, adapter };
 }
 
+/** The run-directory listing `bridgePidFiles` uses; replaceable in tests. */
+let listRunDir = (dir: string): string[] => readdirSync(dir);
+
+/** Replace the run-directory listing; returns the previous reader. A test uses
+ *  this to count how many times one `status --json` call reads the directory. */
+export function setRunDirReader(reader: (dir: string) => string[]): (dir: string) => string[] {
+  const previous = listRunDir;
+  listRunDir = reader;
+  return previous;
+}
+
 /** The bridge pid records discovery accepts, with their strict classification. */
 export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
   let names: string[];
   try {
-    names = readdirSync(pidDir);
+    names = listRunDir(pidDir);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
     if (code === "ENOENT") return [];
@@ -117,20 +128,62 @@ export interface BridgeRunningRecord {
   port?: number;
 }
 
-function runningRecordsFrom(
+/** The liveness probe the `status --json` snapshot uses; replaceable in tests. */
+let statusProbe: (pid: number) => PidState = pidState;
+
+/** Replace the `status --json` liveness probe; returns the previous probe. A
+ *  test uses this to count how often one `status --json` call probes a pid. */
+export function setStatusProbe(probe: (pid: number) => PidState): (pid: number) => PidState {
+  const previous = statusProbe;
+  statusProbe = probe;
+  return previous;
+}
+
+/** Probe each unverified pid in `entries` once; a pid recorded in more than one
+ *  record is probed once. */
+export function probeUnverifiedPids(
   entries: BridgePidFileEntry[],
   probe: (pid: number) => PidState,
+): Map<number, PidState> {
+  const liveness = new Map<number, PidState>();
+  for (const entry of entries) {
+    const { state } = entry;
+    if (state.kind !== "unverified" || liveness.has(state.pid)) continue;
+    liveness.set(state.pid, probe(state.pid));
+  }
+  return liveness;
+}
+
+/** The running records among `entries`: each `running` entry, plus an
+ *  `unverified` entry whose pid the probe reports alive. `liveness` carries the
+ *  probe result per unverified pid, so a caller that already probed does not
+ *  probe again. */
+export function runningRecordsFrom(
+  entries: BridgePidFileEntry[],
+  probe: (pid: number) => PidState = pidState,
+  liveness: Map<number, PidState> = probeUnverifiedPids(entries, probe),
 ): BridgeRunningRecord[] {
   const running: BridgeRunningRecord[] = [];
   for (const entry of entries) {
     const { state, port } = entry;
     let pid: number | undefined;
     if (state.kind === "running") pid = state.pid;
-    else if (state.kind === "unverified" && probe(state.pid) === "alive") pid = state.pid;
+    else if (state.kind === "unverified" && liveness.get(state.pid) === "alive") pid = state.pid;
     if (pid === undefined) continue;
     running.push(port === undefined ? { adapter: entry.adapter, pid } : { adapter: entry.adapter, pid, port });
   }
   return running;
+}
+
+/** The running records and the one probe result per unverified pid that a
+ *  `status --json` document derives both its `bridges` entry and its `records`
+ *  entry from. */
+export function bridgeStatusSnapshot(entries: BridgePidFileEntry[]): {
+  running: BridgeRunningRecord[];
+  liveness: Map<number, PidState>;
+} {
+  const liveness = probeUnverifiedPids(entries, statusProbe);
+  return { running: runningRecordsFrom(entries, statusProbe, liveness), liveness };
 }
 
 function statusOf(
