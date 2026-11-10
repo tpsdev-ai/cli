@@ -108,6 +108,13 @@ describe("tps shared flag reader (cli#903 items 6-8)", () => {
     expect(sent).toBeDefined();
   });
 
+  test("a leading -- is skipped and a later -- ends the flags", async () => {
+    const r = await run(["--", "skill", "list", "--agent", OWNER, "--", `--agent=${OTHER}`]);
+    expect(r.status).toBe(0);
+    expect(r.out).toContain(`Skills assigned to ${OWNER}`);
+    expect(r.out).not.toContain(`Skills assigned to ${OTHER}`);
+  });
+
   test("a conflicting repeat is a usage error naming --agent, with no stack, and acts on nothing", async () => {
     const id = seedFor(OWNER);
     const r = await run(["mail", "ack", id, "--agent", OWNER, `--agent=${OTHER}`]);

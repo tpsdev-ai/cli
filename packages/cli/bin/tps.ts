@@ -58,17 +58,20 @@ const refuseRepeatedFlag = (name: string): never => {
 /**
  * Shared reader for the subcommand flag blocks.
  *
- * `--` ends the CLI's own arguments, so a positional payload that begins with
- * a flag (`mail send <agent> -- --agent=x`) is never read as one. Accepts
+ * A `--` before the subcommand is meow's positionals separator, not the end of
+ * the subcommand's own options, so the scan passes it. The first `--` after the
+ * subcommand ends option parsing, so a positional payload that begins with a
+ * flag (`mail send <agent> -- --agent=x`) is never read as one. Accepts
  * `--name value` and `--name=value`, and refuses more than one value for the
  * same flag.
  */
 const getFlag = (name: string): string | undefined => {
   const args = helpArgs.argv;
+  const commandIndex = args.indexOf(helpArgs.positionals[0] ?? "");
   const values: (string | undefined)[] = [];
   for (let index = 0; index < args.length; index++) {
     const arg = args[index];
-    if (arg === "--") break;
+    if (arg === "--" && index > commandIndex) break;
     if (arg === `--${name}`) {
       const next = args[index + 1];
       if (next === undefined || next.startsWith("-")) {
