@@ -4,4 +4,6 @@
   Bridge status `--json` keeps the existing `running`, `pid`, `port`, `adapter`
   and `bridges` fields unchanged, and adds `records` with one
   `{ adapter, path, state }` entry per pid record; `state` is the record kind
-  (`running`, `invalid`, `stale`, `unverified`, `unreadable`).
+  (`running`, `invalid`, `stale`, `unverified`, `unreadable`), a record whose
+  kind carries a `pid` includes it, and an `unreadable` record includes its
+  `reason` when it has one.

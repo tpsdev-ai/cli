@@ -5,11 +5,13 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { runBridge } from "../src/commands/bridge.js";
 import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
+import { setRunDirReader } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -263,7 +265,7 @@ describe("tps bridge status --json records", () => {
       expect(status.bridges).toEqual([{ adapter: "openclaw", pid: child.pid, port: 7891 }]);
       expect(status.records).toEqual([
         { adapter: "discord", path: badPath, state: "invalid" },
-        { adapter: "openclaw", path: goodPath, state: "running" },
+        { adapter: "openclaw", path: goodPath, state: "running", pid: child.pid },
       ]);
     },
     TIMEOUT,
@@ -284,11 +286,58 @@ describe("tps bridge status --json records", () => {
       expect(result.status).toBe(0);
       const status = JSON.parse(result.stdout);
       expect(status.running).toBe(false);
+      // `bridges` promotes the unverified record whose pid is alive.
+      expect(status.bridges).toEqual([{ adapter: "beta", pid: unverifiedChild.pid }]);
       expect(status.records).toEqual([
-        { adapter: "alpha", path: stalePath, state: "stale" },
-        { adapter: "beta", path: unverifiedPath, state: "unverified" },
-        { adapter: "gamma", path: unreadablePath, state: "unreadable" },
+        { adapter: "alpha", path: stalePath, state: "stale", pid: staleChild.pid },
+        { adapter: "beta", path: unverifiedPath, state: "unverified", pid: unverifiedChild.pid },
+        {
+          adapter: "gamma",
+          path: unreadablePath,
+          state: "unreadable",
+          reason: "could not be opened (ELOOP: symlink resolution refused)",
+        },
       ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an empty run directory is exactly {running:false,records:[]}",
+    () => {
+      const result = runCli(["bridge", "status", "--json"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe('{"running":false,"records":[]}');
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "every field comes from one directory read",
+    async () => {
+      const child = spawnChild();
+      writeBridgeRecord("bridge-openclaw.pid", record(child.pid, childToken(child.pid)));
+
+      const reads: string[] = [];
+      const previous = setRunDirReader((dir) => {
+        reads.push(dir);
+        return readdirSync(dir);
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+        setRunDirReader(previous);
+      }
+
+      expect(reads).toHaveLength(1);
+      const status = JSON.parse(logs[0]);
+      expect(status.records).toEqual([
+        { adapter: "openclaw", path: join(runDir, "bridge-openclaw.pid"), state: "running", pid: child.pid },
+      ]);
+      expect(status.bridges).toEqual([{ adapter: "openclaw", pid: child.pid }]);
     },
     TIMEOUT,
   );

@@ -76,12 +76,23 @@ function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntr
   return { path, state, port, adapter };
 }
 
+/** The run-directory listing `bridgePidFiles` uses; replaceable in tests. */
+let listRunDir = (dir: string): string[] => readdirSync(dir);
+
+/** Replace the run-directory listing; returns the previous reader. A test uses
+ *  this to count how many times one `status --json` call reads the directory. */
+export function setRunDirReader(reader: (dir: string) => string[]): (dir: string) => string[] {
+  const previous = listRunDir;
+  listRunDir = reader;
+  return previous;
+}
+
 /** The bridge pid records discovery accepts, with their strict classification. */
 export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
   let names: string[];
   try {
-    names = readdirSync(pidDir);
+    names = listRunDir(pidDir);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
     if (code === "ENOENT") return [];
@@ -117,9 +128,11 @@ export interface BridgeRunningRecord {
   port?: number;
 }
 
-function runningRecordsFrom(
+/** The running records among `entries`: each `running` entry, plus an
+ *  `unverified` entry whose pid the probe reports alive. */
+export function runningRecordsFrom(
   entries: BridgePidFileEntry[],
-  probe: (pid: number) => PidState,
+  probe: (pid: number) => PidState = pidState,
 ): BridgeRunningRecord[] {
   const running: BridgeRunningRecord[] = [];
   for (const entry of entries) {

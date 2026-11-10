@@ -8,7 +8,7 @@
  */
 
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { bridgePidFiles, bridgeRunningRecords, openClawBridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
+import { bridgePidFiles, openClawBridgeStatus, runningRecordsFrom, startBridgeDaemon } from "../utils/mail-bridge.js";
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
@@ -278,11 +278,15 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
 
     case "status": {
       if (args.json) {
+        // One directory read and one classification pass feed every field, so
+        // no two fields of the document can describe different snapshots.
         const entries = bridgePidFiles();
-        const running = bridgeRunningRecords();
+        const running = runningRecordsFrom(entries);
         // The top-level `running`, `pid` and `port` describe the OpenClaw
-        // record only; `bridges` lists every running record, and `records`
-        // lists every pid record with its classified kind.
+        // record only. `bridges` lists running records PLUS unverified records
+        // whose pid is alive; `records` lists every pid record with its
+        // classified kind, its pid when the kind has one, and a reason when an
+        // unreadable record has one.
         const openclaw = running.find((entry) => entry.adapter === "openclaw");
         const status = {
           running: openclaw !== undefined,
@@ -290,7 +294,19 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           ...(openclaw?.port === undefined ? {} : { port: openclaw.port }),
           ...(openclaw === undefined ? {} : { adapter: openclaw.adapter }),
           ...(running.length === 0 ? {} : { bridges: running }),
-          records: entries.map(({ adapter, path, state }) => ({ adapter, path, state: state.kind })),
+          records: entries.map(({ adapter, path, state }) => {
+            const pid =
+              state.kind === "running" || state.kind === "stale" || state.kind === "unverified"
+                ? state.pid
+                : undefined;
+            return {
+              adapter,
+              path,
+              state: state.kind,
+              ...(pid === undefined ? {} : { pid }),
+              ...(state.kind === "unreadable" && state.reason !== undefined ? { reason: state.reason } : {}),
+            };
+          }),
         };
         console.log(JSON.stringify(status));
       } else {
