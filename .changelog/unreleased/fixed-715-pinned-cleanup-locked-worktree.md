@@ -1,1 +1,1 @@
-- **Launch worktree removal records the pinned path and leaves a locked worktree alone.**
+- **Launch worktree removal records the pinned path and leaves a locked worktree alone.** A launch now refuses an absent registered workspace instead of treating it as existing, and names the pinned tree and how to recover it when a removal record exists.

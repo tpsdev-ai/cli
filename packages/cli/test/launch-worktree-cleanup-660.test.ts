@@ -365,6 +365,8 @@ test("unit — a failed Git removal leaves the registration at the pinned worktr
     // The printed command targets the pinned path, never the occupied workspace path.
     expect(message).toContain(`remove it manually with: git -C '${f.base}' worktree remove --force '${pinned}'`);
     expect(message).not.toContain(`--force '${f.workspace}'`);
+    // The move back did not happen, so the record still names the pinned tree.
+    expect(readFileSync(join(gitDir, "tps-launch-cleanup"), "utf-8")).toBe(`${pinned}\n`);
     expect(created!.removed).toBeUndefined();
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -1355,6 +1357,110 @@ test("unit — a failed Git removal, a completed move back and a failed registra
     expect(existsSync(f.workspace)).toBe(true);
     expect(existsSync(pinned)).toBe(false);
     expect(created!.removed).toBeUndefined();
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a failed Git removal that moves the worktree back drops the cleanup record", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    const gitDir = adminDir(f.workspace);
+    const { restore } = installWrapper(f, { injectMetadataFailure: false, failRemoval: true });
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!);
+    } catch (err) {
+      error = err;
+    } finally {
+      restore();
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("cannot remove a locked working tree");
+    // The move back completed, so the record that pointed at the pinned tree is gone.
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(existsSync(join(gitDir, "tps-launch-cleanup"))).toBe(false);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a verify failure after the move restores the tree and drops the cleanup record", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    const gitDir = adminDir(f.workspace);
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!, {
+        beforeRemoval: () => {
+          writeFileSync(join(gitDir, "tps-launch-owner"), randomUUID());
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain(`the worktree ownership marker changed in ${gitDir}`);
+    // The verification failure moved the tree back, so the record is gone.
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(existsSync(join(gitDir, "tps-launch-cleanup"))).toBe(false);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a failed move aside drops the cleanup record it had just written", () => {
+  const f = fixture();
+  try {
+    let created: WorktreeCreation | undefined;
+    onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+    expect(created).toBeDefined();
+    const gitDir = adminDir(f.workspace);
+    let error: unknown;
+    try {
+      removeCreatedWorktree(created!, {
+        beforeRemoval: () => {
+          rmSync(f.workspace, { recursive: true });
+        },
+      });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("the worktree could not be moved aside for removal");
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(existsSync(join(gitDir, "tps-launch-cleanup"))).toBe(false);
+    expect(readdirSync(f.root).filter((name) => name.includes(".cleanup-"))).toEqual([]);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — onStart refuses a registered worktree deleted by hand with no record and the plain message", () => {
+  const f = fixture();
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    const gitDir = adminDir(f.workspace);
+    // The directory is deleted by hand; the base still registers it and no launch record exists.
+    rmSync(f.workspace, { recursive: true });
+    expect(existsSync(join(gitDir, "tps-launch-cleanup"))).toBe(false);
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toBe(`worktree workspace is missing for a registered worktree: ${f.workspace}`);
+    // Nothing was moved or created at either the workspace path or a cleanup sibling.
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(readdirSync(f.root).filter((name) => name.includes(".cleanup-"))).toEqual([]);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }

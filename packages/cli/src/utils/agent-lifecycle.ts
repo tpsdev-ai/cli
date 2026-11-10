@@ -896,7 +896,7 @@ function clearCleanupRecord(record: string): void {
 /**
  * The refusal for a workspace that is absent while the base still registers it
  * (cli#715): the cleanup record names the pinned tree a stopped removal left,
- * and the text names the recovery steps. Without a record the plain refusal is kept.
+ * and the text names the recovery steps. Without a record the message is the plain one.
  */
 function missingRegisteredWorktreeMessage(workspace: string, baseWorkingTree: string, gitDir: string): string {
   const base = `worktree workspace is missing for a registered worktree: ${workspace}`;
