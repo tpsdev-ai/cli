@@ -1,0 +1,1 @@
+- **Check Socket Firewall checksum-mismatch install paths** The checksum-mismatch test now checks the install path for the host's architecture and the workspace copy.

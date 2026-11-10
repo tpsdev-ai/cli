@@ -372,7 +372,10 @@ describe("the pre-fetch cache and download paths", () => {
 
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("checksum mismatch");
-      expect(existsSync(join(root, "cache", "socket-firewall-free", "1.15.4", "x64", "sfw"))).toBe(false);
+      const installed = join(root, "cache", "socket-firewall-free", FIREWALL_VERSION, archName(), "sfw");
+      expect(existsSync(installed)).toBe(false);
+      expect(existsSync(join(root, "workspace", ".sfw-cache", "sfw"))).toBe(false);
+      expect(existsSync(`${join(root, "cache", "socket-firewall-free", FIREWALL_VERSION, archName())}.complete`)).toBe(false);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
