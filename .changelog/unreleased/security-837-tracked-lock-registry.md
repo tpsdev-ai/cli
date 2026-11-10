@@ -1,0 +1,1 @@
+- **The tracked-lock installer now uses the release-age gate's registry and refuses configuration that could redirect it.** Before npm runs it refuses an `.npmrc`, an `npm_config_*` variable that could change the fetch, and a lock entry whose `resolved` URL is missing or outside that registry.
