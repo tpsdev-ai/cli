@@ -83,6 +83,20 @@ export interface MailWatchOptions {
    * event can deliver the mail it writes.
    */
   watchImpl?: (dir: string, listener: () => void) => { close(): void };
+  /**
+   * Readiness seam: called ONCE, on the event-loop turn after the watcher's
+   * FIRST scan attempt of `new/` completes, whether or not that listing
+   * succeeded (a failed listing is logged and still counts). By then fs.watch
+   * has been called and the startup scan is over, so a record written afterwards
+   * is picked up by an fs event or a poll tick, never by the startup scan.
+   * It does NOT guarantee that fs.watch reports a write made immediately
+   * afterwards in good time: on macOS, FSEvents can report such a write seconds
+   * late. Tests that exercise the fs-event path therefore pass a `watchImpl`
+   * that captures the listener, and fire it themselves after the write.
+   * Default: no-op. It is informational only: errors thrown by the callback are
+   * swallowed, and it does not affect delivery.
+   */
+  onReady?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +261,20 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // not a queue), run when that scan finishes.
   let rescan = false;
 
+  // Fire the readiness seam once, when the FIRST scan attempt has finished,
+  // whether or not its listing succeeded. fs.watch was called before the
+  // startup processNew(), but that does not mean the OS is already reporting
+  // events for new/ (see MailWatchOptions.onReady).
+  let readyFired = false;
+  const fireReady = () => {
+    if (readyFired) return;
+    readyFired = true;
+    // On the next turn of the event loop, after the startup scan has finished.
+    setImmediate(() => {
+      try { opts.onReady?.(); } catch { /* a readiness callback must not crash the watcher */ }
+    });
+  };
+
   const drain = () => {
     while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
       const msg = pending.shift();
@@ -370,6 +398,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
     } finally {
       checking = false;
+      fireReady();
       drain();
       if (rescan && !stopped) { rescan = false; void processNew(); }
     }

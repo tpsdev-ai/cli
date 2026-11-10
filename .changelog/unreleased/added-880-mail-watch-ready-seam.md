@@ -1,0 +1,1 @@
+- **Mail watcher readiness seam:** `watchMail` accepts an `onReady` callback, called once after its first scan of `new/` completes, whether or not that listing succeeded; it is a no-op unless supplied. It does not mean fs events are already being reported: on macOS, a write made right after it can be reported seconds late.
