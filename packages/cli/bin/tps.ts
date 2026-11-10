@@ -205,7 +205,7 @@ const USAGE: Record<string, string> = {
   auth: "Usage:\n  tps auth login <provider>\n  tps auth status\n  tps auth revoke <provider>\n  tps auth refresh <provider>",
   office: "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill",
   context: "Usage:\n  tps context read <workstream>\n  tps context update <workstream> --summary \"...\"\n  tps context list",
-  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
+  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt> [--agent <id>]  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
   identity: "Usage:\n  tps identity init [--expires-in 90d]\n  tps identity show\n  tps identity register <branch> [--expires-in 90d] [--trust standard]\n  tps identity list\n  tps identity revoke <branch> --reason \"...\"\n  tps identity verify <branch>",
   secrets: [
           "Usage:",
@@ -421,7 +421,10 @@ async function main() {
 
       const getFlag = (name: string): string | undefined => {
         const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
+        if (idx >= 0) return process.argv[idx + 1];
+        const prefix = `--${name}=`;
+        const equals = process.argv.find((arg) => arg.startsWith(prefix));
+        return equals === undefined ? undefined : equals.slice(prefix.length);
       };
 
       const { runAgent } = await import("../src/commands/agent.js");
@@ -822,15 +825,43 @@ async function main() {
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
       if (!action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt> [--agent <id>]  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(1);
       }
 
       const getFlag = (name: string): string | undefined => {
         const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
+        if (idx >= 0) return process.argv[idx + 1];
+        const prefix = `--${name}=`;
+        const equals = process.argv.find((arg) => arg.startsWith(prefix));
+        return equals === undefined ? undefined : equals.slice(prefix.length);
       };
+
+      if ((action === "ack" || action === "nack") && rest.length > 2) {
+        console.error(`Unexpected argument: ${rest[2]}`);
+        console.error(`Usage: tps mail ${action} <id>${action === "nack" ? " --reason <text>" : ""} [--agent <id>]`);
+        process.exit(1);
+      }
+
+      if (action === "gc" && rest.length > 1) {
+        console.error(`Unexpected argument: ${rest[1]}`);
+        console.error("Usage: tps mail gc [--agent <id>]");
+        process.exit(1);
+      }
+
+      if (action === "ack" || action === "nack" || action === "gc") {
+        const hasEmptyAgent = process.argv.some((arg, index) => {
+          if (arg === "--agent=") return true;
+          if (arg !== "--agent") return false;
+          const next = process.argv[index + 1];
+          return next === undefined || next === "" || next.startsWith("-");
+        });
+        if (hasEmptyAgent) {
+          console.error("--agent requires a value");
+          process.exit(1);
+        }
+      }
 
       const { runMail } = await import("../src/commands/mail.js");
 
@@ -1294,7 +1325,10 @@ async function main() {
     case "memory": {
       const getFlag = (name: string): string | undefined => {
         const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
+        if (idx >= 0) return process.argv[idx + 1];
+        const prefix = `--${name}=`;
+        const equals = process.argv.find((arg) => arg.startsWith(prefix));
+        return equals === undefined ? undefined : equals.slice(prefix.length);
       };
       const governanceActions = ["review", "approve", "reject", "archive", "unarchive", "purge", "list", "show", "search"];
       if (governanceActions.includes(rest[0] ?? "")) {

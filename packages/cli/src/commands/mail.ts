@@ -826,7 +826,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       const agent = await resolveAgentId(args.agent);
       const id = args.messageId ?? args.message;
       if (!id || !args.reason) {
-        console.error("Usage: tps mail nack <id> --reason <text> [--type transient|agent|permanent] [--retry-after <duration>]");
+        console.error("Usage: tps mail nack <id> --reason <text> [--agent <id>] [--type transient|agent|permanent] [--retry-after <duration>]");
         process.exit(1);
       }
       await verifyMailAction(agent, id);
