@@ -296,9 +296,15 @@ describe("runCommandUnderNono()", () => {
     // On systems where /bin -> /usr/bin, we can't use /bin directly.
     const { mkdtempSync, writeFileSync, symlinkSync, chmodSync } = require("node:fs");
     const { join: pjoin } = require("node:path");
+    // Resolve echo on the real PATH before it is replaced: macOS has /bin/echo but no
+    // /usr/bin/echo, so a hard-coded path left a dangling link and the fallback could not run.
+    const echoBin = Bun.which("echo");
+    if (!echoBin || !existsSync(echoBin)) {
+      throw new Error(`fallback fixture: no echo binary found on the real PATH (resolved: ${echoBin})`);
+    }
     const fakeDir = mkdtempSync(pjoin(require("node:os").tmpdir(), "tps-nono-path-"));
     // Symlink the real echo into our fake dir
-    try { symlinkSync("/usr/bin/echo", pjoin(fakeDir, "echo")); } catch {}
+    symlinkSync(echoBin, pjoin(fakeDir, "echo"));
 
     const savedPath = process.env.PATH;
     process.env.PATH = fakeDir; // has echo, no nono
