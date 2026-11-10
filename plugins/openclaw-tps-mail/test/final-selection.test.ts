@@ -16,7 +16,7 @@
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { createRequire } from "node:module";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -27,7 +27,7 @@ import { signEnvelope, type ChainEntry } from "@tpsdev-ai/agent";
 // The REAL drain: the branch relay quarantines an unparseable outbox record with
 // this exact function (packages/cli/src/commands/branch.ts imports it from the
 // same module). Imported from the built CLI so we exercise the shipped artifact.
-import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
+import { drainOutbox, OUTBOX_PARTIAL_GRACE_MS } from "../../../packages/cli/dist/src/utils/outbox.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -421,6 +421,14 @@ describe("cli#398 T4 — an unrelated quarantined file does not poison later non
     const replyId = obligationFile("anvil", h.inboundId)?.replyId;
     expect(own.includes(replyId), "the quarantined record is named for THIS reply").toBe(true);
     writeFileSync(join(outbox("new"), own), "{ torn by an external fault");
+    // This drill means a record that STAYS malformed. The drain distinguishes
+    // that from a writer still in flight by the file's age, so age it past the
+    // grace before the real drain runs. The obligation deadline here (600 ms)
+    // is shorter than that grace: the verdict still comes from the drain; the
+    // deadline, if it runs first, scans the same outbox state. Aging the file
+    // is the faithful shape of "malformed for good".
+    const aged = new Date(Date.now() - OUTBOX_PARTIAL_GRACE_MS - 60_000);
+    utimesSync(join(outbox("new"), own), aged, aged);
     expect(drainOutbox().length, "nothing was delivered").toBe(0);
     expect(
       readdirSafe(outbox("sent")).filter((f) => f.startsWith(".malformed-")).length,

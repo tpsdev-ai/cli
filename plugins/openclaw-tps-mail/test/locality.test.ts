@@ -32,6 +32,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { join, resolve } from "node:path";
@@ -44,7 +45,7 @@ import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@t
 // with this exact function (packages/cli/src/commands/branch.ts imports it from
 // the same module). Imported from the built CLI so we exercise the shipped
 // artifact.
-import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
+import { drainOutbox, OUTBOX_PARTIAL_GRACE_MS } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as obligationsModule from "../src/obligations.js";
 // The RECIPIENT's side of a delivered reply: the real promotion and ack the CLI
 // runs on a mailbox (cli#429 round 7 — a consumed reply must still be evidence).
@@ -1094,7 +1095,8 @@ describe("cli#389 round 7 — the fail/nack verb refuses once the delivery commi
  *   (g) a thrown post-commit evidence step is logged by name and ARMS the
  *       deadline — the obligation is never stranded;
  *   (h) the drain quarantining THIS reply's own outbox record, attributed by its
- *       reply id, is a definitive verdict: failed + nacked AT ONCE;
+ *       reply id, is a definitive verdict once the record has stayed malformed
+ *       past the partial-write grace: failed + nacked then;
  *   (i) an unrelated `.malformed-*` is NOT a verdict: the committed obligation
  *       keeps its deadline and is never failed or nacked.
  */
@@ -1132,7 +1134,7 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
     expect(typeof outcome.obligation?.deadlineAt, "a deadline is armed").toBe("string");
   }, 20000);
 
-  it("(h) the drain quarantines THIS reply's own outbox record → attributed by reply id → receipt-malformed, failed and nacked AT ONCE", async () => {
+  it("(h) the drain quarantines THIS reply's own outbox record → attributed by reply id → receipt-malformed, failed and nacked once the grace passes", async () => {
     // A deadline would NOT fail this soon: the failure must come from the scan.
     process.env.TPS_OBLIGATION_DEADLINE_MS = "600000";
     const seen: { expectedReplyId: string | undefined; own: boolean; quarantined: number } = {
@@ -1150,7 +1152,13 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
       seen.expectedReplyId = expectedReplyId;
       seen.own = names.length === 1 && !!expectedReplyId && names[0]!.includes(expectedReplyId);
       if (!seen.own) return;
-      writeFileSync(join(outboxNew(), names[0]!), "{ torn by an external fault");
+      const own = join(outboxNew(), names[0]!);
+      writeFileSync(own, "{ torn by an external fault");
+      // The drain tells a torn write from a malformed complete record by AGE,
+      // not content. Age the record past the grace so this exercise is the
+      // settled malformation it means to test, not a writer still in flight.
+      const aged = new Date(Date.now() - OUTBOX_PARTIAL_GRACE_MS - 60_000);
+      utimesSync(own, aged, aged);
       drainOutbox();
       seen.quarantined = readdirSafe(outboxSent()).filter((f) => f.startsWith(".malformed-")).length;
     };
@@ -1200,7 +1208,12 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
     obligations.beforeScan = () => {
       const names = readdirSafe(outboxNew()).filter((f) => f.endsWith(".json"));
       if (names.length !== 1) return;
-      writeFileSync(join(outboxNew(), names[0]!), "{ torn by an external fault");
+      const own = join(outboxNew(), names[0]!);
+      writeFileSync(own, "{ torn by an external fault");
+      // Same shape as (h): a record that STAYS malformed is what this drill
+      // means, so age it past the grace before the real drain runs.
+      const aged = new Date(Date.now() - OUTBOX_PARTIAL_GRACE_MS - 60_000);
+      utimesSync(own, aged, aged);
       drainOutbox();
     };
     try {
