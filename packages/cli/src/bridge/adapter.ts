@@ -54,7 +54,9 @@ export function validateBridgeAdapterName(name: string): boolean {
  * `\x20`-`\x7e` as `\uXXXX` (each UTF-16 unit, so an astral code point is two
  * escapes; JSON.stringify has already escaped the controls).
  */
-function printableName(name: string): string {
+export function printableName(name: string): string {
+  // No `u` flag, on purpose: without it the class matches UTF-16 code units, so both halves of an astral
+  // character (0xD800-0xDFFF) are escaped. With `u` it matches code points, and an astral character passes raw.
   return JSON.stringify(name).replace(
     /[\u007f-\uffff]/g,
     (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,

@@ -202,8 +202,9 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     }
     const adapter = new RenamingAdapter();
     const core = new BridgeCore(adapter, { bridgeAgentId: "test-bridge", defaultAgentId: "default-agent", mailDir }, () => {});
-    await core.start();
     try {
+      // The reply and the promote spy are in place before start(), so the outbox's initial scan delivers it.
+      // Waiting on an fs.watch event instead took up to 2.4 s on a loaded host.
       const reply: MailMessage = {
         id: "reply-1",
         from: "agent-a",
@@ -221,9 +222,11 @@ describe("bridge adapter-name grammar (cli#725)", () => {
         return promoted;
       });
 
+      mkdirSync(join(mailDir, "test-bridge", "new"), { recursive: true });
       writeFileSync(join(mailDir, "test-bridge", "new", "reply.json"), JSON.stringify(reply), "utf-8");
-      for (let attempt = 0; attempt < 200 && adapter.sent.length === 0; attempt++) {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+      await core.start();
+      for (let attempt = 0; attempt < 300 && adapter.sent.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
       }
       expect(adapter.sent.map((envelope) => envelope.content)).toEqual(["plain reply from the agent"]);
       expect(adapter.sent.map((envelope) => envelope.channel)).toEqual(["openclaw"]);
