@@ -18,7 +18,9 @@
 #   * a move that does not land (npm exits 0, the registry never changes) is caught
 #     by the post-move re-read, and the packages already moved are rolled back
 #   * an INTERRUPT (SIGTERM) during a promote write keeps the lock and records that write
-#   * a signal during failure-path rollback does not abandon the restorations
+#   * a signal during failure-path rollback does not abandon the restorations (O)
+#   * a second TERM during the handler's rollback is ignored: the rollback
+#     completes, the registry is restored and the lock is released (P)
 #   * build metadata (1.2.3+build-abc) is not misread as a pre-release
 #   * the confirmation gate aborts on anything but "yes"
 #   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
@@ -438,7 +440,7 @@ if (cmd === 'view') {
       persist(s);
       if (process.env.FAKE_NPM_PIDFILE) fs.writeFileSync(process.env.FAKE_NPM_PIDFILE, String(process.pid));
       process.on('SIGTERM', () => {});
-      setTimeout(() => { process.stdout.write(s.latest[spec.pkg] + '\n'); }, 10000);
+      setTimeout(() => { process.stdout.write(s.latest[spec.pkg] + '\n'); }, Number(process.env.FAKE_NPM_STALL_VIEW_MS || 10000));
       return;
     }
     if ((s.failViewLatest || []).includes(spec.pkg)) fail('npm error code E503\nnpm error fake registry read failed');
@@ -891,20 +893,6 @@ run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [arg
   signal_tool "$d" "$sig"
   finish_held "$d"
 }
-run_interrupt2() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <sig1> <sig2> [args...]
-  local d="$1"
-  local hold="$2"
-  local holdver="$3"
-  local sig1="$4"
-  local sig2="$5"
-  shift 5
-  start_held "$d" "$hold" "$holdver" "$@"
-  wait_count "$HCOUNTER" 1
-  signal_tool "$d" "$sig1"
-  wait_count "$HCOUNTER" 2
-  signal_tool "$d" "$sig2"
-  finish_held "$d"
-}
 adds_count() {
   local n
   n="$(grep -c '^dist-tag add ' "$LOG" 2>/dev/null)"
@@ -1014,12 +1002,39 @@ assert_eq "O interrupt-during-rollback: exit" 4 "$IRC"
 assert_contains "O interrupt-during-rollback: reports rollback" "$ERR" "attempting rollback"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "O interrupt-during-rollback: restored" "latest=0.5.3 for all six"; else bad "O interrupt-during-rollback: restored" "a partial promote was stranded"; fi
 
-# ── P. another TERM during an in-flight write leaves the lock ──────────────
-d="$(new_fixture interrupt-second)"
+# ── P. a second TERM during the handler's rollback is ignored ────────────────
+# Signal #1 lands while NO write is in flight: the fake npm stalls the post-add
+# read, and the tool waits for that `view`. The handler ignores further signals
+# and starts the rollback; signal #2 lands while the rollback's `dist-tag add` is
+# held. The rollback must finish, the registry must be restored and the lock
+# released (exit 4), not abandoned or turned into an uncertain run (exit 7).
+d="$(new_fixture interrupt-two-signals)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
-run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
-assert_eq "P interrupt: exit" 7 "$IRC"
-assert_contains "P interrupt: reason" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "promote to 0.5.4"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallViewAfterAdd="@tpsdev-ai/cli-darwin-arm64"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+FAKE_NPM_STALL_VIEW_MS=2000 FAKE_NPM_PIDFILE="$d/view.pid" FAKE_NPM_RELEASE_FILE="$d/release" \
+  start_held "$d" cli-darwin-arm64 0.5.3 0.5.4 --yes --no-docker
+for ((tries = 0; tries < 200; tries++)); do
+  [ -s "$d/view.pid" ] && break
+  sleep 0.05
+done
+assert_eq "P two-signal: post-add read held" yes "$(if [ -s "$d/view.pid" ]; then echo yes; else echo no; fi)"
+signal_tool "$d" TERM
+if wait_count "$HCOUNTER" 1; then
+  signal_tool "$d" TERM
+else
+  bad "P two-signal: rollback write held" "no hold marker before the timeout"
+fi
+: >"$d/release"
+finish_held "$d"
+assert_eq "P two-signal: exit" 4 "$IRC"
+assert_contains "P two-signal: reports rollback" "$ERR" "attempting rollback"
+if printf '%s' "$ERR" | grep -qF 'UNCERTAIN'; then
+  bad "P two-signal: second signal ignored" "the second signal turned the rollback into an uncertain run"
+else
+  ok "P two-signal: second signal ignored" "the rollback ran to completion"
+fi
+assert_eq "P two-signal: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+if all_latest_eq "$d/state.json" "0.5.3"; then ok "P two-signal: registry restored" "latest=0.5.3 for all six"; else bad "P two-signal: registry restored" "a partial promote was left behind"; fi
 
 # ── Q. build metadata is NOT a pre-release ────────────────────────────────────
 # SemVer permits hyphens in build metadata; 1.2.3+build-abc is a stable release
@@ -1423,14 +1438,21 @@ fi
 d="$(new_fixture supervisor-bound)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-t0="$(python3 -c 'import time; print(time.monotonic())')"
+# Date.now() is a wall clock shared by every process (python3's monotonic is
+# per-process in some builds, e.g. macOS 3.9, so it cannot time across two).
+t0="$(node -p 'Date.now()')"
 NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
-t1="$(python3 -c 'import time; print(time.monotonic())')"
-elapsed="$(python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$t0" "$t1")"
+t1="$(node -p 'Date.now()')"
+elapsed="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
 assert_eq "AL bound: exit" 7 "$RC"
 assert_contains "AL bound: supervisor attempted TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
 assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
-if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$elapsed" 8; then
+if node -e 'process.exit(Number(process.argv[1]) >= 2.5 ? 0 : 1)' "$elapsed"; then
+  ok "AL bound: at least deadline + grace" "${elapsed}s"
+else
+  bad "AL bound: at least deadline + grace" "${elapsed}s — below the 1 s deadline + 2 s grace"
+fi
+if node -e 'process.exit(Number(process.argv[1]) < 8 ? 0 : 1)' "$elapsed"; then
   ok "AL bound: inside deadline + grace + 5s" "${elapsed}s"
 else
   bad "AL bound: inside deadline + grace + 5s" "${elapsed}s"
@@ -1713,11 +1735,11 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10b/npm-supe
   d="$(new_fixture mut-count-sleeps)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-darwin-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-  t0="$(python3 -c 'import time; print(time.monotonic())')"
+  t0="$(node -p 'Date.now()')"
   NPM_TIMEOUT_SECONDS=1 NPM_BIN_OVERRIDE="$slow_npm" REAL_NPM="$fake_npm" PROMOTE_MUTANT_STARTUP_MS=5000 TOOL="$m10b/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
-  t1="$(python3 -c 'import time; print(time.monotonic())')"
-  elapsed="$(python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$t0" "$t1")"
-  if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) >= float(sys.argv[2]) else 1)' "$elapsed" 8; then
+  t1="$(node -p 'Date.now()')"
+  elapsed="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
+  if node -e 'process.exit(Number(process.argv[1]) >= 8 ? 0 : 1)' "$elapsed"; then
     ok "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s, past deadline + grace + 5s"
   else
     bad "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s — fixture AL is blind"
