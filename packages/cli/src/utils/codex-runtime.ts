@@ -604,6 +604,16 @@ function openPullRequest(
   })();
 }
 
+/** Remove ANSI CSI escapes from probe stderr, replace C0 and C1 control characters and DEL with spaces, then cap it. */
+function sanitizeProbeStderr(raw: string): string {
+  const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g");
+  const controls = new RegExp(
+    `[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}-${String.fromCharCode(159)}]`,
+    "g",
+  );
+  return raw.replace(ansi, "").replace(controls, " ").trim().slice(0, 300);
+}
+
 export async function runAutoCommit(
   config: Pick<CodexRuntimeConfig, "workspace" | "agentId">,
   flair: AutoCommitFlair,
@@ -638,6 +648,26 @@ export async function runAutoCommit(
   }
 
   const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
+  if (statusResult.status !== 0 || statusResult.error || statusResult.signal) {
+    const stderr = sanitizeProbeStderr(
+      typeof statusResult.stderr === "string" ? statusResult.stderr : "",
+    );
+    const failure = statusResult.error
+      ? `could not run: ${statusResult.error.message}`
+      : statusResult.signal
+        ? `signal ${statusResult.signal}`
+        : `exit ${statusResult.status}`;
+    const detail = stderr ? `${failure}: ${stderr}` : failure;
+    try {
+      await flair.publishEvent({
+        kind: "blocker",
+        summary: `Auto-commit refused for ${taskId}: git status --porcelain failed`,
+        detail,
+        refId: taskId,
+      });
+    } catch { /* non-fatal */ }
+    throw new Error(`git status --porcelain failed in ${repo}: ${detail}`);
+  }
   const hasWorkingTreeChanges = ((statusResult.stdout ?? "") as string).trim().length > 0;
   const remoteRefCheck = runSync(GIT_BIN, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { cwd: repo, encoding: "utf-8" });
   const aheadResult = runSync(

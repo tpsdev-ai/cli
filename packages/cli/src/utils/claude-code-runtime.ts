@@ -35,7 +35,6 @@ import {
   existsSync, writeFileSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk,
@@ -51,6 +50,7 @@ import {
 } from "./agent-lifecycle.js";
 import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
+import { homeDir } from "./home.js";
 import type { Envelope } from "@tpsdev-ai/agent";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
@@ -156,7 +156,7 @@ async function runClaudeCode(
   }
 
   // Session log — append with task header
-  const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
+  const logPath = config.sessionLogPath ?? join(homeDir(), ".tps", "agents", config.agentId, "session.log");
   const promptSrc = systemPrompt.includes("Flair (live)") ? "flair" : "disk-fallback";
   const logHeader = `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} | prompt_src: ${promptSrc}\n${"=".repeat(60)}\n`;
   appendFileSync(logPath, logHeader, "utf-8");

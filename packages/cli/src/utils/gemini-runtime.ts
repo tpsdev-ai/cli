@@ -8,7 +8,6 @@ import {
   readFileSync, existsSync, appendFileSync, createWriteStream,
 } from "node:fs";
 import { join } from "node:path";
-import { homedir } from "node:os";
 import { FlairClient } from "./flair-client.js";
 import {
   snapshotSoulToDisk, bootContext, searchPastExperience,
@@ -17,6 +16,7 @@ import {
 } from "./agent-lifecycle.js";
 import { pollRuntimeMail, sendRuntimeMail, completeRuntimeMail, runtimeBootPreflight, type RuntimeMailConfig } from "./runtime-mail.js";
 import { externalDispatchRefusal } from "./mail-tier.js";
+import { homeDir } from "./home.js";
 import type { Envelope } from "@tpsdev-ai/agent";
 import type { WorkspaceProvider } from "./workspace-provider.js";
 import snooplogg from "snooplogg";
@@ -123,7 +123,7 @@ export function extractFinalAnswer(raw: string): string {
 async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeoutMs: number): Promise<string> {
   const { systemPrompt, userTask } = await buildPrompt(message, config);
   const model = config.model ?? "gemini-2.5-pro";
-  const logPath = config.sessionLogPath ?? join(homedir(), ".tps", "agents", config.agentId, "session.log");
+  const logPath = config.sessionLogPath ?? join(homeDir(), ".tps", "agents", config.agentId, "session.log");
   appendFileSync(logPath, `\n${"=".repeat(60)}\n[${new Date().toISOString()}] Task from ${message.from} (gemini)\n${"=".repeat(60)}\n`);
   const logStream = createWriteStream(logPath, { flags: "a" });
 
@@ -131,7 +131,7 @@ async function runGemini(message: MailMessage, config: GeminiConfig, taskTimeout
   const args = ["-y", "--model", model, "-p", userTask, "-e", ""];
 
   return new Promise((resolve, reject) => {
-    const tpsBin = join(homedir(), ".tps", "bin");
+    const tpsBin = join(homeDir(), ".tps", "bin");
     const geminiEnv = { ...process.env, TPS_AGENT_ID: config.agentId, PATH: `${tpsBin}:${process.env.PATH ?? ""}` };
     const proc = spawn("gemini", args, { cwd: config.workspace, stdio: ["pipe", "pipe", "pipe"], env: geminiEnv });
     proc.stdin.write(systemPrompt);
