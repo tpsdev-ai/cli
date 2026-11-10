@@ -82,6 +82,71 @@ describe("tryAcquireMailLock owner pid", () => {
 });
 
 describe("tps status pid check", () => {
+  test("reports a forced alive probe answer as online and a forced gone answer as a zombie", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-692-status-"));
+    const home = join(root, "home");
+    const nodes = join(home, ".tps", "status", "nodes");
+    mkdirSync(nodes, { recursive: true });
+    try {
+      const now = new Date().toISOString();
+      // Each forced answer is the opposite of the real probe's: pid 999999 is
+      // gone, so forcing agent-a "alive" and reporting it online proves the
+      // seam was consulted; agent-b's pid is this test process, alive while it
+      // runs, so forcing it "gone" and reporting a zombie proves the same.
+      const pids: Record<string, number> = { "agent-a": 999_999, "agent-b": process.pid };
+      for (const [agentId, pid] of Object.entries(pids)) {
+        writeFileSync(
+          join(nodes, `${agentId}.json`),
+          JSON.stringify({
+            agentId,
+            host: "host-a",
+            model: "model-a",
+            status: "online",
+            lastHeartbeat: now,
+            lastActivity: now,
+            sessionCount: 0,
+            errorCount: 0,
+            uptime: 0,
+            version: "0.0.0",
+            pid,
+          }),
+        );
+      }
+      const scriptPath = join(root, "status-forced.mjs");
+      writeFileSync(
+        scriptPath,
+        `
+import { runStatus } from ${JSON.stringify(STATUS_MODULE)};
+const lines = [];
+const log = console.log;
+console.log = (...args) => lines.push(args.join(" "));
+const forcedPidState = (pid) => (pid === 999999 ? "alive" : "gone");
+await runStatus({ json: true }, { pidState: forcedPidState });
+console.log = log;
+process.stdout.write("RESULT " + JSON.stringify(JSON.parse(lines.join("\\n"))) + "\\n");
+`,
+      );
+
+      const result = spawnSync("bun", [scriptPath], {
+        cwd: root,
+        encoding: "utf-8",
+        timeout: 20_000,
+        env: { ...process.env, HOME: home },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      const line = result.stdout.split("\n").find((entry) => entry.startsWith("RESULT "));
+      expect(line, result.stdout).toBeDefined();
+      const rows = JSON.parse((line as string).slice("RESULT ".length)) as Array<{ id: string; state: string }>;
+      expect(Object.fromEntries(rows.map((row) => [row.id, row.state]))).toEqual({
+        "agent-a": "online",
+        "agent-b": "zombie",
+      });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("reports pid 1 and a running process as online, and a gone, zero, negative, fractional or out-of-range pid as a zombie", async () => {
     const root = mkdtempSync(join(tmpdir(), "tps-677-status-"));
     const home = join(root, "home");
