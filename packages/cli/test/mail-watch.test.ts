@@ -585,18 +585,11 @@ describe("watchMail (verified-only, non-consuming)", () => {
       onReady: ready.onReady,
       onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
     });
-    const env = buildSignedEnvelope("flint", AGENT, "same id, second file", SEEDS);
+    let envId = "";
     try {
       await ready.promise;
-      const wrapper = (id: string) => ({
-        id,
-        from: "flint",
-        to: AGENT,
-        body: JSON.stringify(env),
-        timestamp: env.timestamp,
-        read: false,
-      });
-      writeRecord(wrapper("id-copy-a"));
+      const env = deliverSigned("same id, second file");
+      envId = env.messageId;
       const first = onlyNewFile();
       events.fire(first);
       await waitFor(
@@ -605,20 +598,16 @@ describe("watchMail (verified-only, non-consuming)", () => {
         () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
       );
 
-      // A SECOND file, a different name, the SAME verified envelope id, written
+      // A SECOND file: the same wrapper bytes under a different name, written
       // after the first was presented. The barrier below makes a scan list both
       // copies, so a second presentation of that id would show up.
-      writeRecord(wrapper("id-copy-b"));
-      const barrierEnv = buildSignedEnvelope("flint", AGENT, "barrier", SEEDS);
-      writeRecord({
-        id: "barrier-1",
-        from: "flint",
-        to: AGENT,
-        body: JSON.stringify(barrierEnv),
-        timestamp: barrierEnv.timestamp,
-        read: false,
-      });
-      events.fire(join(dirname(first), "barrier-1.json"));
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      writeRecord({ ...raw, id: "id-copy-b" });
+      deliverSigned("barrier");
+      const files = jsonFiles(dirname(first)).map((f) => join(dirname(first), f));
+      const barrierFile = files.find((p) => p !== first && basename(p) !== "id-copy-b.json");
+      expect(barrierFile).toBeDefined();
+      events.fire(barrierFile!);
       await waitFor(
         () => bodies.includes("barrier"),
         SCAN_SETTLE_MS,
@@ -629,7 +618,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
 
     // The barrier scan listed the first file, the second copy and the barrier.
-    expect(ids.filter((id) => id === env.messageId)).toHaveLength(1);
+    expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
   it("dedups by the VERIFIED envelope id: two files bearing the same signed id are presented once", async () => {
