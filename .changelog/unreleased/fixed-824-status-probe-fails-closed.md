@@ -1,0 +1,1 @@
+- **The auto-commit helper refuses when its working-tree status probe fails.** A non-zero exit, spawn error or signal from `git status --porcelain` throws without committing or pushing; the error names the repository, the probe and its failure, with stderr (cli#824).

@@ -638,6 +638,17 @@ export async function runAutoCommit(
   }
 
   const statusResult = runSync(GIT_BIN, ["status", "--porcelain"], { cwd: repo, encoding: "utf-8" });
+  if (statusResult.status !== 0 || statusResult.error || statusResult.signal) {
+    const stderr = typeof statusResult.stderr === "string" ? statusResult.stderr.trim() : "";
+    const failure = statusResult.error
+      ? `could not run: ${statusResult.error.message}`
+      : statusResult.signal
+        ? `signal ${statusResult.signal}`
+        : `exit ${statusResult.status}`;
+    throw new Error(
+      `git status --porcelain failed in ${repo}: ${failure}${stderr ? `: ${stderr}` : ""}`,
+    );
+  }
   const hasWorkingTreeChanges = ((statusResult.stdout ?? "") as string).trim().length > 0;
   const remoteRefCheck = runSync(GIT_BIN, ["rev-parse", "--verify", `refs/remotes/origin/${branchName}`], { cwd: repo, encoding: "utf-8" });
   const aheadResult = runSync(

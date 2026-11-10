@@ -1,0 +1,1 @@
+- **The Claude Code and Gemini runtimes resolve their default session log, and the Gemini tps shim PATH, under the current HOME** (cli#822).

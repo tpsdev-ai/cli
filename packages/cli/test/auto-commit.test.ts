@@ -1146,6 +1146,95 @@ describe("runAutoCommit", () => {
     ]);
   });
 
+  test("refuses when the second status probe fails instead of reusing existing commits", async () => {
+    const repo = initRepo();
+    const shimDir = mkdtempSync(join(tmpdir(), "cli822-bin-"));
+    const callLog = join(shimDir, "calls.log");
+    const shim = gitShim(shimDir, `printf '%s\\n' "$*" >> ${callLog}
+if [[ "$1" == "status" && "$2" == "--porcelain" ]]; then
+  printf 'injected status failure\\n' >&2
+  exit 3
+fi
+exec ${GIT} "$@"`);
+    try {
+      await expect(runAutoCommit(
+        { agentId: "agent-a", workspace: repo },
+        { publishEvent: mock(async () => {}) },
+        {
+          taskId: "task-probe",
+          branchName: "fix/probe",
+          commitMessage: "fix: probe",
+          authorName: "agent-a",
+          authorEmail: "agent-a@example.com",
+          push: true,
+          openPr: true,
+          prRepo: "agent-a/repo",
+          ghAgent: "agent-a",
+        },
+        { spawnSyncImpl: shimRunner(shim), tpsCommand: shim },
+      )).rejects.toThrow(`git status --porcelain failed in ${repo}: exit 3: injected status failure`);
+
+      const calls = readFileSync(callLog, "utf-8");
+      expect(calls).not.toContain("push");
+      expect(calls).not.toContain("agent commit");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(shimDir, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("refuses when the status probe cannot spawn", async () => {
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/fix/probe\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: null, stdout: "", stderr: "", error: new Error("spawn EACCES"), signal: null };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    await expect(runAutoCommit(
+      { agentId: "agent-a", workspace: "/tmp/repo" },
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-probe",
+        branchName: "fix/probe",
+        commitMessage: "fix: probe",
+        authorName: "agent-a",
+        authorEmail: "agent-a@example.com",
+        push: true,
+      },
+      { spawnSyncImpl },
+    )).rejects.toThrow("git status --porcelain failed in /tmp/repo: could not run: spawn EACCES");
+  });
+
+  test("refuses when the status probe is killed by a signal", async () => {
+    const spawnSyncImpl = mock((cmd: string, args: string[]) => {
+      if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
+        return { status: 0, stdout: "refs/heads/fix/probe\n", stderr: "" };
+      }
+      if (cmd === "/usr/bin/git" && args.join(" ") === "status --porcelain") {
+        return { status: null, stdout: "", stderr: "", signal: "SIGKILL" };
+      }
+      throw new Error(`unexpected command: ${cmd} ${args.join(" ")}`);
+    });
+
+    await expect(runAutoCommit(
+      { agentId: "agent-a", workspace: "/tmp/repo" },
+      { publishEvent: mock(async () => {}) },
+      {
+        taskId: "task-probe",
+        branchName: "fix/probe",
+        commitMessage: "fix: probe",
+        authorName: "agent-a",
+        authorEmail: "agent-a@example.com",
+        push: true,
+      },
+      { spawnSyncImpl },
+    )).rejects.toThrow("git status --porcelain failed in /tmp/repo: signal SIGKILL");
+  });
+
   test("returns no PR URL when no PR is opened", async () => {
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
