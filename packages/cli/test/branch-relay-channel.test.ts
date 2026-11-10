@@ -160,6 +160,8 @@ describe("branch relay authenticated channels", () => {
       const otherFingerprint = fingerprint(otherHost.encryption.publicKey);
       expect(otherFingerprint).not.toBe(hostFingerprint);
       const observe = async (listener: typeof ws.listenForHostWs, ...args: Parameters<typeof ws.listenForHostWs>) => {
+        // The branch must ask for port 0; a pre-chosen port is exactly the #889 race.
+        expect(args[2]).toBe(0);
         const actual = await listener(...args);
         const onConnection = actual.onConnection.bind(actual);
         spyOn(actual, "onConnection").mockImplementation((handler) => {

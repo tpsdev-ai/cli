@@ -49,7 +49,10 @@ export interface TransportChannel {
 }
 
 export interface TransportServer {
-  /** Port the listener is bound to, when the server owns the listener. */
+  /**
+   * Port the listener is bound to, when the server owns the listener. Returns 0 when
+   * the bound address is not available (not listening yet, or bound to a pipe path).
+   */
   port?(): number;
   onConnection(handler: (channel: TransportChannel) => void): void;
   close(): Promise<void>;
