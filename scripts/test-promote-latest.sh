@@ -1483,7 +1483,9 @@ fi
 # The local registry applies the PUT only when the client's connection closes; the
 # client's deadline is 1 s, so the write lands after the supervisor stopped npm.
 d="$(new_fixture delayed-commit)"
-if start_registry "$d" delayed-put; then
+if [ "$real_ready" -ne 1 ]; then
+  printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN delayed-commit"
+elif start_registry "$d" delayed-put; then
   mkdir -p "$d/home" "$d/npm-cache"
   raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
     npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
