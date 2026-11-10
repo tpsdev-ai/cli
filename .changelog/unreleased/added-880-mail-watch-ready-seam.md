@@ -1,0 +1,1 @@
+- **Mail watcher readiness seam:** `watchMail` accepts an `onReady` callback, called once after its startup scan finishes; it is a no-op unless supplied.

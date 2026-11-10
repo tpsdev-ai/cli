@@ -83,6 +83,15 @@ export interface MailWatchOptions {
    * event can deliver the mail it writes.
    */
   watchImpl?: (dir: string, listener: () => void) => { close(): void };
+  /**
+   * Readiness seam: called ONCE, after the startup scan of `new/` finishes —
+   * that is, after fs.watch is installed and the initial listing is processed.
+   * Default: no-op. A test that delivers a record on the fs-event path awaits
+   * this instead of sleeping a fixed time, so it does not race the arming of
+   * the watcher. It is informational only: errors thrown by the callback are
+   * swallowed, and it does not affect delivery.
+   */
+  onReady?: () => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -247,6 +256,20 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // not a queue), run when that scan finishes.
   let rescan = false;
 
+  // Fire the readiness seam once, when the first scan has finished. fs.watch is
+  // installed before the startup processNew() call, so this marks the watcher
+  // as armed and its initial scan as complete.
+  let readyFired = false;
+  const fireReady = () => {
+    if (readyFired) return;
+    readyFired = true;
+    // On the next turn of the event loop, after the watcher has been installed
+    // and its startup scan has finished.
+    setImmediate(() => {
+      try { opts.onReady?.(); } catch { /* a readiness callback must not crash the watcher */ }
+    });
+  };
+
   const drain = () => {
     while (!stopped && pending.length > 0 && activeHandlers < maxConcurrent) {
       const msg = pending.shift();
@@ -370,6 +393,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
     } finally {
       checking = false;
+      fireReady();
       drain();
       if (rescan && !stopped) { rescan = false; void processNew(); }
     }

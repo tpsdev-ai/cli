@@ -50,10 +50,12 @@ function sleep(ms: number) {
 }
 
 /** Bounded poll: resolve when `cond` is true, else throw at `timeoutMs`. */
-async function waitFor(cond: () => boolean, timeoutMs = 5000) {
+async function waitFor(cond: () => boolean, timeoutMs = 5000, describe?: () => string) {
   const start = Date.now();
   while (!cond()) {
-    if (Date.now() - start > timeoutMs) throw new Error("waitFor timed out");
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`waitFor timed out after ${Date.now() - start}ms${describe ? `: ${describe()}` : ""}`);
+    }
     await sleep(5);
   }
 }
@@ -217,6 +219,18 @@ describe("watchMail (verified-only, non-consuming)", () => {
     return { args: [process.execPath, "-e", HOOK_SCRIPT], env: { HOOK_OUT: outFile, HOOK_ENV: envFile } };
   }
 
+  /**
+   * A promise that resolves when watchMail reports its startup scan finished
+   * (fs.watch installed and the initial `new/` listing processed). Delivering a
+   * record only after this removes the fixed sleep that raced the arming of the
+   * event watcher.
+   */
+  function readySignal() {
+    let resolve: () => void = () => {};
+    const promise = new Promise<void>((r) => { resolve = r; });
+    return { onReady: () => resolve(), promise };
+  }
+
   /** Capture console.error lines (the watcher's log) until restored. */
   function captureErrors() {
     const lines: string[] = [];
@@ -305,53 +319,65 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("event path: a signed record delivered AFTER startup is presented", async () => {
     const received: string[] = [];
+    const ready = readySignal();
+    let armed = false;
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
+      onReady: () => { armed = true; ready.onReady(); },
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
+    expect(armed).toBe(true); // deliver only after the watcher reports it is armed
     deliverSigned("event delivered");
-    await sleep(400);
+    await waitFor(
+      () => received.includes("event delivered"),
+      5000,
+      () => `received: ${JSON.stringify(received)}`,
+    );
     watcher.stop();
 
     expect(received).toContain("event delivered");
-  });
+  }, 10_000);
 
   it("event path: an unsigned record reaches NEITHER onMessage nor the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "unsigned-event-hook.txt");
     const envOut = join(tempRoot, "unsigned-event-env.json");
+    const ready = readySignal();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
+      onReady: ready.onReady,
       hook: hookCapturing(out, envOut),
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
     deliverUnsigned("event unsigned", "unsigned-event");
     await sleep(400);
     watcher.stop();
 
     expect(received).toEqual([]);
     expect(existsSync(out), "the hook never ran").toBe(false);
-  });
+  }, 10_000);
 
   it("an envelope with an altered wrapper SENDER is never presented, and never launches the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "tampered-hook.txt");
     const envOut = join(tempRoot, "tampered-env.json");
+    const ready = readySignal();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
+      onReady: ready.onReady,
       hook: hookCapturing(out, envOut),
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
     const env = buildSignedEnvelope("flint", AGENT, "tampered", SEEDS);
     // The signature is valid, but the wrapper SENDER differs from the signed
     // sender: the wrapper-sender↔signed-sender binding fails, so the record is
@@ -373,20 +399,27 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("presents a record ONCE while its file stays in new/ (dedup by envelope id)", async () => {
     const received: string[] = [];
+    const ready = readySignal();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
+      onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
     deliverSigned("once only");
-    await sleep(400); // several poll cycles
+    await waitFor(
+      () => received.length >= 1,
+      5000,
+      () => `received: ${JSON.stringify(received)}`,
+    );
+    await sleep(200); // several poll cycles: a second presentation would show up here
     watcher.stop();
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
-  });
+  }, 10_000);
 
   it("dedups by the VERIFIED envelope id: two files bearing the same signed id are presented once", async () => {
     const received: string[] = [];
@@ -419,17 +452,22 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("presents an unconsumed message AGAIN after its file leaves and re-enters new/", async () => {
     const received: string[] = [];
+    const ready = readySignal();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 30,
+      onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
     deliverSigned("redelivered");
-    await sleep(250);
-    expect(received.filter((b) => b === "redelivered")).toHaveLength(1);
+    await waitFor(
+      () => received.filter((b) => b === "redelivered").length === 1,
+      5000,
+      () => `received: ${JSON.stringify(received)}`,
+    );
 
     // The file leaves new/ — the watcher forgets it.
     const inbox = getInbox(AGENT);
@@ -440,11 +478,15 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     // It re-enters new/ with the same envelope.
     writeFileSync(join(inbox.fresh, `re-${file}`), bytes);
-    await sleep(300);
+    await waitFor(
+      () => received.filter((b) => b === "redelivered").length === 2,
+      5000,
+      () => `received: ${JSON.stringify(received)}`,
+    );
     watcher.stop();
 
     expect(received.filter((b) => b === "redelivered")).toHaveLength(2);
-  });
+  }, 10_000);
 
   it("a transient new/ listing failure does not present a still-present file twice", async () => {
     const received: string[] = [];
@@ -675,20 +717,26 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("a throwing onPoll never crashes the watcher (heartbeat failure is swallowed)", async () => {
     const received: string[] = [];
+    const ready = readySignal();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 40,
+      onReady: ready.onReady,
       onPoll: () => { throw new Error("simulated heartbeat failure"); },
       onMessage: (msg) => { received.push(msg.body); },
     });
 
-    await sleep(60);
+    await ready.promise;
     deliverSigned("still alive");
-    await sleep(400);
+    await waitFor(
+      () => received.includes("still alive"),
+      5000,
+      () => `received: ${JSON.stringify(received)}`,
+    );
     watcher.stop();
     expect(received).toContain("still alive");
-  });
+  }, 10_000);
 
   it("does not present a re-planted envelope whose id is already consumed (replay skip)", async () => {
     const received: string[] = [];
