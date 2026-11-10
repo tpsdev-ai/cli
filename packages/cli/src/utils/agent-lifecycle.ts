@@ -328,7 +328,7 @@ export class WorktreeLifecycleError extends Error {
   }
 }
 
-function gitEnv(): NodeJS.ProcessEnv {
+export function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (!key.startsWith("GIT_")) env[key] = value;
@@ -777,7 +777,9 @@ function trailingRemovalAdvice(message: string): { start: number; path: string }
     const path = manualCommandPath(message.slice(at + marker.length));
     if (path !== null) return { start: at, path };
   }
-  const guidance = /; ([\s\S]+) is no longer a registered worktree of [\s\S]+; inspect it and remove it yourself if it is yours$/.exec(message);
+  // The captured path cannot contain `; `, so the match never starts at an
+  // earlier clause.
+  const guidance = /; ((?:(?!; )[\s\S])+) is no longer a registered worktree of [\s\S]+; inspect it and remove it yourself if it is yours$/.exec(message);
   if (guidance) return { start: guidance.index, path: guidance[1]! };
   const inspectAt = /; inspect it at ([\s\S]+) and remove it yourself if it is yours$/.exec(message);
   if (inspectAt) return { start: inspectAt.index, path: inspectAt[1]! };

@@ -36,7 +36,7 @@
  * process that spawns it — that process already owns it.
  */
 
-import type { WorktreeLaunchBinding } from "./agent-lifecycle.js";
+import { gitEnv, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
 import { randomBytes, createHash } from "node:crypto";
@@ -909,7 +909,8 @@ export interface LaunchOptions {
    * caller sets `pinnedPath` when its removal moves the worktree aside. */
   worktreeCleanup?: WorktreeCleanup;
   /** Called when a refusal's stop leaves a survivor, so the caller keeps the
-   * worktree; the launcher keeps its launch state and exits 78. */
+   * worktree; the launcher keeps its launch state and exits with the refusal
+   * code (78, or the supervised refusal code when supervised). */
   onRefusalSurvivors?: (survivors: number[]) => void;
   /** The path-aware advice filter the caller prints launch errors through; a
    * signal-path cleanup error is formatted by it too. */
@@ -1001,6 +1002,7 @@ export async function launchAttested(
       const result = spawnSync("git", ["-C", cleanup.baseWorkingTree, "worktree", "list", "--porcelain"], {
         encoding: "utf-8",
         timeout: 10_000,
+        env: gitEnv(),
       });
       if (result.status !== 0) {
         remaining.push(
@@ -1028,7 +1030,8 @@ export async function launchAttested(
   // checks the agent read-only. Cleanup of what this launch created runs only
   // after the stop check; an unconfirmed removal keeps the launch state, names
   // what remains (the original path, the moved-aside path or the registration),
-  // and exits 78. A stop that began before the release write
+  // and exits with the refusal code (78, or the supervised refusal code when
+  // supervised). A stop that began before the release write
   // prevents that write. The supervisor is signalled through its own child
   // handle while it has not exited; the released agent is never signalled, only
   // read back by the identity recorded before its release. A second signal is
@@ -1062,7 +1065,7 @@ export async function launchAttested(
         console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
         keepLaunchState = true;
         for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
-        interruptOutcome = REFUSAL_EXIT_CODE;
+        interruptOutcome = refusedCode;
         return;
       }
       if (cleanupError) {
@@ -1094,7 +1097,7 @@ export async function launchAttested(
           console.error(`❌ the worktree removal was not confirmed; ${kept} (${remaining.join("; ")})`);
           keepLaunchState = true;
           for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
-          interruptOutcome = REFUSAL_EXIT_CODE;
+          interruptOutcome = refusedCode;
           return;
         }
       }
@@ -1122,7 +1125,8 @@ export async function launchAttested(
   /** Stop the supervisor through its handle when the launch is refused after a
    * release decision. The agent is checked read-only; a survivor is reported to
    * the caller, which keeps the worktree, and the launcher keeps its launch
-   * state and exits 78. */
+   * state and exits with the refusal code (78, or the supervised refusal code
+   * when supervised). */
   const stopAfterRefusal = async (reason: string): Promise<number> => {
     const stop = await stopLaunchProcesses(
       { supervisor: child, agent: released },
@@ -1134,7 +1138,7 @@ export async function launchAttested(
       console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
       keepLaunchState = true;
       opts.onRefusalSurvivors?.(stop.survivors);
-      return REFUSAL_EXIT_CODE;
+      return refusedCode;
     }
     return refuse(reason);
   };

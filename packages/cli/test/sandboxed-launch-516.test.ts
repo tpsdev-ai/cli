@@ -24,6 +24,7 @@ import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
   REFUSAL_EXIT_CODE,
+  SUPERVISED_REFUSAL_EXIT_CODE,
   canonicalPath,
   harnessReadFiles,
   agentLaunchOptions,
@@ -2287,7 +2288,8 @@ exit 0
   // once the supervisor has exited and the released agent is gone or its pid
   // names another process; a surviving agent keeps the worktree, and an
   // unconfirmed removal keeps the launch state, names what remains (the
-  // original path, the moved-aside path or the registration), and exits 78;
+  // original path, the moved-aside path or the registration), and exits with
+  // the refusal code (78, or the supervised refusal code when supervised);
   // a pre-existing worktree is never removed
   // -------------------------------------------------------------------------
 
@@ -3073,6 +3075,32 @@ process.exit(typeof code === "number" ? code : 1);
     }
   }, 30_000);
 
+  test("the same surviving agent under a supervisor exits with the supervised refusal code", async () => {
+    const f = stopFixture();
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1", FAKE_NONO_KILL_CHILD: "0", TPS_SUPERVISED: "1" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(SUPERVISED_REFUSAL_EXIT_CODE);
+      expect(text()).toContain(`❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws}`);
+      expect(alive(peerPid!)).toBe(true);
+      expect(existsSync(f.sb.ws)).toBe(true);
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("an agent identity that changes between capture and the post-stop check is treated as stopped", async () => {
     const f = stopFixture();
     // The token reader answers from whether the release has been written: a
@@ -3136,6 +3164,37 @@ process.exit(typeof code === "number" ? code : 1);
     }
   }, 30_000);
 
+  test("an inherited GIT_DIR does not hide the base registration from the removal confirmation", async () => {
+    const f = stopFixture("fail-gone");
+    // A different repository: an inherited GIT_DIR redirects `git worktree list`.
+    const other = join(f.sb.root, "other-repo");
+    mkdirSync(other, { recursive: true });
+    const init = spawnSync(GIT, ["init", "-q"], { cwd: other, encoding: "utf8" });
+    expect(init.status, init.stderr).toBe(0);
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1", GIT_DIR: join(other, ".git") });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      // The scrubbed environment still finds the base registration, so the
+      // removal is not confirmed and the launch state is kept.
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      expect(text()).toContain("the worktree removal was not confirmed; kept the launch state (the base repository still registers");
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
   test("a removal whose moved-aside directory remains refuses and keeps the launch state", async () => {
     const f = stopFixture("fail-leftover");
     const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1" });
@@ -3162,6 +3221,30 @@ process.exit(typeof code === "number" ? code : 1);
       expect(
         spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout,
       ).not.toContain(f.sb.ws);
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("an unconfirmed removal under a supervisor exits with the supervised refusal code", async () => {
+    const f = stopFixture("fail-gone");
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1", TPS_SUPERVISED: "1" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(SUPERVISED_REFUSAL_EXIT_CODE);
+      expect(text()).toContain("the worktree removal was not confirmed; kept the launch state (the base repository still registers");
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
     } finally {
       try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
@@ -3197,7 +3280,8 @@ process.exit(typeof code === "number" ? code : 1);
 
 // ---------------------------------------------------------------------------
 // cli#668 round 4 — a refusal after the release, with an agent that outlives
-// its supervisor, keeps the worktree and the launch state and exits 78
+// its supervisor, keeps the worktree and the launch state and exits with the
+// refusal code (78, or the supervised refusal code when supervised)
 // ---------------------------------------------------------------------------
 
 describe("cli#668 round 4 — a refusal after release keeps a surviving agent's worktree", () => {
@@ -3314,7 +3398,7 @@ setInterval(() => {}, 1000);
     return new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
   }
 
-  test("a post-release recheck refusal with a surviving child exits 78 and keeps the worktree and launch state", async () => {
+  test("a post-release recheck refusal with a surviving child keeps the worktree and launch state and exits with the refusal code", async () => {
     const f = survivorFixture();
     const peer = join(f.sb.root, "survivor-peer.cjs");
     writeFileSync(peer, SURVIVOR_PEER);
