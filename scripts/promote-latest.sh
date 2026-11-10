@@ -124,7 +124,7 @@
 #     7  UNCERTAIN — a timed-out write or a signal during a promote write
 #        leaves the registry state unconfirmed. The lock remains,
 #        with a `reason` file when it can be written, so a later run refuses
-#        until tags are fixed by hand
+#        until the lock is removed by hand, after the tags are reconciled
 set -euo pipefail
 
 # ── bash version guard ───────────────────────────────────────────────────────
@@ -251,8 +251,9 @@ GitHub CLI used for the dispatch.
 Exit codes: 0 promoted; 1 usage error or unsupported bash; 2 refused before
 acting; 3 not confirmed (or a non-forward promote not acknowledged); 4 promote
 did not complete (rolled back where possible); 5 rollback did not restore the
-registry; 6 promoted, but the Docker image dispatch failed; 7 a timed-out
-mutating call left the registry unconfirmed (the lock is kept with a reason).
+registry; 6 promoted, but the Docker image dispatch failed; 7 a timed-out npm
+write, or a signal during a promote write, left the registry unconfirmed (the
+lock is kept, with a reason file when it can be written).
 EOF
 }
 

@@ -9,7 +9,8 @@
 // the supervisor sends TERM through the ChildProcess handle; after the grace it
 // sends KILL only while the child has neither an exit code nor a signal code.
 // INT, TERM and HUP received by the supervisor are forwarded to the child the
-// same way. The exit status is the child's status, or 124 on a deadline timeout.
+// same way. Exit status: the child's code (128+n if a signal killed it), 124 on a
+// deadline timeout, 127 if the command cannot start, 2 on a usage error.
 //
 // PROMOTE_SUPERVISOR_LOG, when set, records each ChildProcess.kill() attempt.
 import { spawn } from 'node:child_process';
@@ -31,7 +32,7 @@ if (
   !Number.isFinite(graceSeconds) ||
   graceSeconds < 0
 ) {
-  process.stderr.write('npm-supervisor: deadline and grace must be non-negative numbers\n');
+  process.stderr.write('npm-supervisor: deadline must be a positive number and grace a non-negative number\n');
   process.exit(2);
 }
 const [command, ...args] = argv.slice(3);

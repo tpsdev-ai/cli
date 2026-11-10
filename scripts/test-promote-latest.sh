@@ -6,8 +6,8 @@
 # network, no real npm, and no real dist-tag is ever moved. Each such fixture
 # builds a fake repo tree plus a fake `npm` (injected via NPM_BIN) whose registry
 # state is a JSON file the test controls, then drives scripts/promote-latest.sh
-# and asserts its exit code, its text, and the resulting registry state. Three
-# cases (AI, AJ, AN) run the REAL npm CLI against a registry the test starts on
+# and asserts its exit code, its text, and the resulting registry state. Four
+# cases (AI, AJ, AS, AN), and mutants M12/M13, run the REAL npm CLI against a registry the test starts on
 # 127.0.0.1, so the 2FA prompt seam is exercised by the real client.
 #
 # Covered:
@@ -17,7 +17,7 @@
 #   * "already latest" is reported as such, not proposed as a no-op move
 #   * a move that does not land (npm exits 0, the registry never changes) is caught
 #     by the post-move re-read, and the packages already moved are rolled back
-#   * an INTERRUPT (SIGTERM) during a write keeps the lock and records that write
+#   * an INTERRUPT (SIGTERM) during a promote write keeps the lock and records that write
 #   * a signal during failure-path rollback does not abandon the restorations
 #   * build metadata (1.2.3+build-abc) is not misread as a pre-release
 #   * the confirmation gate aborts on anything but "yes"
@@ -59,8 +59,9 @@
 #     child that ignores TERM is KILLed after the grace (AL)
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
-#     never answers makes the run uncertain (AJ); a PUT the server applies after
-#     the client was killed is still listed by a later refusal (AN).
+#     never answers makes the run uncertain (AJ); TERM during a pending PUT keeps
+#     the lock (AS); a PUT the server applies after the client was killed is still
+#     listed by a later refusal (AN).
 #     TPS_TEST_REQUIRE_REAL_NPM=1 makes a missing npm, node or python3 a failure
 #     instead of a skip.
 #   * the fixtures run under bash 3.2 too (BASH_BIN; the macOS CI leg pins it),
@@ -1457,8 +1458,8 @@ else
 fi
 
 # ── AN. a delayed commit lands after the client stopped; next run refuses ────
-# The local registry applies the PUT 1.5 s after receiving it; the client's
-# deadline is 1 s, so the write lands after the client was killed.
+# The local registry applies the PUT only when the client's connection closes; the
+# client's deadline is 1 s, so the write lands after the supervisor stopped npm.
 d="$(new_fixture delayed-commit)"
 if start_registry "$d" delayed-put; then
   mkdir -p "$d/home" "$d/npm-cache"
