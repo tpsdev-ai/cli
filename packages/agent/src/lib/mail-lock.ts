@@ -53,7 +53,8 @@ const heldByThisProcess = new Set<string>();
 
 /**
  * Fields of `/proc/<pid>/stat` after the `comm` field (2), or null when the
- * file is unreadable or malformed. `comm` may contain spaces and parentheses,
+ * file is unreadable or contains no ')'; a truncated line yields fewer fields,
+ * which callers treat as absent. `comm` may contain spaces and parentheses,
  * so the fields are split after the LAST ')'. fields[0] is field 3 (state);
  * starttime is field 22 → fields[19].
  */

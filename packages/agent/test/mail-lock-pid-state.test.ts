@@ -122,8 +122,25 @@ describe("pidState on Linux", () => {
       children.push(child);
       expect(procStatState(pid)).toBe("Z");
       expect(pidState(pid)).toBe("gone");
-      // processIsGone and the lock-owner check inherit the classifier.
-      expect(processIsGone(pid, "proc:1")).toBe(true);
+      // processIsGone with the owner's real start token, and the lock-owner
+      // reclaim, inherit the classifier.
+      const token = processStartToken(pid);
+      expect(token).not.toBeNull();
+      expect(processIsGone(pid, token)).toBe(true);
+      // acquireMailLockSync is synchronous, so the child stays unreaped.
+      const root = mkdtempSync(join(tmpdir(), "mail-lock-zombie-"));
+      try {
+        mkdirSync(mailLockPath(root));
+        writeFileSync(
+          join(mailLockPath(root), "owner.json"),
+          JSON.stringify({ pid, startToken: token, nonce: "planted" }),
+        );
+        const lock = acquireMailLockSync(root, { timeoutMs: 2_000 });
+        expect(lock).not.toBeNull();
+        lock?.release();
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
     },
     15_000,
   );
