@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
@@ -153,6 +153,101 @@ describe("mail relay status with a bad record", () => {
       expect(result.stdout).not.toMatch(/not running/i);
       expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("tps bridge status with a bad or unverified record", () => {
+  function writeBridgeRecord(contents: string): string {
+    const runDir = join(home, ".tps", "run");
+    mkdirSync(runDir, { recursive: true });
+    const bridgePid = join(runDir, "bridge-openclaw.pid");
+    writeFileSync(bridgePid, contents);
+    return bridgePid;
+  }
+
+  test(
+    "an invalid bridge pid file is reported as unknown",
+    () => {
+      const child = spawnChild();
+      const bridgePid = writeBridgeRecord("not-a-pid\n");
+      expect(readPidFile(bridgePid).kind).toBe("invalid");
+
+      const result = runCli(["bridge", "status"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/Bridge state unknown \(invalid pid file /);
+      expect(result.stdout).not.toMatch(/is not running/);
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a stale bridge pid file is reported as unknown",
+    () => {
+      const child = spawnChild();
+      const bridgePid = writeBridgeRecord(staleRecord(child));
+      expect(readPidFile(bridgePid).kind).toBe("stale");
+
+      const result = runCli(["bridge", "status"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/Bridge state unknown \(stale pid file /);
+      expect(result.stdout).not.toMatch(/is not running/);
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an unreadable bridge pid file is reported as unknown",
+    () => {
+      const child = spawnChild();
+      const runDir = join(home, ".tps", "run");
+      mkdirSync(runDir, { recursive: true });
+      const bridgePid = join(runDir, "bridge-openclaw.pid");
+      symlinkSync(join(home, "missing-bridge-target"), bridgePid);
+      expect(readPidFile(bridgePid).kind).toBe("unreadable");
+
+      const result = runCli(["bridge", "status"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/Bridge state unknown \(unreadable pid file /);
+      expect(result.stdout).not.toMatch(/is not running/);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an unverified bridge record is reported as unknown",
+    () => {
+      const child = spawnChild();
+      const bridgePid = writeBridgeRecord(record(child.pid, null));
+      expect(readPidFile(bridgePid).kind).toBe("unverified");
+
+      const result = runCli(["bridge", "status"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout).toMatch(/Bridge state unknown \(unverified pid file /);
+      expect(result.stdout).not.toMatch(/is not running/);
+      expect(existsSync(bridgePid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an absent bridge pid file still reports the bridge is not running",
+    () => {
+      const result = runCli(["bridge", "status"]);
+
+      expect(result.status).toBe(0);
+      expect(result.stdout.trim()).toBe("Bridge is not running.");
     },
     TIMEOUT,
   );
