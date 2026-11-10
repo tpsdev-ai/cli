@@ -541,6 +541,7 @@ it("the helper installs only from TPS_DEP_AGES_REGISTRY through empty npm config
     const repo = depFixtureRepo(h.root, {
       version: "1.0.0",
       resolved: `${registry}${DEP_PATH}`,
+      integrity: "sha512-deadbeef",
     });
     const result = h.run([HELPER, "--via", "npm", FIXTURE, h.prefix], { TPS_DEP_AGES_REGISTRY: registry }, repo);
     expect({ status: result.status, stderr: result.stderr }).toMatchObject({ status: 0 });
@@ -628,6 +629,93 @@ it.skipIf(!npmAvailable).each(userConfigSources)(
   },
   60_000,
 );
+
+it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "http_proxy"] as const)(
+  "an environment %s is refused with zero registry requests",
+  async (name) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-proxy-env-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    let evil: ReturnType<typeof startEvil> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      evil = startEvil();
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+        [name]: evil.url,
+      });
+      expect(result.status, result.stderr).toBe(3);
+      expect(result.stderr).toContain(JSON.stringify(name));
+      expect(result.stderr).toContain("unset them for this install");
+      expect(registry.requests).toEqual([]);
+      expect(evil.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      evil?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
+
+it.skipIf(!npmAvailable)("NODE_EXTRA_CA_CERTS set in the environment is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-extra-ca-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const home = join(root, "home");
+    const cache = join(root, "npm-cache");
+    for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, {
+      HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+      NODE_EXTRA_CA_CERTS: join(root, "extra-ca.pem"),
+    });
+    expect(result.status, result.stderr).toBe(3);
+    expect(result.stderr).toContain(JSON.stringify("NODE_EXTRA_CA_CERTS"));
+    expect(result.stderr).toContain("unset them for this install");
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("a lock entry under the registry without integrity is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-integrity-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, { version: "1.0.0", resolved: `${registry.url}${DEP_PATH}` });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(`node_modules/${DEP}: no integrity`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
 
 it.skipIf(!npmAvailable)("an .npmrc in the tracked fixture directory is refused with zero registry requests", async () => {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-npmrc-"));

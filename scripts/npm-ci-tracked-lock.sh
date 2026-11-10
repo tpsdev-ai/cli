@@ -15,9 +15,14 @@
 #     an npm_config_* environment variable outside the allowlist in
 #     check_npm_config_env (case-insensitive, so a later npm option is refused
 #     by default; the allowlist holds names that cannot change the fetch, and
-#     the user config path, which the --userconfig flag above outranks); and a
-#     lock entry that would install (not root, link:true, inBundle, file: or
-#     workspace:) whose resolved URL is missing or is not under R.
+#     the user config path, which the --userconfig flag above outranks); the
+#     unprefixed proxy variables http_proxy, https_proxy and all_proxy
+#     (case-insensitive, presence test) and NODE_EXTRA_CA_CERTS; and a lock
+#     entry that would install (not root, link:true, inBundle, file: or
+#     workspace:) whose resolved URL is missing or is not under R, or that
+#     has no integrity. no_proxy is left alone: it only narrows proxying, so
+#     it does nothing once the proxy variables are refused, and some runners
+#     set it.
 set -euo pipefail
 
 if [ "$#" -lt 4 ] || [ "$1" != --via ]; then
@@ -72,9 +77,11 @@ fi
 registry="${TPS_DEP_AGES_REGISTRY:-https://registry.npmjs.org}"
 registry="${registry%/}"
 
-# Allowlisted because they cannot choose what or where npm fetches: cache,
-# log level, npm's own version, user agent, init template, and the user config
-# path (the command-line --userconfig passed below outranks it).
+# Allowlisted because they cannot change what npm installs or the registry it
+# fetches from: cache (an installable entry must carry integrity, so a
+# pre-seeded cache cannot supply other content), log level, npm's own version,
+# user agent, init template, and the user config path (the command-line
+# --userconfig passed below outranks it).
 # npm_config_globalconfig is refused: an environment-named global config is
 # loaded even when --globalconfig is passed.
 # Every other name, a future option included, is refused.
@@ -89,7 +96,8 @@ const allowed = new Set([
   "npm_config_user_agent",
   "npm_config_userconfig",
 ]);
-const refused = Object.keys(process.env)
+const names = Object.keys(process.env);
+const refused = names
   .filter((name) => name.toLowerCase().startsWith("npm_config_") && !allowed.has(name.toLowerCase()))
   .sort();
 if (refused.length > 0) {
@@ -97,11 +105,19 @@ if (refused.length > 0) {
   console.error(`npm-ci-tracked-lock: unset them; this helper installs only from ${registry}`);
   process.exit(3);
 }
+const routing = new Set(["http_proxy", "https_proxy", "all_proxy", "node_extra_ca_certs"]);
+const proxied = names.filter((name) => routing.has(name.toLowerCase())).sort();
+if (proxied.length > 0) {
+  console.error(`npm-ci-tracked-lock: refusing environment variables that can redirect the fetch or replace its trust anchor: ${proxied.map((name) => JSON.stringify(name)).join(", ")}`);
+  console.error("npm-ci-tracked-lock: unset them for this install");
+  process.exit(3);
+}
 NODE
 }
 
 # The committed lock is the one npm will read. Refuse an installable entry whose
-# `resolved` URL is absent or not under R, before npm runs.
+# `resolved` URL is absent or not under R, or that has no integrity, before npm
+# runs.
 check_lock_registry() {
   node - "$1" "$2" "$3" <<'NODE'
 const { readFileSync } = require("node:fs");
@@ -135,6 +151,10 @@ for (const [entry, value] of Object.entries(packages)) {
     continue;
   }
   if (/^(?:file|workspace):/.test(resolved)) continue;
+  const integrity = value.integrity;
+  if (typeof integrity !== "string" || integrity === "") {
+    problems.push(`${entry}: no integrity (version ${JSON.stringify(value.version ?? null)})`);
+  }
   // `prefix` ends in "/", so this pins the host and not just a host prefix:
   // a different host, a host-suffix trick (R + ".evil.test") and a userinfo
   // trick (R + "@evil.test") all fail. A URL with an upper-case scheme fails
