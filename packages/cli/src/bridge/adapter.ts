@@ -49,10 +49,14 @@ export function validateBridgeAdapterName(name: string): boolean {
   return BRIDGE_ADAPTER_NAME_RE.test(name);
 }
 
-/** JSON-quotes a rejected name and also escapes DEL, C1 controls and line/bidi format characters, which JSON.stringify leaves raw. */
+/**
+ * JSON-quotes a rejected name, then escapes every remaining code point outside
+ * `\x20`-`\x7e` as `\uXXXX` (each UTF-16 unit, so an astral code point is two
+ * escapes; JSON.stringify has already escaped the controls).
+ */
 function printableName(name: string): string {
   return JSON.stringify(name).replace(
-    /[\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]/g,
+    /[\u007f-\uffff]/g,
     (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
   );
 }

@@ -197,7 +197,7 @@ Message: ${envelope.content}`;
       } else {
         // Plain text reply — route back to the channel this agent is bridging
         envelope = {
-          channel: this.adapter.name,
+          channel: this.adapterName,
           channelId: this.defaultChannelId ?? "",
           content: verifiedBody,
           senderId: "agent",
