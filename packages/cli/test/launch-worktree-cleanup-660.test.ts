@@ -36,7 +36,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, relative, resolve } from "node:path";
 import {
   onStart,
   onStop,
@@ -1244,50 +1244,187 @@ test("unit — the advice filter keeps an earlier restore-failure clause when it
   }
 });
 
-test("unit — a stop between the move and the registry rewrite leaves a record that a later launch refuses with", () => {
+/** The refusal text for an absent registered workspace with no usable record. */
+function plainMissingMessage(f: Fixture): string {
+  return `worktree workspace is missing for a registered worktree: ${f.workspace}; if the directory was removed on purpose, run git -C '${f.base}' worktree prune and launch again (it re-adds the worktree)`;
+}
+
+/** A real stopped-after-pin state: `onStart` created the worktree, then a
+ *  removal threw at `afterPin` and left the record naming the pinned tree. */
+function stoppedAfterPin(): { f: Fixture; pinned: string; gitDir: string; message: string } {
+  const f = fixture();
+  let created: WorktreeCreation | undefined;
+  onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
+  expect(created).toBeDefined();
+  const gitDir = adminDir(f.workspace);
+  let pinned = "";
+  let stop: unknown;
+  try {
+    removeCreatedWorktree(created!, {
+      afterPin: (pinnedPath) => {
+        pinned = pinnedPath;
+        throw new Error("simulated stop");
+      },
+    });
+  } catch (err) {
+    stop = err;
+  }
+  expect((stop as Error).message).toBe("simulated stop");
+  expect(existsSync(f.workspace)).toBe(false);
+  expect(existsSync(pinned)).toBe(true);
+  expect(readFileSync(join(gitDir, "tps-launch-cleanup"), "utf-8")).toBe(`${pinned}\n`);
+  // The registry still points at the original workspace path.
+  expect(readFileSync(join(gitDir, "gitdir"), "utf-8")).toBe(`${join(f.workspace, ".git")}\n`);
+  let message = "";
+  try {
+    worktreeLaunchBinding(f.workspace);
+  } catch (err) {
+    message = (err as Error).message;
+  }
+  return { f, pinned, gitDir, message };
+}
+
+test("unit — a stop between the move and the registry rewrite prints remediations that both work", () => {
+  const first = stoppedAfterPin();
+  let moveBack: ReturnType<typeof stoppedAfterPin> | undefined;
+  let removal: ReturnType<typeof stoppedAfterPin> | undefined;
+  try {
+    const { f, pinned, message } = first;
+    expect(message).toContain(`worktree workspace is missing for a registered worktree: ${f.workspace}`);
+    expect(message).toContain(`this one is at ${pinned}`);
+    expect(message).toContain(".cleanup-");
+    expect(message).toContain(`move it back to ${f.workspace}`);
+    expect(message).toContain("remove it manually with: ");
+    expect(existsSync(f.workspace)).toBe(false);
+    expect(existsSync(pinned)).toBe(true);
+    // A launch through onStart refuses the same way.
+    let startError: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+    } catch (err) {
+      startError = err;
+    }
+    expect(startError).toBeInstanceOf(WorktreeLifecycleError);
+    expect((startError as Error).message).toContain(`this one is at ${pinned}`);
+
+    // (a) The move-back remediation restores the registered worktree.
+    moveBack = stoppedAfterPin();
+    renameSync(moveBack.pinned, moveBack.f.workspace);
+    expect(worktreeList(moveBack.f.base)).toContain(`worktree ${moveBack.f.workspace}\n`);
+    const status = spawnSync(GIT, ["status"], { cwd: moveBack.f.workspace, encoding: "utf8" });
+    expect(status.status, status.stderr).toBe(0);
+
+    // (b) The printed removal command deletes the pinned tree and its record.
+    removal = stoppedAfterPin();
+    const printed = removal.message.slice(
+      removal.message.indexOf("remove it manually with: ") + "remove it manually with: ".length,
+    );
+    const run = spawnSync("sh", ["-c", printed], { encoding: "utf8" });
+    expect(run.status, run.stderr).toBe(0);
+    expect(existsSync(removal.pinned)).toBe(false);
+    expect(existsSync(removal.gitDir)).toBe(false);
+    const relaunched = onStart("agent-a", removal.f.workspace, { deferCheckout: true });
+    expect(relaunched.cleanupBinding).toBeDefined();
+    expect(existsSync(removal.f.workspace)).toBe(true);
+    expect(worktreeList(removal.f.base)).toContain(`worktree ${removal.f.workspace}\n`);
+  } finally {
+    rmSync(first.f.root, { recursive: true, force: true });
+    if (moveBack) rmSync(moveBack.f.root, { recursive: true, force: true });
+    if (removal) rmSync(removal.f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a hand-written relative record naming the pinned tree is not followed", () => {
+  const stopped = stoppedAfterPin();
+  try {
+    writeFileSync(join(stopped.gitDir, "tps-launch-cleanup"), `${relative(process.cwd(), stopped.pinned)}\n`);
+    let error: unknown;
+    try {
+      worktreeLaunchBinding(stopped.f.workspace);
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toBe(plainMissingMessage(stopped.f));
+  } finally {
+    rmSync(stopped.f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a pre-existing cleanup record survives a failed record write", () => {
   const f = fixture();
   try {
     let created: WorktreeCreation | undefined;
     onStart("agent-a", f.workspace, { deferCheckout: true, onCreated: (record) => { created = record; } });
     expect(created).toBeDefined();
     const gitDir = adminDir(f.workspace);
-    let pinned = "";
-    let stop: unknown;
+    const prior = join(f.root, ".ws.cleanup-prior");
+    const record = join(gitDir, "tps-launch-cleanup");
+    writeFileSync(record, `${prior}\n`);
+    const write = fs.writeFileSync;
+    spyOn(fs, "writeFileSync").mockImplementation((...args: Parameters<typeof fs.writeFileSync>) => {
+      if (args[0] === record) throw new Error("simulated record write failure");
+      return write(...args);
+    });
+    let error: unknown;
     try {
-      removeCreatedWorktree(created!, {
-        afterPin: (pinnedPath) => {
-          pinned = pinnedPath;
-          throw new Error("simulated stop");
-        },
-      });
+      removeCreatedWorktree(created!);
     } catch (err) {
-      stop = err;
+      error = err;
     }
-    expect((stop as Error).message).toBe("simulated stop");
-    expect(existsSync(f.workspace)).toBe(false);
-    expect(existsSync(pinned)).toBe(true);
-    expect(readFileSync(join(gitDir, "tps-launch-cleanup"), "utf-8")).toBe(`${pinned}\n`);
-    // The registry still points at the original workspace path.
-    expect(readFileSync(join(gitDir, "gitdir"), "utf-8")).toBe(`${join(f.workspace, ".git")}\n`);
-    for (const launch of [
-      () => worktreeLaunchBinding(f.workspace),
-      () => onStart("agent-a", f.workspace, { deferCheckout: true }),
-    ]) {
-      let error: unknown;
-      try {
-        launch();
-      } catch (err) {
-        error = err;
-      }
-      expect(error).toBeInstanceOf(WorktreeLifecycleError);
-      const message = (error as Error).message;
-      expect(message).toContain(`worktree workspace is missing for a registered worktree: ${f.workspace}`);
-      expect(message).toContain(pinned);
-      expect(message).toContain(".cleanup-");
-      expect(message).toContain(`move it back to ${f.workspace} or remove it manually with: git -C '${f.base}' worktree remove --force '${pinned}'`);
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toContain("the cleanup record could not be written in");
+    // The record that was already there is untouched, and nothing was moved.
+    expect(readFileSync(record, "utf-8")).toBe(`${prior}\n`);
+    expect(existsSync(f.workspace)).toBe(true);
+    expect(readdirSync(f.root).filter((name) => name.includes(".cleanup-"))).toEqual([]);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a hand-written record naming another worktree of the same base is not followed", () => {
+  const f = fixture();
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    const gitDir = adminDir(f.workspace);
+    const other = join(f.root, "ws-other");
+    const added = spawnSync(GIT, ["worktree", "add", "-q", "--detach", other, "HEAD"], {
+      cwd: f.base,
+      encoding: "utf8",
+    });
+    expect(added.status, added.stderr).toBe(0);
+    writeFileSync(join(gitDir, "tps-launch-cleanup"), `${other}\n`);
+    rmSync(f.workspace, { recursive: true });
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+    } catch (err) {
+      error = err;
     }
-    expect(existsSync(f.workspace)).toBe(false);
-    expect(existsSync(pinned)).toBe(true);
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toBe(plainMissingMessage(f));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — a hand-written record naming a nonexistent absolute path is not followed", () => {
+  const f = fixture();
+  try {
+    onStart("agent-a", f.workspace, { deferCheckout: true });
+    const gitDir = adminDir(f.workspace);
+    const missing = join(tmpdir(), `not-a-worktree-${randomUUID()}`);
+    writeFileSync(join(gitDir, "tps-launch-cleanup"), `${missing}\n`);
+    rmSync(f.workspace, { recursive: true });
+    let error: unknown;
+    try {
+      onStart("agent-a", f.workspace, { deferCheckout: true });
+    } catch (err) {
+      error = err;
+    }
+    expect(error).toBeInstanceOf(WorktreeLifecycleError);
+    expect((error as Error).message).toBe(plainMissingMessage(f));
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -1352,7 +1489,7 @@ test("unit — a failed Git removal, a completed move back and a failed registra
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     const message = (error as Error).message;
     expect(message).toContain(`the worktree registration could not be restored and still points at ${pinned}`);
-    expect(message).toContain(`inspect it at ${pinned}`);
+    expect(message).not.toContain(`inspect it at ${pinned}`);
     // The move back completed: the worktree is at its original path.
     expect(existsSync(f.workspace)).toBe(true);
     expect(existsSync(pinned)).toBe(false);
@@ -1457,7 +1594,8 @@ test("unit — onStart refuses a registered worktree deleted by hand with no rec
       error = err;
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
-    expect((error as Error).message).toBe(`worktree workspace is missing for a registered worktree: ${f.workspace}`);
+    expect((error as Error).message).toBe(plainMissingMessage(f));
+    expect((error as Error).message).toContain(`run git -C '${f.base}' worktree prune and launch again (it re-adds the worktree)`);
     // Nothing was moved or created at either the workspace path or a cleanup sibling.
     expect(existsSync(f.workspace)).toBe(false);
     expect(readdirSync(f.root).filter((name) => name.includes(".cleanup-"))).toEqual([]);

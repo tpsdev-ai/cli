@@ -355,7 +355,7 @@ test("a registered worktree with a missing directory is refused before grants", 
   }
   expect(error).toBeInstanceOf(WorktreeLifecycleError);
   expect((error as Error).message).toBe(
-    `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+    `worktree workspace is missing for a registered worktree: ${input.workspace}; if the directory was removed on purpose, run git -C '${_base}' worktree prune and launch again (it re-adds the worktree)`,
   );
 }));
 
@@ -477,7 +477,7 @@ test("a dangling workspace symlink to a registered target is refused before gran
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     expect((error as Error).message).toBe(
-      `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+      `worktree workspace is missing for a registered worktree: ${input.workspace}; if the directory was removed on purpose, run git -C '${_base}' worktree prune and launch again (it re-adds the worktree)`,
     );
   }
 }));

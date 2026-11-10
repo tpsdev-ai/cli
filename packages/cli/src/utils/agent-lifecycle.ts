@@ -899,10 +899,10 @@ function clearCleanupRecord(record: string): void {
  * and the text names the recovery steps. Without a record the message is the plain one.
  */
 function missingRegisteredWorktreeMessage(workspace: string, baseWorkingTree: string, gitDir: string): string {
-  const base = `worktree workspace is missing for a registered worktree: ${workspace}`;
+  const base = `worktree workspace is missing for a registered worktree: ${workspace}; if the directory was removed on purpose, run git -C ${shellQuote(baseWorkingTree)} worktree prune and launch again (it re-adds the worktree)`;
   const pinned = readCleanupRecord(gitDir);
   if (pinned === undefined) return base;
-  return `${base}; a launch removal moves the worktree aside to a .${basename(workspace)}.cleanup-<uuid> sibling and records it in ${join(gitDir, CLEANUP_RECORD_NAME)}; this one is at ${pinned}; move it back to ${workspace} or remove it manually with: ${manualRemovalCommand({ baseWorkingTree, workspace: pinned })}`;
+  return `${base}; a launch removal moves the worktree aside to a .${basename(workspace)}.cleanup-<uuid> sibling and records it in ${join(gitDir, CLEANUP_RECORD_NAME)}; this one is at ${pinned}; move it back to ${workspace}, or remove it manually with: rm -rf ${shellQuote(pinned)} && git -C ${shellQuote(baseWorkingTree)} worktree prune`;
 }
 
 /**
@@ -1065,7 +1065,8 @@ function pinVerifiedWorktree(
   try {
     writeFileSync(cleanupRecord, `${pinned}\n`);
   } catch (err) {
-    clearCleanupRecord(cleanupRecord);
+    // Leave any record already at this path: it may be an earlier stopped run's
+    // only pointer to a live pinned tree. This attempt moved nothing.
     return { error: `the cleanup record could not be written in ${verified.gitDir}: ${(err as Error).message}` };
   }
   try {
@@ -1164,7 +1165,7 @@ function removePinnedWorktree(
     } catch (err) {
       return {
         ok: false,
-        detail: `${gitError}; the worktree registration could not be restored and still points at ${pin.pinned}: ${(err as Error).message}; inspect it at ${pin.pinned} and remove it yourself if it is yours`,
+        detail: `${gitError}; the worktree registration could not be restored and still points at ${pin.pinned}: ${(err as Error).message}; inspect it and remove it yourself if it is yours`,
         pinned: pin.pinned,
       };
     }
