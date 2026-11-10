@@ -15,9 +15,9 @@
 #     an npm_config_* environment variable outside the allowlist in
 #     check_npm_config_env (case-insensitive, so a later npm option is refused
 #     by default; the allowlist holds names that cannot change the fetch, and
-#     the config paths the flags above override); and a lock entry that would
-#     install (not root, link:true, inBundle, file: or workspace:) whose
-#     resolved URL is missing or is not under R.
+#     the user config path, which the --userconfig flag above outranks); and a
+#     lock entry that would install (not root, link:true, inBundle, file: or
+#     workspace:) whose resolved URL is missing or is not under R.
 set -euo pipefail
 
 if [ "$#" -lt 4 ] || [ "$1" != --via ]; then
@@ -73,15 +73,16 @@ registry="${TPS_DEP_AGES_REGISTRY:-https://registry.npmjs.org}"
 registry="${registry%/}"
 
 # Allowlisted because they cannot choose what or where npm fetches: cache,
-# log level, npm's own version, user agent, init template, and the user/global
-# config paths (the command-line --userconfig/--globalconfig passed below
-# outrank them). Every other name, a future option included, is refused.
+# log level, npm's own version, user agent, init template, and the user config
+# path (the command-line --userconfig passed below outranks it).
+# npm_config_globalconfig is refused: an environment-named global config is
+# loaded even when --globalconfig is passed.
+# Every other name, a future option included, is refused.
 check_npm_config_env() {
   node - "$1" <<'NODE'
 const registry = process.argv[2];
 const allowed = new Set([
   "npm_config_cache",
-  "npm_config_globalconfig",
   "npm_config_init_module",
   "npm_config_loglevel",
   "npm_config_npm_version",

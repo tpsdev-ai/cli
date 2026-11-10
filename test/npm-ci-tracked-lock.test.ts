@@ -645,6 +645,35 @@ for (const name of ["npm_config_registry", "npm_config_@scope:registry", "npm_co
   }, 60_000);
 }
 
+it.skipIf(!npmAvailable)("an env-named global config is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-globalconfig-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: tarball.integrity,
+    });
+    const globalconfig = join(root, "globalconfig");
+    writeFileSync(globalconfig, `registry=${registry.url}/\n`);
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, {
+      HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url,
+      npm_config_globalconfig: globalconfig,
+    });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain("refusing npm_config_* variables");
+    expect(result.stderr).toContain(JSON.stringify("npm_config_globalconfig"));
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
 it.skipIf(!npmAvailable)("a lock entry without a resolved URL is refused with zero registry requests", async () => {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-resolved-"));
   let registry: ReturnType<typeof startRegistry> | undefined;
