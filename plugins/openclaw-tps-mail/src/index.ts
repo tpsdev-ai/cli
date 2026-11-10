@@ -2457,6 +2457,15 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             });
           }, 50);
         });
+        // cli#720: an error stops the watcher (Bun on Linux reports one when a
+        // file under new/ moves out while the watch is being set up). Log it
+        // instead of letting it throw; the rescan above still reads new/.
+        watcher.on("error", (err) => {
+          log?.warn?.(
+            `tps-mail: new/ watcher for ${agentId} stopped: ${err?.message ?? String(err)}; ` +
+              `new mail is picked up by the rescan every ${NEW_DIR_RESCAN_MS / 1000}s`,
+          );
+        });
         watchers.add(watcher);
 
         // Process any files already present (but not in seenFiles) in case

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import { createHash } from "node:crypto";
@@ -48,6 +49,7 @@ describe("new/ periodic rescan (cli#853)", () => {
   let releaseVerify: (() => void) | undefined;
   let verifyUnavailable: boolean;
   let watchSpy: ReturnType<typeof spyOn>;
+  let watcher: fs.FSWatcher | undefined;
   let timerSpy: ReturnType<typeof spyOn>;
   let promoteSpy: ReturnType<typeof spyOn>;
   let readSpy: ReturnType<typeof spyOn> | undefined;
@@ -72,6 +74,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     verifyUnavailable = false;
     readSpy = undefined;
     blockedRelayRoots = [];
+    watcher = undefined;
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
@@ -86,7 +89,8 @@ describe("new/ periodic rescan (cli#853)", () => {
       notifyWatch = (filename) => {
         if (!suppressWatch) { watchCalls++; listener("rename", filename); }
       };
-      return { close() {} } as fs.FSWatcher;
+      watcher = Object.assign(new EventEmitter(), { close() {} }) as unknown as fs.FSWatcher;
+      return watcher;
     }) as typeof fs.watch);
     timerSpy = spyOn(globalThis, "setInterval").mockImplementation(((fn: any, ms: number, ...args: any[]) => {
       if (ms !== NEW_DIR_RESCAN_MS) return realSetInterval(fn, ms, ...args);
@@ -168,6 +172,21 @@ describe("new/ periodic rescan (cli#853)", () => {
     await sleep(intervalMs);
     expect(promoteSpy).toHaveBeenCalledTimes(1);
     expect(logs.filter((line) => line.includes("promoted by rescan"))).toHaveLength(1);
+  });
+
+  it("logs a watcher error and still promotes new mail on the rescan (cli#720)", async () => {
+    await boot();
+    // The error Bun on Linux reports when a file under new/ moves out while the watch is set up.
+    const moved = join(newDir, "moved-out.json");
+    watcher!.emit("error", Object.assign(new Error(`ENOENT: no such file or directory, watch '${moved}'`), {
+      code: "ENOENT",
+      syscall: "watch",
+      path: moved,
+    }));
+    expect(logs.filter((line) => line.startsWith("tps-mail: new/ watcher for recipient stopped: ENOENT"))).toHaveLength(1);
+    plant("after-watch-error");
+    expect(await until(() => dispatches.length === 1, intervalMs * 2)).toBe(true);
+    expect(dispatches).toEqual(["after-watch-error"]);
   });
 
   it("retries a busy promotion on the next rescan tick", async () => {
