@@ -320,13 +320,15 @@ export interface WorktreeRemovalTestHooks {
  * the message names the operation that failed.
  */
 export class WorktreeLifecycleError extends Error {
+  /** The path a failed removal had moved the worktree to, when it moved it. */
+  pinnedPath?: string;
   constructor(message: string) {
     super(message);
     this.name = "WorktreeLifecycleError";
   }
 }
 
-function gitEnv(): NodeJS.ProcessEnv {
+export function gitEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(process.env)) {
     if (!key.startsWith("GIT_")) env[key] = value;
@@ -735,6 +737,105 @@ function manualRemovalCommand(target: { baseWorkingTree: string; workspace: stri
   return `git -C ${shellQuote(target.baseWorkingTree)} worktree remove --force ${shellQuote(target.workspace)}`;
 }
 
+/** Read one POSIX single-quoted token (the quoting `shellQuote` writes). */
+function readShellQuoted(text: string): { value: string; rest: string } | null {
+  if (!text.startsWith("'")) return null;
+  let value = "";
+  let i = 1;
+  while (i < text.length) {
+    if (text[i] === "'") {
+      if (text.startsWith("'\\''", i)) {
+        value += "'";
+        i += 4;
+        continue;
+      }
+      return { value, rest: text.slice(i + 1) };
+    }
+    value += text[i++];
+  }
+  return null;
+}
+
+/** The worktree path named by a `git -C <base> worktree remove --force <path>`
+ * command, or null when the text is not that command. */
+function manualCommandPath(command: string): string | null {
+  const prefix = "git -C ";
+  if (!command.startsWith(prefix)) return null;
+  const base = readShellQuoted(command.slice(prefix.length));
+  if (!base || !base.rest.startsWith(" worktree remove --force ")) return null;
+  const path = readShellQuoted(base.rest.slice(" worktree remove --force ".length));
+  if (!path || path.rest !== "") return null;
+  return path.value;
+}
+
+/** The trailing removal-advice clause of `message`: where it starts and the
+ * worktree path it names. */
+function trailingRemovalAdvice(message: string): { start: number; path: string } | null {
+  for (const marker of ["; remove it manually with: ", "; inspect it and remove it manually with: "]) {
+    const at = message.lastIndexOf(marker);
+    if (at < 0) continue;
+    const path = manualCommandPath(message.slice(at + marker.length));
+    if (path !== null) return { start: at, path };
+  }
+  // The captured path cannot contain `; `, so the match never starts at an
+  // earlier clause.
+  const guidance = /; ((?:(?!; )[\s\S])+) is no longer a registered worktree of [\s\S]+; inspect it and remove it yourself if it is yours$/.exec(message);
+  if (guidance) return { start: guidance.index, path: guidance[1]! };
+  const inspectAt = /; inspect it at ([\s\S]+) and remove it yourself if it is yours$/.exec(message);
+  if (inspectAt) return { start: inspectAt.index, path: inspectAt[1]! };
+  return null;
+}
+
+/** True only when the path is absent (ENOENT). An unreadable path is not
+ * absent, and its advice is kept. */
+function advicePathGone(path: string): boolean {
+  try {
+    lstatSync(path);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+/**
+ * At a launcher signal, remove the worktree only when the launcher verified
+ * that the supervisor and the released child are stopped; otherwise keep it
+ * and report true.
+ */
+export function removeWorktreeAfterStop(stop: { stopped: boolean }, remove: () => void): boolean {
+  if (!stop.stopped) return true;
+  remove();
+  return false;
+}
+
+/**
+ * Drop the removal advice from an error message when the worktree path it
+ * names is gone. Setup, retry, teardown and signal-path cleanup errors are
+ * printed through this (cli#686): a removal that reports failure after it
+ * removed the worktree is not followed by a command for an absent path. An
+ * unreadable path keeps its advice.
+ */
+export function withoutRemovalAdvice(
+  message: string,
+  target?: { baseWorkingTree: string; workspace: string },
+): string {
+  let out = message;
+  if (target) {
+    for (const clause of [`remove it manually with: ${manualRemovalCommand(target)}`, unregisteredGuidance(target)]) {
+      const withSeparator = `; ${clause}`;
+      const at = out.indexOf(withSeparator);
+      if (at >= 0) out = out.slice(0, at) + out.slice(at + withSeparator.length);
+      else out = out.replace(clause, "");
+    }
+  }
+  for (;;) {
+    const tail = trailingRemovalAdvice(out);
+    if (!tail || !advicePathGone(tail.path)) break;
+    out = out.slice(0, tail.start);
+  }
+  return out.replace(/[;\s]+$/, "");
+}
+
 /** Guidance for a path the recorded base does not list as its worktree: no Git command. */
 function unregisteredGuidance(target: { baseWorkingTree: string; workspace: string }): string {
   return `${target.workspace} is no longer a registered worktree of ${target.baseWorkingTree}; inspect it and remove it yourself if it is yours`;
@@ -947,7 +1048,7 @@ function writeRegistryEntry(entry: string, content: string): void {
 function removePinnedWorktree(
   pin: PinnedWorktree,
   testHooks?: WorktreeRemovalTestHooks,
-): { ok: true } | { ok: false; detail: string } {
+): { ok: true } | { ok: false; detail: string; pinned: string } {
   try {
     writeRegistryEntry(pin.registryEntry, `${join(pin.pinned, ".git")}\n`);
   } catch (err) {
@@ -958,6 +1059,7 @@ function removePinnedWorktree(
     return {
       ok: false,
       detail: `the worktree registration could not be repointed at the verified directory: ${(err as Error).message}${restore.detail}; ${guidance}`,
+      pinned: pin.pinned,
     };
   }
   testHooks?.beforeGitRemoval?.(pin.pinned);
@@ -969,6 +1071,7 @@ function removePinnedWorktree(
       return {
         ok: false,
         detail: `${gitError}${restore.detail}; inspect it and remove it manually with: ${manualRemovalCommand({ baseWorkingTree: pin.baseWorkingTree, workspace: pin.pinned })}`,
+        pinned: pin.pinned,
       };
     }
     try {
@@ -977,9 +1080,10 @@ function removePinnedWorktree(
       return {
         ok: false,
         detail: `${gitError}; the worktree registration could not be restored: ${(err as Error).message}; inspect it and remove it yourself if it is yours`,
+        pinned: pin.pinned,
       };
     }
-    return { ok: false, detail: `${gitError}; remove it manually with: ${manualRemovalCommand(pin)}` };
+    return { ok: false, detail: `${gitError}; remove it manually with: ${manualRemovalCommand(pin)}`, pinned: pin.pinned };
   }
   testHooks?.afterGitRemoval?.(pin.pinned);
   let leftover: string | null;
@@ -989,12 +1093,14 @@ function removePinnedWorktree(
     return {
       ok: false,
       detail: `${pin.pinned} could not be inspected after the worktree was removed: ${(err as Error).message}; inspect it yourself`,
+      pinned: pin.pinned,
     };
   }
   if (leftover) {
     return {
       ok: false,
       detail: `${leftover} still exists after the worktree was removed; inspect it and remove it yourself if it is yours`,
+      pinned: pin.pinned,
     };
   }
   return { ok: true };
@@ -1216,9 +1322,11 @@ export function onStop(
     }
     const removal = removePinnedWorktree(pin, testHooks);
     if (!removal.ok) {
-      throw new WorktreeLifecycleError(
+      const error = new WorktreeLifecycleError(
         `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${removal.detail}`,
       );
+      error.pinnedPath = removal.pinned;
+      throw error;
     }
     return { changed: true, reason: "worktree removed" };
   }
@@ -1276,7 +1384,9 @@ export function onStop(
     }
     const removal = removePinnedWorktree(pin, testHooks);
     if (!removal.ok) {
-      throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
+      const error = new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
+      error.pinnedPath = removal.pinned;
+      throw error;
     }
 
     return { changed: true, reason: "worktree removed" };

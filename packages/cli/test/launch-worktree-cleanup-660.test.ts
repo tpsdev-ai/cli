@@ -41,6 +41,7 @@ import {
   onStart,
   onStop,
   removeCreatedWorktree,
+  withoutRemovalAdvice,
   WorktreeLifecycleError,
   type WorktreeCreation,
 } from "../src/utils/agent-lifecycle.js";
@@ -1220,6 +1221,22 @@ test("unit — bound onStop reports a failed worktree listing with inspection gu
     expect(message).not.toContain("worktree remove");
     expect(message).not.toContain("git -C");
     expect(worktreeList(f.base)).toContain(`worktree ${f.workspace}\n`);
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("unit — the advice filter keeps an earlier restore-failure clause when it drops the guidance for an absent worktree", () => {
+  const f = fixture();
+  try {
+    const pinned = join(f.root, ".ws.cleanup-fixture");
+    const message =
+      `worktree cleanup binding changed for ${f.workspace}: ` +
+      `; not restored from ${pinned}: ${f.workspace} is occupied; ` +
+      inspectGuidance(f);
+    expect(withoutRemovalAdvice(message)).toBe(
+      `worktree cleanup binding changed for ${f.workspace}: ; not restored from ${pinned}: ${f.workspace} is occupied`,
+    );
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
