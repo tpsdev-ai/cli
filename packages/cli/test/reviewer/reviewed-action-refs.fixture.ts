@@ -9,6 +9,10 @@
  * The peeled ref is the commit an annotated tag names. Each pair below was
  * recorded on 2026-11-02; every tag resolved to a lightweight tag, so the
  * commit is the tag's own ref.
+ *
+ * Every row added or changed later is re-verified with the same command, and
+ * its ls-remote output is recorded in that PR: the equality test against the
+ * allowlist cannot catch a wrong tag edited identically into both files.
  */
 export const REVIEWED_ACTION_REFS: Record<string, Record<string, string>> = {
   "actions/checkout": {
