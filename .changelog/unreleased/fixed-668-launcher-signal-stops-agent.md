@@ -1,3 +1,3 @@
-- **A signal to the sandboxed launcher stops the nono supervisor through its child handle and never signals the agent's pid.**
+- **A signal to the sandboxed launcher TERMs the nono supervisor and checks the released agent.**
 
-  It then reads the released agent's identity read-only; when the agent is still present or its identity cannot be read it keeps the worktree and exits non-zero.
+  The launcher never signals the agent's pid; it reads the identity captured before the release.

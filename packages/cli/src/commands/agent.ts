@@ -1637,13 +1637,17 @@ async function runAgentCommand(
             let createdWorktree: import("../utils/agent-lifecycle.js").WorktreeCreation | undefined;
             let cleanupBinding: import("../utils/agent-lifecycle.js").WorktreeCleanupBinding | undefined;
             let keepWorktree = false;
+            /** The worktree facts a signal-path removal must confirm, when this
+             * launch created one; `pinnedPath` is recorded by the removal. */
+            let cleanupFacts: { workspace: string; baseWorkingTree: string; pinnedPath?: string } | undefined;
             /** The worktree facts an error's removal advice names, when this
              * launch created one. */
             const adviceTarget = () =>
               createdWorktree ?? cleanupBinding;
             /** Print an error from this launch path, dropping the removal advice
-             * whose clause names a worktree path that is gone at print time. An
-             * unreadable path is not treated as gone. */
+             * whose clause names a worktree path when the lstat check
+             * immediately before this call finds it absent. An unreadable path
+             * is not treated as absent. */
             const printLaunchError = (err: Error, target?: { baseWorkingTree: string; workspace: string }) => {
               let gone = false;
               if (target) {
@@ -1701,9 +1705,10 @@ async function runAgentCommand(
                   cleanupError = cleanupErr as Error;
                 }
               }
-              // Removal advice is printed only when the path it names exists at
-              // print time (cli#686): setup, retry, teardown and signal-path
-              // cleanup errors all pass through this filter.
+              // Removal advice is dropped when the lstat check immediately
+              // before printing finds its path absent (cli#686): setup, retry,
+              // teardown and signal-path cleanup errors all pass through this
+              // filter.
               printLaunchError(setupError, adviceTarget());
               if (cleanupError) printLaunchError(cleanupError, adviceTarget());
               process.exit(isSupervised() ? SUPERVISED_REFUSAL_EXIT_CODE : REFUSAL_EXIT_CODE);
@@ -1716,6 +1721,10 @@ async function runAgentCommand(
             launchEnv.TPS_AGENT_WORKSPACE = config.workspace;
             delete launchEnv.TPS_WORKTREE_PENDING;
             if (worktreeCreated) launchEnv.TPS_WORKTREE_PENDING = config.workspace;
+            const factsTarget = adviceTarget();
+            cleanupFacts = worktreeCreated && factsTarget
+              ? { workspace: factsTarget.workspace, baseWorkingTree: factsTarget.baseWorkingTree }
+              : undefined;
             let exitCode: number;
             try {
               exitCode = await launchAttested(
@@ -1741,10 +1750,16 @@ async function runAgentCommand(
                       // Removal is unconfirmed: the launcher refuses and keeps
                       // the launch state, so the teardown below must not retry.
                       keepWorktree = true;
+                      const pinnedPath = (err as { pinnedPath?: unknown }).pinnedPath;
+                      if (cleanupFacts && typeof pinnedPath === "string") cleanupFacts.pinnedPath = pinnedPath;
                       throw err;
                     }
                   },
                   worktreePath: worktreeCreated ? cleanupBinding?.workspace ?? createdWorktree?.workspace : undefined,
+                  worktreeCleanup: cleanupFacts,
+                  onRefusalSurvivors: () => {
+                    keepWorktree = true;
+                  },
                   // The same path-aware advice filter as printLaunchError, for
                   // a cleanup error on the signal path (cli#686).
                   formatCleanupError: (err) => {

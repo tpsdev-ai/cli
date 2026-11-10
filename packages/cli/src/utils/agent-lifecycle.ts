@@ -320,6 +320,8 @@ export interface WorktreeRemovalTestHooks {
  * the message names the operation that failed.
  */
 export class WorktreeLifecycleError extends Error {
+  /** The path a failed removal had moved the worktree to, when it moved it. */
+  pinnedPath?: string;
   constructor(message: string) {
     super(message);
     this.name = "WorktreeLifecycleError";
@@ -796,8 +798,7 @@ function advicePathGone(path: string): boolean {
 /**
  * At a launcher signal, remove the worktree only when the launcher verified
  * that the supervisor and the released child are stopped; otherwise keep it
- * and report true. The caller turns `true` into a kept-worktree message and a
- * non-zero exit.
+ * and report true.
  */
 export function removeWorktreeAfterStop(stop: { stopped: boolean }, remove: () => void): boolean {
   if (!stop.stopped) return true;
@@ -807,10 +808,10 @@ export function removeWorktreeAfterStop(stop: { stopped: boolean }, remove: () =
 
 /**
  * Drop the removal advice from an error message when the worktree path it
- * names is gone. Setup, retry, teardown and signal-path cleanup errors carry
- * the same advice clauses and are printed through this (cli#686): a removal
- * that reports failure after it removed the worktree is not followed by a
- * command for an absent path. An unreadable path keeps its advice.
+ * names is gone. Setup, retry, teardown and signal-path cleanup errors are
+ * printed through this (cli#686): a removal that reports failure after it
+ * removed the worktree is not followed by a command for an absent path. An
+ * unreadable path keeps its advice.
  */
 export function withoutRemovalAdvice(
   message: string,
@@ -1045,7 +1046,7 @@ function writeRegistryEntry(entry: string, content: string): void {
 function removePinnedWorktree(
   pin: PinnedWorktree,
   testHooks?: WorktreeRemovalTestHooks,
-): { ok: true } | { ok: false; detail: string } {
+): { ok: true } | { ok: false; detail: string; pinned: string } {
   try {
     writeRegistryEntry(pin.registryEntry, `${join(pin.pinned, ".git")}\n`);
   } catch (err) {
@@ -1056,6 +1057,7 @@ function removePinnedWorktree(
     return {
       ok: false,
       detail: `the worktree registration could not be repointed at the verified directory: ${(err as Error).message}${restore.detail}; ${guidance}`,
+      pinned: pin.pinned,
     };
   }
   testHooks?.beforeGitRemoval?.(pin.pinned);
@@ -1067,6 +1069,7 @@ function removePinnedWorktree(
       return {
         ok: false,
         detail: `${gitError}${restore.detail}; inspect it and remove it manually with: ${manualRemovalCommand({ baseWorkingTree: pin.baseWorkingTree, workspace: pin.pinned })}`,
+        pinned: pin.pinned,
       };
     }
     try {
@@ -1075,9 +1078,10 @@ function removePinnedWorktree(
       return {
         ok: false,
         detail: `${gitError}; the worktree registration could not be restored: ${(err as Error).message}; inspect it and remove it yourself if it is yours`,
+        pinned: pin.pinned,
       };
     }
-    return { ok: false, detail: `${gitError}; remove it manually with: ${manualRemovalCommand(pin)}` };
+    return { ok: false, detail: `${gitError}; remove it manually with: ${manualRemovalCommand(pin)}`, pinned: pin.pinned };
   }
   testHooks?.afterGitRemoval?.(pin.pinned);
   let leftover: string | null;
@@ -1087,12 +1091,14 @@ function removePinnedWorktree(
     return {
       ok: false,
       detail: `${pin.pinned} could not be inspected after the worktree was removed: ${(err as Error).message}; inspect it yourself`,
+      pinned: pin.pinned,
     };
   }
   if (leftover) {
     return {
       ok: false,
       detail: `${leftover} still exists after the worktree was removed; inspect it and remove it yourself if it is yours`,
+      pinned: pin.pinned,
     };
   }
   return { ok: true };
@@ -1314,9 +1320,11 @@ export function onStop(
     }
     const removal = removePinnedWorktree(pin, testHooks);
     if (!removal.ok) {
-      throw new WorktreeLifecycleError(
+      const error = new WorktreeLifecycleError(
         `worktree cleanup failed for ${_agentId} (${binding.workspace}): ${removal.detail}`,
       );
+      error.pinnedPath = removal.pinned;
+      throw error;
     }
     return { changed: true, reason: "worktree removed" };
   }
@@ -1374,7 +1382,9 @@ export function onStop(
     }
     const removal = removePinnedWorktree(pin, testHooks);
     if (!removal.ok) {
-      throw new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
+      const error = new WorktreeLifecycleError(`worktree cleanup failed for ${_agentId} (${workspace}): ${removal.detail}`);
+      error.pinnedPath = removal.pinned;
+      throw error;
     }
 
     return { changed: true, reason: "worktree removed" };

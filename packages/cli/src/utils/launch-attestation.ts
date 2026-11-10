@@ -66,7 +66,7 @@ import {
  * capability; this variable only says where it lives. */
 export const LAUNCH_SOCK_ENV = "TPS_LAUNCH_SOCK";
 
-/** The signals a launcher forwards to the supervisor it started, then re-raises. */
+/** The signals a launcher stops on. */
 export const INTERRUPT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 
 /** How long a signalled launcher waits for the supervisor to exit before it
@@ -905,6 +905,12 @@ export interface LaunchOptions {
   /** The worktree this launch created, named in the error when a survivor
    * keeps it or when its removal is unconfirmed. */
   worktreePath?: string;
+  /** The worktree facts a failed signal-path removal must confirm gone. The
+   * caller sets `pinnedPath` when its removal moves the worktree aside. */
+  worktreeCleanup?: WorktreeCleanup;
+  /** Called when a refusal's stop leaves a survivor, so the caller keeps the
+   * worktree; the launcher keeps its launch state and exits 78. */
+  onRefusalSurvivors?: (survivors: number[]) => void;
   /** The path-aware advice filter the caller prints launch errors through; a
    * signal-path cleanup error is formatted by it too. */
   formatCleanupError?: (err: Error) => string;
@@ -973,29 +979,59 @@ export async function launchAttested(
   const currentRelease = (): ReleasedAgent | null => released;
   let keepLaunchState = false;
 
-  /** True only when the path is absent (ENOENT). An unreadable path is not
-   * confirmed removed. */
-  const pathConfirmedGone = (path: string | undefined): boolean => {
-    if (!path) return false;
+  /** What a failed signal-path removal left behind. Empty only when the
+   * original path is absent, the path the removal moved it to is absent, and
+   * the base repository no longer lists the worktree. */
+  const remainingWorktreeCleanup = (cleanup: WorktreeCleanup): string[] => {
+    const remaining: string[] = [];
+    const absence = (path: string, what: string): void => {
+      try {
+        lstatSync(path);
+        remaining.push(`${what} ${path} remains`);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+          remaining.push(`${what} ${path} could not be checked (${(err as NodeJS.ErrnoException).code ?? "error"})`);
+        }
+      }
+    };
+    absence(cleanup.workspace, "the worktree path");
+    if (cleanup.pinnedPath) absence(cleanup.pinnedPath, "the worktree moved aside to");
+    let listing: string;
     try {
-      lstatSync(path);
-      return false;
+      const result = spawnSync("git", ["-C", cleanup.baseWorkingTree, "worktree", "list", "--porcelain"], {
+        encoding: "utf-8",
+        timeout: 10_000,
+      });
+      if (result.status !== 0) {
+        remaining.push(
+          `the worktree registration could not be read (${(result.stderr || result.stdout || `git exited ${result.status}`).trim()})`,
+        );
+        return remaining;
+      }
+      listing = result.stdout ?? "";
     } catch (err) {
-      return (err as NodeJS.ErrnoException).code === "ENOENT";
+      remaining.push(`the worktree registration could not be read (${(err as Error).message})`);
+      return remaining;
     }
+    const named = [cleanup.workspace, cleanup.pinnedPath].filter((path): path is string => typeof path === "string");
+    for (const line of listing.split("\n")) {
+      if (!line.startsWith("worktree ")) continue;
+      const listed = line.slice("worktree ".length);
+      if (named.some((path) => resolve(path) === resolve(listed))) {
+        remaining.push(`the base repository still registers ${listed}`);
+      }
+    }
+    return remaining;
   };
 
-  // A signal to the launcher stops the session it started, cleans up what only
-  // this launch created, and only then re-raises so the exit status still says
-  // it was signalled. Closing the release gate is the first thing it does: the
-  // connection callback writes no release once `stopping` is set, and a release
-  // written before it is part of what the stop must verify. The supervisor is
-  // signalled through its own child handle while it has not exited; the
-  // released agent is never signalled, only read back by the identity recorded
-  // before its release. The caller's removal runs only when the supervisor has
-  // exited and the agent is gone or its pid names a different process. A
-  // second signal is recorded and ignored: it must not re-enter the stop or
-  // cleanup path.
+  // A signal to the launcher TERMs the supervisor through its child handle and
+  // checks the agent read-only. Cleanup of what this launch created runs only
+  // after the stop check; an unconfirmed removal keeps the worktree and the
+  // launch state and exits 78. A stop that began before the release write
+  // prevents that write. The supervisor is signalled through its own child
+  // handle while it has not exited; the released agent is never signalled, only
+  // read back by the identity recorded before its release. A second signal is
+  // recorded and ignored: it must not re-enter the stop or cleanup path.
   let stopping = false;
   let interruptDone: Promise<void> | undefined;
   let interruptOutcome: number | undefined;
@@ -1030,14 +1066,22 @@ export async function launchAttested(
       }
       if (cleanupError) {
         // The caller's removal threw. Print it through the caller's advice
-        // filter, and when the worktree path is not confirmed gone the removal
-        // is unconfirmed: keep the launch state and refuse instead of
+        // filter. The removal is unconfirmed unless the original path, the
+        // path it was moved to, and the base repository's registration are all
+        // gone; then the launcher keeps the launch state and refuses instead of
         // re-raising the signal.
         const message = (opts.formatCleanupError ?? ((err: Error) => err.message))(cleanupError);
         console.error(`❌ ${message}`);
-        if (!pathConfirmedGone(opts.worktreePath)) {
+        const remaining = opts.worktreeCleanup
+          ? remainingWorktreeCleanup(opts.worktreeCleanup)
+          : [
+              opts.worktreePath
+                ? `the worktree registration for ${opts.worktreePath} was not checked`
+                : "the worktree path was not named",
+            ];
+        if (remaining.length > 0) {
           const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-          console.error(`❌ the worktree removal was not confirmed; kept ${kept} and the launch state`);
+          console.error(`❌ the worktree removal was not confirmed; kept ${kept} and the launch state (${remaining.join("; ")})`);
           keepLaunchState = true;
           for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
           interruptOutcome = REFUSAL_EXIT_CODE;
@@ -1066,8 +1110,9 @@ export async function launchAttested(
   };
 
   /** Stop the supervisor through its handle when the launch is refused after a
-   * release decision. The agent is checked read-only through its recorded
-   * identity; a survivor keeps the launch state and exits non-zero. */
+   * release decision. The agent is checked read-only; a survivor is reported to
+   * the caller, which keeps the worktree, and the launcher keeps its launch
+   * state and exits 78. */
   const stopAfterRefusal = async (reason: string): Promise<number> => {
     const stop = await stopLaunchProcesses(
       { supervisor: child, agent: released },
@@ -1078,6 +1123,7 @@ export async function launchAttested(
       const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
       console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
       keepLaunchState = true;
+      opts.onRefusalSurvivors?.(stop.survivors);
       return REFUSAL_EXIT_CODE;
     }
     return refuse(reason);
@@ -1209,8 +1255,7 @@ export async function launchAttested(
       //
       // Signal ONLY the nono supervisor the launcher spawned, through its
       // handle (cli#350 r4g, CWE-20): the child-REPORTED pid is unverified here
-      // — a peer may report any pid — so it is never signalled. Stopping the
-      // supervisor stops the session and its child.
+      // — a peer may report any pid — so it is never signalled.
       return await stopAfterRefusal(`${verdict.reason} — refusing to release the agent`);
     }
 
@@ -1257,6 +1302,16 @@ export async function launchAttested(
       log.push(`cleaned=${!existsSync(priv.root)}`);
     }
   }
+}
+
+/** The worktree facts a failed signal-path removal must confirm: the path
+ * this launch created, the base repository that registers it, and the path the
+ * removal moved it to before removing it. */
+export interface WorktreeCleanup {
+  workspace: string;
+  baseWorkingTree: string;
+  /** Set by the caller when its removal moves the worktree aside. */
+  pinnedPath?: string;
 }
 
 /** Values of `--flag value` in a command line. */

@@ -2651,7 +2651,7 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
     "  child=$!",
     '  prof=""; args=("$@"); for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
     '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
-    '  trap \'if [ "${FAKE_NONO_KILL_CHILD:-1}" = 1 ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; sleep "${FAKE_NONO_DELAY_MS:-0}"; exit 0\' TERM INT HUP',
+    '  trap \'if [ "${FAKE_NONO_KILL_CHILD:-1}" = 1 ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; if [ -n "${FAKE_NONO_HOLD_EXIT:-}" ]; then i=0; while [ ! -f "${FAKE_NONO_HOLD_EXIT}" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; fi; sleep "${FAKE_NONO_DELAY_MS:-0}"; exit 0\' TERM INT HUP',
     "  while :; do sleep 0.05; done",
     "fi",
     "exit 0",
@@ -2720,6 +2720,7 @@ const releaseTestHooks = process.env.D_HOLD_RELEASE === "1" ? {
     while (!existsSync(process.env.D_RELEASE_GO) && Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 25));
     }
+    if (process.env.D_RESUMED) writeFileSync(process.env.D_RESUMED, "1");
   },
 } : tokens === "release-relative" ? {
   afterReleaseWrite: () => writeFileSync(process.env.D_RELEASE_TOKEN_FLAG, "1"),
@@ -2730,6 +2731,7 @@ if (process.env.D_WORKTREE === "1") {
   const started = onStart("probe", ws, { deferCheckout: true });
   binding = started.cleanupBinding;
 }
+const cleanupFacts = binding ? { workspace: ws, baseWorkingTree: binding.baseWorkingTree } : undefined;
 const code = await launchAttested(
   "tps-agent-run",
   { workdir: ws, read: [], readFiles: [], allow: [ws] },
@@ -2739,20 +2741,29 @@ const code = await launchAttested(
     home: process.env.HOME,
     worktreeBinding: binding,
     worktreePath: ws,
+    worktreeCleanup: cleanupFacts,
     signalStopTimeoutMs: Number(process.env.D_BOUND ?? "5000"),
     interruptTestHooks: hooks,
     releaseTestHooks,
     formatCleanupError: (err) => withoutRemovalAdvice(err.message),
     onInterrupt: (_signal, stop) => {
       writeFileSync(process.env.D_RESULT, JSON.stringify(stop));
-      if (binding) kept = removeWorktreeAfterStop(stop, () => onStop("probe", ws, binding));
+      if (binding) {
+        try {
+          kept = removeWorktreeAfterStop(stop, () => onStop("probe", ws, binding));
+        } catch (err) {
+          const pinnedPath = err && err.pinnedPath;
+          if (cleanupFacts && typeof pinnedPath === "string") cleanupFacts.pinnedPath = pinnedPath;
+          throw err;
+        }
+      }
     },
   }
 );
 process.exit(typeof code === "number" ? code : 1);
 `;
 
-  function stopFixture(gitRemove?: "fail-gone" | "fail-keep"): StopFixture {
+  function stopFixture(gitRemove?: "fail-gone" | "fail-keep" | "fail-leftover"): StopFixture {
     const sb = makeSandbox();
     const base = join(sb.home, "ops", "tps");
     mkdirSync(base, { recursive: true });
@@ -2767,20 +2778,32 @@ process.exit(typeof code === "number" ? code : 1);
     chmodSync(sb.nonoBin, 0o755);
     writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run");
     writeFileSync(join(sb.home, ".tps", "agents", "probe", "agent.yaml"), agentYaml(sb, sb.ws));
-    // A git wrapper logs each call and execs real Git.
+    // A git wrapper logs each call and, for a removal, either fails before Git
+    // runs (fail-gone deletes the moved-aside directory first, fail-keep leaves
+    // it), or lets Git remove the worktree and then recreates the moved-aside
+    // directory (fail-leftover).
     const bin = join(sb.root, "git-bin");
     mkdirSync(bin);
     const gitLog = join(sb.root, "git-calls.log");
     const removeFailure =
       gitRemove === undefined
         ? ""
-        : [
-            'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
-            ...(gitRemove === "fail-gone" ? ['  rm -rf "$4"'] : []),
-            '  echo "fatal: injected removal failure" >&2',
-            "  exit 1",
-            "fi",
-          ].join("\n");
+        : gitRemove === "fail-leftover"
+          ? [
+              'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+              `  "${GIT}" "$@"`,
+              "  status=$?",
+              '  mkdir -p "$4"',
+              "  exit $status",
+              "fi",
+            ].join("\n")
+          : [
+              'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+              ...(gitRemove === "fail-gone" ? ['  rm -rf "$4"'] : []),
+              '  echo "fatal: injected removal failure" >&2',
+              "  exit 1",
+              "fi",
+            ].join("\n");
     writeFileSync(
       join(bin, "git"),
       ["#!/bin/sh", `printf '%s\\n' "$*" >> "${gitLog}"`, removeFailure, `exec "${GIT}" "$@"`, ""].join("\n"),
@@ -2970,23 +2993,33 @@ process.exit(typeof code === "number" ? code : 1);
     const f = stopFixture();
     const held = join(f.sb.root, "release-held");
     const go = join(f.sb.root, "release-go");
+    const resumed = join(f.sb.root, "release-resumed");
+    const supervisorGo = join(f.sb.root, "supervisor-go");
     const { launcher, text } = spawnStopDriver(f, {
       D_HOLD_RELEASE: "1",
       D_HELD: held,
       D_RELEASE_GO: go,
-      // The supervisor exits without stopping its child, and only after a
-      // delay, so a release written after the stop began would be observable.
+      D_RESUMED: resumed,
+      // The supervisor is held after its TERM until the test lets it exit, so
+      // the launcher is alive when the held handshake resumes.
       FAKE_NONO_KILL_CHILD: "0",
       FAKE_NONO_DELAY_MS: "1",
+      FAKE_NONO_HOLD_EXIT: supervisorGo,
       D_BOUND: "3000",
     });
     try {
       expect(await waitFor(() => existsSync(held), 20_000), text()).toBe(true);
       process.kill(launcher.pid!, "SIGTERM");
-      // Let the release gate close while the supervisor is still stopping, then
-      // let the handshake proceed.
-      await new Promise((r) => setTimeout(r, 250));
+      expect(
+        await waitFor(() => observed(f.observe).some((line) => line.includes(" SIGTERM supervisor")), 5_000),
+        text(),
+      ).toBe(true);
+      // Let the handshake resume with the stop already begun.
       writeFileSync(go, "1");
+      expect(await waitFor(() => existsSync(resumed), 5_000), text()).toBe(true);
+      // The callback resumed while the launcher was still stopping.
+      expect(alive(launcher.pid!)).toBe(true);
+      writeFileSync(supervisorGo, "1");
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
         if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
         launcher.once("exit", (code, signal) => r({ code, signal }));
@@ -3066,7 +3099,7 @@ process.exit(typeof code === "number" ? code : 1);
     }
   }, 30_000);
 
-  test("a signal-path removal that reports failure after the directory is gone prints no advice for it", async () => {
+  test("a removal that reports failure after the moved directory is gone but the registration remains refuses and keeps the launch state", async () => {
     const f = stopFixture("fail-gone");
     const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1" });
     let peerPid: number | undefined;
@@ -3079,12 +3112,52 @@ process.exit(typeof code === "number" ? code : 1);
         if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
         launcher.once("exit", (code, signal) => r({ code, signal }));
       });
-      // The directory is gone, so the removal is confirmed: the launcher keeps
-      // its signal-shaped exit, without advice naming the absent path.
-      expect(exit.signal, text()).toBe("SIGTERM");
+      // The moved-aside directory is gone, but Git never ran: the base still
+      // registers it. The removal is unconfirmed, so the launcher refuses and
+      // keeps the launch state instead of re-raising the signal.
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      expect(text()).toContain("the worktree removal was not confirmed");
+      expect(text()).toContain("the base repository still registers");
       expect(text()).not.toContain("remove it manually with:");
       expect(text()).not.toContain("inspect it and remove it yourself");
       expect(existsSync(f.sb.ws)).toBe(false);
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+      expect(
+        spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout,
+      ).toContain(".ws.cleanup-");
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a removal whose moved-aside directory remains refuses and keeps the launch state", async () => {
+    const f = stopFixture("fail-leftover");
+    const { launcher, text } = spawnStopDriver(f, { D_WORKTREE: "1" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      // Git removed and unregistered the worktree, then the wrapper recreated
+      // the moved-aside directory. The original path is absent but the removal
+      // is unconfirmed: refuse and keep the launch state.
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      expect(text()).toContain("the worktree removal was not confirmed");
+      expect(text()).toContain("the worktree moved aside to");
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+      expect(
+        spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout,
+      ).not.toContain(f.sb.ws);
     } finally {
       try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
@@ -3113,6 +3186,178 @@ process.exit(typeof code === "number" ? code : 1);
     } finally {
       try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+});
+
+// ---------------------------------------------------------------------------
+// cli#668 round 4 — a refusal after the release, with an agent that outlives
+// its supervisor, keeps the worktree and the launch state and exits 78
+// ---------------------------------------------------------------------------
+
+describe("cli#668 round 4 — a refusal after release keeps a surviving agent's worktree", () => {
+  const GIT = spawnSync("which", ["git"], { encoding: "utf8" }).stdout?.trim() || "git";
+
+  interface SurvivorFixture {
+    sb: Sandbox;
+    base: string;
+  }
+
+  function survivorFixture(): SurvivorFixture {
+    const sb = makeSandbox();
+    const base = join(sb.home, "ops", "tps");
+    mkdirSync(base, { recursive: true });
+    const git = (args: string[]) => {
+      const result = spawnSync(GIT, args, { cwd: base, encoding: "utf8" });
+      expect(result.status, result.stderr).toBe(0);
+    };
+    git(["init", "-q"]);
+    git(["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit", "--allow-empty", "-qm", "init"]);
+    rmSync(sb.ws, { recursive: true, force: true });
+    writeProfilePair(join(sb.home, ".config", "nono", "profiles"), "tps-agent-run-codex");
+    writeFileSync(
+      join(sb.home, ".tps", "agents", "probe", "agent.yaml"),
+      agentYaml(sb, sb.ws).replace("provider: ollama", "provider: openai"),
+    );
+    return { sb, base };
+  }
+
+  /** Fake nono: the first `ps` call reports the bound session; every later one
+   * reports none, so the post-release recheck refuses. Its TERM trap exits
+   * without stopping the child. */
+  const RECHECK_FAILURE_FAKE_NONO = [
+    "#!/usr/bin/env bash",
+    "set -u",
+    'if [ "${1:-}" = "--version" ]; then echo "nono 0.74.0"; exit 0; fi',
+    'if [ "${1:-}" = "profile" ]; then exit 0; fi',
+    'if [ "${1:-}" = "why" ]; then echo \'{"status":"denied","reason":"path_not_granted"}\'; exit 0; fi',
+    'if [ "${1:-}" = "ps" ]; then',
+    '  n=0; [ -f "${FAKE_NONO_PS_COUNT:?}" ] && n=$(cat "${FAKE_NONO_PS_COUNT}")',
+    '  n=$((n+1)); printf "%s" "$n" > "${FAKE_NONO_PS_COUNT}"',
+    '  if [ "$n" -le 1 ]; then',
+    '    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do',
+    '      [ -s "${FAKE_NONO_PS_JSON:?}" ] && break',
+    "      sleep 0.05",
+    "    done",
+    '    cat "${FAKE_NONO_PS_JSON}"; exit 0',
+    "  fi",
+    "  echo '[]'; exit 0",
+    "fi",
+    'if [ "${1:-}" = "run" ]; then',
+    '  "${RELEASE_PEER_NODE:?}" "${RELEASE_PEER:?}" &',
+    "  child=$!",
+    '  prof=""; args=("$@"); i=0',
+    '  for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
+    '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
+    '  trap "exit 0" TERM INT HUP',
+    "  while :; do sleep 0.05; done",
+    "fi",
+    "exit 0",
+    "",
+  ].join("\n");
+
+  /** The released child: it stays alive and ignores the supervisor and the
+   * launcher socket going away, so it survives its supervisor. */
+  const SURVIVOR_PEER = `const { connect } = require("node:net");
+const { readFileSync, writeFileSync } = require("node:fs");
+const { dirname, join } = require("node:path");
+const sock = connect(process.env.TPS_LAUNCH_SOCK);
+sock.on("error", () => process.exit(0));
+sock.on("connect", () => {
+  const inside = readFileSync(join(dirname(process.env.TPS_LAUNCH_SOCK), "canary-inside"), "utf-8").trim();
+  sock.write("PID " + process.pid + "\\n");
+  sock.write("CANARY OUTSIDE DENIED\\n");
+  sock.write("CANARY INSIDE READ:" + inside + "\\n");
+});
+sock.on("data", (chunk) => {
+  if (String(chunk).includes("CONFINED")) writeFileSync(process.env.PEER_PID_FILE, String(process.pid));
+});
+setInterval(() => {}, 1000);
+`;
+
+  async function waitUntil(check: () => boolean, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (check()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return check();
+  }
+
+  function pidFromFile(path: string): number | undefined {
+    try {
+      const pid = Number.parseInt(readFileSync(path, "utf-8").trim(), 10);
+      return Number.isFinite(pid) && pid > 1 ? pid : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  function processAlive(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  }
+
+  function waitExit(child: ReturnType<typeof spawn>): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+    }
+    return new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
+  }
+
+  test("a post-release recheck refusal with a surviving child exits 78 and keeps the worktree and launch state", async () => {
+    const f = survivorFixture();
+    const peer = join(f.sb.root, "survivor-peer.cjs");
+    writeFileSync(peer, SURVIVOR_PEER);
+    writeFileSync(f.sb.nonoBin, RECHECK_FAILURE_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const peerPidFile = join(f.sb.root, "peer.pid");
+    const launcher = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED], {
+      cwd: f.sb.run,
+      detached: true,
+      env: cliEnv(f.sb, {
+        FAKE_NONO_PS_JSON: join(f.sb.root, "ps.json"),
+        FAKE_NONO_PS_COUNT: join(f.sb.root, "ps-count"),
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+        PEER_PID_FILE: peerPidFile,
+        TPS_LAUNCH_TIMEOUT_MS: "20000",
+      }),
+    });
+    let text = "";
+    launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    let peerPid: number | undefined;
+    try {
+      expect(
+        await waitUntil(
+          () => /released under nono session \S+ \(child pid \d+\)/.test(text) && existsSync(peerPidFile),
+          20_000,
+        ),
+        text,
+      ).toBe(true);
+      peerPid = pidFromFile(peerPidFile);
+      expect(peerPid).toBeDefined();
+      const exit = await waitExit(launcher);
+      expect(exit.signal, text).toBeNull();
+      expect(exit.code, text).toBe(REFUSAL_EXIT_CODE);
+      expect(text).toContain(`may still be running; kept the worktree ${f.sb.ws}`);
+      // The child outlived its supervisor and was not signalled.
+      expect(processAlive(peerPid!)).toBe(true);
+      expect(existsSync(f.sb.ws)).toBe(true);
+      expect(
+        spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout,
+      ).toContain(`worktree ${f.sb.ws}\n`);
+      // The launcher kept its private launch state.
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+    } finally {
+      try { if (peerPid && processAlive(peerPid)) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   }, 30_000);
