@@ -150,8 +150,8 @@ function tokenSource(token: string): string {
  * "dead" — pid gone, or pid alive under a different readable start token from
  * the same source. While the pid is alive, a token from another source, or
  * either token unavailable (the recorded token, or the current one), is
- * "unverifiable": it is kept, never treated as dead. A pid that pidState
- * classifies as "invalid" is "unreadable", like an owner record that cannot be
+ * "unverifiable": it is kept, never treated as dead. A pid that the probe
+ * (default: pidState) classifies as "invalid" is "unreadable", like an owner record that cannot be
  * read.
  */
 function ownerState(
