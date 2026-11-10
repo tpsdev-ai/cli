@@ -1,0 +1,1 @@
+- **A mail lock whose owner exited but was not reaped can be reclaimed on Linux.**
