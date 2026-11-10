@@ -4,6 +4,12 @@ set -euo pipefail
 TEAM_FILE="/workspace/.tps/team.json"
 PIDS_FILE="/workspace/.tps/pids.json"
 
+# SHUTDOWN_GRACE_SECONDS is used in shell arithmetic, which evaluates a
+# variable's value as an expression; accept only an integer from 1 to 300.
+if ! [[ "${SHUTDOWN_GRACE_SECONDS:-10}" =~ ^([1-9]|[1-9][0-9]|[12][0-9][0-9]|300)$ ]]; then
+  echo "Invalid SHUTDOWN_GRACE_SECONDS: must be an integer from 1 to 300" >&2; exit 1
+fi
+
 case "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" in
   ''|TERM|INT|HUP) ;;
   *) echo "Invalid TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH: $TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" >&2; exit 1 ;;
@@ -201,16 +207,17 @@ write_pids_file() {
   chmod 644 "$PIDS_FILE"
 }
 
-# Signal the tracked children, poll for them against SHUTDOWN_GRACE_SECONDS,
+# Signal the tracked children, poll until the whole-second SECONDS deadline
+# (within the grace plus at most one poll),
 # attempt KILL for every tracked PID still alive, clear the tracked list and
 # only then remove the PID file. `wait` reaps this shell's children only, so neither step
 # proves that every survivor is reaped.
-SHUTDOWN_GRACE_SECONDS=10
+SHUTDOWN_GRACE_SECONDS="${SHUTDOWN_GRACE_SECONDS:-10}"
 shutdown_in_progress=0
 
 shutdown_children() {
   if (( shutdown_in_progress++ )); then return 0; fi
-  local signal="${1:-TERM}" pid alive waited
+  local signal="${1:-TERM}" pid alive deadline
 
   if [[ ${#AGENT_PIDS[@]} -eq 0 ]]; then
     cleanup_pids_file
@@ -223,8 +230,8 @@ shutdown_children() {
     fi
   done
 
-  waited=0
-  while [[ $waited -lt $((SHUTDOWN_GRACE_SECONDS * 10)) ]]; do
+  deadline=$((SECONDS + SHUTDOWN_GRACE_SECONDS))
+  while [[ $SECONDS -lt $deadline ]]; do
     alive=0
     for pid in "${AGENT_PIDS[@]}"; do
       if kill -0 "$pid" 2>/dev/null; then
@@ -236,7 +243,6 @@ shutdown_children() {
       break
     fi
     sleep 0.1
-    waited=$((waited + 1))
   done
 
   for pid in "${AGENT_PIDS[@]}"; do

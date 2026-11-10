@@ -31,8 +31,8 @@
 #      after a child's background launch and before its PID is tracked, so the
 #      window is exercised on every run; the child is stopped and the PID file
 #      removed.
-#   9. cli#357 r4: a child that ignores TERM is KILLed after the ~10 s TERM grace
-#      (counted sleeps) and the supervisor exits; the EXIT trap sends no second TERM.
+#   9. cli#357 r4: a child that ignores TERM reaches the KILL attempt at the
+#      grace deadline; the EXIT trap sends no second TERM.
 #
 # Part C (behavioural, requires root, jq, writable /workspace, and the S4-pinned nono):
 #   1. POSITIVE with XDG_CONFIG_HOME pointed at an EMPTY dir (cli#352 r3): the
@@ -54,9 +54,7 @@
 #      the same setup that launches in C.1 refuses, because nono can only report
 #      "Profile not found" (the wrong reason) for a bare name against an empty
 #      config dir. A Dockerfile that forgets the COPY turns these red.
-#   5. cli#357 r4: the session the supervisor launched is queried after launch; a
-#      handled signal while it runs ends that session and its child, and removes
-#      the PID file.
+#   5. cli#357 r4: query the launched session after a handled signal.
 #
 #   docker run --rm -v "$PWD":/repo -w /repo --entrypoint bash <image> \
 #     scripts/test-tps-office-supervisor.sh
@@ -100,12 +98,15 @@ session_gone_in() { # <ps-output-file> <ps-status> <id> <name>
   local output="$1" status="$2" id="$3" name="$4"
   [ "$status" -eq 0 ] || return 1
   [ -n "$id" ] || [ -n "$name" ] || return 1
+  # nono bc1406e9, docs/cli/features/session-lifecycle.mdx: running, paused, exited.
   jq -e -s --arg id "$id" --arg name "$name" \
     'length == 1 and (.[0] | type == "array" and all(.[];
-      type == "object" and (.status | type == "string") and
-      (.status != "running" or
-        (((.session_id | type == "string" and length > 0) or (.name | type == "string" and length > 0)) and
-         ($id == "" or .session_id != $id) and ($name == "" or .name != $name)))))' \
+      type == "object" and
+      (.status == "running" or .status == "paused" or .status == "exited") and
+      (.session_id | type == "string" and length > 0) and
+      (.name == null or (.name | type == "string")) and
+      (.status == "exited" or
+        (($id == "" or .session_id != $id) and ($name == "" or .name != $name)))))' \
     "$output" >/dev/null 2>&1
 }
 
@@ -125,9 +126,16 @@ check_session_gone_fixture "a row without status does not confirm a stop" '[{}]'
 check_session_gone_fixture "a running row without identity does not confirm a stop" '[{"status":"running"}]' 0 no
 check_session_gone_fixture "a non-object row does not confirm a stop" '[1]' 0 no
 check_session_gone_fixture "a non-string status does not confirm a stop" '[{"status":5}]' 0 no
+check_session_gone_fixture "an unknown status does not confirm a stop" '[{"status":"runnning","session_id":"fixture-id"}]' 0 no
+check_session_gone_fixture "an unknown status on another session does not confirm a stop" '[{"status":"zombie","session_id":"other-id"}]' 0 no
+check_session_gone_fixture "a matching paused session does not confirm a stop" '[{"status":"paused","session_id":"fixture-id"}]' 0 no
+check_session_gone_fixture "a paused session matching by name does not confirm a stop" '[{"status":"paused","session_id":"other-id","name":"fixture-name"}]' 0 no
+check_session_gone_fixture "a numeric session id does not confirm a stop" '[{"status":"running","session_id":7,"name":"other"}]' 0 no
+check_session_gone_fixture "a numeric name does not confirm a stop" '[{"status":"exited","session_id":"other-id","name":7}]' 0 no
+check_session_gone_fixture "an exited row without session id does not confirm a stop" '[{"status":"exited"}]' 0 no
 check_session_gone_fixture "successful empty ps array confirms a stop" '[]' 0 yes
-check_session_gone_fixture "a different identified running session confirms a stop" '[{"status":"running","name":"other"}]' 0 yes
-check_session_gone_fixture "a stopped session row confirms a stop" '[{"status":"stopped"}]' 0 yes
+check_session_gone_fixture "a different identified running session confirms a stop" '[{"status":"running","session_id":"other-id","name":"other"}]' 0 yes
+check_session_gone_fixture "an exited session row confirms a stop" '[{"status":"exited","session_id":"fixture-id"}]' 0 yes
 
 if [ "${TPS_TEST_NONROOT_GATE_FIXTURE:-}" != 1 ]; then
   if [ "$(id -u)" -eq 0 ]; then
@@ -154,10 +162,24 @@ for hook_value in BOGUS KILL; do
     bad "unlisted launch hook $hook_value (status=$hook_status output=$hook_output)"
   fi
 done
+for grace_value in 0 301 abc '1+' "a[\$(touch '$hook_fixture/ran')]"; do
+  grace_output="$(SHUTDOWN_GRACE_SECONDS="$grace_value" bash "$hook_fixture/startup.sh" 2>&1)"; grace_status=$?
+  if [ "$grace_status" -eq 1 ] && [[ "$grace_output" == *"Invalid SHUTDOWN_GRACE_SECONDS"* ]] && [ ! -e "$hook_fixture/launched" ] && [ ! -e "$hook_fixture/ran" ]; then
+    ok "SHUTDOWN_GRACE_SECONDS=$grace_value refuses before launch"
+  else
+    bad "SHUTDOWN_GRACE_SECONDS=$grace_value (status=$grace_status output=$grace_output)"
+  fi
+done
+grace_output="$(SHUTDOWN_GRACE_SECONDS=300 bash "$hook_fixture/startup.sh" 2>&1)"; grace_status=$?
+if [ "$grace_status" -eq 0 ] && [ -e "$hook_fixture/launched" ]; then
+  ok "SHUTDOWN_GRACE_SECONDS=300 is accepted"
+else
+  bad "SHUTDOWN_GRACE_SECONDS=300 (status=$grace_status output=$grace_output)"
+fi
 rm -rf "$hook_fixture"
 
 shutdown_fixture="$(mktemp -d)"
-sed -n '/^SHUTDOWN_GRACE_SECONDS=10$/,/^# cli#357 r4 —/p' "$sup" | sed '$d' >"$shutdown_fixture/functions.sh"
+sed -n '/^SHUTDOWN_GRACE_SECONDS=/,/^# cli#357 r4 —/p' "$sup" | sed '$d' >"$shutdown_fixture/functions.sh"
 sed -n '/^on_signal() {/,/^}/p' "$sup" >>"$shutdown_fixture/functions.sh"
 cat >"$shutdown_fixture/child.sh" <<'CHILD'
 #!/usr/bin/env bash
@@ -175,7 +197,7 @@ AGENT_PIDS=()
 defer_signals=0
 pending_signal=""
 source "$SHUTDOWN_FIXTURE/functions.sh"
-sleep() { if [ "$1" = 0.1 ]; then echo tick >>"$SHUTDOWN_FIXTURE/ticks"; fi; command sleep "$@"; }
+sleep() { if [ "$1" = 0.1 ]; then echo tick >>"$SHUTDOWN_FIXTURE/ticks"; command sleep 0.4; else command sleep "$@"; fi; }
 SHUTDOWN_GRACE_SECONDS=1
 trap 'on_signal TERM' SIGTERM
 trap 'on_signal HUP' SIGHUP
@@ -194,6 +216,7 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 if [ "$shutdown_ready" -eq 1 ]; then
+  shutdown_started="$(node -p 'Date.now()')"
   kill -TERM "$shutdown_supervisor" 2>/dev/null || true
   first_term=0
   for _ in $(seq 1 100); do
@@ -209,13 +232,14 @@ if [ "$shutdown_ready" -eq 1 ]; then
   done
   if [ "$shutdown_finished" -eq 0 ]; then kill -KILL "$shutdown_supervisor" 2>/dev/null || true; fi
   wait "$shutdown_supervisor" 2>/dev/null; shutdown_status=$?
+  shutdown_elapsed=$(( $(node -p 'Date.now()') - shutdown_started ))
   term_count="$(grep -c '^TERM$' "$shutdown_fixture/terms" 2>/dev/null || true)"
   tick_count="$(grep -c '^tick$' "$shutdown_fixture/ticks" 2>/dev/null || true)"
   child_pid="$(cat "$shutdown_fixture/child-pid")"
-  if [ "$first_term" -eq 1 ] && [ "$shutdown_finished" -eq 1 ] && [ "$shutdown_status" -eq 0 ] && [ "$term_count" -eq 1 ] && [ "$tick_count" -eq 10 ] && ! kill -0 "$child_pid" 2>/dev/null; then
-    ok "second handled signal during grace sends one TERM and still escalates to KILL"
+  if [ "$first_term" -eq 1 ] && [ "$shutdown_finished" -eq 1 ] && [ "$shutdown_status" -eq 0 ] && [ "$term_count" -eq 1 ] && [ "$tick_count" -gt 0 ] && [ "$shutdown_elapsed" -le 3000 ] && ! kill -0 "$child_pid" 2>/dev/null; then
+    ok "second handled signal during grace sends one TERM and reaches KILL within grace plus 2 seconds"
   else
-    bad "shutdown re-entry (first=$first_term finished=$shutdown_finished status=$shutdown_status terms=$term_count ticks=$tick_count child=$child_pid)"
+    bad "shutdown re-entry (first=$first_term finished=$shutdown_finished status=$shutdown_status terms=$term_count ticks=$tick_count elapsed=$shutdown_elapsed child=$child_pid)"
   fi
 else
   kill -KILL "$shutdown_supervisor" 2>/dev/null || true
@@ -769,7 +793,7 @@ SH
   if [ -n "$launched_pid" ] && ! kill -0 "$launched_pid" 2>/dev/null; then ok "first agent process $launched_pid is gone afterwards"; else bad "first agent process '${launched_pid:-unknown}' is still running after the errexit"; fi
   if [ ! -e /workspace/.tps/pids.json ]; then ok "no PID file remains after the errexit"; else bad "the PID file remains after the errexit"; fi
 
-  # (3c) cli#357 r4 — a ~10 s TERM grace (counted sleeps), then a KILL attempt.
+  # (3c) cli#357 r4 — a TERM grace deadline, then a KILL attempt.
   # The child ignores TERM; the supervisor attempts KILL after the grace and
   # exits. It sees exactly one TERM.
   mkshutdown() {
@@ -817,7 +841,7 @@ SH
   fi
   elapsed=$((t1 - t0))
   if [ "$rc3c" -eq 0 ]; then ok "TERM grace then KILL: the supervisor exits 0 after the grace"; else bad "TERM grace then KILL: the supervisor exited $rc3c"; fi
-  if [ "$elapsed" -ge 10 ] && [ "$elapsed" -le 20 ]; then ok "TERM grace then KILL: the KILL attempt followed the ~10 s grace ($elapsed s)"; else bad "TERM grace then KILL: the elapsed time was not the ~10 s grace ($elapsed s)"; fi
+  if [ "$elapsed" -ge 9 ] && [ "$elapsed" -le 12 ]; then ok "TERM grace then KILL: the KILL attempt reached the deadline ($elapsed s)"; else bad "TERM grace then KILL: the elapsed time missed the deadline ($elapsed s)"; fi
   shut_pid="$(sed -n 's/^started //p' "$SHUTDOWN_MARKER" | head -n1)"
   if [ -n "$shut_pid" ] && ! kill -0 "$shut_pid" 2>/dev/null; then ok "TERM grace then KILL: the TERM-ignoring child $shut_pid is gone"; else bad "TERM grace then KILL: the child '${shut_pid:-unknown}' survived"; fi
   terms="$(grep -c '^term$' "$SHUTDOWN_MARKER" || true)"
@@ -1169,7 +1193,7 @@ SH
     fi
     if [ -n "$sess5_id" ] || [ -n "$sess5_name" ]; then
       if session_gone_in "$real/ps5.after.json" "$ps5_status" "$sess5_id" "$sess5_name"; then
-        ok "real-nono stop: ps exited 0; exactly one JSON array; every row is an object with string status; every running row has non-empty string session_id or name and matches neither recorded id nor name ($sess5_name $sess5_id)"
+        ok "real-nono stop: ps output meets the pinned lifecycle and identity contract ($sess5_name $sess5_id)"
       else
         bad "real-nono stop: nono ps did not confirm the recorded session ($sess5_name ${sess5_id:-none}) gone (status=$ps5_status raw='$(cat "$real/ps5.after.json" 2>/dev/null)')"
       fi
