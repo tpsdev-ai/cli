@@ -70,8 +70,8 @@ jobs:
         run: echo "arch=${PLATFORM#linux/}" >>"$GITHUB_OUTPUT"
 
       # ONE build per leg, to an OCI archive that is never pushed here: the
-      # smoke below and the publish job use these bytes (cli#353). The GHA
-      # cache is written on both publish=false and publish=true runs, scoped
+      # smoke below and the publish job use these bytes (cli#353). A build that
+      # completes writes the GHA cache whether publish is false or true, scoped
       # per platform so the legs never share layers.
       - name: Build ${{ matrix.platform }} to an OCI archive
         id: build
@@ -200,8 +200,9 @@ jobs:
       contents: read
       packages: write # the "Log in to ghcr.io" and "Push the index to GHCR" steps
     services:
-      # The handoff target: the archives are copied here on every run, so the
-      # index and its digest equality are proven even when nothing is published.
+      # The handoff target: a publish job that reaches the copy step copies the
+      # archives here, so the index and its digests are checked even when
+      # nothing is published.
       registry:
         image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
         ports:

@@ -355,10 +355,11 @@ describe("docker-publish-index.sh assemble and verify", () => {
     expect(runScript(c, ["copy", c.archives, c.digests]).status).toBe(0);
     const amd64 = recorded(c, "linux/amd64");
     writeFileSync(c.digests, `${amd64.join(" ")}\n`);
-    seedIndex(c, [{ platform: "linux/amd64", digest: amd64[3] }]);
 
     const r = runScript(c, ["verify", c.digests]);
     expect(r.status).toBe(1);
+    // No index was seeded: an inspect before the set check would fail with the stub's "no tag" error instead.
+    expect(r.stderr).not.toContain("stub skopeo");
     expect(r.stderr).toContain("missing linux/arm64");
   });
 
@@ -371,14 +372,11 @@ describe("docker-publish-index.sh assemble and verify", () => {
     const arm64 = recorded(c, "linux/arm64");
     const extra = `sha256:${sha256("riscv64")}`;
     writeFileSync(c.digests, `${readFileSync(c.digests, "utf8")}linux/riscv64 riscv64 ${extra} ${extra}\n`);
-    seedIndex(c, [
-      { platform: "linux/amd64", digest: amd64[3] },
-      { platform: "linux/arm64", digest: arm64[3] },
-      { platform: "linux/riscv64", digest: extra },
-    ]);
 
     const r = runScript(c, ["verify", c.digests]);
     expect(r.status).toBe(1);
+    // No index was seeded: an inspect before the set check would fail with the stub's "no tag" error instead.
+    expect(r.stderr).not.toContain("stub skopeo");
     expect(r.stderr).toContain("extra linux/riscv64");
   });
 
@@ -390,13 +388,11 @@ describe("docker-publish-index.sh assemble and verify", () => {
     const amd64 = recorded(c, "linux/amd64");
     const arm64 = recorded(c, "linux/arm64");
     writeFileSync(c.digests, `${readFileSync(c.digests, "utf8")}${amd64.join(" ")}\n`);
-    seedIndex(c, [
-      { platform: "linux/amd64", digest: amd64[3] },
-      { platform: "linux/arm64", digest: arm64[3] },
-    ]);
 
     const r = runScript(c, ["verify", c.digests]);
     expect(r.status).toBe(1);
+    // No index was seeded: an inspect before the set check would fail with the stub's "no tag" error instead.
+    expect(r.stderr).not.toContain("stub skopeo");
     expect(r.stderr).toContain("duplicate linux/amd64");
   });
 
@@ -467,7 +463,7 @@ describe("docker-publish-index.sh assemble and verify", () => {
 });
 
 describe("docker-publish-index.sh push", () => {
-  test("rehearsal and GHCR copies preserve the local index digest", () => {
+  test("push compares the destination digest with the local index digest on the stubbed rehearsal and GHCR branches", () => {
     const c = newCase();
     makeArchive(c, "linux/amd64", true);
     makeArchive(c, "linux/arm64", false);
