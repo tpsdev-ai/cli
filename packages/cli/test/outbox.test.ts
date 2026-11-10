@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
+import { queueOutboxMessage, drainOutbox, drainOutboxWithStats, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OutboxYoungRetryScheduler, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS, OUTBOX_PARTIAL_GRACE_MS } from "../src/utils/outbox.js";
 import * as mailLock from "../src/utils/mail-lock.js";
 
 afterEach(() => {
@@ -69,13 +69,94 @@ describe("outbox", () => {
     const newDir = join(root, ".tps", "outbox", "new");
     const sentDir = join(root, ".tps", "outbox", "sent");
     queueOutboxMessage("host", "good", "austin");
-    writeFileSync(join(newDir, "2026-05-16-corrupt.json"), "", "utf-8");
-    const rows = drainOutbox();
-    expect(rows.length).toBe(1);
-    expect(rows[0]?.body).toBe("good");
-    expect(readdirSync(newDir).length).toBe(0);
-    // Bad file lands in sent/ with a .malformed- prefix for forensics
-    expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
+    const corrupt = join(newDir, "2026-05-16-corrupt.json");
+    writeFileSync(corrupt, "", "utf-8");
+    const past = new Date(Date.now() - 10_000);
+    utimesSync(corrupt, past, past);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const rows = drainOutbox();
+      expect(rows.length).toBe(1);
+      expect(rows[0]?.body).toBe("good");
+      expect(readdirSync(newDir).length).toBe(0);
+      // Bad file lands in sent/ with a .malformed- prefix for forensics
+      expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
+      const logs = errors.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(logs).toMatch(/failed to parse 2026-05-16-corrupt\.json \(age \d+ms\): quarantining/);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test("a young empty file is skipped, then returned once after it is complete and never quarantined", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    const sentDir = join(root, ".tps", "outbox", "sent");
+    const name = "2026-05-16-partial.json";
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(join(newDir, name), "", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(drainOutbox()).toEqual([]);
+      expect(existsSync(join(newDir, name))).toBe(true);
+      expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
+
+      writeFileSync(
+        join(newDir, name),
+        JSON.stringify({ id: "partial-1", to: "host", from: "agent", body: "complete", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+      expect(drainOutbox().map((m) => m.id)).toEqual(["partial-1"]);
+      expect(drainOutbox()).toEqual([]);
+      expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
+      expect(existsSync(join(sentDir, name))).toBe(true);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test("a valid file is returned on the first pass in both archive modes", () => {
+    queueOutboxMessage("host", "archived", "agent");
+    expect(drainOutbox(true).map((m) => m.body)).toEqual(["archived"]);
+    queueOutboxMessage("host", "kept", "agent");
+    expect(drainOutbox(false).map((m) => m.body)).toEqual(["kept"]);
+  });
+
+  test("a pass that skips a young file schedules one re-run and no second timer while it is pending", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(join(newDir, "young.json"), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    const scheduler = new OutboxYoungRetryScheduler(
+      (fn, ms) => {
+        timers.push({ fn, ms });
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      () => {},
+    );
+    try {
+      let runs = 0;
+      const first = drainOutboxWithStats(false);
+      expect(first.skippedYoung).toBe(1);
+      scheduler.observe(first.skippedYoung, () => { runs += 1; });
+      expect(timers).toHaveLength(1);
+      expect(timers[0]!.ms).toBe(OUTBOX_PARTIAL_GRACE_MS);
+
+      const second = drainOutboxWithStats(false);
+      expect(second.skippedYoung).toBe(1);
+      scheduler.observe(second.skippedYoung, () => { runs += 1; });
+      expect(timers).toHaveLength(1);
+
+      timers[0]!.fn();
+      expect(runs).toBe(1);
+      expect(scheduler.pending).toBe(false);
+
+      scheduler.observe(1, () => { runs += 1; });
+      expect(timers).toHaveLength(2);
+    } finally {
+      scheduler.cancel();
+      errors.mockRestore();
+    }
   });
 
   test("drainOutbox leaves a source it cannot read in place", () => {
