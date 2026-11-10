@@ -6,14 +6,18 @@ PIDS_FILE="/workspace/.tps/pids.json"
 
 # SHUTDOWN_GRACE_SECONDS is used in shell arithmetic, which evaluates a
 # variable's value as an expression; accept only an integer from 1 to 300.
-if ! [[ "${SHUTDOWN_GRACE_SECONDS:-10}" =~ ^([1-9]|[1-9][0-9]|[12][0-9][0-9]|300)$ ]]; then
-  echo "Invalid SHUTDOWN_GRACE_SECONDS: must be an integer from 1 to 300" >&2; exit 1
-fi
-
-case "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" in
-  ''|TERM|INT|HUP) ;;
-  *) echo "Invalid TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH: $TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" >&2; exit 1 ;;
-esac
+# The secrets loader can replace either value, so this runs at startup and
+# again after the secrets are loaded.
+validate_control_values() {
+  if ! [[ "${SHUTDOWN_GRACE_SECONDS:-10}" =~ ^([1-9]|[1-9][0-9]|[12][0-9][0-9]|300)$ ]]; then
+    echo "Invalid SHUTDOWN_GRACE_SECONDS: must be an integer from 1 to 300" >&2; exit 1
+  fi
+  case "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" in
+    ''|TERM|INT|HUP) ;;
+    *) echo "Invalid TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH: $TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" >&2; exit 1 ;;
+  esac
+}
+validate_control_values
 
 # cli#352 r — supervisor-path parity with cli#351 (S1b).
 #
@@ -123,6 +127,9 @@ fi
 # Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
 SECRETS_DIR="/run/secrets"
 SECRETS_TIMEOUT=30
+# A secret file named like one of these would replace it when exported;
+# readonly makes that export fail.
+readonly TEAM_FILE PIDS_FILE STATE_ROOT SBOX_SYSTEM_READ_FILES AGENT_UID_BASE AGENT_ID_SCAN_MAX NONO_PROFILE SECRETS_DIR
 elapsed=0
 while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $((SECRETS_TIMEOUT * 2)) ]]; do
   sleep 0.5
@@ -141,11 +148,13 @@ if [[ -d "$SECRETS_DIR" ]]; then
     [[ -f "$secret_file" ]] || continue
     fname=$(basename "$secret_file")
     [[ "$fname" == ".ready" ]] && continue
-    export "$fname"="$(cat "$secret_file")"
+    secret_value="$(cat "$secret_file")"
     rm -f "$secret_file"
+    export "$fname"="$secret_value"
   done
   rm -f "$SECRETS_DIR/.ready"
 fi
+validate_control_values
 
 declare -a AGENT_IDS=()
 declare -a AGENT_PIDS=()

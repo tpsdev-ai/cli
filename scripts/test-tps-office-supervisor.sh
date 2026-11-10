@@ -152,7 +152,7 @@ fi
 rm -f "$session_fixture"
 
 hook_fixture="$(mktemp -d)"
-sed -n '1,/^esac$/p' "$sup" >"$hook_fixture/startup.sh"
+sed -n '1,/^validate_control_values$/p' "$sup" >"$hook_fixture/startup.sh"
 printf 'printf launched >>"%s"\n' "$hook_fixture/launched" >>"$hook_fixture/startup.sh"
 for hook_value in BOGUS KILL; do
   hook_output="$(TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH="$hook_value" bash "$hook_fixture/startup.sh" 2>&1)"; hook_status=$?
@@ -177,6 +177,46 @@ else
   bad "SHUTDOWN_GRACE_SECONDS=300 (status=$grace_status output=$grace_output)"
 fi
 rm -rf "$hook_fixture"
+
+# The same values arriving as files through the real secrets loader. The
+# fixture is the supervisor's own lines from the top through the post-load
+# validation; only the secrets directory is pointed at a scratch directory by
+# rewriting its assignment here (the supervisor has no override for it).
+secret_fixture="$(mktemp -d)"
+{
+  sed -n '1,/^validate_control_values$/p' "$sup"
+  sed -n '/^SECRETS_DIR=/,/^validate_control_values$/p' "$sup" | sed "s|^SECRETS_DIR=.*|SECRETS_DIR=\"$secret_fixture/secrets\"|"
+  printf 'printf launched >>"%s"\n' "$secret_fixture/launched"
+} >"$secret_fixture/startup.sh"
+run_secret_fixture() { # <file name> <file content>; sets secret_status, secret_output
+  rm -rf "$secret_fixture/secrets" "$secret_fixture/launched" "$secret_fixture/ran"
+  mkdir "$secret_fixture/secrets"
+  printf '%s' "$2" >"$secret_fixture/secrets/$1"
+  : >"$secret_fixture/secrets/.ready"
+  secret_output="$(bash "$secret_fixture/startup.sh" 2>&1)"; secret_status=$?
+}
+for secret_case in 'SHUTDOWN_GRACE_SECONDS|1+' 'SHUTDOWN_GRACE_SECONDS|a[$(touch '"$secret_fixture"'/ran)]' 'SHUTDOWN_GRACE_SECONDS|0' 'TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH|KILL'; do
+  secret_name="${secret_case%%|*}"; secret_content="${secret_case#*|}"
+  run_secret_fixture "$secret_name" "$secret_content"
+  if [ "$secret_status" -eq 1 ] && [[ "$secret_output" == *"Invalid $secret_name"* ]] && [ ! -e "$secret_fixture/launched" ] && [ ! -e "$secret_fixture/ran" ]; then
+    ok "secret file $secret_name=$secret_content refuses before launch"
+  else
+    bad "secret file $secret_name=$secret_content (status=$secret_status output=$secret_output)"
+  fi
+done
+run_secret_fixture SHUTDOWN_GRACE_SECONDS 5
+if [ "$secret_status" -eq 0 ] && [ -e "$secret_fixture/launched" ]; then
+  ok "secret file SHUTDOWN_GRACE_SECONDS=5 is accepted"
+else
+  bad "secret file SHUTDOWN_GRACE_SECONDS=5 (status=$secret_status output=$secret_output)"
+fi
+run_secret_fixture PIDS_FILE /nonexistent/replaced
+if [ "$secret_status" -ne 0 ] && [ ! -e "$secret_fixture/launched" ]; then
+  ok "secret file named like a supervisor constant is refused before launch"
+else
+  bad "secret file PIDS_FILE (status=$secret_status output=$secret_output)"
+fi
+rm -rf "$secret_fixture"
 
 shutdown_fixture="$(mktemp -d)"
 sed -n '/^SHUTDOWN_GRACE_SECONDS=/,/^# cli#357 r4 —/p' "$sup" | sed '$d' >"$shutdown_fixture/functions.sh"
