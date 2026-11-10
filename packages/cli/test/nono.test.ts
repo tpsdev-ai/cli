@@ -16,7 +16,7 @@ const patchShared = createPatchShared();
  * `tps office` with real nono — they are NOT in this file.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
 import { join } from "node:path";
 import {
   mkdtempSync,
@@ -27,6 +27,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import * as childProcess from "node:child_process";
 import {
   findNono,
   buildNonoArgs,
@@ -72,6 +73,10 @@ afterEach(() => {
   delete process.env.NONO_FAKE_LOG;
   delete process.env.NONO_PROFILES_DIR;
   rmSync(tmpDir, { recursive: true, force: true });
+});
+
+afterEach(() => {
+  mock.restore();
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -292,38 +297,56 @@ describe("runCommandUnderNono()", () => {
   });
 
   test("warns and falls back when nono not on PATH (non-strict)", () => {
-    // Create a tmpdir with a real 'echo' binary symlink but no 'nono'.
-    // On systems where /bin -> /usr/bin, we can't use /bin directly.
+    // Create a tmpdir with real 'echo' and 'which' symlinks but no 'nono'.
     const { mkdtempSync, writeFileSync, symlinkSync, chmodSync } = require("node:fs");
     const { join: pjoin } = require("node:path");
-    // Resolve echo on the real PATH before it is replaced: macOS has /bin/echo but no
+    // Resolve echo and which on the real PATH before it is replaced: macOS has /bin/echo but no
     // /usr/bin/echo, so a hard-coded path left a dangling link and the fallback could not run.
     const echoBin = Bun.which("echo");
     if (!echoBin || !existsSync(echoBin)) {
       throw new Error(`fallback fixture: no echo binary found on the real PATH (resolved: ${echoBin})`);
     }
-    const fakeDir = mkdtempSync(pjoin(require("node:os").tmpdir(), "tps-nono-path-"));
-    // Symlink the real echo into our fake dir
-    symlinkSync(echoBin, pjoin(fakeDir, "echo"));
+    const whichBin = Bun.which("which");
+    if (!whichBin || !existsSync(whichBin)) {
+      throw new Error(`fallback fixture: no which binary found on the real PATH (resolved: ${whichBin})`);
+    }
+
+    // Watch findNono()'s `which` lookup: with a `which` on the fake PATH the test
+    // proves the lookup ran and answered "not found" (exit 1), not that the spawn failed.
+    const realSpawnSync = childProcess.spawnSync;
+    const whichStatuses: Array<number | null> = [];
+    spyOn(childProcess, "spawnSync").mockImplementation(((...args: unknown[]) => {
+      const result = (realSpawnSync as (...spawnArgs: unknown[]) => any)(...args);
+      if (args[0] === "which") whichStatuses.push(result.status);
+      return result;
+    }) as typeof childProcess.spawnSync);
 
     const savedPath = process.env.PATH;
-    process.env.PATH = fakeDir; // has echo, no nono
-
     const originalWarn = console.warn;
     const warnings: string[] = [];
-    patchShared(console, "warn", (...args) => warnings.push(args.join(" ")));
-
+    let fakeDir: string | undefined;
     let exitCode: number;
     try {
+      fakeDir = mkdtempSync(pjoin(require("node:os").tmpdir(), "tps-nono-path-"));
+      // Symlink the real echo and which into our fake dir
+      symlinkSync(echoBin, pjoin(fakeDir, "echo"));
+      symlinkSync(whichBin, pjoin(fakeDir, "which"));
+
+      process.env.PATH = fakeDir; // has echo and which, no nono
+
+      patchShared(console, "warn", (...args) => warnings.push(args.join(" ")));
       exitCode = runCommandUnderNono("tps-hire", {}, ["echo", "fallback"]);
     } finally {
       patchShared(console, "warn", originalWarn);
       process.env.PATH = savedPath; // always restore PATH
-      require("node:fs").rmSync(fakeDir, { recursive: true, force: true });
+      if (fakeDir !== undefined) require("node:fs").rmSync(fakeDir, { recursive: true, force: true });
     }
 
     expect(exitCode!).toBe(0);
     expect(warnings.some((w) => w.includes("nono not found"))).toBe(true);
+    // `which nono` ran in the fake PATH and exited 1 ("not found"), not a failed spawn (null).
+    expect(whichStatuses).toContain(1);
+    expect(whichStatuses).not.toContain(null);
   });
 
   test("returns 1 when nono unavailable in strict mode", () => {
