@@ -2206,6 +2206,22 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     }
   });
 
+  it("follows a quoted literal invocation inside a followed script", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "bash \"scripts/install.sh\"\n",
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), new Set(["package-lock.json"]), root, "workflow-nested");
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/outer.sh");
+      expect(report.followed).toContain("scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a literal interpreter path outside the repository", () => {
     expect(() => probeTree({ "scripts/install.sh": "bash /tmp/gen.sh\n" })).toThrow(
       /unresolved script invocation in scripts\/install\.sh \(line 1\) token \/tmp\/gen\.sh/,
