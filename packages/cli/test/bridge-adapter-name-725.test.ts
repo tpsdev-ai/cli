@@ -31,18 +31,23 @@ function makeTmpDir(): string {
 const PARITY_STATE_WAIT_MS = 10_000;
 const PARITY_TEST_TIMEOUT_MS = 30_000;
 
-/** Wait for the pid record start() writes to be classified `running`, or fail
- *  with how long it waited and the last state it saw instead of bun's timeout. */
-async function waitForRunningPidRecord(name: string, timeoutMs: number): Promise<void> {
+/** Wait for the pid record start() writes at `expectedPath` to be classified
+ *  `running`, or fail with how long it waited and the last state it saw instead
+ *  of bun's timeout. The path is compared exactly, so a legacy record mapping to
+ *  the same adapter name cannot satisfy the wait. */
+async function waitForRunningPidRecord(name: string, expectedPath: string, timeoutMs: number): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastSeen = "no record";
   for (;;) {
     const found = bridgePidFiles(name);
-    lastSeen = found.length === 0 ? "no record" : JSON.stringify(found.map((entry) => entry.state));
-    if (found.length === 1 && found[0]?.state.kind === "running") return;
+    lastSeen = found.length === 0
+      ? "no record"
+      : JSON.stringify(found.map((entry) => ({ path: entry.path, state: entry.state })));
+    const expected = found.find((entry) => entry.path === expectedPath);
+    if (expected?.state.kind === "running") return;
     if (Date.now() >= deadline) {
       throw new Error(
-        `bridge pid record for ${JSON.stringify(name)} did not reach "running" within ${timeoutMs} ms; last state: ${lastSeen}`,
+        `bridge pid record at ${JSON.stringify(expectedPath)} did not reach "running" within ${timeoutMs} ms; last state: ${lastSeen}`,
       );
     }
     await new Promise((resolve) => setTimeout(resolve, 25));
@@ -166,8 +171,8 @@ describe("bridge adapter-name grammar (cli#725)", () => {
       const core = new BridgeCore(adapter, { defaultAgentId: "default-agent", mailDir }, () => {});
       await core.start();
       try {
-        await waitForRunningPidRecord(name, PARITY_STATE_WAIT_MS);
         const expectedPath = join(testHome, ".tps", "run", `bridge-${name}.pid`);
+        await waitForRunningPidRecord(name, expectedPath, PARITY_STATE_WAIT_MS);
         expect(existsSync(expectedPath)).toBe(true);
 
         const byAdapter = bridgePidFiles(name);
@@ -197,10 +202,12 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     const core = new BridgeCore(new RenamingAdapter(), { defaultAgentId: "default-agent", mailDir }, () => {});
     await core.start();
     const runDir = join(testHome, ".tps", "run");
+    const expectedPath = join(runDir, "bridge-openclaw.pid");
     try {
+      await waitForRunningPidRecord("openclaw", expectedPath, PARITY_STATE_WAIT_MS);
       expect(readdirSync(runDir)).toEqual(["bridge-openclaw.pid"]);
       const found = bridgePidFiles("openclaw");
-      expect(found).toHaveLength(1);
+      expect(found.map((entry) => entry.path)).toEqual([expectedPath]);
       expect(found[0]?.adapter).toBe("openclaw");
       expect(found[0]?.state.kind).toBe("running");
     } finally {
@@ -208,7 +215,7 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     }
     // stop() removes the file it wrote, not one named after the renamed adapter.
     expect(readdirSync(runDir)).toEqual([]);
-  });
+  }, PARITY_TEST_TIMEOUT_MS);
 
   test("a plain-text outbound reply carries the constructed adapter name after the adapter renames itself in start()", async () => {
     class RenamingAdapter implements BridgeAdapter {
@@ -304,7 +311,7 @@ describe("bridge adapter-name grammar (cli#725)", () => {
   });
 
   test("the refusal message escapes every code point outside printable ASCII", () => {
-    const codePoints = [0x009b, 0x202e, 0x2028, 0x061c, 0x200b, 0x200d, 0x2060, 0x206a, 0xfeff, 0x180e, 0x00ad, 0xfffe, 0xffff, 0x1f600];
+    const codePoints = [0x007f, 0x009b, 0x202e, 0x2028, 0x061c, 0x200b, 0x200d, 0x2060, 0x206a, 0xfeff, 0x180e, 0x00ad, 0xfdd0, 0xfde0, 0xfdef, 0xfffe, 0xffff, 0x1f600];
     let message = "";
     try {
       assertBridgeAdapterName(`x${String.fromCodePoint(...codePoints)}`);
