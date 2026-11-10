@@ -630,7 +630,7 @@ it.skipIf(!npmAvailable).each(userConfigSources)(
   60_000,
 );
 
-it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "http_proxy"] as const)(
+it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const)(
   "an environment %s is refused with zero registry requests",
   async (name) => {
     const root = mkdtempSync(join(tmpdir(), "tracked-lock-proxy-env-"));
@@ -697,6 +697,41 @@ it.skipIf(!npmAvailable)("NODE_EXTRA_CA_CERTS set in the environment is refused 
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+for (const { name, value, title } of [
+  { name: "NODE_OPTIONS", value: "--max-old-space-size=128", title: "a non-empty NODE_OPTIONS" },
+  { name: "NODE_TLS_REJECT_UNAUTHORIZED", value: "0", title: "NODE_TLS_REJECT_UNAUTHORIZED" },
+] as const) {
+  it.skipIf(!npmAvailable)(`${title} in the environment is refused with zero registry requests`, async () => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-node-env-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+        [name]: value,
+      });
+      expect(result.status, result.stderr).toBe(3);
+      expect(result.stderr).toContain(JSON.stringify(name));
+      expect(result.stderr).toContain("unset them for this install");
+      expect(registry.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+}
 
 it.skipIf(!npmAvailable)("a lock entry under the registry without integrity is refused with zero registry requests", async () => {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-integrity-"));

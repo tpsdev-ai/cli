@@ -13,16 +13,18 @@
 #     version check out of the registry request log.
 #   * REFUSALS, before any fetch: an .npmrc in the fixture or install directory;
 #     an npm_config_* environment variable outside the allowlist in
-#     check_npm_config_env (case-insensitive, so a later npm option is refused
-#     by default; the allowlist holds names that cannot change the fetch, and
-#     the user config path, which the --userconfig flag above outranks); the
-#     unprefixed proxy variables http_proxy, https_proxy and all_proxy
-#     (case-insensitive, presence test) and NODE_EXTRA_CA_CERTS; and a lock
-#     entry that would install (not root, link:true, inBundle, file: or
-#     workspace:) whose resolved URL is missing or is not under R, or that
-#     has no integrity. no_proxy is left alone: it only narrows proxying, so
-#     it does nothing once the proxy variables are refused, and some runners
-#     set it.
+#     check_npm_config_env (a default-deny allowlist, so an npm option that is
+#     not on it is refused; matching is case-insensitive because npm reads
+#     environment keys case-insensitively; the allowlist holds names that
+#     cannot change the fetch, and the user config path, which the --userconfig
+#     flag above outranks); the unprefixed proxy variables http_proxy,
+#     https_proxy and all_proxy (case-insensitive, presence test),
+#     NODE_EXTRA_CA_CERTS and NODE_TLS_REJECT_UNAUTHORIZED (presence test) and
+#     a non-empty NODE_OPTIONS; and a lock entry that would install (not root,
+#     link:true, inBundle, file: or workspace:) whose resolved URL is missing
+#     or is not under R, or that has no integrity. no_proxy is left alone: it
+#     only narrows proxying, so it does nothing once the proxy variables are
+#     refused, and some runners set it.
 set -euo pipefail
 
 if [ "$#" -lt 4 ] || [ "$1" != --via ]; then
@@ -105,10 +107,19 @@ if (refused.length > 0) {
   console.error(`npm-ci-tracked-lock: unset them; this helper installs only from ${registry}`);
   process.exit(3);
 }
-const routing = new Set(["http_proxy", "https_proxy", "all_proxy", "node_extra_ca_certs"]);
-const proxied = names.filter((name) => routing.has(name.toLowerCase())).sort();
-if (proxied.length > 0) {
-  console.error(`npm-ci-tracked-lock: refusing environment variables that can redirect the fetch or replace its trust anchor: ${proxied.map((name) => JSON.stringify(name)).join(", ")}`);
+const routing = new Set([
+  "http_proxy", "https_proxy", "all_proxy", "node_extra_ca_certs", "node_tls_reject_unauthorized",
+]);
+// NODE_OPTIONS can load code into npm's Node process (--require) or switch its
+// TLS trust (--use-openssl-ca); it is refused when non-empty. The names in
+// `routing` are refused on presence.
+const routingRefused = names
+  .filter((name) => name.toLowerCase() === "node_options"
+    ? process.env[name] !== ""
+    : routing.has(name.toLowerCase()))
+  .sort();
+if (routingRefused.length > 0) {
+  console.error(`npm-ci-tracked-lock: refusing environment variables that can redirect the fetch, load code into npm's process or change its trust anchors: ${routingRefused.map((name) => JSON.stringify(name)).join(", ")}`);
   console.error("npm-ci-tracked-lock: unset them for this install");
   process.exit(3);
 }
