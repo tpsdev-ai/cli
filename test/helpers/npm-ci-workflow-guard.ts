@@ -1163,7 +1163,7 @@ function recordClauseInvocation(
   if (!word.token.quoted && (command === "source" || command === ".")) {
     const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
     if (argument === undefined) pushUnresolved(ctx, rel, line, command);
-    else recordInvocation(ctx, rel, resolveScriptArgument(ctx, argument, directory, at, scriptDir, directoryUnresolved, bindings), line, directory);
+    else recordInvocation(ctx, rel, resolveScriptArgument(ctx, argument, directory, at, scriptDir, directoryUnresolved, bindings), line, directory, directoryUnresolved);
     return;
   }
   if (!word.token.quoted && command === "eval") {
@@ -1216,7 +1216,7 @@ function recordClauseInvocation(
         if (script === undefined) return;
         const value = stripOuterQuotes(script.text);
         if (!SCRIPT_EXTENSION.test(value) && !value.includes("/") && !value.startsWith(".")) return;
-        recordInvocation(ctx, rel, resolveScriptArgument(ctx, script, directory, at, scriptDir, directoryUnresolved, bindings), line, directory);
+        recordInvocation(ctx, rel, resolveScriptArgument(ctx, script, directory, at, scriptDir, directoryUnresolved, bindings), line, directory, directoryUnresolved);
         return;
       }
     }
@@ -1225,20 +1225,25 @@ function recordClauseInvocation(
       pushUnresolved(ctx, rel, line, "stdin");
       return;
     }
-    recordInvocation(ctx, rel, resolveScriptArgument(ctx, argument, directory, at, scriptDir, directoryUnresolved, bindings), line, directory);
+    recordInvocation(ctx, rel, resolveScriptArgument(ctx, argument, directory, at, scriptDir, directoryUnresolved, bindings), line, directory, directoryUnresolved);
     return;
   }
   if (SCRIPT_EXTENSION.test(command)) {
-    recordInvocation(ctx, rel, resolveScriptArgument(ctx, word.token, directory, at, scriptDir, directoryUnresolved, bindings), line, directory);
+    recordInvocation(ctx, rel, resolveScriptArgument(ctx, word.token, directory, at, scriptDir, directoryUnresolved, bindings), line, directory, directoryUnresolved);
   }
 }
 
-function recordInvocation(ctx: TreeContext, rel: string, invocation: Invocation, line: number, cwd: string) {
+/**
+ * Follow one invocation. Unknown propagates: a child followed from a
+ * non-literal directory change starts unknown, so its own installs stay unbound
+ * until a literal absolute-in-repository or script-directory `cd` re-anchors it.
+ */
+function recordInvocation(ctx: TreeContext, rel: string, invocation: Invocation, line: number, cwd: string, cwdUnresolved: boolean) {
   if ("dynamic" in invocation) {
     pushUnresolved(ctx, rel, line, invocation.dynamic);
     return;
   }
-  followScript(ctx, invocation.rel, cwd, "assertNpmCiWorkflowTree", [invocation.rel]);
+  followScript(ctx, invocation.rel, cwd, "assertNpmCiWorkflowTree", [invocation.rel], cwdUnresolved);
 }
 
 function recordLineInvocations(
@@ -1340,14 +1345,14 @@ function addFollowed(ctx: TreeContext, rel: string) {
   ctx.scriptEnv.set(rel, env);
 }
 
-function followScript(ctx: TreeContext, rel: string, cwd: string, label: string, chain: string[]) {
+function followScript(ctx: TreeContext, rel: string, cwd: string, label: string, chain: string[], cwdUnresolved = false) {
   if (ctx.visiting.has(rel)) return;
   if (!scriptExists(ctx, rel)) return;
   addFollowed(ctx, rel);
   const content = readFileSync(join(ctx.root, rel), "utf8");
   ctx.visiting.add(rel);
   try {
-    scanScript(ctx, rel, content, cwd, label, [...chain, rel]);
+    scanScript(ctx, rel, content, cwd, label, [...chain, rel], cwdUnresolved);
   } finally {
     ctx.visiting.delete(rel);
   }
@@ -1538,7 +1543,7 @@ function embeddedInvocations(clause: Clause): Invocation[] {
   return found;
 }
 
-function followEmbeddedInvocations(ctx: TreeContext, rel: string, clause: Clause, directory: string, number: number, bindings?: Map<string, VariableBinding[]>) {
+function followEmbeddedInvocations(ctx: TreeContext, rel: string, clause: Clause, directory: string, directoryUnresolved: boolean, number: number, bindings?: Map<string, VariableBinding[]>) {
   const scriptDir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
   for (const invocation of embeddedInvocations(clause)) {
     if ("dynamic" in invocation) {
@@ -1554,7 +1559,7 @@ function followEmbeddedInvocations(ctx: TreeContext, rel: string, clause: Clause
                 ? repoRelativePath(ctx, joinVariableSuffix(resolved.path, suffix))
                 : resolveRepoDir(directory, joinVariableSuffix(resolved.path, suffix), "embedded invocation");
             if (relPath !== null && scriptExists(ctx, relPath)) {
-              followScript(ctx, relPath, directory, "assertNpmCiWorkflowTree", [relPath]);
+              followScript(ctx, relPath, directory, "assertNpmCiWorkflowTree", [relPath], directoryUnresolved);
               continue;
             }
           }
@@ -1563,19 +1568,19 @@ function followEmbeddedInvocations(ctx: TreeContext, rel: string, clause: Clause
         continue;
       }
       const resolved = resolveDynamicSuffix(ctx, invocation.dynamic, scriptDir === "" ? [directory] : [scriptDir, directory]);
-      if (resolved !== null) followScript(ctx, resolved, directory, "assertNpmCiWorkflowTree", [resolved]);
+      if (resolved !== null) followScript(ctx, resolved, directory, "assertNpmCiWorkflowTree", [resolved], directoryUnresolved);
       else pushUnresolved(ctx, rel, number, invocation.dynamic);
       continue;
     }
     const resolved = resolveRepoDir(directory, invocation.rel, "embedded invocation");
     const fromRoot = resolved === invocation.rel ? null : resolveRepoDir("", invocation.rel, "embedded invocation");
-    if (scriptExists(ctx, resolved)) followScript(ctx, resolved, directory, "assertNpmCiWorkflowTree", [resolved]);
-    else if (fromRoot !== null && scriptExists(ctx, fromRoot)) followScript(ctx, fromRoot, directory, "assertNpmCiWorkflowTree", [fromRoot]);
+    if (scriptExists(ctx, resolved)) followScript(ctx, resolved, directory, "assertNpmCiWorkflowTree", [resolved], directoryUnresolved);
+    else if (fromRoot !== null && scriptExists(ctx, fromRoot)) followScript(ctx, fromRoot, directory, "assertNpmCiWorkflowTree", [fromRoot], directoryUnresolved);
     else pushUnresolved(ctx, rel, number, invocation.rel);
   }
 }
 
-function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[]) {
+function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[], cwdUnresolved = false) {
   const at = `${label}: script ${rel} (invocation ${chain.join(" -> ")})`;
   // The tracked-lock helper is the approved install implementation: rule 1 does
   // not screen its own lines, but its invocations are still followed under rule 2.
@@ -1583,7 +1588,7 @@ function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: st
   const bindings = collectBindings(content);
   const scriptDir = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "";
   let directory = resolveRepoDir("", cwd, at);
-  let directoryUnresolved = false;
+  let directoryUnresolved = cwdUnresolved;
   let staged = false;
   for (const entry of logicalShellLines(content)) {
     const line = entry.text;
@@ -1661,7 +1666,7 @@ function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: st
       }
       if (!assignmentSubstitution) {
         recordClauseInvocation(ctx, rel, clause, directory, directoryUnresolved, entry.line, lineAt, bindings);
-        followEmbeddedInvocations(ctx, rel, clause, directory, entry.line, bindings);
+        followEmbeddedInvocations(ctx, rel, clause, directory, directoryUnresolved, entry.line, bindings);
       }
     }
     if (!rule1Exempt && !clauseInstall && isInstallLine(line)) {
@@ -1673,12 +1678,17 @@ function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: st
   }
 }
 
-function scanNonShellScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[]) {
+function scanNonShellScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[], cwdUnresolved = false) {
   const at = `${label}: script ${rel} (invocation ${chain.join(" -> ")})`;
   const directory = resolveRepoDir("", cwd, at);
   const text = stripCStyleComments(content);
   for (const entry of physicalLines(text)) {
     for (const invocation of invocationsIn(entry.text)) {
+      // Unknown => refuse: a path in this file resolves against the cwd the
+      // process was started in, which a non-literal directory change cannot name.
+      if (cwdUnresolved) {
+        throw new Error(`${at}, line ${entry.line}: cannot resolve a script invocation after a non-literal directory change: ${entry.text}`);
+      }
       if ("dynamic" in invocation) {
         const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
         if (resolved !== null) followScript(ctx, resolved, directory, label, chain);
@@ -1694,9 +1704,9 @@ function scanNonShellScript(ctx: TreeContext, rel: string, content: string, cwd:
   }
 }
 
-function scanScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[]) {
-  if (isShellScript(rel, content)) scanShellScript(ctx, rel, content, cwd, label, chain);
-  else scanNonShellScript(ctx, rel, content, cwd, label, chain);
+function scanScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[], cwdUnresolved = false) {
+  if (isShellScript(rel, content)) scanShellScript(ctx, rel, content, cwd, label, chain, cwdUnresolved);
+  else scanNonShellScript(ctx, rel, content, cwd, label, chain, cwdUnresolved);
 }
 
 /** Literal and computed repository-script invocations written in one non-shell line. */
@@ -1798,6 +1808,9 @@ function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string)
         else throw new Error(`${label}: invoked script is not a repository file: ${invocation.rel} (physical line ${entry.line})`);
       }
       for (const invocation of embeddedInvocations(clause)) {
+        if (directoryUnresolved) {
+          throw new Error(`${label}: cannot resolve a script invocation after a non-literal directory change: ${entry.text} (physical line ${entry.line})`);
+        }
         if ("dynamic" in invocation) {
           if (reviewedWrapped) continue;
           const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
@@ -1813,15 +1826,52 @@ function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string)
       }
     }
     for (const body of commandSubstitutions(entry.text)) {
-      for (const invocation of invocationsIn(body)) {
+      const invocations = invocationsIn(body);
+      if (invocations.length === 0) continue;
+      if (directoryUnresolved) {
+        throw new Error(`${label}: cannot resolve a script invocation after a non-literal directory change: ${entry.text} (physical line ${entry.line})`);
+      }
+      const base = substitutionDirectory(ctx, body, directory, `${label}: ${entry.text}`);
+      if (base === null) {
+        throw new Error(`${label}: cannot resolve a script invocation in a command substitution that changes directory: ${entry.text} (physical line ${entry.line})`);
+      }
+      for (const invocation of invocations) {
         if ("dynamic" in invocation) {
           const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
-          if (resolved !== null) followScript(ctx, resolved, directory, label, []);
+          if (resolved !== null) followScript(ctx, resolved, base, label, []);
           else throw new Error(`${label}: cannot resolve a dynamic script path to one repository file: ${invocation.dynamic} (physical line ${entry.line})`);
+          continue;
         }
+        const resolved = resolveRepoDir(base, invocation.rel, `${label}: ${entry.text}`);
+        const fromRoot = resolved === invocation.rel ? null : resolveRepoDir("", invocation.rel, `${label}: ${entry.text}`);
+        if (scriptExists(ctx, resolved)) followScript(ctx, resolved, base, label, []);
+        else if (fromRoot !== null && scriptExists(ctx, fromRoot)) followScript(ctx, fromRoot, base, label, []);
+        else throw new Error(`${label}: invoked script is not a repository file: ${invocation.rel} (physical line ${entry.line})`);
       }
     }
   }
+}
+
+/**
+ * The directory a command-substitution body runs in: the enclosing directory
+ * after its own literal `cd` clauses, or null when one cannot be resolved (a
+ * non-literal target, or pushd/popd). Unknown => the caller refuses.
+ */
+function substitutionDirectory(ctx: TreeContext, body: string, directory: string, at: string): string | null {
+  let base = directory;
+  for (const clause of splitClauses(body)) {
+    const word = commandWord(clause.tokens);
+    if (word === null || word.token.quoted) continue;
+    const command = stripOuterQuotes(word.token.text);
+    if (command === "pushd" || command === "popd") return null;
+    if (command !== "cd") continue;
+    const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
+    const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
+    const resolved = resolveCdTarget(ctx, target, base, "", undefined, at);
+    if (resolved === null) return null;
+    base = resolved.path;
+  }
+  return base;
 }
 
 /** Literal invocations in one clause, without pushing unresolved entries (run blocks throw). */
@@ -1917,7 +1967,13 @@ function followAction(ctx: TreeContext, actionPath: string, label: string, inher
       if (step.run === undefined) continue;
       const workdir = step["working-directory"] ?? "";
       const direct = npmCiLockDirs(step.run, workdir, stepLabel);
-      ctx.installs += direct.length;
+      for (const dir of direct) {
+        const lockfile = dir === "" ? "package-lock.json" : `${dir}/package-lock.json`;
+        if (!ctx.tracked.has(lockfile)) {
+          throw new Error(`${stepLabel}: ${lockfile} is not a tracked lockfile the gate reads`);
+        }
+        ctx.installs++;
+      }
       scanRunBlock(ctx, step.run, workdir, stepLabel);
     }
   } finally {

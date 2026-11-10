@@ -4,6 +4,14 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The helper is a literal path so the workflow guard can resolve it. HELPER is
+# refused because every fixture below runs that literal path: a mutation test
+# that sets HELPER would exercise the real helper and could pass. Mutate the
+# helper in place instead.
+if [ -n "${HELPER:-}" ]; then
+  printf 'test-docker-bun-version: HELPER is not an override; edit scripts/docker-bun-version.sh in place and re-run (got: %s)\n' "$HELPER" >&2
+  exit 2
+fi
 helper="$here/docker-bun-version.sh"
 assert="$here/assert-bun-version.sh"
 work="$(mktemp -d)"

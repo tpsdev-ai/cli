@@ -2892,3 +2892,111 @@ describe("the workflow guard refuses what it cannot fully resolve (#820 round 5)
     }
   });
 });
+
+describe("the workflow guard propagates an unknown cwd and scans substitutions (#820 round 6)", () => {
+  it("refuses an install in a child followed from an unknown cwd", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "here=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\nwork=\"$(mktemp -d)\"\ncd \"$work\"\nbash \"$here/install.sh\"\n",
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-child",
+      )).toThrow(/scripts\/install\.sh.*cannot bind an npm install after a non-literal directory change/s);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows a literal invocation inside a command substitution in a run block", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep('out="$(bash scripts/install.sh)"', "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-substitution",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an install in a script run through a command substitution", () => {
+    const root = makeTreeFixture({ "scripts/install.sh": "npm ci\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('out="$(bash scripts/install.sh)"', "."),
+        new Set(),
+        root,
+        "workflow-substitution",
+      )).toThrow(/cannot bind the npm install to a tracked lockfile: package-lock\.json is not a lockfile the gate reads/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a composite action's helper call on an untracked directory", () => {
+    const root = makeTreeFixture({
+      ".github/actions/setup/action.yml": [
+        "name: setup",
+        "runs:",
+        "  using: composite",
+        "  steps:",
+        "    - run: bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked",
+      ].join("\n"),
+      "scripts/npm-ci-tracked-lock.sh": "echo helper\n",
+    });
+    const workflow = "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/setup\n";
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflow, new Set(), root, "workflow-action-helper")).toThrow(
+        /\.github\/actions\/setup.*plugins\/untracked\/package-lock\.json is not a tracked lockfile the gate reads/s,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a wrapped interpreter after an unknown cd in a run block", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('X="$(mktemp -d)"\ncd "$X"\ntimeout 5 bash scripts/install.sh', "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-embedded",
+      )).toThrow(/cannot resolve a script invocation after a non-literal directory change/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves an invocation inside a substitution that changes directory", () => {
+    const root = makeTreeFixture({
+      "install.sh": "echo clean\n",
+      "sub/install.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('out="$(cd sub && bash install.sh)"', "."),
+        new Set(),
+        root,
+        "workflow-substitution-cd",
+      )).toThrow(/cannot bind the npm install to a tracked lockfile: sub\/package-lock\.json is not a lockfile the gate reads/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
