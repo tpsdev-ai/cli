@@ -22,7 +22,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
@@ -62,6 +62,18 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000, describe?: () => s
 
 // Never fires an fs event.
 const NO_FS_EVENTS = () => ({ close() {} });
+
+// Bound for a wait that only an fs event can satisfy. On a loaded macOS host,
+// FSEvents has reported a lone write over 10 s late, and a write that was being
+// touched (waitForTouching) over 5 s late. The bound is sized for that; it costs
+// nothing when the event arrives promptly.
+const EVENT_PATH_DEADLINE_MS = 15_000;
+// Timeout of a case that waits up to EVENT_PATH_DEADLINE_MS.
+const EVENT_PATH_CASE_TIMEOUT_MS = EVENT_PATH_DEADLINE_MS + 5_000;
+// Poll interval for such a case: longer than its timeout, so no poll tick can
+// run inside it. After the startup scan, only an fs event can make the watcher
+// scan new/ again.
+const EVENT_PATH_POLL_MS = 60_000;
 
 // ---------------------------------------------------------------------------
 // validateAgentId
@@ -220,15 +232,44 @@ describe("watchMail (verified-only, non-consuming)", () => {
   }
 
   /**
-   * A promise that resolves when watchMail reports its startup scan finished
-   * (fs.watch installed and the initial `new/` listing processed). Delivering a
-   * record only after this removes the fixed sleep that raced the arming of the
-   * event watcher.
+   * A promise that resolves when watchMail reports its FIRST scan attempt of
+   * `new/` finished (whether or not the listing succeeded). A record delivered
+   * after this cannot be picked up by the startup scan. It does not mean fs.watch
+   * is already reporting events: see waitForTouching.
    */
   function readySignal() {
     let resolve: () => void = () => {};
     const promise = new Promise<void>((r) => { resolve = r; });
     return { onReady: () => resolve(), promise };
+  }
+
+  /** The path of the one `*.json` record in new/: the record a case just delivered. */
+  function onlyNewFile(): string {
+    const fresh = getInbox(AGENT).fresh;
+    const files = jsonFiles(fresh);
+    expect(files).toHaveLength(1);
+    return join(fresh, files[0]!);
+  }
+
+  /**
+   * waitFor for a record delivered on the fs-EVENT path: until `cond` holds, set
+   * `file`'s times to now on every iteration. On macOS, FSEvents can report a
+   * lone write seconds late, even after onReady; touching the file keeps events
+   * for it coming until the watcher has scanned it. A touch changes metadata
+   * only, so a scan never reads a half-written record, and the watcher skips a
+   * file it has already classified, so a touch cannot present a record twice.
+   */
+  async function waitForTouching(file: string, cond: () => boolean, timeoutMs: number, describe: () => string) {
+    await waitFor(
+      () => {
+        if (cond()) return true;
+        const now = new Date();
+        utimesSync(file, now, now);
+        return false;
+      },
+      timeoutMs,
+      describe,
+    );
   }
 
   /** Capture console.error lines (the watcher's log) until restored. */
@@ -320,82 +361,110 @@ describe("watchMail (verified-only, non-consuming)", () => {
   it("event path: a signed record delivered AFTER startup is presented", async () => {
     const received: string[] = [];
     const ready = readySignal();
-    let armed = false;
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
-      onReady: () => { armed = true; ready.onReady(); },
+      pollMs: EVENT_PATH_POLL_MS,
+      onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
 
     await ready.promise;
-    expect(armed).toBe(true); // deliver only after the watcher reports it is armed
     deliverSigned("event delivered");
-    await waitFor(
+    await waitForTouching(
+      onlyNewFile(),
       () => received.includes("event delivered"),
-      5000,
+      EVENT_PATH_DEADLINE_MS,
       () => `received: ${JSON.stringify(received)}`,
     );
     watcher.stop();
 
     expect(received).toContain("event delivered");
-  }, 10_000);
+  }, EVENT_PATH_CASE_TIMEOUT_MS);
 
   it("event path: an unsigned record reaches NEITHER onMessage nor the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "unsigned-event-hook.txt");
     const envOut = join(tempRoot, "unsigned-event-env.json");
     const ready = readySignal();
-    const watcher = watchMail({
-      agent: AGENT,
-      debounceMs: 20,
-      onReady: ready.onReady,
-      hook: hookCapturing(out, envOut),
-      onMessage: (msg) => { received.push(msg.body); },
-    });
+    const log = captureErrors();
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: EVENT_PATH_POLL_MS,
+        onReady: ready.onReady,
+        hook: hookCapturing(out, envOut),
+        onMessage: (msg) => { received.push(msg.body); },
+      });
 
-    await ready.promise;
-    deliverUnsigned("event unsigned", "unsigned-event");
-    await sleep(400);
-    watcher.stop();
+      await ready.promise;
+      deliverUnsigned("event unsigned", "unsigned-event");
+      // Wait until a scan has READ the record and refused it, so the assertions
+      // below are about a record the watcher saw.
+      const refused = () => log.lines.some((l) => l.includes("unsigned-event: not presented"));
+      await waitForTouching(
+        onlyNewFile(),
+        () => refused() || received.length > 0,
+        EVENT_PATH_DEADLINE_MS,
+        () => `received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
+      );
+    } finally {
+      watcher?.stop();
+      log.restore();
+    }
 
     expect(received).toEqual([]);
     expect(existsSync(out), "the hook never ran").toBe(false);
-  }, 10_000);
+  }, EVENT_PATH_CASE_TIMEOUT_MS);
 
   it("an envelope with an altered wrapper SENDER is never presented, and never launches the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "tampered-hook.txt");
     const envOut = join(tempRoot, "tampered-env.json");
     const ready = readySignal();
-    const watcher = watchMail({
-      agent: AGENT,
-      debounceMs: 20,
-      pollMs: 30,
-      onReady: ready.onReady,
-      hook: hookCapturing(out, envOut),
-      onMessage: (msg) => { received.push(msg.body); },
-    });
+    const log = captureErrors();
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 30,
+        onReady: ready.onReady,
+        hook: hookCapturing(out, envOut),
+        onMessage: (msg) => { received.push(msg.body); },
+      });
 
-    await ready.promise;
-    const env = buildSignedEnvelope("flint", AGENT, "tampered", SEEDS);
-    // The signature is valid, but the wrapper SENDER differs from the signed
-    // sender: the wrapper-sender↔signed-sender binding fails, so the record is
-    // neither presented nor handed to the hook.
-    writeRecord({
-      id: "tampered-1",
-      from: "someone-else",
-      to: AGENT,
-      body: JSON.stringify(env),
-      timestamp: env.timestamp,
-      read: false,
-    });
-    await sleep(300);
-    watcher.stop();
+      await ready.promise;
+      const env = buildSignedEnvelope("flint", AGENT, "tampered", SEEDS);
+      // The signature is valid, but the wrapper SENDER differs from the signed
+      // sender: the wrapper-sender↔signed-sender binding fails, so the record is
+      // neither presented nor handed to the hook.
+      writeRecord({
+        id: "tampered-1",
+        from: "someone-else",
+        to: AGENT,
+        body: JSON.stringify(env),
+        timestamp: env.timestamp,
+        read: false,
+      });
+      // Wait until a scan has READ the record and refused it.
+      const refused = () => log.lines.some((l) => l.includes("tampered-1: not presented"));
+      await waitForTouching(
+        onlyNewFile(),
+        () => refused() || received.length > 0,
+        5000,
+        () => `received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
+      );
+    } finally {
+      watcher?.stop();
+      log.restore();
+    }
 
     expect(received).toEqual([]);
     expect(existsSync(out), "the hook never ran").toBe(false);
-  });
+  }, 10_000);
 
   it("presents a record ONCE while its file stays in new/ (dedup by envelope id)", async () => {
     const received: string[] = [];
@@ -410,12 +479,20 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     await ready.promise;
     deliverSigned("once only");
-    await waitFor(
+    const file = onlyNewFile();
+    await waitForTouching(
+      file,
       () => received.length >= 1,
       5000,
       () => `received: ${JSON.stringify(received)}`,
     );
-    await sleep(200); // several poll cycles: a second presentation would show up here
+    // Several poll cycles, and further fs events on the same file (touches, as
+    // above): a second presentation would show up here.
+    for (let i = 0; i < 10; i++) {
+      const now = new Date();
+      utimesSync(file, now, now);
+      await sleep(20);
+    }
     watcher.stop();
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
@@ -463,7 +540,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     await ready.promise;
     deliverSigned("redelivered");
-    await waitFor(
+    await waitForTouching(
+      onlyNewFile(),
       () => received.filter((b) => b === "redelivered").length === 1,
       5000,
       () => `received: ${JSON.stringify(received)}`,
@@ -478,7 +556,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     // It re-enters new/ with the same envelope.
     writeFileSync(join(inbox.fresh, `re-${file}`), bytes);
-    await waitFor(
+    await waitForTouching(
+      join(inbox.fresh, `re-${file}`),
       () => received.filter((b) => b === "redelivered").length === 2,
       5000,
       () => `received: ${JSON.stringify(received)}`,
@@ -729,7 +808,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     await ready.promise;
     deliverSigned("still alive");
-    await waitFor(
+    await waitForTouching(
+      onlyNewFile(),
       () => received.includes("still alive"),
       5000,
       () => `received: ${JSON.stringify(received)}`,

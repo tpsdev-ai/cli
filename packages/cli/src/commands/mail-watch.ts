@@ -84,11 +84,16 @@ export interface MailWatchOptions {
    */
   watchImpl?: (dir: string, listener: () => void) => { close(): void };
   /**
-   * Readiness seam: called ONCE, after the startup scan of `new/` finishes —
-   * that is, after fs.watch is installed and the initial listing is processed.
-   * Default: no-op. A test that delivers a record on the fs-event path awaits
-   * this instead of sleeping a fixed time, so it does not race the arming of
-   * the watcher. It is informational only: errors thrown by the callback are
+   * Readiness seam: called ONCE, on the event-loop turn after the watcher's
+   * FIRST scan attempt of `new/` completes, whether or not that listing
+   * succeeded (a failed listing is logged and still counts). By then fs.watch
+   * has been called and the startup scan is over, so a record written afterwards
+   * is picked up by an fs event or a poll tick, never by the startup scan.
+   * It does NOT guarantee that fs.watch reports a write made immediately
+   * afterwards in good time: on macOS, FSEvents can report such a write seconds
+   * late. Tests that deliver on the fs-event path therefore keep touching the
+   * file they wrote until the watcher has scanned it, within a bounded wait.
+   * Default: no-op. It is informational only: errors thrown by the callback are
    * swallowed, and it does not affect delivery.
    */
   onReady?: () => void;
@@ -256,15 +261,15 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // not a queue), run when that scan finishes.
   let rescan = false;
 
-  // Fire the readiness seam once, when the first scan has finished. fs.watch is
-  // installed before the startup processNew() call, so this marks the watcher
-  // as armed and its initial scan as complete.
+  // Fire the readiness seam once, when the FIRST scan attempt has finished,
+  // whether or not its listing succeeded. fs.watch was called before the
+  // startup processNew(), but that does not mean the OS is already reporting
+  // events for new/ (see MailWatchOptions.onReady).
   let readyFired = false;
   const fireReady = () => {
     if (readyFired) return;
     readyFired = true;
-    // On the next turn of the event loop, after the watcher has been installed
-    // and its startup scan has finished.
+    // On the next turn of the event loop, after the startup scan has finished.
     setImmediate(() => {
       try { opts.onReady?.(); } catch { /* a readiness callback must not crash the watcher */ }
     });
