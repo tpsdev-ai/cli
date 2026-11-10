@@ -2779,6 +2779,24 @@ describe("the workflow guard refuses what it cannot fully resolve (#820 round 5)
     }
   });
 
+  it("refuses a computed tracked-lock helper directory argument", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "dir=\"$(mktemp -d)\"\nbash scripts/npm-ci-tracked-lock.sh --via npm \"$dir\"\n",
+      "scripts/npm-ci-tracked-lock.sh": "echo helper\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-helper",
+      )).toThrow(/tracked-lock helper call is not the literal accepted shape/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["timeout", "timeout 5 bash -c 'echo hi'\n"],
     ["docker", "docker run --rm x bash -c 'echo hi'\n"],
