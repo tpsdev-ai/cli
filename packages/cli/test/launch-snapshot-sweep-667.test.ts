@@ -322,22 +322,23 @@ console.log("REMOVED " + JSON.stringify(sweepStaleLaunchSnapshots(${JSON.stringi
     }
   });
 
-  test("keeps a snapshot whose forced EPERM probe result is alive and removes one the same seam reports gone", () => {
+  test("keeps a snapshot whose forced probe answer is alive and removes one the same seam reports gone", () => {
     const fixture = makeFixture();
     try {
-      // pid 1 is the pid an unprivileged user's signal probe is refused (EPERM),
-      // which pidState classifies as alive; pid 999999 is the same seam forced
-      // the other way, so the probe is proven to be consulted.
-      const eperm = makeSnapshot(fixture.launch, "config-eperm1");
-      writeOwner(eperm, { pid: 1, startToken: null });
-      ageSnapshot(eperm);
-      const gone = makeSnapshot(fixture.launch, "config-eperm2");
-      writeOwner(gone, { pid: 999_999, startToken: null });
+      // Each forced answer is the opposite of the real probe's: pid 999999 is
+      // gone, so forcing "alive" and keeping it proves the seam was consulted;
+      // this process is alive, so forcing "gone" and removing it proves the
+      // same.
+      const alive = makeSnapshot(fixture.launch, "config-alive0");
+      writeOwner(alive, { pid: 999_999, startToken: null });
+      ageSnapshot(alive);
+      const gone = makeSnapshot(fixture.launch, "config-gone00");
+      writeOwner(gone, { pid: process.pid, startToken: processStartToken(process.pid) });
       ageSnapshot(gone);
 
-      const forcedPidState = (pid: number) => (pid === 1 ? "alive" : "gone");
+      const forcedPidState = (pid: number) => (pid === 999_999 ? "alive" : "gone");
       expect(sweepStaleLaunchSnapshots(fixture.launch, { pidState: forcedPidState })).toEqual([gone]);
-      expect(existsSync(eperm)).toBe(true);
+      expect(existsSync(alive)).toBe(true);
       expect(existsSync(gone)).toBe(false);
     } finally {
       rmSync(fixture.root, { recursive: true, force: true });

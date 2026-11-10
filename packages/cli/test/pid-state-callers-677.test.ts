@@ -82,17 +82,18 @@ describe("tryAcquireMailLock owner pid", () => {
 });
 
 describe("tps status pid check", () => {
-  test("reports a forced EPERM probe result as alive and a forced gone result as a zombie", () => {
+  test("reports a forced alive probe answer as online and a forced gone answer as a zombie", () => {
     const root = mkdtempSync(join(tmpdir(), "tps-692-status-"));
     const home = join(root, "home");
     const nodes = join(home, ".tps", "status", "nodes");
     mkdirSync(nodes, { recursive: true });
     try {
       const now = new Date().toISOString();
-      // agent-a's pid stands in for the pid 1 probe an unprivileged user is
-      // refused (EPERM), which pidState classifies as alive; agent-b's is the
-      // same seam forced the other way, so the probe is proven to be consulted.
-      const pids: Record<string, number> = { "agent-a": 1, "agent-b": 2 };
+      // Each forced answer is the opposite of the real probe's: pid 999999 is
+      // gone, so forcing agent-a "alive" and reporting it online proves the
+      // seam was consulted; agent-b's pid is this test process, alive while it
+      // runs, so forcing it "gone" and reporting a zombie proves the same.
+      const pids: Record<string, number> = { "agent-a": 999_999, "agent-b": process.pid };
       for (const [agentId, pid] of Object.entries(pids)) {
         writeFileSync(
           join(nodes, `${agentId}.json`),
@@ -119,7 +120,7 @@ import { runStatus } from ${JSON.stringify(STATUS_MODULE)};
 const lines = [];
 const log = console.log;
 console.log = (...args) => lines.push(args.join(" "));
-const forcedPidState = (pid) => (pid === 1 ? "alive" : "gone");
+const forcedPidState = (pid) => (pid === 999999 ? "alive" : "gone");
 await runStatus({ json: true }, { pidState: forcedPidState });
 console.log = log;
 process.stdout.write("RESULT " + JSON.stringify(JSON.parse(lines.join("\\n"))) + "\\n");
