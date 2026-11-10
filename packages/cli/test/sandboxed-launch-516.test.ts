@@ -3450,4 +3450,58 @@ setInterval(() => {}, 1000);
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("the same post-release recheck refusal under a supervisor exits with the supervised refusal code", async () => {
+    const f = survivorFixture();
+    const peer = join(f.sb.root, "survivor-peer.cjs");
+    writeFileSync(peer, SURVIVOR_PEER);
+    writeFileSync(f.sb.nonoBin, RECHECK_FAILURE_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const peerPidFile = join(f.sb.root, "peer.pid");
+    const launcher = spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED], {
+      cwd: f.sb.run,
+      detached: true,
+      env: cliEnv(f.sb, {
+        FAKE_NONO_PS_JSON: join(f.sb.root, "ps.json"),
+        FAKE_NONO_PS_COUNT: join(f.sb.root, "ps-count"),
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+        PEER_PID_FILE: peerPidFile,
+        TPS_LAUNCH_TIMEOUT_MS: "20000",
+        TPS_SUPERVISED: "1",
+      }),
+    });
+    let text = "";
+    launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
+    let peerPid: number | undefined;
+    try {
+      expect(
+        await waitUntil(
+          () => /released under nono session \S+ \(child pid \d+\)/.test(text) && existsSync(peerPidFile),
+          20_000,
+        ),
+        text,
+      ).toBe(true);
+      peerPid = pidFromFile(peerPidFile);
+      expect(peerPid).toBeDefined();
+      const exit = await waitExit(launcher);
+      expect(exit.signal, text).toBeNull();
+      expect(exit.code, text).toBe(SUPERVISED_REFUSAL_EXIT_CODE);
+      expect(text).toContain(`may still be running; kept the worktree ${f.sb.ws}`);
+      expect(text).toContain("❌ refusing to launch: ");
+      // The child outlived its supervisor and was not signalled.
+      expect(processAlive(peerPid!)).toBe(true);
+      expect(existsSync(f.sb.ws)).toBe(true);
+      expect(
+        spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout,
+      ).toContain(`worktree ${f.sb.ws}\n`);
+      // The launcher kept its private launch state.
+      expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
+    } finally {
+      try { if (peerPid && processAlive(peerPid)) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
