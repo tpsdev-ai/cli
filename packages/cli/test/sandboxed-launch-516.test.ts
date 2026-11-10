@@ -3435,6 +3435,7 @@ setInterval(() => {}, 1000);
       expect(exit.signal, text).toBeNull();
       expect(exit.code, text).toBe(REFUSAL_EXIT_CODE);
       expect(text).toContain(`may still be running; kept the worktree ${f.sb.ws}`);
+      expect(text).toContain("❌ refusing to launch: ");
       // The child outlived its supervisor and was not signalled.
       expect(processAlive(peerPid!)).toBe(true);
       expect(existsSync(f.sb.ws)).toBe(true);

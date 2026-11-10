@@ -1134,11 +1134,13 @@ export async function launchAttested(
       { boundMs: opts.signalStopTimeoutMs ?? SIGNAL_STOP_BOUND_MS, hooks: opts.interruptTestHooks }
     );
     if (!stop.stopped) {
+      // Name the cause first: the survivor line alone does not say why the launch was refused.
+      const code = refuse(reason);
       const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
       console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
       keepLaunchState = true;
       opts.onRefusalSurvivors?.(stop.survivors);
-      return refusedCode;
+      return code;
     }
     return refuse(reason);
   };
