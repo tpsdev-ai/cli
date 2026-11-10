@@ -37,6 +37,15 @@
 set -euo pipefail
 
 platforms="${PLATFORMS:-linux/amd64,linux/arm64}"
+
+# Bash 4.4 or newer: under `set -u`, bash 3.2 treats an empty "${array[@]}" as
+# unbound, and with an EXIT trap set it then exits 0, so a failed push would
+# read as success.
+if [ "${BASH_VERSINFO[0]:-0}" -lt 4 ] || { [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -lt 4 ]; }; then
+  printf 'docker-publish-index.sh: bash %s found, but bash 4.4 or newer is required.\n' "${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
 registry="${REGISTRY:-localhost:5000}"
 repository="${REPOSITORY:-tps-office}"
 command="${1:?usage: docker-publish-index.sh <copy|assemble|verify|push> ...}"
@@ -202,10 +211,10 @@ push)
   digest_file="${RUNNER_TEMP:-/tmp}/index-digest"
   [ -s "$digest_file" ] || { echo "missing local index digest: $digest_file" >&2; exit 1; }
   expected="$(cat "$digest_file")"
-  skopeo copy --all --preserve-digests --src-tls-verify=false "${tls_args[@]}" \
+  skopeo copy --all --preserve-digests --src-tls-verify=false ${tls_args[@]+"${tls_args[@]}"} \
     "docker://$registry/$repository:verify" "docker://$dest"
   target_raw="$tmp/pushed-index.json"
-  skopeo inspect "${inspect_args[@]}" --raw "docker://$dest" >"$target_raw"
+  skopeo inspect ${inspect_args[@]+"${inspect_args[@]}"} --raw "docker://$dest" >"$target_raw"
   actual="$(sha256sum "$target_raw" | cut -d' ' -f1)"
   if [ "$expected" != "$actual" ]; then
     echo "digest mismatch for $dest: local index $expected, registry $actual" >&2

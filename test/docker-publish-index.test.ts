@@ -13,7 +13,7 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -462,6 +462,27 @@ describe("docker-publish-index.sh assemble and verify", () => {
   });
 });
 
+const SYSTEM_BASH = "/bin/bash";
+const systemBashIsOld = (() => {
+  if (!existsSync(SYSTEM_BASH)) return false;
+  const r = spawnSync(SYSTEM_BASH, ["-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'], { encoding: "utf8" });
+  const [major, minor] = r.stdout.trim().split(" ").map(Number);
+  return major < 4 || (major === 4 && minor < 4);
+})();
+
+describe.skipIf(!systemBashIsOld)("docker-publish-index.sh on a bash older than 4.4", () => {
+  test("refuses before any registry command", () => {
+    const c = newCase();
+    const r = spawnSync(SYSTEM_BASH, [SCRIPT, "push", "ghcr.io/tpsdev-ai/tps-office:test"], {
+      encoding: "utf8",
+      env: { PATH: `${join(c.dir, "bin")}:${process.env.PATH ?? "/usr/bin:/bin"}`, STUB_STATE: c.state, PLATFORMS: "linux/amd64,linux/arm64", RUNNER_TEMP: c.dir },
+    });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("bash 4.4 or newer is required");
+    expect(existsSync(join(c.state, "tags", "ghcr.io_tpsdev-ai_tps-office_test"))).toBe(false);
+  });
+});
+
 describe("docker-publish-index.sh push", () => {
   test("push compares the destination digest with the local index digest on the stubbed rehearsal and GHCR branches", () => {
     const c = newCase();
@@ -474,7 +495,10 @@ describe("docker-publish-index.sh push", () => {
     writeFileSync(join(c.dir, "index-digest"), sha256(readFileSync(raw, "utf8")));
 
     expect(runScript(c, ["push", "localhost:5001/tps-office:rehearsal", "--rehearsal"], { RUNNER_TEMP: c.dir }).status).toBe(0);
+    // The copy must have happened: the stub records each destination tag it was given.
+    expect(existsSync(join(c.state, "tags", "localhost_5001_tps-office_rehearsal"))).toBe(true);
     expect(runScript(c, ["push", "ghcr.io/tpsdev-ai/tps-office:test"], { RUNNER_TEMP: c.dir }).status).toBe(0);
+    expect(existsSync(join(c.state, "tags", "ghcr.io_tpsdev-ai_tps-office_test"))).toBe(true);
     const mismatch = runScript(c, ["push", "ghcr.io/tpsdev-ai/tps-office:test"], { RUNNER_TEMP: c.dir, STUB_MISMATCH: "1" });
     expect(mismatch.status).toBe(1);
     expect(mismatch.stderr).toContain("digest mismatch for ghcr.io/tpsdev-ai/tps-office:test");
