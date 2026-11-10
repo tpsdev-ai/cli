@@ -217,7 +217,8 @@ write_pids_file() {
 }
 
 # Signal the tracked children, poll until the whole-second SECONDS deadline
-# (within the grace plus at most one poll),
+# (at least the grace: the deadline adds one second because SECONDS counts
+# whole-second boundaries; at most the grace plus one second and one poll),
 # attempt KILL for every tracked PID still alive, clear the tracked list and
 # only then remove the PID file. `wait` reaps this shell's children only, so neither step
 # proves that every survivor is reaped.
@@ -239,7 +240,7 @@ shutdown_children() {
     fi
   done
 
-  deadline=$((SECONDS + SHUTDOWN_GRACE_SECONDS))
+  deadline=$((SECONDS + SHUTDOWN_GRACE_SECONDS + 1))
   while [[ $SECONDS -lt $deadline ]]; do
     alive=0
     for pid in "${AGENT_PIDS[@]}"; do

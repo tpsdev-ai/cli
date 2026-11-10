@@ -179,9 +179,10 @@ fi
 rm -rf "$hook_fixture"
 
 # The same values arriving as files through the real secrets loader. The
-# fixture is the supervisor's own lines from the top through the post-load
-# validation; only the secrets directory is pointed at a scratch directory by
-# rewriting its assignment here (the supervisor has no override for it).
+# fixture is the supervisor's lines from the top through the startup validation,
+# then from the `SECRETS_DIR=` assignment through the post-load validation (the
+# lines in between are omitted); the secrets directory assignment is rewritten to
+# a scratch directory (the supervisor has no override for it).
 secret_fixture="$(mktemp -d)"
 {
   sed -n '1,/^validate_control_values$/p' "$sup"
