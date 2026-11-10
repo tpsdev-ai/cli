@@ -943,10 +943,10 @@ function singleQuoteMask(line: string): boolean[] {
 }
 
 /**
- * Command substitution bodies in one line: `$(...)` at any depth of nesting
- * and backtick spans, each returned once at this level; nested bodies are left
- * to the recursive scan of the body. A backtick span with no reliable close is
- * returned as unparsed so the caller can refuse it.
+ * Outermost command substitution bodies in one line: `$(...)` and backtick
+ * spans, each returned once; nested bodies are left to the recursive scan of the
+ * body. A backtick span with no reliable close is returned as unparsed so the
+ * caller can refuse it.
  */
 function commandSubstitutions(line: string): { bodies: string[]; unparsed: string[] } {
   const bodies: string[] = [];
@@ -1526,7 +1526,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     if (state.depth >= 8) continue;
     // A command substitution runs in its own subshell: it starts from the
     // enclosing state and keeps its own cd and nested substitutions. A backtick
-    // span the line cannot parse reliably is refused, never skipped.
+    // span the line cannot parse reliably is refused as unresolved, never skipped.
     const substitutions = commandSubstitutions(entry.text);
     for (const token of substitutions.unparsed) {
       if (state.source === "followed-script") {
