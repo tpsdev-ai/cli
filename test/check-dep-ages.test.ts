@@ -3267,3 +3267,43 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
     }
   });
 });
+
+describe("the workflow guard treats a single-quoted $() as literal text (#820 round 9)", () => {
+  it.each([
+    [
+      "a single-quoted $( before a live backtick, in a run block",
+      "sed 's/$(/X/' f; y=`bash scripts/inst.sh`; echo ')'",
+      false,
+    ],
+    [
+      "a single-quoted $( before a live backtick, in a followed script",
+      "sed 's/$(/X/' f; y=`bash scripts/inst.sh`; echo ')'",
+      true,
+    ],
+    [
+      "a single-quoted $( around a live backtick, in a run block",
+      "echo '$(' `bash scripts/inst.sh` ')'",
+      false,
+    ],
+    [
+      "a single-quoted $( around a live backtick, in a followed script",
+      "echo '$(' `bash scripts/inst.sh` ')'",
+      true,
+    ],
+  ])("refuses %s", (_label, line, asScript) => {
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(),
+        root,
+        "workflow-single-quote-probe",
+      )).toThrow(/cannot bind the npm install/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

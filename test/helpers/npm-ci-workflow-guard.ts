@@ -958,7 +958,7 @@ function commandSubstitutions(line: string): { bodies: string[]; unparsed: strin
       index++;
       continue;
     }
-    if (char === "$" && line[index + 1] === "(") {
+    if (char === "$" && line[index + 1] === "(" && !singleQuoted[index]) {
       const match = parenSpan(line, index + 1);
       if (match === null) continue;
       if ("unparsed" in match) {
