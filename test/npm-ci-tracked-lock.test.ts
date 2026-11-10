@@ -670,7 +670,7 @@ const foreignResolvedUrls: [string, (registry: string) => string][] = [
   ["a userinfo trick", (registry) => `${registry}@evil.test${DEP_PATH}`],
 ];
 
-it.each(foreignResolvedUrls)(
+it.skipIf(!npmAvailable).each(foreignResolvedUrls)(
   "a lock entry whose resolved URL is %s is refused with zero registry requests",
   async (_label, resolved) => {
     const root = mkdtempSync(join(tmpdir(), "tracked-lock-resolved-host-"));
