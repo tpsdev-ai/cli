@@ -52,6 +52,24 @@ export function mailLockPath(root: string): string {
 const heldByThisProcess = new Set<string>();
 
 /**
+ * Fields of `/proc/<pid>/stat` after the `comm` field (2), or null when the
+ * file is unreadable or contains no ')'; a truncated line yields fewer fields,
+ * which callers treat as absent. `comm` may contain spaces and parentheses,
+ * so the fields are split after the LAST ')'. fields[0] is field 3 (state);
+ * starttime is field 22 → fields[19].
+ */
+function readProcStatFields(pid: number): string[] | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    const rparen = stat.lastIndexOf(")");
+    if (rparen === -1) return null;
+    return stat.slice(rparen + 2).split(" ");
+  } catch {
+    return null;
+  }
+}
+
+/**
  * A stable per-process identity token — its kernel birth time — or null only
  * when it cannot be read at all.
  *
@@ -61,18 +79,10 @@ const heldByThisProcess = new Set<string>();
  * pid alone — exactly the pid-reuse confusion this token exists to prevent.
  */
 export function processStartToken(pid: number): string | null {
-  // /proc/<pid>/stat: the `comm` field (2) may contain spaces and parentheses,
-  // so split after the LAST ')'. fields[0] is field 3 (state); starttime is
-  // field 22 → fields[19].
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
-    const rparen = stat.lastIndexOf(")");
-    if (rparen !== -1) {
-      const token = stat.slice(rparen + 2).split(" ")[19];
-      if (token) return `proc:${token}`;
-    }
-  } catch {
-    /* fall through to ps */
+  const fields = readProcStatFields(pid);
+  if (fields) {
+    const token = fields[19];
+    if (token) return `proc:${token}`;
   }
   // Portable fallback — `lstart` is a stable per-process birth time string.
   try {
@@ -104,13 +114,16 @@ export function isValidPid(pid: number): boolean {
 /**
  * Probe a recorded pid with `process.kill(pid, 0)`. "invalid": not an integer
  * of at least 1 (0 and negative pids do not name one process), or a pid
- * process.kill rejects as an argument. "gone": ESRCH. "alive": the probe
- * succeeds or fails with any other error, EPERM (permission denied) included.
+ * process.kill rejects as an argument. "gone": ESRCH, or on Linux a pid whose
+ * `/proc/<pid>/stat` state is `Z` (exited but not reaped). "alive": the probe
+ * succeeds or fails with any other error, EPERM (permission denied) included;
+ * an unreadable stat file keeps "alive".
  */
-export function pidState(pid: number): PidState {
+export function pidState(pid: number, readStat: (pid: number) => string[] | null = readProcStatFields): PidState {
   if (!isValidPid(pid)) return "invalid";
   try {
     process.kill(pid, 0);
+    if (process.platform === "linux" && readStat(pid)?.[0] === "Z") return "gone";
     return "alive";
   } catch (error) {
     return pidStateFromProbeError(error);
