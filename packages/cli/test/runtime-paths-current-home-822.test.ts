@@ -10,9 +10,12 @@ import * as runtimeMail from "../src/utils/runtime-mail.js";
 
 const startHome = process.env.HOME;
 
-// spyOn needs a top-level restore (mock-restore-guard).
+// spyOn needs a top-level restore whose only statement is mock.restore() (mock-restore-guard).
 afterEach(() => {
   mock.restore();
+});
+
+afterEach(() => {
   process.env.HOME = startHome;
 });
 
