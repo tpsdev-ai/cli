@@ -28,6 +28,27 @@ function makeTmpDir(): string {
   return dir;
 }
 
+const PARITY_STATE_WAIT_MS = 10_000;
+const PARITY_TEST_TIMEOUT_MS = 30_000;
+
+/** Wait for the pid record start() writes to be classified `running`, or fail
+ *  with how long it waited and the last state it saw instead of bun's timeout. */
+async function waitForRunningPidRecord(name: string, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  let lastSeen = "no record";
+  for (;;) {
+    const found = bridgePidFiles(name);
+    lastSeen = found.length === 0 ? "no record" : JSON.stringify(found.map((entry) => entry.state));
+    if (found.length === 1 && found[0]?.state.kind === "running") return;
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `bridge pid record for ${JSON.stringify(name)} did not reach "running" within ${timeoutMs} ms; last state: ${lastSeen}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 describe("bridge adapter-name grammar (cli#725)", () => {
   let mailDir: string;
   let testHome: string;
@@ -145,6 +166,7 @@ describe("bridge adapter-name grammar (cli#725)", () => {
       const core = new BridgeCore(adapter, { defaultAgentId: "default-agent", mailDir }, () => {});
       await core.start();
       try {
+        await waitForRunningPidRecord(name, PARITY_STATE_WAIT_MS);
         const expectedPath = join(testHome, ".tps", "run", `bridge-${name}.pid`);
         expect(existsSync(expectedPath)).toBe(true);
 
@@ -160,7 +182,7 @@ describe("bridge adapter-name grammar (cli#725)", () => {
         await core.stop();
       }
       expect(bridgePidFiles(name)).toEqual([]);
-    });
+    }, PARITY_TEST_TIMEOUT_MS);
   }
 
   test("the pid file and record use the name validated at construction, even when the adapter renames itself in start()", async () => {
@@ -282,7 +304,7 @@ describe("bridge adapter-name grammar (cli#725)", () => {
   });
 
   test("the refusal message escapes every code point outside printable ASCII", () => {
-    const codePoints = [0x009b, 0x202e, 0x2028, 0x061c, 0x200b, 0x200d, 0x2060, 0x206a, 0xfeff, 0x180e, 0x00ad, 0x1f600];
+    const codePoints = [0x009b, 0x202e, 0x2028, 0x061c, 0x200b, 0x200d, 0x2060, 0x206a, 0xfeff, 0x180e, 0x00ad, 0xfffe, 0xffff, 0x1f600];
     let message = "";
     try {
       assertBridgeAdapterName(`x${String.fromCodePoint(...codePoints)}`);
