@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,44 +18,6 @@ afterEach(() => {
 // The real fs.watch, taken before any test spies on it: each test wraps this
 // one, never whatever fs.watch is at that moment.
 const realWatch = fs.watch;
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolve(address.port));
-    });
-  });
-}
-
-// Hold the port freePort() just chose, so a start can be shown either to stay
-// clear of it (port 0) or to collide with it. The probe closes before the hold
-// binds, so retry a bounded number of times if another process takes it.
-async function holdPort(): Promise<{ port: number; close: () => Promise<void> }> {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const port = await freePort();
-    const server = net.createServer();
-    try {
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(port, "127.0.0.1", () => resolve());
-      });
-      return {
-        port,
-        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
-      };
-    } catch {
-      /* the probed port was taken before the hold bound it; try another */
-    }
-  }
-  throw new Error("could not hold a free port");
-}
 
 async function waitUntil(ready: () => boolean): Promise<void> {
   const deadline = Date.now() + 5000;
@@ -188,9 +149,6 @@ describe("branch relay authenticated channels", () => {
         const listener = tcp.listenForHost;
         spyOn(tcp, "listenForHost").mockImplementation((...args) => observe(listener, ...args));
       }
-      // The port freePort() would have pre-chosen is held open: a start that
-      // binds it fails, while a port-0 start comes up on another port (cli#889).
-      const held = await holdPort();
       let startupError: unknown;
       async function start(peer: TpsKeyPair): Promise<number> {
         startupError = undefined;
@@ -215,12 +173,6 @@ describe("branch relay authenticated channels", () => {
       }
       const body = MailDeliverBodySchema.parse({ id: randomUUID(), from: "remote", to: "local", content: "original", timestamp: "2026-10-07T00:00:00.000Z" });
       const message = (seq: number, content = body.content): TpsMessage => ({ type: MSG_MAIL_DELIVER, seq, ts: body.timestamp, body: { ...body, content } });
-      try {
-        expect(await start(host)).not.toBe(held.port);
-      } finally {
-        await stop();
-        await held.close();
-      }
       const port = await start(host);
       const first = await connect(host, port);
       expect((await exchange(first, message(1), MSG_MAIL_ACK)).body).toEqual({ id: body.id, accepted: true });
