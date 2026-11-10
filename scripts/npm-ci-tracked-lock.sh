@@ -17,14 +17,15 @@
 #     not on it is refused; matching is case-insensitive because npm reads
 #     environment keys case-insensitively; the allowlist holds names that
 #     cannot change the fetch, and the user config path, which the --userconfig
-#     flag above outranks); the unprefixed proxy variables http_proxy,
-#     https_proxy and all_proxy (case-insensitive, presence test),
-#     NODE_EXTRA_CA_CERTS and NODE_TLS_REJECT_UNAUTHORIZED (presence test) and
-#     a non-empty NODE_OPTIONS; and a lock entry that would install (not root,
-#     link:true, inBundle, file: or workspace:) whose resolved URL is missing
-#     or is not under R, or that has no integrity. no_proxy is left alone: it
-#     only narrows proxying, so it does nothing once the proxy variables are
-#     refused, and some runners set it.
+#     flag above outranks); the unprefixed proxy variables https_proxy,
+#     http_proxy and proxy (case-insensitive, presence test), which npm's
+#     agent reads alongside no_proxy, and all_proxy, which the agent does not
+#     read and which is refused as defence in depth; NODE_EXTRA_CA_CERTS and
+#     NODE_TLS_REJECT_UNAUTHORIZED (presence test) and a non-empty NODE_OPTIONS;
+#     and a lock entry that would install (not root, link:true, inBundle, file:
+#     or workspace:) whose resolved URL is missing or is not under R, or whose
+#     integrity is missing or is not sha512. no_proxy is left alone: it only
+#     narrows proxying, and some runners set it.
 set -euo pipefail
 
 if [ "$#" -lt 4 ] || [ "$1" != --via ]; then
@@ -108,7 +109,7 @@ if (refused.length > 0) {
   process.exit(3);
 }
 const routing = new Set([
-  "http_proxy", "https_proxy", "all_proxy", "node_extra_ca_certs", "node_tls_reject_unauthorized",
+  "http_proxy", "https_proxy", "proxy", "all_proxy", "node_extra_ca_certs", "node_tls_reject_unauthorized",
 ]);
 // NODE_OPTIONS can load code into npm's Node process (--require) or switch its
 // TLS trust (--use-openssl-ca); it is refused when non-empty. The names in
@@ -127,8 +128,8 @@ NODE
 }
 
 # The committed lock is the one npm will read. Refuse an installable entry whose
-# `resolved` URL is absent or not under R, or that has no integrity, before npm
-# runs.
+# `resolved` URL is absent or not under R, or whose integrity is missing or is
+# not sha512, before npm runs.
 check_lock_registry() {
   node - "$1" "$2" "$3" <<'NODE'
 const { readFileSync } = require("node:fs");
@@ -165,6 +166,12 @@ for (const [entry, value] of Object.entries(packages)) {
   const integrity = value.integrity;
   if (typeof integrity !== "string" || integrity === "") {
     problems.push(`${entry}: no integrity (version ${JSON.stringify(value.version ?? null)})`);
+  } else {
+    const dash = integrity.indexOf("-");
+    const algorithm = dash === -1 ? integrity : integrity.slice(0, dash);
+    if (algorithm !== "sha512") {
+      problems.push(`${entry}: integrity algorithm is not sha512 (version ${JSON.stringify(value.version ?? null)}): ${algorithm}`);
+    }
   }
   // `prefix` ends in "/", so this pins the host and not just a host prefix:
   // a different host, a host-suffix trick (R + ".evil.test") and a userinfo

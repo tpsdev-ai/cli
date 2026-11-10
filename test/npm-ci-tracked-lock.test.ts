@@ -630,7 +630,7 @@ it.skipIf(!npmAvailable).each(userConfigSources)(
   60_000,
 );
 
-it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] as const)(
+it.skipIf(!npmAvailable).each(["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "PROXY", "proxy", "ALL_PROXY", "all_proxy"] as const)(
   "an environment %s is refused with zero registry requests",
   async (name) => {
     const root = mkdtempSync(join(tmpdir(), "tracked-lock-proxy-env-"));
@@ -745,6 +745,30 @@ it.skipIf(!npmAvailable)("a lock entry under the registry without integrity is r
     ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
     expect(result.status).toBe(3);
     expect(result.stderr).toContain(`node_modules/${DEP}: no integrity`);
+    expect(registry.requests).toEqual([]);
+  } finally {
+    registry?.stop();
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 60_000);
+
+it.skipIf(!npmAvailable)("a lock entry under the registry without sha512 integrity is refused with zero registry requests", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tracked-lock-integrity-alg-"));
+  let registry: ReturnType<typeof startRegistry> | undefined;
+  try {
+    const tarball = packedTarball(root);
+    registry = startRegistry(tarball.bytes);
+    const repo = depFixtureRepo(root, {
+      version: "1.0.0",
+      resolved: `${registry.url}${DEP_PATH}`,
+      integrity: `sha1-${createHash("sha1").update(tarball.bytes).digest("base64")}`,
+    });
+    const result = await runHelper([
+      "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+    ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+    expect(result.status).toBe(3);
+    expect(result.stderr).toContain(`node_modules/${DEP}: integrity algorithm is not sha512`);
+    expect(result.stderr).toContain(`: sha1`);
     expect(registry.requests).toEqual([]);
   } finally {
     registry?.stop();
