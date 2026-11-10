@@ -26,14 +26,14 @@
  *   F-S2d  multiple final payloads → exactly one post.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, openSync, writeSync, closeSync, watch as fsWatch } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, openSync, writeSync, closeSync, utimesSync, watch as fsWatch } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 // The REAL consumer: the branch relay drains the outbox with this exact
 // function (packages/cli/src/commands/branch.ts imports it from the same
 // module). Imported from the built CLI so we exercise the shipped artifact.
-import { drainOutbox } from "../../../packages/cli/dist/src/utils/outbox.js";
+import { drainOutbox, OUTBOX_PARTIAL_GRACE_MS } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as ed from "@noble/ed25519";
 import { createHash } from "node:crypto";
 import { signEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
@@ -200,7 +200,15 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     };
 
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
-    await waitFor(() => dispatched !== null || existsSync(resolve(tempMailDir, agentId, "dlq")));
+    // The gated (external-tier) path never dispatches: wait for the gate's own
+    // log line as well, instead of burning the full waitFor bound on a
+    // predicate that is false by design in that case.
+    await waitFor(
+      () =>
+        dispatched !== null ||
+        existsSync(resolve(tempMailDir, agentId, "dlq")) ||
+        warnCalls.some((line) => line.includes("not dispatched")),
+    );
 
     return {
       dispatched,
@@ -367,32 +375,42 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   //
   // The property that matters is not "the final name is never changed in
   // place" — that is an inotify shape and does not hold on every platform — it
-  // is "a concurrent drain never observes a half-written record". The REAL
-  // consumer is drainOutbox(): the branch relay (branch.ts:409) watches
-  // ~/.tps/outbox/new and calls it on every directory event, and it quarantines
-  // (never retries) a non-dot `.json` it cannot JSON.parse — so a torn read is a
-  // permanently LOST reply.
+  // is that a concurrent drain does not quarantine a record that is still being
+  // written. The REAL consumer is drainOutbox(): in `runStart`, `outboxWatcher`
+  // watches ~/.tps/outbox/new and calls the send pass, which drains through
+  // `OutboxSendTracker.dueWithStats` → `drainOutboxWithStats(false)`.
+  //
+  // CURRENT CONTRACT (#913): an unparseable file with an age from
+  // -OUTBOX_FUTURE_SKEW_MS (1 s) up to OUTBOX_PARTIAL_GRACE_MS is treated as a writer still in flight — the drain
+  // leaves it in place ("leaving in place") and a later pass reads it again.
+  // Only a file that is still malformed once it is at least the grace old, or
+  // one whose mtime is more than OUTBOX_FUTURE_SKEW_MS in the future, is quarantined to sent/.malformed-*. A
+  // torn in-place write is therefore lost only if it stays torn past the grace;
+  // one that completes within it is returned by `drainOutbox()` exactly once.
   //
   //   POSITIVE: the FIXED writer (writeOutboxFile, staged to a dot temp then
   //             renamed), driven through the production shape — a real
   //             fs.watch → drainOutbox() relay loop. Every record survives,
   //             zero quarantines. This loop must stay green.
-  //   NEGATIVE CONTROL: the PRE-FIX shape reprised as a test-only writer — a
-  //             MULTI-SYSCALL in-place write straight to the FINAL name
-  //             (open → 64 KiB writeSync chunks → close). It invokes the REAL
+  //   TORN-WRITER REGRESSION (#913): the PRE-FIX shape reprised as a test-only
+  //             writer — a MULTI-SYSCALL in-place write straight to the FINAL
+  //             name (open → 64 KiB writeSync chunks → close) — invokes the REAL
   //             consumer drainOutbox() between chunks, i.e. at the instant the
-  //             record is GUARANTEED incomplete, so the tear is deterministic:
-  //             no watch event, no yield, no timing — it holds on macOS and
-  //             Linux alike.
+  //             record is GUARANTEED incomplete. The record is LEFT IN PLACE
+  //             while young and delivered EXACTLY ONCE once complete.
+  //   NEGATIVE CONTROL: the same torn shape, aged past the grace while still
+  //             torn, IS quarantined. This one can fail: it goes red if the
+  //             quarantine is dropped (the regression test above goes red if the
+  //             grace is removed).
   //
   // A single synchronous writeFileSync, however large, is effectively atomic
-  // against an in-process reader and never tears — which is why the negative
-  // control is multi-syscall AND drives the drain itself rather than racing a
-  // watcher. The relay loop for the POSITIVE case mirrors branch.ts:409 exactly
-  // (a real fs.watch on outbox/new → drainOutbox() on each event); HOME is
-  // redirected per-test, and every wait has an explicit deadline.
+  // against an in-process reader and never tears — which is why the writer is
+  // multi-syscall AND drives the drain itself rather than racing a watcher.
+  // The relay loop for the POSITIVE case follows the branch relay's shape (a real
+  // fs.watch on outbox/new → drainOutbox() on each event); HOME is redirected
+  // per-test, and every wait has an explicit deadline.
 
-  /** The real relay, exactly as branch.ts:409 runs it. Collects delivered items. */
+  /** The real relay loop, following `outboxWatcher` in `runStart`. Collects delivered items. */
   function startRelay(newDir: string) {
     mkdirSync(newDir, { recursive: true });
     const delivered: any[] = [];
@@ -509,19 +527,23 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
     }
   }, 30000);
 
-  it("S0 relay (NEGATIVE CONTROL — pre-fix torn writer): the fixture CAN fail; an in-place chunked write is quarantined", () => {
+  it("S0 relay (torn-writer regression, #913): a chunked in-place write read mid-write is LEFT IN PLACE, then delivered exactly once", () => {
     const { newDir, sentDir } = outboxDirs();
     mkdirSync(newDir, { recursive: true });
 
-    // Capture the consumer's own quarantine log line.
+    // Capture the consumer's own log lines.
     const errLines: string[] = [];
     const origErr = console.error;
     console.error = (...args: any[]) => { errLines.push(args.map(String).join(" ")); };
 
     const N = 4;
+    const expectedIds: string[] = [];
+    const deliveredIds: string[] = [];
+    let malformedSeen = 0;
     try {
       for (let i = 0; i < N; i++) {
         const id = randomUUID();
+        expectedIds.push(id);
         const filename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${id}.json`;
         const record = JSON.stringify(
           { id, to: "flint", from: "anvil", body: `${i}:${BIG_BODY}`, timestamp: new Date().toISOString() },
@@ -531,21 +553,53 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
         // PRE-FIX shape: multi-syscall in-place write to the FINAL name, with the
         // REAL consumer draining between chunks — the record is guaranteed
         // incomplete at that instant, so the tear needs no timing at all.
-        tornWriteInPlace(resolve(newDir, filename), record, () => { drainOutbox(); });
+        tornWriteInPlace(resolve(newDir, filename), record, () => {
+          for (const item of drainOutbox()) deliveredIds.push(item.id);
+          malformedSeen = Math.max(malformedSeen, sentInventory(sentDir).malformed.length);
+        });
       }
-      drainOutbox(); // settle before read
+      for (const item of drainOutbox()) deliveredIds.push(item.id); // settle before read
+    } finally {
+      console.error = origErr;
+    }
+
+    // The consumer read the record mid-write and LEFT IT IN PLACE: the
+    // "leaving in place" line is the young-skip path…
+    expect(errLines.some((l) => l.includes("failed to parse") && l.includes("leaving in place"))).toBe(true);
+    // …no mid-write read quarantined anything…
+    expect(malformedSeen).toBe(0);
+    const { good, malformed } = sentInventory(sentDir);
+    expect(malformed.length).toBe(0);
+    // …and each completed record was delivered exactly once, not lost.
+    expect(good.length).toBe(N);
+    expect([...deliveredIds].sort()).toEqual([...expectedIds].sort());
+  }, 30000);
+
+  it("S0 relay (NEGATIVE CONTROL — torn writer aged past the grace): a record that stays malformed is quarantined", () => {
+    const { newDir, sentDir } = outboxDirs();
+    mkdirSync(newDir, { recursive: true });
+
+    const errLines: string[] = [];
+    const origErr = console.error;
+    console.error = (...args: any[]) => { errLines.push(args.map(String).join(" ")); };
+
+    try {
+      const filename = `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.json`;
+      const target = resolve(newDir, filename);
+      // Half of a record: it will never parse, and it is old enough that the
+      // drain cannot read it as a writer still in flight.
+      writeFileSync(target, '{"id":"torn","to":"flint","from":"anvil","body":"');
+      const aged = new Date(Date.now() - OUTBOX_PARTIAL_GRACE_MS - 60_000);
+      utimesSync(target, aged, aged);
+      expect(drainOutbox().length).toBe(0);
     } finally {
       console.error = origErr;
     }
 
     const { good, malformed } = sentInventory(sentDir);
-    // The mechanism is real: the consumer read a record mid-write and
-    // quarantined it with no retry, logging its own line…
-    expect(malformed.length).toBeGreaterThanOrEqual(1);
+    expect(malformed.length, "the aged torn record is quarantined").toBe(1);
+    expect(good.length).toBe(0);
     expect(errLines.some((l) => l.includes("failed to parse") && l.includes("quarantining"))).toBe(true);
-    // …so the delivered set comes up short — the reply would have been LOST.
-    expect(good.length).toBeLessThan(N);
-    expect(good.length + malformed.length).toBeLessThanOrEqual(N);
   }, 20000);
 
   it("S0 positive control: the final outbox file parses, keeps replyToId + headers, no dot file remains", async () => {

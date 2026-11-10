@@ -11,7 +11,7 @@ import { startServiceProxies, type ServiceProxySet } from "../utils/service-prox
 import { sendMessage, inboxExists, findRelayedRecord } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { OutboxSendTracker, queueOutboxMessage } from "../utils/outbox.js";
+import { OutboxSendTracker, OutboxYoungRetryScheduler, queueOutboxMessage, runOutboxSendPass } from "../utils/outbox.js";
 import { branchStatePath, clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
@@ -572,6 +572,28 @@ async function runStart(): Promise<void> {
 
   let serviceProxies: ServiceProxySet | null = null;
   const outboxSends = new OutboxSendTracker();
+  const outboxYoungRetry = new OutboxYoungRetryScheduler();
+
+  // One send pass: drain, deliver, and schedule a single retry if a young
+  // unparseable file was skipped. The retry is how that file gets another
+  // pass without another directory event; it may use only a live host channel.
+  const sendOutboxPass = (channel: TransportChannel, seq: number): Promise<void> =>
+    runOutboxSendPass({
+      tracker: outboxSends,
+      scheduler: outboxYoungRetry,
+      target: channel,
+      seq,
+      send: (target, item, sendSeq) => target.send({
+        type: MSG_MAIL_DELIVER,
+        seq: sendSeq,
+        ts: new Date().toISOString(),
+        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
+      }),
+      pickTarget: () => (activeHostChannel?.isAlive() ? activeHostChannel : null),
+      onRetryError: (error) => {
+        logLine("WARN", `Outbox retry failed: ${error instanceof Error ? error.message : String(error)}`);
+      },
+    });
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {
@@ -595,14 +617,7 @@ async function runStart(): Promise<void> {
     if (msg.type === MSG_HEARTBEAT) {
       // Echo heartbeat back so host can track bidirectional liveness
       await channel.send({ type: MSG_HEARTBEAT, seq: msg.seq, ts: new Date().toISOString(), body: {} }).catch(() => {});
-      for (const item of outboxSends.due()) {
-        await channel.send({
-          type: MSG_MAIL_DELIVER,
-          seq: msg.seq + 1,
-          ts: new Date().toISOString(),
-          body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-        }).catch(() => outboxSends.sendFailed(item.id));
-      }
+      await sendOutboxPass(channel, msg.seq + 1);
       logLine("SYNC", "Heartbeat received — drained outbox");
       return;
     }
@@ -719,14 +734,7 @@ async function runStart(): Promise<void> {
       logLine("MAIL", `Received message for ${body.to} (id: ${body.id})`);
     }
 
-    for (const item of outboxSends.due()) {
-      await channel.send({
-        type: MSG_MAIL_DELIVER,
-        seq: msg.seq + 1,
-        ts: new Date().toISOString(),
-        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => outboxSends.sendFailed(item.id));
-    }
+    await sendOutboxPass(channel, msg.seq + 1);
   };
 
   let server: TransportServer | null = null;
@@ -744,6 +752,7 @@ async function runStart(): Promise<void> {
       await branchTestPauseAsync("shutdown-after-signal", pidPath());
     }
     try { outboxWatcher?.close(); } catch {}
+    outboxYoungRetry.cancel();
     try { serviceProxies?.close(); } catch {}
     serviceProxies = null;
     activeHostChannel = null;
@@ -809,14 +818,7 @@ async function runStart(): Promise<void> {
   mkdirSync(outboxNewDir, { recursive: true });
   outboxWatcher = watch(outboxNewDir, async () => {
     if (!activeHostChannel || !activeHostChannel.isAlive()) return;
-    for (const item of outboxSends.due()) {
-      await activeHostChannel.send({
-        type: MSG_MAIL_DELIVER,
-        seq: 0,
-        ts: new Date().toISOString(),
-        body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => outboxSends.sendFailed(item.id));
-    }
+    await sendOutboxPass(activeHostChannel, 0);
   });
 
   // Keep alive — bun does not treat a no-op interval as a ref'd handle, so the

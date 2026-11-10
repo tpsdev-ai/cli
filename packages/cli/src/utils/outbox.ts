@@ -1,5 +1,5 @@
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -128,7 +128,28 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
   return { result: alreadyRecorded ? "duplicate" : "queued" };
 }
 
+/**
+ * A file that does not parse and whose age is under this value is treated as a
+ * writer still in flight, not a bad record. Ages down to -OUTBOX_FUTURE_SKEW_MS
+ * count as young (timestamp and clock skew); an mtime further in the future is
+ * treated as old.
+ */
+export const OUTBOX_PARTIAL_GRACE_MS = 5_000;
+
+/** Negative ages smaller than this are timestamp or clock skew, not a future-dated file. */
+export const OUTBOX_FUTURE_SKEW_MS = 1_000;
+
+export interface OutboxDrainResult {
+  messages: OutboxMessage[];
+  /** Unparseable files left in place because they are younger than the grace. */
+  skippedYoung: number;
+}
+
 export function drainOutbox(archive = true): OutboxMessage[] {
+  return drainOutboxWithStats(archive).messages;
+}
+
+export function drainOutboxWithStats(archive = true): OutboxDrainResult {
   const newDir = outboxDir("new");
   const sentDir = outboxDir("sent");
   mkdirSync(newDir, { recursive: true });
@@ -136,6 +157,7 @@ export function drainOutbox(archive = true): OutboxMessage[] {
 
   const files = readdirSync(newDir).filter(isMailboxMessageFile);
   const out: OutboxMessage[] = [];
+  let skippedYoung = 0;
   for (const f of files) {
     const src = join(newDir, f);
     let msg: OutboxMessage;
@@ -149,10 +171,26 @@ export function drainOutbox(archive = true): OutboxMessage[] {
     try {
       msg = JSON.parse(raw) as OutboxMessage;
     } catch (err) {
-      // Defense-in-depth: even with atomic writes, a partial file could appear
-      // (manual edit, crash mid-write before rename). Don't take the whole
-      // daemon down — log and quarantine the bad file.
-      console.error(`drainOutbox: failed to parse ${f}: ${(err as Error).message}; quarantining`);
+      let ageMs: number;
+      try {
+        // Read the mtime before the clock, so a write landing between the two
+        // reads cannot make an in-flight file look future-dated.
+        const mtimeMs = statSync(src).mtimeMs;
+        ageMs = Date.now() - mtimeMs;
+      } catch (statErr) {
+        console.error(`drainOutbox: failed to stat ${f}: ${(statErr as Error).message}; leaving in place`);
+        continue;
+      }
+      // A writer that is still writing publishes a short, unparseable file.
+      // Leave it for the next pass; quarantine once it has had the grace period
+      // and still does not parse, or straight away when its mtime is more than
+      // OUTBOX_FUTURE_SKEW_MS in the future (no writer in flight is that far ahead).
+      if (ageMs > -OUTBOX_FUTURE_SKEW_MS && ageMs < OUTBOX_PARTIAL_GRACE_MS) {
+        console.error(`drainOutbox: failed to parse ${f} (age ${Math.round(ageMs)}ms): younger than ${OUTBOX_PARTIAL_GRACE_MS}ms; leaving in place`);
+        skippedYoung++;
+        continue;
+      }
+      console.error(`drainOutbox: failed to parse ${f} (age ${Math.round(ageMs)}ms): quarantining`);
       try {
         renameSync(src, join(sentDir, `.malformed-${f}`));
       } catch {
@@ -163,7 +201,7 @@ export function drainOutbox(archive = true): OutboxMessage[] {
     if (archive) renameSync(src, join(sentDir, f));
     out.push(msg);
   }
-  return out;
+  return { messages: out, skippedYoung };
 }
 
 export function acknowledgeOutbox(id: string): void {
@@ -187,12 +225,22 @@ export function acknowledgeOutbox(id: string): void {
 export const OUTBOX_RESEND_BASE_MS = 60_000;
 export const OUTBOX_MAX_SENDS = 5;
 
+export interface OutboxSendPass {
+  messages: OutboxMessage[];
+  skippedYoung: number;
+}
+
 export class OutboxSendTracker {
   private readonly sends = new Map<string, { at: number; count: number }>();
 
   due(now = Date.now()): OutboxMessage[] {
+    return this.dueWithStats(now).messages;
+  }
+
+  dueWithStats(now = Date.now()): OutboxSendPass {
+    const { messages, skippedYoung } = drainOutboxWithStats(false);
     const out: OutboxMessage[] = [];
-    for (const item of drainOutbox(false)) {
+    for (const item of messages) {
       const prev = this.sends.get(item.id);
       if (prev && prev.count >= OUTBOX_MAX_SENDS) continue;
       if (prev && now - prev.at < OUTBOX_RESEND_BASE_MS * 2 ** (prev.count - 1)) continue;
@@ -201,7 +249,7 @@ export class OutboxSendTracker {
       if (count === OUTBOX_MAX_SENDS) console.error(`outbox: ${item.id} sent ${count} times without an ACK; not resending until restart`);
       out.push(item);
     }
-    return out;
+    return { messages: out, skippedYoung };
   }
 
   sendFailed(id: string): void {
@@ -215,4 +263,81 @@ export class OutboxSendTracker {
     acknowledgeOutbox(id);
     this.sends.delete(id);
   }
+}
+
+/**
+ * Schedules one retry when a send pass skipped a young unparseable file.
+ * While a retry is pending, further skips schedule nothing. The timer is
+ * unref'd so it does not hold the process open.
+ */
+export class OutboxYoungRetryScheduler {
+  private handle: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
+
+  constructor(
+    private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
+    private readonly clearTimer: (handle: ReturnType<typeof setTimeout>) => void = clearTimeout,
+    private readonly delayMs: number = OUTBOX_PARTIAL_GRACE_MS,
+  ) {}
+
+  get pending(): boolean {
+    return this.handle !== null;
+  }
+
+  observe(skippedYoung: number, run: () => void): void {
+    if (this.stopped || skippedYoung <= 0 || this.handle !== null) return;
+    const handle = this.setTimer(() => {
+      this.handle = null;
+      run();
+    }, this.delayMs);
+    this.handle = handle;
+    (handle as unknown as { unref?: () => void }).unref?.();
+  }
+
+  cancel(): void {
+    this.stopped = true;
+    if (this.handle === null) return;
+    this.clearTimer(this.handle);
+    this.handle = null;
+  }
+}
+
+export interface OutboxSendPassOptions<T> {
+  tracker: OutboxSendTracker;
+  scheduler: OutboxYoungRetryScheduler;
+  /** Channel this pass sends on. */
+  target: T;
+  /** Wire sequence number for this pass. */
+  seq: number;
+  /** Delivers one drained record on `target`; a rejection fails that record. */
+  send: (target: T, item: OutboxMessage, seq: number) => Promise<unknown> | void;
+  /**
+   * The channel a scheduled retry may use, or null when none is alive. A retry
+   * runs on seq 0: it belongs to no inbound message, and the outbox watcher
+   * uses 0 for the same reason.
+   */
+  pickTarget: () => T | null;
+  onRetryError?: (error: unknown) => void;
+}
+
+/**
+ * One send pass: drain, deliver, and schedule a single retry if a pass skipped
+ * a young unparseable file. The retry is how that file gets another pass
+ * without another directory event.
+ */
+export async function runOutboxSendPass<T>(options: OutboxSendPassOptions<T>): Promise<void> {
+  const { tracker, scheduler, target, seq, send, pickTarget, onRetryError } = options;
+  const pass = tracker.dueWithStats();
+  for (const item of pass.messages) {
+    try {
+      await send(target, item, seq);
+    } catch {
+      tracker.sendFailed(item.id);
+    }
+  }
+  scheduler.observe(pass.skippedYoung, () => {
+    const retryTarget = pickTarget();
+    if (retryTarget === null) return;
+    void runOutboxSendPass({ ...options, target: retryTarget, seq: 0 }).catch((error) => onRetryError?.(error));
+  });
 }

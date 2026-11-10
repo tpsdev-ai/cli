@@ -1,9 +1,9 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
-import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { queueOutboxMessage, drainOutbox, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS } from "../src/utils/outbox.js";
+import { queueOutboxMessage, drainOutbox, drainOutboxWithStats, OUTBOX_FUTURE_SKEW_MS, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OutboxYoungRetryScheduler, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS, OUTBOX_PARTIAL_GRACE_MS, runOutboxSendPass } from "../src/utils/outbox.js";
 import * as mailLock from "../src/utils/mail-lock.js";
 
 afterEach(() => {
@@ -69,13 +69,94 @@ describe("outbox", () => {
     const newDir = join(root, ".tps", "outbox", "new");
     const sentDir = join(root, ".tps", "outbox", "sent");
     queueOutboxMessage("host", "good", "austin");
-    writeFileSync(join(newDir, "2026-05-16-corrupt.json"), "", "utf-8");
-    const rows = drainOutbox();
-    expect(rows.length).toBe(1);
-    expect(rows[0]?.body).toBe("good");
-    expect(readdirSync(newDir).length).toBe(0);
-    // Bad file lands in sent/ with a .malformed- prefix for forensics
-    expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
+    const corrupt = join(newDir, "2026-05-16-corrupt.json");
+    writeFileSync(corrupt, "", "utf-8");
+    const past = new Date(Date.now() - 10_000);
+    utimesSync(corrupt, past, past);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const rows = drainOutbox();
+      expect(rows.length).toBe(1);
+      expect(rows[0]?.body).toBe("good");
+      expect(readdirSync(newDir).length).toBe(0);
+      // Bad file lands in sent/ with a .malformed- prefix for forensics
+      expect(readdirSync(sentDir).some((f) => f.startsWith(".malformed-"))).toBe(true);
+      const logs = errors.mock.calls.map((call) => String(call[0])).join("\n");
+      expect(logs).toMatch(/failed to parse 2026-05-16-corrupt\.json \(age \d+ms\): quarantining/);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test("a young empty file is skipped, then returned once after it is complete and never quarantined", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    const sentDir = join(root, ".tps", "outbox", "sent");
+    const name = "2026-05-16-partial.json";
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(join(newDir, name), "", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(drainOutbox()).toEqual([]);
+      expect(existsSync(join(newDir, name))).toBe(true);
+      expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
+
+      writeFileSync(
+        join(newDir, name),
+        JSON.stringify({ id: "partial-1", to: "host", from: "agent", body: "complete", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+      expect(drainOutbox().map((m) => m.id)).toEqual(["partial-1"]);
+      expect(drainOutbox()).toEqual([]);
+      expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
+      expect(existsSync(join(sentDir, name))).toBe(true);
+    } finally {
+      errors.mockRestore();
+    }
+  });
+
+  test("a valid file is returned on the first pass in both archive modes", () => {
+    queueOutboxMessage("host", "archived", "agent");
+    expect(drainOutbox(true).map((m) => m.body)).toEqual(["archived"]);
+    queueOutboxMessage("host", "kept", "agent");
+    expect(drainOutbox(false).map((m) => m.body)).toEqual(["kept"]);
+  });
+
+  test("a pass that skips a young file schedules one re-run and no second timer while it is pending", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    mkdirSync(newDir, { recursive: true });
+    writeFileSync(join(newDir, "young.json"), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    const scheduler = new OutboxYoungRetryScheduler(
+      (fn, ms) => {
+        timers.push({ fn, ms });
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      () => {},
+    );
+    try {
+      let runs = 0;
+      const first = drainOutboxWithStats(false);
+      expect(first.skippedYoung).toBe(1);
+      scheduler.observe(first.skippedYoung, () => { runs += 1; });
+      expect(timers).toHaveLength(1);
+      expect(timers[0]!.ms).toBe(OUTBOX_PARTIAL_GRACE_MS);
+
+      const second = drainOutboxWithStats(false);
+      expect(second.skippedYoung).toBe(1);
+      scheduler.observe(second.skippedYoung, () => { runs += 1; });
+      expect(timers).toHaveLength(1);
+
+      timers[0]!.fn();
+      expect(runs).toBe(1);
+      expect(scheduler.pending).toBe(false);
+
+      scheduler.observe(1, () => { runs += 1; });
+      expect(timers).toHaveLength(2);
+    } finally {
+      scheduler.cancel();
+      errors.mockRestore();
+    }
   });
 
   test("drainOutbox leaves a source it cannot read in place", () => {
@@ -183,6 +264,184 @@ describe("outbox", () => {
       }
     } finally {
       lock.mockRestore();
+    }
+  });
+
+  test("an mtime slightly in the future (within the skew tolerance) is treated as young", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    const sentDir = join(root, ".tps", "outbox", "sent");
+    mkdirSync(newDir, { recursive: true });
+    const name = "2026-05-16-skew.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const ahead = new Date(Date.now() + OUTBOX_FUTURE_SKEW_MS / 2);
+    utimesSync(join(newDir, name), ahead, ahead);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A writer in flight can stamp an mtime just ahead of the drain's clock read.
+      const result = drainOutboxWithStats(false);
+      expect(result.skippedYoung).toBe(1);
+      expect(result.messages).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(existsSync(join(newDir, name))).toBe(true);
+    expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
+  });
+
+  test("a file with an mtime more than OUTBOX_FUTURE_SKEW_MS in the future is treated as old and quarantined", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    const sentDir = join(root, ".tps", "outbox", "sent");
+    mkdirSync(newDir, { recursive: true });
+    const name = "2026-05-16-future.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const future = new Date(Date.now() + 3_600_000);
+    utimesSync(join(newDir, name), future, future);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A writer cannot hold a file young with an mtime more than OUTBOX_FUTURE_SKEW_MS ahead.
+      const result = drainOutboxWithStats(false);
+      expect(result.skippedYoung).toBe(0);
+      expect(result.messages).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(true);
+    expect(existsSync(join(newDir, name))).toBe(false);
+  });
+
+  test("a real timer runs the retry once after the delay, and cancel() suppresses it", async () => {
+    const scheduler = new OutboxYoungRetryScheduler(undefined, undefined, 20);
+    let runs = 0;
+    scheduler.observe(1, () => { runs += 1; });
+    expect(scheduler.pending).toBe(true);
+    await Bun.sleep(80);
+    expect(runs).toBe(1);
+    expect(scheduler.pending).toBe(false);
+
+    const second = new OutboxYoungRetryScheduler(undefined, undefined, 20);
+    let runsAfterCancel = 0;
+    second.observe(1, () => { runsAfterCancel += 1; });
+    second.cancel();
+    await Bun.sleep(80);
+    expect(runsAfterCancel).toBe(0);
+  });
+
+  test("observe() after cancel() schedules nothing", () => {
+    const timers: Array<{ fn: () => void; ms: number }> = [];
+    const scheduler = new OutboxYoungRetryScheduler(
+      (fn, ms) => {
+        timers.push({ fn, ms });
+        return 1 as unknown as ReturnType<typeof setTimeout>;
+      },
+      () => {},
+    );
+    scheduler.cancel();
+    scheduler.observe(1, () => {});
+    expect(timers).toHaveLength(0);
+    expect(scheduler.pending).toBe(false);
+  });
+
+  test("runOutboxSendPass leaves a young file, then its retry sends it once on seq 0", async () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    mkdirSync(newDir, { recursive: true });
+    const name = "young-relay.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const sent: Array<{ id: string; seq: number }> = [];
+    const tracker = new OutboxSendTracker();
+    const scheduler = new OutboxYoungRetryScheduler(undefined, undefined, 20);
+    const target = { name: "host-a" };
+    try {
+      await runOutboxSendPass({
+        tracker,
+        scheduler,
+        target,
+        seq: 42,
+        send: (_target, item, seq) => { sent.push({ id: item.id, seq }); },
+        pickTarget: () => target,
+      });
+      expect(sent).toEqual([]);
+      expect(scheduler.pending).toBe(true);
+
+      writeFileSync(
+        join(newDir, name),
+        JSON.stringify({ id: "young-1", to: "host-a", from: "agent-a", body: "complete", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+      await Bun.sleep(80);
+      // The retry belongs to no inbound message, so it does not reuse the pass's seq.
+      expect(sent).toEqual([{ id: "young-1", seq: 0 }]);
+      expect(scheduler.pending).toBe(false);
+    } finally {
+      scheduler.cancel();
+      errors.mockRestore();
+    }
+  });
+
+  test("runOutboxSendPass sends nothing when pickTarget returns null", async () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    mkdirSync(newDir, { recursive: true });
+    const name = "young-null.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const sent: string[] = [];
+    const tracker = new OutboxSendTracker();
+    const scheduler = new OutboxYoungRetryScheduler(undefined, undefined, 20);
+    try {
+      await runOutboxSendPass({
+        tracker,
+        scheduler,
+        target: { name: "host-a" },
+        seq: 0,
+        send: (_target, item) => { sent.push(item.id); },
+        pickTarget: () => null,
+      });
+      // The file is complete before the timer fires, so a retry that ran WOULD
+      // have something to send.
+      writeFileSync(
+        join(newDir, name),
+        JSON.stringify({ id: "young-3", to: "host-a", from: "agent-a", body: "complete", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+      await Bun.sleep(80);
+      expect(sent).toEqual([]);
+      expect(scheduler.pending).toBe(false);
+    } finally {
+      scheduler.cancel();
+      errors.mockRestore();
+    }
+  });
+
+  test("runOutboxSendPass sends nothing when cancelled before the retry fires", async () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    mkdirSync(newDir, { recursive: true });
+    const name = "young-cancelled.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    const sent: string[] = [];
+    const tracker = new OutboxSendTracker();
+    const scheduler = new OutboxYoungRetryScheduler(undefined, undefined, 20);
+    const target = { name: "host-a" };
+    try {
+      await runOutboxSendPass({
+        tracker,
+        scheduler,
+        target,
+        seq: 0,
+        send: (_target, item) => { sent.push(item.id); },
+        pickTarget: () => target,
+      });
+      writeFileSync(
+        join(newDir, name),
+        JSON.stringify({ id: "young-2", to: "host-a", from: "agent-a", body: "complete", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+      scheduler.cancel();
+      await Bun.sleep(80);
+      expect(sent).toEqual([]);
+    } finally {
+      scheduler.cancel();
+      errors.mockRestore();
     }
   });
 
