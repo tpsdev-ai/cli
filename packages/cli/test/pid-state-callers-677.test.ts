@@ -120,7 +120,7 @@ import { runStatus } from ${JSON.stringify(STATUS_MODULE)};
 const lines = [];
 const log = console.log;
 console.log = (...args) => lines.push(args.join(" "));
-const forcedPidState = (pid) => (pid === 999999 ? "alive" : "gone");
+const forcedPidState = (pid) => (pid === 999_999 ? "alive" : "gone");
 await runStatus({ json: true }, { pidState: forcedPidState });
 console.log = log;
 process.stdout.write("RESULT " + JSON.stringify(JSON.parse(lines.join("\\n"))) + "\\n");

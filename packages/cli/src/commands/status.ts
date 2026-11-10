@@ -415,8 +415,9 @@ function computeState(
   if (raw.status === "error") {
     return "error";
   }
-  // For an online record, every present pid, including 0, goes through
-  // pidState. A probe refused with EPERM (permission denied) is reported alive.
+  // For an online record, every present pid, including 0, goes through the
+  // probe (default: pidState, which reports a probe refused with EPERM,
+  // permission denied, as alive).
   if (raw.pid !== undefined && raw.pid !== null && raw.status === "online" && probe(raw.pid) !== "alive") {
     return "zombie";
   }
