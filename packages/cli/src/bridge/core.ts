@@ -22,6 +22,7 @@ import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridge
 import {
   assertBridgeAdapterName,
   BRIDGE_ADAPTER_NAME_RE,
+  printableName,
   validateBridgeAdapterName,
   type BridgeAdapter,
   type BridgeEnvelope,
@@ -85,7 +86,7 @@ export class BridgeCore {
     if (currentName !== this.adapterName) {
       assertBridgeAdapterName(currentName);
       throw new Error(
-        `Bridge adapter name changed from ${JSON.stringify(this.adapterName)} to ${JSON.stringify(currentName)} after construction; refusing to start. Construct a new bridge for the new name.`,
+        `Bridge adapter name changed from ${printableName(this.adapterName)} to ${printableName(currentName)} after construction; refusing to start. Construct a new bridge for the new name.`,
       );
     }
     // Start adapter with inbound callback
@@ -197,7 +198,7 @@ Message: ${envelope.content}`;
       } else {
         // Plain text reply — route back to the channel this agent is bridging
         envelope = {
-          channel: this.adapter.name,
+          channel: this.adapterName,
           channelId: this.defaultChannelId ?? "",
           content: verifiedBody,
           senderId: "agent",

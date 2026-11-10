@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -8,12 +8,19 @@ import {
   BRIDGE_ADAPTER_NAME_RE,
   validateBridgeAdapterName,
   type BridgeAdapter,
+  type BridgeEnvelope,
 } from "../src/bridge/adapter.js";
 import { BRIDGE_ADAPTERS, BridgeCore } from "../src/bridge/core.js";
 import { DiscordAdapter } from "../src/bridge/discord-adapter.js";
 import { OpenClawAdapter } from "../src/bridge/openclaw-adapter.js";
 import { StdioAdapter } from "../src/bridge/stdio-adapter.js";
 import { bridgePidFiles } from "../src/utils/mail-bridge.js";
+import * as mail from "../src/utils/mail.js";
+import type { MailMessage, PromoteOk } from "../src/utils/mail.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 function makeTmpDir(): string {
   const dir = join(tmpdir(), `tps-bridge-adapter-name-725-${randomUUID()}`);
@@ -125,10 +132,8 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     }
   });
 
-  test("writer/reader parity: every accepted adapter name writes a pid file discovered by bridgePidFiles", async () => {
-    const acceptedNames = [...BRIDGE_ADAPTERS, "a", "z", "customadapter"];
-
-    for (const name of acceptedNames) {
+  for (const name of [...BRIDGE_ADAPTERS, "a", "z", "customadapter"]) {
+    test(`writer/reader parity: accepted adapter name ${name} writes a pid file discovered by bridgePidFiles`, async () => {
       expect(validateBridgeAdapterName(name)).toBe(true);
 
       const adapter: BridgeAdapter = {
@@ -155,8 +160,8 @@ describe("bridge adapter-name grammar (cli#725)", () => {
         await core.stop();
       }
       expect(bridgePidFiles(name)).toEqual([]);
-    }
-  });
+    });
+  }
 
   test("the pid file and record use the name validated at construction, even when the adapter renames itself in start()", async () => {
     class RenamingAdapter implements BridgeAdapter {
@@ -182,6 +187,53 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     // stop() removes the file it wrote, not one named after the renamed adapter.
     expect(readdirSync(runDir)).toEqual([]);
   });
+
+  test("a plain-text outbound reply carries the constructed adapter name after the adapter renames itself in start()", async () => {
+    class RenamingAdapter implements BridgeAdapter {
+      name = "openclaw";
+      readonly sent: BridgeEnvelope[] = [];
+      async start() {
+        this.name = "openclaw2";
+      }
+      async send(envelope: BridgeEnvelope) {
+        this.sent.push(envelope);
+      }
+      async stop() {}
+    }
+    const adapter = new RenamingAdapter();
+    const core = new BridgeCore(adapter, { bridgeAgentId: "test-bridge", defaultAgentId: "default-agent", mailDir }, () => {});
+    try {
+      // The reply and the promote spy are in place before start(), so the outbox's initial scan delivers it.
+      // Waiting on an fs.watch event instead took up to 2.4 s on a loaded host.
+      const reply: MailMessage = {
+        id: "reply-1",
+        from: "agent-a",
+        to: "test-bridge",
+        body: "plain reply from the agent",
+        timestamp: new Date().toISOString(),
+        read: false,
+      };
+      const replyPath = join(mailDir, "test-bridge", "tmp", "reply.json");
+      mkdirSync(join(mailDir, "test-bridge", "tmp"), { recursive: true });
+      writeFileSync(replyPath, JSON.stringify(reply), "utf-8");
+      const promoted: PromoteOk = { ok: true, message: reply, path: replyPath };
+      spyOn(mail, "promote").mockImplementation(async (_agent, filePath) => {
+        rmSync(filePath, { force: true });
+        return promoted;
+      });
+
+      mkdirSync(join(mailDir, "test-bridge", "new"), { recursive: true });
+      writeFileSync(join(mailDir, "test-bridge", "new", "reply.json"), JSON.stringify(reply), "utf-8");
+      await core.start();
+      for (let attempt = 0; attempt < 300 && adapter.sent.length === 0; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      expect(adapter.sent.map((envelope) => envelope.content)).toEqual(["plain reply from the agent"]);
+      expect(adapter.sent.map((envelope) => envelope.channel)).toEqual(["openclaw"]);
+    } finally {
+      await core.stop();
+    }
+  }, 10_000);
 
   test("start() refuses when the adapter's name changed to another valid name after construction", async () => {
     let current = "openclaw";
@@ -229,14 +281,21 @@ describe("bridge adapter-name grammar (cli#725)", () => {
     expect(principals.some((file) => file.startsWith("openclaw-bridge"))).toBe(true);
   });
 
-  test("the refusal message escapes C1 controls and line or bidi format characters", () => {
+  test("the refusal message escapes every code point outside printable ASCII", () => {
+    const codePoints = [0x009b, 0x202e, 0x2028, 0x061c, 0x200b, 0x200d, 0x2060, 0x206a, 0xfeff, 0x180e, 0x00ad, 0x1f600];
     let message = "";
     try {
-      assertBridgeAdapterName("x\u009b31m\u202e\u2028");
+      assertBridgeAdapterName(`x${String.fromCodePoint(...codePoints)}`);
     } catch (err) {
       message = (err as Error).message;
     }
-    expect(message).toContain("\\u009b31m\\u202e\\u2028");
-    expect(/[\u007f-\u009f\u2028\u202e]/.test(message)).toBe(false);
+    for (const codePoint of codePoints) {
+      const raw = String.fromCodePoint(codePoint);
+      expect(message).not.toContain(raw);
+      for (let index = 0; index < raw.length; index++) {
+        const escape = `\\u${raw.charCodeAt(index).toString(16).padStart(4, "0")}`;
+        expect(message).toContain(escape);
+      }
+    }
   });
 });
