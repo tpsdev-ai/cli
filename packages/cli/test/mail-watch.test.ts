@@ -7,8 +7,10 @@
  *    watcher does NOT consume — it moves, leases and acks nothing; the source
  *    file stays in new/ and nothing appears in cur/. A record that does not
  *    verify is skipped, never presented.
- *  - the poll path is proven ALONE (fs events suppressed via a no-op watchImpl)
- *    and the event path is proven with the real fs.watch.
+ *  - the poll path is proven ALONE (fs events suppressed via a no-op watchImpl).
+ *    The event path is driven through the same watchImpl seam: the case captures
+ *    the listener the watcher registers and fires it itself, with the poll idle.
+ *    One smoke case runs the real fs.watch, with a short poll fallback.
  *  - dedup is on the verified envelope id while the file stays in new/ (two
  *    files with the same signed id present once); within one watcher instance a
  *    message is presented again only after a scan observes its file absent from
@@ -22,8 +24,8 @@
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
 import * as fs from "node:fs";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { execFileSync } from "node:child_process";
 import { platform } from "node:os";
@@ -63,17 +65,20 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000, describe?: () => s
 // Never fires an fs event.
 const NO_FS_EVENTS = () => ({ close() {} });
 
-// Bound for a wait that only an fs event can satisfy. On a loaded macOS host,
-// FSEvents has reported a lone write over 10 s late, and a write that was being
-// touched (waitForTouching) over 5 s late. The bound is sized for that; it costs
-// nothing when the event arrives promptly.
-const EVENT_PATH_DEADLINE_MS = 15_000;
-// Timeout of a case that waits up to EVENT_PATH_DEADLINE_MS.
-const EVENT_PATH_CASE_TIMEOUT_MS = EVENT_PATH_DEADLINE_MS + 5_000;
-// Poll interval for such a case: longer than its timeout, so no poll tick can
-// run inside it. After the startup scan, only an fs event can make the watcher
-// scan new/ again.
-const EVENT_PATH_POLL_MS = 60_000;
+// Poll interval for a case that fires the fs event itself (capturedFsEvents):
+// far longer than the case's timeout, so no poll tick runs inside it. After the
+// startup scan, only the event the case fires makes the watcher scan new/ again.
+const IDLE_POLL_MS = 60_000;
+// Bound for the scan a fired event triggers. The watcher's debounce, listing and
+// verification take tens of milliseconds; nothing here waits on the OS.
+const SCAN_SETTLE_MS = 2_000;
+
+// The one case on the real fs.watch. On macOS, FSEvents can report a write
+// seconds late on a loaded host, and no unit-test bound covers that. So the case
+// keeps a short poll fallback, and asserts only that the record is presented
+// within SMOKE_DEADLINE_MS, by an fs event or a poll tick.
+const SMOKE_POLL_MS = 1_000;
+const SMOKE_DEADLINE_MS = 10_000;
 
 // ---------------------------------------------------------------------------
 // validateAgentId
@@ -235,7 +240,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
    * A promise that resolves when watchMail reports its FIRST scan attempt of
    * `new/` finished (whether or not the listing succeeded). A record delivered
    * after this cannot be picked up by the startup scan. It does not mean fs.watch
-   * is already reporting events: see waitForTouching.
+   * is already reporting events (see MailWatchOptions.onReady).
    */
   function readySignal() {
     let resolve: () => void = () => {};
@@ -252,24 +257,25 @@ describe("watchMail (verified-only, non-consuming)", () => {
   }
 
   /**
-   * waitFor for a record delivered on the fs-EVENT path: until `cond` holds, set
-   * `file`'s times to now on every iteration. On macOS, FSEvents can report a
-   * lone write seconds late, even after onReady; touching the file keeps events
-   * for it coming until the watcher has scanned it. A touch changes metadata
-   * only, so a scan never reads a half-written record, and the watcher skips a
-   * file it has already classified, so a touch cannot present a record twice.
+   * A watchImpl that subscribes to nothing in the OS: it captures the listener
+   * watchMail registers, and `fire` calls it with the arguments fs.watch passes
+   * (eventType, then the file name relative to new/). A case fires it after the
+   * record is on disk, so the event path runs at a known point. The real
+   * fs.watch cannot be bounded in a unit test: on macOS, FSEvents can report a
+   * write seconds late on a loaded host.
    */
-  async function waitForTouching(file: string, cond: () => boolean, timeoutMs: number, describe: () => string) {
-    await waitFor(
-      () => {
-        if (cond()) return true;
-        const now = new Date();
-        utimesSync(file, now, now);
-        return false;
+  function capturedFsEvents() {
+    let listener: ((eventType: string, filename: string) => void) | undefined;
+    return {
+      watchImpl: (_dir: string, registered: () => void) => {
+        listener = registered;
+        return { close() {} };
       },
-      timeoutMs,
-      describe,
-    );
+      fire(file: string, eventType: "rename" | "change" = "rename") {
+        if (!listener) throw new Error("watchMail registered no fs.watch listener");
+        listener(eventType, basename(file));
+      },
+    };
   }
 
   /** Capture console.error lines (the watcher's log) until restored. */
@@ -358,42 +364,48 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(jsonFiles(inbox.cur)).toHaveLength(0);
   });
 
-  it("event path: a signed record delivered AFTER startup is presented", async () => {
+  it("event path (the case fires the fs event, poll idle): a signed record delivered AFTER startup is presented", async () => {
     const received: string[] = [];
     const ready = readySignal();
+    const events = capturedFsEvents();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
-      pollMs: EVENT_PATH_POLL_MS,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
       onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
-
-    await ready.promise;
-    deliverSigned("event delivered");
-    await waitForTouching(
-      onlyNewFile(),
-      () => received.includes("event delivered"),
-      EVENT_PATH_DEADLINE_MS,
-      () => `received: ${JSON.stringify(received)}`,
-    );
-    watcher.stop();
+    try {
+      await ready.promise;
+      deliverSigned("event delivered");
+      events.fire(onlyNewFile());
+      await waitFor(
+        () => received.includes("event delivered"),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the record; received: ${JSON.stringify(received)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
 
     expect(received).toContain("event delivered");
-  }, EVENT_PATH_CASE_TIMEOUT_MS);
+  }, 10_000);
 
-  it("event path: an unsigned record reaches NEITHER onMessage nor the hook", async () => {
+  it("event path (the case fires the fs event, poll idle): an unsigned record reaches NEITHER onMessage nor the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "unsigned-event-hook.txt");
     const envOut = join(tempRoot, "unsigned-event-env.json");
     const ready = readySignal();
+    const events = capturedFsEvents();
     const log = captureErrors();
     let watcher: MailWatcher | undefined;
     try {
       watcher = watchMail({
         agent: AGENT,
         debounceMs: 20,
-        pollMs: EVENT_PATH_POLL_MS,
+        pollMs: IDLE_POLL_MS,
+        watchImpl: events.watchImpl,
         onReady: ready.onReady,
         hook: hookCapturing(out, envOut),
         onMessage: (msg) => { received.push(msg.body); },
@@ -401,14 +413,14 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
       await ready.promise;
       deliverUnsigned("event unsigned", "unsigned-event");
+      events.fire(onlyNewFile());
       // Wait until a scan has READ the record and refused it, so the assertions
       // below are about a record the watcher saw.
       const refused = () => log.lines.some((l) => l.includes("unsigned-event: not presented"));
-      await waitForTouching(
-        onlyNewFile(),
+      await waitFor(
         () => refused() || received.length > 0,
-        EVENT_PATH_DEADLINE_MS,
-        () => `received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
+        SCAN_SETTLE_MS,
+        () => `the fs event did not lead to a refusal; received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
       );
     } finally {
       watcher?.stop();
@@ -417,20 +429,49 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     expect(received).toEqual([]);
     expect(existsSync(out), "the hook never ran").toBe(false);
-  }, EVENT_PATH_CASE_TIMEOUT_MS);
+  }, 10_000);
+
+  it("real fs.watch with a 1 s poll fallback: a signed record delivered AFTER startup is presented within 10 s", async () => {
+    const received: string[] = [];
+    const ready = readySignal();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: SMOKE_POLL_MS,
+      onReady: ready.onReady,
+      onMessage: (msg) => { received.push(msg.body); },
+    });
+    try {
+      await ready.promise;
+      deliverSigned("smoke delivered");
+      await waitFor(
+        () => received.includes("smoke delivered"),
+        SMOKE_DEADLINE_MS,
+        () =>
+          `neither an fs event nor a ${SMOKE_POLL_MS} ms poll tick presented the record; ` +
+          `received: ${JSON.stringify(received)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
+
+    expect(received).toContain("smoke delivered");
+  }, SMOKE_DEADLINE_MS + 5_000);
 
   it("an envelope with an altered wrapper SENDER is never presented, and never launches the hook", async () => {
     const received: string[] = [];
     const out = join(tempRoot, "tampered-hook.txt");
     const envOut = join(tempRoot, "tampered-env.json");
     const ready = readySignal();
+    const events = capturedFsEvents();
     const log = captureErrors();
     let watcher: MailWatcher | undefined;
     try {
       watcher = watchMail({
         agent: AGENT,
         debounceMs: 20,
-        pollMs: 30,
+        pollMs: IDLE_POLL_MS,
+        watchImpl: events.watchImpl,
         onReady: ready.onReady,
         hook: hookCapturing(out, envOut),
         onMessage: (msg) => { received.push(msg.body); },
@@ -449,13 +490,13 @@ describe("watchMail (verified-only, non-consuming)", () => {
         timestamp: env.timestamp,
         read: false,
       });
+      events.fire(onlyNewFile());
       // Wait until a scan has READ the record and refused it.
       const refused = () => log.lines.some((l) => l.includes("tampered-1: not presented"));
-      await waitForTouching(
-        onlyNewFile(),
+      await waitFor(
         () => refused() || received.length > 0,
-        5000,
-        () => `received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
+        SCAN_SETTLE_MS,
+        () => `the fs event did not lead to a refusal; received: ${JSON.stringify(received)}; log: ${JSON.stringify(log.lines)}`,
       );
     } finally {
       watcher?.stop();
@@ -469,31 +510,46 @@ describe("watchMail (verified-only, non-consuming)", () => {
   it("presents a record ONCE while its file stays in new/ (dedup by envelope id)", async () => {
     const received: string[] = [];
     const ready = readySignal();
+    const events = capturedFsEvents();
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
-      pollMs: 30,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
       onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
-
-    await ready.promise;
-    deliverSigned("once only");
-    const file = onlyNewFile();
-    await waitForTouching(
-      file,
-      () => received.length >= 1,
-      5000,
-      () => `received: ${JSON.stringify(received)}`,
-    );
-    // Several poll cycles, and further fs events on the same file (touches, as
-    // above): a second presentation would show up here.
-    for (let i = 0; i < 10; i++) {
-      const now = new Date();
-      utimesSync(file, now, now);
-      await sleep(20);
+    try {
+      await ready.promise;
+      deliverSigned("once only");
+      const file = onlyNewFile();
+      events.fire(file);
+      await waitFor(
+        () => received.length >= 1,
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the record; received: ${JSON.stringify(received)}`,
+      );
+      // Ten further fs events on the same file, each after the debounce window,
+      // so each starts its own scan of new/: a second presentation would show up.
+      for (let i = 0; i < 10; i++) {
+        events.fire(file, "change");
+        await sleep(40);
+      }
+      // Barrier: a second record, fired after those events, is presented by a
+      // scan that lists the first file again; once it is in, every scan above
+      // has finished.
+      deliverSigned("barrier");
+      const barrier = jsonFiles(dirname(file)).map((f) => join(dirname(file), f)).find((p) => p !== file);
+      expect(barrier).toBeDefined();
+      events.fire(barrier!);
+      await waitFor(
+        () => received.includes("barrier"),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the barrier record; received: ${JSON.stringify(received)}`,
+      );
+    } finally {
+      watcher.stop();
     }
-    watcher.stop();
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
   }, 10_000);
@@ -530,41 +586,49 @@ describe("watchMail (verified-only, non-consuming)", () => {
   it("presents an unconsumed message AGAIN after its file leaves and re-enters new/", async () => {
     const received: string[] = [];
     const ready = readySignal();
+    const events = capturedFsEvents();
+    const presentations = () => received.filter((b) => b === "redelivered").length;
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
-      pollMs: 30,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
       onReady: ready.onReady,
       onMessage: (msg) => { received.push(msg.body); },
     });
+    try {
+      await ready.promise;
+      deliverSigned("redelivered");
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => presentations() === 1,
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the record; received: ${JSON.stringify(received)}`,
+      );
 
-    await ready.promise;
-    deliverSigned("redelivered");
-    await waitForTouching(
-      onlyNewFile(),
-      () => received.filter((b) => b === "redelivered").length === 1,
-      5000,
-      () => `received: ${JSON.stringify(received)}`,
-    );
+      // The file leaves new/ — the scan this event starts finds it gone, and the
+      // watcher forgets it. (A later scan would observe the same absence, so this
+      // settle is not what the second presentation depends on.)
+      const bytes = readFileSync(first);
+      rmSync(first);
+      events.fire(first);
+      await sleep(100);
 
-    // The file leaves new/ — the watcher forgets it.
-    const inbox = getInbox(AGENT);
-    const [file] = jsonFiles(inbox.fresh);
-    const bytes = readFileSync(join(inbox.fresh, file));
-    rmSync(join(inbox.fresh, file));
-    await sleep(120);
+      // It re-enters new/ with the same envelope.
+      const again = join(dirname(first), `re-${basename(first)}`);
+      writeFileSync(again, bytes);
+      events.fire(again);
+      await waitFor(
+        () => presentations() === 2,
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the re-entered record; received: ${JSON.stringify(received)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
 
-    // It re-enters new/ with the same envelope.
-    writeFileSync(join(inbox.fresh, `re-${file}`), bytes);
-    await waitForTouching(
-      join(inbox.fresh, `re-${file}`),
-      () => received.filter((b) => b === "redelivered").length === 2,
-      5000,
-      () => `received: ${JSON.stringify(received)}`,
-    );
-    watcher.stop();
-
-    expect(received.filter((b) => b === "redelivered")).toHaveLength(2);
+    expect(presentations()).toBe(2);
   }, 10_000);
 
   it("a transient new/ listing failure does not present a still-present file twice", async () => {
@@ -796,25 +860,36 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
   it("a throwing onPoll never crashes the watcher (heartbeat failure is swallowed)", async () => {
     const received: string[] = [];
+    let throws = 0;
     const ready = readySignal();
+    const events = capturedFsEvents();
+    // The poll stays short here: the heartbeat runs once per poll cycle, so the
+    // case needs poll cycles for onPoll to throw on.
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: 40,
+      watchImpl: events.watchImpl,
       onReady: ready.onReady,
-      onPoll: () => { throw new Error("simulated heartbeat failure"); },
+      onPoll: () => { throws++; throw new Error("simulated heartbeat failure"); },
       onMessage: (msg) => { received.push(msg.body); },
     });
-
-    await ready.promise;
-    deliverSigned("still alive");
-    await waitForTouching(
-      onlyNewFile(),
-      () => received.includes("still alive"),
-      5000,
-      () => `received: ${JSON.stringify(received)}`,
-    );
-    watcher.stop();
+    try {
+      await ready.promise;
+      // onPoll has thrown at startup and on at least two poll cycles.
+      await waitFor(() => throws >= 3, SCAN_SETTLE_MS, () => `onPoll ran ${throws} time(s)`);
+      deliverSigned("still alive");
+      // The fired event or a poll tick presents it: the case asserts only that
+      // the watcher still delivers after onPoll threw.
+      events.fire(onlyNewFile());
+      await waitFor(
+        () => received.includes("still alive"),
+        SCAN_SETTLE_MS,
+        () => `the record was not presented after onPoll threw ${throws} time(s); received: ${JSON.stringify(received)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
     expect(received).toContain("still alive");
   }, 10_000);
 

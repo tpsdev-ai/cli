@@ -91,8 +91,8 @@ export interface MailWatchOptions {
    * is picked up by an fs event or a poll tick, never by the startup scan.
    * It does NOT guarantee that fs.watch reports a write made immediately
    * afterwards in good time: on macOS, FSEvents can report such a write seconds
-   * late. Tests that deliver on the fs-event path therefore keep touching the
-   * file they wrote until the watcher has scanned it, within a bounded wait.
+   * late. Tests that exercise the fs-event path therefore pass a `watchImpl`
+   * that captures the listener, and fire it themselves after the write.
    * Default: no-op. It is informational only: errors thrown by the callback are
    * swallowed, and it does not affect delivery.
    */
