@@ -5,7 +5,9 @@
  * Uses the test-key pattern from packages/cli/test/mail-send-sign.test.ts
  * (seedFromByte, mockFlair). Tests are hermetic — no real Flair HTTP calls.
  */
-import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
+import { describe, expect, it, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve, basename } from "node:path";
 import { tmpdir } from "node:os";
@@ -73,6 +75,16 @@ function readDlqReason(mailDir: string, agentId: string): string | null {
   }
 }
 
+const sleep = (ms: number) => new Promise<void>((res) => setTimeout(res, ms));
+const TEST_TIMEOUT_MS = 15_000;
+
+/** Poll until `done()` holds, for at most `timeoutMs` (cli#720). */
+async function until(done: () => boolean, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!done() && Date.now() < deadline) await sleep(10);
+  return done();
+}
+
 function readdirSafe(dir: string): string[] {
   try { return readdirSync(dir); } catch { return []; }
 }
@@ -132,37 +144,52 @@ describe("verify-strict: signed envelope verification", () => {
   let tempMailDir: string;
   let abortController: AbortController;
   let dispatchResolve: (val: any) => void;
-  let dispatchReject: (err: any) => void;
   let dispatchPromise: Promise<any>;
   let dispatchCount: number;
+  let startPromise: Promise<void> | undefined;
+  let openWatchers: Set<EventEmitter>;
+  let watchSpy: ReturnType<typeof spyOn>;
 
   beforeEach(() => {
     tempMailDir = mkdtempSync(join(tmpdir(), "tps-verify-"));
     abortController = new AbortController();
     dispatchCount = 0;
-    dispatchPromise = new Promise<any>((res, rej) => {
+    startPromise = undefined;
+    dispatchPromise = new Promise<any>((res) => {
       dispatchResolve = res;
-      dispatchReject = rej;
     });
+    // cli#720: no OS watch. Bun on Linux registers each file already in new/
+    // when a directory watch starts, and the plugin moves that file out of new/
+    // at once. The startup scan reads new/ without the watch.
+    openWatchers = new Set();
+    watchSpy = spyOn(fs, "watch").mockImplementation((() => {
+      const watcher: EventEmitter = Object.assign(new EventEmitter(), { close: () => openWatchers.delete(watcher) });
+      openWatchers.add(watcher);
+      return watcher;
+    }) as unknown as typeof fs.watch);
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     abortController.abort();
+    try { await startPromise; } catch { /* expected on abort */ }
+    watchSpy.mockRestore();
     try {
       rmSync(tempMailDir, { recursive: true, force: true });
     } catch {
       /* best effort */
     }
+    expect(openWatchers.size).toBe(0);
   });
 
   /**
-   * Start the plugin and wait for either a dispatch (happy path) or
-   * a timeout (implies DLQ). Returns the dispatch result or null if
-   * nothing was dispatched.
+   * Write one mail with `body` to `agentId`'s new/, start the plugin, and wait
+   * (bounded) until the mail is dispatched or dead-lettered. Returns the
+   * dispatch result or null if nothing was dispatched.
    */
-  async function runVerifyTest(
+  async function runMail(
     agentId: string,
-    envelope: Envelope,
+    from: string,
+    body: string,
     flairMock: { getAgent(name: string): Promise<{ publicKey: Buffer } | null> },
   ): Promise<{ dispatched: any | null; dlqReason: string | null }> {
     // Mock the verify-adapter to inject hermetic Flair mock
@@ -173,8 +200,7 @@ describe("verify-strict: signed envelope verification", () => {
     const newDir = resolve(tempMailDir, agentId, "new");
     mkdirSync(newDir, { recursive: true });
 
-    // Write the mail file with signed envelope as body
-    const msg = makeMailEnvelope(JSON.stringify(envelope), { from: envelope.from, to: agentId });
+    const msg = makeMailEnvelope(body, { from, to: agentId });
     const filename = `2026-05-26T00-00-00-${msg.id}.json`;
     writeFileSync(resolve(newDir, filename), JSON.stringify(msg, null, 2), "utf-8");
 
@@ -204,26 +230,27 @@ describe("verify-strict: signed envelope verification", () => {
       abortSignal: abortController.signal,
     };
 
-    const startPromise = capturedPlugin.gateway.startAccount(ctx);
+    startPromise = capturedPlugin.gateway.startAccount(ctx);
 
-    // Wait for dispatch or timeout
-    let dispatched: any = null;
-    try {
-      dispatched = await Promise.race([
-        dispatchPromise,
-        new Promise<null>((res) => setTimeout(() => res(null), 2000)),
-      ]);
-    } catch {
-      // dispatchReject or timeout
-    }
+    // cli#720: wait for the outcome, not a fixed time. `Reason:` is the last
+    // line the dead-letter write puts in the sidecar.
+    await until(() => dispatchCount > 0 || (readDlqReason(tempMailDir, agentId)?.includes("Reason:") ?? false));
 
     abortController.abort();
     try { await startPromise; } catch { /* expected on abort */ }
 
-    // Read DLQ reason
-    const dlqReason = readDlqReason(tempMailDir, agentId);
+    return {
+      dispatched: dispatchCount > 0 ? await dispatchPromise : null,
+      dlqReason: readDlqReason(tempMailDir, agentId),
+    };
+  }
 
-    return { dispatched, dlqReason };
+  function runVerifyTest(
+    agentId: string,
+    envelope: Envelope,
+    flairMock: { getAgent(name: string): Promise<{ publicKey: Buffer } | null> },
+  ) {
+    return runMail(agentId, envelope.from, JSON.stringify(envelope), flairMock);
   }
 
   // ── Happy path ──────────────────────────────────────────────────────
@@ -241,7 +268,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dispatched.ctx.Body).toBe("Hello from signed envelope");
     expect(dispatched.ctx.From).toBe("flint");
     expect(dispatchCount).toBe(1);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 1: Forged sender (wrong key signs) ────────────────
 
@@ -297,7 +324,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toContain("signature");
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 2: Chain truncation ──────────────────────────────
 
@@ -330,7 +357,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toMatch(/mismatch/i);
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 3: Chain injection ───────────────────────────────
 
@@ -359,7 +386,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toMatch(/signature|mismatch/i);
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 4: Adjacent-hop reorder ──────────────────────────
 
@@ -390,7 +417,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toMatch(/signature|mismatch|tip/i);
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 5: Tampered rationale ─────────────────────────────
 
@@ -410,7 +437,7 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toMatch(/signature/i);
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Attack vector 6: Message swap (mutate body after sign) ─────────
 
@@ -430,67 +457,22 @@ describe("verify-strict: signed envelope verification", () => {
     expect(dlqReason).not.toBeNull();
     expect(dlqReason!).toMatch(/signature/i);
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Malformed: not JSON ─────────────────────────────────────────────
 
   it("dlqs non-JSON body", async () => {
-    const agentId = "anvil";
-    const newDir = resolve(tempMailDir, agentId, "new");
-    mkdirSync(newDir, { recursive: true });
+    const { dlqReason: reason } = await runMail("anvil", "flint", "not json at all {{{", mockFlair({ flint: FLINT_SEED }));
 
-    const msg = makeMailEnvelope("not json at all {{{", { from: "flint" });
-    const filename = `2026-05-26T00-00-00-${msg.id}.json`;
-    writeFileSync(resolve(newDir, filename), JSON.stringify(msg, null, 2), "utf-8");
-
-    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
-      createMailVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
-    }));
-
-    const channelRuntime = {
-      routing: {
-        buildAgentSessionKey: (p: any) => `agent:${p.agentId}:tps-mail:default:${p.peer.id}`,
-      },
-      reply: {
-        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
-        dispatchReplyWithBufferedBlockDispatcher: async ({ ctx }: any) => {
-          dispatchResolve({ ctx });
-        },
-      },
-    };
-
-    const ctx = {
-      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
-      cfg: { bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }] },
-      log: { info: () => {}, warn: () => {}, error: () => {} },
-      channelRuntime,
-      abortSignal: abortController.signal,
-    };
-
-    const startPromise = capturedPlugin.gateway.startAccount(ctx);
-
-    try {
-      await Promise.race([
-        dispatchPromise,
-        new Promise((r) => setTimeout(() => r(null), 2000)),
-      ]);
-    } catch {}
-
-    abortController.abort();
-    try { await startPromise; } catch {}
-
-    const reason = readDlqReason(tempMailDir, agentId);
     expect(reason).not.toBeNull();
     expect(reason!).toContain("not JSON");
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 
   // ── Missing signature field ─────────────────────────────────────────
 
   it("dlqs envelope without outer signature", async () => {
     const agentId = "anvil";
-    const newDir = resolve(tempMailDir, agentId, "new");
-    mkdirSync(newDir, { recursive: true });
 
     // Valid envelope structure but missing signature
     const noSig: Partial<Envelope> = {
@@ -506,50 +488,10 @@ describe("verify-strict: signed envelope verification", () => {
       ],
     };
 
-    const msg = makeMailEnvelope(JSON.stringify(noSig), { from: "flint" });
-    const filename = `2026-05-26T00-00-00-${msg.id}.json`;
-    writeFileSync(resolve(newDir, filename), JSON.stringify(msg, null, 2), "utf-8");
-
-    mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
-      createMailVerifyClient: async () => mockFlair({ flint: FLINT_SEED }),
-    }));
-
-    const channelRuntime = {
-      routing: {
-        buildAgentSessionKey: (p: any) => `agent:${p.agentId}:tps-mail:default:${p.peer.id}`,
-      },
-      reply: {
-        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
-        dispatchReplyWithBufferedBlockDispatcher: async ({ ctx }: any) => {
-          dispatchResolve({ ctx });
-        },
-      },
-    };
-
-    const ctx = {
-      account: { accountId: "default", mailDir: tempMailDir, enabled: true },
-      cfg: { bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }] },
-      log: { info: () => {}, warn: () => {}, error: () => {} },
-      channelRuntime,
-      abortSignal: abortController.signal,
-    };
-
-    const startPromise = capturedPlugin.gateway.startAccount(ctx);
-
-    try {
-      await Promise.race([
-        dispatchPromise,
-        new Promise((r) => setTimeout(() => r(null), 2000)),
-      ]);
-    } catch {}
-
-    abortController.abort();
-    try { await startPromise; } catch {}
-
-    const reason = readDlqReason(tempMailDir, agentId);
+    const { dlqReason: reason } = await runMail(agentId, "flint", JSON.stringify(noSig), mockFlair({ flint: FLINT_SEED }));
     expect(reason).not.toBeNull();
     expect(reason!).toContain("class: invalid");
     expect(reason!).toContain("body is not envelope-shaped");
     expect(dispatchCount).toBe(0);
-  });
+  }, TEST_TIMEOUT_MS);
 });
