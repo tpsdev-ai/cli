@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBridge } from "../src/commands/bridge.js";
 import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
-import { setRunDirReader } from "../src/utils/mail-bridge.js";
+import { setRunDirReader, setStatusProbe } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -298,6 +298,50 @@ describe("tps bridge status --json records", () => {
           reason: "could not be opened (ELOOP: symlink resolution refused)",
         },
       ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "one probe per unverified pid decides both the record and its promotion",
+    async () => {
+      const first = spawnChild();
+      const second = spawnChild();
+      const firstPath = writeBridgeRecord("bridge-alpha.pid", record(first.pid, null));
+      const secondPath = writeBridgeRecord("bridge-beta.pid", record(second.pid, null));
+      const thirdPath = writeBridgeRecord("bridge-gamma.pid", record(first.pid, null));
+
+      // The seam answers alive the first time it sees a pid and gone on any
+      // later call for that pid, so a second probe of one pid makes the
+      // document contradict itself.
+      const seen = new Map<number, number>();
+      const probed: number[] = [];
+      const previous = setStatusProbe((pid) => {
+        probed.push(pid);
+        const count = (seen.get(pid) ?? 0) + 1;
+        seen.set(pid, count);
+        return count === 1 ? "alive" : "gone";
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+        setStatusProbe(previous);
+      }
+
+      const status = JSON.parse(logs[0]);
+      expect(status.bridges).toEqual([
+        { adapter: "alpha", pid: first.pid },
+        { adapter: "beta", pid: second.pid },
+        { adapter: "gamma", pid: first.pid },
+      ]);
+      expect(status.records).toEqual([
+        { adapter: "alpha", path: firstPath, state: "unverified", pid: first.pid },
+        { adapter: "beta", path: secondPath, state: "unverified", pid: second.pid },
+        { adapter: "gamma", path: thirdPath, state: "unverified", pid: first.pid },
+      ]);
+      expect(probed.slice().sort((a, b) => a - b)).toEqual([first.pid, second.pid].sort((a, b) => a - b));
     },
     TIMEOUT,
   );
