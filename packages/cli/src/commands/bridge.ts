@@ -296,7 +296,19 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           console.log(`Bridge running: adapter=${entry.adapter}, pid=${entry.pid}${port}`);
         }
       } else {
-        console.log("Bridge is not running.");
+        // A bad record says nothing about a bridge process.
+        const unproven = bridgePidFiles().filter(
+          ({ state }) => state.kind === "invalid" || state.kind === "stale",
+        );
+        if (unproven.length === 0) {
+          console.log("Bridge is not running.");
+        } else {
+          for (const { state } of unproven) {
+            if (state.kind === "invalid" || state.kind === "stale") {
+              console.log(`Bridge state unknown (${state.kind} pid file ${state.path}).`);
+            }
+          }
+        }
       }
       break;
     }

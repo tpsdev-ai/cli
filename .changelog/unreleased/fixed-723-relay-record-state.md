@@ -1,0 +1,1 @@
+- **`tps mail relay status` and `tps mail relay stop` no longer report the relay as not running from an invalid or stale pid file.**

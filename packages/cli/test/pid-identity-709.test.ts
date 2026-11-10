@@ -228,7 +228,7 @@ describe("relay stop identity", () => {
 
       expect(signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(false);
-      expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+      expect(logs.join("\n")).toMatch(/was stale and was removed/i);
       expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,
@@ -298,7 +298,7 @@ describe("relay stop identity", () => {
 
       expect(signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(false);
-      expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+      expect(logs.join("\n")).toMatch(/was stale and was removed/i);
     },
     TIMEOUT,
   );
@@ -327,7 +327,7 @@ describe("relay stop identity", () => {
         }
         expect(signals).toEqual([]);
         expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
       }
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -579,7 +579,7 @@ describe("json pid interpretation", () => {
         }
         expect(signals).toEqual([]);
         expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
       }
     },
     TIMEOUT,
@@ -1166,7 +1166,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
       });
 
       expect(result.status).toBe(0);
-      expect(result.stdout).toMatch(/stale pid file removed/);
+      expect(result.stdout).toMatch(/was stale and was removed/);
       expect(existsSync(relayPid)).toBe(false);
       expect(pidState(child.pid)).toBe("alive");
     },
