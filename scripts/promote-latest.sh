@@ -486,7 +486,8 @@ mark_uncertain() {
   keep_lock=1
   local record existing
   record="  - ${names[$1]}: target $version, previous latest ${prev_latest[$1]} ($2 to $3 may still be applied)"
-  for existing in "${uncertain_records[@]}"; do
+  # ${a[@]+"${a[@]}"}: bash 3.2 under set -u treats an empty "${a[@]}" as unbound.
+  for existing in ${uncertain_records[@]+"${uncertain_records[@]}"}; do
     [ "$existing" = "$record" ] && return
   done
   uncertain[$1]=1
