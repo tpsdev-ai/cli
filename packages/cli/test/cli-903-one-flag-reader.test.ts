@@ -1,7 +1,7 @@
 /**
  * cli#903 (items 6-8): one shared `--flag` reader for the subcommand blocks.
  *
- * It stops at `--`, accepts `--name value` and `--name=value`, and refuses a
+ * It stops at the first `--` after the subcommand (a `--` before it is passed), accepts `--name value` and `--name=value`, and refuses a
  * repeated flag with a usage error naming it. A conflicting repeat that meow
  * rejects is reported the same way, without a stack.
  */
