@@ -809,7 +809,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       const agent = await resolveAgentId(args.agent);
       const id = args.messageId ?? args.message;
       if (!id) {
-        console.error("Usage: tps mail ack <id> [agent]");
+        console.error("Usage: tps mail ack <id> [--agent <id>]");
         process.exit(1);
       }
       await verifyMailAction(agent, id);
