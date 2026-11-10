@@ -1738,7 +1738,8 @@ async function runAgentCommand(
                   // A signal to the launcher removes a worktree THIS launch
                   // created only when the supervisor and the released child are
                   // verified stopped; otherwise the worktree is kept and the
-                  // launcher exits non-zero. A pre-existing worktree is never
+                  // launcher exits with the refusal code (78, or the supervised
+                  // refusal code when supervised). A pre-existing worktree is never
                   // touched (cli#672).
                   onInterrupt: (_signal, stop) => {
                     if (!worktreeCreated) return;

@@ -1059,7 +1059,8 @@ export async function launchAttested(
       }
       if (!stop.stopped) {
         // A survivor may still be writing to the worktree and the launch state:
-        // keep both, name what may still run, and exit non-zero without
+        // keep both, name what may still run, and exit with the refusal code
+        // (78, or the supervised refusal code when supervised) without
         // re-raising the signal.
         const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
         console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
