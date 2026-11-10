@@ -606,14 +606,15 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const timestamp = new Date().toISOString();
       const agent = validateAgent(args.agent);
       const ws = workspacePath(agent);
-      const relayRunning = existsSync(relayPidFile(agent));
+      const relayState = readPidFile(relayPidFile(agent));
+      const relayRunning = relayState.kind === "running";
       const counts = outboxCounts(agent);
       const sb = findContainer(agent);
       
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
       if (args.json) {
-        const status = sb ? sb.state : relayRunning ? "relay-running" : "not running";
+        const status = sb ? sb.state : relayRunning ? "relay-running" : relayState.kind === "missing" ? "not running" : "relay-unknown";
         const lastSeen = lastSeenFromPaths([
           relayPidFile(agent),
           soundstageMarker,
@@ -637,7 +638,19 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         console.log(`Office: not running`);
       }
 
-      console.log(`Relay: ${relayRunning ? "running" : "stopped"}`);
+      if (relayState.kind === "running") {
+        console.log("Relay: running");
+      } else if (relayState.kind === "missing") {
+        console.log("Relay: stopped");
+      } else if (relayState.kind === "unverified") {
+        console.log(`Relay: unverified (pid ${relayState.pid}, pid file ${relayState.path}).`);
+      } else if (relayState.kind === "stale") {
+        console.log(`Relay: unknown (stale pid file ${relayState.path}).`);
+      } else if (relayState.kind === "invalid") {
+        console.log(`Relay: unknown (invalid pid file ${relayState.path}).`);
+      } else {
+        console.log(`Relay: state unknown (pid file ${relayState.path} could not be read).`);
+      }
       console.log(`Outbox pending: ${counts.newCount} (cur=${counts.curCount}, failed=${counts.failedCount})`);
 
       const pausedDir = join(ws, "mail", "outbox", "paused");

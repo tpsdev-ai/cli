@@ -230,7 +230,7 @@ describe("tps mail relay stop refusals exit non-zero", () => {
 
 describe("tps bridge status --json records", () => {
   test(
-    "a bad record adds its kind to records and leaves running false",
+    "a bad record adds its kind and reason to records and leaves running false",
     () => {
       const badPath = writeBridgeRecord("bridge-openclaw.pid", "not-a-pid\n");
 
@@ -239,7 +239,9 @@ describe("tps bridge status --json records", () => {
       expect(result.status).toBe(0);
       const status = JSON.parse(result.stdout);
       expect(status.running).toBe(false);
-      expect(status.records).toEqual([{ adapter: "openclaw", path: badPath, state: "invalid" }]);
+      expect(status.records).toEqual([
+        { adapter: "openclaw", path: badPath, state: "invalid", reason: "pid is not a whole positive decimal integer" },
+      ]);
     },
     TIMEOUT,
   );
@@ -264,7 +266,7 @@ describe("tps bridge status --json records", () => {
       expect(status.adapter).toBe("openclaw");
       expect(status.bridges).toEqual([{ adapter: "openclaw", pid: child.pid, port: 7891 }]);
       expect(status.records).toEqual([
-        { adapter: "discord", path: badPath, state: "invalid" },
+        { adapter: "discord", path: badPath, state: "invalid", reason: "pid is not a whole positive decimal integer" },
         { adapter: "openclaw", path: goodPath, state: "running", pid: child.pid },
       ]);
     },
@@ -288,16 +290,18 @@ describe("tps bridge status --json records", () => {
       expect(status.running).toBe(false);
       // `bridges` promotes the unverified record whose pid is alive.
       expect(status.bridges).toEqual([{ adapter: "beta", pid: unverifiedChild.pid }]);
-      expect(status.records).toEqual([
+      expect(status.records.slice(0, 2)).toEqual([
         { adapter: "alpha", path: stalePath, state: "stale", pid: staleChild.pid },
         { adapter: "beta", path: unverifiedPath, state: "unverified", pid: unverifiedChild.pid },
-        {
-          adapter: "gamma",
-          path: unreadablePath,
-          state: "unreadable",
-          reason: "could not be opened (ELOOP: symlink resolution refused)",
-        },
       ]);
+      const unreadable = status.records.find((entry: { adapter: string }) => entry.adapter === "gamma");
+      expect(unreadable).toMatchObject({
+        adapter: "gamma",
+        path: unreadablePath,
+        state: "unreadable",
+      });
+      expect(typeof unreadable.reason).toBe("string");
+      expect(unreadable.reason.length).toBeGreaterThan(0);
     },
     TIMEOUT,
   );

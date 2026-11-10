@@ -15,7 +15,7 @@ import { parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
-import { removePidFile } from "../utils/pid-file.js";
+import { removePidFile, type PidFileState } from "../utils/pid-file.js";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -25,6 +25,17 @@ let sendRelayStopSignal: RelayStopSignal = (pid) => process.kill(pid, "SIGTERM")
 export function setRelayStopSignal(fn: RelayStopSignal): RelayStopSignal {
   const previous = sendRelayStopSignal;
   sendRelayStopSignal = fn;
+  return previous;
+}
+
+/** The pid-record reader for `mail relay stop`; replaceable in tests so a record
+ *  can change between the first read and the re-read before the signal. */
+type RelayStopRecordReader = () => PidFileState;
+let relayStopRecordReader: RelayStopRecordReader | null = null;
+
+export function setRelayStopRecordReader(fn: RelayStopRecordReader | null): RelayStopRecordReader | null {
+  const previous = relayStopRecordReader;
+  relayStopRecordReader = fn;
   return previous;
 }
 
@@ -681,7 +692,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
 
       if (relayAction === "stop") {
-        const state = readRelayPidFile();
+        const readStopRecord = (): PidFileState => relayStopRecordReader?.() ?? readRelayPidFile();
+        const state = readStopRecord();
         // A removal failure keeps the relay pid file, reports the path and the
         // error code, and exits non-zero.
         const removeRelayPid = (path: string): "removed" | "already gone" => {
@@ -727,6 +739,36 @@ export async function runMail(args: MailArgs): Promise<void> {
           throw new Error(
             `Mail relay pid file names pid ${state.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${state.path} if the relay is not running.`,
           );
+        }
+        // The classification above is the plan, not the decision: re-read the
+        // record immediately before signalling and signal only the same pid
+        // with the same start token.
+        const fresh = readStopRecord();
+        if (fresh.kind !== "running" || fresh.pid !== state.pid || fresh.startToken !== state.startToken) {
+          if (fresh.kind === "missing") {
+            console.log("Mail relay pid file disappeared before it was signalled; this command signalled no process.");
+          } else if (fresh.kind === "invalid" || fresh.kind === "stale") {
+            console.log(
+              `Mail relay pid file ${fresh.path} is now ${fresh.kind}; this command signalled no process.`,
+            );
+          } else if (fresh.kind === "unreadable") {
+            throw new Error(
+              `Mail relay pid file ${fresh.path} could not be re-read, so its process identity cannot be verified; this command signalled no process. Check that process and stop it yourself, or remove ${fresh.path} if the relay is not running.`,
+            );
+          } else if (fresh.kind === "unverified") {
+            throw new Error(
+              `Mail relay pid file ${fresh.path} now names pid ${fresh.pid}, but that process's identity cannot be verified; this command signalled no process. Check that pid and stop it yourself, or remove ${fresh.path} if the relay is not running.`,
+            );
+          } else if (fresh.pid !== state.pid) {
+            console.log(
+              `Mail relay pid file ${fresh.path} now names pid ${fresh.pid}, not the pid ${state.pid} that was read; this command signalled no process.`,
+            );
+          } else {
+            console.log(
+              `Mail relay pid file ${fresh.path} still names pid ${fresh.pid}, but its start token changed before it was signalled; this command signalled no process.`,
+            );
+          }
+          break;
         }
         try {
           sendRelayStopSignal(state.pid);
