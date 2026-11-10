@@ -38,3 +38,29 @@ export interface BridgeAdapter {
    */
   stop(): Promise<void>;
 }
+
+/**
+ * Adapter name grammar (cli#725): one or more lowercase ASCII letters (`[a-z]+`).
+ * Shared by `BridgeCore` at start and `bridgePidFiles` during discovery.
+ */
+export const BRIDGE_ADAPTER_NAME_RE = /^[a-z]+$/;
+
+export function validateBridgeAdapterName(name: string): boolean {
+  return BRIDGE_ADAPTER_NAME_RE.test(name);
+}
+
+/** JSON-quotes a rejected name and also escapes DEL, C1 controls and line/bidi format characters, which JSON.stringify leaves raw. */
+function printableName(name: string): string {
+  return JSON.stringify(name).replace(
+    /[\u007f-\u009f\u200e\u200f\u2028-\u202e\u2066-\u2069]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+}
+
+export function assertBridgeAdapterName(name: string): void {
+  if (!validateBridgeAdapterName(name)) {
+    throw new Error(
+      `Invalid bridge adapter name ${printableName(name)}: allowed characters are lowercase ASCII letters ([a-z]+).`,
+    );
+  }
+}
