@@ -760,11 +760,11 @@ export async function runMail(args: MailArgs): Promise<void> {
               `Mail relay pid file ${fresh.path} now names pid ${fresh.pid}, but that process's identity cannot be verified; this command signalled no process. Check that pid and stop it yourself, or remove ${fresh.path} if the relay is not running.`,
             );
           } else if (fresh.pid !== state.pid) {
-            console.log(
+            throw new Error(
               `Mail relay pid file ${fresh.path} now names pid ${fresh.pid}, not the pid ${state.pid} that was read; this command signalled no process.`,
             );
           } else {
-            console.log(
+            throw new Error(
               `Mail relay pid file ${fresh.path} still names pid ${fresh.pid}, but its start token changed before it was signalled; this command signalled no process.`,
             );
           }

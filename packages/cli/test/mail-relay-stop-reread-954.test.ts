@@ -161,21 +161,17 @@ describe("mail relay stop re-reads the record before signalling", () => {
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
-      const { logs, restore } = captureLogs();
       try {
-        await runMail({ action: "relay", agent: "stop" });
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`,
+        );
       } finally {
-        restore();
         setRelayStopSignal(previousSignal);
         setRelayStopRecordReader(previousReader);
       }
 
       expect(reads).toBe(2);
       expect(signals).toEqual([]);
-      expect(logs.join("\n")).toContain(
-        `Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`,
-      );
-      expect(logs.join("\n")).toContain("signalled no process");
       expect(pidState(planned.pid)).toBe("alive");
       expect(pidState(replacement.pid)).toBe("alive");
     },
@@ -196,21 +192,17 @@ describe("mail relay stop re-reads the record before signalling", () => {
         startToken: foreignStartToken(childToken(child.pid)),
       }));
       const signalling = captureSignals();
-      const { logs, restore } = captureLogs();
       try {
-        await runMail({ action: "relay", agent: "stop" });
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} still names pid ${child.pid}, but its start token changed before it was signalled`,
+        );
       } finally {
-        restore();
         signalling.restore();
         reader.restore();
       }
 
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
-      expect(logs.join("\n")).toContain(
-        `Mail relay pid file ${relayPid} still names pid ${child.pid}, but its start token changed before it was signalled`,
-      );
-      expect(logs.join("\n")).toContain("signalled no process");
       expect(pidState(child.pid)).toBe("alive");
     },
     20_000,
