@@ -3,7 +3,7 @@
  * A trailing positional agent is refused, and `--agent=<id>` is honoured.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { listMessages, sendMessage } from "../src/utils/mail.js";
@@ -75,6 +75,20 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
 
   async function recordFor(agent: string, id: string) {
     return (await listMessages(agent)).find((m) => m.id === id || m.id.startsWith(id));
+  }
+
+  /** Seed one acked record in each agent's mailbox that `gc --max-age 0s` collects. */
+  function seedCollectable(): { idA: string; idB: string } {
+    const a = sendMessage(OWNER, JSON.stringify(buildSignedEnvelope(SENDER, OWNER, "to owner", SEEDS)), SENDER);
+    const b = sendMessage(OTHER, JSON.stringify(buildSignedEnvelope(SENDER, OTHER, "to other", SEEDS)), SENDER);
+    for (const record of [a, b]) {
+      const seeded = JSON.parse(readFileSync(record.filePath, "utf-8"));
+      seeded.read = true;
+      seeded.ackedAt = "2000-01-01T00:00:00.000Z";
+      seeded.receivedAt = "2000-01-01T00:00:00.000Z";
+      writeFileSync(record.filePath, JSON.stringify(seeded));
+    }
+    return { idA: a.id, idB: b.id };
   }
 
   test("ack refuses a trailing positional agent and acts on nothing", async () => {
@@ -160,6 +174,20 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     const a = await recordFor(OWNER, idA);
     expect(a).toBeDefined();
     expect(a?.nackedAt).toBeUndefined();
+  });
+
+  test("gc refuses an empty --agent value and collects nothing", async () => {
+    const { idA, idB } = seedCollectable();
+    for (const args of [["mail", "gc", "--agent="], ["mail", "gc", "--agent"], ["mail", "gc", "--agent", "--max-age", "0s"]]) {
+      const r = await run(args);
+      expect(r.status).not.toBe(0);
+      expect(r.out).toContain("--agent requires a value");
+
+      const a = await recordFor(OWNER, idA);
+      const b = await recordFor(OTHER, idB);
+      expect(a).toBeDefined();
+      expect(b).toBeDefined();
+    }
   });
 
   test("another getFlag option accepts the equals form", async () => {
