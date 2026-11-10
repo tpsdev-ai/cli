@@ -8,10 +8,10 @@
 # below states the floor explicitly so a future bash-4 construct fails with a
 # sentence here, not with a parse error mid-release.
 #
-# ── THE INVARIANT THIS DELIVERS — READ THIS BEFORE TRUSTING THE ALL-SIX CHECK ─
+# ── SCOPE ────────────────────────────────────────────────────────────────────
 #
-# This tool delivers "NO PARTIAL PROMOTE": either all six `latest` tags move to V,
-# or none do. It does NOT deliver "the promoted set is trustworthy". It checks only
+# This tool checks whether each `latest` tag moved to V. An uncertain write needs
+# manual reconciliation. It does NOT deliver "the promoted set is trustworthy". It checks only
 # that each package EXISTS at V — it never checks that the four platform packages
 # at V were built from the same commit as cli at V. A trojaned
 # @tpsdev-ai/cli-linux-x64@V next to a clean @tpsdev-ai/cli@V passes every check in
@@ -49,11 +49,8 @@
 #      to confirm the tag moved. It does not trust `npm dist-tag add`'s exit code:
 #      a command that "succeeded" without moving `latest` is the exact bug this
 #      issue is about.
-#   4. It moves all six or none: if a move fails, does not land, or the process is
-#      interrupted (SIGINT/SIGTERM/SIGHUP) mid-move, the packages already moved are
-#      rolled back to their previous `latest`. The attempted-flag is set BEFORE each
-#      `dist-tag add`, so a signal landing immediately after a tag change still rolls
-#      that package back.
+#   4. On a failed move it attempts to restore previously moved tags. A timed-out
+#      write or a signal during a promote write keeps the lock for manual reconciliation.
 #   5. A target that is not a forward release — older than the current `latest` (a
 #      DOWNGRADE) or a pre-release — is allowed (a downgrade is a legitimate
 #      rollback) but never silently: it is called out loudly and needs the distinct
@@ -85,10 +82,24 @@
 #                         successful promote (build the image yourself).
 #     --help              Show usage.
 #
+# Lock: $PROMOTE_ROOT/.promote-latest.lock (default: repo root). `pid` records the
+# holder, or the refusal prints `unknown` if it sees the directory before that
+# file is written. A handled non-uncertain exit releases the lock; SIGKILL cannot
+# run the EXIT trap. An uncertain run (exit 7) keeps the
+# lock; it writes a `reason` file naming the uncertain writes and the steps to
+# reconcile the registry by hand, and if that write fails it says so and keeps
+# the lock.
+#
 # ENVIRONMENT
 #
 #     NPM_BIN        npm binary to use (default: `npm`). Overridable so the
 #                    test harness can inject a fake registry.
+#     NPM_TIMEOUT_SECONDS  Per-call deadline in positive integer seconds (default:
+#                    120; accepted range: 1..2147483). The timer is set just
+#                    after spawn. The call also has a 2-second grace. The
+#                    deadline includes time spent at an npm one-time-password
+#                    prompt; at the deadline it sends TERM if npm is running,
+#                    then KILL if npm is still running after the grace.
 #     NPM_REGISTRY   Registry to pin every npm call to (default
 #                    https://registry.npmjs.org).
 #     PROMOTE_ROOT   Repo root to read package.json files from (default: the
@@ -110,6 +121,10 @@
 #     5  the promote failed AND a rollback did not restore the registry
 #     6  the promote succeeded, but the Docker image dispatch failed; the move
 #        stands and is NOT rolled back — run the printed command by hand
+#     7  UNCERTAIN — a timed-out write or a signal during a promote write
+#        leaves the registry state unconfirmed. The lock remains,
+#        with a `reason` file when it can be written, so a later run refuses
+#        until the lock is removed by hand, after the tags are reconciled
 set -euo pipefail
 
 # ── bash version guard ───────────────────────────────────────────────────────
@@ -123,9 +138,15 @@ if [ "$BASH_MAJOR" -lt 3 ] || { [ "$BASH_MAJOR" -eq 3 ] && [ "$BASH_MINOR" -lt 2
 fi
 
 NPM_BIN="${NPM_BIN:-npm}"
+NODE_BIN="${NODE_BIN:-node}"
+NPM_TIMEOUT_SECONDS="${NPM_TIMEOUT_SECONDS:-120}"
+# Seconds between TERM and KILL on the supervisor's deadline. Fixed rather than
+# an environment knob: the deadline already bounds the call.
+NPM_TERM_GRACE_SECONDS=2
 NPM_REGISTRY="${NPM_REGISTRY:-https://registry.npmjs.org}"
 GH_BIN="${GH_BIN:-gh}"
 root="${PROMOTE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+supervisor="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/npm-supervisor.mjs"
 
 # The six published packages, in dependency order: the four platform binaries
 # first, then the agent runtime, then the CLI last (it pins the platform packages).
@@ -138,16 +159,68 @@ EXIT_ABORTED=3
 EXIT_INCOMPLETE=4
 EXIT_ROLLBACK_FAILED=5
 EXIT_DISPATCH_FAILED=6
+EXIT_UNCERTAIN=7
 
 die() { printf 'promote-latest: %s\n' "$1" >&2; exit "${2:-$EXIT_USAGE}"; }
+
+release_lock() {
+  if [ "$lock_owned" -eq 1 ] && [ "$keep_lock" -eq 0 ]; then
+    rm -f "$lock_dir/pid"
+    rmdir "$lock_dir" 2>/dev/null || :
+    lock_owned=0
+  fi
+}
+
+acquire_lock() {
+  lock_dir="$root/.promote-latest.lock"
+  lock_owned=0
+  keep_lock=0
+  trap 'release_lock' EXIT
+  trap 'exit "$EXIT_REFUSED"' INT TERM HUP
+  if mkdir "$lock_dir" 2>/dev/null; then
+    lock_owned=1
+    printf '%s\n' "$$" >"$lock_dir/pid"
+  else
+    # The directory appears before its pid file is written. Say unknown rather
+    # than print an empty PID.
+    holder="$(cat "$lock_dir/pid" 2>/dev/null || true)"
+    [ -n "$holder" ] || holder=unknown
+    {
+      printf 'promote-latest: lock held: %s (PID %s). Wait, or remove the directory if that PID is not running.\n' "$lock_dir" "$holder"
+      if [ -f "$lock_dir/reason" ]; then
+        printf '\nThe previous run left this reason for the lock:\n\n'
+        cat "$lock_dir/reason" 2>/dev/null || printf '(the reason file could not be read)\n'
+      fi
+    } >&2
+    exit "$EXIT_REFUSED"
+  fi
+}
+
+run_npm() (
+  # One Node supervisor owns the npm child and enforces the deadline with a
+  # timer: TERM through the ChildProcess handle at the deadline, KILL after the
+  # grace only while the child has no exit code and no signal code. This
+  # subshell waits for the supervisor. `<&0` keeps stdin on the script's stdin so npm's 2FA
+  # prompt can read it.
+  sup_rc=0
+  "$NODE_BIN" "$supervisor" "$NPM_TIMEOUT_SECONDS" "$NPM_TERM_GRACE_SECONDS" -- "$NPM_BIN" "$@" <&0 &
+  sup_pid=$!
+  wait "$sup_pid" || sup_rc=$?
+  if [ "$sup_rc" -eq 124 ]; then
+    printf 'promote-latest: npm command timed out after %s seconds: npm' "$NPM_TIMEOUT_SECONDS" >&2
+    printf ' %q' "$@" >&2
+    printf '\n' >&2
+  fi
+  exit "$sup_rc"
+)
 
 usage() {
   cat <<'EOF'
 Usage: scripts/promote-latest.sh [VERSION] [--dry-run] [--yes] [--allow-downgrade]
                                 [--no-docker]
 
-Move the `latest` dist-tag of every @tpsdev-ai package to VERSION. All six move
-together; the script refuses if any is not published at VERSION.
+Move the `latest` dist-tag of every @tpsdev-ai package to VERSION.
+The script refuses if any is not published at VERSION.
 
   VERSION             Version to promote (default: packages/cli/package.json).
   --dry-run           Print the plan and stop, changing nothing.
@@ -178,7 +251,9 @@ GitHub CLI used for the dispatch.
 Exit codes: 0 promoted; 1 usage error or unsupported bash; 2 refused before
 acting; 3 not confirmed (or a non-forward promote not acknowledged); 4 promote
 did not complete (rolled back where possible); 5 rollback did not restore the
-registry; 6 promoted, but the Docker image dispatch failed.
+registry; 6 promoted, but the Docker image dispatch failed; 7 a timed-out npm
+write, or a signal during a promote write, left the registry unconfirmed (the
+lock is kept, with a reason file when it can be written).
 EOF
 }
 
@@ -229,6 +304,8 @@ done
 [ "$#" -eq 0 ] || die "unexpected argument: $1"
 
 command -v node >/dev/null 2>&1 || die "node is required to read package.json files"
+command -v "$NODE_BIN" >/dev/null 2>&1 || die "node binary not found: $NODE_BIN"
+[ -f "$supervisor" ] || die "missing npm supervisor: $supervisor"
 command -v "$NPM_BIN" >/dev/null 2>&1 || die "npm binary not found: $NPM_BIN"
 
 # ── resolve version and package names ────────────────────────────────────────
@@ -239,7 +316,7 @@ if [ -z "$version" ]; then
 fi
 
 # Reject anything that is not a plausible semver, so a typo cannot reach npm.
-if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$ ]]; then
+if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
   die "invalid version: $version"
 fi
 
@@ -259,7 +336,21 @@ for ((i = 0; i < NPKG; i++)); do
   new_latest[i]=""
   view_out[i]=""
   moved[i]=0
+  uncertain[i]=0
+  rollback_failed_state[i]=""
 done
+uncertain_records=()
+uncertain_any=0
+rollback_failed_pkgs=()
+in_flight_op=""
+in_flight_pkg=""
+in_flight_version=""
+
+case "$NPM_TIMEOUT_SECONDS" in
+  '' | *[!0-9]*) die "NPM_TIMEOUT_SECONDS must be in the range 1..2147483 seconds" ;;
+esac
+[ "$NPM_TIMEOUT_SECONDS" -ge 1 ] 2>/dev/null && [ "$NPM_TIMEOUT_SECONDS" -le 2147483 ] 2>/dev/null || die "NPM_TIMEOUT_SECONDS must be in the range 1..2147483 seconds"
+acquire_lock
 
 printf 'Promoting the "latest" dist-tag to %s\n' "$version"
 
@@ -267,7 +358,7 @@ printf 'Promoting the "latest" dist-tag to %s\n' "$version"
 missing=()
 for ((i = 0; i < NPKG; i++)); do
   set +e
-  out="$("$NPM_BIN" view "${names[i]}@${version}" version --registry "$NPM_REGISTRY" 2>&1)"
+  out="$(run_npm view "${names[i]}@${version}" version --registry "$NPM_REGISTRY" 2>&1)"
   rc=$?
   set -e
   view_out[i]="$out"
@@ -305,7 +396,7 @@ plan_moves=0
 downgrades=()
 for ((i = 0; i < NPKG; i++)); do
   set +e
-  cur="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+  cur="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
   rc=$?
   set -e
   cur="$(trim "$cur")"
@@ -391,8 +482,57 @@ fi
 # ── helpers used by the move loop, the failure path, and the signal handler ──
 rollback_failed=0
 
+# Record each uncertain write separately.
+mark_uncertain() {
+  keep_lock=1
+  local record existing
+  record="  - ${names[$1]}: target $version, previous latest ${prev_latest[$1]} ($2 to $3 may still be applied)"
+  # ${a[@]+"${a[@]}"}: bash 3.2 under set -u treats an empty "${a[@]}" as unbound.
+  for existing in ${uncertain_records[@]+"${uncertain_records[@]}"}; do
+    [ "$existing" = "$record" ] && return
+  done
+  uncertain[$1]=1
+  uncertain_records+=("$record")
+  uncertain_any=1
+}
+
+mark_rollback_failed() {
+  rollback_failed_pkgs+=("$1")
+  rollback_failed_state[$1]="$2"
+}
+
+# The persisted reason and the printed steps list uncertain writes and failed rollbacks.
+reconciliation_report() {
+  printf 'promote-latest: the registry state is unconfirmed after an npm write.\n\n'
+  printf 'A dist-tag write may still be applied by the registry after the npm\n'
+  printf 'client stopped. A single read cannot prove the final tag value.\n\n'
+  printf 'Affected package(s) and tag(s):\n'
+  if [ "${#uncertain_records[@]}" -gt 0 ]; then
+    printf '%s\n' "${uncertain_records[@]}"
+  fi
+  if [ "${#rollback_failed_pkgs[@]}" -gt 0 ]; then
+    for i in "${rollback_failed_pkgs[@]}"; do
+      printf '  - %s: rollback to %s did not restore it (registry reported %s)\n' \
+        "${names[i]}" "${prev_latest[i]}" "${rollback_failed_state[i]:-<unreadable>}"
+    done
+  fi
+  printf '\nReconcile by hand, after the registry has settled:\n'
+  printf '  1. Read every package above: npm view <package> dist-tags\n'
+  printf '     A read taken before the registry has settled can still show the old tag.\n'
+  printf '  2. Set any tag that is not what you intend: npm dist-tag add <package>@<version> latest\n'
+  printf '  3. Confirm every package above on the registry, then remove the lock: rm -rf %s\n' "$lock_dir"
+}
+
+write_reconciliation_reason() {
+  if ! reconciliation_report 2>/dev/null >"$lock_dir/reason"; then
+    printf 'promote-latest: the lock is kept, but the reason file could not be written at %s/reason; inspect the tags by hand before removing the lock.\n' "$lock_dir" >&2
+    return 1
+  fi
+  return 0
+}
+
 rollback_moved() {
-  printf '\npromote-latest: the promote did not complete — rolling back so the end state is all-six or none.\n' >&2
+  printf '\npromote-latest: the promote did not complete — attempting rollback.\n' >&2
   # Reverse dependency order: restore the CLI first, then agent, then the platform
   # binaries — so there is no window with a new CLI beside previous platform tags.
   for ((i = NPKG - 1; i >= 0; i--)); do
@@ -401,19 +541,39 @@ rollback_moved() {
     # also needs the script's own stdin/stdout/stderr (not captured): captured
     # output loses stdout's TTY, so npm cannot prompt for 2FA.
     set +e
-    "$NPM_BIN" dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
+    in_flight_op=rollback
+    in_flight_pkg="$i"
+    in_flight_version="${prev_latest[i]}"
+    run_npm dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"
     rb_rc=$?
     set -e
+    if [ "$rb_rc" -eq 124 ]; then
+      # The rollback's own mutating call timed out: the registry state is still
+      # unconfirmed, and no later read can prove which write won.
+      mark_uncertain "$i" rollback "${prev_latest[i]}"
+      in_flight_op=""
+      new_latest[i]="unconfirmed"
+      printf 'promote-latest: ROLLBACK UNCERTAIN for %s — its dist-tag add timed out; the registry state is unconfirmed. Check: npm view %s dist-tags\n' \
+        "${names[i]}" "${names[i]}" >&2
+      continue
+    fi
+    in_flight_op=""
     set +e
-    back="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    back="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     brc=$?
     set -e
     back="$(trim "$back")"
     new_latest[i]="$back"
     if [ "$rb_rc" -ne 0 ] || [ "$brc" -ne 0 ] || [ "$back" != "${prev_latest[i]}" ]; then
       rollback_failed=1
+      mark_rollback_failed "$i" "${back:-<unreadable>}"
       printf 'promote-latest: ROLLBACK FAILED for %s — it reports %s, expected %s. Restore it by hand: npm dist-tag add %s@%s latest\n' \
         "${names[i]}" "${back:-<unreadable>}" "${prev_latest[i]}" "${names[i]}" "${prev_latest[i]}" >&2
+    elif [ "${uncertain[i]}" -eq 1 ]; then
+      # The rollback add ran, but the promote write for this package timed out:
+      # it may still be applied, so never call this package restored.
+      printf 'promote-latest: rollback of %s cannot be confirmed — its promote call timed out and may still be applied. Check: npm view %s dist-tags\n' \
+        "${names[i]}" "${names[i]}" >&2
     else
       printf 'promote-latest: rolled back %s to %s\n' "${names[i]}" "${prev_latest[i]}" >&2
     fi
@@ -467,20 +627,39 @@ dispatch_docker() {
 }
 
 # ── 4. interrupt handling ────────────────────────────────────────────────────
-# Installed only now: before this point nothing has moved, so the default signal
-# action is harmless. A signal during the move loop must roll back, not leave a
-# partial promote — the exact failure this tool exists to remove.
+# Installed after confirmation. A signal during a promote write keeps the lock.
 # shellcheck disable=SC2317  # on_signal is invoked indirectly, from the traps below
 on_signal() {
+  if [ -n "$in_flight_op" ]; then
+    keep_lock=1
+    sig="$1"
+    trap '' TERM INT HUP
+    mark_uncertain "$in_flight_pkg" "$in_flight_op" "$in_flight_version"
+    write_reconciliation_reason || :
+    reconciliation_report >&2
+    printf 'promote-latest: UNCERTAIN — SIG%s during %s to %s; lock kept: %s\n' "$sig" "$in_flight_op" "$in_flight_version" "$lock_dir" >&2
+    exit "$EXIT_UNCERTAIN"
+  fi
   sig="$1"
   # Ignore further termination signals at once. A second signal must NOT abandon
   # the rollback (which is what an `exit` here did), and ignoring makes re-entry
   # impossible, so no separate guard is needed.
   trap '' TERM INT HUP
   failure=1
-  printf '\npromote-latest: received SIG%s — rolling back so the end state is all-six or none.\n' "$sig" >&2
+  printf '\npromote-latest: received SIG%s — attempting rollback.\n' "$sig" >&2
   rollback_moved
   print_final_table
+  if [ "$uncertain_any" -ne 0 ]; then
+    keep_lock=1
+    write_reconciliation_reason || :
+    if [ "$rollback_failed" -ne 0 ]; then
+      printf 'promote-latest: a rollback also reported failure; see ROLLBACK FAILED above.\n' >&2
+    fi
+    printf '\n' >&2
+    reconciliation_report >&2
+    printf '\npromote-latest: UNCERTAIN — interrupted (SIG%s) and a timed-out mutating call may still be applied. The lock is kept: %s\n' "$sig" "$lock_dir" >&2
+    exit "$EXIT_UNCERTAIN"
+  fi
   if [ "$rollback_failed" -ne 0 ]; then
     printf '\npromote-latest: FAILED — interrupted (SIG%s) and a rollback did not restore the registry. Manual action needed.\n' "$sig" >&2
     exit "$EXIT_ROLLBACK_FAILED"
@@ -514,13 +693,22 @@ for ((i = 0; i < NPKG; i++)); do
   # are both TTYs; captured output loses stdout's TTY, and npm then exits EOTP
   # without moving the tag.
   set +e
-  "$NPM_BIN" dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
+  in_flight_op=promote
+  in_flight_pkg="$i"
+  in_flight_version="$version"
+  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"
   rc=$?
   set -e
+  if [ "$rc" -eq 124 ]; then
+    # A timed-out MUTATING call may still be applied by the registry after the
+    # client is stopped. One later read cannot prove the tag's value.
+    mark_uncertain "$i" promote "$version"
+  fi
+  in_flight_op=""
 
   # Do NOT trust the exit code: re-read the registry and confirm the tag moved.
   set +e
-  post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+  post="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
   prc=$?
   set -e
   post="$(trim "$post")"
@@ -539,7 +727,7 @@ done
 if [ "$failure" -eq 0 ]; then
   for ((i = 0; i < NPKG; i++)); do
     set +e
-    post="$("$NPM_BIN" view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
+    post="$(run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY" 2>&1)"
     prc=$?
     set -e
     post="$(trim "$post")"
@@ -552,7 +740,7 @@ if [ "$failure" -eq 0 ]; then
   done
 fi
 
-# ── 6. all-six-or-none: select the branch, THEN stop handling termination ─────
+# ── 6. select the result branch ────────────────────────────────────────────────
 # The handlers are still active here. Clearing them BEFORE this branch is what
 # left a window in which a signal killed the script mid-rollback. Select the
 # branch first: on failure, IGNORE further signals while the rollback runs (a
@@ -576,6 +764,18 @@ if [ "$failure" -eq 0 ] && [ "$all_ok" -eq 1 ]; then
   printf '\npromote-latest: OK — "latest" is now %s for all six packages (verified against the registry).\n' "$version"
   dispatch_docker
   exit 0
+fi
+
+if [ "$uncertain_any" -ne 0 ]; then
+  keep_lock=1
+  write_reconciliation_reason || :
+  if [ "$rollback_failed" -ne 0 ]; then
+    printf 'promote-latest: a rollback also reported failure; see ROLLBACK FAILED above.\n' >&2
+  fi
+  printf '\n' >&2
+  reconciliation_report >&2
+  printf '\npromote-latest: UNCERTAIN — a timed-out mutating call may still be applied by the registry. The lock is kept: %s\n' "$lock_dir" >&2
+  exit "$EXIT_UNCERTAIN"
 fi
 
 if [ "$rollback_failed" -ne 0 ]; then
