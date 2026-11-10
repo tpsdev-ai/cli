@@ -66,9 +66,10 @@ async function main() {
 
   const config = loadAgentConfig(configPath);
 
-  // cli#352 r — `check` is the supervisor's pre-flight: refuse BEFORE anything
-  // is launched, so a refusal cannot leave a partial team running. It is the
-  // same rule the launch itself applies below, so the two cannot disagree.
+  // cli#352 r — `check` is the supervisor's pre-flight: refuse before THIS
+  // agent is launched. A later seating iteration runs it after earlier agents
+  // have launched, so the supervisor stops those children before exiting. It is
+  // the same rule the launch itself applies below, so the two cannot disagree.
   if (command === "check") {
     if (!launchId) usage();
     assertConfigAgrees(launchId, config.agentId);

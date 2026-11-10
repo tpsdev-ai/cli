@@ -4,6 +4,21 @@ set -euo pipefail
 TEAM_FILE="/workspace/.tps/team.json"
 PIDS_FILE="/workspace/.tps/pids.json"
 
+# SHUTDOWN_GRACE_SECONDS is used in shell arithmetic, which evaluates a
+# variable's value as an expression; accept only an integer from 1 to 300.
+# The secrets loader can replace either value, so this runs at startup and
+# again after the secrets are loaded.
+validate_control_values() {
+  if ! [[ "${SHUTDOWN_GRACE_SECONDS:-10}" =~ ^([1-9]|[1-9][0-9]|[12][0-9][0-9]|300)$ ]]; then
+    echo "Invalid SHUTDOWN_GRACE_SECONDS: must be an integer from 1 to 300" >&2; exit 1
+  fi
+  case "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" in
+    ''|TERM|INT|HUP) ;;
+    *) echo "Invalid TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH: $TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" >&2; exit 1 ;;
+  esac
+}
+validate_control_values
+
 # cli#352 r — supervisor-path parity with cli#351 (S1b).
 #
 # 1. STATE_ROOT is the roster's OWN state root — the directory that holds the
@@ -112,6 +127,9 @@ fi
 # Host writes secrets to /run/secrets/ then touches /run/secrets/.ready
 SECRETS_DIR="/run/secrets"
 SECRETS_TIMEOUT=30
+# A secret file named like one of these would replace it when exported;
+# readonly makes that export fail.
+readonly TEAM_FILE PIDS_FILE STATE_ROOT SBOX_SYSTEM_READ_FILES AGENT_UID_BASE AGENT_ID_SCAN_MAX NONO_PROFILE SECRETS_DIR
 elapsed=0
 while [[ ! -f "$SECRETS_DIR/.ready" ]] && [[ $elapsed -lt $((SECRETS_TIMEOUT * 2)) ]]; do
   sleep 0.5
@@ -130,11 +148,13 @@ if [[ -d "$SECRETS_DIR" ]]; then
     [[ -f "$secret_file" ]] || continue
     fname=$(basename "$secret_file")
     [[ "$fname" == ".ready" ]] && continue
-    export "$fname"="$(cat "$secret_file")"
+    secret_value="$(cat "$secret_file")"
     rm -f "$secret_file"
+    export "$fname"="$secret_value"
   done
   rm -f "$SECRETS_DIR/.ready"
 fi
+validate_control_values
 
 declare -a AGENT_IDS=()
 declare -a AGENT_PIDS=()
@@ -196,34 +216,101 @@ write_pids_file() {
   chmod 644 "$PIDS_FILE"
 }
 
+# Signal the tracked children, poll until the whole-second SECONDS deadline
+# (at least the grace: the deadline adds one second because SECONDS counts
+# whole-second boundaries; at most the grace plus one second and one poll),
+# attempt KILL for every tracked PID still alive, clear the tracked list and
+# only then remove the PID file. `wait` reaps this shell's children only, so neither step
+# proves that every survivor is reaped.
+SHUTDOWN_GRACE_SECONDS="${SHUTDOWN_GRACE_SECONDS:-10}"
+shutdown_in_progress=0
+
 shutdown_children() {
-  local signal="${1:-TERM}"
+  if (( shutdown_in_progress++ )); then return 0; fi
+  local signal="${1:-TERM}" pid alive deadline
 
-  if [[ ${#AGENT_PIDS[@]} -gt 0 ]]; then
-    for pid in "${AGENT_PIDS[@]}"; do
-      if kill -0 "$pid" 2>/dev/null; then
-        kill -"$signal" "$pid" 2>/dev/null || true
-      fi
-    done
-
-    for pid in "${AGENT_PIDS[@]}"; do
-      wait "$pid" 2>/dev/null || true
-    done
+  if [[ ${#AGENT_PIDS[@]} -eq 0 ]]; then
+    cleanup_pids_file
+    return 0
   fi
 
+  for pid in "${AGENT_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -"$signal" "$pid" 2>/dev/null || true
+    fi
+  done
+
+  deadline=$((SECONDS + SHUTDOWN_GRACE_SECONDS + 1))
+  while [[ $SECONDS -lt $deadline ]]; do
+    alive=0
+    for pid in "${AGENT_PIDS[@]}"; do
+      if kill -0 "$pid" 2>/dev/null; then
+        alive=1
+        break
+      fi
+    done
+    if [[ $alive -eq 0 ]]; then
+      break
+    fi
+    sleep 0.1
+  done
+
+  for pid in "${AGENT_PIDS[@]}"; do
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+  done
+
+  for pid in "${AGENT_PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+
+  AGENT_PIDS=()
+  AGENT_IDS=()
   cleanup_pids_file
 }
 
+# cli#357 r4 — when TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH is TERM, INT or HUP,
+# pause briefly so the launched child can start, then send ourselves that
+# signal. The supervisor calls this on every sandboxed launch, between the
+# child's background launch and the tracking of its PID; the regression sets the
+# variable, so the signal always lands inside the window. It does nothing when
+# the variable is unset.
+test_signal_after_launch() {
+  if [[ -n "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" ]]; then
+    sleep 0.5
+    kill -"$TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH" "$$"
+  fi
+}
+
+# cli#357 r3 — a signal that arrives between the launch and the moment the PID
+# is tracked would be handled with an empty list, so the handler records it
+# instead and the loop acts on it right after registration.
+defer_signals=0
+pending_signal=""
+
 on_signal() {
   local signal="$1"
-  trap - SIGTERM SIGINT
+  if (( shutdown_in_progress > 0 )); then
+    pending_signal="$signal"
+    return 0
+  fi
+  if [[ "$defer_signals" -eq 1 ]]; then
+    pending_signal="$signal"
+    return 0
+  fi
   shutdown_children "$signal"
   exit 0
 }
 
 trap 'on_signal TERM' SIGTERM
 trap 'on_signal INT' SIGINT
-trap cleanup_pids_file EXIT
+trap 'on_signal HUP' SIGHUP
+# An explicit exit, an errexit failure in the supervised work or a handled
+# signal calls shutdown_children, and the PID file is removed last. The seating loop stops
+# earlier iterations' children the same way before an explicit exit, so that
+# path does not depend on this trap.
+trap 'shutdown_children TERM' EXIT
 
 kill_stale_pids
 
@@ -286,10 +373,9 @@ for ((i=0; i<count; i++)); do
   config_path=$(echo "$agents_json" | jq -r ".[$i].configPath")
 
   # cli#352 r7 — these roster-shape checks fire INSIDE the loop too, so at i>0
-  # agents from earlier iterations are already backgrounded. They obey the same
-  # all-or-nothing rule as the launch refusals below: stop the children before
-  # exiting, never leave a partial team. (Bounded by the Part A source control
-  # "every exit in the seating loop is preceded by shutdown_children".)
+  # agents from earlier iterations are already backgrounded. Stop them before
+  # exiting, like the launch refusals below. (The Part A control checks that an
+  # explicit exit form in this loop is guarded by shutdown_children.)
   if [[ -z "$id" || "$id" == "null" ]]; then
     echo "Agent missing id at index $i" >&2
     shutdown_children TERM
@@ -321,8 +407,9 @@ for ((i=0; i<count; i++)); do
   # cli#352 r (a) — the launch id is the ROSTER entry's (validated above). The
   # agent's config can be rewritten by the agent itself, so it may only VETO:
   # `tps-agent check` applies the same rule the launch does (charset, traversal,
-  # and config.agentId must agree — refusing names both) and refuses BEFORE
-  # anything is launched, so a refusal cannot leave a partial team running.
+  # and config.agentId must agree — refusing names both) and refuses before THIS
+  # agent is launched. At i>0 earlier iterations' agents are already running, so
+  # the refusal below stops them before exiting.
   # Fail closed when tps-agent is missing too (the launch would 127 anyway).
   if ! check_out="$(tps-agent check --id "$id" --config "$config_path" 2>&1)"; then
     echo "❌ agent '$id': refusing to launch — ${check_out:-tps-agent check failed}" >&2
@@ -333,10 +420,9 @@ for ((i=0; i<count; i++)); do
   if ! id "$user" >/dev/null 2>&1; then
     uid="$(first_free_id user)" || {
       echo "❌ cannot seat agent '$id': no free uid in ${AGENT_UID_BASE}..$((AGENT_UID_BASE + AGENT_ID_SCAN_MAX - 1)) while seating ${count} agent(s) from $TEAM_FILE — refusing to launch (never reusing a colliding id)" >&2
-      # All-or-nothing, exactly like the two sibling refusals in this loop: this
-      # fires mid-loop, so stop the agents launched in earlier iterations before
-      # exiting (pids.json is written only after the loop, and the EXIT trap just
-      # removes it — nothing durable would reap them).
+      # Like the two sibling refusals in this loop: this fires mid-loop, so stop
+      # the agents launched in earlier iterations before exiting (the EXIT trap
+      # stops them too).
       shutdown_children TERM
       exit 1
     }
@@ -397,7 +483,11 @@ for ((i=0; i<count; i++)); do
     # reach the agent binary, SBOX_ENV) but must not hand the agent the
     # supervisor's HOME (see AGENT_HOME above). The probe one call earlier runs
     # with the passwd HOME for the same user, so both sites agree.
+    defer_signals=1
     su -m -s /bin/bash "$user" -c "HOME='$AGENT_HOME' exec nono ${launch_args[*]} -- tps-agent start --id '$id' --config '$config_path'" &
+    # The regression sets TERM, so the signal
+    # lands between the background launch and the tracking of its PID.
+    test_signal_after_launch
   else
     # FAIL CLOSED (cli#341 S2). The previous UID-only fallback launched the agent
     # with NO nono isolation; that path is deleted. If nono cannot engage (it is
@@ -405,9 +495,8 @@ for ((i=0; i<count; i++)); do
     # refuses rather than running an agent unsandboxed.
     #
     # All-or-nothing (cli#352 r): the refusal fires mid-loop, so agents launched
-    # in earlier iterations are already backgrounded. Stop them before exiting so
-    # a refusal leaves NO agent running — a team is either whole or absent,
-    # never partial. (The EXIT trap only removes pids.json.)
+    # in earlier iterations are already backgrounded. Stop them before exiting,
+    # as the sibling refusals above do. (The EXIT trap stops them too.)
     echo "❌ agent '$id': nono could not engage (nono missing, or Landlock cannot enforce the profile at $NONO_PROFILE) — refusing to launch the agent without isolation" >&2
     shutdown_children TERM
     exit 1
@@ -416,6 +505,11 @@ for ((i=0; i<count; i++)); do
   pid=$!
   AGENT_IDS+=("$id")
   AGENT_PIDS+=("$pid")
+  defer_signals=0
+  if [[ -n "$pending_signal" ]]; then
+    shutdown_children TERM
+    exit 0
+  fi
 done
 
 write_pids_file
