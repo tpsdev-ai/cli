@@ -17,10 +17,8 @@
 #   * "already latest" is reported as such, not proposed as a no-op move
 #   * a move that does not land (npm exits 0, the registry never changes) is caught
 #     by the post-move re-read, and the packages already moved are rolled back
-#   * an INTERRUPT (SIGTERM) during the move loop rolls back the packages already
-#     moved, including the in-flight one — the all-six-or-none guarantee holds
-#   * a signal DURING the rollback, and a SECOND signal during it, do not strand a
-#     partial promote — the second must not abandon the remaining restorations
+#   * an INTERRUPT (SIGTERM) during a write keeps the lock and records that write
+#   * a signal during failure-path rollback does not abandon the restorations
 #   * build metadata (1.2.3+build-abc) is not misread as a pre-release
 #   * the confirmation gate aborts on anything but "yes"
 #   * a DOWNGRADE or a PRE-RELEASE target is allowed but needs --allow-downgrade,
@@ -202,7 +200,9 @@ const latest = {};
 for (const n of names) latest['@tpsdev-ai/' + n] = '0.5.3';
 const requests = [];
 const applied = [];
-function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied }, null, 2)); }
+const disconnected = [];
+let eventOrder = 0;
+function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied, disconnected }, null, 2)); }
 function manifest(pkg, version) {
   return { name: pkg, version, dist: { tarball: 'http://127.0.0.1/' + pkg.replace('/', '-') + '-' + version + '.tgz', shasum: '0' } };
 }
@@ -226,19 +226,15 @@ const server = http.createServer((req, res) => {
       if (req.method === 'PUT' && tag[2] === 'latest') {
         if (mode === 'hang-put') return; // never answer
         if (mode === 'delayed-put') {
-          // Record the request now and apply the tag only after a delay longer
-          // than the client's deadline, so the write lands after the client is
-          // stopped.
           const received = Date.now();
-          setTimeout(() => {
+          res.on('close', () => {
+            if (res.writableEnded) return;
+            const closed = Date.now();
+            disconnected.push({ pkg, at: closed, order: ++eventOrder });
             latest[pkg] = JSON.parse(body);
-            applied.push({ pkg, version: latest[pkg], received, at: Date.now() });
+            applied.push({ pkg, version: latest[pkg], received, closed, at: Date.now(), order: ++eventOrder });
             persist();
-            if (!res.writableEnded) {
-              res.writeHead(201, { 'content-type': 'application/json' });
-              res.end(JSON.stringify({ ok: true }));
-            }
-          }, 1500);
+          });
           return;
         }
         if (!req.headers['npm-otp']) {
@@ -311,6 +307,9 @@ attrs[3] &= ~termios.ECHO
 termios.tcsetattr(slave, termios.TCSANOW, attrs)
 proc = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave,
                         preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+if os.environ.get('PTY_PIDFILE'):
+    with open(os.environ['PTY_PIDFILE'], 'w') as f:
+        f.write(str(proc.pid))
 os.close(slave)
 deadline = time.monotonic() + float(os.environ.get('PTY_TIMEOUT', '60'))
 out = sys.stdout.buffer
@@ -473,7 +472,8 @@ if (cmd === 'view') {
   if (s.rollbackFailPkg === spec.pkg && spec.ver === s.rollbackFailVersion) {
     fail('npm error code E401\nnpm error fake npm: rollback add refused');
   }
-  const willStall = s.stallAdd === spec.pkg && spec.ver !== s.stallRollbackVersion;
+  const willStall = (s.stallAdd === spec.pkg && spec.ver !== s.stallRollbackVersion) ||
+    (s.stallRollbackPkg === spec.pkg && spec.ver === s.stallRollbackVersion);
   // `noopAdd`: a command that exits 0 but never moves the tag. `stallNoCommit`:
   // the stalled add never applies its change.
   if (!((s.noopAdd || []).includes(spec.pkg)) && !(willStall && s.stallNoCommit)) s.latest[spec.pkg] = spec.ver;
@@ -597,7 +597,7 @@ const [src, dst, which] = process.argv.slice(2);
 const s = fs.readFileSync(src, 'utf8');
 function withoutFinalRead(source) {
   const start = source.indexOf('# Re-read every package, including ones that were already at the target before');
-  const end = source.indexOf('# ── 6. all-six-or-none:', start);
+  const end = source.indexOf('# ── 6. select the result branch', start);
   if (start < 0 || end < 0) { console.error('final-read mutation target not found'); process.exit(3); }
   return source.slice(0, start) + source.slice(end);
 }
@@ -613,16 +613,16 @@ const targets = {
     "trap - TERM INT HUP\nif [ \"$failure\" -ne 0 ]; then\n  rollback_moved\nfi\n",
   ],
   reorder: [
-    '  moved[i]=1\n  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
-    '  printf \'\\n-> %s: npm dist-tag add %s@%s latest\\n\' "${names[i]}" "${names[i]}" "$version"\n  # The add runs with the script\'s own stdin/stdout/stderr (not captured): no\n  # command substitution and no pipe, so npm\'s browser 2FA can run when the script\n  # itself is run from a terminal. npm prompts for 2FA only when stdin and stdout\n  # are both TTYs; captured output loses stdout\'s TTY, and npm then exits EOTP\n  # without moving the tag.\n  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  moved[i]=1\n  set -e\n',
+    '  in_flight_op=promote\n',
+    '  in_flight_op=""\n',
   ],
   capture: [
-    '  set +e\n  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n',
-    '  set +e\n  out="$(run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"\n  rc=$?\n  set -e\n  [ -z "$out" ] || printf \'%s\\n\' "$out"\n',
+    '  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n',
+    '  out="$(run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY" 2>&1)"\n',
   ],
   dispatch_early: [
-    '  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  if [ "$rc" -eq 124 ]; then\n    # A timed-out MUTATING call may still be applied by the registry after the\n    # client is stopped. One later read cannot prove the tag\'s value.\n    mark_uncertain "$i"\n  fi\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
-    '  run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"\n  rc=$?\n  set -e\n  if [ "$i" -eq $((NPKG - 1)) ]; then dispatch_docker; fi\n  if [ "$rc" -eq 124 ]; then\n    # A timed-out MUTATING call may still be applied by the registry after the\n    # client is stopped. One later read cannot prove the tag\'s value.\n    mark_uncertain "$i"\n  fi\n\n  # Do NOT trust the exit code: re-read the registry and confirm the tag moved.\n',
+    '  if [ "$rc" -eq 124 ]; then\n',
+    '  if [ "$i" -eq $((NPKG - 1)) ]; then dispatch_docker; fi\n  if [ "$rc" -eq 124 ]; then\n',
   ],
   dispatch_rollback: [
     '  exit "$EXIT_DISPATCH_FAILED"\n',
@@ -654,6 +654,7 @@ if (which === 'keep_lock_after_reason') {
   }
   let out = s.replace(onSig, '    write_reconciliation_reason\n    keep_lock=1\n');
   out = out.replace(main, '  write_reconciliation_reason\n  keep_lock=1\n');
+  out = out.replace('mark_uncertain() {\n  keep_lock=1\n', 'mark_uncertain() {\n');
   fs.writeFileSync(dst, out);
   process.exit(0);
 }
@@ -719,7 +720,7 @@ if (which === 'count_sleeps') {
   }
   const replacement = `const startupMs = Number(process.env.PROMOTE_MUTANT_STARTUP_MS || 0);
 // MUTANT: counts fixed 200 ms sleeps after an assumed startup delay instead of
-// measuring elapsed time from the call's start.
+// using the timer set after spawn.
 setTimeout(() => {
   let counted = 0;
   const step = () => {
@@ -977,7 +978,7 @@ write_state "$d/state.json" "0.5.4" "0.5.3" "cli-linux-arm64"
 invoke "$d" 0.5.4 --yes
 assert_eq "G noop-rollback: exit" 4 "$RC"
 assert_eq "G noop-rollback: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
-assert_contains "G noop-rollback: reports the rollback" "$ERR" "rolling back"
+assert_contains "G noop-rollback: reports the rollback" "$ERR" "attempting rollback"
 assert_contains "G noop-rollback: final table flags NO" "$OUT" "NO"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "G noop-rollback: registry restored" "latest=0.5.3 for all six"; else bad "G noop-rollback: registry restored" "a partial promote was left behind"; fi
 
@@ -988,18 +989,17 @@ invoke "$d" --dry-run
 assert_eq "J default-version: exit" 0 "$RC"
 assert_contains "J default-version: used package.json version" "$OUT" 'Promoting the "latest" dist-tag to 0.5.4'
 
-# ── K. SIGTERM mid-move rolls back, including the in-flight package ───────────
-# The in-flight package (cli-linux-arm64, index 2) has already had its tag moved
-# by the fake npm when the signal lands; the attempt flag is set BEFORE the add, so
-# the rollback must restore it too. A script with no trap dies here and leaves a
-# partial promote — this fixture is the control for that.
+# ── K. SIGTERM during an add keeps the lock and names the write ──────────────
 d="$(new_fixture interrupt)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
-assert_eq "K interrupt: exit" 4 "$IRC"
-assert_contains "K interrupt: reports the rollback" "$ERR" "rolling back"
+assert_eq "K interrupt: exit" 7 "$IRC"
 assert_contains "K interrupt: names the signal" "$ERR" "SIGTERM"
-if all_latest_eq "$d/state.json" "0.5.3"; then ok "K interrupt: registry restored" "latest=0.5.3 for all six"; else bad "K interrupt: registry restored" "a partial promote was left behind"; fi
+assert_eq "K interrupt: lock kept" yes "$(if [ -d "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+assert_contains "K interrupt: reason names write" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "promote to 0.5.4"
+invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "K interrupt: second run refuses" 2 "$RC"
+assert_contains "K interrupt: second refusal names write" "$ERR" "promote to 0.5.4"
 
 # ── O. a signal DURING the failure-path rollback must not strand a partial ────
 # Drive a failing move (a noop add for the CLI) so the failure branch is taken,
@@ -1010,18 +1010,15 @@ d="$(new_fixture interrupt-rollback)"
 write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
 run_interrupt "$d" "cli-linux-arm64" "0.5.3" TERM 0.5.4 --yes
 assert_eq "O interrupt-during-rollback: exit" 4 "$IRC"
-assert_contains "O interrupt-during-rollback: reports rollback" "$ERR" "rolling back"
+assert_contains "O interrupt-during-rollback: reports rollback" "$ERR" "attempting rollback"
 if all_latest_eq "$d/state.json" "0.5.3"; then ok "O interrupt-during-rollback: restored" "latest=0.5.3 for all six"; else bad "O interrupt-during-rollback: restored" "a partial promote was stranded"; fi
 
-# ── P. a SECOND signal during rollback must not abandon it ────────────────────
-# Hold every add of the platform package, so signal #1 starts the handler's
-# rollback and signal #2 lands during that rollback. The handler must IGNORE the
-# second signal, not exit (which would abandon the remaining restorations).
+# ── P. another TERM during an in-flight write leaves the lock ──────────────
 d="$(new_fixture interrupt-second)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
-run_interrupt2 "$d" "cli-linux-arm64" "-" TERM TERM 0.5.4 --yes
-assert_contains "P second-signal: reports rollback" "$ERR" "rolling back"
-if all_latest_eq "$d/state.json" "0.5.3"; then ok "P second-signal: all six restored" "latest=0.5.3 for all six"; else bad "P second-signal: all six restored" "the second signal abandoned part of the rollback"; fi
+run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
+assert_eq "P interrupt: exit" 7 "$IRC"
+assert_contains "P interrupt: reason" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "promote to 0.5.4"
 
 # ── Q. build metadata is NOT a pre-release ────────────────────────────────────
 # SemVer permits hyphens in build metadata; 1.2.3+build-abc is a stable release
@@ -1227,10 +1224,9 @@ assert_eq "AB first run completes" 0 "$IRC"
 d="$(new_fixture lock-int)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 run_interrupt "$d" cli-linux-arm64 0.5.4 INT 0.5.4 --yes --no-docker
-assert_eq "AC INT: exit" 4 "$IRC"
+assert_eq "AC INT: exit" 7 "$IRC"
 assert_contains "AC INT: signal" "$ERR" "SIGINT"
-assert_eq "AC INT: lock released" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
-if all_latest_eq "$d/state.json" "0.5.3"; then ok "AC INT: restored" ""; else bad "AC INT: restored" "partial promote"; fi
+assert_eq "AC INT: lock kept" yes "$(if [ -d "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
 
 # ── AD. a timed-out mutating call is UNCERTAIN: lock kept, no "restored" ──────
 # The fake applies the new tag and then stalls past the bound. The registry may
@@ -1304,8 +1300,8 @@ assert_contains "AG term-grace: TERM received" "$(cat "$d/signals" 2>/dev/null)"
 assert_contains "AG term-grace: handler finished inside the grace" "$(cat "$d/signals" 2>/dev/null)" "TERM-EXIT"
 # The supervisor's own log is what it sent: TERM at the deadline, no KILL once
 # the child has exited during the grace.
-assert_contains "AG term-grace: supervisor sent TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
-assert_eq "AG term-grace: supervisor sent no KILL" 0 "$(grep -c '^KILL$' "$d/supervisor.log" 2>/dev/null || true)"
+assert_contains "AG term-grace: supervisor attempted TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
+assert_eq "AG term-grace: supervisor attempted no KILL" 0 "$(grep -c '^KILL$' "$d/supervisor.log" 2>/dev/null || true)"
 if [ -s "$d/npm.pid" ]; then
   if kill -0 "$(cat "$d/npm.pid")" 2>/dev/null; then bad "AG term-grace: process gone" "npm still running"; else ok "AG term-grace: process gone" "npm is gone"; fi
 else
@@ -1387,6 +1383,36 @@ else
     bad "AJ real npm PUT hang: registry started" "no port file"
   fi
   stop_registry
+
+  # AS. TERM while real npm has a PUT pending keeps the lock and records it.
+  d="$(new_fixture real-npm-signal)"
+  if start_registry "$d" delayed-put; then
+    mkdir -p "$d/home" "$d/npm-cache"
+    HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
+      npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
+      NPM_TIMEOUT_SECONDS=5 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+      PTY_PIDFILE="$d/tool.pid" python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker >"$d/out.txt" 2>&1 &
+    real_signal_pid=$!
+    saw_put=0
+    for ((tries = 0; tries < 200; tries++)); do
+      if node -e 'const fs=require("fs"); try {const s=JSON.parse(fs.readFileSync(process.argv[1])); process.exit(s.requests.some((r)=>r.method==="PUT")?0:1)} catch {process.exit(1)}' "$d/registry.state"; then saw_put=1; break; fi
+      sleep 0.05
+    done
+    assert_eq "AS real npm signal: PUT reached registry" 1 "$saw_put"
+    if [ "$saw_put" -eq 1 ]; then signal_tool "$d" TERM || :; fi
+    wait "$real_signal_pid" 2>/dev/null
+    real_signal_rc=$?
+    assert_eq "AS real npm signal: exit" 7 "$real_signal_rc"
+    assert_eq "AS real npm signal: lock kept" yes "$(if [ -d "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+    assert_contains "AS real npm signal: reason names write" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "promote to 0.5.4"
+    assert_contains "AS real npm signal: signal reported" "$(cat "$d/out.txt")" "SIGTERM"
+    invoke "$d" 0.5.4 --yes --no-docker
+    assert_eq "AS real npm signal: second run refuses" 2 "$RC"
+    assert_contains "AS real npm signal: refusal includes reason" "$ERR" "promote to 0.5.4"
+  else
+    bad "AS real npm signal: registry started" "no port file"
+  fi
+  stop_registry
 fi
 
 # ── AL. the supervisor's bound: a TERM-ignoring child is KILLed after the grace ─
@@ -1401,8 +1427,8 @@ NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
 t1="$(python3 -c 'import time; print(time.monotonic())')"
 elapsed="$(python3 -c 'import sys; print("%.2f" % (float(sys.argv[2]) - float(sys.argv[1])))' "$t0" "$t1")"
 assert_eq "AL bound: exit" 7 "$RC"
-assert_contains "AL bound: supervisor sent TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
-assert_contains "AL bound: supervisor sent KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
+assert_contains "AL bound: supervisor attempted TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
+assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
 if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) < float(sys.argv[2]) else 1)' "$elapsed" 8; then
   ok "AL bound: inside deadline + grace + 5s" "${elapsed}s"
 else
@@ -1423,7 +1449,7 @@ if wait_count "$HCOUNTER" 1; then
   assert_eq "AM reason-write: exit" 7 "$IRC"
   assert_eq "AM reason-write: lock kept" yes "$(if [ -d "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
   assert_contains "AM reason-write: names the lock path" "$ERR" "$d/root/.promote-latest.lock/reason"
-  assert_contains "AM reason-write: says it could not be written" "$ERR" "reason file could not be written"
+  assert_eq "AM reason-write: one error line" 1 "$(printf '%s\n' "$ERR" | grep -Fc "$d/root/.promote-latest.lock/reason")"
 else
   : >"$d/release"
   finish_held "$d"
@@ -1446,10 +1472,10 @@ if start_registry "$d" delayed-put; then
   assert_eq "AN delayed-commit: exit" 7 "$RC"
   assert_contains "AN delayed-commit: reason names the package" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "@tpsdev-ai/cli-darwin-arm64: target 0.5.4"
   sleep 2
-  if node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.exit((s.applied||[]).some((a)=>a.at-a.received>=1000)?0:1)' "$d/registry.state"; then
-    ok "AN delayed-commit: the write landed after the client stopped" "applied >= 1 s after receipt"
+  if node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.exit((s.applied||[]).some((a)=>a.pkg==="@tpsdev-ai/cli-darwin-arm64" && a.version==="0.5.4" && (s.disconnected||[]).some((d)=>d.pkg===a.pkg && d.order<a.order))?0:1)' "$d/registry.state"; then
+    ok "AN delayed-commit: the write landed after the client stopped" "disconnect recorded before apply"
   else
-    bad "AN delayed-commit: the write landed after the client stopped" "no delayed apply recorded"
+    bad "AN delayed-commit: the write landed after the client stopped" "no apply after disconnect recorded"
   fi
   invoke "$d" 0.5.4 --yes --no-docker
   assert_eq "AN delayed-commit: second run refuses" 2 "$RC"
@@ -1472,6 +1498,37 @@ assert_contains "AO mixed: printed steps list the uncertain write" "$ERR" "@tpsd
 assert_contains "AO mixed: printed steps list the rollback failure" "$ERR" "@tpsdev-ai/cli-darwin-arm64: rollback to 0.5.3 did not restore it"
 assert_contains "AO mixed: steps say confirm after the registry settled" "$reason" "after the registry has settled"
 assert_contains "AO mixed: steps say one read cannot prove the tag" "$reason" "A single read cannot prove"
+
+# ── AP. timeout values are checked before the lock ───────────────────────────
+d="$(new_fixture timeout-boundary)"
+write_state "$d/state.json" "0.5.4" "0.5.4"
+NPM_TIMEOUT_SECONDS=2147483 invoke "$d" 0.5.4 --dry-run
+assert_eq "AP maximum timeout: accepted" 0 "$RC"
+NPM_TIMEOUT_SECONDS=2147484 invoke "$d" 0.5.4 --dry-run
+assert_eq "AP excessive timeout: refused" 1 "$RC"
+assert_contains "AP excessive timeout: variable and range" "$ERR" "NPM_TIMEOUT_SECONDS must be in the range 1..2147483 seconds"
+assert_eq "AP excessive timeout: no lock" no "$(if [ -e "$d/root/.promote-latest.lock" ]; then echo yes; else echo no; fi)"
+
+# ── AQ. a rollback-only timeout records the version it attempted ────────────
+d="$(new_fixture rollback-timeout)"
+write_state "$d/state.json" "0.5.4" "0.5.3" "cli"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallRollbackPkg="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "AQ rollback timeout: exit" 7 "$RC"
+reason="$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)"
+assert_contains "AQ rollback timeout: previous version" "$reason" "@tpsdev-ai/cli-linux-arm64: target 0.5.4, previous latest 0.5.3 (rollback to 0.5.3"
+assert_eq "AQ rollback timeout: one write" 1 "$(printf '%s\n' "$reason" | grep -c '^  - @tpsdev-ai/cli-linux-arm64:')"
+
+# ── AR. promote and rollback timeouts on one package get separate entries ───
+d="$(new_fixture both-timeouts)"
+write_state "$d/state.json" "0.5.4" "0.5.3"
+node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackPkg=s.stallAdd; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
+assert_eq "AR two timeouts: exit" 7 "$RC"
+reason="$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)"
+assert_contains "AR two timeouts: promote" "$reason" "(promote to 0.5.4"
+assert_contains "AR two timeouts: rollback" "$reason" "(rollback to 0.5.3"
+assert_eq "AR two timeouts: separate entries" 2 "$(printf '%s\n' "$reason" | grep -c '^  - @tpsdev-ai/cli-linux-arm64:')"
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
@@ -1503,22 +1560,22 @@ if node "$work/mutate.mjs" "$tool" "$mut" interrupt; then
   d="$(new_fixture mut-trap)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
-  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M3 mutation: missing TERM trap caught" "mutant restored the registry — fixture K is blind to it"; else ok "M3 mutation: missing TERM trap caught" "mutant left a partial promote (fixture K catches it)"; fi
+  if [ -d "$d/root/.promote-latest.lock" ]; then bad "M3 mutation: missing TERM trap caught" "mutant kept the lock — fixture K is blind to it"; else ok "M3 mutation: missing TERM trap caught" "mutant released the lock (fixture K catches it)"; fi
   TOOL=""
 else
   bad "M3 mutation: missing TERM trap caught" "could not build the mutant"
 fi
 
-# ── M4. mutation: flag the attempt AFTER the add; fixture K must catch it ─────
+# ── M4. mutation: ignore the in-flight write; fixture K must catch it ─────
 mut="$work/tool-reorder.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" reorder; then
   d="$(new_fixture mut-reorder)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   TOOL="$mut" run_interrupt "$d" "cli-linux-arm64" "0.5.4" TERM 0.5.4 --yes
-  if all_latest_eq "$d/state.json" "0.5.3"; then bad "M4 mutation: late attempt flag caught" "mutant restored the registry — fixture K is blind to it"; else ok "M4 mutation: late attempt flag caught" "mutant left the in-flight package moved (fixture K catches it)"; fi
+  if [ -d "$d/root/.promote-latest.lock" ]; then bad "M4 mutation: in-flight omission caught" "mutant kept the lock — fixture K is blind to it"; else ok "M4 mutation: in-flight omission caught" "mutant released the lock (fixture K catches it)"; fi
   TOOL=""
 else
-  bad "M4 mutation: late attempt flag caught" "could not build the mutant"
+  bad "M4 mutation: in-flight omission caught" "could not build the mutant"
 fi
 
 # ── M5. mutation: clear the traps before the failure branch; O must catch it ──
@@ -1530,7 +1587,7 @@ if node "$work/mutate.mjs" "$tool" "$mut" trapclear; then
   if all_latest_eq "$d/state.json" "0.5.3"; then bad "M5 mutation: early trap clear caught" "mutant restored the registry — fixture O is blind to it"; else ok "M5 mutation: early trap clear caught" "mutant stranded a partial promote (fixture O catches it)"; fi
   TOOL=""
 else
-  bad "M4 mutation: late attempt flag caught" "could not build the mutant"
+  bad "M5 mutation: early trap clear caught" "could not build the mutant"
 fi
 
 # ── M6. mutation: capture the add again; fixture R must catch it ─────────────
@@ -1616,7 +1673,7 @@ fi
 
 # ── M10. mutation (a): supervisor KILLs without the exit-code check ──────────
 # Fixture AG's child exits during the grace, so a checked supervisor sends no
-# KILL; the mutant sends one and records it in the supervisor log.
+# KILL; the mutant calls kill() and records the attempt in the supervisor log.
 m10="$work/mut-kill-unchecked"
 mkdir -p "$m10"
 cp "$tool" "$m10/promote-latest.sh"
@@ -1626,9 +1683,9 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10/npm-super
   node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
   NPM_TIMEOUT_SECONDS=1 FAKE_NPM_PIDFILE="$d/npm.pid" FAKE_NPM_SIGNAL_LOG="$d/signals" FAKE_NPM_TERM_GRACE_EXIT=1 TOOL="$m10/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
   if [ "$(grep -c '^KILL$' "$d/supervisor.log" 2>/dev/null || true)" -eq 0 ]; then
-    bad "M10 mutation (a): unchecked KILL caught" "mutant sent no KILL — fixture AG is blind"
+    bad "M10 mutation (a): unchecked KILL caught" "mutant made no KILL attempt — fixture AG is blind"
   else
-    ok "M10 mutation (a): unchecked KILL caught" "mutant sent KILL after the child exited (fixture AG catches it)"
+    ok "M10 mutation (a): unchecked KILL caught" "mutant attempted kill() after the child exited (fixture AG catches it)"
   fi
   TOOL=""
 else

@@ -5,14 +5,13 @@
 //
 // The child inherits this process's stdin, stdout and stderr, so an npm
 // one-time-password prompt still reaches the terminal. The deadline is measured
-// from this process's start with a timer (not counted sleeps). On the deadline
+// from the timer set just after spawn (not counted sleeps). On the deadline
 // the supervisor sends TERM through the ChildProcess handle; after the grace it
 // sends KILL only while the child has neither an exit code nor a signal code.
 // INT, TERM and HUP received by the supervisor are forwarded to the child the
 // same way. The exit status is the child's status, or 124 on a deadline timeout.
 //
-// PROMOTE_SUPERVISOR_LOG, when set, receives one line per signal sent (TERM,
-// KILL, and any forwarded signal). It is a diagnostic for the test harness.
+// PROMOTE_SUPERVISOR_LOG, when set, records each ChildProcess.kill() attempt.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
