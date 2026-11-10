@@ -46,7 +46,7 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
 
   /** The CLI authenticates mail verification as the mailbox owner it acts on. */
   async function run(args: string[], keyAgent = OWNER): Promise<Result> {
-    const proc = Bun.spawn([process.execPath, TPS_BIN, ...args, "--quiet-nono-check"], {
+    const proc = Bun.spawn([process.execPath, TPS_BIN, "--quiet-nono-check", ...args], {
       cwd: tempRoot,
       env: {
         ...process.env,
@@ -91,6 +91,22 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     expect(b?.ackedAt).toBeUndefined();
   });
 
+  test("ack refuses an empty --agent value and acks nothing", async () => {
+    const { idA, idB } = seed();
+    for (const flag of ["--agent=", "--agent"]) {
+      const r = await run(["mail", "ack", idA, flag]);
+      expect(r.status).not.toBe(0);
+      expect(r.out).toContain("--agent requires a value");
+    }
+
+    const a = await recordFor(OWNER, idA);
+    const b = await recordFor(OTHER, idB);
+    expect(a).toBeDefined();
+    expect(a?.ackedAt).toBeUndefined();
+    expect(b).toBeDefined();
+    expect(b?.ackedAt).toBeUndefined();
+  });
+
   test("ack honours --agent=<id>", async () => {
     const { idA, idB } = seed();
     const r = await run(["mail", "ack", idB, `--agent=${OTHER}`], OTHER);
@@ -108,6 +124,22 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     const r = await run(["mail", "nack", idA, OTHER, "--reason", "test"]);
     expect(r.status).not.toBe(0);
     expect(r.out).toContain("--agent <id>");
+
+    const a = await recordFor(OWNER, idA);
+    const b = await recordFor(OTHER, idB);
+    expect(a).toBeDefined();
+    expect(a?.nackedAt).toBeUndefined();
+    expect(b).toBeDefined();
+    expect(b?.nackedAt).toBeUndefined();
+  });
+
+  test("nack refuses an empty --agent value and nacks nothing", async () => {
+    const { idA, idB } = seed();
+    for (const flag of ["--agent=", "--agent"]) {
+      const r = await run(["mail", "nack", idA, "--reason=test", flag]);
+      expect(r.status).not.toBe(0);
+      expect(r.out).toContain("--agent requires a value");
+    }
 
     const a = await recordFor(OWNER, idA);
     const b = await recordFor(OTHER, idB);

@@ -844,6 +844,19 @@ async function main() {
         process.exit(1);
       }
 
+      if (action === "ack" || action === "nack" || action === "gc") {
+        const hasEmptyAgent = process.argv.some((arg, index) => {
+          if (arg === "--agent=") return true;
+          if (arg !== "--agent") return false;
+          const next = process.argv[index + 1];
+          return next === undefined || next === "" || next.startsWith("-");
+        });
+        if (hasEmptyAgent) {
+          console.error("--agent requires a value");
+          process.exit(1);
+        }
+      }
+
       const { runMail } = await import("../src/commands/mail.js");
 
       if (action === "topic") {
