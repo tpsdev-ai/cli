@@ -18,5 +18,4 @@
   shrinkwrap and verifies working manifest and lock bytes before installing.
   Both modes compare the installed lock against the saved revision bytes afterward.
   npm configuration is not checked (#837).
-  The guard inspects workflow `run:` steps; installs inside other script files or
-  composite actions are not inspected.
+  The guard inspects workflow `run:` steps and the scripts and local composite actions those steps invoke by a literal path; installs inside other script files are not inspected.

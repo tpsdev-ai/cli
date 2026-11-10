@@ -473,7 +473,6 @@ export type UnresolvedInvocationAllowlistEntry = {
  * assignment is stale and fails the scan.
  */
 export const UNRESOLVED_INVOCATION_ALLOWLIST: readonly UnresolvedInvocationAllowlistEntry[] = [
-  { script: "scripts/test-docker-bun-version.sh", line: 20, token: '"$helper"', target: "scripts/docker-bun-version.sh", assignment: 'helper="${HELPER:-$here/docker-bun-version.sh}"', reason: "$helper defaults to scripts/docker-bun-version.sh (a shell version check; no npm install); HELPER is not set by any workflow env" },
   { script: "scripts/test-promote-latest.sh", line: 367, token: '"$registry_js"', target: "scripts/test-promote-latest.sh", assignment: 'registry_js="$work/registry.js"', reason: "$registry_js is the generated registry fixture written by this script (no npm install)" },
   { script: "scripts/test-promote-latest.sh", line: 765, token: '"$work/mkstate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mkstate.mjs\" <<'MK'", reason: "$work/mkstate.mjs is the generated fixture writer written by this script (no npm install)" },
   { script: "scripts/test-promote-latest.sh", line: 767, token: '"$work/latest.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/latest.mjs\" <<'LM'", reason: "$work/latest.mjs is the generated fixture reader written by this script (no npm install)" },
@@ -482,7 +481,7 @@ export const UNRESOLVED_INVOCATION_ALLOWLIST: readonly UnresolvedInvocationAllow
   { script: "scripts/test-tps-office-supervisor.sh", line: 158, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 166, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 173, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
-  { script: "scripts/test-tps-office-supervisor.sh", line: 197, token: '"$secret_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "} >\"$secret_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
+  { script: "scripts/test-tps-office-supervisor.sh", line: 197, token: '"$secret_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '/^SECRETS_DIR=/,/^validate_control_values$/p' \"$sup\" | sed \"s|^SECRETS_DIR=.*|SECRETS_DIR=\\\"$secret_fixture/secrets\\\"|\"", reason: "generated supervisor slice written by this test's group from $sup (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 251, token: '"$shutdown_fixture/run.sh"', target: "scripts/test-tps-office-supervisor.sh", assignment: "cat >\"$shutdown_fixture/run.sh\" <<'RUN'", reason: "$shutdown_fixture/run.sh is the generated supervisor fixture written by this script (no npm install)" },
   { script: "docker/tps-office-supervisor.sh", line: 351, token: "-c", target: "docker/tps-office-supervisor.sh", assignment: 'su -s /bin/bash "$user" -c "echo probe > \'$probe_file\'" >/dev/null 2>&1', reason: "inline landlock probe run as another user; no npm install" },
   { script: "docker/tps-office-supervisor.sh", line: 357, token: "-c", target: "docker/tps-office-supervisor.sh", assignment: 'su -s /bin/bash "$user" -c "exec nono run --profile \\"$NONO_PROFILE\\" --allow \'$workdir\' --allow \'$tmpdir\' -- bash -lc \'cat \\"$probe_file\\" >/dev/null\'" >/dev/null 2>&1', reason: "inline landlock probe run as another user; no npm install" },
@@ -498,6 +497,20 @@ export const REVIEWED_SCRIPT_LINE_ALLOWLIST: readonly ReviewedScriptLineEntry[] 
   { script: "scripts/test-promote-latest.sh", line: 476, text: "fail('npm error code E401\\nnpm error fake npm: rollback add refused');", reason: "assertion fixture string; no command is run" },
   { script: "scripts/test-promote-latest.sh", line: 1256, text: "assert_contains \"AD add-timeout: command and bound\" \"$ERR\" \"timed out after 1 seconds: npm dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.4\"", reason: "assertion fixture string; no command is run" },
   { script: "scripts/test-promote-latest.sh", line: 1389, text: "assert_contains \"AJ real npm PUT hang: timed out\" \"$ERR\" \"timed out after 1 seconds: npm dist-tag add @tpsdev-ai/cli-darwin-arm64@0.5.4\"", reason: "assertion fixture string; no command is run" },
+];
+
+/**
+ * Exact run-block logical lines whose wrapped interpreter payload is a
+ * non-literal string. The line is reviewed as a whole; its payload is not
+ * parsed, so a wrapped interpreter anywhere else is refused.
+ */
+export type ReviewedWrappedPayloadEntry = { text: string; reason: string };
+
+export const REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST: readonly ReviewedWrappedPayloadEntry[] = [
+  {
+    text: "docker run --rm -v \"$HOME/.local/nono-pin-bookworm:/out\" -e COMMIT=\"${{ steps.pin.outputs.commit }}\" rust:bookworm bash -c '",
+    reason: "builds the pinned nono in a bookworm container: the payload installs distro packages and builds Rust, and runs no npm or npx",
+  },
 ];
 
 type UnresolvedEntry = { script: string; line: number; token: string };
@@ -536,6 +549,11 @@ function stripOuterQuotes(value: string): string {
     return value.slice(1, -1);
   }
   return value;
+}
+
+/** The literal word a token spells once quotes are dropped and escapes removed. */
+function literalWord(text: string): string {
+  return text.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
 }
 
 function isShellScript(rel: string, content: string): boolean {
@@ -710,7 +728,9 @@ function quoteStartMask(raw: string[]): boolean[] {
       } else if (char === quote) quote = "";
     }
     if (quote === "") {
-      const heredoc = physical.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
+      // Unknown => refuse: a here-document header is matched after the comment
+      // is stripped, so `# <<EOF` prose cannot swallow the lines below it.
+      const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
       if (heredoc !== null) {
         delimiter = heredoc[3];
         stripTabs = heredoc[1] === "-";
@@ -762,7 +782,7 @@ function logicalShellLines(text: string): LogicalLine[] {
     }
     buffer += line;
     flush();
-    const heredoc = physical.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
+    const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
     if (heredoc !== null) {
       delimiter = heredoc[3];
       stripTabs = heredoc[1] === "-";
@@ -1020,12 +1040,28 @@ function resolveAssignmentReference(
 }
 
 function repoRelativePath(ctx: TreeContext, value: string): string | null {
-  if (!value.startsWith(`${ctx.root}/`)) return null;
-  const rel = value.slice(ctx.root.length + 1);
-  return rel === "" || rel.startsWith("..") ? null : rel;
+  const normalized = value.replace(/\/+$/, "");
+  if (normalized === ctx.root) return "";
+  if (!normalized.startsWith(`${ctx.root}/`)) return null;
+  const rel = normalized.slice(ctx.root.length + 1);
+  return rel === "" || rel.split("/").some((segment) => segment === "..") ? null : rel;
 }
 
-/** A literal cd target, or a variable one bound exactly once to a literal path. */
+/**
+ * How a cd target anchors: `absolute` (a repository path spelled in full),
+ * `scriptDir` (the followed script's own directory, or a path derived from it)
+ * or `cwd` (relative to the directory the script is in at that point).
+ */
+type CdTarget = { kind: "absolute" | "scriptDir" | "cwd"; path: string };
+
+/**
+ * A cd target that resolves to a repository directory, with the kind of anchor
+ * it used. `null` means the target cannot be resolved, so the cwd is unknown.
+ * A literal relative target is `cwd`-anchored; a literal absolute target inside
+ * the repository is `absolute`; a target anchored to the script directory or to
+ * `git rev-parse --show-toplevel` is `absolute`/`scriptDir`. An absolute target
+ * outside the repository is unknown, never a repository-relative path.
+ */
 function resolveCdTarget(
   ctx: TreeContext,
   target: string,
@@ -1033,17 +1069,38 @@ function resolveCdTarget(
   scriptDir: string,
   bindings: Map<string, VariableBinding[]> | undefined,
   at: string,
-): string | null {
+): CdTarget | null {
   if (target === "" || target === "-" || target === "--" || /[~*?]/.test(target)) return null;
-  if (!/[$`]/.test(target)) return resolveRepoDir(directory, target, at);
+  const toplevel = target.match(/^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(.*)$/s);
+  if (toplevel !== null) {
+    const suffix = toplevel[1];
+    if (/[$`]/.test(suffix)) return null;
+    const rel = joinVariableSuffix("", suffix);
+    const path = rel === "" ? "" : resolveRepoDir("", rel, at);
+    return path.startsWith("..") ? null : { kind: "absolute", path };
+  }
+  if (!/[$`]/.test(target)) {
+    if (target.startsWith("/")) {
+      const rel = repoRelativePath(ctx, target);
+      return rel === null ? null : { kind: "absolute", path: rel };
+    }
+    return { kind: "cwd", path: resolveRepoDir(directory, target, at) };
+  }
   if (bindings === undefined) return null;
   const name = tokenVariableName(target);
-  if (name === null || tokenVariableSuffix(target) !== "") return null;
+  if (name === null) return null;
+  const suffix = tokenVariableSuffix(target);
+  if (/[$`]/.test(suffix)) return null;
   const resolved = resolveAssignmentReference(name, bindings, scriptDir);
   if (resolved === null) return null;
-  if (resolved.kind === "scriptDir") return resolved.path;
-  if (resolved.kind === "absolute") return repoRelativePath(ctx, resolved.path);
-  return resolveRepoDir(directory, resolved.path, at);
+  if (resolved.kind === "scriptDir") {
+    return { kind: "scriptDir", path: joinVariableSuffix(resolved.path, suffix) };
+  }
+  if (resolved.kind === "absolute") {
+    const rel = repoRelativePath(ctx, joinVariableSuffix(resolved.path, suffix));
+    return rel === null ? null : { kind: "absolute", path: rel };
+  }
+  return { kind: "cwd", path: resolveRepoDir(directory, joinVariableSuffix(resolved.path, suffix), at) };
 }
 
 function resolveScriptArgument(ctx: TreeContext, token: ShellToken, directory: string, at: string, scriptDir = "", rootOnly = false, bindings?: Map<string, VariableBinding[]>): Invocation {
@@ -1209,8 +1266,10 @@ function recordLineInvocations(
         const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
         const resolved = resolveCdTarget(ctx, target, localDirectory, scriptDir, bindings, at);
         if (resolved === null) localUnresolved = true;
-        else {
-          localDirectory = resolved;
+        else if (localUnresolved && resolved.kind === "cwd") {
+          // Unknown => sticky: a cwd-relative cd cannot re-anchor an unknown cwd.
+        } else {
+          localDirectory = resolved.path;
           localUnresolved = false;
         }
         continue;
@@ -1339,8 +1398,10 @@ const NPM_VALUE_FLAGS = new Set([
 function npmTokens(line: string): { command: string; args: string[] } | null {
   const tokens = shellTokens(line);
   for (let index = 0; index < tokens.length; index++) {
-    if (tokens[index].quoted) continue;
-    const text = stripOuterQuotes(tokens[index].text);
+    // A quoted or backslash-escaped command word is still a literal `npm` when
+    // its shell value is exactly `npm`/`npx`; anything else (e.g. `$NPM`) is not
+    // a shape this scanner can read, and handleInstall refuses it.
+    const text = literalWord(tokens[index].text);
     if (text !== "npm" && text !== "npx") continue;
     return { command: text, args: tokens.slice(index + 1).map((token) => stripOuterQuotes(token.text)) };
   }
@@ -1376,18 +1437,24 @@ function npmInstallDirectory(line: string, directory: string, at: string): strin
   const parsed = npmTokens(line);
   if (parsed === null) return directory;
   let base = directory;
+  let sawDirectoryFlag = false;
   for (let index = 0; index < parsed.args.length; index++) {
     const text = parsed.args[index];
-    let value: string | null = null;
     const equals = text.match(/^(--prefix|-C|--workspace|-w)=(.*)$/);
+    const flag = equals !== null ? equals[1] : NPM_DIRECTORY_FLAGS.has(text) ? text : null;
+    if (flag === null) continue;
+    if (sawDirectoryFlag) {
+      throw new Error(`${at}: an npm install repeats a directory flag (${flag}); the effective directory is refused: ${line}`);
+    }
+    sawDirectoryFlag = true;
+    let value: string | null;
     if (equals !== null) value = equals[2];
-    else if (NPM_DIRECTORY_FLAGS.has(text)) {
+    else {
       value = parsed.args[index + 1] ?? null;
       index++;
     }
-    if (value === null) continue;
-    if (value === "" || value.startsWith("-") || /[$`~*?]/.test(value)) {
-      throw new Error(`${at}: cannot bind an npm install: directory flag ${text} is not a literal repository path: ${line}`);
+    if (value === null || value === "" || value.startsWith("-") || /[$`~*?]/.test(value)) {
+      throw new Error(`${at}: cannot bind an npm install: directory flag ${flag} is not a literal repository path: ${line}`);
     }
     base = resolveRepoDir(base, value, at);
   }
@@ -1398,6 +1465,7 @@ function handleInstall(
   ctx: TreeContext,
   rel: string,
   line: string,
+  shapeLine: string,
   number: number,
   at: string,
   directory: string,
@@ -1409,7 +1477,14 @@ function handleInstall(
   );
   if (reviewed !== undefined) ctx.reviewedLines.push(reviewedLineKey(reviewed));
   if (reviewed !== undefined) return;
-  const shape = npmInstallShape(line);
+  const shape = npmInstallShape(shapeLine);
+  // Unknown => refuse: an install-classified line whose command word or flags
+  // the parser cannot read is never bound to the cwd lockfile.
+  if (shape === null) {
+    throw new Error(
+      `${at}: an npm install line whose npm/npx shape cannot be read is refused: ${shapeLine}`,
+    );
+  }
   if (shape === "run") return;
   if (shape === "npx" || shape === "exec") {
     throw new Error(
@@ -1419,8 +1494,8 @@ function handleInstall(
   if (line.includes("--no-package-lock")) throw new Error(`${at}: npm install with --no-package-lock is refused: ${line}`);
   if (directoryUnresolved) throw new Error(`${at}: cannot bind an npm install after a non-literal directory change: ${line}`);
   if (staged) throw new Error(`${at}: cannot bind an npm install after the script stages or copies a different lockfile before installing: ${line}`);
-  if (isAcceptedGlobalToolInstall(line)) return;
-  const installDirectory = npmInstallDirectory(line, directory, at);
+  if (isAcceptedGlobalToolInstall(shapeLine)) return;
+  const installDirectory = npmInstallDirectory(shapeLine, directory, at);
   const lockfile = installDirectory === "" ? "package-lock.json" : `${installDirectory}/package-lock.json`;
   if (!ctx.tracked.has(lockfile)) {
     throw new Error(`${at}: cannot bind the npm install to a tracked lockfile: ${lockfile} is not a lockfile the gate reads: ${line}`);
@@ -1446,9 +1521,18 @@ function embeddedInvocations(clause: Clause): Invocation[] {
     const text = stripOuterQuotes(token.text);
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
     const argument = tokens[index + 1];
-    if (argument === undefined) continue;
+    // Unknown => refuse: a wrapped interpreter whose payload is absent,
+    // `-c`/`-s`, or a here-document cannot be resolved to one repository file.
+    if (argument === undefined) {
+      found.push({ dynamic: `${text} stdin` });
+      continue;
+    }
     const value = stripOuterQuotes(argument.text);
-    if (/[$`]/.test(value)) found.push({ dynamic: argument.text });
+    if (value === "-c" || value === "-s") {
+      found.push({ dynamic: value });
+    } else if (value.includes("<<")) {
+      if (SHELL_INTERPRETERS.has(text)) found.push({ dynamic: value });
+    } else if (/[$`]/.test(value)) found.push({ dynamic: argument.text });
     else if (SCRIPT_EXTENSION.test(value)) found.push({ rel: value });
   }
   return found;
@@ -1505,24 +1589,46 @@ function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: st
     const line = entry.text;
     const lineAt = `${at}, line ${entry.line}`;
     if (entry.body) {
-      if (!rule1Exempt && isInstallLine(line)) handleInstall(ctx, rel, line, entry.line, lineAt, directory, directoryUnresolved, staged);
+      if (!rule1Exempt && isInstallLine(line)) {
+        handleInstall(ctx, rel, line, line, entry.line, lineAt, directory, directoryUnresolved, staged);
+      }
       continue;
     }
-    if (/^(?:pushd|popd)\b/.test(line)) directoryUnresolved = true;
+    if (/^(?:pushd|popd)\b/.test(line)) {
+      // Unknown => refuse: pushd/popd change the cwd to a location this scan
+      // does not model, and no later line may read that cwd as known.
+      directoryUnresolved = true;
+    }
     if (/^(?:cp|mv|ln|install|rsync|tee)\s/.test(line) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(line)) staged = true;
     if (/^(?:sed\s+-i|perl\s+-i)/.test(line) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(line)) staged = true;
     if (/(?:^|[^0-9])>{1,2}\s*[^;&|]*package-lock\.json/.test(line)) staged = true;
 
-    let installHandled = rule1Exempt || !isInstallLine(line);
-    let installDone = false;
-    const assignmentSubstitution = /^[A-Za-z_][A-Za-z0-9_]*=.*\$\(/.test(line);
-    const clauses = splitClauses(line);
-    const installClause = clauses.findIndex((clause) => isInstallLine(clause.tokens.map((token) => token.text).join(" ")));
-    if (!installHandled && installClause === -1) {
-      handleInstall(ctx, rel, line, entry.line, lineAt, directory, directoryUnresolved, staged);
-      installHandled = true;
+    // A tracked-lock helper call is a whole-line shape. Unknown cwd => refuse:
+    // its directory argument is resolved against the cwd the helper runs in.
+    const helper = line.match(HELPER_CALL);
+    if (helper !== null) {
+      if (!rule1Exempt) {
+        const dir = helper[3];
+        if (dir.startsWith("/") || dir === "-") throw new Error(`${lineAt}: tracked-lock helper directory is not relative: ${line}`);
+        if (directoryUnresolved) {
+          throw new Error(`${lineAt}: cannot bind the tracked-lock helper after a non-literal directory change: ${line}`);
+        }
+        const resolved = resolveRepoDir(directory, dir, lineAt);
+        const lockfile = resolved === "" ? "package-lock.json" : `${resolved}/package-lock.json`;
+        if (!ctx.tracked.has(lockfile)) throw new Error(`${lineAt}: ${lockfile} is not a tracked lockfile the gate reads: ${line}`);
+        ctx.installs++;
+        const helperRel = resolveRepoDir(directory, "scripts/npm-ci-tracked-lock.sh", lineAt);
+        if (scriptExists(ctx, helperRel)) followScript(ctx, helperRel, directory, label, [rel, helperRel]);
+      }
+      continue;
     }
-    for (const [index, clause] of clauses.entries()) {
+    if (line.startsWith("bash scripts/npm-ci-tracked-lock.sh") || line.startsWith("bash ./scripts/npm-ci-tracked-lock.sh")) {
+      throw new Error(`${lineAt}: tracked-lock helper call is not the literal accepted shape: ${line}`);
+    }
+
+    let clauseInstall = false;
+    const assignmentSubstitution = /^[A-Za-z_][A-Za-z0-9_]*=.*\$\(/.test(line);
+    for (const clause of splitClauses(line)) {
       const word = commandWord(clause.tokens);
       if (word !== null) {
         const command = stripOuterQuotes(word.token.text);
@@ -1530,46 +1636,40 @@ function scanShellScript(ctx: TreeContext, rel: string, content: string, cwd: st
           const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
           const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
           const resolved = resolveCdTarget(ctx, target, directory, scriptDir, bindings, lineAt);
-          if (resolved === null) directoryUnresolved = true;
-          else {
-            directory = resolved;
+          if (resolved === null) {
+            directoryUnresolved = true;
+          } else if (directoryUnresolved && resolved.kind === "cwd") {
+            // Unknown => sticky: a cwd-relative cd cannot re-anchor an unknown
+            // cwd; only an absolute-in-repo or script-directory anchor can.
+          } else {
+            directory = resolved.path;
             directoryUnresolved = false;
           }
           continue;
         }
-        if (!word.token.quoted && (command === "pushd" || command === "popd")) directoryUnresolved = true;
+        if (!word.token.quoted && (command === "pushd" || command === "popd")) {
+          directoryUnresolved = true;
+          continue;
+        }
       }
-      if (!installHandled && index === installClause) {
-        handleInstall(ctx, rel, line, entry.line, lineAt, directory, directoryUnresolved, staged);
-        installHandled = true;
-        installDone = true;
-      }
-      const helper = line.match(HELPER_CALL);
-      if (helper !== null && !installDone) {
-        const dir = helper[3];
-        if (dir.startsWith("/") || dir === "-") throw new Error(`${lineAt}: tracked-lock helper directory is not relative: ${line}`);
-        const resolved = resolveRepoDir(directory, dir, lineAt);
-        const lockfile = resolved === "" ? "package-lock.json" : `${resolved}/package-lock.json`;
-        if (!ctx.tracked.has(lockfile)) throw new Error(`${lineAt}: ${lockfile} is not a tracked lockfile the gate reads: ${line}`);
-        ctx.installs++;
-        installDone = true;
-        if (!installHandled) installHandled = true;
-        const helperRel = resolveRepoDir(directory, "scripts/npm-ci-tracked-lock.sh", lineAt);
-        if (scriptExists(ctx, helperRel)) followScript(ctx, helperRel, directory, label, [rel, helperRel]);
-        continue;
+      // Every install clause on the line is judged, in order, so an earlier
+      // install cannot consume the check for a later one.
+      const clauseText = clause.tokens.map((token) => token.text).join(" ");
+      if (!rule1Exempt && isInstallLine(clauseText)) {
+        handleInstall(ctx, rel, line, clauseText, entry.line, lineAt, directory, directoryUnresolved, staged);
+        clauseInstall = true;
       }
       if (!assignmentSubstitution) {
         recordClauseInvocation(ctx, rel, clause, directory, directoryUnresolved, entry.line, lineAt, bindings);
         followEmbeddedInvocations(ctx, rel, clause, directory, entry.line, bindings);
       }
     }
-    if (line.startsWith("bash scripts/npm-ci-tracked-lock.sh") || line.startsWith("bash ./scripts/npm-ci-tracked-lock.sh")) {
-      if (line.match(HELPER_CALL) === null) throw new Error(`${lineAt}: tracked-lock helper call is not the literal accepted shape: ${line}`);
+    if (!rule1Exempt && !clauseInstall && isInstallLine(line)) {
+      handleInstall(ctx, rel, line, line, entry.line, lineAt, directory, directoryUnresolved, staged);
     }
     for (const body of commandSubstitutions(line)) {
       recordLineInvocations(ctx, rel, body, directory, directoryUnresolved, entry.line, lineAt, bindings);
     }
-    if (!installHandled) handleInstall(ctx, rel, line, entry.line, lineAt, directory, directoryUnresolved, staged);
   }
 }
 
@@ -1658,6 +1758,7 @@ function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string)
   let directoryUnresolved = false;
   for (const entry of logicalShellLines(run)) {
     if (entry.body) continue;
+    const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
       const word = commandWord(clause.tokens);
       if (word !== null) {
@@ -1665,8 +1766,18 @@ function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string)
         if (!word.token.quoted && command === "cd") {
           const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
           const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
-          if (target === "" || /[$`~*?]/.test(target) || target === "-" || target === "--") directoryUnresolved = true;
-          else directory = resolveRepoDir(directory, target, `${label}: ${entry.text}`);
+          const resolved = resolveCdTarget(ctx, target, directory, "", undefined, `${label}: ${entry.text}`);
+          if (resolved === null) directoryUnresolved = true;
+          else if (directoryUnresolved && resolved.kind === "cwd") {
+            // Unknown => sticky: only an absolute-in-repo anchor can re-anchor.
+          } else {
+            directory = resolved.path;
+            directoryUnresolved = false;
+          }
+          continue;
+        }
+        if (!word.token.quoted && (command === "pushd" || command === "popd")) {
+          directoryUnresolved = true;
           continue;
         }
       }
@@ -1688,6 +1799,7 @@ function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string)
       }
       for (const invocation of embeddedInvocations(clause)) {
         if ("dynamic" in invocation) {
+          if (reviewedWrapped) continue;
           const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
           if (resolved !== null) followScript(ctx, resolved, directory, label, []);
           else throw new Error(`${label}: cannot resolve a dynamic script path to one repository file: ${invocation.dynamic} (physical line ${entry.line})`);
@@ -1824,10 +1936,43 @@ function assignmentToVariable(assignment: string, name: string): boolean {
   );
 }
 
-function overridableVariables(assignment: string): string[] {
-  const names = new Set<string>();
-  for (const match of assignment.matchAll(/\$\{([A-Za-z_][A-Za-z0-9_]*):?[-=]/g)) names.add(match[1]);
-  return [...names];
+/**
+ * The repository files a pinned assignment names. A variable is resolved through
+ * the script's single assignment; a literal path is taken as written. Unknown
+ * => absent: a `source` the pinned text does not derive is refused.
+ */
+function assignmentSourcePaths(
+  ctx: TreeContext,
+  assignment: string,
+  content: string,
+  script: string,
+): Set<string> {
+  const bindings = collectBindings(content);
+  const scriptDir = script.includes("/") ? script.slice(0, script.lastIndexOf("/")) : "";
+  const out = new Set<string>();
+  const addLiteral = (value: string) => {
+    const rel = value.replace(/^\.\//, "");
+    if (/^(?:[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+$/.test(rel) && scriptExists(ctx, rel)) out.add(rel);
+  };
+  for (const token of shellTokens(assignment)) {
+    const value = stripOuterQuotes(token.text);
+    if (!/[$`]/.test(value)) {
+      addLiteral(value);
+      continue;
+    }
+    for (const match of token.text.matchAll(/\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/g)) {
+      const name = match[1] ?? match[2];
+      const resolved = resolveAssignmentReference(name, bindings, scriptDir);
+      if (resolved === null) continue;
+      if (resolved.kind === "scriptDir") {
+        if (scriptExists(ctx, resolved.path)) out.add(resolved.path);
+      } else if (resolved.kind === "absolute") {
+        const rel = repoRelativePath(ctx, resolved.path);
+        if (rel !== null && scriptExists(ctx, rel)) out.add(rel);
+      }
+    }
+  }
+  return out;
 }
 
 /** Verify one reviewed entry: its single assignment, env reach, target and source. */
@@ -1859,12 +2004,12 @@ function verifyAllowlistEntry(ctx: TreeContext, entry: UnresolvedInvocationAllow
       );
     }
   }
-  for (const name of overridableVariables(entry.assignment)) {
-    if (ctx.scriptEnv.get(entry.script)?.has(name)) {
-      throw new Error(
-        `assertNpmCiWorkflowTree: UNRESOLVED_INVOCATION_ALLOWLIST entry ${entry.script} line ${entry.line} defaults ${name}, but a workflow env block sets ${name}; the pinned target can be overridden`,
-      );
-    }
+  // Unknown => refuse: `${VAR:-default}` and `${VAR-default}` depend on the
+  // runtime environment the scan cannot see, so no reviewed entry may pin one.
+  if (ENV_OVERRIDABLE.test(entry.assignment)) {
+    throw new Error(
+      `assertNpmCiWorkflowTree: UNRESOLVED_INVOCATION_ALLOWLIST entry ${entry.script} line ${entry.line} pins an env-overridable default (${entry.assignment}); an unresolved value may not be pinned`,
+    );
   }
   if (!scriptExists(ctx, entry.target)) {
     throw new Error(
@@ -1875,6 +2020,14 @@ function verifyAllowlistEntry(ctx: TreeContext, entry: UnresolvedInvocationAllow
     if (!scriptExists(ctx, entry.source)) {
       throw new Error(
         `assertNpmCiWorkflowTree: stale UNRESOLVED_INVOCATION_ALLOWLIST entry: ${entry.script} line ${entry.line} source ${entry.source} is not a repository file`,
+      );
+    }
+    // Unknown => refuse: the source must be tied to the pinned assignment text,
+    // not merely declared next to it.
+    const derived = assignmentSourcePaths(ctx, entry.assignment, content, entry.script);
+    if (!derived.has(entry.source)) {
+      throw new Error(
+        `assertNpmCiWorkflowTree: UNRESOLVED_INVOCATION_ALLOWLIST entry ${entry.script} line ${entry.line} source ${entry.source} is not derived from the pinned assignment ${entry.assignment}`,
       );
     }
     followScript(ctx, entry.source, "", "assertNpmCiWorkflowTree", [entry.source]);

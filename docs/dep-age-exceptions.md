@@ -31,28 +31,47 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
 Refusals name the workflow, job, step and physical line. Variable or substitution
 indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
 The guard follows repository scripts a workflow invokes by a literal path,
-recursively, and local composite actions (`uses: ./...`). In a followed shell
-script, a logical line (continuations joined, word-boundary comments stripped,
+recursively, and local composite actions (`uses: ./...`). It is a fail-closed
+lint for reviewed changes: it passes an install only as a bounded global
+install or when it resolves to a tracked lockfile, and it refuses anything it
+cannot fully resolve. It is not a boundary
+against an author who deliberately evades it; review is, and a runtime npm
+guard in CI is the structural fix, tracked separately.
+
+In a followed shell script, a logical line (continuations joined, word-boundary
+comments stripped, here-document headers matched after comment stripping,
 here-document bodies kept) is an install when, after lowercasing and deleting
 backslashes and quotes, it contains `npx` as a word, or `npm` as a word followed
-later by `ci`, `install`, `i`, `add`, `exec` or `x`. An install must use the
-tracked-lock helper, a bounded global install, or bind to a tracked lockfile;
-`--no-package-lock` is refused, as are `npx`, `npm exec` and `npm x`, which do
-not read a lockfile. `--prefix`/`-C`/`--workspace`/`-w` bind the install to the
-literal directory they name. `scripts/npm-ci-tracked-lock.sh` is the approved
-install implementation: its own lines are not screened by that classifier, and
-a helper call is followed wherever it appears. An interpreter invocation is
-followed when its script argument resolves to a repository file: a literal path,
-or a variable the script binds exactly once to a literal or
-script-directory-relative path. A computed, external, `-c`/`-s` or
+later by `ci`, `install`, `i`, `add`, `exec` or `x`. Every install clause on a
+line is judged, in order. An install must use the tracked-lock helper, a bounded
+global install, or bind to a tracked lockfile; an install line whose npm/npx
+shape cannot be read is refused, as are `--no-package-lock`, `npx`, `npm exec`
+and `npm x`, which do not read a lockfile. `--prefix`/`-C`/`--workspace`/`-w`
+bind the install to the literal directory they name; a repeated directory flag
+is refused. `scripts/npm-ci-tracked-lock.sh` is the approved install
+implementation: its own lines are not screened by that classifier, and a helper
+call is followed wherever it appears; a helper call is refused when the cwd or
+its directory argument is not resolved.
+
+An interpreter invocation is followed when its script argument resolves to a
+repository file: a literal path, or a variable the script binds exactly once to
+a literal or script-directory-relative path. A computed, external, `-c`/`-s` or
 here-document-to-shell invocation is refused unless it is on the reviewed
-allowlist, whose entries pin the target, the single assignment to the variable
-and any content source. An install or relative invocation after a non-literal
-`cd` is refused. A reviewed entry whose assignment has an env-overridable
-default (`${VAR:-...}`) is refused when a workflow, job or step `env:` block
-sets that variable. Installs inside followed JavaScript or TypeScript scripts,
-and node `-e`/`-p` or node here-document payloads, are not inspected; their
-here-document bodies are still install-screened. Helper
+allowlist, as is a wrapped interpreter (`timeout`, `docker`, `su`, ...) whose
+payload is absent or non-literal. The allowlist pins the target, the single
+assignment to the variable and any content source; a `source` must be derived
+from the pinned assignment, and an entry whose assignment is an env-overridable
+default (`${VAR:-...}`) is refused.
+
+An install or relative invocation after a non-literal `cd`, `pushd`, `popd` or
+`cd -` is refused. The unknown cwd is sticky: a later relative `cd` keeps it
+unknown, and only a `cd` to an absolute path inside the repository, to a path
+anchored to the repository root, or to the script's own directory makes it
+known again. A literal absolute `cd` outside the repository leaves it unknown.
+
+Installs inside followed JavaScript or TypeScript scripts, node `-e`/`-p` or
+node here-document payloads, and `npm run`/`bun run` targets in `package.json`
+are not inspected; here-document bodies are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper

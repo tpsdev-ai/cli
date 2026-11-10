@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Fixtures for scripts/docker-bun-version.sh and scripts/assert-bun-version.sh.
-# HELPER overrides the helper under test (used to run a mutant).
+# The helper under test is resolved from this script's directory.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-helper="${HELPER:-$here/docker-bun-version.sh}"
+helper="$here/docker-bun-version.sh"
 assert="$here/assert-bun-version.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
