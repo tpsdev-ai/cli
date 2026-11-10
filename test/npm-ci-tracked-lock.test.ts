@@ -281,6 +281,20 @@ function startRegistry(bytes: Uint8Array) {
   return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
 }
 
+/** A second loopback server that records every request; any request is a leak. */
+function startEvil() {
+  const requests: string[] = [];
+  const server = Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request) {
+      requests.push(`${request.method} ${new URL(request.url).pathname}`);
+      return new Response("unexpected proxy request", { status: 404 });
+    },
+  });
+  return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+}
+
 async function runHelper(args: string[], cwd: string, extra: Record<string, string>) {
   const env = { PATH: process.env.PATH ?? "", ...extra };
   const proc = Bun.spawn(["/bin/bash", HELPER, ...args], { cwd, env, stdout: "pipe", stderr: "pipe" });
@@ -565,6 +579,55 @@ it.skipIf(!npmAvailable)("a clean fixture installs through the local registry th
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+const userConfigSources = ["$HOME/.npmrc", "npm_config_userconfig"] as const;
+
+it.skipIf(!npmAvailable).each(userConfigSources)(
+  "a user npmrc supplied via %s cannot route the install",
+  async (source) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-userconfig-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    let evil: ReturnType<typeof startEvil> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      evil = startEvil();
+      const repo = depFixtureRepo(root, {
+        version: "1.0.0",
+        resolved: `${registry.url}${DEP_PATH}`,
+        integrity: tarball.integrity,
+      });
+      const home = join(root, "home");
+      const cache = join(root, "npm-cache");
+      const prefix = join(root, "prefix");
+      for (const dir of [home, cache]) mkdirSync(dir, { recursive: true });
+      const contents = `proxy=${evil.url}/\nhttps-proxy=${evil.url}/\nregistry=${evil.url}/\n`;
+      const extra: Record<string, string> = {
+        HOME: home, TPS_DEP_AGES_REGISTRY: registry.url, npm_config_cache: cache,
+      };
+      if (source === "$HOME/.npmrc") {
+        writeFileSync(join(home, ".npmrc"), contents);
+      } else {
+        const named = join(root, "named-userconfig");
+        writeFileSync(named, contents);
+        extra.npm_config_userconfig = named;
+      }
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, prefix, "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, extra);
+      expect(result.status, result.stderr).toBe(0);
+      const installed = JSON.parse(readFileSync(join(prefix, "node_modules", DEP, "package.json"), "utf8"));
+      expect(installed.name).toBe(DEP);
+      expect(registry.requests).toContain(`GET ${DEP_PATH}`);
+      expect(evil.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      evil?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
 
 it.skipIf(!npmAvailable)("an .npmrc in the tracked fixture directory is refused with zero registry requests", async () => {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-npmrc-"));
