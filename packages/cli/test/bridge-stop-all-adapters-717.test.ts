@@ -25,8 +25,35 @@ const FIFO_DEADLINE = FIFO_TEST_TIMEOUT - FIFO_DEADLINE_MARGIN;
 /** This test also starts a real bridge before the FIFO read, so its timeout
  *  covers START_TIMEOUT as well. */
 const FIFO_STOP_TEST_TIMEOUT = FIFO_TEST_TIMEOUT + START_TIMEOUT;
-/** Timeouts of the tests that arm FIFO_DEADLINE. */
-const FIFO_TEST_TIMEOUTS = [FIFO_TEST_TIMEOUT, FIFO_STOP_TEST_TIMEOUT] as const;
+
+/** The time a FIFO test needs: what it spends before the FIFO read, the read's
+ *  deadline, and the margin. A timeout below this fails registration. */
+function checkFifoTimeout(name: string, timeoutMs: number, preReadMs: number): void {
+  const needed = preReadMs + FIFO_DEADLINE + FIFO_DEADLINE_MARGIN;
+  if (timeoutMs < needed) {
+    throw new Error(`FIFO test "${name}": timeout ${timeoutMs} ms is below ${needed} ms (pre-read ${preReadMs} + FIFO_DEADLINE ${FIFO_DEADLINE} + margin ${FIFO_DEADLINE_MARGIN})`);
+  }
+}
+
+/** Names of the tests registered through fifoTest. */
+const fifoCases: string[] = [];
+/** True only while a fifoTest body runs; runFifoRead refuses otherwise. */
+let fifoTestRunning = false;
+
+/** The only way to register a test that arms FIFO_DEADLINE: its own timeout is
+ *  checked where it is declared, so no list can drift from the call sites. */
+function fifoTest(name: string, fn: () => Promise<void>, timeoutMs: number, preReadMs = 0): void {
+  checkFifoTimeout(name, timeoutMs, preReadMs);
+  fifoCases.push(name);
+  test(name, async () => {
+    fifoTestRunning = true;
+    try {
+      await fn();
+    } finally {
+      fifoTestRunning = false;
+    }
+  }, timeoutMs);
+}
 const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
 const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
@@ -146,6 +173,7 @@ async function runStartDecision(): Promise<{ stdout: string; exitCode: number }>
 }
 
 async function runFifoRead(deadlineMs: number, script: string): Promise<Record<string, unknown>> {
+  if (!fifoTestRunning) throw new Error("runFifoRead runs only inside a test registered with fifoTest");
   const path = join(home, "fifo-read.mts");
   writeFileSync(path, script);
   const child = spawnScript(path, {});
@@ -508,11 +536,19 @@ describe("bridge status names the adapter of each running record", () => {
 });
 
 describe("FIFO deadline bounds", () => {
-  test("the FIFO deadline leaves the margin before every timeout that arms it", () => {
-    for (const timeout of FIFO_TEST_TIMEOUTS) {
-      expect(FIFO_DEADLINE).toBeLessThan(timeout);
-      expect(timeout - FIFO_DEADLINE).toBeGreaterThanOrEqual(FIFO_DEADLINE_MARGIN);
-    }
+  test("a FIFO test timeout below pre-read + deadline + margin is refused, and exactly enough is accepted", () => {
+    const needed = START_TIMEOUT + FIFO_DEADLINE + FIFO_DEADLINE_MARGIN;
+    expect(() => checkFifoTimeout("probe", needed - 1, START_TIMEOUT)).toThrow("is below");
+    expect(() => checkFifoTimeout("probe", needed, START_TIMEOUT)).not.toThrow();
+    expect(() => checkFifoTimeout("probe", FIFO_DEADLINE + FIFO_DEADLINE_MARGIN - 1, 0)).toThrow("is below");
+  });
+
+  test("every test that runs a FIFO read is registered through fifoTest", () => {
+    expect(fifoCases).toHaveLength(4);
+  });
+
+  test("runFifoRead refuses outside a fifoTest", async () => {
+    await expect(runFifoRead(FIFO_DEADLINE, "")).rejects.toThrow("only inside a test registered with fifoTest");
   });
 });
 
@@ -534,7 +570,7 @@ describe("child environment", () => {
 });
 
 describe("guarded pid-file reads", () => {
-  test(
+  fifoTest(
     "a discovered regular record replaced by a FIFO is classified without being read and kept",
     async () => {
       const fifo = join(runDir, "bridge-fifo.pid");
@@ -554,7 +590,7 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
     FIFO_TEST_TIMEOUT,
   );
 
-  test("a final-component symlink is classified without reading its target and kept", async () => {
+  fifoTest("a final-component symlink is classified without reading its target and kept", async () => {
     const target = join(runDir, "target");
     const path = join(runDir, "bridge-openclaw.pid");
     expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
@@ -569,7 +605,7 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(path)})));
     expect(existsSync(path)).toBe(true);
   }, FIFO_TEST_TIMEOUT);
 
-  test("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
+  fifoTest("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
     const path = join(runDir, "bridge-fifo.pid");
     writeFileSync(path, "");
 
@@ -611,7 +647,7 @@ console.log("RESULT:" + JSON.stringify({ fresh, signals, message, reads }));
     expect(existsSync(path)).toBe(true);
   }, FIFO_TEST_TIMEOUT);
 
-  test(
+  fifoTest(
     "a FIFO record is reported as kept while the other records are stopped",
     async () => {
       const child = await startStdioBridge();
@@ -637,5 +673,6 @@ console.log("RESULT:" + JSON.stringify({ adapters, message }));
       expect(existsSync(fifo)).toBe(true);
     },
     FIFO_STOP_TEST_TIMEOUT,
+    START_TIMEOUT,
   );
 });
