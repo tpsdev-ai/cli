@@ -16,14 +16,17 @@ import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
 const START_TIMEOUT = 10_000;
-/** The FIFO child's deadline sits inside the per-test timeout that bounds it, so
- *  a hung child reports the named error rather than bun's generic timeout. */
+/** Room the FIFO child's deadline leaves before the timeout of the test that
+ *  arms it, so a hung child reports the named error rather than bun's generic
+ *  timeout. */
 const FIFO_DEADLINE_MARGIN = 2_000;
 const FIFO_TEST_TIMEOUT = 10_000;
 const FIFO_DEADLINE = FIFO_TEST_TIMEOUT - FIFO_DEADLINE_MARGIN;
 /** This test also starts a real bridge before the FIFO read, so its timeout
  *  covers START_TIMEOUT as well. */
-const FIFO_STOP_TEST_TIMEOUT = FIFO_DEADLINE + FIFO_DEADLINE_MARGIN + START_TIMEOUT;
+const FIFO_STOP_TEST_TIMEOUT = FIFO_TEST_TIMEOUT + START_TIMEOUT;
+/** Timeouts of the tests that arm FIFO_DEADLINE. */
+const FIFO_TEST_TIMEOUTS = [FIFO_TEST_TIMEOUT, FIFO_STOP_TEST_TIMEOUT] as const;
 const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
 const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
@@ -103,7 +106,7 @@ function spawnSleep(): Bun.Subprocess {
 
 function spawnScript(script: string, env: Record<string, string>): Bun.Subprocess {
   const child = Bun.spawn(["bun", script], {
-    env: { ...process.env, HOME: home, ...env },
+    env: { ...process.env, ...env, HOME: home },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -499,6 +502,32 @@ describe("bridge status names the adapter of each running record", () => {
           },
         ],
       });
+    },
+    TIMEOUT,
+  );
+});
+
+describe("FIFO deadline bounds", () => {
+  test("the FIFO deadline leaves the margin before every timeout that arms it", () => {
+    for (const timeout of FIFO_TEST_TIMEOUTS) {
+      expect(FIFO_DEADLINE).toBeLessThan(timeout);
+      expect(timeout - FIFO_DEADLINE).toBeGreaterThanOrEqual(FIFO_DEADLINE_MARGIN);
+    }
+  });
+});
+
+describe("child environment", () => {
+  test(
+    "a caller's env cannot override the temp HOME",
+    async () => {
+      const script = join(home, "print-home.mts");
+      writeFileSync(script, 'console.log("HOME:" + process.env.HOME);');
+      const child = spawnScript(script, { HOME: join(home, "other") });
+      const exitCode = await child.exited;
+      const stdout = await new Response(child.stdout).text();
+
+      expect(exitCode).toBe(0);
+      expect(stdout.trim()).toBe(`HOME:${home}`);
     },
     TIMEOUT,
   );
