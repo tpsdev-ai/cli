@@ -128,7 +128,11 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
   return { result: alreadyRecorded ? "duplicate" : "queued" };
 }
 
-/** A file younger than this that does not parse is a writer still in flight, not a bad record. */
+/**
+ * A file whose age is between 0 and this value that does not parse is treated
+ * as a writer still in flight, not a bad record. A negative age (mtime in the
+ * future) is treated as old.
+ */
 export const OUTBOX_PARTIAL_GRACE_MS = 5_000;
 
 export interface OutboxDrainResult {
@@ -171,9 +175,10 @@ export function drainOutboxWithStats(archive = true): OutboxDrainResult {
         continue;
       }
       // A writer that is still writing publishes a short, unparseable file.
-      // Leave it for the next pass; only quarantine once it has had the grace
-      // period and still does not parse.
-      if (ageMs < OUTBOX_PARTIAL_GRACE_MS) {
+      // Leave it for the next pass; quarantine once it has had the grace period
+      // and still does not parse, or straight away when its mtime is in the
+      // future (a negative age is not a writer in flight).
+      if (ageMs >= 0 && ageMs < OUTBOX_PARTIAL_GRACE_MS) {
         console.error(`drainOutbox: failed to parse ${f} (age ${ageMs}ms): younger than ${OUTBOX_PARTIAL_GRACE_MS}ms; leaving in place`);
         skippedYoung++;
         continue;
@@ -260,6 +265,7 @@ export class OutboxSendTracker {
  */
 export class OutboxYoungRetryScheduler {
   private handle: ReturnType<typeof setTimeout> | null = null;
+  private stopped = false;
 
   constructor(
     private readonly setTimer: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
@@ -272,7 +278,7 @@ export class OutboxYoungRetryScheduler {
   }
 
   observe(skippedYoung: number, run: () => void): void {
-    if (skippedYoung <= 0 || this.handle !== null) return;
+    if (this.stopped || skippedYoung <= 0 || this.handle !== null) return;
     const handle = this.setTimer(() => {
       this.handle = null;
       run();
@@ -282,8 +288,49 @@ export class OutboxYoungRetryScheduler {
   }
 
   cancel(): void {
+    this.stopped = true;
     if (this.handle === null) return;
     this.clearTimer(this.handle);
     this.handle = null;
   }
+}
+
+export interface OutboxSendPassOptions<T> {
+  tracker: OutboxSendTracker;
+  scheduler: OutboxYoungRetryScheduler;
+  /** Channel this pass sends on. */
+  target: T;
+  /** Wire sequence number for this pass. */
+  seq: number;
+  /** Delivers one drained record on `target`; a rejection fails that record. */
+  send: (target: T, item: OutboxMessage, seq: number) => Promise<unknown> | void;
+  /**
+   * The channel a scheduled retry may use, or null when none is alive. A retry
+   * runs on seq 0: it belongs to no inbound message, and the outbox watcher
+   * uses 0 for the same reason.
+   */
+  pickTarget: () => T | null;
+  onRetryError?: (error: unknown) => void;
+}
+
+/**
+ * One send pass: drain, deliver, and schedule a single retry if a pass skipped
+ * a young unparseable file. The retry is how that file gets another pass
+ * without another directory event.
+ */
+export async function runOutboxSendPass<T>(options: OutboxSendPassOptions<T>): Promise<void> {
+  const { tracker, scheduler, target, seq, send, pickTarget, onRetryError } = options;
+  const pass = tracker.dueWithStats();
+  for (const item of pass.messages) {
+    try {
+      await send(target, item, seq);
+    } catch {
+      tracker.sendFailed(item.id);
+    }
+  }
+  scheduler.observe(pass.skippedYoung, () => {
+    const retryTarget = pickTarget();
+    if (retryTarget === null) return;
+    void runOutboxSendPass({ ...options, target: retryTarget, seq: 0 }).catch((error) => onRetryError?.(error));
+  });
 }

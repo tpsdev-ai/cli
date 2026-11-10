@@ -11,7 +11,7 @@ import { startServiceProxies, type ServiceProxySet } from "../utils/service-prox
 import { sendMessage, inboxExists, findRelayedRecord } from "../utils/mail.js";
 import { signForDelivery } from "../utils/mail-producer.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { OutboxSendTracker, OutboxYoungRetryScheduler, queueOutboxMessage } from "../utils/outbox.js";
+import { OutboxSendTracker, OutboxYoungRetryScheduler, queueOutboxMessage, runOutboxSendPass } from "../utils/outbox.js";
 import { branchStatePath, clearBranchState, writeBranchState } from "../utils/connection-state.js";
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
@@ -576,25 +576,24 @@ async function runStart(): Promise<void> {
 
   // One send pass: drain, deliver, and schedule a single retry if a young
   // unparseable file was skipped. The retry is how that file gets another
-  // pass without another directory event.
-  const sendOutboxPass = async (channel: TransportChannel, seq: number): Promise<void> => {
-    const pass = outboxSends.dueWithStats();
-    for (const item of pass.messages) {
-      await channel.send({
+  // pass without another directory event; it may use only a live host channel.
+  const sendOutboxPass = (channel: TransportChannel, seq: number): Promise<void> =>
+    runOutboxSendPass({
+      tracker: outboxSends,
+      scheduler: outboxYoungRetry,
+      target: channel,
+      seq,
+      send: (target, item, sendSeq) => target.send({
         type: MSG_MAIL_DELIVER,
-        seq,
+        seq: sendSeq,
         ts: new Date().toISOString(),
         body: { id: item.id, from: item.from, to: item.to, content: item.body, timestamp: item.timestamp },
-      }).catch(() => outboxSends.sendFailed(item.id));
-    }
-    outboxYoungRetry.observe(pass.skippedYoung, () => {
-      const target = activeHostChannel?.isAlive() ? activeHostChannel : channel.isAlive() ? channel : null;
-      if (!target) return;
-      void sendOutboxPass(target, seq).catch((error) => {
+      }),
+      pickTarget: () => (activeHostChannel?.isAlive() ? activeHostChannel : null),
+      onRetryError: (error) => {
         logLine("WARN", `Outbox retry failed: ${error instanceof Error ? error.message : String(error)}`);
-      });
+      },
     });
-  };
 
   const onMessage = async (msg: TpsMessage, channel: TransportChannel) => {
     if (activeHostChannel !== channel) {

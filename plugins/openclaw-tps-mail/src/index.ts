@@ -325,8 +325,8 @@ function writeOutboxFile(message: TpsMailBody): string {
   // relay watches outbox/new and calls drainOutbox() on EVERY directory event,
   // including the create event that precedes the bytes — a record written
   // straight to its final name can be read mid-write and fail JSON.parse. The
-  // drain leaves a file younger than its partial-write grace in place and reads
-  // it again on a later pass; a record that stays malformed past the grace is
+  // drain leaves a file aged between 0 and its partial-write grace in place and
+  // reads it again on a later pass; a record older than the grace is
   // quarantined. drainOutbox filters dot-prefixed names by design, so a
   // concurrent reader never sees a half-written record, and rename(2) within one
   // filesystem is atomic. (This is replicated here rather than calling queueOutboxMessage
@@ -922,8 +922,10 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   }
   const outbox = resolve(home, ".tps", "outbox");
   // The branch drain moves the record new/ → sent/ keeping replyToId+headers,
-  // so a REMOTE receipt is either file; a `.malformed-*` in either is a FAILURE
-  // once the drain has quarantined it (after the partial-write grace).
+  // so a REMOTE receipt is either file; a `.malformed-*` in sent/ carrying THIS
+  // reply's id is a FAILURE (the drain quarantines a record once it is older
+  // than the partial-write grace, or straight away when its mtime is in the
+  // future); an unrelated one is not.
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 

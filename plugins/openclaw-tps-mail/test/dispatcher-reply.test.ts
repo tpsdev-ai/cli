@@ -376,16 +376,17 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   // The property that matters is not "the final name is never changed in
   // place" — that is an inotify shape and does not hold on every platform — it
   // is that a concurrent drain does not quarantine a record that is still being
-  // written. The REAL consumer is drainOutbox(): the branch relay (branch.ts:409)
-  // watches ~/.tps/outbox/new and calls it on every directory event.
+  // written. The REAL consumer is drainOutbox(): in `runStart`, `outboxWatcher`
+  // watches ~/.tps/outbox/new and calls the send pass, which drains through
+  // `OutboxSendTracker.dueWithStats` → `drainOutboxWithStats(false)`.
   //
-  // CURRENT CONTRACT (#913): an unparseable file younger than
-  // OUTBOX_PARTIAL_GRACE_MS is a writer still in flight — the drain leaves it
-  // in place ("leaving in place") and a later pass reads it again. Only a file
-  // that is still malformed once it is at least the grace old is quarantined
-  // to sent/.malformed-*. A torn in-place write is therefore lost only if it
-  // stays torn past the grace; one that completes within it is delivered
-  // exactly once.
+  // CURRENT CONTRACT (#913): an unparseable file with an age between 0 and
+  // OUTBOX_PARTIAL_GRACE_MS is treated as a writer still in flight — the drain
+  // leaves it in place ("leaving in place") and a later pass reads it again.
+  // Only a file that is still malformed once it is at least the grace old, or
+  // one whose mtime is in the future, is quarantined to sent/.malformed-*. A
+  // torn in-place write is therefore lost only if it stays torn past the grace;
+  // one that completes within it is returned by `drainOutbox()` exactly once.
   //
   //   POSITIVE: the FIXED writer (writeOutboxFile, staged to a dot temp then
   //             renamed), driven through the production shape — a real
@@ -399,16 +400,17 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   //             while young and delivered EXACTLY ONCE once complete.
   //   NEGATIVE CONTROL: the same torn shape, aged past the grace while still
   //             torn, IS quarantined. This one can fail: it goes red if the
-  //             grace is removed or the quarantine is dropped.
+  //             quarantine is dropped (the regression test above goes red if the
+  //             grace is removed).
   //
   // A single synchronous writeFileSync, however large, is effectively atomic
   // against an in-process reader and never tears — which is why the writer is
   // multi-syscall AND drives the drain itself rather than racing a watcher.
-  // The relay loop for the POSITIVE case mirrors branch.ts:409 exactly (a real
+  // The relay loop for the POSITIVE case follows the branch relay's shape (a real
   // fs.watch on outbox/new → drainOutbox() on each event); HOME is redirected
   // per-test, and every wait has an explicit deadline.
 
-  /** The real relay, exactly as branch.ts:409 runs it. Collects delivered items. */
+  /** The real relay loop, following `outboxWatcher` in `runStart`. Collects delivered items. */
   function startRelay(newDir: string) {
     mkdirSync(newDir, { recursive: true });
     const delivered: any[] = [];
