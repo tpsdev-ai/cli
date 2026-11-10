@@ -604,11 +604,11 @@ function openPullRequest(
   })();
 }
 
-/** Strip ANSI escapes and control characters from probe stderr, then cap it. */
+/** Remove ANSI CSI escapes from probe stderr, replace C0 and C1 control characters and DEL with spaces, then cap it. */
 function sanitizeProbeStderr(raw: string): string {
   const ansi = new RegExp(`${String.fromCharCode(27)}\\[[0-?]*[ -/]*[@-~]`, "g");
   const controls = new RegExp(
-    `[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}]`,
+    `[${String.fromCharCode(0)}-${String.fromCharCode(31)}${String.fromCharCode(127)}-${String.fromCharCode(159)}]`,
     "g",
   );
   return raw.replace(ansi, "").replace(controls, " ").trim().slice(0, 300);

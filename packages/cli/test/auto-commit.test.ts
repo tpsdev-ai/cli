@@ -1262,9 +1262,9 @@ exec ${GIT} "$@"`);
     });
   });
 
-  test("caps and strips control characters from a refused status probe's stderr", async () => {
+  test("caps a refused status probe's stderr and replaces its C0, DEL and C1 control characters", async () => {
     const publishEvent = mock(async () => {});
-    const noisy = `\u001b[31m${"A".repeat(150)}\u0000${"A".repeat(1850)}`;
+    const noisy = `\u001b[31m${"A".repeat(100)}\u009b31m\u0085${"A".repeat(50)}\u0000${"A".repeat(1850)}`;
     const spawnSyncImpl = mock((cmd: string, args: string[]) => {
       if (cmd === "/usr/bin/git" && args.join(" ") === "symbolic-ref --quiet HEAD") {
         return { status: 0, stdout: "refs/heads/fix/probe\n", stderr: "" };
@@ -1297,7 +1297,7 @@ exec ${GIT} "$@"`);
     expect(thrown).toBeDefined();
     const detail = (publishEvent.mock.calls[0][0] as { detail: string }).detail;
     const hasControl = (text: string) =>
-      [...text].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f);
+      [...text].some((ch) => ch.charCodeAt(0) < 0x20 || (ch.charCodeAt(0) >= 0x7f && ch.charCodeAt(0) <= 0x9f));
     for (const text of [thrown!.message, detail]) {
       expect(hasControl(text)).toBe(false);
       expect(text).not.toContain("[31m");
