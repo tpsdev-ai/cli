@@ -17,7 +17,7 @@ import { workspacePath as resolveWorkspacePath } from "../utils/workspace.js";
 import { createFlairClient, type OrgEvent } from "../utils/flair-client.js";
 import { readOpenClawConfig, resolveConfigPath, getAgentList, type OpenClawConfig, type OpenClawAgent } from "../utils/config.js";
 import { homeDir } from "../utils/home.js";
-import { pidState } from "@tpsdev-ai/agent";
+import { pidState, type PidState } from "@tpsdev-ai/agent";
 
 function statusDir(): string {
   return join(homeDir(), ".tps", "status");
@@ -96,6 +96,11 @@ export interface StatusArgs {
   cost?: boolean;
   shared?: boolean;
   costSince?: "day" | "week" | "month";
+}
+
+export interface StatusDeps {
+  /** Probe a recorded pid; defaults to the shared pidState. */
+  pidState?: (pid: number) => PidState;
 }
 
 interface RenderRow {
@@ -399,14 +404,20 @@ function detectDangerState(profile?: string, nonono?: boolean, status?: string):
   return "";
 }
 
-function computeState(raw: NodeStatus, now: number, staleMs: number, offlineMs: number): AgentState {
+function computeState(
+  raw: NodeStatus,
+  now: number,
+  staleMs: number,
+  offlineMs: number,
+  probe: (pid: number) => PidState = pidState,
+): AgentState {
   const hb = new Date(raw.lastHeartbeat).getTime();
   if (raw.status === "error") {
     return "error";
   }
   // For an online record, every present pid, including 0, goes through
   // pidState. A probe refused with EPERM (permission denied) is reported alive.
-  if (raw.pid !== undefined && raw.pid !== null && raw.status === "online" && pidState(raw.pid) !== "alive") {
+  if (raw.pid !== undefined && raw.pid !== null && raw.status === "online" && probe(raw.pid) !== "alive") {
     return "zombie";
   }
   if (now - hb >= offlineMs) return "offline";
@@ -511,8 +522,9 @@ export async function runHeartbeat(args: HeartbeatArgs): Promise<void> {
   }
 }
 
-export async function runStatus(args: StatusArgs): Promise<void> {
+export async function runStatus(args: StatusArgs, deps: StatusDeps = {}): Promise<void> {
   ensureDir(nodesDir());
+  const probe = deps.pidState ?? pidState;
 
   if (!args.agentId) {
     const now = Date.now();
@@ -536,7 +548,7 @@ export async function runStatus(args: StatusArgs): Promise<void> {
       .map((p) => readStatus(basename(p, ".json")))
       .filter((r): r is NodeStatus => Boolean(r))
       .map((entry) => {
-        const effective = computeState(entry, now, staleMs, offlineMs);
+        const effective = computeState(entry, now, staleMs, offlineMs, probe);
         const warning = detectDangerState(entry.runtimeProfile, entry.nonono);
         return {
           id: entry.agentId,
@@ -617,7 +629,7 @@ export async function runStatus(args: StatusArgs): Promise<void> {
 
   const staleMs = (args.staleMinutes || 30) * 60 * 1000;
   const offlineMs = (args.offlineHours || 2) * 60 * 60 * 1000;
-  const effective = computeState(status, Date.now(), staleMs, offlineMs);
+  const effective = computeState(status, Date.now(), staleMs, offlineMs, probe);
   const warning = detectDangerState(status.runtimeProfile, status.nonono);
   const payload = {
     ...status,
