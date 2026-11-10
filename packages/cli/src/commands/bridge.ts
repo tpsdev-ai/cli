@@ -278,9 +278,11 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
 
     case "status": {
       if (args.json) {
+        const entries = bridgePidFiles();
         const running = bridgeRunningRecords();
         // The top-level `running`, `pid` and `port` describe the OpenClaw
-        // record only; `bridges` lists every running record.
+        // record only; `bridges` lists every running record, and `records`
+        // lists every pid record with its classified kind.
         const openclaw = running.find((entry) => entry.adapter === "openclaw");
         const status = {
           running: openclaw !== undefined,
@@ -288,6 +290,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           ...(openclaw?.port === undefined ? {} : { port: openclaw.port }),
           ...(openclaw === undefined ? {} : { adapter: openclaw.adapter }),
           ...(running.length === 0 ? {} : { bridges: running }),
+          records: entries.map(({ adapter, path, state }) => ({ adapter, path, state: state.kind })),
         };
         console.log(JSON.stringify(status));
       } else {

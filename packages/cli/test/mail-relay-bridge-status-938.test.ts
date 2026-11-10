@@ -1,0 +1,295 @@
+/**
+ * cli#938 — follow-ups from #923: pin the mixed-record human status, the
+ * signalled-path "is gone" line, non-zero exits on a relay stop refusal, and
+ * the additive per-record state in `tps bridge status --json`.
+ */
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
+import { readPidFile } from "../src/utils/pid-file.js";
+
+const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+const TIMEOUT = 20_000;
+
+let home: string;
+let relayPid: string;
+let runDir: string;
+let savedHome: string | undefined;
+const children: Bun.Subprocess[] = [];
+
+function spawnChild(): Bun.Subprocess {
+  const child = Bun.spawn(["sleep", "60"], { stdio: ["ignore", "ignore", "ignore"] });
+  children.push(child);
+  return child;
+}
+
+function childToken(pid: number): string {
+  const token = processStartToken(pid);
+  if (token === null) throw new Error(`no start token for pid ${pid}`);
+  return token;
+}
+
+/** A token from the same source as `real` whose value the child cannot carry,
+ *  so the record is stale by construction on Linux and macOS. */
+function foreignStartToken(real: string): string {
+  if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
+  if (real.startsWith("proc:")) return "proc:1";
+  throw new Error(`unexpected start token source: ${real}`);
+}
+
+function record(pid: number, token: string | null, port?: number): string {
+  const fields: Record<string, unknown> = { pid, startToken: token };
+  if (port !== undefined) fields.port = port;
+  return `${JSON.stringify(fields)}\n`;
+}
+
+function staleRecord(child: Bun.Subprocess): string {
+  return record(child.pid, foreignStartToken(childToken(child.pid)));
+}
+
+/** Drive the shipped CLI the way a user does, with HOME pointing at this test. */
+function runCli(args: string[]): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("node", [TPS_BIN, ...args], {
+    env: { ...process.env, HOME: home },
+    encoding: "utf8",
+    timeout: TIMEOUT,
+  });
+  return { status: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+function writeBridgeRecord(name: string, contents: string): string {
+  const path = join(runDir, name);
+  writeFileSync(path, contents);
+  return path;
+}
+
+function captureLogs(): { logs: string[]; restore: () => void } {
+  const logs: string[] = [];
+  const logSpy = spyOn(console, "log").mockImplementation((...args: unknown[]) => {
+    logs.push(args.join(" "));
+  });
+  const errorSpy = spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+    logs.push(args.join(" "));
+  });
+  return {
+    logs,
+    restore: () => {
+      logSpy.mockRestore();
+      errorSpy.mockRestore();
+    },
+  };
+}
+
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  home = mkdtempSync(join(tmpdir(), "tps-relay-bridge-938-"));
+  process.env.HOME = home;
+  runDir = join(home, ".tps", "run");
+  mkdirSync(runDir, { recursive: true });
+  relayPid = join(home, ".tps", "relay.pid");
+});
+
+// Every spy is restored even when an assertion throws.
+afterEach(() => {
+  mock.restore();
+});
+
+afterEach(() => {
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  for (const child of children.splice(0)) {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  rmSync(home, { recursive: true, force: true });
+});
+
+describe("tps bridge status with one running record and one bad record", () => {
+  const badRecords: Array<{ kind: string; article: string; write: (name: string) => string }> = [
+    { kind: "invalid", article: "an", write: (name) => writeBridgeRecord(name, "not-a-pid\n") },
+    {
+      kind: "stale",
+      article: "a",
+      write: (name) => writeBridgeRecord(name, staleRecord(spawnChild())),
+    },
+    {
+      kind: "unverified",
+      article: "an",
+      write: (name) => writeBridgeRecord(name, record(spawnChild().pid, null)),
+    },
+    {
+      kind: "unreadable",
+      article: "an",
+      write: (name) => {
+        const path = join(runDir, name);
+        symlinkSync(join(home, "missing-bridge-target"), path);
+        return path;
+      },
+    },
+  ];
+
+  for (const { kind, article, write } of badRecords) {
+    test(
+      `${article} ${kind} record is not mentioned while a bridge is running`,
+      () => {
+        const child = spawnChild();
+        writeBridgeRecord("bridge-openclaw.pid", record(child.pid, childToken(child.pid)));
+        const badPath = write("bridge-discord.pid");
+
+        const result = runCli(["bridge", "status"]);
+
+        expect(result.status).toBe(0);
+        expect(result.stdout.trim()).toBe(`Bridge running: adapter=openclaw, pid=${child.pid}`);
+        expect(result.stdout).not.toContain(badPath);
+        expect(pidState(child.pid)).toBe("alive");
+      },
+      TIMEOUT,
+    );
+  }
+});
+
+describe("tps mail relay stop with a signalled record that is gone", () => {
+  test(
+    "prints the whole gone line and removes the pid file",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+      expect(readPidFile(relayPid).kind).toBe("running");
+
+      // The signal sender is the code's own seam. The process exits between
+      // the record read and the signal, so the signal raises the kernel's
+      // ESRCH for that pid.
+      const previous = setRelayStopSignal((pid) => {
+        expect(pid).toBe(child.pid);
+        child.kill("SIGKILL");
+        throw Object.assign(new Error(`kill ESRCH`), { code: "ESRCH" });
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previous);
+      }
+
+      expect(logs.join("\n")).toContain(
+        `Recorded relay process (pid ${child.pid}) is gone (stale pid file removed).`,
+      );
+      expect(existsSync(relayPid)).toBe(false);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("tps mail relay stop refusals exit non-zero", () => {
+  test(
+    "an unverified record prints guidance, signals nothing, keeps the file and exits 1",
+    () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, null));
+
+      const result = runCli(["mail", "relay", "stop"]);
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(relayPid);
+      expect(result.stderr).toMatch(/identity cannot be verified/);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an unreadable record prints guidance, signals nothing, keeps the file and exits 1",
+    () => {
+      const child = spawnChild();
+      mkdirSync(relayPid);
+
+      const result = runCli(["mail", "relay", "stop"]);
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toBe("");
+      expect(result.stderr).toContain(relayPid);
+      expect(result.stderr).toMatch(/could not be read|is not a regular file/);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+});
+
+describe("tps bridge status --json records", () => {
+  test(
+    "a bad record adds its kind to records and leaves running false",
+    () => {
+      const badPath = writeBridgeRecord("bridge-openclaw.pid", "not-a-pid\n");
+
+      const result = runCli(["bridge", "status", "--json"]);
+
+      expect(result.status).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.running).toBe(false);
+      expect(status.records).toEqual([{ adapter: "openclaw", path: badPath, state: "invalid" }]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a running record keeps the existing fields and adds each record's state",
+    () => {
+      const child = spawnChild();
+      const goodPath = writeBridgeRecord(
+        "bridge-openclaw.pid",
+        record(child.pid, childToken(child.pid), 7891),
+      );
+      const badPath = writeBridgeRecord("bridge-discord.pid", "not-a-pid\n");
+
+      const result = runCli(["bridge", "status", "--json"]);
+
+      expect(result.status).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.running).toBe(true);
+      expect(status.pid).toBe(child.pid);
+      expect(status.port).toBe(7891);
+      expect(status.adapter).toBe("openclaw");
+      expect(status.bridges).toEqual([{ adapter: "openclaw", pid: child.pid, port: 7891 }]);
+      expect(status.records).toEqual([
+        { adapter: "discord", path: badPath, state: "invalid" },
+        { adapter: "openclaw", path: goodPath, state: "running" },
+      ]);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "records names the kind of a stale, unverified and unreadable record",
+    () => {
+      const staleChild = spawnChild();
+      const unverifiedChild = spawnChild();
+      const stalePath = writeBridgeRecord("bridge-alpha.pid", staleRecord(staleChild));
+      const unverifiedPath = writeBridgeRecord("bridge-beta.pid", record(unverifiedChild.pid, null));
+      const unreadablePath = join(runDir, "bridge-gamma.pid");
+      symlinkSync(join(home, "missing-bridge-target"), unreadablePath);
+
+      const result = runCli(["bridge", "status", "--json"]);
+
+      expect(result.status).toBe(0);
+      const status = JSON.parse(result.stdout);
+      expect(status.running).toBe(false);
+      expect(status.records).toEqual([
+        { adapter: "alpha", path: stalePath, state: "stale" },
+        { adapter: "beta", path: unverifiedPath, state: "unverified" },
+        { adapter: "gamma", path: unreadablePath, state: "unreadable" },
+      ]);
+    },
+    TIMEOUT,
+  );
+});

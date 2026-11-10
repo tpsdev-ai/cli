@@ -420,6 +420,9 @@ describe("bridge status names the adapter of each running record", () => {
         port: 7891,
         adapter: "openclaw",
         bridges: [{ adapter: "openclaw", pid: child.pid, port: 7891 }],
+        records: [
+          { adapter: "openclaw", path: join(runDir, "bridge-openclaw.pid"), state: "running" },
+        ],
       });
     },
     TIMEOUT,
@@ -474,6 +477,9 @@ describe("bridge status names the adapter of each running record", () => {
       expect(JSON.parse(lines[0])).toEqual({
         running: false,
         bridges: [{ adapter: "discord", pid: discord.pid }],
+        records: [
+          { adapter: "discord", path: join(runDir, "bridge-discord.pid"), state: "running" },
+        ],
       });
     },
     TIMEOUT,
