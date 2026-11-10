@@ -15,6 +15,15 @@ import { readPidFile } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
+const START_TIMEOUT = 10_000;
+/** The FIFO child's deadline sits inside the per-test timeout that bounds it, so
+ *  a hung child reports the named error rather than bun's generic timeout. */
+const FIFO_DEADLINE_MARGIN = 2_000;
+const FIFO_TEST_TIMEOUT = 10_000;
+const FIFO_DEADLINE = FIFO_TEST_TIMEOUT - FIFO_DEADLINE_MARGIN;
+/** This test also starts a real bridge before the FIFO read, so its timeout
+ *  covers START_TIMEOUT as well. */
+const FIFO_STOP_TEST_TIMEOUT = FIFO_DEADLINE + FIFO_DEADLINE_MARGIN + START_TIMEOUT;
 const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
 const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
@@ -22,7 +31,6 @@ const MAIL_BRIDGE_URL = new URL("../src/utils/mail-bridge.js", import.meta.url).
 const BUILT_PID_FILE_URL = new URL("../dist/src/utils/pid-file.js", import.meta.url).href;
 const BUILT_MAIL_BRIDGE_URL = new URL("../dist/src/utils/mail-bridge.js", import.meta.url).href;
 const BUILT_COMMANDS_URL = new URL("../dist/src/commands/bridge.js", import.meta.url).href;
-const FIFO_DEADLINE = TIMEOUT - 5_000;
 
 function cannotListRestrictedDirectory(): boolean {
   const directory = mkdtempSync(join(tmpdir(), "tps-bridge-717-mode-"));
@@ -106,7 +114,7 @@ function spawnScript(script: string, env: Record<string, string>): Bun.Subproces
 
 async function waitForRunning(path: string, child: Bun.Subprocess): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < 10_000) {
+  while (Date.now() - start < START_TIMEOUT) {
     if (readPidFile(path).kind === "running") return;
     if (child.exitCode !== null) {
       throw new Error(`bridge child exited (${child.exitCode}) before writing ${path}`);
@@ -134,7 +142,7 @@ async function runStartDecision(): Promise<{ stdout: string; exitCode: number }>
   return { stdout: await new Response(child.stdout).text(), exitCode };
 }
 
-async function runFifoRead(script: string): Promise<Record<string, unknown>> {
+async function runFifoRead(deadlineMs: number, script: string): Promise<Record<string, unknown>> {
   const path = join(home, "fifo-read.mts");
   writeFileSync(path, script);
   const child = spawnScript(path, {});
@@ -142,10 +150,10 @@ async function runFifoRead(script: string): Promise<Record<string, unknown>> {
   const timer = setTimeout(() => {
     expired = true;
     child.kill("SIGKILL");
-  }, FIFO_DEADLINE);
+  }, deadlineMs);
   try {
     const exitCode = await child.exited;
-    if (expired) throw new Error(`FIFO child deadline exceeded (${FIFO_DEADLINE} ms)`);
+    if (expired) throw new Error(`FIFO child deadline exceeded (${deadlineMs} ms)`);
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();
     if (exitCode !== 0) throw new Error(`FIFO child exited ${exitCode}: ${stderr}`);
@@ -506,7 +514,7 @@ describe("guarded pid-file reads", () => {
       rmSync(fifo);
       expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
 
-      const result = await runFifoRead(`
+      const result = await runFifoRead(FIFO_DEADLINE, `
 const { readPidFile } = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
 console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
 `);
@@ -514,7 +522,7 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
       expect(result).toEqual({ kind: "unreadable", path: fifo, reason: "is not a regular file" });
       expect(existsSync(fifo)).toBe(true);
     },
-    10_000,
+    FIFO_TEST_TIMEOUT,
   );
 
   test("a final-component symlink is classified without reading its target and kept", async () => {
@@ -523,20 +531,20 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
     expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
     symlinkSync(target, path);
 
-    const result = await runFifoRead(`
+    const result = await runFifoRead(FIFO_DEADLINE, `
 const { readPidFile } = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
 console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(path)})));
 `);
 
     expect(result).toEqual({ kind: "unreadable", path, reason: "could not be opened (ELOOP: symlink resolution refused)" });
     expect(existsSync(path)).toBe(true);
-  }, 10_000);
+  }, FIFO_TEST_TIMEOUT);
 
   test("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
     const path = join(runDir, "bridge-fifo.pid");
     writeFileSync(path, "");
 
-    const result = await runFifoRead(`
+    const result = await runFifoRead(FIFO_DEADLINE, `
 const { mock } = await import("bun:test");
 const { rmSync } = await import("node:fs");
 const real = await import(${JSON.stringify(BUILT_PID_FILE_URL)});
@@ -572,7 +580,7 @@ console.log("RESULT:" + JSON.stringify({ fresh, signals, message, reads }));
     expect(result.signals).toEqual([]);
     expect(result.message).toContain("the pid file was kept");
     expect(existsSync(path)).toBe(true);
-  }, 10_000);
+  }, FIFO_TEST_TIMEOUT);
 
   test(
     "a FIFO record is reported as kept while the other records are stopped",
@@ -582,7 +590,7 @@ console.log("RESULT:" + JSON.stringify({ fresh, signals, message, reads }));
       const made = Bun.spawnSync(["mkfifo", fifo]);
       expect(made.exitCode).toBe(0);
 
-      const result = await runFifoRead(`
+      const result = await runFifoRead(FIFO_DEADLINE, `
 const { bridgeRunningRecords } = await import(${JSON.stringify(BUILT_MAIL_BRIDGE_URL)});
 const { runBridge } = await import(${JSON.stringify(BUILT_COMMANDS_URL)});
 const adapters = bridgeRunningRecords().map((entry) => entry.adapter);
@@ -599,6 +607,6 @@ console.log("RESULT:" + JSON.stringify({ adapters, message }));
       expect(existsSync(stdioPid)).toBe(false);
       expect(existsSync(fifo)).toBe(true);
     },
-    10_000,
+    FIFO_STOP_TEST_TIMEOUT,
   );
 });
