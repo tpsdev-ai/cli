@@ -1471,6 +1471,7 @@ if start_registry "$d" delayed-put; then
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
   ERR="$OUT"
   assert_eq "AN delayed-commit: exit" 7 "$RC"
+  assert_eq "AN delayed-commit: lock still has its pid" yes "$(if [ -f "$d/root/.promote-latest.lock/pid" ]; then echo yes; else echo no; fi)"
   assert_contains "AN delayed-commit: reason names the package" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "@tpsdev-ai/cli-darwin-arm64: target 0.5.4"
   sleep 2
   if node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.exit((s.applied||[]).some((a)=>a.pkg==="@tpsdev-ai/cli-darwin-arm64" && a.version==="0.5.4" && (s.disconnected||[]).some((d)=>d.pkg===a.pkg && d.order<a.order))?0:1)' "$d/registry.state"; then
@@ -1744,8 +1745,10 @@ else
 fi
 
 # ── M12. mutation (e): release the lock on the delayed-commit path ──────────
-# Fixture AN's delayed PUT lands after the client stopped. The mutant releases
-# the uncertain lock, so the next run would not refuse. AN expects the lock.
+# Fixture AN's delayed PUT lands after the client stopped. The mutant sets
+# keep_lock=0, so the EXIT trap removes the lock's pid file. The directory stays
+# only because the reason file is inside it, so the next run still refuses. AN
+# asserts the pid file.
 mut="$work/tool-release-uncertain-lock.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
   if [ "$real_ready" -eq 1 ]; then
@@ -1760,7 +1763,7 @@ if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
       if [ -f "$d/root/.promote-latest.lock/pid" ]; then
         bad "M12 mutation (e): lock release on delayed commit caught" "mutant kept the lock — AN is blind"
       else
-        ok "M12 mutation (e): lock release on delayed commit caught" "mutant removed the pid file (AN catches it)"
+        ok "M12 mutation (e): lock release on delayed commit caught" "mutant removed the pid file (AN asserts the pid file)"
       fi
     else
       bad "M12 mutation (e): lock release on delayed commit caught" "registry did not start"
@@ -1808,7 +1811,8 @@ fi
 
 # ── M14. mutation (c): set keep_lock AFTER the reason write ─────────────────
 # Fixture AM makes the reason write fail. The mutant writes first and lets the
-# failure abort under `set -e`, so keep_lock is still 0 and the lock is released.
+# failure abort under `set -e`, so keep_lock is still 0, the script exits 1 (not 7),
+# and the EXIT trap removes the lock's pid file.
 mut="$work/tool-keep-lock-after-reason.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" keep_lock_after_reason; then
   d="$(new_fixture mut-keep-lock-after-reason)"
