@@ -347,6 +347,35 @@ describe("tps bridge status --json records", () => {
   );
 
   test(
+    "an unverified record the probe finds gone is stale and not promoted",
+    async () => {
+      // The child is alive, so only the seam's answer can make the record stale.
+      const child = spawnChild();
+      const path = writeBridgeRecord("bridge-openclaw.pid", record(child.pid, null));
+
+      const probed: number[] = [];
+      const previous = setStatusProbe((pid) => {
+        probed.push(pid);
+        return "gone";
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runBridge({ action: "status", json: true });
+      } finally {
+        restore();
+        setStatusProbe(previous);
+      }
+
+      const status = JSON.parse(logs[0]);
+      expect(status.running).toBe(false);
+      expect(status).not.toHaveProperty("bridges");
+      expect(status.records).toEqual([{ adapter: "openclaw", path, state: "stale", pid: child.pid }]);
+      expect(probed).toEqual([child.pid]);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "an empty run directory is exactly {running:false,records:[]}",
     () => {
       const result = runCli(["bridge", "status", "--json"]);
