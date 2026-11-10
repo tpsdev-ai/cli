@@ -10,7 +10,9 @@
  *  - the poll path is proven ALONE (fs events suppressed via a no-op watchImpl).
  *    The event path is driven through the same watchImpl seam: the case captures
  *    the listener the watcher registers and fires it itself, with the poll idle.
- *    One smoke case runs the real fs.watch, with a short poll fallback.
+ *    One smoke case runs the real fs.watch: a short poll fallback on macOS
+ *    (FSEvents can be seconds late), an idle poll elsewhere, so on Linux the
+ *    case proves a real fs event triggers the scan.
  *  - dedup is on the verified envelope id while the file stays in new/ (two
  *    files with the same signed id present once); within one watcher instance a
  *    message is presented again only after a scan observes its file absent from
@@ -74,10 +76,11 @@ const IDLE_POLL_MS = 60_000;
 const SCAN_SETTLE_MS = 2_000;
 
 // The one case on the real fs.watch. On macOS, FSEvents can report a write
-// seconds late on a loaded host, and no unit-test bound covers that. So the case
-// keeps a short poll fallback, and asserts only that the record is presented
-// within SMOKE_DEADLINE_MS, by an fs event or a poll tick.
-const SMOKE_POLL_MS = 1_000;
+// seconds late on a loaded host, and no unit-test bound covers that, so there the
+// case keeps a 1 s poll fallback and accepts a presentation by an fs event or a
+// poll tick. Elsewhere the poll is idle (longer than SMOKE_DEADLINE_MS), so
+// within that bound only a real fs event can present the record.
+const SMOKE_POLL_MS = platform() === "darwin" ? 1_000 : IDLE_POLL_MS;
 const SMOKE_DEADLINE_MS = 10_000;
 
 // ---------------------------------------------------------------------------
@@ -431,32 +434,39 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(existsSync(out), "the hook never ran").toBe(false);
   }, 10_000);
 
-  it("real fs.watch with a 1 s poll fallback: a signed record delivered AFTER startup is presented within 10 s", async () => {
-    const received: string[] = [];
-    const ready = readySignal();
-    const watcher = watchMail({
-      agent: AGENT,
-      debounceMs: 20,
-      pollMs: SMOKE_POLL_MS,
-      onReady: ready.onReady,
-      onMessage: (msg) => { received.push(msg.body); },
-    });
-    try {
-      await ready.promise;
-      deliverSigned("smoke delivered");
-      await waitFor(
-        () => received.includes("smoke delivered"),
-        SMOKE_DEADLINE_MS,
-        () =>
-          `neither an fs event nor a ${SMOKE_POLL_MS} ms poll tick presented the record; ` +
-          `received: ${JSON.stringify(received)}`,
-      );
-    } finally {
-      watcher.stop();
-    }
+  it(
+    `real fs.watch (poll ${platform() === "darwin" ? "1 s fallback" : `${IDLE_POLL_MS / 1000} s idle, longer than the deadline`}): a signed record delivered AFTER startup is presented within ${SMOKE_DEADLINE_MS / 1000} s`,
+    async () => {
+      const received: string[] = [];
+      const ready = readySignal();
+      const watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: SMOKE_POLL_MS,
+        onReady: ready.onReady,
+        onMessage: (msg) => { received.push(msg.body); },
+      });
+      try {
+        await ready.promise;
+        deliverSigned("smoke delivered");
+        await waitFor(
+          () => received.includes("smoke delivered"),
+          SMOKE_DEADLINE_MS,
+          () =>
+            platform() === "darwin"
+              ? `neither an fs event nor a ${SMOKE_POLL_MS} ms poll tick presented the record; ` +
+                `received: ${JSON.stringify(received)}`
+              : `no fs event presented the record (the poll is ${SMOKE_POLL_MS} ms, longer than the ` +
+                `${SMOKE_DEADLINE_MS} ms deadline); received: ${JSON.stringify(received)}`,
+        );
+      } finally {
+        watcher.stop();
+      }
 
-    expect(received).toContain("smoke delivered");
-  }, SMOKE_DEADLINE_MS + 5_000);
+      expect(received).toContain("smoke delivered");
+    },
+    SMOKE_DEADLINE_MS + 5_000,
+  );
 
   it("an envelope with an altered wrapper SENDER is never presented, and never launches the hook", async () => {
     const received: string[] = [];
@@ -507,16 +517,20 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(existsSync(out), "the hook never ran").toBe(false);
   }, 10_000);
 
-  it("presents a record ONCE while its file stays in new/ (dedup by envelope id)", async () => {
+  it("presents a record ONCE while its file stays in new/ (per-file guard: the file is verified once)", async () => {
     const received: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
+    // Counts verify attempts: the per-file guard must stop a re-event on a file
+    // that is still in new/ from re-verifying it.
+    let verifications = 0;
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: IDLE_POLL_MS,
       watchImpl: events.watchImpl,
       onReady: ready.onReady,
+      beforeVerify: async () => { verifications++; },
       onMessage: (msg) => { received.push(msg.body); },
     });
     try {
@@ -552,6 +566,70 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
+    // One verification for the record, one for the barrier. With the per-file
+    // guard removed, this case measured 13: each of the ten re-events re-verified
+    // the record.
+    expect(verifications).toBe(2);
+  }, 10_000);
+
+  it("the envelope-id map persists across scans: a SECOND file carrying the SAME signed id is not presented again", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    const env = buildSignedEnvelope("flint", AGENT, "same id, second file", SEEDS);
+    try {
+      await ready.promise;
+      const wrapper = (id: string) => ({
+        id,
+        from: "flint",
+        to: AGENT,
+        body: JSON.stringify(env),
+        timestamp: env.timestamp,
+        read: false,
+      });
+      writeRecord(wrapper("id-copy-a"));
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => ids.includes(env.messageId),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
+      );
+
+      // A SECOND file, a different name, the SAME verified envelope id, written
+      // after the first was presented. The barrier below makes a scan list both
+      // copies, so a second presentation of that id would show up.
+      writeRecord(wrapper("id-copy-b"));
+      const barrierEnv = buildSignedEnvelope("flint", AGENT, "barrier", SEEDS);
+      writeRecord({
+        id: "barrier-1",
+        from: "flint",
+        to: AGENT,
+        body: JSON.stringify(barrierEnv),
+        timestamp: barrierEnv.timestamp,
+        read: false,
+      });
+      events.fire(join(dirname(first), "barrier-1.json"));
+      await waitFor(
+        () => bodies.includes("barrier"),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the barrier record; received: ${JSON.stringify(bodies)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
+
+    // The barrier scan listed the first file, the second copy and the barrier.
+    expect(ids.filter((id) => id === env.messageId)).toHaveLength(1);
   }, 10_000);
 
   it("dedups by the VERIFIED envelope id: two files bearing the same signed id are presented once", async () => {
