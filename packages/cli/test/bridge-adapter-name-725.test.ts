@@ -157,4 +157,86 @@ describe("bridge adapter-name grammar (cli#725)", () => {
       expect(bridgePidFiles(name)).toEqual([]);
     }
   });
+
+  test("the pid file and record use the name validated at construction, even when the adapter renames itself in start()", async () => {
+    class RenamingAdapter implements BridgeAdapter {
+      name = "openclaw";
+      async start() {
+        this.name = "openclaw2";
+      }
+      async send() {}
+      async stop() {}
+    }
+    const core = new BridgeCore(new RenamingAdapter(), { defaultAgentId: "default-agent", mailDir }, () => {});
+    await core.start();
+    const runDir = join(testHome, ".tps", "run");
+    try {
+      expect(readdirSync(runDir)).toEqual(["bridge-openclaw.pid"]);
+      const found = bridgePidFiles("openclaw");
+      expect(found).toHaveLength(1);
+      expect(found[0]?.adapter).toBe("openclaw");
+      expect(found[0]?.state.kind).toBe("running");
+    } finally {
+      await core.stop();
+    }
+    // stop() removes the file it wrote, not one named after the renamed adapter.
+    expect(readdirSync(runDir)).toEqual([]);
+  });
+
+  test("start() refuses when the adapter's name changed to another valid name after construction", async () => {
+    let current = "openclaw";
+    let started = false;
+    const adapter: BridgeAdapter = {
+      get name() {
+        return current;
+      },
+      async start() {
+        started = true;
+      },
+      async send() {},
+      async stop() {},
+    };
+    const core = new BridgeCore(adapter, { defaultAgentId: "default-agent", mailDir }, () => {});
+    current = "discord";
+
+    let startError: Error | undefined;
+    try {
+      await core.start();
+    } catch (err) {
+      startError = err as Error;
+    }
+    expect(startError?.message).toContain('changed from "openclaw" to "discord"');
+    expect(started).toBe(false);
+    const pidDir = join(testHome, ".tps", "run");
+    expect(existsSync(pidDir) ? readdirSync(pidDir) : []).toEqual([]);
+  });
+
+  test("construction reads the adapter name once, so the principal record is for the validated name", () => {
+    let reads = 0;
+    const adapter: BridgeAdapter = {
+      get name() {
+        reads += 1;
+        return reads === 1 ? "openclaw" : "bad_name";
+      },
+      async start() {},
+      async send() {},
+      async stop() {},
+    };
+    new BridgeCore(adapter, { defaultAgentId: "default-agent", mailDir }, () => {});
+    expect(reads).toBe(1);
+    const principals = readdirSync(join(mailDir, ".bridge-principals"));
+    expect(principals.some((file) => file.startsWith("bad_name"))).toBe(false);
+    expect(principals.some((file) => file.startsWith("openclaw-bridge"))).toBe(true);
+  });
+
+  test("the refusal message escapes C1 controls and line or bidi format characters", () => {
+    let message = "";
+    try {
+      assertBridgeAdapterName("x\u009b31m\u202e\u2028");
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain("\\u009b31m\\u202e\\u2028");
+    expect(/[\u007f-\u009f\u2028\u202e]/.test(message)).toBe(false);
+  });
 });

@@ -52,6 +52,8 @@ export interface BridgeCoreConfig {
 
 export class BridgeCore {
   private readonly bridgeAgentId: string;
+  /** The adapter name read once and validated at construction; every name-derived path and record uses it. */
+  private readonly adapterName: string;
   private readonly mailDir: string;
   private readonly defaultAgentId: string;
   private readonly defaultChannelId: string;
@@ -65,10 +67,13 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    assertBridgeAdapterName(adapter.name);
+    // One read of the name: the value validated is the value used (a getter could return another on a second read).
+    const adapterName = adapter.name;
+    assertBridgeAdapterName(adapterName);
+    this.adapterName = adapterName;
     this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(homeDir(), ".tps", "mail");
     this.defaultAgentId = requireLocalAgentId("bridge default agent id", config.defaultAgentId);
-    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
+    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapterName, config.bridgeAgentId);
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
     this.redriveMs = config.redriveMs ?? 30_000;
@@ -76,7 +81,13 @@ export class BridgeCore {
   }
 
   async start(): Promise<void> {
-    assertBridgeAdapterName(this.adapter.name);
+    const currentName = this.adapter.name;
+    if (currentName !== this.adapterName) {
+      assertBridgeAdapterName(currentName);
+      throw new Error(
+        `Bridge adapter name changed from ${JSON.stringify(this.adapterName)} to ${JSON.stringify(currentName)} after construction; refusing to start. Construct a new bridge for the new name.`,
+      );
+    }
     // Start adapter with inbound callback
     await this.adapter.start((envelope) => this.handleInbound(envelope));
 
@@ -87,20 +98,20 @@ export class BridgeCore {
     const pidDir = join(homeDir(), ".tps", "run");
     mkdirSync(pidDir, { recursive: true });
     writeFileSync(
-      join(pidDir, `bridge-${this.adapter.name}.pid`),
-      `${JSON.stringify({ pid: process.pid, startToken: processStartToken(process.pid), adapter: this.adapter.name })}\n`,
+      join(pidDir, `bridge-${this.adapterName}.pid`),
+      `${JSON.stringify({ pid: process.pid, startToken: processStartToken(process.pid), adapter: this.adapterName })}\n`,
       "utf-8",
     );
 
-    this.log(`[bridge:${this.adapter.name}] Started (agent=${this.bridgeAgentId}, default=${this.defaultAgentId})`);
+    this.log(`[bridge:${this.adapterName}] Started (agent=${this.bridgeAgentId}, default=${this.defaultAgentId})`);
   }
 
   async stop(): Promise<void> {
     this.stopOutbound?.();
     await this.adapter.stop();
-    const pidPath = join(homeDir(), ".tps", "run", `bridge-${this.adapter.name}.pid`);
+    const pidPath = join(homeDir(), ".tps", "run", `bridge-${this.adapterName}.pid`);
     rmSync(pidPath, { force: true });
-    this.log(`[bridge:${this.adapter.name}] Stopped`);
+    this.log(`[bridge:${this.adapterName}] Stopped`);
   }
 
   private handleInbound(envelope: BridgeEnvelope): string {
