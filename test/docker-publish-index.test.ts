@@ -471,7 +471,7 @@ const systemBashIsOld = (() => {
 })();
 
 describe.skipIf(!systemBashIsOld)("docker-publish-index.sh on a bash older than 4.4", () => {
-  test("refuses before any registry command", () => {
+  test("refuses with exit 1 and the stub records no destination tag", () => {
     const c = newCase();
     const r = spawnSync(SYSTEM_BASH, [SCRIPT, "push", "ghcr.io/tpsdev-ai/tps-office:test"], {
       encoding: "utf8",
