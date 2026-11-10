@@ -30,7 +30,10 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
 
 Refusals name the workflow, job, step and physical line. Variable or substitution
 indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
-Installs inside other script files or composite actions are not inspected. Helper
+The guard follows repository scripts a workflow invokes by a literal path,
+recursively, and local composite actions (`uses: ./...`); an npm install found
+there must bind to a tracked lockfile or the scan refuses it, naming the
+invocation path. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper

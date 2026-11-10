@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { load } from "js-yaml";
 
 type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string };
@@ -436,4 +438,296 @@ export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, w
     }
   }
   return installs;
+}
+
+/* ─────────── workflow-invoked scripts and local composite actions (#820) ─────────── */
+
+export type WorkflowTreeReport = {
+  /** npm installs bound to a tracked lockfile (direct run lines and followed scripts). */
+  installs: number;
+  /** Repository-relative paths of every script and local action the scan followed. */
+  followed: string[];
+  /** Script invocations a followed script could not resolve to one repository file. */
+  unresolved: string[];
+};
+
+type TreeContext = {
+  root: string;
+  tracked: Set<string>;
+  installs: number;
+  followed: string[];
+  unresolved: string[];
+  visiting: Set<string>;
+};
+
+const SCRIPT_FILE = String.raw`(?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|bash|mjs|cjs|js|ts)`;
+const COMMAND_START = String.raw`(?:^|[;&|{]\s*|\bthen\s+|\bdo\s+|\belse\s+)`;
+const INSTALL_VERBS = new Set(["ci", "install", "i", "add"]);
+
+function stripOuterQuotes(value: string): string {
+  if (value.length >= 2 && ((value[0] === '"' && value[value.length - 1] === '"') || (value[0] === "'" && value[value.length - 1] === "'"))) {
+    return value.slice(1, -1);
+  }
+  return value;
+}
+
+/**
+ * Physical lines with comment lines and here-document bodies removed. A
+ * here-document body is data a script writes, not a command it runs, so an
+ * install or an invocation inside one is not executed by the script.
+ */
+function shellLines(text: string): PhysicalLine[] {
+  const lines: PhysicalLine[] = [];
+  const rawLines = text.split("\n");
+  let delimiter: string | null = null;
+  let stripTabs = false;
+  for (let index = 0; index < rawLines.length; index++) {
+    const raw = rawLines[index].replace(/\r$/, "");
+    if (delimiter !== null) {
+      const candidate = stripTabs ? raw.replace(/^\t+/, "") : raw;
+      if (candidate === delimiter) delimiter = null;
+      continue;
+    }
+    const textLine = raw.trim();
+    if (textLine === "" || textLine.startsWith("#")) continue;
+    lines.push({ text: textLine, line: index + 1 });
+    const heredoc = raw.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
+    if (heredoc !== null) {
+      delimiter = heredoc[3];
+      stripTabs = heredoc[1] === "-";
+    }
+  }
+  return lines;
+}
+
+function isShellScript(rel: string, content: string): boolean {
+  if (/\.(?:sh|bash)$/i.test(rel)) return true;
+  const first = content.split("\n")[0] ?? "";
+  return /^#!.*\b(?:ba)?sh\b/.test(first);
+}
+
+function scriptExists(ctx: TreeContext, rel: string): boolean {
+  try {
+    return readFileSync(join(ctx.root, rel), "utf8") !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** Resolve the literal suffix of a computed script path to one repository file. */
+function resolveDynamicSuffix(ctx: TreeContext, token: string): string | null {
+  const value = stripOuterQuotes(token);
+  const variable = value.match(/^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?(?:[%#][^}]*)?\}?|\([^)]*\)|`[^`]*`)/);
+  if (variable === null) return null;
+  let suffix = value.slice(variable[0].length);
+  if (suffix.startsWith("/")) suffix = suffix.slice(1);
+  if (suffix === "" || !/\.(?:sh|bash|mjs|cjs|js|ts)$/.test(suffix)) return null;
+  const rel = suffix.replace(/^\.\//, "");
+  return scriptExists(ctx, rel) ? rel : null;
+}
+
+type Invocation = { rel: string } | { dynamic: string };
+
+/** Literal and computed repository-script invocations written in one shell line. */
+function invocationsIn(line: string): Invocation[] {
+  const found: Invocation[] = [];
+  const seen = new Set<string>();
+  const add = (rel: string) => {
+    const normalized = rel.replace(/^\.\//, "");
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    found.push({ rel: normalized });
+  };
+  const literal = new RegExp(String.raw`\b(?:bash|sh|node|bun)\s+(${SCRIPT_FILE})\b`, "g");
+  for (const match of line.matchAll(literal)) add(match[1]);
+  const direct = new RegExp(String.raw`${COMMAND_START}(\.\/${SCRIPT_FILE.replace(/^\(\?:\\\.\\\/\)\?/, "")})\b`, "g");
+  for (const match of line.matchAll(direct)) add(match[1]);
+  const sourced = new RegExp(String.raw`${COMMAND_START}(?:source|\.)\s+(${SCRIPT_FILE})\b`, "g");
+  for (const match of line.matchAll(sourced)) add(match[1]);
+  const quotedCommand = new RegExp(String.raw`(?:^|[\s;&|])(?:"[^"]*"|'[^']*'|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?)\s+((?:\.\/|scripts\/|\.github\/scripts\/)[A-Za-z0-9_./-]+\.(?:sh|bash|mjs|cjs|js|ts))\b`, "g");
+  for (const match of line.matchAll(quotedCommand)) add(match[1]);
+  const computed = new RegExp(String.raw`${COMMAND_START}(?:bash|sh|node|bun)\s+((?:"[^"]*"|'[^']*'|\S+))`, "g");
+  for (const match of line.matchAll(computed)) {
+    const token = match[1];
+    if (!/[$`]/.test(token)) continue;
+    found.push({ dynamic: token });
+  }
+  return found;
+}
+
+function addFollowed(ctx: TreeContext, rel: string) {
+  if (!ctx.followed.includes(rel)) ctx.followed.push(rel);
+}
+
+function followScript(ctx: TreeContext, rel: string, cwd: string, label: string, chain: string[]) {
+  if (ctx.visiting.has(rel)) return;
+  if (!scriptExists(ctx, rel)) return;
+  addFollowed(ctx, rel);
+  const content = readFileSync(join(ctx.root, rel), "utf8");
+  ctx.visiting.add(rel);
+  try {
+    scanScript(ctx, rel, content, cwd, label, [...chain, rel]);
+  } finally {
+    ctx.visiting.delete(rel);
+  }
+}
+
+function scanScript(ctx: TreeContext, rel: string, content: string, cwd: string, label: string, chain: string[]) {
+  const pathText = chain.join(" -> ");
+  let directory = resolveRepoDir("", cwd, `${label}: script ${rel}`);
+  let directoryUnresolved = false;
+  let staged = false;
+  for (const entry of shellLines(content)) {
+    const line = entry.text;
+    const at = `${label}: script ${rel} (invocation ${pathText}, line ${entry.line})`;
+    if (isShellScript(rel, content)) {
+      const cd = line.match(/^(?:\(\s*)?cd\s+(.+?)(?:\s*&&.*)?$/);
+      if (cd !== null) {
+        const target = stripOuterQuotes(cd[1].trim());
+        if (target === "" || /[$`~*?]/.test(target) || target === "-" || target === "--") {
+          directoryUnresolved = true;
+        } else {
+          directory = resolveRepoDir(directory, target.replace(/^--\s+/, ""), at);
+        }
+        continue;
+      }
+      if (/^(?:pushd|popd)\b/.test(line)) directoryUnresolved = true;
+      if (/^(?:cp|mv|ln|install|rsync|tee)\s/.test(line) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(line)) staged = true;
+      if (/^(?:sed\s+-i|perl\s+-i)/.test(line) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(line)) staged = true;
+      if (/(?:^|[^0-9])>{1,2}\s*[^;&|]*package-lock\.json/.test(line)) staged = true;
+      if (/^eval\b/.test(line)) throw new Error(`${at}: eval is refused: ${line}`);
+      const source = line.match(/^(?:source|\.)\s+(\S+)/);
+      if (source !== null && /[$`]/.test(source[1])) {
+        throw new Error(`${at}: source of a computed path is refused: ${line}`);
+      }
+      if (line.startsWith("bash scripts/npm-ci-tracked-lock.sh") || line.startsWith("bash ./scripts/npm-ci-tracked-lock.sh")) {
+        const helper = line.match(HELPER_CALL);
+        if (helper === null) throw new Error(`${at}: tracked-lock helper call is not the literal accepted shape: ${line}`);
+        const dir = helper[3];
+        if (dir.startsWith("/") || dir === "-") throw new Error(`${at}: tracked-lock helper directory is not relative: ${line}`);
+        const resolved = resolveRepoDir(directory, dir, at);
+        const lockfile = resolved === "" ? "package-lock.json" : `${resolved}/package-lock.json`;
+        if (!ctx.tracked.has(lockfile)) throw new Error(`${at}: ${lockfile} is not a tracked lockfile the gate reads: ${line}`);
+        ctx.installs++;
+        continue;
+      }
+      const npmCommand = line.match(new RegExp(String.raw`${COMMAND_START}(?:sfw\s+)?npm\b(.*)$`));
+      if (npmCommand !== null) {
+        const args = npmCommand[1].trim().split(/\s+/).filter(Boolean);
+        if (args.some((arg) => INSTALL_VERBS.has(arg))) {
+          if (directoryUnresolved) {
+            throw new Error(`${at}: cannot bind an npm install after a non-literal directory change: ${line}`);
+          }
+          if (staged) {
+            throw new Error(`${at}: cannot bind an npm install after the script stages or copies a different lockfile before installing: ${line}`);
+          }
+          if (args.some((arg) => arg === "-g" || arg === "--global" || arg.startsWith("--prefix") || arg === "-C" || arg === "--pref" || arg.startsWith("--location"))) {
+            if (isAcceptedGlobalToolInstall(line)) continue;
+            throw new Error(`${at}: npm install changes the install directory or is global: ${line}`);
+          }
+          const lockfile = directory === "" ? "package-lock.json" : `${directory}/package-lock.json`;
+          if (!ctx.tracked.has(lockfile)) {
+            throw new Error(`${at}: cannot bind the npm install to a tracked lockfile: ${lockfile} is not a lockfile the gate reads: ${line}`);
+          }
+          ctx.installs++;
+          continue;
+        }
+      }
+    }
+    for (const invocation of invocationsIn(line)) {
+      if ("dynamic" in invocation) {
+        const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
+        if (resolved !== null) followScript(ctx, resolved, directory, label, chain);
+        else ctx.unresolved.push(`${at}: ${invocation.dynamic}`);
+        continue;
+      }
+      const resolved = resolveRepoDir(directory, invocation.rel, at);
+      const fromRoot = resolved === invocation.rel ? null : resolveRepoDir("", invocation.rel, at);
+      if (scriptExists(ctx, resolved)) followScript(ctx, resolved, directory, label, chain);
+      else if (fromRoot !== null && scriptExists(ctx, fromRoot)) followScript(ctx, fromRoot, directory, label, chain);
+      else if (/^(?:\.\/)?(?:scripts|\.github\/scripts)\//.test(invocation.rel)) {
+        throw new Error(`${at}: invoked script is not a repository file: ${invocation.rel}`);
+      }
+    }
+  }
+}
+
+function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string) {
+  for (const entry of shellLines(run)) {
+    const at = `${label}: ${entry.text} (physical line ${entry.line})`;
+    for (const invocation of invocationsIn(entry.text)) {
+      if ("dynamic" in invocation) {
+        const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
+        if (resolved !== null) followScript(ctx, resolved, cwd, label, []);
+        else throw new Error(`${label}: cannot resolve a dynamic script path to one repository file: ${invocation.dynamic} (physical line ${entry.line})`);
+        continue;
+      }
+      const resolved = resolveRepoDir(cwd, invocation.rel, at);
+      const fromRoot = resolved === invocation.rel ? null : resolveRepoDir("", invocation.rel, at);
+      if (scriptExists(ctx, resolved)) followScript(ctx, resolved, cwd, label, []);
+      else if (fromRoot !== null && scriptExists(ctx, fromRoot)) followScript(ctx, fromRoot, cwd, label, []);
+      else if (/^(?:\.\/)?(?:scripts|\.github\/scripts)\//.test(invocation.rel)) {
+        throw new Error(`${label}: invoked script is not a repository file: ${invocation.rel} (physical line ${entry.line})`);
+      }
+    }
+  }
+}
+
+function followAction(ctx: TreeContext, actionPath: string, label: string) {
+  const rel = actionPath.replace(/^\.\//, "").replace(/\/$/, "");
+  let source: string | null = null;
+  for (const name of ["action.yml", "action.yaml"]) {
+    try {
+      source = readFileSync(join(ctx.root, rel, name), "utf8");
+      break;
+    } catch {
+      // try the other spelling
+    }
+  }
+  if (source === null) throw new Error(`${label}: local action ${rel} has no action.yml or action.yaml`);
+  addFollowed(ctx, rel);
+  const action = load(source) as { runs?: { steps?: WorkflowStep[] } };
+  const steps = action.runs?.steps ?? [];
+  for (const [index, step] of steps.entries()) {
+    const stepLabel = `${label} action ${rel} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
+    if (step.uses?.startsWith("./")) {
+      followAction(ctx, step.uses, stepLabel);
+      continue;
+    }
+    if (step.run === undefined) continue;
+    const workdir = step["working-directory"] ?? "";
+    const direct = npmCiLockDirs(step.run, workdir, stepLabel);
+    ctx.installs += direct;
+    scanRunBlock(ctx, step.run, workdir, stepLabel);
+  }
+}
+
+/**
+ * Scan a workflow, the repository scripts its steps invoke by a literal path
+ * (recursively), and the local composite actions it uses. Direct run-line
+ * decisions stay with
+ * assertNpmCiLockfilesRead; this adds the installs found in followed files.
+ */
+export function assertNpmCiWorkflowTree(
+  source: string,
+  tracked: Set<string>,
+  repoRoot: string,
+  workflowName?: string,
+): WorkflowTreeReport {
+  const ctx: TreeContext = { root: repoRoot, tracked, installs: 0, followed: [], unresolved: [], visiting: new Set() };
+  ctx.installs += assertNpmCiLockfilesRead(source, tracked, workflowName);
+  const workflow = parseWorkflow(source);
+  for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
+    const defaultWorkdir = job.defaults?.run?.["working-directory"] ?? workflow.defaults?.run?.["working-directory"] ?? "";
+    for (const [index, step] of job.steps.entries()) {
+      const label = `${workflowName === undefined ? "" : `workflow ${workflowName} `}job ${jobName} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
+      if (step.uses?.startsWith("./")) {
+        followAction(ctx, step.uses, label);
+        continue;
+      }
+      if (step.run === undefined) continue;
+      scanRunBlock(ctx, step.run, step["working-directory"] ?? defaultWorkdir, label);
+    }
+  }
+  return { installs: ctx.installs, followed: ctx.followed, unresolved: ctx.unresolved };
 }

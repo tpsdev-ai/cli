@@ -1,0 +1,1 @@
+- **The release-age workflow guard follows workflow-invoked scripts and local composite actions and refuses an install it cannot bind to the tracked lockfile.**

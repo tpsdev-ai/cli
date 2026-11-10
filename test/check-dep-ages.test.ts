@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead, EXACT_BLOCK_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -1949,5 +1949,150 @@ describe("the exact-block allowlist", () => {
       expect(entry.reason.length).toBeGreaterThan(0);
       expect(workflowBlocks.filter((block) => block === entry.text).length).toBeGreaterThan(0);
     }
+  }, 30_000);
+});
+
+
+function makeTreeFixture(files: Record<string, string>): string {
+  const root = mkdtempSync(join(tmpdir(), "dep-age-tree-"));
+  for (const [rel, content] of Object.entries(files)) {
+    const path = join(root, rel);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, content);
+  }
+  return root;
+}
+
+describe("the workflow guard follows invoked scripts and local composite actions (#820)", () => {
+  it("binds a script's npm ci to the tracked lockfile in the script's directory", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-script",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an install after a script changes directory, naming the new directory", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "cd packages/other\nnpm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/install.sh", "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-script",
+        );
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain("job build step 1");
+      expect(message).toContain("scripts/install.sh");
+      expect(message).toContain("packages/other/package-lock.json");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an install after a script stages a different lockfile", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "cp other/package-lock.json package-lock.json\nnpm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/install.sh", "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-script",
+        );
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain("scripts/install.sh");
+      expect(message).toContain("stages or copies a different lockfile");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("scans a local composite action's run steps and names the action path", () => {
+    const root = makeTreeFixture({
+      ".github/actions/setup/action.yml": [
+        "name: setup",
+        "runs:",
+        "  using: composite",
+        "  steps:",
+        "    - run: npm install",
+      ].join("\n"),
+    });
+    const workflow = "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/setup\n";
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(workflow, new Set(), root, "workflow-action");
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain(".github/actions/setup");
+      expect(message).toContain("job build step 1");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a dynamic script path instead of skipping it", () => {
+    const root = makeTreeFixture({});
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('bash "$SCRIPT"', "."),
+        new Set(),
+        root,
+        "workflow-dynamic",
+      )).toThrow(/cannot resolve a dynamic script path.*\$SCRIPT/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("scans this repository's workflows, follows their scripts, and reports them", () => {
+    const tracked = new Set(trackedLockfiles());
+    const workflowsDir = join(REPO, ".github", "workflows");
+    const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
+    let installs = 0;
+    const followed = new Set<string>();
+    for (const name of workflows) {
+      const report = assertNpmCiWorkflowTree(readFileSync(join(workflowsDir, name), "utf8"), tracked, REPO, name);
+      installs += report.installs;
+      for (const rel of report.followed) followed.add(rel);
+    }
+    expect(installs).toBeGreaterThan(0);
+    for (const expected of [
+      "scripts/prefetch-socket-firewall.sh",
+      "scripts/check-dep-ages.mjs",
+      "scripts/npm-ci-tracked-lock.sh",
+      "scripts/heartbeat-real-openclaw-lane.mjs",
+      "scripts/test-promote-latest.sh",
+      "scripts/test-tps-office-supervisor.sh",
+    ]) {
+      expect(followed.has(expected)).toBe(true);
+    }
+    expect([...followed].some((rel) => rel.startsWith(".github/actions/"))).toBe(false);
   }, 30_000);
 });
