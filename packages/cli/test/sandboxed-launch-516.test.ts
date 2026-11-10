@@ -2662,7 +2662,7 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
   ].join("\n");
 
   /** The released child: it speaks the handshake over the launcher socket,
-   * records the signals it receives, and stays alive unless PEER_EXIT=1. */
+   * records a SIGTERM it receives (as "TERM"), and stays alive unless PEER_EXIT=1. */
   const STOP_PEER = `
 const { connect } = require("node:net");
 const { appendFileSync, existsSync, readdirSync, readFileSync, writeFileSync } = require("node:fs");

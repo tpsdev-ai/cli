@@ -697,7 +697,7 @@ export interface ReleasedAgent {
 }
 
 /** "same": the pid is alive and carries the recorded start token. "gone": the
- * pid names no process. "different": the pid is alive under a different start
+ * pid names no process, or only an exited (zombie) one. "different": the pid is alive under a different start
  * token (pid reuse). "unknown": the identity cannot be read. */
 export type ProcessIdentity = "same" | "gone" | "different" | "unknown";
 
@@ -1026,7 +1026,8 @@ export async function launchAttested(
     return remaining;
   };
 
-  // A signal to the launcher TERMs the supervisor through its child handle and
+  // A signal to the launcher is passed on to the supervisor through its child
+  // handle (SIGKILL after the bound) and
   // checks the agent read-only. Cleanup of what this launch created runs only
   // after the stop check; an unconfirmed removal keeps the launch state, names
   // what remains (the original path, the moved-aside path or the registration),
