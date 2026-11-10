@@ -36,16 +36,23 @@ script, a logical line (continuations joined, word-boundary comments stripped,
 here-document bodies kept) is an install when, after lowercasing and deleting
 backslashes and quotes, it contains `npx` as a word, or `npm` as a word followed
 later by `ci`, `install`, `i`, `add`, `exec` or `x`. An install must use the
-tracked-lock helper, a bounded global install, or bind to a tracked lockfile,
-and `--no-package-lock` is refused. `scripts/npm-ci-tracked-lock.sh` is the
-approved install implementation: its own lines are not screened by that
-classifier, though its invocations are followed. An interpreter invocation is
-followed when its script argument resolves to a repository file; a computed,
-external, `-c`/`-s` or here-document-to-shell invocation is refused unless it is
-on the reviewed allowlist, whose entries pin the assignment text and target.
-Installs inside followed JavaScript or TypeScript scripts, and node `-e`/`-p`
-or node here-document payloads, are not inspected; their here-document bodies
-are still install-screened. Helper
+tracked-lock helper, a bounded global install, or bind to a tracked lockfile;
+`--no-package-lock` is refused, as are `npx`, `npm exec` and `npm x`, which do
+not read a lockfile. `--prefix`/`-C`/`--workspace`/`-w` bind the install to the
+literal directory they name. `scripts/npm-ci-tracked-lock.sh` is the approved
+install implementation: its own lines are not screened by that classifier, and
+a helper call is followed wherever it appears. An interpreter invocation is
+followed when its script argument resolves to a repository file: a literal path,
+or a variable the script binds exactly once to a literal or
+script-directory-relative path. A computed, external, `-c`/`-s` or
+here-document-to-shell invocation is refused unless it is on the reviewed
+allowlist, whose entries pin the target, the single assignment to the variable
+and any content source. An install or relative invocation after a non-literal
+`cd` is refused. A reviewed entry whose assignment has an env-overridable
+default (`${VAR:-...}`) is refused when a workflow, job or step `env:` block
+sets that variable. Installs inside followed JavaScript or TypeScript scripts,
+and node `-e`/`-p` or node here-document payloads, are not inspected; their
+here-document bodies are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
