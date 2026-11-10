@@ -501,6 +501,11 @@ export async function listenForHostWs(
 
   return {
     onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },
+    port: () => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") return 0;
+      return address.port;
+    },
     // Settles once the listener has stopped, with or without a live host
     // channel, and resolves at once when it is already closed. `wss.close()`
     // leaves accepted sockets open when the HTTP server is external, and a

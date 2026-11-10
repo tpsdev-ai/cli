@@ -35,6 +35,29 @@ async function freePort(): Promise<number> {
   });
 }
 
+// Hold the port freePort() just chose, so a start can be shown either to stay
+// clear of it (port 0) or to collide with it. The probe closes before the hold
+// binds, so retry a bounded number of times if another process takes it.
+async function holdPort(): Promise<{ port: number; close: () => Promise<void> }> {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const port = await freePort();
+    const server = net.createServer();
+    try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(port, "127.0.0.1", () => resolve());
+      });
+      return {
+        port,
+        close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+      };
+    } catch {
+      /* the probed port was taken before the hold bound it; try another */
+    }
+  }
+  throw new Error("could not hold a free port");
+}
+
 async function waitUntil(ready: () => boolean): Promise<void> {
   const deadline = Date.now() + 5000;
   while (!ready()) {
@@ -163,15 +186,23 @@ describe("branch relay authenticated channels", () => {
         const listener = tcp.listenForHost;
         spyOn(tcp, "listenForHost").mockImplementation((...args) => observe(listener, ...args));
       }
+      // The port freePort() would have pre-chosen is held open: a start that
+      // binds it fails, while a port-0 start comes up on another port (cli#889).
+      const held = await holdPort();
       let startupError: unknown;
       async function start(peer: TpsKeyPair): Promise<number> {
-        const port = await freePort();
+        startupError = undefined;
         fs.writeFileSync(join(root, "identity", "host.json"), JSON.stringify({ publicKey: Buffer.from(peer.encryption.publicKey).toString("base64url") }));
-        writeBranchConf(port, "127.0.0.1", transport, undefined, "local");
+        // Bind port 0 and read the bound port back: no port is selected ahead
+        // of the listener, so a port another process takes in between cannot
+        // fail the start.
+        writeBranchConf(0, "127.0.0.1", transport, undefined, "local");
         void runBranch({ action: "start" }).catch((error: unknown) => { startupError = error; });
         await waitUntil(() => server !== undefined || startupError !== undefined);
         if (startupError) throw startupError;
-        return port;
+        const bound = server?.port?.();
+        if (!bound) throw new Error("listener did not report its bound port");
+        return bound;
       }
       async function connect(peer: TpsKeyPair, port: number): Promise<TransportChannel> {
         const client = transport === "ws" ? new ws.WsNoiseTransport(peer) : new tcp.NoiseIkTransport(peer);
@@ -182,6 +213,12 @@ describe("branch relay authenticated channels", () => {
       }
       const body = MailDeliverBodySchema.parse({ id: randomUUID(), from: "remote", to: "local", content: "original", timestamp: "2026-10-07T00:00:00.000Z" });
       const message = (seq: number, content = body.content): TpsMessage => ({ type: MSG_MAIL_DELIVER, seq, ts: body.timestamp, body: { ...body, content } });
+      try {
+        expect(await start(host)).not.toBe(held.port);
+      } finally {
+        await stop();
+        await held.close();
+      }
       const port = await start(host);
       const first = await connect(host, port);
       expect((await exchange(first, message(1), MSG_MAIL_ACK)).body).toEqual({ id: body.id, accepted: true });

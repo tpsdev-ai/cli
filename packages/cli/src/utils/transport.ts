@@ -49,6 +49,8 @@ export interface TransportChannel {
 }
 
 export interface TransportServer {
+  /** Port the listener is bound to, when the server owns the listener. */
+  port?(): number;
   onConnection(handler: (channel: TransportChannel) => void): void;
   close(): Promise<void>;
 }
