@@ -288,7 +288,7 @@ describe("outbox", () => {
     expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
   });
 
-  test("a file with an mtime in the future is treated as old and quarantined", () => {
+  test("a file with an mtime more than OUTBOX_FUTURE_SKEW_MS in the future is treated as old and quarantined", () => {
     const newDir = join(root, ".tps", "outbox", "new");
     const sentDir = join(root, ".tps", "outbox", "sent");
     mkdirSync(newDir, { recursive: true });
@@ -298,7 +298,7 @@ describe("outbox", () => {
     utimesSync(join(newDir, name), future, future);
     const errors = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // No writer can hold a file young by setting a future mtime.
+      // A writer cannot hold a file young with an mtime more than OUTBOX_FUTURE_SKEW_MS ahead.
       const result = drainOutboxWithStats(false);
       expect(result.skippedYoung).toBe(0);
       expect(result.messages).toEqual([]);

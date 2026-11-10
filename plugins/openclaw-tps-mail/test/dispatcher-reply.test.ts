@@ -380,11 +380,11 @@ describe("openclaw-tps-mail: dispatcher reply path (cli#338, S0/S1)", () => {
   // watches ~/.tps/outbox/new and calls the send pass, which drains through
   // `OutboxSendTracker.dueWithStats` → `drainOutboxWithStats(false)`.
   //
-  // CURRENT CONTRACT (#913): an unparseable file with an age between 0 and
-  // OUTBOX_PARTIAL_GRACE_MS is treated as a writer still in flight — the drain
+  // CURRENT CONTRACT (#913): an unparseable file with an age from
+  // -OUTBOX_FUTURE_SKEW_MS (1 s) up to OUTBOX_PARTIAL_GRACE_MS is treated as a writer still in flight — the drain
   // leaves it in place ("leaving in place") and a later pass reads it again.
   // Only a file that is still malformed once it is at least the grace old, or
-  // one whose mtime is in the future, is quarantined to sent/.malformed-*. A
+  // one whose mtime is more than OUTBOX_FUTURE_SKEW_MS in the future, is quarantined to sent/.malformed-*. A
   // torn in-place write is therefore lost only if it stays torn past the grace;
   // one that completes within it is returned by `drainOutbox()` exactly once.
   //
