@@ -11,6 +11,7 @@ import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
+import type { PidFileState } from "../src/utils/pid-file.js";
 
 let home: string;
 let relayPid: string;
@@ -43,6 +44,23 @@ function record(pid: number, token: string | null): string {
 
 function staleRecord(child: Bun.Subprocess): string {
   return record(child.pid, foreignStartToken(childToken(child.pid)));
+}
+
+/** Makes the first read the real record and the second read `second`. */
+function installSecondRead(second: () => PidFileState): { reads: () => number; restore: () => void } {
+  let reads = 0;
+  const previous = setRelayStopRecordReader(() => {
+    reads++;
+    if (reads === 1) return readRelayPidFile();
+    return second();
+  });
+  return { reads: () => reads, restore: () => setRelayStopRecordReader(previous) };
+}
+
+function captureSignals(): { signals: number[]; restore: () => void } {
+  const signals: number[] = [];
+  const previous = setRelayStopSignal((pid) => signals.push(pid));
+  return { signals, restore: () => setRelayStopSignal(previous) };
 }
 
 function captureLogs(): { logs: string[]; restore: () => void } {
@@ -160,6 +178,142 @@ describe("mail relay stop re-reads the record before signalling", () => {
       expect(logs.join("\n")).toContain("signalled no process");
       expect(pidState(planned.pid)).toBe("alive");
       expect(pidState(replacement.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a record whose start token changed for the same pid is reported and sends no signal",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+      expect(readRelayPidFile().kind).toBe("running");
+
+      const reader = installSecondRead(() => ({
+        kind: "running",
+        path: relayPid,
+        pid: child.pid,
+        startToken: foreignStartToken(childToken(child.pid)),
+      }));
+      const signalling = captureSignals();
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        `Mail relay pid file ${relayPid} still names pid ${child.pid}, but its start token changed before it was signalled`,
+      );
+      expect(logs.join("\n")).toContain("signalled no process");
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a second read that is unreadable refuses and sends no signal",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const reader = installSecondRead(() => ({ kind: "unreadable", path: relayPid }));
+      const signalling = captureSignals();
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} could not be re-read`,
+        );
+      } finally {
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a second read that is missing is reported and sends no signal",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const reader = installSecondRead(() => ({ kind: "missing" }));
+      const signalling = captureSignals();
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        "Mail relay pid file disappeared before it was signalled; this command signalled no process.",
+      );
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a second read that is invalid is reported and sends no signal",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const reader = installSecondRead(() => ({ kind: "invalid", path: relayPid, reason: "not a JSON object" }));
+      const signalling = captureSignals();
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        `Mail relay pid file ${relayPid} is now invalid; this command signalled no process.`,
+      );
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a second read that is unverified refuses and sends no signal",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const reader = installSecondRead(() => ({ kind: "unverified", path: relayPid, pid: child.pid, startToken: null }));
+      const signalling = captureSignals();
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} now names pid ${child.pid}, but that process's identity cannot be verified`,
+        );
+      } finally {
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
+      expect(pidState(child.pid)).toBe("alive");
     },
     20_000,
   );
