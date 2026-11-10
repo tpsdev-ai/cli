@@ -3000,3 +3000,184 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
     }
   });
 });
+
+describe("the workflow guard scans run blocks and followed scripts with one scanner (#820 round 7)", () => {
+  function scanOutcome(root: string, text: string, tracked: Set<string>): { refused: boolean; installs: number; message: string } {
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep(text, "."), tracked, root, "workflow-parity");
+      return { refused: false, installs: report.installs, message: "" };
+    } catch (error) {
+      return { refused: true, installs: 0, message: error instanceof Error ? error.message : String(error) };
+    }
+  }
+
+  type ParityCase = {
+    label: string;
+    text: string;
+    files: Record<string, string>;
+    tracked: Set<string>;
+    /** Expected install count, or null when both paths must refuse. */
+    installs: number | null;
+  };
+
+  const parityCases: ParityCase[] = [
+    {
+      label: "plain install call",
+      text: "bash scripts/inst.sh",
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "cd && install",
+      text: "cd sub && bash inst.sh",
+      files: { "sub/inst.sh": "npm ci\n" },
+      tracked: new Set(["sub/package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "unknown cd then relative call",
+      text: 'X="$(mktemp -d)"\ncd "$X"\nbash scripts/noop.sh',
+      files: { "scripts/noop.sh": "echo clean\n" },
+      tracked: new Set(),
+      installs: null,
+    },
+    {
+      label: "wrapped interpreter",
+      text: "timeout 5 bash scripts/inst.sh",
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "substitution",
+      text: 'echo "$(bash scripts/inst.sh)"',
+      files: { "scripts/inst.sh": "npm ci\n" },
+      tracked: new Set(["package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "nested substitution with its own cd",
+      text: 'echo "$(cd sub && echo "$(bash inst.sh)")"',
+      files: { "sub/inst.sh": "npm ci\n" },
+      tracked: new Set(["sub/package-lock.json"]),
+      installs: 1,
+    },
+    {
+      label: "heredoc into bash",
+      text: "bash <<'EOF'\nbash scripts/noop.sh\nEOF",
+      files: { "scripts/noop.sh": "echo clean\n" },
+      tracked: new Set(),
+      installs: null,
+    },
+    {
+      label: "nested substitution after an unknown cd",
+      text: 'X="$(mktemp -d)"\necho "$(cd "$X" && echo "$(bash scripts/noop.sh)")"',
+      files: { "scripts/noop.sh": "echo clean\n" },
+      tracked: new Set(),
+      installs: null,
+    },
+    {
+      label: "tracked-lock helper call",
+      text: "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/demo",
+      files: { "scripts/npm-ci-tracked-lock.sh": "echo helper\n", "plugins/demo/package-lock.json": "{}\n" },
+      tracked: new Set(["plugins/demo/package-lock.json"]),
+      installs: 1,
+    },
+  ];
+
+  for (const parity of parityCases) {
+    it(`reaches the same outcome for a ${parity.label} as a run block and as a followed script`, () => {
+      const root = makeTreeFixture({ "scripts/inner.sh": parity.text, ...parity.files });
+      try {
+        const run = scanOutcome(root, parity.text, parity.tracked);
+        const script = scanOutcome(root, "bash scripts/inner.sh", parity.tracked);
+        expect(script.refused).toBe(run.refused);
+        if (parity.installs === null) {
+          expect({ run: run.refused, script: script.refused }).toEqual({ run: true, script: true });
+          return;
+        }
+        expect(run).toEqual({ refused: false, installs: parity.installs, message: "" });
+        expect(script).toEqual({ refused: false, installs: parity.installs, message: "" });
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("refuses a wrapped interpreter after an unknown cd in a followed script", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": 'X="$(mktemp -d)"\ncd "$X"\ntimeout 5 bash scripts/inst.sh\n',
+      "scripts/inst.sh": "echo clean\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(),
+        root,
+        "workflow-wrapped-script",
+      )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 3\) token scripts\/inst\.sh/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows a wrapped interpreter inside a command substitution in a followed script", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": 'echo "$(timeout 5 bash scripts/inst.sh)"\n',
+      "scripts/inst.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(),
+        root,
+        "workflow-wrapped-substitution",
+      )).toThrow(/scripts\/inst\.sh.*cannot bind the npm install to a tracked lockfile/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an invocation in a nested substitution after its own unknown cd", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": 'X="$(mktemp -d)"\necho "$(cd "$X" && echo "$(bash scripts/a.sh)")"\n',
+      "scripts/a.sh": "echo clean\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(),
+        root,
+        "workflow-nested-substitution",
+      )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 2\) token scripts\/a\.sh/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("names the workflow, job, step and invocation path two follows deep", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "bash scripts/mid.sh\n",
+      "scripts/mid.sh": "bash scripts/inner.sh\n",
+      "scripts/inner.sh": "npm ci\n",
+    });
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/outer.sh", "."),
+          new Set(),
+          root,
+          "workflow-chain",
+        );
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain("workflow workflow-chain job build step 1");
+      expect(message).toContain("scripts/outer.sh -> scripts/mid.sh -> scripts/inner.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
