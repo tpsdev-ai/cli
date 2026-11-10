@@ -616,7 +616,7 @@ it.skipIf(!npmAvailable)("an .npmrc in the install directory is refused with zer
   }
 }, 60_000);
 
-for (const name of ["npm_config_registry", "npm_config_@scope:registry"]) {
+for (const name of ["npm_config_registry", "npm_config_@scope:registry", "npm_config_prefix", "npm_config_node_gyp", "NPM_CONFIG_REGISTRY"]) {
   it.skipIf(!npmAvailable)(`the helper refuses ${name} before any registry request`, async () => {
     const root = mkdtempSync(join(tmpdir(), "tracked-lock-env-"));
     let registry: ReturnType<typeof startRegistry> | undefined;
@@ -636,7 +636,7 @@ for (const name of ["npm_config_registry", "npm_config_@scope:registry"]) {
       });
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("refusing npm_config_* variables");
-      expect(result.stderr).toContain(name.toLowerCase());
+      expect(result.stderr).toContain(JSON.stringify(name));
       expect(registry.requests).toEqual([]);
     } finally {
       registry?.stop();
@@ -663,6 +663,35 @@ it.skipIf(!npmAvailable)("a lock entry without a resolved URL is refused with ze
     rmSync(root, { recursive: true, force: true });
   }
 }, 60_000);
+
+const foreignResolvedUrls: [string, (registry: string) => string][] = [
+  ["a different host", () => `https://other.example${DEP_PATH}`],
+  ["a host-suffix trick", (registry) => `${registry}.evil.test${DEP_PATH}`],
+  ["a userinfo trick", (registry) => `${registry}@evil.test${DEP_PATH}`],
+];
+
+it.each(foreignResolvedUrls)(
+  "a lock entry whose resolved URL is %s is refused with zero registry requests",
+  async (_label, resolved) => {
+    const root = mkdtempSync(join(tmpdir(), "tracked-lock-resolved-host-"));
+    let registry: ReturnType<typeof startRegistry> | undefined;
+    try {
+      const tarball = packedTarball(root);
+      registry = startRegistry(tarball.bytes);
+      const repo = depFixtureRepo(root, { version: "1.0.0", resolved: resolved(registry.url) });
+      const result = await runHelper([
+        "--via", "npm", FIXTURE, join(root, "prefix"), "--ignore-scripts", "--no-audit", "--no-fund",
+      ], repo, { HOME: join(root, "home"), TPS_DEP_AGES_REGISTRY: registry.url });
+      expect(result.status).toBe(3);
+      expect(result.stderr).toContain(`node_modules/${DEP}: resolved URL is not under ${registry.url}`);
+      expect(registry.requests).toEqual([]);
+    } finally {
+      registry?.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  },
+  60_000,
+);
 
 it.skipIf(!npmAvailable)("TPS_DEP_AGES_REGISTRY is refused under the CI signal with zero registry requests", async () => {
   const root = mkdtempSync(join(tmpdir(), "tracked-lock-ci-"));

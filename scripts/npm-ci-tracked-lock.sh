@@ -73,10 +73,9 @@ registry="${TPS_DEP_AGES_REGISTRY:-https://registry.npmjs.org}"
 registry="${registry%/}"
 
 # Allowlisted because they cannot choose what or where npm fetches: cache,
-# log level, npm's own version, user agent, init template, node-gyp path, and
-# the user/global config paths (the command-line --userconfig/--globalconfig
-# passed below outrank them). Every other name, a future option included, is
-# refused.
+# log level, npm's own version, user agent, init template, and the user/global
+# config paths (the command-line --userconfig/--globalconfig passed below
+# outrank them). Every other name, a future option included, is refused.
 check_npm_config_env() {
   node - "$1" <<'NODE'
 const registry = process.argv[2];
@@ -85,7 +84,6 @@ const allowed = new Set([
   "npm_config_globalconfig",
   "npm_config_init_module",
   "npm_config_loglevel",
-  "npm_config_node_gyp",
   "npm_config_npm_version",
   "npm_config_user_agent",
   "npm_config_userconfig",
@@ -136,6 +134,10 @@ for (const [entry, value] of Object.entries(packages)) {
     continue;
   }
   if (/^(?:file|workspace):/.test(resolved)) continue;
+  // `prefix` ends in "/", so this pins the host and not just a host prefix:
+  // a different host, a host-suffix trick (R + ".evil.test") and a userinfo
+  // trick (R + "@evil.test") all fail. A URL with an upper-case scheme fails
+  // closed, because the match is case-sensitive.
   if (!resolved.startsWith(prefix)) {
     problems.push(`${entry}: resolved URL is not under ${registry}: ${resolved}`);
   }
