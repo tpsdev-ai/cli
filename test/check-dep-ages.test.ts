@@ -3087,7 +3087,7 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
   ];
 
   for (const parity of parityCases) {
-    it(`reaches the same outcome for a ${parity.label} as a run block and as a followed script`, () => {
+    it(`reaches the same outcome for the ${parity.label} shape as a run block and as a followed script`, () => {
       const root = makeTreeFixture({ "scripts/inner.sh": parity.text, ...parity.files });
       try {
         const run = scanOutcome(root, parity.text, parity.tracked);

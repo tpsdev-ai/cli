@@ -40,7 +40,7 @@ script differ only in their initial state. Here-document bodies are install-scre
 a here-document passed to a shell is refused rather than executed. It is a fail-closed
 lint for reviewed changes: it passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
-it cannot resolve is refused. It is not a boundary
+it cannot resolve is refused unless a reviewed allowlist entry names it. It is not a boundary
 against an author who deliberately evades it; review is, and a runtime npm
 guard in CI is the structural fix, tracked separately (cli#948). Installs inside
 followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
