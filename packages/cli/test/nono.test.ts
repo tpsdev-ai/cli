@@ -23,6 +23,7 @@ import {
   rmSync,
   readFileSync,
   existsSync,
+  symlinkSync,
   unlinkSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -105,9 +106,41 @@ describe("findNono()", () => {
   });
 
   test("returns null when nono not on PATH", () => {
-    process.env.PATH = "/nonexistent/bin";
-    const found = findNono();
-    expect(found).toBeNull();
+    // Resolve a real `which` on the real PATH before it is replaced: the lookup
+    // must succeed and answer "not found" (exit 1), not fail with ENOENT.
+    const whichBin = Bun.which("which");
+    if (!whichBin || !existsSync(whichBin)) {
+      throw new Error(`findNono fixture: no which binary found on the real PATH (resolved: ${whichBin})`);
+    }
+
+    // Watch findNono()'s `which` lookup: with a `which` on the fake PATH the test
+    // proves the lookup ran and answered "not found" (exit 1), not that the spawn failed.
+    const realSpawnSync = childProcess.spawnSync;
+    const whichStatuses: Array<number | null> = [];
+    spyOn(childProcess, "spawnSync").mockImplementation(((...args: unknown[]) => {
+      const result = (realSpawnSync as (...spawnArgs: unknown[]) => any)(...args);
+      if (args[0] === "which") whichStatuses.push(result.status);
+      return result;
+    }) as typeof childProcess.spawnSync);
+
+    const savedPath = process.env.PATH;
+    let fakeDir: string | undefined;
+    let found: string | null;
+    try {
+      fakeDir = mkdtempSync(join(tmpdir(), "tps-nono-findnono-"));
+      // Symlink the real which into our fake dir
+      symlinkSync(whichBin, join(fakeDir, "which"));
+
+      process.env.PATH = fakeDir; // has which, no nono
+      found = findNono();
+    } finally {
+      process.env.PATH = savedPath; // always restore PATH
+      if (fakeDir !== undefined) rmSync(fakeDir, { recursive: true, force: true });
+    }
+
+    expect(found!).toBeNull();
+    // `which nono` ran in the fake PATH and exited 1 ("not found"), not a failed spawn (null).
+    expect(whichStatuses).toContain(1);
   });
 });
 
