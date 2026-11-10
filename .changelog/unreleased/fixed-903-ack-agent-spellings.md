@@ -1,1 +1,1 @@
-- **Refuse a value-less `--agent` in `mail ack`/`nack`/`gc`:** an `--agent` with no value is refused, so it does not fall back to the default agent; `ack`/`nack` also refuse a trailing positional agent and honour `--agent=<id>`, and `nack` usage names `--agent <id>`.
+- **Refuse a value-less `--agent` in `mail ack`/`nack`/`gc`:** an `--agent` with no value is refused, so it does not fall back to the default agent; `ack`/`nack` also refuse a trailing positional agent and honour `--agent=<id>`, `gc` refuses a positional agent, and `nack` usage names `--agent <id>`.

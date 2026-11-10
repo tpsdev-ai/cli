@@ -844,6 +844,12 @@ async function main() {
         process.exit(1);
       }
 
+      if (action === "gc" && rest.length > 1) {
+        console.error(`Unexpected argument: ${rest[1]}`);
+        console.error("Usage: tps mail gc [--agent <id>]");
+        process.exit(1);
+      }
+
       if (action === "ack" || action === "nack" || action === "gc") {
         const hasEmptyAgent = process.argv.some((arg, index) => {
           if (arg === "--agent=") return true;

@@ -45,8 +45,28 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
   }
 
   /** The CLI authenticates mail verification as the mailbox owner it acts on. */
-  async function run(args: string[], keyAgent = OWNER): Promise<Result> {
-    const proc = Bun.spawn([process.execPath, TPS_BIN, "--quiet-nono-check", ...args], {
+  async function run(args: string[], keyAgent = OWNER, keepAcked = false): Promise<Result> {
+    const preload = keepAcked ? join(tempRoot, "keep-acked-preload.ts") : undefined;
+    if (preload) {
+      // `tps mail ack` writes `ackedAt` and then unlinks the record. Skip that
+      // cleanup unlink under TPS_TEST_KEEP_ACK_ROOT so the test can read the
+      // written record back. Only this spawned CLI gets the preload.
+      writeFileSync(preload, [
+        'import { mock } from "bun:test";',
+        'import * as fs from "node:fs";',
+        'import { resolve, sep } from "node:path";',
+        'const root = process.env.TPS_TEST_KEEP_ACK_ROOT;',
+        'const unlink = fs.unlinkSync;',
+        'mock.module("node:fs", () => ({',
+        '  ...fs,',
+        '  unlinkSync: (path: any) => {',
+        '    if (root && resolve(String(path)).startsWith(root + sep)) return;',
+        '    return unlink(path);',
+        '  },',
+        '}));',
+      ].join("\n"));
+    }
+    const proc = Bun.spawn([process.execPath, ...(preload ? [`--preload=${preload}`] : []), TPS_BIN, "--quiet-nono-check", ...args], {
       cwd: tempRoot,
       env: {
         ...process.env,
@@ -55,6 +75,7 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
         TPS_AGENT_ID: OWNER,
         FLAIR_URL: stub.url,
         FLAIR_KEY_PATH: join(keysDir, `${keyAgent}.key`),
+        ...(preload ? { TPS_TEST_KEEP_ACK_ROOT: join(tempRoot, "mail") } : {}),
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -121,13 +142,30 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     expect(b?.ackedAt).toBeUndefined();
   });
 
+  test("ack refuses a whitespace --agent value and acks nothing", async () => {
+    const { idA, idB } = seed();
+    for (const flag of ["--agent= ", "--agent=\t"]) {
+      const r = await run(["mail", "ack", idA, flag]);
+      expect(r.status).not.toBe(0);
+      expect(r.out).toContain("Invalid agent id");
+    }
+
+    const a = await recordFor(OWNER, idA);
+    const b = await recordFor(OTHER, idB);
+    expect(a).toBeDefined();
+    expect(a?.ackedAt).toBeUndefined();
+    expect(b).toBeDefined();
+    expect(b?.ackedAt).toBeUndefined();
+  });
+
   test("ack honours --agent=<id>", async () => {
     const { idA, idB } = seed();
-    const r = await run(["mail", "ack", idB, `--agent=${OTHER}`], OTHER);
+    const r = await run(["mail", "ack", idB, `--agent=${OTHER}`], OTHER, true);
     expect(r.status).toBe(0);
 
     const b = await recordFor(OTHER, idB);
-    expect(b === undefined || b.ackedAt !== undefined).toBe(true);
+    expect(b).toBeDefined();
+    expect(b?.ackedAt).toBeDefined();
     const a = await recordFor(OWNER, idA);
     expect(a).toBeDefined();
     expect(a?.ackedAt).toBeUndefined();
@@ -188,6 +226,19 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
       expect(a).toBeDefined();
       expect(b).toBeDefined();
     }
+  });
+
+  test("gc refuses a positional agent and collects nothing", async () => {
+    const { idA, idB } = seedCollectable();
+    const r = await run(["mail", "gc", OTHER, "--max-age", "0s"]);
+    expect(r.status).not.toBe(0);
+    expect(r.out).toContain(`Unexpected argument: ${OTHER}`);
+    expect(r.out).toContain("Usage: tps mail gc [--agent <id>]");
+
+    const a = await recordFor(OWNER, idA);
+    const b = await recordFor(OTHER, idB);
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
   });
 
   test("another getFlag option accepts the equals form", async () => {
