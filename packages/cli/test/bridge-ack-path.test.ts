@@ -9,6 +9,13 @@ import type { BridgeAdapter, BridgeEnvelope } from "../src/bridge/adapter.js";
 import { FlairClient } from "../src/utils/flair-client.js";
 import * as mail from "../src/utils/mail.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+import {
+  WORKER_OWNER_WATCH_SCRIPT,
+  ownerAwareGateWaitScript,
+  spawnWatchedWorker,
+  stopChild,
+  waitForChildExit,
+} from "../../../test/helpers/live-process.js";
 
 afterEach(() => {
   mock.restore();
@@ -277,15 +284,10 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
     import { spyOn } from "bun:test";
     import * as fs from "node:fs";
     import { join } from "node:path";
+    ${WORKER_OWNER_WATCH_SCRIPT}
     const [role, root, target, source] = process.argv.slice(2);
     const signal = (name) => fs.writeFileSync(join(root, name), "ready");
-    const wait = (name) => {
-      const deadline = Date.now() + 5000;
-      while (!fs.existsSync(join(root, name))) {
-        if (Date.now() > deadline) throw new Error("barrier timeout: " + name);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-      }
-    };
+    ${ownerAwareGateWaitScript()}
     const unlink = fs.unlinkSync;
     spyOn(fs, "unlinkSync").mockImplementation((file) => {
       if (file !== target) return unlink(file);
@@ -321,11 +323,12 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
       if (role !== "second" || !String(error).includes("ENOENT")) throw error;
       signal("second-missing");
     }
+    process.exit(0);
   `);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const spawn = (role: string) => {
-    const child = Bun.spawn([process.execPath, worker, role, root, target,
-      new URL("../src/utils/mail.ts", import.meta.url).href], { stdout: "pipe", stderr: "pipe" });
+    const child = spawnWatchedWorker(worker, [role, root, target,
+      new URL("../src/utils/mail.ts", import.meta.url).href]);
     children.push(child);
     return child;
   };
@@ -335,15 +338,14 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
     const second = spawn("second");
     await waitFor(() => ["second-checked", "second-contended"].some((name) => fs.existsSync(join(root, name))));
     fs.writeFileSync(join(root, "release-first"), "ready");
-    expect(await first.exited).toBe(0);
+    expect(await waitForChildExit(first, 10_000)).toBe(0);
     expect(fs.existsSync(target)).toBe(false);
     fs.writeFileSync(join(root, "release-second"), "ready");
-    expect(await second.exited).toBe(0);
+    expect(await waitForChildExit(second, 10_000)).toBe(0);
     expect(fs.existsSync(join(root, "recreated"))).toBe(false);
     expect(fs.existsSync(target)).toBe(false);
     expect(fs.existsSync(join(root, "second-missing"))).toBe(true);
   } finally {
-    for (const child of children) child.kill();
-    await Promise.all(children.map((child) => child.exited));
+    await Promise.all(children.map((child) => stopChild(child)));
   }
 });

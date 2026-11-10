@@ -7,6 +7,13 @@ import { tmpdir } from "node:os";
 import * as mail from "../src/utils/mail.js";
 import { FlairClient } from "../src/utils/flair-client.js";
 import { buildSignedEnvelope, pubkeyFromSeed } from "./helpers/stub-flair.js";
+import {
+  WORKER_OWNER_WATCH_SCRIPT,
+  ownerAwareGateWaitScript,
+  spawnWatchedWorker,
+  stopChild,
+  waitForChildExit,
+} from "../../../test/helpers/live-process.js";
 
 afterEach(() => {
   mock.restore();
@@ -133,16 +140,11 @@ test("nack and ack interleaving never recreates the removed record", async () =>
     import { spyOn } from "bun:test";
     import * as fs from "node:fs";
     import { join } from "node:path";
+    ${WORKER_OWNER_WATCH_SCRIPT}
     const [role, root, target, source, agent] = process.argv.slice(2);
     process.env.TPS_MAIL_DIR = root;
     const signal = (name) => fs.writeFileSync(join(root, name), "ready");
-    const wait = (name) => {
-      const deadline = Date.now() + 5000;
-      while (!fs.existsSync(join(root, name))) {
-        if (Date.now() > deadline) throw new Error("barrier timeout: " + name);
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5);
-      }
-    };
+    ${ownerAwareGateWaitScript()}
     const read = fs.readFileSync;
     let reads = 0;
     spyOn(fs, "readFileSync").mockImplementation((...args) => {
@@ -156,11 +158,12 @@ test("nack and ack interleaving never recreates the removed record", async () =>
     if (role === "nack") mail.nackMessage(agent, "record-id", "retry");
     else mail.ackMessageAtPath(target);
     signal(role + "-done");
+    process.exit(0);
   `);
   const children: ReturnType<typeof Bun.spawn>[] = [];
   const spawn = (role: string) => {
-    const child = Bun.spawn([process.execPath, worker, role, root, target,
-      new URL("../src/utils/mail.ts", import.meta.url).href, agent], { stdout: "pipe", stderr: "pipe" });
+    const child = spawnWatchedWorker(worker, [role, root, target,
+      new URL("../src/utils/mail.ts", import.meta.url).href, agent]);
     children.push(child);
     return child;
   };
@@ -170,11 +173,10 @@ test("nack and ack interleaving never recreates the removed record", async () =>
     const ack = spawn("ack");
     await waitFor(() => ["ack-done", "ack-contended"].some((name) => fs.existsSync(join(root, name))));
     fs.writeFileSync(join(root, "release-nack"), "ready");
-    expect(await nack.exited).toBe(0);
-    expect(await ack.exited).toBe(0);
+    expect(await waitForChildExit(nack, 10_000)).toBe(0);
+    expect(await waitForChildExit(ack, 10_000)).toBe(0);
     expect(fs.existsSync(target)).toBe(false);
   } finally {
-    for (const child of children) child.kill();
-    await Promise.all(children.map((child) => child.exited));
+    await Promise.all(children.map((child) => stopChild(child)));
   }
 });
