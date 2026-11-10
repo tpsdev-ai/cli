@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import { mkdtempSync, rmSync, readdirSync, writeFileSync, existsSync, mkdirSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { queueOutboxMessage, drainOutbox, drainOutboxWithStats, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OutboxYoungRetryScheduler, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS, OUTBOX_PARTIAL_GRACE_MS, runOutboxSendPass } from "../src/utils/outbox.js";
+import { queueOutboxMessage, drainOutbox, drainOutboxWithStats, OUTBOX_FUTURE_SKEW_MS, releaseOutboxRecord, acknowledgeOutbox, OutboxSendTracker, OutboxYoungRetryScheduler, OUTBOX_MAX_SENDS, OUTBOX_RESEND_BASE_MS, OUTBOX_PARTIAL_GRACE_MS, runOutboxSendPass } from "../src/utils/outbox.js";
 import * as mailLock from "../src/utils/mail-lock.js";
 
 afterEach(() => {
@@ -265,6 +265,27 @@ describe("outbox", () => {
     } finally {
       lock.mockRestore();
     }
+  });
+
+  test("an mtime slightly in the future (within the skew tolerance) is treated as young", () => {
+    const newDir = join(root, ".tps", "outbox", "new");
+    const sentDir = join(root, ".tps", "outbox", "sent");
+    mkdirSync(newDir, { recursive: true });
+    const name = "2026-05-16-skew.json";
+    writeFileSync(join(newDir, name), "{", "utf-8");
+    const ahead = new Date(Date.now() + OUTBOX_FUTURE_SKEW_MS / 2);
+    utimesSync(join(newDir, name), ahead, ahead);
+    const errors = spyOn(console, "error").mockImplementation(() => {});
+    try {
+      // A writer in flight can stamp an mtime just ahead of the drain's clock read.
+      const result = drainOutboxWithStats(false);
+      expect(result.skippedYoung).toBe(1);
+      expect(result.messages).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(existsSync(join(newDir, name))).toBe(true);
+    expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
   });
 
   test("a file with an mtime in the future is treated as old and quarantined", () => {

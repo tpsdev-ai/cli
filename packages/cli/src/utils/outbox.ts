@@ -129,11 +129,15 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
 }
 
 /**
- * A file whose age is between 0 and this value that does not parse is treated
- * as a writer still in flight, not a bad record. A negative age (mtime in the
- * future) is treated as old.
+ * A file that does not parse and whose age is under this value is treated as a
+ * writer still in flight, not a bad record. Ages down to -OUTBOX_FUTURE_SKEW_MS
+ * count as young (timestamp and clock skew); an mtime further in the future is
+ * treated as old.
  */
 export const OUTBOX_PARTIAL_GRACE_MS = 5_000;
+
+/** Negative ages smaller than this are timestamp or clock skew, not a future-dated file. */
+export const OUTBOX_FUTURE_SKEW_MS = 1_000;
 
 export interface OutboxDrainResult {
   messages: OutboxMessage[];
@@ -169,21 +173,24 @@ export function drainOutboxWithStats(archive = true): OutboxDrainResult {
     } catch (err) {
       let ageMs: number;
       try {
-        ageMs = Math.round(Date.now() - statSync(src).mtimeMs);
+        // Read the mtime before the clock, so a write landing between the two
+        // reads cannot make an in-flight file look future-dated.
+        const mtimeMs = statSync(src).mtimeMs;
+        ageMs = Date.now() - mtimeMs;
       } catch (statErr) {
         console.error(`drainOutbox: failed to stat ${f}: ${(statErr as Error).message}; leaving in place`);
         continue;
       }
       // A writer that is still writing publishes a short, unparseable file.
       // Leave it for the next pass; quarantine once it has had the grace period
-      // and still does not parse, or straight away when its mtime is in the
-      // future (a negative age is not a writer in flight).
-      if (ageMs >= 0 && ageMs < OUTBOX_PARTIAL_GRACE_MS) {
-        console.error(`drainOutbox: failed to parse ${f} (age ${ageMs}ms): younger than ${OUTBOX_PARTIAL_GRACE_MS}ms; leaving in place`);
+      // and still does not parse, or straight away when its mtime is more than
+      // OUTBOX_FUTURE_SKEW_MS in the future (no writer in flight is that far ahead).
+      if (ageMs > -OUTBOX_FUTURE_SKEW_MS && ageMs < OUTBOX_PARTIAL_GRACE_MS) {
+        console.error(`drainOutbox: failed to parse ${f} (age ${Math.round(ageMs)}ms): younger than ${OUTBOX_PARTIAL_GRACE_MS}ms; leaving in place`);
         skippedYoung++;
         continue;
       }
-      console.error(`drainOutbox: failed to parse ${f} (age ${ageMs}ms): quarantining`);
+      console.error(`drainOutbox: failed to parse ${f} (age ${Math.round(ageMs)}ms): quarantining`);
       try {
         renameSync(src, join(sentDir, `.malformed-${f}`));
       } catch {
