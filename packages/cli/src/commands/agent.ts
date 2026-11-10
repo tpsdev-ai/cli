@@ -1733,9 +1733,16 @@ async function runAgentCommand(
                   // touched (cli#672).
                   onInterrupt: (_signal, stop) => {
                     if (!worktreeCreated) return;
-                    keepWorktree = removeWorktreeAfterStop(stop, () =>
-                      onStop(launchId, config.workspace, cleanupBinding)
-                    );
+                    try {
+                      keepWorktree = removeWorktreeAfterStop(stop, () =>
+                        onStop(launchId, config.workspace, cleanupBinding)
+                      );
+                    } catch (err) {
+                      // Removal is unconfirmed: the launcher refuses and keeps
+                      // the launch state, so the teardown below must not retry.
+                      keepWorktree = true;
+                      throw err;
+                    }
                   },
                   worktreePath: worktreeCreated ? cleanupBinding?.workspace ?? createdWorktree?.workspace : undefined,
                   // The same path-aware advice filter as printLaunchError, for
