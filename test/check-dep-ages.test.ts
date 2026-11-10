@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow, UNRESOLVED_INVOCATION_ALLOWLIST } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -2071,18 +2071,61 @@ describe("the workflow guard follows invoked scripts and local composite actions
     }
   });
 
+  it("refuses a computed invocation inside a followed script, naming script, line and token", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "echo before\nbash \"$x\"\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-computed",
+      )).toThrow(/unresolved script invocation in scripts\/install\.sh \(line 2\) token "\$x"/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a stale allowlist entry whose line no longer holds its token", () => {
+    const root = makeTreeFixture({
+      "scripts/install.sh": "echo before\nbash \"$y\"\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-stale",
+        [{ script: "scripts/install.sh", line: 1, token: '"$y"', reason: "test fixture" }],
+      )).toThrow(/stale UNRESOLVED_INVOCATION_ALLOWLIST entry: scripts\/install\.sh line 1 no longer holds "\$y"/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("scans this repository's workflows, follows their scripts, and reports them", () => {
     const tracked = new Set(trackedLockfiles());
     const workflowsDir = join(REPO, ".github", "workflows");
     const workflows = readdirSync(workflowsDir).filter((name) => name.endsWith(".yml") || name.endsWith(".yaml"));
     let installs = 0;
     const followed = new Set<string>();
+    const unresolved = new Set<string>();
     for (const name of workflows) {
       const report = assertNpmCiWorkflowTree(readFileSync(join(workflowsDir, name), "utf8"), tracked, REPO, name);
       installs += report.installs;
       for (const rel of report.followed) followed.add(rel);
+      for (const entry of report.unresolved) unresolved.add(entry);
     }
-    expect(installs).toBeGreaterThan(0);
+    expect(installs).toBe(5);
+    expect(followed.size).toBe(21);
+    const allowed = new Set(
+      UNRESOLVED_INVOCATION_ALLOWLIST.map((entry) => `${entry.script} (line ${entry.line}): ${entry.token}`),
+    );
+    expect([...unresolved].sort()).toEqual([...allowed].sort());
+    expect([...unresolved].filter((entry) => !allowed.has(entry))).toEqual([]);
     for (const expected of [
       "scripts/prefetch-socket-firewall.sh",
       "scripts/check-dep-ages.mjs",

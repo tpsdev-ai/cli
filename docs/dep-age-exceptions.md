@@ -33,7 +33,9 @@ indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`); an npm install found
 there must bind to a tracked lockfile or the scan refuses it, naming the
-invocation path. Helper
+invocation path. Installs inside followed JavaScript or TypeScript scripts are
+not inspected; a computed script path is refused unless it is on the reviewed
+allowlist. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper
