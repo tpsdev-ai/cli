@@ -15,11 +15,17 @@ import {
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homeDir } from "../utils/home.js";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridgeSentAtPath, type PromoteOk } from "../utils/mail.js";
-import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+import {
+  assertBridgeAdapterName,
+  BRIDGE_ADAPTER_NAME_RE,
+  validateBridgeAdapterName,
+  type BridgeAdapter,
+  type BridgeEnvelope,
+} from "./adapter.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
@@ -28,6 +34,7 @@ const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export function validateAgentId(id: string): boolean {
   return AGENT_ID_RE.test(id);
 }
+export { assertBridgeAdapterName, BRIDGE_ADAPTER_NAME_RE, validateBridgeAdapterName };
 
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
 import { configureBridgeIdentity, processStartToken } from "@tpsdev-ai/agent";
@@ -58,7 +65,8 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(process.env.HOME ?? homedir(), ".tps", "mail");
+    assertBridgeAdapterName(adapter.name);
+    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(homeDir(), ".tps", "mail");
     this.defaultAgentId = requireLocalAgentId("bridge default agent id", config.defaultAgentId);
     this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
     this.defaultChannelId = config.defaultChannelId ?? "";
@@ -68,6 +76,7 @@ export class BridgeCore {
   }
 
   async start(): Promise<void> {
+    assertBridgeAdapterName(this.adapter.name);
     // Start adapter with inbound callback
     await this.adapter.start((envelope) => this.handleInbound(envelope));
 
@@ -75,7 +84,7 @@ export class BridgeCore {
     this.stopOutbound = this.watchOutbox();
 
     // PID file
-    const pidDir = join(homedir(), ".tps", "run");
+    const pidDir = join(homeDir(), ".tps", "run");
     mkdirSync(pidDir, { recursive: true });
     writeFileSync(
       join(pidDir, `bridge-${this.adapter.name}.pid`),
@@ -89,7 +98,7 @@ export class BridgeCore {
   async stop(): Promise<void> {
     this.stopOutbound?.();
     await this.adapter.stop();
-    const pidPath = join(homedir(), ".tps", "run", `bridge-${this.adapter.name}.pid`);
+    const pidPath = join(homeDir(), ".tps", "run", `bridge-${this.adapter.name}.pid`);
     rmSync(pidPath, { force: true });
     this.log(`[bridge:${this.adapter.name}] Stopped`);
   }

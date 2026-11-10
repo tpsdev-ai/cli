@@ -6,12 +6,19 @@
  * for backward compatibility.
  */
 
-export { BridgeCore, validateAgentId } from "../bridge/core.js";
+export {
+  assertBridgeAdapterName,
+  BRIDGE_ADAPTER_NAME_RE,
+  BridgeCore,
+  validateAgentId,
+  validateBridgeAdapterName,
+} from "../bridge/core.js";
 export type { BridgeEnvelope } from "../bridge/adapter.js";
 export { OpenClawAdapter } from "../bridge/openclaw-adapter.js";
 export { StdioAdapter } from "../bridge/stdio-adapter.js";
 
 import { BridgeCore } from "../bridge/core.js";
+import { validateBridgeAdapterName } from "../bridge/adapter.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
 import { readdirSync } from "node:fs";
@@ -41,10 +48,19 @@ export interface BridgePidFileEntry {
 /** `BridgeCore.start` writes `bridge-<adapter>.pid`. Discovery accepts an
  *  adapter part of lowercase ASCII letters only. The legacy name
  *  `mail-bridge.pid` is treated as the OpenClaw bridge. */
-const BRIDGE_PID_NAME = /^(?:bridge-([a-z]+)|mail-bridge)\.pid$/;
+const BRIDGE_PID_PREFIX = "bridge-";
+const BRIDGE_PID_SUFFIX = ".pid";
+const LEGACY_PID_NAME = "mail-bridge.pid";
 const LEGACY_ADAPTER = "openclaw";
 /** The OpenClaw records, in the order the start check reads them. */
 const OPENCLAW_PID_NAMES = ["bridge-openclaw.pid", "mail-bridge.pid"] as const;
+
+function bridgePidRecordAdapter(name: string): string | null {
+  if (name === LEGACY_PID_NAME) return LEGACY_ADAPTER;
+  if (!name.startsWith(BRIDGE_PID_PREFIX) || !name.endsWith(BRIDGE_PID_SUFFIX)) return null;
+  const adapter = name.slice(BRIDGE_PID_PREFIX.length, -BRIDGE_PID_SUFFIX.length);
+  return validateBridgeAdapterName(adapter) ? adapter : null;
+}
 
 function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntry | null {
   let port: number | undefined;
@@ -74,8 +90,9 @@ export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
     );
   }
   const entries: BridgePidFileEntry[] = [];
-  for (const name of names.filter((entry) => BRIDGE_PID_NAME.test(entry)).sort()) {
-    const recordAdapter = BRIDGE_PID_NAME.exec(name)?.[1] ?? LEGACY_ADAPTER;
+  for (const name of [...names].sort()) {
+    const recordAdapter = bridgePidRecordAdapter(name);
+    if (recordAdapter === null) continue;
     if (adapter !== undefined && recordAdapter !== adapter) continue;
     const entry = classifyBridgePidFile(join(pidDir, name), recordAdapter);
     if (entry) entries.push(entry);
