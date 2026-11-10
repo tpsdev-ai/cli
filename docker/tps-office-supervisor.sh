@@ -272,9 +272,10 @@ shutdown_children() {
 
 # cli#357 r4 — when TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH is TERM, INT or HUP,
 # pause briefly so the launched child can start, then send ourselves that
-# signal. The regression calls this between a child's background launch and the
-# tracking of its PID, so the signal always lands inside the window; it does
-# nothing when the variable is unset.
+# signal. The supervisor calls this on every sandboxed launch, between the
+# child's background launch and the tracking of its PID; the regression sets the
+# variable, so the signal always lands inside the window. It does nothing when
+# the variable is unset.
 test_signal_after_launch() {
   if [[ -n "${TPS_SUPERVISOR_TEST_SIGNAL_AFTER_LAUNCH:-}" ]]; then
     sleep 0.5

@@ -277,8 +277,8 @@ if [ "$shutdown_ready" -eq 1 ]; then
   term_count="$(grep -c '^TERM$' "$shutdown_fixture/terms" 2>/dev/null || true)"
   tick_count="$(grep -c '^tick$' "$shutdown_fixture/ticks" 2>/dev/null || true)"
   child_pid="$(cat "$shutdown_fixture/child-pid")"
-  if [ "$first_term" -eq 1 ] && [ "$shutdown_finished" -eq 1 ] && [ "$shutdown_status" -eq 0 ] && [ "$term_count" -eq 1 ] && [ "$tick_count" -gt 0 ] && [ "$shutdown_elapsed" -le 3000 ] && ! kill -0 "$child_pid" 2>/dev/null; then
-    ok "second handled signal during grace sends one TERM and reaches KILL within grace plus 2 seconds"
+  if [ "$first_term" -eq 1 ] && [ "$shutdown_finished" -eq 1 ] && [ "$shutdown_status" -eq 0 ] && [ "$term_count" -eq 1 ] && [ "$tick_count" -gt 0 ] && [ "$shutdown_elapsed" -ge 1000 ] && [ "$shutdown_elapsed" -le 3000 ] && ! kill -0 "$child_pid" 2>/dev/null; then
+    ok "second handled signal during grace sends one TERM and reaches KILL no sooner than the grace and within grace plus 2 seconds"
   else
     bad "shutdown re-entry (first=$first_term finished=$shutdown_finished status=$shutdown_status terms=$term_count ticks=$tick_count elapsed=$shutdown_elapsed child=$child_pid)"
   fi
@@ -882,7 +882,7 @@ SH
   fi
   elapsed=$((t1 - t0))
   if [ "$rc3c" -eq 0 ]; then ok "TERM grace then KILL: the supervisor exits 0 after the grace"; else bad "TERM grace then KILL: the supervisor exited $rc3c"; fi
-  if [ "$elapsed" -ge 9 ] && [ "$elapsed" -le 12 ]; then ok "TERM grace then KILL: the KILL attempt reached the deadline ($elapsed s)"; else bad "TERM grace then KILL: the elapsed time missed the deadline ($elapsed s)"; fi
+  if [ "$elapsed" -ge 10 ] && [ "$elapsed" -le 12 ]; then ok "TERM grace then KILL: the KILL attempt reached the deadline ($elapsed s)"; else bad "TERM grace then KILL: the elapsed time missed the deadline ($elapsed s)"; fi
   shut_pid="$(sed -n 's/^started //p' "$SHUTDOWN_MARKER" | head -n1)"
   if [ -n "$shut_pid" ] && ! kill -0 "$shut_pid" 2>/dev/null; then ok "TERM grace then KILL: the TERM-ignoring child $shut_pid is gone"; else bad "TERM grace then KILL: the child '${shut_pid:-unknown}' survived"; fi
   terms="$(grep -c '^term$' "$SHUTDOWN_MARKER" || true)"
