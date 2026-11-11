@@ -57,5 +57,10 @@
   "dependencies": {
     "@tpsdev-ai/agent": "file:../../packages/agent",
     "@tpsdev-ai/cli": "file:../../packages/cli"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.10",
+    "openclaw": "2026.8.1",
+    "typescript": "^5.7.0"
   }
 }

@@ -85,7 +85,7 @@ import {
   type ReceiptRecord,
   type ReceiptScanDirs,
 } from "./obligations.js";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { formatStampDiagnostic, type ObligationPresence } from "./diagnostics.js";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
 import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
@@ -95,7 +95,7 @@ import type {
   ChannelOutboundContext,
 } from "openclaw/plugin-sdk/channel-contract";
 
-// The pinned openclaw (2026.5.22) exports no `plugin-sdk/channels` subpath, and
+// The pinned openclaw (2026.8.1) exports no `plugin-sdk/channels` subpath, and
 // ChannelGatewayAdapter / ChannelConfigAdapter have no public NAMED export at
 // all. Derive both from the public ChannelPlugin contract — its `gateway` and
 // `config` members — so the SDK type stays the source of truth rather than a
@@ -2093,6 +2093,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // latest final that carries real text, and post exactly ONCE after the
       // dispatch resolves.
       let latestFinalText: string | null = null;
+      // With block streaming enabled, OpenClaw delivers the turn's text as
+      // `block` payloads and skips the final (the streamed block is the
+      // terminal text). Keep the latest postable block as a fallback so such a
+      // turn is not silently left unposted.
+      let latestBlockText: string | null = null;
       // A final that was suppressed before delivery (empty, or the runtime's
       // silent token) is tracked so "the turn produced no postable final" is a
       // NAMED failure rather than a silent yield.
@@ -2117,7 +2122,14 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // a host that rewrites NO_REPLY to a canned phrase is not filtered
             // (see SUPPRESSED_FINAL_TOKENS).
             deliver: async (payload: any, info: any) => {
-              if (!isLiveContext(yieldCtx) || info?.kind !== "final") return;
+              if (!isLiveContext(yieldCtx)) return;
+              if (info?.kind === "block") {
+                const text = extractFinalText(payload);
+                if (isPostableFinalText(text)) latestBlockText = text;
+                else if (text) sawSuppressedFinal = true;
+                return;
+              }
+              if (info?.kind !== "final") return;
               const text = extractFinalText(payload);
               if (!isPostableFinalText(text)) {
                 // A raw silent token reached `deliver` (a host that rewrites
@@ -2144,9 +2156,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           return;
         }
 
-        // POST EXACTLY ONCE, after the dispatch has resolved.
-        if (latestFinalText !== null) {
-          const replyText = latestFinalText;
+        // POST EXACTLY ONCE, after the dispatch has resolved. A final wins;
+        // the latest block is the fallback for a block-streamed turn.
+        const replyText = latestFinalText ?? latestBlockText;
+        if (replyText !== null) {
           // Requirement 4: sign the reply (Ed25519 + messageId). cli#429: the
           // thread is the inbound's SIGNED envelope id, signed INSIDE the
           // envelope; the inbound's record id is bookkeeping only.
@@ -2364,7 +2377,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // nothing was sent, so this is a definitive non-delivery — fail and
           // nack exactly as before.
           await settleObligation(yieldCtx, obId, { receipt: "none", verdict: postFailure, reason: postFailure });
-        } else if (sawSuppressedFinal && latestFinalText === null) {
+        } else if (sawSuppressedFinal && latestFinalText === null && latestBlockText === null) {
           // The turn produced finals, but every one was empty or silent — a
           // NAMED failure with a nack, never a silent yield. `latestFinalText`
           // must be null: a turn that POSTED a real final whose receipt is
