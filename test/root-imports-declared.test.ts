@@ -133,7 +133,7 @@ describe("root imports are declared", () => {
 		}
 	});
 
-	it("accepts builtins, a relative import and a declared scoped package", () => {
+	it("accepts builtins, relative and absolute imports, and packages declared in dependencies or devDependencies", () => {
 		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
 		try {
 			writeFileSync(
@@ -144,11 +144,13 @@ describe("root imports are declared", () => {
 					'import { helper } from "./helper";',
 					'import { absolute } from "/abs/helper";',
 					'import { agent } from "@tpsdev-ai/agent";',
-					"void readFileSync; void describe; void helper; void absolute; void agent;",
+					'import { WebSocket } from "ws";',
+					"void readFileSync; void describe; void helper; void absolute; void agent; void WebSocket;",
 					"",
 				].join("\n"),
 			);
 			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], {
+				dependencies: { ws: "^8.0.0" },
 				devDependencies: { "@tpsdev-ai/agent": "workspace:*" },
 			});
 			expect(undeclared).toEqual([]);
