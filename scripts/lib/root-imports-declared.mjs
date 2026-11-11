@@ -10,7 +10,9 @@
  * (scope and name for a scoped package, first segment otherwise) is declared.
  * Relative and absolute imports pass. A `#` specifier (a package.json
  * `imports` entry) is reported under its own name, `#x`; the root manifest has
- * no `imports` field.
+ * no `imports` field. A .tsx or .jsx file that contains JSX is reported as
+ * importing `react`: Bun's scanner adds the JSX runtime (`react/jsx-runtime`
+ * or `react/jsx-dev-runtime`) and `react` as requires.
  *
  * NOT covered: a type-only import (`import type { X } from "pkg"`,
  * `export type { X } from "pkg"`, or an import of `type` names only), which
@@ -18,16 +20,40 @@
  * a dynamic import whose specifier is not a literal string
  * (`await import(name)`), packages imported only from outside test/ and
  * scripts/, and whether a declared range resolves for a published consumer.
- * The root test lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files and does
- * not descend into a directory reached through a symlink, so JavaScript inside
- * shell scripts or built in template strings, and .mts/.cts files, are not read.
+ * `listSourceFiles` lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files, skips
+ * `node_modules`, and does not descend into a directory reached through a
+ * symlink, so JavaScript inside shell scripts or built in template strings, and
+ * .mts/.cts files, are not read.
  */
 
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { extname, join } from "node:path";
 
 const BUILTINS = new Set(builtinModules);
+
+export const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
+
+/**
+ * Source files under `dir` (relative to `root`), sorted, as root-relative paths.
+ * A symlinked directory is not a Dirent directory, so it is never entered.
+ * @param {string} root
+ * @param {string} dir
+ * @returns {string[]}
+ */
+export function listSourceFiles(root, dir) {
+	const found = [];
+	for (const entry of readdirSync(join(root, dir), { withFileTypes: true })) {
+		const relativePath = join(dir, entry.name);
+		if (entry.isDirectory()) {
+			if (entry.name === "node_modules") continue;
+			found.push(...listSourceFiles(root, relativePath));
+		} else if (SOURCE_EXTENSIONS.has(extname(entry.name))) {
+			found.push(relativePath);
+		}
+	}
+	return found.sort();
+}
 
 function loaderFor(file) {
 	switch (extname(file)) {

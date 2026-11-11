@@ -9,37 +9,23 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { extname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
 	findUndeclaredImports,
 	formatUndeclared,
+	listSourceFiles,
 } from "../scripts/lib/root-imports-declared.mjs";
 
 const ROOT = fileURLToPath(new URL("..", import.meta.url));
 const SCANNED_DIRS = ["test", "scripts"] as const;
-const SOURCE_EXTENSIONS = new Set([".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"]);
 
 type RootManifest = {
 	dependencies?: Record<string, string>;
 	devDependencies?: Record<string, string>;
 };
-
-function listSourceFiles(root: string, dir: string): string[] {
-	const found: string[] = [];
-	for (const entry of readdirSync(join(root, dir), { withFileTypes: true })) {
-		const relativePath = join(dir, entry.name);
-		if (entry.isDirectory()) {
-			if (entry.name === "node_modules") continue;
-			found.push(...listSourceFiles(root, relativePath));
-		} else if (SOURCE_EXTENSIONS.has(extname(entry.name))) {
-			found.push(relativePath);
-		}
-	}
-	return found.sort();
-}
 
 function rootManifest(): RootManifest {
 	return JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as RootManifest;
@@ -207,6 +193,53 @@ describe("root imports are declared", () => {
 			]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+	it("lists and checks exactly the six claimed extensions, outside node_modules and symlinked directories", () => {
+		const root = mkdtempSync(join(tmpdir(), "root-imports-"));
+		try {
+			const write = (rel: string, body: string) => {
+				mkdirSync(join(root, rel, ".."), { recursive: true });
+				writeFileSync(join(root, rel), body);
+			};
+			write("test/a.ts", 'import x from "undeclared-ts";\nvoid x;\n');
+			write("test/b.tsx", 'import x from "undeclared-tsx";\nexport const el = <div>{String(x)}</div>;\n');
+			write("test/c.js", 'import x from "undeclared-js";\nvoid x;\n');
+			write("test/d.jsx", 'import x from "undeclared-jsx";\nexport const el = <div>{String(x)}</div>;\n');
+			write("test/sub/e.mjs", 'import x from "undeclared-mjs";\nvoid x;\n');
+			write("test/f.cjs", 'const x = require("undeclared-cjs");\nvoid x;\n');
+			write("test/node_modules/pkg/g.ts", 'import x from "undeclared-node-modules";\nvoid x;\n');
+			write("outside/h.ts", 'import x from "undeclared-symlinked";\nvoid x;\n');
+			symlinkSync(join(root, "outside"), join(root, "test", "linked"), "dir");
+			write("test/i.mts", 'import x from "undeclared-mts";\nvoid x;\n');
+			write("test/j.cts", 'import x from "undeclared-cts";\nvoid x;\n');
+			write("test/k.sh", 'node -e \'require("undeclared-sh")\'\n');
+			const files = listSourceFiles(root, "test");
+			expect(files).toEqual([
+				"test/a.ts",
+				"test/b.tsx",
+				"test/c.js",
+				"test/d.jsx",
+				"test/f.cjs",
+				"test/sub/e.mjs",
+			]);
+			const undeclared = findUndeclaredImports(root, files, { devDependencies: {} });
+			// JSX in b.tsx and d.jsx: Bun's scanner adds two `react` requires per file (the
+			// JSX runtime subpath and `react`), so JSX in a root file needs `react` declared.
+			expect(undeclared.map((entry) => entry.packageName).sort()).toEqual([
+				"react",
+				"react",
+				"react",
+				"react",
+				"undeclared-cjs",
+				"undeclared-js",
+				"undeclared-jsx",
+				"undeclared-mjs",
+				"undeclared-ts",
+				"undeclared-tsx",
+			]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
 		}
 	});
 });
