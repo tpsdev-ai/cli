@@ -36,13 +36,18 @@ workflow and action `run:` blocks and followed shell files: it splits clauses,
 tracks `cd` through one resolution state, scans command substitutions (`$(...)`
 and backtick spans, each with its own `cd` and nested state; one left-to-right
 lexer carries quote state and span nesting together, so a substitution body
-whose own lexing ends inside a quote or an unclosed span is refused rather than
-skipped, as is a line whose open quote or span never closes; a substitution
-that does not close on its logical line is not followed), resolves wrapped
-interpreters and literal invocations, and applies the install classifier; a run
-block and a followed script differ only in their initial state. Here-document bodies are install-screened;
-a here-document passed to a shell is refused rather than executed. It is a fail-closed
-lint for reviewed changes: it passes an install only as a bounded global
+whose own lexing ends inside a quote or an unclosed span on its own logical line
+is refused rather than skipped; a line that ends inside a quote at the end of a
+run block or script is not refused (bash fails it with a syntax error), and the
+passes that track quotes outside this lexer are a known limit (cli#975); a
+substitution that does not close on its logical line is not followed; a
+backslash-escaped double quote inside a double-quoted backtick body is not
+unescaped before the body is scanned (cli#975)), resolves wrapped interpreters
+and literal invocations, and applies the install classifier; a run block and a
+followed script differ only in their initial state. Here-document bodies are install-screened;
+a here-document passed to a shell is refused rather than executed. It refuses what it cannot
+resolve in the shapes it parses; nested quoting inside substitutions is a known
+limit (cli#975). It passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
 it cannot resolve is refused unless a reviewed allowlist entry names it; an
 unresolved-invocation refusal names the step and the invocation path. It is not a boundary

@@ -3501,3 +3501,192 @@ describe("the workflow guard follows $'...' and refuses a non-literal working-di
     }
   });
 });
+
+describe("the workflow guard's nested-quote limit (cli#975)", () => {
+  // A quoted apostrophe inside a substitution on the first physical line moves
+  // the line splitter into a single-quote state, so the second line is treated
+  // as quoted text and the install is never scanned. cli#975 tracks the passes
+  // that keep their own quote state outside the substitution lexer.
+  const twoLineTr = 'echo "$(tr -d \'"\' <f)"\n"$(bash scripts/inst.sh)"';
+
+  it.failing("follows the install after a two-line tr body in a run block (cli#975)", () => {
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(twoLineTr, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-known-limit-run",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.failing("follows the install after a two-line tr body in a followed script (cli#975)", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": `${twoLineTr}\n`,
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-known-limit-script",
+      );
+      expect(report.followed).toContain("scripts/inst.sh");
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  // A quoted `;` inside a substitution passes today, so it is not this class.
+  it.each([
+    ["a run block", false],
+    ["a followed script", true],
+  ])("follows the install after a quoted semicolon inside a substitution in %s", (_label, asScript) => {
+    const line = `x="$(printf '%s' ';')"; bash scripts/inst.sh`;
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-quoted-semicolon",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the workflow guard claims a removal regresses (#820 round 12)", () => {
+  it("reads a # inside ${...} as part of the word, not a comment", () => {
+    const line = "x=${#items[@]}; bash scripts/inst.sh";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-brace-hash",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("carries an ANSI-C quote's closed state to the next physical line", () => {
+    const line = "sep=$'\\''\nbash scripts/inst.sh";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-ansi-line",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("strips a comment after an ANSI-C quote before tracking quotes on the next line", () => {
+    const line = "x=$'\\'' # it's fine\nbash scripts/inst.sh";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-ansi-comment",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a substitution that closes on a later physical line", () => {
+    const line = 'echo "$(bash scripts/inst.sh\n)"';
+    const root = makeTreeFixture({ "scripts/inst.sh": "npm ci\n" });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-later-line",
+      );
+      expect(report.installs).toBe(0);
+      expect(report.followed).toEqual([]);
+      expect(report.unresolved).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a substitution nesting deeper than its bound", () => {
+    const line = "echo " + "$(".repeat(8) + "bash scripts/inst.sh" + ")".repeat(8);
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-depth",
+      )).toThrow(/command substitution nesting is too deep to resolve/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not inspect install text inside a followed JavaScript script", () => {
+    const root = makeTreeFixture({
+      "scripts/check.mjs": 'import { execSync } from "node:child_process";\nexecSync("npm ci");\n',
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/check.mjs", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-js-limit",
+      );
+      expect(report.installs).toBe(0);
+      expect(report.followed).toContain("scripts/check.mjs");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
