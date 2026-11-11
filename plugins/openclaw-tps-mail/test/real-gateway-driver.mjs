@@ -12,7 +12,7 @@
  *   3. launches the pinned real `openclaw gateway run` with an isolated HOME,
  *      TMPDIR and state dir, loads the BUILT openclaw-tps-mail plugin under the
  *      channel config the plugin's README documents (no streaming), and writes
- *      one signed mail into the agent's new/;
+ *      one signed mail into the agent's tmp/ then renames it into new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
  *      the ack, re-reads the reply count after the ack and again after the
  *      gateway stops, reads the cur/ record and the obligation record, then
@@ -27,7 +27,7 @@ import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -144,6 +144,7 @@ for (const dir of [
   join(HOME, ".openclaw"),
   join(HOME, ".flair", "keys"),
   join(MAIL, "agent-a", "new"),
+  join(MAIL, "agent-a", "tmp"),
   join(MAIL, "agent-b", "new"),
   join(ROOT, "tmp"),
 ]) {
@@ -330,7 +331,7 @@ try {
   child.stderr.on("data", onData);
 
   await until(
-    () => logs.includes("watching 1 agent inbox") || logs.includes("http server listening"),
+    () => logs.includes("watching 1 agent inbox"),
     GATEWAY_BOOT_DEADLINE_MS,
     "gateway boot",
   );
@@ -361,10 +362,16 @@ try {
     { "agent-b": seedB },
   );
   report.inboundId = inboundId;
+  // Stage in the maildir's tmp/ and rename into new/: the plugin reads new/
+  // synchronously at start, and rename(2) within one filesystem is atomic, so it
+  // never sees a half-written record.
+  const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`;
+  const inboundTmp = join(MAIL, "agent-a", "tmp", inboundName);
   writeFileSync(
-    join(MAIL, "agent-a", "new", `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`),
+    inboundTmp,
     JSON.stringify({ id: inboundId, from: "agent-b", to: "agent-a", body: JSON.stringify(envelope), timestamp, read: false }, null, 2),
   );
+  renameSync(inboundTmp, join(MAIL, "agent-a", "new", inboundName));
 
   await until(
     () => readdirSync(join(MAIL, "agent-b", "new")).some((f) => f.endsWith(".json")),
