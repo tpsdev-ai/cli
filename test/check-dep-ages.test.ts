@@ -2653,6 +2653,43 @@ describe("the tracked-lock helper is refused outside its literal shape (#820 rou
     }
   });
 
+  it("refuses a helper call behind a computed path in a followed non-shell script", () => {
+    const root = makeTreeFixture({
+      "scripts/task.mjs": "#!/usr/bin/env node\nbash $ROOT/scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked\n",
+      "scripts/npm-ci-tracked-lock.sh": helper,
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/task.mjs", "."),
+        tracked,
+        root,
+        "workflow-helper-shape",
+      )).toThrow(/script scripts\/task\.mjs \(invocation scripts\/task\.mjs\), line 2: tracked-lock helper call is not the literal accepted shape/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not screen a helper call in the helper's own file", () => {
+    const root = makeTreeFixture({
+      "scripts/npm-ci-tracked-lock.sh": "#!/bin/sh\nbash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked\n",
+      "plugins/demo/package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/demo", "."),
+        new Set(["plugins/demo/package-lock.json"]),
+        root,
+        "workflow-helper-shape",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toEqual(["scripts/npm-ci-tracked-lock.sh"]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("refuses a helper call spelled in a followed non-shell script", () => {
     const root = makeTreeFixture({
       "scripts/task.mjs": "#!/usr/bin/env node\nbash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked\n",
