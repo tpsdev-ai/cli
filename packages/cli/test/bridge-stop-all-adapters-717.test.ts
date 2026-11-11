@@ -58,7 +58,7 @@ function fifoDeadline(elapsedMs: number, timeoutMs: number): number {
   return deadline;
 }
 
-/** The only way to register a test that arms FIFO_DEADLINE: its own timeout is
+/** The only way to register a test that runs a FIFO read: its own timeout is
  *  checked where it is declared, so no list can drift from the call sites. */
 function fifoTest(name: string, fn: () => Promise<void>, timeoutMs: number, preReadMs = 0): void {
   checkFifoTimeout(name, timeoutMs, preReadMs);
@@ -69,6 +69,7 @@ function fifoTest(name: string, fn: () => Promise<void>, timeoutMs: number, preR
     try {
       await fn();
       // Every deadline this test actually armed ended inside its budget, margin included.
+      expect(budget.armed.length).toBeGreaterThan(0);
       for (const { elapsedMs, deadlineMs } of budget.armed) {
         expect(elapsedMs + deadlineMs + FIFO_DEADLINE_MARGIN).toBeLessThanOrEqual(timeoutMs);
       }
@@ -197,12 +198,21 @@ async function runStartDecision(): Promise<{ stdout: string; exitCode: number }>
 
 async function runFifoRead(script: string): Promise<Record<string, unknown>> {
   if (fifoBudget === null) throw new Error("runFifoRead runs only inside a test registered with fifoTest");
-  const elapsedMs = Date.now() - fifoBudget.startedAt;
-  const deadlineMs = fifoDeadline(elapsedMs, fifoBudget.timeoutMs);
-  fifoBudget.armed.push({ elapsedMs, deadlineMs });
+  const budget = fifoBudget;
   const path = join(home, "fifo-read.mts");
   writeFileSync(path, script);
   const child = spawnScript(path, {});
+  // Sampled at arming time, after the write and the spawn, so the recorded
+  // elapsed time covers everything the test spent before the timer starts.
+  const elapsedMs = Date.now() - budget.startedAt;
+  let deadlineMs: number;
+  try {
+    deadlineMs = fifoDeadline(elapsedMs, budget.timeoutMs);
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
+  budget.armed.push({ elapsedMs, deadlineMs });
   let expired = false;
   const timer = setTimeout(() => {
     expired = true;
@@ -567,10 +577,13 @@ describe("FIFO deadline bounds", () => {
     expect(() => checkFifoTimeout("probe", needed - 1, START_TIMEOUT)).toThrow("is below");
     expect(() => checkFifoTimeout("probe", needed, START_TIMEOUT)).not.toThrow();
     expect(() => checkFifoTimeout("probe", FIFO_DEADLINE + FIFO_DEADLINE_MARGIN - 1, 0)).toThrow("is below");
+    // fifoTest itself refuses before registering anything, so these probes add no test.
+    expect(() => fifoTest("probe", async () => {}, FIFO_DEADLINE + FIFO_DEADLINE_MARGIN - 1)).toThrow("is below");
+    expect(() => fifoTest("probe", async () => {}, needed - 1, START_TIMEOUT)).toThrow("is below");
   });
 
   test("every test that runs a FIFO read is registered through fifoTest", () => {
-    expect(fifoCases).toHaveLength(4);
+    expect(fifoCases).toHaveLength(5);
   });
 
   test("runFifoRead refuses outside a fifoTest", async () => {
@@ -606,6 +619,12 @@ describe("child environment", () => {
 });
 
 describe("guarded pid-file reads", () => {
+  // The only case whose child never exits: it proves the armed timer, the kill and
+  // the named error, which every prompt child above leaves unexercised (~8 s).
+  fifoTest("a hung FIFO child is killed at the armed deadline and reports the named error", async () => {
+    await expect(runFifoRead("await new Promise(() => {});")).rejects.toThrow("FIFO child deadline exceeded");
+  }, FIFO_TEST_TIMEOUT);
+
   fifoTest(
     "a discovered regular record replaced by a FIFO is classified without being read and kept",
     async () => {
