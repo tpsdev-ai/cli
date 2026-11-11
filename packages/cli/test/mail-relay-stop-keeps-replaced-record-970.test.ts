@@ -1,8 +1,9 @@
 /**
  * cli#970 item 2 — `mail relay stop` compares the relay pid record's bytes
- * before it removes the path. A record a new relay wrote after that read is
- * kept and the output names the kept record. With no record lock, a write
- * between the compare and the unlink can still be removed.
+ * before it removes the path, at the two removal sites after a signal and
+ * before removing a stale or invalid record. A record a new relay wrote after
+ * that read is kept and the output names the kept record. With no record lock,
+ * a write between the compare and the unlink can still be removed.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -10,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
-import { snapshotPidRecord } from "../src/commands/branch.js";
+import { snapshotPidRecord } from "../src/utils/pid-file.js";
 
 const CASE_TIMEOUT_MS = 20_000;
 const WAIT_DEADLINE_MS = 5_000;
@@ -34,6 +35,14 @@ function childToken(pid: number): string {
 
 function record(pid: number, token: string): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
+}
+
+/** A token from the same source as `real` whose value the child cannot carry,
+ *  so the record is stale by construction on Linux and macOS. */
+function foreignStartToken(real: string): string {
+  if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
+  if (real.startsWith("proc:")) return "proc:1";
+  throw new Error(`unexpected start token source: ${real}`);
 }
 
 function captureLogs(): { logs: string[]; restore: () => void } {
@@ -120,7 +129,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
 
       await waitUntil(() => pidState(planned.pid) === "gone", "the targeted relay to exit");
       expect(logs.join("\n")).toContain(
-        `Mail relay stopped (pid=${planned.pid}); pid file ${relayPid} now belongs to a different relay process (pid ${replacement.pid}) and was kept.`,
+        `Mail relay stopped (pid=${planned.pid}); pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
       );
       expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
       expect(pidState(replacement.pid)).toBe("alive");
@@ -154,7 +163,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
 
       await waitUntil(() => pidState(planned.pid) === "gone", "the targeted relay to exit");
       expect(logs.join("\n")).toContain(
-        `Recorded relay process (pid ${planned.pid}) is gone; pid file ${relayPid} now belongs to a different relay process (pid ${replacement.pid}) and was kept.`,
+        `Recorded relay process (pid ${planned.pid}) is gone; pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
       );
       expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
       expect(pidState(replacement.pid)).toBe("alive");
@@ -198,7 +207,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
       expect(signals).toEqual([planned.pid]);
       expect(pidState(replacement.pid)).toBe("alive");
       expect(logs.join("\n")).toContain(
-        `Mail relay stopped (pid=${planned.pid}); pid file ${relayPid} now belongs to a different relay process (pid ${replacement.pid}) and was kept.`,
+        `Mail relay stopped (pid=${planned.pid}); pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
       );
       expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
     },
@@ -348,6 +357,109 @@ describe("mail relay stop keeps a record replaced before removal", () => {
       expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
       expect(pidState(planned.pid)).toBe("alive");
       expect(pidState(replacement.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a stale record replaced by a live relay before its removal is kept and named",
+    async () => {
+      const planned = spawnChild();
+      const replacement = spawnChild();
+      const staleBytes = record(planned.pid, foreignStartToken(childToken(planned.pid)));
+      const replacementBytes = record(replacement.pid, childToken(replacement.pid));
+      writeFileSync(relayPid, staleBytes);
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        const snapshot = snapshotPidRecord(relayPid);
+        reads++;
+        // The classification reads the stale record; a live relay writes its
+        // own record before the removal check.
+        if (reads === 1) writeFileSync(relayPid, replacementBytes);
+        return snapshot;
+      });
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+        setRelayStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        `Mail relay pid file ${relayPid} was stale; pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept. This command signalled no process, and the relay's state is unknown.`,
+      );
+      expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(pidState(planned.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "an invalid record replaced by a live relay before its removal is kept and named",
+    async () => {
+      const replacement = spawnChild();
+      const replacementBytes = record(replacement.pid, childToken(replacement.pid));
+      writeFileSync(relayPid, "");
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        const snapshot = snapshotPidRecord(relayPid);
+        reads++;
+        if (reads === 1) writeFileSync(relayPid, replacementBytes);
+        return snapshot;
+      });
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+        setRelayStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        `Mail relay pid file ${relayPid} was invalid; pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept. This command signalled no process, and the relay's state is unknown.`,
+      );
+      expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "an unchanged stale record is still removed",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, foreignStartToken(childToken(child.pid))));
+
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+      }
+
+      expect(signals).toEqual([]);
+      expect(logs.join("\n")).toContain(
+        `Mail relay pid file ${relayPid} was stale and was removed; this command signalled no process, and the relay's state is unknown.`,
+      );
+      expect(existsSync(relayPid)).toBe(false);
+      expect(pidState(child.pid)).toBe("alive");
     },
     CASE_TIMEOUT_MS,
   );

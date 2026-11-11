@@ -5,12 +5,12 @@
  * nothing.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
-import { snapshotPidRecord } from "../src/commands/branch.js";
+import { snapshotPidRecord } from "../src/utils/pid-file.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 
@@ -47,13 +47,21 @@ function staleRecord(child: Bun.Subprocess): string {
   return record(child.pid, foreignStartToken(childToken(child.pid)));
 }
 
-/** Makes the first read the real record and the second read `second`. */
+/** Makes the first read the real record and the second read `second`, with the
+ *  second snapshot's raw bytes read from the file it describes. A null here
+ *  would compare unequal on every path and keep a record spuriously. */
 function installSecondRead(second: () => PidFileState): { reads: () => number; restore: () => void } {
   let reads = 0;
   const previous = setRelayStopRecordReader(() => {
     reads++;
     if (reads === 1) return snapshotPidRecord(relayPid);
-    return { state: second(), raw: null };
+    let raw: Buffer | null;
+    try {
+      raw = readFileSync(relayPid);
+    } catch {
+      raw = null;
+    }
+    return { state: second(), raw };
   });
   return { reads: () => reads, restore: () => setRelayStopRecordReader(previous) };
 }

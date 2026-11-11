@@ -15,8 +15,7 @@ import { parseInboundChain } from "../utils/agent-keys.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
-import { removePidFile, type PidFileState } from "../utils/pid-file.js";
-import { pidRecordBytesEqual, snapshotPidRecord, type PidRecordSnapshot } from "./branch.js";
+import { removePidFile, pidRecordBytesEqual, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -695,7 +694,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (relayAction === "stop") {
         const readStopRecord = (): PidRecordSnapshot =>
           relayStopRecordReader?.() ?? snapshotPidRecord(relayPidPath());
-        const state = readStopRecord().state;
+        const classification = readStopRecord();
+        const state = classification.state;
         // A removal failure keeps the relay pid file, reports the path and the
         // error code, and exits non-zero.
         const removeRelayPid = (path: string): "removed" | "already gone" => {
@@ -706,17 +706,51 @@ export async function runMail(args: MailArgs): Promise<void> {
             throw new Error(`Mail relay pid file ${path} could not be removed (${code}); the pid file was kept.`);
           }
         };
+        const describeKeptRecord = (
+          path: string,
+          kept: PidFileState,
+          expectedPid?: number,
+          expectedStartToken?: string,
+        ): string => {
+          if (kept.kind === "running" && (kept.pid !== expectedPid || kept.startToken !== expectedStartToken)) {
+            return `pid file ${path} now belongs to a different process (pid ${kept.pid}) and was kept.`;
+          }
+          return `pid file ${path} no longer holds the record this stop read and was kept.`;
+        };
         // A bad record says nothing about the relay process: describe the
-        // record, remove it when unlink succeeds, and leave state unknown.
-        const reportBadRecord = (kind: "invalid" | "stale", path: string): void => {
-          let removal: "removed" | "already gone";
-          try {
-            removal = removeRelayPidFile(path);
-          } catch (error) {
-            const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+        // record, remove it when the re-read still holds the same bytes, and
+        // leave state unknown. A record replaced in between is kept.
+        const reportBadRecord = (snapshot: PidRecordSnapshot): void => {
+          const state = snapshot.state;
+          if (state.kind !== "invalid" && state.kind !== "stale") return;
+          const { kind, path } = state;
+          const current = snapshotPidRecord(path);
+          if (current.state.kind === "unreadable") {
             throw new Error(
-              `Mail relay pid file ${path} was ${kind} and could not be removed (${code}); this command signalled no process, the pid file was kept, and the relay's state is unknown.`,
+              `Mail relay pid file ${path} was ${kind} and could not be read at the final check; the pid file was kept, and the relay's state is unknown. Inspect it and remove it yourself if the relay is not running.`,
             );
+          }
+          if (
+            current.state.kind !== "missing" &&
+            !pidRecordBytesEqual(current.raw, snapshot.raw)
+          ) {
+            console.log(
+              `Mail relay pid file ${path} was ${kind}; ${describeKeptRecord(path, current.state, state.kind === "stale" ? state.pid : undefined)} This command signalled no process, and the relay's state is unknown.`,
+            );
+            return;
+          }
+          let removal: "removed" | "already gone";
+          if (current.state.kind === "missing") {
+            removal = "already gone";
+          } else {
+            try {
+              removal = removeRelayPidFile(path);
+            } catch (error) {
+              const code = (error as NodeJS.ErrnoException).code ?? "unknown";
+              throw new Error(
+                `Mail relay pid file ${path} was ${kind} and could not be removed (${code}); this command signalled no process, the pid file was kept, and the relay's state is unknown.`,
+              );
+            }
           }
           console.log(
             removal === "removed"
@@ -734,7 +768,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           );
         }
         if (state.kind === "invalid" || state.kind === "stale") {
-          reportBadRecord(state.kind, state.path);
+          reportBadRecord(classification);
           break;
         }
         if (state.kind === "unverified") {
@@ -779,12 +813,6 @@ export async function runMail(args: MailArgs): Promise<void> {
         // be removed.
         const stopPid = state.pid;
         const stopStartToken = state.startToken;
-        const describeKeptRecord = (path: string, kept: PidFileState): string => {
-          if (kept.kind === "running" && (kept.pid !== stopPid || kept.startToken !== stopStartToken)) {
-            return `pid file ${path} now belongs to a different relay process (pid ${kept.pid}) and was kept.`;
-          }
-          return `pid file ${path} no longer holds the record this stop read and was kept.`;
-        };
         const removeStopRecord = (
           path: string,
           snapshot: PidRecordSnapshot,
@@ -817,7 +845,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             console.log(`Recorded relay process (pid ${state.pid}) is gone (pid file already gone).`);
           } else {
             console.log(
-              `Recorded relay process (pid ${state.pid}) is gone; ${describeKeptRecord(state.path, removal.kept)}`,
+              `Recorded relay process (pid ${state.pid}) is gone; ${describeKeptRecord(state.path, removal.kept, stopPid, stopStartToken)}`,
             );
           }
           break;
@@ -831,7 +859,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         } else if (removal === "already gone") {
           console.log(`Mail relay stopped (pid=${state.pid}); pid file already gone.`);
         } else {
-          console.log(`Mail relay stopped (pid=${state.pid}); ${describeKeptRecord(state.path, removal.kept)}`);
+          console.log(`Mail relay stopped (pid=${state.pid}); ${describeKeptRecord(state.path, removal.kept, stopPid, stopStartToken)}`);
         }
         break;
       }

@@ -16,7 +16,7 @@ import { branchStatePath, clearBranchState, writeBranchState } from "../utils/co
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
-import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "../utils/pid-file.js";
+import { pidRecordBytesEqual, readPidFile, removePidFile, serializePidRecord, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
 import { acquireMailLockSync, mailLockPath } from "../utils/mail-lock.js";
 
 let activeHostChannel: TransportChannel | null = null;
@@ -251,26 +251,6 @@ async function branchTestPauseAsync(phase: string, path: string): Promise<void> 
     }
     await new Promise<void>((resolveWait) => setTimeout(resolveWait, 5));
   }
-}
-
-export interface PidRecordSnapshot {
-  state: PidFileState;
-  raw: Buffer | null;
-}
-
-export function snapshotPidRecord(path: string): PidRecordSnapshot {
-  let bytes: Buffer | null = null;
-  const state = readPidFile(path, processStartToken, (_text, raw) => {
-    bytes = raw;
-  });
-  return { state, raw: bytes };
-}
-
-/** Byte equality for two snapshots' raw file contents; a failed read is only
- *  equal to another failed read. */
-export function pidRecordBytesEqual(a: Buffer | null, b: Buffer | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.equals(b);
 }
 
 /** Spawn the branch daemon with its pid record claimed under the branch lock. */
