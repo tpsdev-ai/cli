@@ -9,11 +9,13 @@
  * delivery key.
  */
 import { createHash } from "node:crypto";
-import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { parseSignedEnvelope, verifyEnvelope, type FlairClient } from "@tpsdev-ai/agent";
 
-/** How long a stored signed envelope can be reused, in milliseconds. It
- *  matches the branch's acceptance-receipt window: a re-send later than this
+/** How long a stored signed envelope can be reused, in milliseconds. The window
+ *  defaults to the branch's acceptance-receipt window; the branch's value is
+ *  overridable with TPS_RELAY_ACCEPT_RECEIPT_TTL_MS. A re-send later than this
  *  is a new delivery attempt. */
 export const SENT_ENVELOPE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -67,24 +69,41 @@ function parseStored(raw: string, path: string): EnvelopeFields {
   return { messageId: env.messageId, from: env.from, to: env.to, body: env.body, timestamp: env.timestamp };
 }
 
-/** Read the signed envelope stored for `messageId` when it is the same message.
- *  Returns undefined when no entry exists. */
-export function readSentEnvelope(
+/** Read the signed envelope stored for `messageId` when it is the same message
+ *  and still verifies with the sender's CURRENT key. Returns undefined when no
+ *  entry exists. The entry is only ours if it is a regular file, readable only
+ *  by its owner, and owned by this user: otherwise reusing it would send bytes
+ *  this process cannot vouch for. */
+export async function readSentEnvelope(
   root: string,
   messageId: string,
-  expected: { from: string; to: string; body: string },
-): string | undefined {
+  expected: { from: string; to: string; body: string; replyToId?: string },
+  client: FlairClient,
+): Promise<string | undefined> {
   const path = envelopePath(root, messageId);
-  let ageMs: number;
+  let entry: ReturnType<typeof lstatSync>;
   try {
-    ageMs = Date.now() - statSync(path).mtimeMs;
+    entry = lstatSync(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
     throw new StoredEnvelopeError(
       `cannot read the stored signed message at ${path}: ${error instanceof Error ? error.message : String(error)}; refusing to send`,
     );
   }
-  if (ageMs >= SENT_ENVELOPE_TTL_MS) {
+  if (!entry.isFile()) {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is not a regular file; refusing to send`);
+  }
+  if ((entry.mode & 0o077) !== 0) {
+    throw new StoredEnvelopeError(
+      `the stored signed message at ${path} is readable by group or others (mode 0${(entry.mode & 0o777).toString(8)}); refusing to send`,
+    );
+  }
+  const getuid = process.getuid;
+  // A platform without process.getuid cannot compare owners; skip only there.
+  if (typeof getuid === "function" && entry.uid !== getuid()) {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is not owned by this user; refusing to send`);
+  }
+  if (Date.now() - entry.mtimeMs >= SENT_ENVELOPE_TTL_MS) {
     try {
       unlinkSync(path);
     } catch {
@@ -105,17 +124,32 @@ export function readSentEnvelope(
   if (env.messageId !== messageId || env.from !== expected.from || env.to !== expected.to || env.body !== expected.body) {
     throw new StoredEnvelopeError(`--message-id ${messageId} was already used to sign a different message; use a new --message-id`);
   }
+  const parsed = parseSignedEnvelope(raw);
+  if (!parsed.ok) {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is not a valid signed envelope (${parsed.reason}); refusing to send`);
+  }
+  const signed = parsed.envelope;
+  if ((signed.replyToId ?? undefined) !== (expected.replyToId ?? undefined)) {
+    throw new StoredEnvelopeError(`--message-id ${messageId} was already used to sign a message with a different --reply-to; use a new --message-id`);
+  }
+  const verified = await verifyEnvelope(signed, client);
+  if (!verified.ok) {
+    throw new StoredEnvelopeError(
+      `the stored signed message at ${path} does not verify against the current key for agent "${expected.from}" (${verified.reason}); refusing to send`,
+    );
+  }
   return raw;
 }
 
 /** Store the first signed envelope for `messageId`, or return the one another
  *  process stored first for the same message. */
-export function storeSentEnvelope(
+export async function storeSentEnvelope(
   root: string,
   messageId: string,
   signed: string,
-  expected: { from: string; to: string; body: string },
-): string {
+  expected: { from: string; to: string; body: string; replyToId?: string },
+  client: FlairClient,
+): Promise<string> {
   const dir = join(root, DIR_NAME);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   pruneExpired(dir);
@@ -130,7 +164,7 @@ export function storeSentEnvelope(
           `cannot store the signed message for --message-id ${messageId} at ${path}: ${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      const existing = readSentEnvelope(root, messageId, expected);
+      const existing = await readSentEnvelope(root, messageId, expected, client);
       if (existing !== undefined) return existing;
       if (attempt >= 1) {
         throw new StoredEnvelopeError(`the stored signed message for --message-id ${messageId} vanished while writing; retry`);
@@ -139,8 +173,8 @@ export function storeSentEnvelope(
   }
 }
 
-/** Drop entries older than the reuse window. Best effort: a leftover entry
- *  only makes a later re-send use an older signed message, never sends one. */
+/** Drop entries older than the reuse window. Best effort: read-time expiry
+ *  ignores a leftover entry, and a failed prune never sends anything. */
 function pruneExpired(dir: string): void {
   let entries: string[];
   try {

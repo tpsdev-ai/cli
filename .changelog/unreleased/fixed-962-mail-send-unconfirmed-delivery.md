@@ -3,6 +3,8 @@
   with `--ack-timeout <ms>` or `TPS_MAIL_ACK_TIMEOUT_MS`. If no ACK arrives in
   that window the command prints the message id, says the message may still
   arrive, and exits 75 (EX_TEMPFAIL). A refused delivery keeps its current error
-  and exit status. A re-send with the same `--message-id` re-sends the signed
-  envelope stored for that id (same id, timestamp and payload), so the branch can
-  recognise it as a duplicate.
+  and exit status. A re-send with the same `--message-id` reuses the signed
+  envelope stored for that id (same id, timestamp and payload) when it still
+  verifies with the sender's current key, so the branch can recognise it as a
+  duplicate; a stored envelope that does not verify with that key, or does not
+  match this message, is refused by name and nothing is sent.

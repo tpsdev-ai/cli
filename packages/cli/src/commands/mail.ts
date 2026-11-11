@@ -1,4 +1,4 @@
-import { isMailboxMessageFile } from "@tpsdev-ai/agent";
+import { isMailboxMessageFile, type FlairClient } from "@tpsdev-ai/agent";
 import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch, EXIT_DELIVERY_UNCONFIRMED, MailDeliveryUnconfirmedError, parseMailAckTimeoutMs, resolveMailAckTimeoutMs } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
@@ -12,12 +12,13 @@ import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { parseInboundChain } from "../utils/agent-keys.js";
-import { signOutboundBody } from "../utils/mail-sign.js";
+import { assertValidReplyToId, readOutboundSigningKey, requireOutboundSigningKey, signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
 import { removePidFile, pidRecordBytesEqual, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
 import { readSentEnvelope, storeSentEnvelope } from "../utils/sent-envelope.js";
 import { isValidMailDeliveryId } from "../utils/wire-mail.js";
+import * as ed from "@noble/ed25519";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -261,23 +262,49 @@ function validateAgent(agent?: string): string {
 // The envelope builder itself lives in utils/mail-sign.ts (shared with the
 // agent runtimes) so the two cannot drift; it validates --reply-to (the ONE
 // id rule) before it reads any key.
-function signOutboundOrFail(
+// The verify client for a stored envelope: the sender's CURRENT key, plus any
+// earlier delegation hop whose key this host can read. A hop this host cannot
+// resolve is null, so verifyEnvelope refuses instead of trusting it.
+async function storedEnvelopeVerifyClient(from: string, seed: Buffer): Promise<FlairClient> {
+  const senderKey = Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(seed)));
+  return {
+    async getAgent(name: string) {
+      if (name === from) return { publicKey: senderKey };
+      try {
+        const other = readOutboundSigningKey(name);
+        return other ? { publicKey: Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(other))) } : null;
+      } catch {
+        return null;
+      }
+    },
+  };
+}
+
+async function signOutboundOrFail(
   from: string,
   to: string,
   body: string,
   opts: { replyToId?: string; messageId?: string },
-): string {
+): Promise<string> {
   try {
     if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
       throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
     }
+    // A re-send runs the same --reply-to validation and the same sender-key
+    // resolution as a fresh send BEFORE it consults the store, so a missing,
+    // unreadable, corrupt or conflicting key is refused here, not after a hit.
+    if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
     const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
     // A re-send of an explicit id reuses the signed envelope stored for it:
     // signing again would change its timestamp and signature, and the branch
-    // treats a same-id payload mismatch as a conflict, not a duplicate.
-    let signed = opts.messageId === undefined
-      ? undefined
-      : readSentEnvelope(mailRoot, opts.messageId, { from, to, body });
+    // treats a same-id payload mismatch as a conflict, not a duplicate. The
+    // stored bytes must match this message and verify with the CURRENT key.
+    let client: FlairClient | undefined;
+    let signed: string | undefined;
+    if (opts.messageId !== undefined) {
+      client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+      signed = await readSentEnvelope(mailRoot, opts.messageId, { from, to, body, replyToId: opts.replyToId }, client);
+    }
     if (signed === undefined) {
       signed = signOutboundBody(from, to, body, {
         requireKey: true,
@@ -286,7 +313,9 @@ function signOutboundOrFail(
         rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
         priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
       });
-      if (opts.messageId !== undefined) signed = storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body });
+      if (opts.messageId !== undefined) {
+        signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId }, client!);
+      }
     }
     // cli#429: every route limits the SIGNED envelope (the body plus its
     // signature, chain and envelope fields) to MAX_BODY_BYTES, not the
@@ -398,7 +427,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
       // ship signed bodies, and so a send that cannot sign fails with nothing
       // written. cli#429.
-      args.message = signOutboundOrFail(from, to, messageBody, {
+      args.message = await signOutboundOrFail(from, to, messageBody, {
         replyToId: args.replyTo,
         messageId: args.sendMessageId,
       });

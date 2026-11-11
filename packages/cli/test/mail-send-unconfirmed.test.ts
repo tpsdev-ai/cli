@@ -11,10 +11,12 @@
  * The branch keys its inbox record by (branch, wire id), so a second delivery
  * with the same id and payload reuses the record and still ACKs accepted. These
  * tests drive the REAL WS/Noise transport and the branch acceptance path
- * (`deliverRelayedToLocal`), not a stub channel.
+ * (`deliverRelayedToLocal`); the one exception is the fault-injection test that
+ * stubs `WsNoiseTransport.prototype.connect`.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import net from "node:net";
@@ -39,6 +41,8 @@ import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/uti
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile } from "./helpers/stub-flair.js";
 import { readSentEnvelope, SENT_ENVELOPE_TTL_MS, storeSentEnvelope } from "../src/utils/sent-envelope.js";
+import { signEnvelope, type Envelope, type FlairClient } from "@tpsdev-ai/agent";
+import * as ed from "@noble/ed25519";
 
 afterEach(() => {
   mock.restore();
@@ -273,9 +277,58 @@ function inboxRecords(agent = "local"): string[] {
   return existsSync(inbox.fresh) ? readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")) : [];
 }
 
-async function runSend(args: string[], env: Record<string, string> = {}, ms = 15_000, body = "unconfirmed delivery test"): Promise<{ status: number; stdout: string; stderr: string }> {
+function sentEnvelopeFile(id: string): string {
+  const key = createHash("sha256").update(id, "utf8").digest("hex");
+  return join(root, "mail", ".sent-envelopes", `${key}.json`);
+}
+
+function sentEnvelopeDir(): string {
+  return join(root, "mail", ".sent-envelopes");
+}
+
+/** A signed envelope in the shape `tps mail send` stores, plus the verify
+ *  client that resolves its sender to the seed's public key. */
+async function signedStoredEnvelope(
+  id: string,
+  expected: { from: string; to: string; body: string },
+  seed: Buffer,
+  replyToId?: string,
+): Promise<{ raw: string; client: FlairClient }> {
+  const now = new Date().toISOString();
+  const envelope: Envelope = {
+    v: 1,
+    from: expected.from,
+    to: expected.to,
+    body: expected.body,
+    messageId: id,
+    timestamp: now,
+    delegationChain: [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: expected.from, kind: "agent", timestamp: now, rationale: "test send", signature: null },
+    ],
+    ...(replyToId !== undefined ? { replyToId } : {}),
+  };
+  const raw = JSON.stringify(signEnvelope(envelope, { [expected.from]: seed }));
+  const publicKey = Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(seed)));
+  return {
+    raw,
+    client: {
+      async getAgent(name: string) {
+        return name === expected.from ? { publicKey } : null;
+      },
+    },
+  };
+}
+
+async function runSend(
+  args: string[],
+  env: Record<string, string> = {},
+  ms = 15_000,
+  body = "unconfirmed delivery test",
+  opts: { seed?: Buffer; writeKey?: boolean } = {},
+): Promise<{ status: number; stdout: string; stderr: string }> {
   const keysDir = join(root, "keys");
-  writeKeyFile(keysDir, "flint", FLINT_SEED);
+  if (opts.writeKey !== false) writeKeyFile(keysDir, "flint", opts.seed ?? FLINT_SEED);
   const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", "remote-a", ...args], {
     cwd: root,
     env: {
@@ -453,8 +506,13 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     pointRemoteAtServer();
     const id = "55555555-5555-5555-5555-555555555555";
     const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"]);
-    const second = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"]);
     expect(first.status).toBe(0);
+    // The stored envelope is ours: regular file, owner-only read/write
+    // (0600) inside an owner-only directory (0700).
+    expect(statSync(sentEnvelopeFile(id)).mode & 0o777).toBe(0o600);
+    expect(statSync(sentEnvelopeDir()).mode & 0o777).toBe(0o700);
+    expect(first.status).toBe(0);
+    const second = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"]);
     expect(second.status).toBe(0);
     expect(second.stderr).not.toContain("conflict");
     expect(branch.acceptErrors).toEqual([]);
@@ -478,24 +536,182 @@ describe("a CLI re-send with the same --message-id sends the same signed message
   }, 25_000);
 });
 
+describe("a --message-id re-send re-checks the key and the stored envelope", () => {
+  async function firstSend(id: string, replyToId?: string, body = "re-send body"): Promise<void> {
+    const args = ["--stdin", "--message-id", id, "--ack-timeout", "2000"];
+    if (replyToId !== undefined) args.push("--reply-to", replyToId);
+    const first = await runSend(args, {}, 15_000, body);
+    expect(first.status).toBe(0);
+  }
+
+  function secondArgs(id: string, replyToId?: string): string[] {
+    const args = ["--stdin", "--message-id", id, "--ack-timeout", "2000"];
+    if (replyToId !== undefined) args.push("--reply-to", replyToId);
+    return args;
+  }
+
+  test("a re-send after the key is removed is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777771";
+    await firstSend(id);
+    rmSync(join(root, "keys", "flint.key"));
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body", { writeKey: false });
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("no Ed25519 private key");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a re-send with a rotated key is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777772";
+    await firstSend(id);
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body", { seed: Buffer.alloc(32, 0x03) });
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("does not verify against the current key");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a stored signature that was stripped is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777773";
+    await firstSend(id);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8"));
+    delete stored.signature;
+    writeFileSync(path, JSON.stringify(stored));
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("not a valid signed envelope");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a stored body changed by one byte is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777774";
+    await firstSend(id);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8"));
+    stored.body = `${stored.body}x`;
+    writeFileSync(path, JSON.stringify(stored));
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("already used to sign a different message");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a stored signature that no longer verifies is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777775";
+    await firstSend(id);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8"));
+    const sig: string = stored.signature;
+    const prefix = "ed25519:";
+    const body64 = sig.slice(prefix.length);
+    const at = Math.floor(body64.length / 2);
+    const flipped = body64[at] === "A" ? "B" : "A";
+    stored.signature = `${prefix}${body64.slice(0, at)}${flipped}${body64.slice(at + 1)}`;
+    writeFileSync(path, JSON.stringify(stored));
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("does not verify against the current key");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a re-send with a different --reply-to is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777776";
+    await firstSend(id, "reply-one");
+    const second = await runSend(secondArgs(id, "reply-two"), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("different --reply-to");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("an invalid --reply-to on a re-send is refused before the store is read", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777777";
+    await firstSend(id);
+    const second = await runSend(secondArgs(id, "not a valid id!"), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("invalid --reply-to id");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a stored entry readable by group or others is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777778";
+    await firstSend(id);
+    chmodSync(sentEnvelopeFile(id), 0o644);
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("readable by group or others");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
+  test("a symlinked stored entry is refused and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777779";
+    await firstSend(id);
+    const path = sentEnvelopeFile(id);
+    const decoy = join(root, "decoy-envelope.json");
+    writeFileSync(decoy, readFileSync(path), { mode: 0o600 });
+    rmSync(path);
+    symlinkSync(decoy, path);
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("not a regular file");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+});
+
 describe("the stored signed envelope has a reuse window", () => {
-  test("an entry older than the window is not reused and is removed", () => {
+  test("an entry older than the window is not reused and is removed", async () => {
     const root = process.env.TPS_MAIL_DIR!;
     const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-    const expected = { from: "flint", to: "remote-a", body: "old message" };
-    storeSentEnvelope(
-      root,
-      id,
-      JSON.stringify({ messageId: id, ...expected, timestamp: "2026-01-01T00:00:00.000Z" }),
-      expected,
-    );
+    const expected = { from: "agent-a", to: "agent-b", body: "old message" };
+    const { raw, client } = await signedStoredEnvelope(id, expected, Buffer.alloc(32, 0x02));
+    await storeSentEnvelope(root, id, raw, expected, client);
     const dir = join(root, ".sent-envelopes");
     const [name] = readdirSync(dir);
     const path = join(dir, name!);
     const old = new Date(Date.now() - SENT_ENVELOPE_TTL_MS - 1000);
     utimesSync(path, old, old);
-    expect(readSentEnvelope(root, id, expected)).toBeUndefined();
+    expect(await readSentEnvelope(root, id, expected, client)).toBeUndefined();
     expect(existsSync(path)).toBe(false);
+  });
+
+  test("a correct 0600 entry signed by the current key is reused", async () => {
+    const root = process.env.TPS_MAIL_DIR!;
+    const id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const expected = { from: "agent-a", to: "agent-b", body: "current message" };
+    const { raw, client } = await signedStoredEnvelope(id, expected, Buffer.alloc(32, 0x02));
+    await storeSentEnvelope(root, id, raw, expected, client);
+    expect(await readSentEnvelope(root, id, expected, client)).toBe(raw);
+  });
+
+  test("an entry owned by another uid is refused", async () => {
+    const root = process.env.TPS_MAIL_DIR!;
+    const id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const expected = { from: "agent-a", to: "agent-b", body: "owned elsewhere" };
+    const { raw, client } = await signedStoredEnvelope(id, expected, Buffer.alloc(32, 0x02));
+    await storeSentEnvelope(root, id, raw, expected, client);
+    const realUid = process.getuid!();
+    const spy = spyOn(process, "getuid").mockReturnValue(realUid + 1);
+    try {
+      await expect(readSentEnvelope(root, id, expected, client)).rejects.toThrow(/not owned by this user/);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 

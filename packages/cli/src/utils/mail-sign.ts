@@ -49,6 +49,42 @@ function unusableKeyError(from: string, err: AgentKeyError): Error {
   return new Error(`cannot sign for agent "${from}": ${err.message}. Remedy: ${remedy}.`);
 }
 
+/** The refusal when no key is available and one is required. Names every path
+ *  that was searched and the remedy; never carries key material. */
+function noKeyError(from: string, keyPath?: string): Error {
+  const searched = keyPath ? [keyPath] : agentKeyCandidates(from);
+  return new Error(
+    `no Ed25519 private key for agent "${from}" — refusing to send an unsigned body: ` +
+      `a promote()-reading recipient dead-letters it terminal. Looked at ${searched.join(", then ")}. ` +
+      `Provision the key: install the agent's Ed25519 private key at ${searched[0]} ` +
+      `(or set TPS_TEST_KEYS_DIR in tests).`,
+  );
+}
+
+/**
+ * Resolve the sender's private key exactly as a fresh send does: a key that
+ * exists but cannot be read or parsed is refused by name, and two default
+ * locations holding different keys are refused. Returns null when no key
+ * exists. Exported so the `--message-id` re-send path can run the same key
+ * checks BEFORE it consults the stored envelope.
+ */
+export function readOutboundSigningKey(from: string, keyPath?: string): Buffer | null {
+  try {
+    return readAgentPrivateKey(from, keyPath);
+  } catch (err) {
+    if (err instanceof AgentKeyError) throw unusableKeyError(from, err);
+    if (err instanceof AgentKeyConflictError) throw new Error(`cannot sign for agent "${from}": ${err.message}`);
+    throw err;
+  }
+}
+
+/** Resolve the sender's private key or throw the fresh-send refusal. */
+export function requireOutboundSigningKey(from: string, keyPath?: string): Buffer {
+  const privkey = readOutboundSigningKey(from, keyPath);
+  if (!privkey) throw noKeyError(from, keyPath);
+  return privkey;
+}
+
 export interface SignOutboundOptions {
   /** Explicit Ed25519 key path, checked against both default locations (or TPS_TEST_KEYS_DIR). */
   keyPath?: string;
@@ -92,25 +128,9 @@ export function signOutboundBody(
   // --reply-to is refused the same way with or without a key.
   if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
 
-  let privkey: Buffer | null;
-  try {
-    privkey = readAgentPrivateKey(from, opts.keyPath);
-  } catch (err) {
-    if (err instanceof AgentKeyError) throw unusableKeyError(from, err);
-    if (err instanceof AgentKeyConflictError) throw new Error(`cannot sign for agent "${from}": ${err.message}`);
-    throw err;
-  }
-
+  const privkey = readOutboundSigningKey(from, opts.keyPath);
   if (!privkey) {
-    if (opts.requireKey) {
-      const searched = opts.keyPath ? [opts.keyPath] : agentKeyCandidates(from);
-      throw new Error(
-        `no Ed25519 private key for agent "${from}" — refusing to send an unsigned body: ` +
-          `a promote()-reading recipient dead-letters it terminal. Looked at ${searched.join(", then ")}. ` +
-          `Provision the key: install the agent's Ed25519 private key at ${searched[0]} ` +
-          `(or set TPS_TEST_KEYS_DIR in tests).`,
-      );
-    }
+    if (opts.requireKey) throw noKeyError(from, opts.keyPath);
     return body;
   }
 
