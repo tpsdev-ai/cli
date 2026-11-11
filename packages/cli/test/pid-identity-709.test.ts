@@ -35,16 +35,22 @@ const mode = process.env.MODE;
 const { mock } = await import("bun:test");
 const real = await import(${JSON.stringify(PID_FILE_URL)});
 let reads = 0;
+const fakeRead = (path) => {
+  if (mode === "token") {
+    if (path !== pidPath) return { kind: "missing" };
+    reads += 1;
+    return { kind: "running", path, pid, startToken: reads === 1 ? "token-a" : "token-b" };
+  }
+  if (path !== pidPath && path !== secondPath) return { kind: "missing" };
+  return { kind: "running", path, pid, startToken: "token-a" };
+};
 mock.module(${JSON.stringify(PID_FILE_URL)}, () => ({
   ...real,
-  readPidFile(path) {
-    if (mode === "token") {
-      if (path !== pidPath) return { kind: "missing" };
-      reads += 1;
-      return { kind: "running", path, pid, startToken: reads === 1 ? "token-a" : "token-b" };
-    }
-    if (path !== pidPath && path !== secondPath) return { kind: "missing" };
-    return { kind: "running", path, pid, startToken: "token-a" };
+  readPidFile: fakeRead,
+  snapshotPidRecord(path) {
+    let raw = null;
+    const state = fakeRead(path, undefined, (_text, bytes) => { raw = bytes; });
+    return { state, raw };
   },
   removePidFile(path) {
     if (removeFailPath !== "" && path === removeFailPath) {
@@ -318,16 +324,18 @@ describe("relay stop identity", () => {
         writeFileSync(relayPid, content);
         const signals: number[] = [];
         const previous = setRelayStopSignal((pid) => signals.push(pid));
-        const { logs, restore } = captureLogs();
+        let message = "";
         try {
-          await runMail({ action: "relay", agent: "stop" });
+          await runMail({ action: "relay", agent: "stop" }).catch((error) => {
+            message = (error as Error).message;
+          });
         } finally {
-          restore();
           setRelayStopSignal(previous);
         }
         expect(signals).toEqual([]);
-        expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
+        expect(existsSync(relayPid)).toBe(true);
+        expect(message).toMatch(/is invalid/);
+        expect(message).toMatch(/Check whether a relay is running/);
       }
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -572,16 +580,18 @@ describe("json pid interpretation", () => {
         writeFileSync(relayPid, content);
         const signals: number[] = [];
         const previous = setRelayStopSignal((pid) => signals.push(pid));
-        const { logs, restore } = captureLogs();
+        let message = "";
         try {
-          await runMail({ action: "relay", agent: "stop" });
+          await runMail({ action: "relay", agent: "stop" }).catch((error) => {
+            message = (error as Error).message;
+          });
         } finally {
-          restore();
           setRelayStopSignal(previous);
         }
         expect(signals).toEqual([]);
-        expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
+        expect(existsSync(relayPid)).toBe(true);
+        expect(message).toMatch(/is invalid/);
+        expect(message).toMatch(/Check whether a relay is running/);
       }
     },
     TIMEOUT,
@@ -719,16 +729,18 @@ describe("bridge stop identity", () => {
         writeFileSync(bridgePid, content);
         const signals: number[] = [];
         const previous = setBridgeStopSignal((pid) => signals.push(pid));
-        const { logs, restore } = captureLogs();
+        let message = "";
         try {
-          await runBridge({ action: "stop" });
+          await runBridge({ action: "stop" }).catch((error) => {
+            message = (error as Error).message;
+          });
         } finally {
-          restore();
           setBridgeStopSignal(previous);
         }
         expect(signals).toEqual([]);
-        expect(existsSync(bridgePid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+        expect(existsSync(bridgePid)).toBe(true);
+        expect(message).toMatch(/is invalid/);
+        expect(message).toMatch(/Check whether a bridge is running/);
       }
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -908,7 +920,7 @@ describe("bridge stop identity", () => {
   );
 
   test(
-    "a pid file that cannot be removed is reported kept and a later record is still processed",
+    "a pid file replaced by a directory after the signal is kept and a later record is still processed",
     async () => {
       const first = spawnChild();
       const second = spawnChild();
@@ -922,8 +934,8 @@ describe("bridge stop identity", () => {
       const previous = setBridgeStopSignal((pid) => {
         signals.push(pid);
         if (pid === first.pid) {
-          // A non-empty directory in the file's place fails unlink for every
-          // uid, root included.
+          // A non-empty directory in the file's place is unreadable for every
+          // uid, root included, so the final check keeps it.
           rmSync(bridgePid);
           mkdirSync(bridgePid);
           writeFileSync(join(bridgePid, "keep"), "x");
@@ -942,9 +954,8 @@ describe("bridge stop identity", () => {
       }
 
       expect(message).toContain(bridgePid);
-      expect(message).toMatch(/could not be removed/);
+      expect(message).toMatch(/could not be read at the final check/);
       expect(message).toMatch(/kept/);
-      expect(message).toMatch(/EISDIR|EPERM/);
       expect(message).not.toMatch(/\n\s+at /);
       expect(signals).toEqual([first.pid, second.pid]);
       expect(existsSync(legacyBridgePid)).toBe(false);
@@ -956,7 +967,7 @@ describe("bridge stop identity", () => {
   );
 
   test(
-    "two records naming the same verified process send one signal and remove both",
+    "two records naming the same verified process send one signal, remove the first record, and leave the second stale record",
     async () => {
       const child = spawnChild();
       const token = processStartToken(child.pid);
@@ -976,7 +987,9 @@ describe("bridge stop identity", () => {
 
       expect(signals).toEqual([child.pid]);
       expect(existsSync(bridgePid)).toBe(false);
-      expect(existsSync(legacyBridgePid)).toBe(false);
+      // The second record's re-read is stale for the pid this stop verified, so
+      // it is left in place, as relay leaves its record.
+      expect(existsSync(legacyBridgePid)).toBe(true);
     },
     TIMEOUT,
   );

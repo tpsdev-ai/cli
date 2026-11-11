@@ -717,12 +717,13 @@ export async function runMail(args: MailArgs): Promise<void> {
           }
           return `pid file ${path} no longer holds the record this stop read and was kept.`;
         };
-        // A bad record says nothing about the relay process: describe the
-        // record, remove it when the re-read still holds the same bytes, and
-        // leave state unknown. A record replaced in between is kept.
+        // A stale record proves the recorded process gone (readPidFile already
+        // checked the pid and start token): describe the record, remove it when
+        // the re-read still holds the same bytes, and leave state unknown. A
+        // record replaced in between is kept.
         const reportBadRecord = (snapshot: PidRecordSnapshot): void => {
           const state = snapshot.state;
-          if (state.kind !== "invalid" && state.kind !== "stale") return;
+          if (state.kind !== "stale") return;
           const { kind, path } = state;
           const current = snapshotPidRecord(path);
           if (current.state.kind === "unreadable") {
@@ -735,7 +736,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             !pidRecordBytesEqual(current.raw, snapshot.raw)
           ) {
             console.log(
-              `Mail relay pid file ${path} was ${kind}; ${describeKeptRecord(path, current.state, state.kind === "stale" ? state.pid : undefined)} This command signalled no process, and the relay's state is unknown.`,
+              `Mail relay pid file ${path} was ${kind}; ${describeKeptRecord(path, current.state, state.pid)} This command signalled no process, and the relay's state is unknown.`,
             );
             return;
           }
@@ -767,7 +768,14 @@ export async function runMail(args: MailArgs): Promise<void> {
             `Mail relay pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if the relay is not running.`,
           );
         }
-        if (state.kind === "invalid" || state.kind === "stale") {
+        if (state.kind === "invalid") {
+          // An invalid record was never verified: it may be a torn write from a
+          // live relay. Keep it and refuse, as the unreadable branch does.
+          throw new Error(
+            `Mail relay pid file ${state.path} is invalid (${state.reason}), so the relay's process identity cannot be verified. Check whether a relay is running, and remove ${state.path} by hand only if none is.`,
+          );
+        }
+        if (state.kind === "stale") {
           reportBadRecord(classification);
           break;
         }
