@@ -36,7 +36,7 @@ pluginModule.register({
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const linuxIt = it.skipIf(process.platform !== "linux");
 
-/** Every wait in this file carries a named deadline. */
+/** Every condition wait in this file carries a named deadline. */
 async function deadline(predicate: () => boolean, ms: number, label: string): Promise<void> {
   const startedAt = Date.now();
   while (!predicate()) {
