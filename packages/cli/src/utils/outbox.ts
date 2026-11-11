@@ -129,14 +129,21 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
 }
 
 /**
- * A file that does not parse and whose age is under this value is treated as a
- * writer still in flight, not a bad record. Ages down to -OUTBOX_FUTURE_SKEW_MS
- * count as young (timestamp and clock skew); an mtime further in the future is
- * treated as old.
+ * A file that does not parse is treated as a writer still in flight, not a bad
+ * record, when it is younger than OUTBOX_PARTIAL_GRACE_MS and less than
+ * OUTBOX_FUTURE_SKEW_MS in the future; an mtime OUTBOX_FUTURE_SKEW_MS or more in
+ * the future is treated as old.
+ *
+ * Known limit: a writer that re-stamps the file's mtime on every pass keeps it
+ * young. OutboxYoungRetryScheduler schedules at most one retry timer per grace
+ * period; each pass still re-reads, parses, stats and logs the young file, and
+ * in the branch daemon an fs.watch event triggers an immediate pass while a host channel is alive.
+ * Known limit: the skew tolerance was measured on a local filesystem, so a
+ * network filesystem with a larger clock skew may need more than 1 s.
  */
 export const OUTBOX_PARTIAL_GRACE_MS = 5_000;
 
-/** Negative ages smaller than this are timestamp or clock skew, not a future-dated file. */
+/** Negative ages above -OUTBOX_FUTURE_SKEW_MS (an mtime less than this far in the future) are timestamp or clock skew, not a future-dated file. */
 export const OUTBOX_FUTURE_SKEW_MS = 1_000;
 
 export interface OutboxDrainResult {
@@ -182,9 +189,9 @@ export function drainOutboxWithStats(archive = true): OutboxDrainResult {
         continue;
       }
       // A writer that is still writing publishes a short, unparseable file.
-      // Leave it for the next pass; quarantine once it has had the grace period
-      // and still does not parse, or straight away when its mtime is more than
-      // OUTBOX_FUTURE_SKEW_MS in the future (no writer in flight is that far ahead).
+      // Leave it for the next pass; quarantine once it is at least the grace
+      // old and still does not parse, or straight away when its mtime is 1 s or
+      // more in the future (no writer in flight is that far ahead).
       if (ageMs > -OUTBOX_FUTURE_SKEW_MS && ageMs < OUTBOX_PARTIAL_GRACE_MS) {
         console.error(`drainOutbox: failed to parse ${f} (age ${Math.round(ageMs)}ms): younger than ${OUTBOX_PARTIAL_GRACE_MS}ms; leaving in place`);
         skippedYoung++;

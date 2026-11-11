@@ -42,8 +42,9 @@ import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { signEnvelope, verifyEnvelope, type ChainEntry, type Envelope } from "@tpsdev-ai/agent";
 // The REAL consumer: the branch relay quarantines an unparseable outbox record
-// with this exact function (packages/cli/src/commands/branch.ts imports it from
-// the same module). Imported from the built CLI so we exercise the shipped
+// through drainOutboxWithStats (reached via OutboxSendTracker.dueWithStats in
+// packages/cli/src/commands/branch.ts); this test calls drainOutbox from the
+// same module. Imported from the built CLI so we exercise the shipped
 // artifact.
 import { drainOutbox, OUTBOX_PARTIAL_GRACE_MS } from "../../../packages/cli/dist/src/utils/outbox.js";
 import * as obligationsModule from "../src/obligations.js";
