@@ -9,10 +9,10 @@
  * `TPS_MAIL_ACK_TIMEOUT_MS`, default 30000, and a bad value is refused by name.
  *
  * The branch keys its inbox record by (branch, wire id), so a second delivery
- * with the same id and payload reuses the record and still ACKs accepted. These
- * tests drive the REAL WS/Noise transport and the branch acceptance path
- * (`deliverRelayedToLocal`); the one exception is the fault-injection test that
- * stubs `WsNoiseTransport.prototype.connect`.
+ * with the same id and payload reuses the record and still ACKs accepted. Most
+ * tests drive the real WS/Noise transport and the branch acceptance path
+ * (`deliverRelayedToLocal`); the fault-injection cases stub
+ * `WsNoiseTransport.prototype.connect`.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
@@ -30,6 +30,7 @@ import {
   deliverRelayedToLocal,
   deliverToRemoteBranch,
   MailDeliveryUnconfirmedError,
+  MAX_MAIL_ACK_TIMEOUT_MS,
   parseMailAckTimeoutMs,
   RemoteDeliveryTimeoutError,
   resolveMailAckTimeoutMs,
@@ -78,6 +79,8 @@ interface BranchBehavior {
   error?: string;
   /** Run the real branch acceptance path before ACKing. */
   recordInbox?: boolean;
+  /** Close the connection after receiving the deliver, before ACKing. */
+  closeBeforeAck?: boolean;
 }
 
 interface BranchServer {
@@ -144,6 +147,10 @@ async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer
             branch.acceptErrors.push(error);
             accepted = false;
           }
+        }
+        if (behavior.closeBeforeAck) {
+          ws.close();
+          return;
         }
         if (behavior.noAck || !accepted) return;
         if (behavior.ackDelayMs) await sleep(behavior.ackDelayMs);
@@ -378,6 +385,17 @@ describe("the ACK window is configurable and refuses bad values by name", () => 
     expect(() => resolveMailAckTimeoutMs({ TPS_MAIL_ACK_TIMEOUT_MS: "abc" })).toThrow(/TPS_MAIL_ACK_TIMEOUT_MS must be a positive integer/);
     expect(() => resolveMailAckTimeoutMs({ TPS_MAIL_ACK_TIMEOUT_MS: "0" })).toThrow(/TPS_MAIL_ACK_TIMEOUT_MS must be a positive integer/);
   });
+
+  test("the largest window whose timers fit is accepted, and one more is refused by name", () => {
+    // The ACK timer and the send bound (connection + window) must both stay
+    // inside the largest delay a Node timer accepts.
+    expect(MAX_MAIL_ACK_TIMEOUT_MS).toBe(2_147_463_647);
+    expect(parseMailAckTimeoutMs(String(MAX_MAIL_ACK_TIMEOUT_MS), "--ack-timeout")).toBe(MAX_MAIL_ACK_TIMEOUT_MS);
+    expect(() => parseMailAckTimeoutMs(String(MAX_MAIL_ACK_TIMEOUT_MS + 1), "--ack-timeout")).toThrow(
+      /--ack-timeout must be at most 2147463647 milliseconds/,
+    );
+    expect(() => parseMailAckTimeoutMs("2147483647", "--ack-timeout")).toThrow(/must be at most 2147463647 milliseconds/);
+  });
 });
 
 describe("deliverToRemoteBranch reports a late ACK as unconfirmed", () => {
@@ -498,6 +516,15 @@ describe("tps mail send exit codes", () => {
     expect(r.stderr).toContain("TPS_MAIL_ACK_TIMEOUT_MS must be a positive integer");
     expect(branch.deliveries).toEqual([]);
   }, 20_000);
+
+  test("an --ack-timeout past the timer limit is refused by name before anything is sent", async () => {
+    await startBranchServer({});
+    pointRemoteAtServer();
+    const r = await runSend(["--stdin", "--ack-timeout", "2147483647"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--ack-timeout must be at most 2147463647 milliseconds");
+    expect(branch.deliveries).toEqual([]);
+  }, 20_000);
 });
 
 describe("a CLI re-send with the same --message-id sends the same signed message", () => {
@@ -534,6 +561,39 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(branch.deliveries).toHaveLength(1);
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 25_000);
+
+  test("a send without --message-id stores its generated id for the printed retry", async () => {
+    await startBranchServer({ recordInbox: true, ackDelayMs: 700 });
+    pointRemoteAtServer();
+    const first = await runSend(["--stdin", "--ack-timeout", "150"]);
+    expect(first.status).toBe(75);
+    const id = first.stderr.match(/for message ([0-9a-f-]{36}) within 150ms/)?.[1];
+    expect(id).toBeDefined();
+    // The printed retry command names the generated id, so its signed envelope
+    // must already be stored.
+    expect(existsSync(sentEnvelopeFile(id!))).toBe(true);
+    const second = await runSend(["--stdin", "--message-id", id!, "--ack-timeout", "5000"]);
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toContain("conflict");
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
+    expect(new Set(branch.deliveries.map((delivery) => delivery.timestamp)).size).toBe(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    await expectConnectionEndedAfter("a printed-id retry");
+  }, 30_000);
+
+  test("an oversized signed envelope stores nothing, so the same id can be sent shorter", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "abababab-abab-4bab-8bab-abababababab";
+    const oversized = await runSend(["--stdin", "--message-id", id], {}, 15_000, "x".repeat(65_530));
+    expect(oversized.status).toBe(1);
+    expect(oversized.stderr).toContain("the signed message is too large to send");
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    const shorter = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"], {}, 15_000, "short body");
+    expect(shorter.status).toBe(0);
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id]);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
 });
 
 describe("a --message-id re-send re-checks the key and the stored envelope", () => {
@@ -1159,8 +1219,62 @@ describe("the connect bound and the ACK window are separate", () => {
     }
     const elapsedMs = Date.now() - startedAt;
     expect(caught).toBeInstanceOf(RemoteDeliveryTimeoutError);
-    expect((caught as Error).message).toContain("exceeded 200ms after connect (send + ack)");
+    expect((caught as Error).message).toContain("exceeded 200ms after connect (send)");
     expect(closed).toBe(true);
     expect(elapsedMs).toBeLessThan(settleBoundMs);
   }, 5_000);
+
+  test("a slow send leaves the full ACK window after the send resolves", async () => {
+    const id = "bbbbbbbb-0000-4000-8000-000000000002";
+    let deliver: ((msg: TpsMessage) => void) | null = null;
+    let ackTimer: ReturnType<typeof setTimeout> | null = null;
+    const channel: TransportChannel = {
+      async send() {
+        // The write takes 200 ms; the ACK follows 450 ms after it resolves, so
+        // it is inside the 500 ms window that starts with the send.
+        await sleep(200);
+        ackTimer = setTimeout(() => {
+          deliver?.({ type: MSG_MAIL_ACK, seq: 0, ts: new Date().toISOString(), body: { id, accepted: true } });
+        }, 450);
+      },
+      onMessage(handler) {
+        deliver = handler;
+      },
+      offMessage() {
+        deliver = null;
+      },
+      async close() {},
+      isAlive() {
+        return true;
+      },
+      peerFingerprint() {
+        return "c".repeat(64);
+      },
+    };
+    const connectSpy = spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id, to: "local", from: "agent-a", body: "slow send" },
+        { timeoutMs: 100, ackTimeoutMs: 500 },
+      );
+    } finally {
+      if (ackTimer) clearTimeout(ackTimer);
+      connectSpy.mockRestore();
+    }
+  }, 10_000);
+
+  test("a branch that closes before the ACK exits 75 at once", async () => {
+    await startBranchServer({ closeBeforeAck: true });
+    pointRemoteAtServer();
+    const startedAt = Date.now();
+    // A 60 s window: only the close can report unconfirmed inside the bound.
+    const r = await runSend(["--stdin", "--ack-timeout", "60000"], {}, 8_000);
+    const elapsedMs = Date.now() - startedAt;
+    expect(r.status).toBe(75);
+    expect(r.stderr).toContain("Delivery unconfirmed");
+    expect(r.stderr).toContain("closed before the ACK");
+    expect(r.stderr).toContain("--message-id");
+    expect(elapsedMs).toBeLessThan(5_000);
+  }, 15_000);
 });

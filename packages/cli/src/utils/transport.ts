@@ -43,6 +43,10 @@ export interface TransportChannel {
   send(msg: TpsMessage): Promise<void>;
   onMessage(handler: (msg: TpsMessage) => void): void;
   offMessage(handler: (msg: TpsMessage) => void): void;
+  /** Register a handler for the transport closing, whether the peer or this
+   *  side closed it. Optional so an in-memory channel can omit it. */
+  onClose?(handler: () => void): void;
+  offClose?(handler: () => void): void;
   close(): Promise<void>;
   isAlive(): boolean;
   peerFingerprint(): string;

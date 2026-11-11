@@ -302,6 +302,7 @@ async function signOutboundOrFail(
       client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
       signed = await readSentEnvelope(mailRoot, opts.messageId, { from, to, body, replyToId: opts.replyToId, priorChain }, client);
     }
+    const reusedStoredEnvelope = signed !== undefined;
     if (signed === undefined) {
       signed = signOutboundBody(from, to, body, {
         requireKey: true,
@@ -310,15 +311,14 @@ async function signOutboundOrFail(
         rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
         priorChain,
       });
-      if (opts.messageId !== undefined) {
-        signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId, priorChain }, client!);
-      }
     }
     // cli#429: every route limits the SIGNED envelope (the body plus its
     // signature, chain and envelope fields) to MAX_BODY_BYTES, not the
     // plaintext — so check it HERE, before any route, and refuse by name. A body
     // just under the limit passes the plaintext check (e.g. --stdin) and would
-    // otherwise fail later, with a different error, inside a route.
+    // otherwise fail later, with a different error, inside a route. The check
+    // runs BEFORE the store: an oversized envelope must not reserve its id when
+    // the refusal says nothing was written.
     try {
       assertValidBody(signed);
     } catch (err) {
@@ -327,11 +327,33 @@ async function signOutboundOrFail(
           `the body plus its signature, delegation chain and envelope fields — so shorten the body. Nothing was written.`,
       );
     }
+    if (!reusedStoredEnvelope && opts.messageId !== undefined) {
+      signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId, priorChain }, client!);
+    }
     return signed;
   } catch (err) {
     console.error(`Refusing to send: ${(err as Error).message}`);
     process.exit(1);
   }
+}
+
+/** Store the signed envelope of a REMOTE send that generated its own id. The
+ *  exit-75 message prints that id and tells the sender to re-send with it; only
+ *  the stored bytes make that retry the same signed message (same id, timestamp
+ *  and payload) the branch can accept as a duplicate. */
+async function storeGeneratedSignedEnvelope(
+  from: string,
+  to: string,
+  body: string,
+  replyToId: string | undefined,
+  signed: string,
+): Promise<void> {
+  const messageId = signedMessageId(signed);
+  if (messageId === undefined) throw new Error("the signed message has no envelope id");
+  const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+  const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+  await storeSentEnvelope(mailRoot, messageId, signed, { from, to, body, replyToId, priorChain }, client);
 }
 
 function newestJsonMtime(dir: string, fresh = false): string | null {
@@ -466,6 +488,16 @@ export async function runMail(args: MailArgs): Promise<void> {
               `the wire delivery id must be a UUID or a 64-character lowercase hex id.`,
           );
           process.exit(1);
+        }
+        // A generated id is printed in the unconfirmed message too, so store
+        // its signed envelope before the delivery that can print it.
+        if (args.sendMessageId === undefined) {
+          try {
+            await storeGeneratedSignedEnvelope(from, to, messageBody, args.replyTo, args.message);
+          } catch (err) {
+            console.error(`Refusing to send: ${(err as Error).message}`);
+            process.exit(1);
+          }
         }
         try {
           await deliverToRemoteBranch(

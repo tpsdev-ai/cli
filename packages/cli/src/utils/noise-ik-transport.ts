@@ -101,6 +101,7 @@ async function readFrame(socket: Socket, maxBytes = MAX_HANDSHAKE_BYTES): Promis
 
 class NoiseIkChannel implements TransportChannel {
   private alive = true;
+  private closeEmitted = false;
   private emitter = new EventEmitter();
   private rxBuffer: Buffer = Buffer.alloc(0);
 
@@ -110,9 +111,7 @@ class NoiseIkChannel implements TransportChannel {
     private readonly recvCipher: Cipher,
     private readonly peerFp: string
   ) {
-    this.socket.on("close", () => {
-      this.alive = false;
-    });
+    this.socket.on("close", () => this.emitClose());
 
     this.socket.on("data", (chunk: Buffer) => {
       try {
@@ -158,6 +157,21 @@ class NoiseIkChannel implements TransportChannel {
 
   offMessage(handler: (msg: TpsMessage) => void): void {
     this.emitter.off("message", handler);
+  }
+
+  onClose(handler: () => void): void {
+    this.emitter.on("close", handler);
+  }
+
+  offClose(handler: () => void): void {
+    this.emitter.off("close", handler);
+  }
+
+  private emitClose(): void {
+    this.alive = false;
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.emitter.emit("close");
   }
 
   async close(): Promise<void> {

@@ -66,6 +66,7 @@ function waitForMessage(ws: WebSocket, timeoutMs: number): Promise<Buffer> {
 
 class WsNoiseChannel implements TransportChannel {
   private alive = true;
+  private closeEmitted = false;
   private emitter = new EventEmitter();
 
   constructor(
@@ -74,9 +75,7 @@ class WsNoiseChannel implements TransportChannel {
     private readonly recvCipher: Cipher,
     private readonly peerFp: string
   ) {
-    ws.on("close", () => {
-      this.alive = false;
-    });
+    ws.on("close", () => this.emitClose());
 
     // Catch post-connection WS errors (e.g. ErrorEvent on reconnect) before
     // they propagate as unhandled process events and crash office connect. (#245)
@@ -119,6 +118,21 @@ class WsNoiseChannel implements TransportChannel {
 
   offMessage(handler: (msg: TpsMessage) => void): void {
     this.emitter.off("message", handler);
+  }
+
+  onClose(handler: () => void): void {
+    this.emitter.on("close", handler);
+  }
+
+  offClose(handler: () => void): void {
+    this.emitter.off("close", handler);
+  }
+
+  private emitClose(): void {
+    this.alive = false;
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.emitter.emit("close");
   }
 
   async close(): Promise<void> {
