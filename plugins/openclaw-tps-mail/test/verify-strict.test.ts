@@ -149,6 +149,7 @@ describe("verify-strict: signed envelope verification", () => {
   let startPromise: Promise<void> | undefined;
   let openWatchers: Set<EventEmitter>;
   let watchSpy: ReturnType<typeof spyOn>;
+  let watchStubCalls: number;
 
   beforeEach(() => {
     tempMailDir = mkdtempSync(join(tmpdir(), "tps-verify-"));
@@ -162,7 +163,9 @@ describe("verify-strict: signed envelope verification", () => {
     // when a directory watch starts, and the plugin moves that file out of new/
     // at once. The startup scan reads new/ without the watch.
     openWatchers = new Set();
+    watchStubCalls = 0;
     watchSpy = spyOn(fs, "watch").mockImplementation((() => {
+      watchStubCalls++;
       const watcher: EventEmitter = Object.assign(new EventEmitter(), { close: () => openWatchers.delete(watcher) });
       openWatchers.add(watcher);
       return watcher;
@@ -179,6 +182,9 @@ describe("verify-strict: signed envelope verification", () => {
       /* best effort */
     }
     expect(openWatchers.size).toBe(0);
+    // cli#922 item 4: a zero-watcher set would also pass the check above, so
+    // prove the plugin actually asked for a watcher in this test.
+    expect(watchStubCalls).toBeGreaterThan(0);
   });
 
   /**
