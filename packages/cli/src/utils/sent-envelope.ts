@@ -75,6 +75,23 @@ export function readSentEnvelope(
   expected: { from: string; to: string; body: string },
 ): string | undefined {
   const path = envelopePath(root, messageId);
+  let ageMs: number;
+  try {
+    ageMs = Date.now() - statSync(path).mtimeMs;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new StoredEnvelopeError(
+      `cannot read the stored signed message at ${path}: ${error instanceof Error ? error.message : String(error)}; refusing to send`,
+    );
+  }
+  if (ageMs >= SENT_ENVELOPE_TTL_MS) {
+    try {
+      unlinkSync(path);
+    } catch {
+      /* another process pruned it; the entry is expired either way */
+    }
+    return undefined;
+  }
   let raw: string;
   try {
     raw = readFileSync(path, "utf-8");

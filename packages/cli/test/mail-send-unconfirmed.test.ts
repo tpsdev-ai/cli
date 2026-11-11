@@ -14,7 +14,7 @@
  * (`deliverRelayedToLocal`), not a stub channel.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import net from "node:net";
@@ -38,6 +38,7 @@ import { getInbox } from "../src/utils/mail.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile } from "./helpers/stub-flair.js";
+import { readSentEnvelope, SENT_ENVELOPE_TTL_MS, storeSentEnvelope } from "../src/utils/sent-envelope.js";
 
 afterEach(() => {
   mock.restore();
@@ -475,6 +476,27 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(branch.deliveries).toHaveLength(1);
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 25_000);
+});
+
+describe("the stored signed envelope has a reuse window", () => {
+  test("an entry older than the window is not reused and is removed", () => {
+    const root = process.env.TPS_MAIL_DIR!;
+    const id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const expected = { from: "flint", to: "remote-a", body: "old message" };
+    storeSentEnvelope(
+      root,
+      id,
+      JSON.stringify({ messageId: id, ...expected, timestamp: "2026-01-01T00:00:00.000Z" }),
+      expected,
+    );
+    const dir = join(root, ".sent-envelopes");
+    const [name] = readdirSync(dir);
+    const path = join(dir, name!);
+    const old = new Date(Date.now() - SENT_ENVELOPE_TTL_MS - 1000);
+    utimesSync(path, old, old);
+    expect(readSentEnvelope(root, id, expected)).toBeUndefined();
+    expect(existsSync(path)).toBe(false);
+  });
 });
 
 describe("flags and ids the remote wire cannot carry are refused by name", () => {
