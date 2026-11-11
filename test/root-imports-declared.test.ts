@@ -144,13 +144,14 @@ describe("root imports are declared", () => {
 					'import { helper } from "./helper";',
 					'import { absolute } from "/abs/helper";',
 					'import { agent } from "@tpsdev-ai/agent";',
-					'import { WebSocket } from "ws";',
-					"void readFileSync; void describe; void helper; void absolute; void agent; void WebSocket;",
+					'import onlyInDependencies from "declared-in-dependencies";',
+					"void readFileSync; void describe; void helper; void absolute; void agent; void onlyInDependencies;",
 					"",
 				].join("\n"),
 			);
 			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], {
-				dependencies: { ws: "^8.0.0" },
+				// Not a Bun/Node builtin name, so only the dependencies entry can pass it.
+				dependencies: { "declared-in-dependencies": "^1.0.0" },
 				devDependencies: { "@tpsdev-ai/agent": "workspace:*" },
 			});
 			expect(undeclared).toEqual([]);
