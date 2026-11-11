@@ -8,12 +8,12 @@
  */
 import { afterEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createConnectShutdown } from "../src/commands/office.js";
-import { hostStatePath, readHostState } from "../src/utils/connection-state.js";
+import { hostStatePath } from "../src/utils/connection-state.js";
 import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/identity.js";
 import { QUIET_NONO_CHECK_FLAG, SANDBOX_REQUIRED_FLAG } from "../src/utils/nono.js";
 import type { TransportChannel, TransportServer } from "../src/utils/transport.js";
@@ -122,6 +122,17 @@ let stdout = "";
 let stderr = "";
 
 /** Start `tps office connect` and wait for its connection and host record. */
+/** The pid a host record file names, or null while it is absent or not yet whole. */
+function recordPid(path: string): number | null {
+  if (!existsSync(path)) return null;
+  try {
+    const record = JSON.parse(readFileSync(path, "utf8")) as { pid?: unknown };
+    return typeof record.pid === "number" ? record.pid : null;
+  } catch {
+    return null;
+  }
+}
+
 async function startConnect(): Promise<{ channel: TransportChannel; recordPath: string }> {
   const dir = root!;
   const port = await freePort();
@@ -152,7 +163,7 @@ async function startConnect(): Promise<{ channel: TransportChannel; recordPath: 
     throw new Error(`office connect exited before connecting (code ${proc.exitCode}):\nstdout:\n${stdout}\nstderr:\n${stderr}`);
   }
   const recordPath = hostStatePath(BRANCH);
-  await waitFor("the host record to name the connector process", () => readHostState(BRANCH)?.pid === proc.pid, RECORD_DEADLINE_MS);
+  await waitFor("the host record to name the connector process", () => recordPid(recordPath) === proc.pid, RECORD_DEADLINE_MS);
   return { channel: connected, recordPath };
 }
 
@@ -205,7 +216,7 @@ describe("tps office connect checked shutdown", () => {
 
       const result = await signalAndWait(signal);
       expect(result).toEqual({ code: 0, signal: null });
-      expect(readHostState(BRANCH)).toBeNull();
+      expect(existsSync(hostStatePath(BRANCH))).toBe(false);
       await waitFor("the relay's channel to close", () => !channel.isAlive(), CHANNEL_CLOSE_DEADLINE_MS);
       expect(stderr).not.toContain("Disconnect failed");
     }, TEST_TIMEOUT_MS);
@@ -219,8 +230,7 @@ describe("tps office connect checked shutdown", () => {
       const result = await signalAndWait(signal);
       expect(result.code).toBe(1);
       expect(stderr).toContain(`Disconnect failed: Host state record ${recordPath} is present but is not a regular file`);
-      // Read first, stat last: the record entry is still the directory we put there.
-      expect(readHostState(BRANCH)).toBeNull();
+      // The record entry is still the directory we put there.
       expect(statSync(recordPath).isDirectory()).toBe(true);
     }, TEST_TIMEOUT_MS);
   }
