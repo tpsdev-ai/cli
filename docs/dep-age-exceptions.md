@@ -73,8 +73,9 @@ and `npm x`, which do not read a lockfile. `--prefix`/`-C`/`--workspace`/`-w`
 bind the install to the literal directory they name; a repeated directory flag
 is refused. `scripts/npm-ci-tracked-lock.sh` is the approved install
 implementation: its own lines are not screened by that classifier, and a helper
-call is followed wherever it appears; a helper call is refused when the cwd or
-its directory argument is not resolved.
+call is followed only as the literal whole-line shape of a run block or followed
+shell file; any other spelling, and a helper call whose cwd or directory
+argument is not resolved, is refused.
 
 An interpreter invocation is followed when its script argument resolves to a
 repository file: a literal path; a variable the script binds exactly once to a

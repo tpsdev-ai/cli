@@ -78,7 +78,7 @@ const QUOTED_VALUE = String.raw`(?:"(?:[A-Za-z0-9_./ :+-]|\$[A-Za-z_][A-Za-z0-9_
 
 /** Accept only a tracked-lock helper call: the shape accepted on main, with literal options. */
 const HELPER_CALL = new RegExp(
-  String.raw`^bash (?:\./)?scripts/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./-]+)(?: (${QUOTED_VALUE}))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$`,
+  String.raw`^bash (?:\./)?scripts/npm-ci-tracked-lock\.sh --via (npm|sfw) (?:(--in-place) )?([A-Za-z0-9_./][A-Za-z0-9_./-]*)(?: (${QUOTED_VALUE}))?(?: ((?:--ignore-scripts|--no-audit|--no-fund)(?: (?:--ignore-scripts|--no-audit|--no-fund))*))?$`,
 );
 
 type AllowlistEntry = { text: string; reason: string };
@@ -1247,9 +1247,9 @@ function resolveCdTarget(
   at: string,
 ): CdTarget | null {
   if (target === "" || target === "-" || target === "--" || /[~*?]/.test(target)) return null;
-  const toplevel = target.match(/^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(.*)$/s);
+  const toplevel = target.match(/^\$\(\s*git\s+rev-parse\s+--show-toplevel\s*\)(?:\/(.*))?$/s);
   if (toplevel !== null) {
-    const suffix = toplevel[1];
+    const suffix = toplevel[1] ?? "";
     if (/[$`]/.test(suffix)) return null;
     const rel = joinVariableSuffix("", suffix);
     const path = rel === "" ? "" : resolveRepoDir("", rel, at);
@@ -1402,6 +1402,11 @@ function refuseInvocation(
   );
 }
 
+/** The tracked-lock helper is only accepted as its literal whole-line shape. */
+function isTrackedLockHelper(rel: string): boolean {
+  return rel.replace(/^\.\//, "") === "scripts/npm-ci-tracked-lock.sh";
+}
+
 function followInvocation(
   ctx: TreeContext,
   state: ShellState,
@@ -1410,6 +1415,13 @@ function followInvocation(
   number: number,
 ): void {
   if ("rel" in invocation) {
+    // A run block's literal helper line was validated by npmCiLockDirs before
+    // this scan; every other route (another spelling, a followed script, or a
+    // command substitution) is refused here.
+    if (!state.rule1Exempt && isTrackedLockHelper(invocation.rel) &&
+        !(state.source === "run-block" && HELPER_CALL.test(entryText))) {
+      throw new Error(`${lineAt(state, number)}: tracked-lock helper call is not the literal accepted shape: ${entryText}`);
+    }
     followScript(ctx, invocation.rel, { cwd: state.cwd, cwdUnknown: state.cwdUnknown, label: state.label, chain: state.chain });
     return;
   }
@@ -1918,6 +1930,9 @@ function scanNonShellScript(ctx: TreeContext, rel: string, content: string, orig
       if ("dynamic" in invocation) {
         const resolved = resolveDynamicSuffix(ctx, invocation.dynamic);
         if (resolved !== null) {
+          if (isTrackedLockHelper(resolved)) {
+            throw new Error(`${at}, line ${entry.line}: tracked-lock helper call is not the literal accepted shape: ${entry.text}`);
+          }
           followScript(ctx, resolved, { cwd: directory, cwdUnknown: false, label: origin.label, chain });
         } else {
           pushUnresolved(ctx, rel, entry.line, invocation.dynamic, origin.label, chain);
@@ -1926,6 +1941,9 @@ function scanNonShellScript(ctx: TreeContext, rel: string, content: string, orig
       }
       const resolved = resolveRepoDir(directory, invocation.rel, at);
       const fromRoot = resolved === invocation.rel ? null : resolveRepoDir("", invocation.rel, at);
+      if (isTrackedLockHelper(resolved) || (fromRoot !== null && isTrackedLockHelper(fromRoot))) {
+        throw new Error(`${at}, line ${entry.line}: tracked-lock helper call is not the literal accepted shape: ${entry.text}`);
+      }
       if (scriptExists(ctx, resolved)) followScript(ctx, resolved, { cwd: directory, cwdUnknown: false, label: origin.label, chain });
       else if (fromRoot !== null && scriptExists(ctx, fromRoot)) {
         followScript(ctx, fromRoot, { cwd: directory, cwdUnknown: false, label: origin.label, chain });

@@ -2603,6 +2603,112 @@ describe("the workflow guard resolves one assignment per variable (#820 round 4)
   });
 });
 
+describe("the tracked-lock helper is refused outside its literal shape (#820 round 16)", () => {
+  const helper = "#!/bin/sh\necho helper\n";
+  const tracked = new Set(["plugins/untracked/package-lock.json"]);
+
+  function followedProbe(lines: string[]) {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${lines.join("\n")}\n`,
+      "scripts/npm-ci-tracked-lock.sh": helper,
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    try {
+      return assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, "workflow-helper-shape");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["a dot-slash script word", ["./scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"]],
+    ["a flagged interpreter", ["bash -e scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"]],
+    ["a compound line", ["true && bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"]],
+    ["a command substitution", ["x=$(bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked)"]],
+    ["a computed path after an unknown cd", ["cd \"$(mktemp -d)\"", "\"$here/npm-ci-tracked-lock.sh\" --via npm --in-place plugins/untracked"]],
+    ["a computed directory argument", ["dir=plugins/untracked", "bash scripts/npm-ci-tracked-lock.sh --via npm --in-place \"$dir\""]],
+  ])("refuses %s in a followed script", (_label, lines) => {
+    expect(() => followedProbe(lines as string[])).toThrow(
+      /tracked-lock helper call is not the literal accepted shape/,
+    );
+  });
+
+  it.each([
+    ["a dot-slash script word", "./scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"],
+    ["a flagged interpreter", "bash -e scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"],
+    ["a compound line", "true && bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked"],
+    ["a command substitution", "x=$(bash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked)"],
+    ["a computed directory argument", "dir=plugins/untracked\nbash scripts/npm-ci-tracked-lock.sh --via npm --in-place \"$dir\""],
+  ])("refuses %s in a run block", (_label, run) => {
+    const root = makeTreeFixture({
+      "scripts/npm-ci-tracked-lock.sh": helper,
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, "workflow-helper-shape")).toThrow(
+        /cannot establish the npm ci directory/,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a helper call spelled in a followed non-shell script", () => {
+    const root = makeTreeFixture({
+      "scripts/task.mjs": "#!/usr/bin/env node\nbash scripts/npm-ci-tracked-lock.sh --via npm --in-place plugins/untracked\n",
+      "scripts/npm-ci-tracked-lock.sh": helper,
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/task.mjs", "."),
+        tracked,
+        root,
+        "workflow-helper-shape",
+      )).toThrow(/script scripts\/task\.mjs \(invocation scripts\/task\.mjs\), line 2: tracked-lock helper call is not the literal accepted shape/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("an unknown cwd is re-anchored only inside the repository (#820 round 16)", () => {
+  it("re-anchors an unknown cwd at a path under the repository root", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "cd /tmp\ncd \"$(git rev-parse --show-toplevel)/packages/a\"\nnpm ci\n",
+      "packages/a/package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["packages/a/package-lock.json"]),
+        root,
+        "workflow-cd-anchor",
+      );
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a repository-root cd whose path continues outside the repository", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "cd \"$(git rev-parse --show-toplevel)-sibling\"\nnpm ci\n",
+      "-sibling/package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["-sibling/package-lock.json"]),
+        root,
+        "workflow-cd-anchor",
+      )).toThrow(/cannot bind an npm install after a non-literal directory change/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("the install classifier refuses lockfile-free installs in a followed script (#820 round 4)", () => {
   function probeTree(script: string, tracked: Set<string> = new Set(["package-lock.json"])) {
     const root = makeTreeFixture({ "scripts/install.sh": script, "package-lock.json": "{}\n" });
