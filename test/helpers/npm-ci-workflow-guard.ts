@@ -1547,8 +1547,8 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       continue;
     }
     // A command substitution runs in its own subshell: it starts from the
-    // enclosing state and keeps its own cd and nested substitutions. A line the
-    // lexer cannot parse reliably is refused as unresolved, never skipped.
+    // enclosing state and keeps its own cd and nested substitutions. An unparsed
+    // token is refused as unresolved, never skipped.
     const substitutions = commandSubstitutions(entry.text, entry.tail ?? "", entry.quoteContinued === true);
     for (const token of substitutions.unparsed) {
       if (state.source === "followed-script") {
