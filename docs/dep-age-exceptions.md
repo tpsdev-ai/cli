@@ -49,9 +49,9 @@ files, and a run block's lines are screened by the physical-line check above.
 An `npx` invocation in a workflow or composite-action `run:` block is not
 classified by either pass. Here-document bodies are install-screened;
 a here-document passed to a shell is refused rather than executed. It refuses what it cannot
-resolve in the shapes it parses; a prefix assignment whose value holds a
-substitution the lexer cannot close skips the clause, and nested quoting inside
-substitutions is a known limit (cli#975). It passes an install only as a bounded global
+resolve in the shapes it parses; a prefix assignment whose value the lexer
+cannot close skips the clause, and nested quoting inside substitutions is a
+known limit (cli#975). It passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
 it cannot resolve is refused unless a reviewed allowlist entry names it; an
 unresolved-invocation refusal names the step and the invocation path. It is not a boundary

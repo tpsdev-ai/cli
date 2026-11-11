@@ -1587,11 +1587,11 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       // environment assignment plus a command, and the value cannot be
       // evaluated, so the clause is refused: a run block throws and a followed
       // script records an unresolved entry. An assignment-only clause is judged
-      // by that substitution's own scan below. A value holding a substitution
-      // the lexer cannot close (nested quotes, cli#975) keeps the earlier skip:
-      // its clause words are not the shell's words. A `$(` the lexer reads as
-      // literal (single quotes, ANSI-C quoting, an escaped dollar) is not a
-      // substitution, so the clause is scanned normally.
+      // by that substitution's own scan below. A value the lexer cannot close
+      // (nested quotes, cli#975) keeps the earlier skip: its clause words are
+      // not the shell's words. A `$(` the lexer reads as literal (single
+      // quotes, ANSI-C quoting, an escaped dollar) is not a substitution, so
+      // the clause is scanned normally.
       const assignment = clause.tokens[0] === undefined ? null : assignmentToken(clause.tokens[0].text);
       const substitution = assignment === null ? null : commandSubstitutions(assignment.value);
       const assignmentSubstitution =

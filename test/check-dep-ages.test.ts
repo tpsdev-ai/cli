@@ -3813,8 +3813,8 @@ describe("the workflow guard refuses a prefix assignment before a command (#820 
 });
 
 describe("the workflow guard reads a literal $() in a prefix assignment through the lexer (#820 round 14)", () => {
-  // The skip is the lexer's verdict: only a substitution it cannot close keeps
-  // the clause unscanned. A `$(` inside single quotes, ANSI-C quotes or behind
+  // The skip is the lexer's verdict: only a value it cannot close keeps the
+  // clause unscanned. A `$(` inside single quotes, ANSI-C quotes or behind
   // an escaped dollar is literal text the shell does not run.
   const shapes: Array<[string, string]> = [
     ["a single-quoted $( in a prefix assignment", "V='$(date)' bash scripts/inst.sh"],
