@@ -24,7 +24,8 @@ import { readPidFile, removePidFile, serializePidRecord, type PidFileState } fro
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
-function relayPidPath(): string {
+/** The relay pid file path. */
+export function relayPidPath(): string {
   return join(homeDir(), ".tps", "relay.pid");
 }
 const RELAY_POLL_MS = 500;
