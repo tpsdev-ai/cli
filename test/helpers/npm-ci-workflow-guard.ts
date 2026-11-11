@@ -2066,9 +2066,10 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
 
 function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string) {
   // A working-directory the scan cannot spell as a literal relative path (a
-  // `${{ ... }}` expression, any other `$`, or a leading `/`) leaves the step's
-  // directory unknown, so every install and invocation on it is refused unless
-  // allowlisted.
+  // `${{ ... }}` expression, any other `$`, or a leading `/`) starts at an
+  // unknown cwd, so a relative invocation or a cwd-bound install on it is
+  // unresolved, except a computed token whose literal suffix names an existing
+  // repository file (docs/dep-age-exceptions.md).
   const cwdUnknown = cwd.includes("$") || cwd.startsWith("/");
   scanShellText(
     ctx,
