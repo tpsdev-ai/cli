@@ -3711,9 +3711,8 @@ describe("the workflow guard refuses a prefix assignment before a command (#820 
       } catch (error) {
         message = (error as Error).message;
       }
-      expect(message).toContain(
-        "compute the value on its own line, or add the step to the reviewed exact-block allowlist",
-      );
+      expect(message).toContain("compute the value on its own line");
+      expect(message).not.toContain("allowlist");
       expect(message).not.toContain("name the script in a reviewed entry");
     } finally {
       rmSync(root, { recursive: true, force: true });

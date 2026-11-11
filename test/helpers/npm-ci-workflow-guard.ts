@@ -1604,7 +1604,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
           pushUnresolved(ctx, state.file, number, token, state.label, state.chain, remedy);
           continue;
         }
-        const remedy = "compute the value on its own line, or add the step to the reviewed exact-block allowlist";
+        const remedy = "compute the value on its own line";
         throw new Error(
           `${state.label}: cannot resolve a prefix assignment whose value holds a command substitution: ${entry.text} (physical line ${number}); ${remedy}`,
         );
