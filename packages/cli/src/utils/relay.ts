@@ -1418,6 +1418,7 @@ export async function connectAndKeepAlive(
     stopped = true;
     cancelInboundPersist();
     stopPrune();
+    let lateConnectCloseBounded = false;
     if (pendingConnect !== null) {
       let lateConnectTimer: ReturnType<typeof setTimeout> | undefined;
       const deadline = new Promise<"timeout">((resolve) => {
@@ -1428,11 +1429,19 @@ export async function connectAndKeepAlive(
         // If the connect attempt (or its tracked close) has not settled by the
         // deadline, the close is unconfirmed: keep the record.
         if (outcome === "timeout") unconfirmedChannelClose = true;
+        // A late connect tracks its close on `pendingChannelClose`; a close that
+        // never settles must share the same deadline, not block stop() forever.
+        if (pendingChannelClose !== null) {
+          const closeOutcome = await Promise.race([pendingChannelClose, deadline]);
+          if (closeOutcome === "timeout") unconfirmedChannelClose = true;
+          lateConnectCloseBounded = true;
+        }
       } finally {
         if (lateConnectTimer !== undefined) clearTimeout(lateConnectTimer);
       }
     }
-    if (pendingChannelClose !== null) await pendingChannelClose;
+    // The in-loop close path keeps its pre-existing unbounded wait.
+    if (!lateConnectCloseBounded && pendingChannelClose !== null) await pendingChannelClose;
     if (currentChannel !== null) {
       retainFailedChannel(currentChannel);
       currentChannel = null;

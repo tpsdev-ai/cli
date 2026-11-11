@@ -492,6 +492,33 @@ test("stop() keeps the host record when an in-flight connect does not settle by 
   }
 }, 20_000);
 
+test("stop() bounds a late-connect close that never settles and keeps the host record", async () => {
+  const scenario = await lateConnectScenario({ lateClose: () => new Promise<void>(() => {}) });
+  const STOP_BOUND_MS = 2_000;
+  let boundTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    let stopSettled = false;
+    const stopping = scenario.stop().then(
+      () => { stopSettled = true; return null; },
+      (error: unknown) => { stopSettled = true; return error; },
+    );
+    await Bun.sleep(20);
+    expect(stopSettled, "stop() must wait for the in-flight connect").toBe(false);
+    scenario.releaseConnect();
+    const bound = new Promise<"bound">((resolve) => {
+      boundTimer = realSetTimeout(() => resolve("bound"), STOP_BOUND_MS);
+    });
+    const outcome = await Promise.race([stopping, bound]);
+    expect(outcome, `stop() must settle within ${STOP_BOUND_MS} ms`).not.toBe("bound");
+    expect(outcome).toMatchObject({ name: "HostChannelCloseError" });
+    expect(scenario.counts().lateCloses).toBe(1);
+    expect(existsSync(scenario.path)).toBe(true);
+  } finally {
+    if (boundTimer !== undefined) clearTimeout(boundTimer);
+    await scenario.cleanup();
+  }
+}, 20_000);
+
 test("a failed host record refresh is reported once per connection until a write succeeds", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-refresh-report-783-"));
   const savedEnv = savedRelayEnv();
