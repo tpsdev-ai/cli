@@ -1794,6 +1794,8 @@ const outbound: ChannelOutboundAdapter = {
 
 export const NEW_DIR_RESCAN_MS = 30_000;
 export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
+/** cli#922 item 1: the cap on the rescan-tick backoff between watcher re-arm attempts. */
+export const MAX_WATCHER_REARM_BACKOFF_TICKS = 32;
 
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
@@ -2415,10 +2417,80 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       }
       const pendingWatchFiles = new Set<string>();
       let rescanning = false;
+      // cli#922 item 1: a watcher that emits "error" is stopped by the OS. The
+      // rescan tick is the only place that re-arms it (never the error handler,
+      // which can spin against a path that still fails): one attempt per tick,
+      // with an exponential backoff on repeated failures.
+      let activeWatcher: FSWatcher | null = null;
+      let watcherStopped = false;
+      let rearmFailures = 0;
+      let rearmDelayTicks = 1;
+      let lastRearmTick = Number.NEGATIVE_INFINITY;
+      let tickIndex = 0;
+
+      const attachWatcher = (): FSWatcher => {
+        const watcher = fsWatch(newDir, { persistent: true }, (_event, filename) => {
+          if (!isLive() || !filename) return;
+          const filePath = resolve(newDir, String(filename));
+          if (!existsSync(filePath)) return;
+          pendingWatchFiles.add(filePath);
+          // Debounce: fs.watch can fire multiple events per file write.
+          accountTimer(accountContext, () => {
+            pendingWatchFiles.delete(filePath);
+            processNewFile(agentId, filePath).catch((err) => {
+              log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
+            });
+          }, 50);
+        });
+        // cli#720: an error stops the watcher (Bun on Linux reports one when a
+        // file under new/ moves out while the watch is being set up). Log it
+        // instead of letting it throw; the rescan tick below re-arms it, and
+        // until then the rescan still reads new/.
+        watcher.on("error", (err) => {
+          if (watcher !== activeWatcher || watcherStopped) return;
+          watcherStopped = true;
+          log?.warn?.(
+            `tps-mail: new/ watcher for ${agentId} stopped: ${err?.message ?? String(err)}; ` +
+              `new mail is picked up by the rescan every ${NEW_DIR_RESCAN_MS / 1000}s until it re-arms`,
+          );
+        });
+        watchers.add(watcher);
+        activeWatcher = watcher;
+        return watcher;
+      };
+
+      const rearmIfStopped = () => {
+        if (!watcherStopped || !isLive()) return;
+        if (tickIndex - lastRearmTick < rearmDelayTicks) return;
+        lastRearmTick = tickIndex;
+        if (activeWatcher) {
+          watchers.delete(activeWatcher);
+          try { activeWatcher.close(); } catch { /* ignore */ }
+          activeWatcher = null;
+        }
+        try {
+          attachWatcher();
+          watcherStopped = false;
+          rearmFailures = 0;
+          rearmDelayTicks = 1;
+          lastRearmTick = Number.NEGATIVE_INFINITY;
+          log?.info?.(`tps-mail: new/ watcher for ${agentId} re-armed`);
+        } catch (err: any) {
+          rearmFailures++;
+          rearmDelayTicks = Math.min(2 ** (rearmFailures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
+          log?.warn?.(
+            `tps-mail: new/ watcher for ${agentId} still failing after ${rearmFailures} re-arm attempt(s): ` +
+              `${err?.message ?? String(err)}; next attempt in ${rearmDelayTicks} rescan tick(s)`,
+          );
+        }
+      };
+
       const rescan = async () => {
         if (!isLive() || rescanning) return;
         rescanning = true;
+        tickIndex++;
         try {
+          rearmIfStopped();
           const filenames = await readdir(newDir);
           const present = new Set(filenames.map((filename) => resolve(newDir, filename)));
           for (const [identity, { filePath }] of transientFailures) {
@@ -2444,29 +2516,13 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       lifetime.intervals.add(rescanInterval);
 
       try {
-        const watcher = fsWatch(newDir, { persistent: true }, (_event, filename) => {
-          if (!isLive() || !filename) return;
-          const filePath = resolve(newDir, String(filename));
-          if (!existsSync(filePath)) return;
-          pendingWatchFiles.add(filePath);
-          // Debounce: fs.watch can fire multiple events per file write.
-          accountTimer(accountContext, () => {
-            pendingWatchFiles.delete(filePath);
-            processNewFile(agentId, filePath).catch((err) => {
-              log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
-            });
-          }, 50);
-        });
-        // cli#720: an error stops the watcher (Bun on Linux reports one when a
-        // file under new/ moves out while the watch is being set up). Log it
-        // instead of letting it throw; the rescan above still reads new/.
-        watcher.on("error", (err) => {
-          log?.warn?.(
-            `tps-mail: new/ watcher for ${agentId} stopped: ${err?.message ?? String(err)}; ` +
-              `new mail is picked up by the rescan every ${NEW_DIR_RESCAN_MS / 1000}s`,
-          );
-        });
-        watchers.add(watcher);
+        try {
+          attachWatcher();
+        } catch (err) {
+          // No watcher was created; let the rescan tick try again.
+          watcherStopped = true;
+          throw err;
+        }
 
         // Process any files already present (but not in seenFiles) in case
         // the gateway starts up after mail was already written.

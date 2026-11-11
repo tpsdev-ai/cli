@@ -50,6 +50,7 @@ describe("new/ periodic rescan (cli#853)", () => {
   let verifyUnavailable: boolean;
   let watchSpy: ReturnType<typeof spyOn>;
   let watcher: fs.FSWatcher | undefined;
+  let closedWatchers: Set<object>;
   let timerSpy: ReturnType<typeof spyOn>;
   let promoteSpy: ReturnType<typeof spyOn>;
   let readSpy: ReturnType<typeof spyOn> | undefined;
@@ -75,6 +76,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     readSpy = undefined;
     blockedRelayRoots = [];
     watcher = undefined;
+    closedWatchers = new Set();
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
@@ -89,8 +91,11 @@ describe("new/ periodic rescan (cli#853)", () => {
       notifyWatch = (filename) => {
         if (!suppressWatch) { watchCalls++; listener("rename", filename); }
       };
-      watcher = Object.assign(new EventEmitter(), { close() {} }) as unknown as fs.FSWatcher;
-      return watcher;
+      const created = Object.assign(new EventEmitter(), {
+        close() { closedWatchers.add(created); },
+      }) as unknown as fs.FSWatcher;
+      watcher = created;
+      return created;
     }) as typeof fs.watch);
     timerSpy = spyOn(globalThis, "setInterval").mockImplementation(((fn: any, ms: number, ...args: any[]) => {
       if (ms !== NEW_DIR_RESCAN_MS) return realSetInterval(fn, ms, ...args);
@@ -184,9 +189,58 @@ describe("new/ periodic rescan (cli#853)", () => {
       path: moved,
     }));
     expect(logs.filter((line) => line.startsWith("tps-mail: new/ watcher for recipient stopped: ENOENT"))).toHaveLength(1);
-    plant("after-watch-error");
+    const path = plant("after-watch-error");
     expect(await until(() => dispatches.length === 1, intervalMs * 2)).toBe(true);
     expect(dispatches).toEqual(["after-watch-error"]);
+    // cli#922 item 3: prove the delivery came through the RESCAN, not the
+    // stub watcher's listener (which stays suppressed in this test).
+    expect(logs).toContain(`tps-mail: promoted by rescan: ${path}`);
+    expect(watchCalls).toBe(0);
+  });
+
+  it("re-arms a stopped watcher on the rescan and delivers through the new watcher", async () => {
+    await boot();
+    expect(watchSpy).toHaveBeenCalledTimes(1);
+    watcher!.emit("error", new Error("injected watcher error"));
+    expect(await until(() => watchSpy.mock.calls.length === 2, intervalMs * 2)).toBe(true);
+    expect(logs.filter((line) => line.includes("re-armed"))).toHaveLength(1);
+    // Stop the rescan: delivery from here can only come from the new watcher.
+    clearInterval(intervals[0]!);
+    const ticksBefore = ticks;
+    suppressWatch = false;
+    plant("after-rearm");
+    expect(await until(() => dispatches.length === 1, 5000)).toBe(true);
+    expect(ticks).toBe(ticksBefore);
+    expect(watchCalls).toBe(1);
+    expect(dispatches).toEqual(["after-rearm"]);
+  });
+
+  it("backs off re-arm attempts on repeated failures", async () => {
+    await boot();
+    expect(watchSpy).toHaveBeenCalledTimes(1);
+    watcher!.emit("error", new Error("injected watcher error"));
+    watchSpy.mockImplementation((() => { throw new Error("injected re-arm failure"); }) as typeof fs.watch);
+    expect(await until(() => ticks >= 8, intervalMs * 12)).toBe(true);
+    // Attempts fall on ticks 1, 2, 4 and 8 (gaps of 1, 2 then 4 ticks), not one
+    // per tick.
+    expect(watchSpy.mock.calls.length - 1).toBe(4);
+    expect(logs.filter((line) => line.includes("still failing after"))).toHaveLength(4);
+    expect(logs.some((line) => line.includes("still failing after 4 re-arm attempt(s)"))).toBe(true);
+  });
+
+  it("closes a re-armed watcher on stop and runs no further tick", async () => {
+    await boot();
+    watcher!.emit("error", new Error("injected watcher error"));
+    expect(await until(() => watchSpy.mock.calls.length === 2, intervalMs * 2)).toBe(true);
+    const rearmed = watcher!;
+    expect(closedWatchers.has(rearmed)).toBe(false);
+    controller.abort();
+    await start;
+    start = undefined;
+    expect(closedWatchers.has(rearmed)).toBe(true);
+    const ticksAtStop = ticks;
+    await sleep(intervalMs * 2);
+    expect(ticks).toBe(ticksAtStop);
   });
 
   it("retries a busy promotion on the next rescan tick", async () => {
