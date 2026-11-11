@@ -1142,8 +1142,8 @@ export async function deliverToRemoteBranch(
   // rejection must still be handled.
   void acked.catch(() => {});
 
-  // Safety net for a send that never settles. Measured from after the connect,
-  // so it cannot pre-empt the ACK window that starts with the deliver.
+  // Safety net for a send that never settles. It starts after the connect, so
+  // the connect does not shorten the ACK window that starts with the deliver.
   const attemptMs = connectMs + ackTimeoutMs;
   let attemptTimer: ReturnType<typeof setTimeout> | null = null;
   const attemptDeadline = new Promise<never>((_resolve, reject) => {
