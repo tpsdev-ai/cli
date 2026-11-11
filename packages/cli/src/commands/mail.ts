@@ -1,6 +1,6 @@
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
-import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
+import { deliverToSandbox, deliverToRemoteBranch, EXIT_DELIVERY_UNCONFIRMED, MailDeliveryUnconfirmedError, parseMailAckTimeoutMs, resolveMailAckTimeoutMs } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
@@ -100,6 +100,17 @@ function sendReceiptJson(
   });
 }
 
+/** The signed envelope's messageId, which this path also uses as the wire
+ *  delivery id, so a caller's `--message-id` re-send reuses the id. */
+function signedMessageId(signedBody: string): string | undefined {
+  try {
+    const env = JSON.parse(signedBody) as { messageId?: unknown };
+    return typeof env.messageId === "string" ? env.messageId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
   agent?: string;
@@ -116,6 +127,8 @@ interface MailArgs {
   messageId?: string;
   /** cli#429: read the message body from stdin (fd 0) instead of argv. */
   stdin?: boolean;
+  /** cli#962: how long to wait for the branch's delivery ACK, in milliseconds. */
+  ackTimeout?: string;
   /** cli#429: the signed messageId this message replies to. */
   replyTo?: string;
   /**
@@ -297,6 +310,18 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
       const to = validateAgent(args.agent);
 
+      // cli#962: the ACK wait is a positive number of milliseconds. Refuse a bad
+      // flag before any input is read; a bad env var is refused when the remote
+      // route needs it.
+      if (args.ackTimeout !== undefined) {
+        try {
+          parseMailAckTimeoutMs(args.ackTimeout, "--ack-timeout");
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      }
+
       // Build the message body. Three sources, mutually exclusive (cli#429):
       //   --stdin   read the body from fd 0
       //   --task    construct a task envelope
@@ -378,7 +403,27 @@ export async function runMail(args: MailArgs): Promise<void> {
       // A recipient registered for remote delivery (GAL entry + remote.json).
       if (route.kind === "remote-branch") {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(route.branchId, { to, from, body: args.message });
+        let ackTimeoutMs: number;
+        try {
+          ackTimeoutMs = resolveMailAckTimeoutMs(process.env, args.ackTimeout);
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+        try {
+          await deliverToRemoteBranch(
+            route.branchId,
+            { id: signedMessageId(args.message), to, from, body: args.message },
+            { ackTimeoutMs },
+          );
+        } catch (err) {
+          if (err instanceof MailDeliveryUnconfirmedError) {
+            console.error(err.message);
+            process.exitCode = EXIT_DELIVERY_UNCONFIRMED;
+            return;
+          }
+          throw err;
+        }
         if (args.json) {
           console.log(
             sendReceiptJson("remote-branch", args.message, {

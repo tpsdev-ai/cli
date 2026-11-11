@@ -925,8 +925,72 @@ export function startRelay(agentId: string): () => void {
 }
 
 /** The overall bound for a remote delivery (the connection AND the ACK wait)
- *  when the caller does not give one. */
+ *  when the caller does not give one. The ACK window (below) is added to it, so
+ *  a missing ACK is reported as unconfirmed at its own, configurable deadline
+ *  rather than as this overall timeout. */
 export const DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS = 20_000;
+
+/** The default wait for the branch's MSG_MAIL_ACK after a MAIL_DELIVER. */
+export const DEFAULT_MAIL_ACK_TIMEOUT_MS = 30_000;
+
+/** The environment variable that overrides the ACK wait, in milliseconds. */
+export const MAIL_ACK_TIMEOUT_ENV = "TPS_MAIL_ACK_TIMEOUT_MS";
+
+/** The flag that overrides the ACK wait, in milliseconds. */
+export const MAIL_ACK_TIMEOUT_FLAG = "--ack-timeout";
+
+/** Exit status for a delivery whose ACK did not arrive: EX_TEMPFAIL (75). */
+export const EXIT_DELIVERY_UNCONFIRMED = 75;
+
+/** A bad ACK-window value: names the source (flag or env var) and what it takes. */
+export class MailAckTimeoutConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MailAckTimeoutConfigError";
+  }
+}
+
+/** Parse one positive integer number of milliseconds, or refuse it by name. */
+export function parseMailAckTimeoutMs(raw: string, source: string): number {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) {
+    throw new MailAckTimeoutConfigError(`${source} must be a positive integer number of milliseconds (got "${raw}")`);
+  }
+  const ms = Number(trimmed);
+  if (!Number.isSafeInteger(ms) || ms <= 0) {
+    throw new MailAckTimeoutConfigError(`${source} must be a positive integer number of milliseconds (got "${raw}")`);
+  }
+  return ms;
+}
+
+/** Resolve the ACK wait: the flag wins over the environment variable, which
+ *  wins over DEFAULT_MAIL_ACK_TIMEOUT_MS. */
+export function resolveMailAckTimeoutMs(env: NodeJS.ProcessEnv = process.env, flag?: string): number {
+  if (flag !== undefined) return parseMailAckTimeoutMs(flag, MAIL_ACK_TIMEOUT_FLAG);
+  const raw = env[MAIL_ACK_TIMEOUT_ENV];
+  if (raw === undefined || raw === "") return DEFAULT_MAIL_ACK_TIMEOUT_MS;
+  return parseMailAckTimeoutMs(raw, MAIL_ACK_TIMEOUT_ENV);
+}
+
+/** A delivery whose ACK did not arrive inside the window. The transport was
+ *  closed, but the branch may already have written the record — so a re-send
+ *  must reuse the message id for the branch to recognise it. */
+export class MailDeliveryUnconfirmedError extends Error {
+  readonly messageId: string;
+  readonly branchId: string;
+  readonly ackTimeoutMs: number;
+
+  constructor(messageId: string, branchId: string, ackTimeoutMs: number) {
+    super(
+      `Delivery unconfirmed: no ACK from branch "${branchId}" for message ${messageId} within ${ackTimeoutMs}ms; ` +
+        `the message may still arrive. If you re-send, reuse --message-id ${messageId} so the branch can recognise it as a duplicate.`,
+    );
+    this.name = "MailDeliveryUnconfirmedError";
+    this.messageId = messageId;
+    this.branchId = branchId;
+    this.ackTimeoutMs = ackTimeoutMs;
+  }
+}
 
 /** Thrown when a remote delivery exceeds its overall bound. NAMED so a caller
  *  can tell a bounded timeout (the transport was CLOSED) from any other
@@ -940,11 +1004,16 @@ export class RemoteDeliveryTimeoutError extends Error {
 }
 
 export interface RemoteBranchDeliveryOptions {
-  /** Overall bound for the WHOLE delivery — the connection AND the ACK wait —
+  /** Overall bound for one delivery attempt (the connection and the ACK wait),
    *  in milliseconds. On expiry the in-flight transport/channel is CLOSED and
    *  the attempt rejects with a `RemoteDeliveryTimeoutError`. Omitted/<=0 uses
-   *  `DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS`. */
+   *  `DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS` plus the ACK window, so the ACK
+   *  window elapses first. */
   timeoutMs?: number;
+  /** Wait for the branch's MSG_MAIL_ACK, in milliseconds. Omitted uses the
+   *  `TPS_MAIL_ACK_TIMEOUT_MS` environment variable, else
+   *  `DEFAULT_MAIL_ACK_TIMEOUT_MS`. */
+  ackTimeoutMs?: number;
 }
 
 export async function deliverToRemoteBranch(
@@ -979,8 +1048,13 @@ export async function deliverToRemoteBranch(
   // (the initial open/connect has no application-level timeout) can hang a
   // caller forever; on expiry the transport is CLOSED so no half-open socket is
   // left behind.
+  const ackTimeoutMs = opts.ackTimeoutMs === undefined
+    ? resolveMailAckTimeoutMs()
+    : parseMailAckTimeoutMs(String(opts.ackTimeoutMs), "ackTimeoutMs");
   const overallMs =
-    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0 ? opts.timeoutMs : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
+    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
+      ? opts.timeoutMs
+      : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS + ackTimeoutMs;
   // A closer for the channel once it exists, so BOTH the expiry handler and the
   // finally can tear it down. Starts as a no-op (there is nothing to close
   // before connect returns).
@@ -1031,8 +1105,8 @@ export async function deliverToRemoteBranch(
     const acked = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
         ch.offMessage(handler);
-        reject(new Error("Delivery timeout (5s)"));
-      }, 5000);
+        reject(new MailDeliveryUnconfirmedError(String(msgId), branchId, ackTimeoutMs));
+      }, ackTimeoutMs);
 
       const handler = (msg: TpsMessage) => {
         if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
