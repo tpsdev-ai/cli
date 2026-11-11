@@ -44,11 +44,13 @@ block and a followed script differ only in their initial state. Here-document bo
 a here-document passed to a shell is refused rather than executed. It is a fail-closed
 lint for reviewed changes: it passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
-it cannot resolve is refused unless a reviewed allowlist entry names it. It is not a boundary
+it cannot resolve is refused unless a reviewed allowlist entry names it; an
+unresolved-invocation refusal names the step and the invocation path. It is not a boundary
 against an author who deliberately evades it; review is, and a runtime npm
 guard in CI is the structural fix, tracked separately (cli#948). Installs inside
 followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
-`package.json` are not inspected.
+`package.json` are not inspected. A `$'...'` span is a quote in which a backslash
+escapes the next character and `$(` and a backtick are literal.
 
 In a followed shell script, a logical line (continuations joined, word-boundary
 comments stripped, here-document headers matched after comment stripping,
@@ -80,6 +82,9 @@ An install or relative invocation after a non-literal `cd`, `pushd`, `popd` or
 unknown, and only a `cd` to an absolute path inside the repository, to a path
 anchored to the repository root, or to the script's own directory makes it
 known again. A literal absolute `cd` outside the repository leaves it unknown.
+A step whose `working-directory` is not a literal relative path (a `${{ ... }}`
+expression or any other `$`, or a leading `/`) starts at an unknown cwd, so a
+relative invocation or a cwd-bound install on it is unresolved.
 
 Installs inside followed JavaScript or TypeScript scripts, node `-e`/`-p` or
 node here-document payloads, and `npm run`/`bun run` targets in `package.json`

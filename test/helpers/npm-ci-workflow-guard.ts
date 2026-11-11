@@ -339,8 +339,11 @@ function hasUnbalancedLineQuotes(lines: PhysicalLine[]): boolean {
       if (char === "\\" && quote !== "'") {
         index++;
       } else if (quote === "") {
-        if (char === "'" || char === '"') quote = char;
-      } else if (char === quote) {
+        if (char === "$" && text[index + 1] === "'") {
+          quote = "ansi";
+          index++;
+        } else if (char === "'" || char === '"') quote = char;
+      } else if (quote === "ansi" ? char === "'" : char === quote) {
         quote = "";
       }
     }
@@ -638,6 +641,26 @@ function shellTokens(line: string): ShellToken[] {
         }
         continue;
       }
+      if (next === "$" && line[index + 1] === "'") {
+        // ANSI-C quoting: a backslash escapes the next character, and a
+        // `$(`/backtick inside it is literal text.
+        text += "$'";
+        quoted = true;
+        index += 2;
+        while (index < line.length) {
+          const inner = line[index];
+          if (inner === "\\") {
+            text += inner;
+            index++;
+            if (index < line.length) text += line[index++];
+            continue;
+          }
+          text += inner;
+          index++;
+          if (inner === "'") break;
+        }
+        continue;
+      }
       if (next === "$" && line[index + 1] === "(") {
         text += next;
         index++;
@@ -690,9 +713,12 @@ function stripWordBoundaryComment(line: string): string {
       continue;
     }
     if (quote === "") {
-      if (char === "'" || char === '"') quote = char;
+      if (char === "$" && line[index + 1] === "'") {
+        quote = "ansi";
+        index++;
+      } else if (char === "'" || char === '"') quote = char;
       else if (char === "#" && (index === 0 || /\s|[;&|()]/.test(line[index - 1]))) return line.slice(0, index);
-    } else if (char === quote) quote = "";
+    } else if (quote === "ansi" ? char === "'" : char === quote) quote = "";
   }
   return line;
 }
@@ -723,10 +749,15 @@ function quoteStartMask(raw: string[]): boolean[] {
           index++;
           continue;
         }
+        if (char === "$" && line[index + 1] === "'") {
+          quote = "ansi";
+          index++;
+          continue;
+        }
         if (char === "'" || char === '"') quote = char;
-      } else if (char === "\\" && quote === '"') {
+      } else if (char === "\\" && (quote === '"' || quote === "ansi")) {
         index++;
-      } else if (char === quote) quote = "";
+      } else if (quote === "ansi" ? char === "'" : char === quote) quote = "";
     }
     if (quote === "") {
       // Unknown => refuse: a here-document header is matched after the comment
@@ -874,6 +905,14 @@ function parenSpan(line: string, open: number): SpanMatch | null {
   for (let index = open; index < line.length; index++) {
     const char = line[index];
     if (quote !== "") {
+      if (quote === "ansi") {
+        if (char === "\\") {
+          index++;
+          continue;
+        }
+        if (char === "'") quote = "";
+        continue;
+      }
       if (char === "\\" && quote === '"') {
         index++;
         continue;
@@ -888,6 +927,11 @@ function parenSpan(line: string, open: number): SpanMatch | null {
       continue;
     }
     if (char === "\\") {
+      index++;
+      continue;
+    }
+    if (char === "$" && line[index + 1] === "'") {
+      quote = "ansi";
       index++;
       continue;
     }
@@ -923,11 +967,22 @@ function parenSpan(line: string, open: number): SpanMatch | null {
 function commandSubstitutions(line: string, tail = "", quoteContinued = false): { bodies: string[]; unparsed: string[] } {
   const bodies: string[] = [];
   const unparsed: string[] = [];
-  let quote: "" | "'" | '"' = "";
+  let quote: "" | "'" | '"' | "ansi" = "";
   let index = 0;
   while (index < line.length) {
     const char = line[index];
     if (quote === "'") {
+      if (char === "'") quote = "";
+      index++;
+      continue;
+    }
+    if (quote === "ansi") {
+      // ANSI-C quoting: a backslash escapes the next character, and `$(` and a
+      // backtick inside it are literal.
+      if (char === "\\") {
+        index += 2;
+        continue;
+      }
       if (char === "'") quote = "";
       index++;
       continue;
@@ -945,6 +1000,11 @@ function commandSubstitutions(line: string, tail = "", quoteContinued = false): 
       }
     } else {
       if (char === "\\") {
+        index += 2;
+        continue;
+      }
+      if (char === "$" && line[index + 1] === "'") {
+        quote = "ansi";
         index += 2;
         continue;
       }
@@ -1877,11 +1937,16 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
 }
 
 function scanRunBlock(ctx: TreeContext, run: string, cwd: string, label: string) {
+  // A working-directory the scan cannot spell as a literal relative path (a
+  // `${{ ... }}` expression, any other `$`, or a leading `/`) leaves the step's
+  // directory unknown, so every install and invocation on it is refused unless
+  // allowlisted.
+  const cwdUnknown = cwd.includes("$") || cwd.startsWith("/");
   scanShellText(
     ctx,
     {
-      cwd: resolveRepoDir("", cwd, label),
-      cwdUnknown: false,
+      cwd: cwdUnknown ? "" : resolveRepoDir("", cwd, label),
+      cwdUnknown,
       label,
       chain: [],
       file: "",
@@ -2163,7 +2228,7 @@ function assertUnresolvedInvocationsKnown(
   for (const entry of observed.values()) {
     if (allowed.has(unresolvedKey(entry))) continue;
     throw new Error(
-      `assertNpmCiWorkflowTree: unresolved script invocation in ${entry.script} (line ${entry.line}) token ${entry.token}: not on UNRESOLVED_INVOCATION_ALLOWLIST in test/helpers/npm-ci-workflow-guard.ts; a computed path is refused until reviewed`,
+      `assertNpmCiWorkflowTree: unresolved script invocation in ${entry.script} (line ${entry.line}) token ${entry.token}: not on UNRESOLVED_INVOCATION_ALLOWLIST in test/helpers/npm-ci-workflow-guard.ts; a computed path is refused until reviewed; step ${entry.label}; invocation ${entry.chain.join(" -> ")}`,
     );
   }
 }

@@ -3364,3 +3364,140 @@ describe("the workflow guard keeps one quote state across nested substitution bo
     }
   }
 });
+
+describe("the workflow guard follows $'...' and refuses a non-literal working-directory (#820 round 11)", () => {
+  // ANSI-C quoting: a backslash escapes the next character, so `$'\''` is one
+  // quote character rather than a close and a reopen; `$(` and a backtick
+  // inside it are literal.
+  it.each([
+    ["a run block", false],
+    ["a followed script", true],
+  ])("follows the install after an ANSI-C quoted quote in %s", (_label, asScript) => {
+    const line = "sep=$'\\''; out=$(bash scripts/inst.sh)";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-ansi-quote",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a run block", false],
+    ["a followed script", true],
+  ])("opens no span for a substitution inside an ANSI-C quote in %s", (_label, asScript) => {
+    const line = "x=$'$(bash scripts/inst.sh)'";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(),
+        root,
+        "workflow-ansi-literal",
+      );
+      expect(report.installs).toBe(0);
+      expect(report.followed).not.toContain("scripts/inst.sh");
+      expect(report.unresolved).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a quoted apostrophe inside a tr body", `echo "$(tr -d '"' <f)" "$(bash scripts/inst.sh)"`],
+    ["a quoted apostrophe in an assigned tr body", `clean="$(tr -d '"' <f)"; out="$(bash scripts/inst.sh)"`],
+    ["an apostrophe inside a printf body", `msg="$(printf "%s's" "$u")"; out="$(bash scripts/inst.sh)"`],
+  ])("follows an install after %s", (_label, line) => {
+    for (const asScript of [false, true]) {
+      const root = makeTreeFixture({
+        "scripts/inst.sh": "npm ci\n",
+        "package-lock.json": "{}\n",
+        ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+      });
+      try {
+        const report = assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-nested-quotes",
+        );
+        expect(report.installs).toBe(1);
+        expect(report.followed).toContain("scripts/inst.sh");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  for (const where of ["${{ inputs.dir }}", "/abs"]) {
+    for (const asAction of [false, true]) {
+      it(`refuses a ${where} working-directory on a ${asAction ? "composite action" : "workflow"} step`, () => {
+        const action = [
+          "name: setup",
+          "runs:",
+          "  using: composite",
+          "  steps:",
+          `    - working-directory: ${where}`,
+          "      run: bash scripts/inst.sh",
+        ].join("\n");
+        const root = makeTreeFixture({
+          "scripts/inst.sh": "npm ci\n",
+          "package-lock.json": "{}\n",
+          ...(asAction ? { ".github/actions/setup/action.yml": action } : {}),
+        });
+        const workflow = asAction
+          ? "jobs:\n  build:\n    steps:\n      - uses: ./.github/actions/setup\n"
+          : workflowStep("bash scripts/inst.sh", where);
+        try {
+          expect(() => assertNpmCiWorkflowTree(
+            workflow,
+            new Set(["package-lock.json"]),
+            root,
+            "workflow-workdir",
+          )).toThrow(/non-literal directory change/);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+
+  it("names both followed scripts and the step in a nested unresolved refusal", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "bash scripts/inner.sh\n",
+      "scripts/inner.sh": "echo before\nbash \"$x\"\n",
+    });
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/outer.sh", "."),
+          new Set(),
+          root,
+          "workflow-nested-label",
+        );
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message).toContain("unresolved script invocation in scripts/inner.sh (line 2) token \"$x\"");
+      expect(message).toContain("workflow workflow-nested-label job build step 1");
+      expect(message).toContain("scripts/outer.sh -> scripts/inner.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
