@@ -643,7 +643,8 @@ describe("a --message-id re-send re-checks the key and the stored envelope", () 
     await firstSend(id);
     const path = sentEnvelopeFile(id);
     const stored = JSON.parse(readFileSync(path, "utf-8")) as Envelope;
-    // A version no receiver accepts is checked before any key is read.
+    // The unsupported version fails verifyStoredEnvelope's structural check
+    // before signature verification.
     stored.v = 2;
     writeFileSync(path, JSON.stringify(stored));
     const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
@@ -914,8 +915,45 @@ describe("an inbound chain a re-send could not reproduce is refused on a fresh s
     expect(existsSync(sentEnvelopeFile(id))).toBe(false);
     expect(branch.deliveries).toHaveLength(0);
   }, 20_000);
-});
 
+  test("a human hop with no signature key is refused by name", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const now = new Date().toISOString();
+    const id = "99999999-9999-4999-8999-999999999994";
+    const result = await runSend(
+      ["--stdin", "--message-id", id, "--ack-timeout", "2000"],
+      {
+        TPS_INBOUND_CHAIN_JSON: JSON.stringify([
+          { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates" },
+        ]),
+      },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('inbound delegation chain hop 0 for "agent-a" is human-kind and must have a null signature');
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    expect(branch.deliveries).toHaveLength(0);
+  }, 20_000);
+
+  test("a human hop with a string signature is refused by name", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const now = new Date().toISOString();
+    const id = "99999999-9999-4999-8999-999999999995";
+    const result = await runSend(
+      ["--stdin", "--message-id", id, "--ack-timeout", "2000"],
+      {
+        TPS_INBOUND_CHAIN_JSON: JSON.stringify([
+          { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates", signature: "ed25519:AAAA" },
+        ]),
+      },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('inbound delegation chain hop 0 for "agent-a" is human-kind and must have a null signature');
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    expect(branch.deliveries).toHaveLength(0);
+  }, 20_000);
+});
 describe("the stored signed envelope has a reuse window", () => {
   test("an entry older than the window is not reused and is removed", async () => {
     const root = process.env.TPS_MAIL_DIR!;

@@ -13,7 +13,9 @@ export {
 
 /**
  * Parse TPS_INBOUND_CHAIN_JSON into a ChainEntry array.
- * Returns null if unset, empty, or not a JSON array.
+ * Returns null if unset, empty, not a JSON array, or a reached entry has a
+ * non-string agent, timestamp or rationale, or a kind other than "human" or
+ * "agent".
  * Throws InboundChainShapeError for a hop whose signature is not the one its
  * kind carries in a signed envelope: null for a human hop, a string for an
  * agent hop. Those shapes would make the fresh send fail or store a chain a
