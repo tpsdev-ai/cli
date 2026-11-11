@@ -1,14 +1,16 @@
 /**
- * cli#970 item 2 — `mail relay stop` removes the pid record only while it
- * still holds the bytes the stop read. A relay that starts and writes its own
- * record before the removal keeps it, and the output names the kept record.
+ * cli#970 item 2 — `mail relay stop` compares the relay pid record's bytes
+ * before it removes the path. A record a new relay wrote after that read is
+ * kept and the output names the kept record. With no record lock, a write
+ * between the compare and the unlink can still be removed.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
+import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
+import { snapshotPidRecord } from "../src/commands/branch.js";
 
 const CASE_TIMEOUT_MS = 20_000;
 const WAIT_DEADLINE_MS = 5_000;
@@ -57,6 +59,13 @@ async function waitUntil(check: () => boolean, what: string): Promise<void> {
     if (Date.now() >= deadline) throw new Error(`timed out after ${WAIT_DEADLINE_MS} ms waiting for ${what}`);
     await new Promise((r) => setTimeout(r, 20));
   }
+}
+
+/** Replace the record with a directory: `readPidFile` reports it unreadable for
+ *  every uid, root included. */
+function leaveUnreadableRecord(): void {
+  rmSync(relayPid);
+  mkdirSync(relayPid);
 }
 
 beforeEach(() => {
@@ -148,6 +157,196 @@ describe("mail relay stop keeps a record replaced before removal", () => {
         `Recorded relay process (pid ${planned.pid}) is gone; pid file ${relayPid} now belongs to a different relay process (pid ${replacement.pid}) and was kept.`,
       );
       expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record rewritten after the pre-signal snapshot is kept and its process is not signalled",
+    async () => {
+      const planned = spawnChild();
+      const replacement = spawnChild();
+      writeFileSync(relayPid, record(planned.pid, childToken(planned.pid)));
+      const replacementBytes = record(replacement.pid, childToken(replacement.pid));
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        const snapshot = snapshotPidRecord(relayPid);
+        reads++;
+        // The pre-signal snapshot names the planned relay; the record changes
+        // after that read and before the signal goes out.
+        if (reads === 2) writeFileSync(relayPid, replacementBytes);
+        return snapshot;
+      });
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+        setRelayStopRecordReader(previousReader);
+      }
+
+      await waitUntil(() => pidState(planned.pid) === "gone", "the targeted relay to exit");
+      expect(reads).toBe(2);
+      expect(signals).toEqual([planned.pid]);
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(logs.join("\n")).toContain(
+        `Mail relay stopped (pid=${planned.pid}); pid file ${relayPid} now belongs to a different relay process (pid ${replacement.pid}) and was kept.`,
+      );
+      expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record left unreadable after the relay exits fails the stop at the final check",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const previousSignal = setRelayStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        leaveUnreadableRecord();
+      });
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          "could not be read at the final check",
+        );
+      } finally {
+        setRelayStopSignal(previousSignal);
+      }
+
+      await waitUntil(() => pidState(child.pid) === "gone", "the targeted relay to exit");
+      expect(existsSync(relayPid)).toBe(true);
+      expect(statSync(relayPid).isDirectory()).toBe(true);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record left unreadable in the gone branch fails the stop at the final check",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const previousSignal = setRelayStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        leaveUnreadableRecord();
+        throw Object.assign(new Error(`kill ESRCH (pid ${pid})`), { code: "ESRCH" });
+      });
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          "could not be read at the final check",
+        );
+      } finally {
+        setRelayStopSignal(previousSignal);
+      }
+
+      await waitUntil(() => pidState(child.pid) === "gone", "the targeted relay to exit");
+      expect(existsSync(relayPid)).toBe(true);
+      expect(statSync(relayPid).isDirectory()).toBe(true);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record rewritten with the same pid and different bytes before removal is kept",
+    async () => {
+      const child = spawnChild();
+      const token = childToken(child.pid);
+      writeFileSync(relayPid, record(child.pid, token));
+      // The same identity, serialized with the keys in the other order.
+      const rewritten = `${JSON.stringify({ startToken: token, pid: child.pid })}\n`;
+
+      const previousSignal = setRelayStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        writeFileSync(relayPid, rewritten);
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+      }
+
+      await waitUntil(() => pidState(child.pid) === "gone", "the targeted relay to exit");
+      expect(logs.join("\n")).toContain(
+        `Mail relay stopped (pid=${child.pid}); pid file ${relayPid} no longer holds the record this stop read and was kept.`,
+      );
+      expect(readFileSync(relayPid, "utf8")).toBe(rewritten);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record rewritten to name a different, gone pid before removal is kept",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+      const other = spawnChild();
+      const otherBytes = record(other.pid, childToken(other.pid));
+      process.kill(other.pid, "SIGKILL");
+      await waitUntil(() => pidState(other.pid) === "gone", "the other child to exit");
+
+      const previousSignal = setRelayStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        writeFileSync(relayPid, otherBytes);
+      });
+      const { logs, restore } = captureLogs();
+      try {
+        await runMail({ action: "relay", agent: "stop" });
+      } finally {
+        restore();
+        setRelayStopSignal(previousSignal);
+      }
+
+      await waitUntil(() => pidState(child.pid) === "gone", "the targeted relay to exit");
+      expect(logs.join("\n")).toContain(
+        `Mail relay stopped (pid=${child.pid}); pid file ${relayPid} no longer holds the record this stop read and was kept.`,
+      );
+      expect(readFileSync(relayPid, "utf8")).toBe(otherBytes);
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "a record rewritten after the first read is not signalled",
+    async () => {
+      const planned = spawnChild();
+      const replacement = spawnChild();
+      writeFileSync(relayPid, record(planned.pid, childToken(planned.pid)));
+      const replacementBytes = record(replacement.pid, childToken(replacement.pid));
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        const snapshot = snapshotPidRecord(relayPid);
+        reads++;
+        if (reads === 1) writeFileSync(relayPid, replacementBytes);
+        return snapshot;
+      });
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`,
+        );
+      } finally {
+        setRelayStopSignal(previousSignal);
+        setRelayStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(2);
+      expect(signals).toEqual([]);
+      expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
+      expect(pidState(planned.pid)).toBe("alive");
       expect(pidState(replacement.pid)).toBe("alive");
     },
     CASE_TIMEOUT_MS,

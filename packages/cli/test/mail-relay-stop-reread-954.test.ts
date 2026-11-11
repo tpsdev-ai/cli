@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
+import { snapshotPidRecord } from "../src/commands/branch.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 
@@ -51,8 +52,8 @@ function installSecondRead(second: () => PidFileState): { reads: () => number; r
   let reads = 0;
   const previous = setRelayStopRecordReader(() => {
     reads++;
-    if (reads === 1) return readRelayPidFile();
-    return second();
+    if (reads === 1) return snapshotPidRecord(relayPid);
+    return { state: second(), raw: null };
   });
   return { reads: () => reads, restore: () => setRelayStopRecordReader(previous) };
 }
@@ -116,11 +117,11 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       let reads = 0;
       const previousReader = setRelayStopRecordReader(() => {
-        const state = readRelayPidFile();
+        const snapshot = snapshotPidRecord(relayPid);
         reads++;
         // The record changes after the first read, before the re-read.
         if (reads === 1) writeFileSync(relayPid, staleRecord(child));
-        return state;
+        return snapshot;
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
@@ -152,12 +153,12 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       let reads = 0;
       const previousReader = setRelayStopRecordReader(() => {
-        const state = readRelayPidFile();
+        const snapshot = snapshotPidRecord(relayPid);
         reads++;
         if (reads === 1) {
           writeFileSync(relayPid, record(replacement.pid, childToken(replacement.pid)));
         }
-        return state;
+        return snapshot;
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));

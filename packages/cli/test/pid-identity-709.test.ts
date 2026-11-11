@@ -403,8 +403,9 @@ describe("relay stop identity", () => {
       expect(token).not.toBeNull();
       writeFileSync(relayPid, relayRecord(child.pid, token));
       const previousRemoval = setRelayPidRemoval(() => {
-        // Force unlink to fail for every uid, root included, without relying on
-        // a mode bit.
+        // Replace the remover with a stub that throws, so the removal-failure
+        // path runs for every uid, root included, without relying on a mode
+        // bit.
         throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
       });
       const previous = setRelayStopSignal((pid) => {
