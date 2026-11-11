@@ -126,10 +126,10 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     expect(b?.ackedAt).toBeUndefined();
   });
 
-  test("ack refuses an empty --agent value and acks nothing", async () => {
+  test("ack refuses an empty --agent value, or --agent followed by another flag, and acks nothing", async () => {
     const { idA, idB } = seed();
-    for (const flag of ["--agent=", "--agent"]) {
-      const r = await run(["mail", "ack", idA, flag]);
+    for (const tail of [["--agent="], ["--agent"], ["--agent", "--max-age", "0s"]]) {
+      const r = await run(["mail", "ack", idA, ...tail]);
       expect(r.status).not.toBe(0);
       expect(r.out).toContain("--agent requires a value");
     }
@@ -185,10 +185,10 @@ describe("tps mail ack/nack agent flags (cli#903)", () => {
     expect(b?.nackedAt).toBeUndefined();
   });
 
-  test("nack refuses an empty --agent value and nacks nothing", async () => {
+  test("nack refuses an empty --agent value, or --agent followed by another flag, and nacks nothing", async () => {
     const { idA, idB } = seed();
-    for (const flag of ["--agent=", "--agent"]) {
-      const r = await run(["mail", "nack", idA, "--reason=test", flag]);
+    for (const tail of [["--agent="], ["--agent"], ["--agent", "--max-age", "0s"]]) {
+      const r = await run(["mail", "nack", idA, "--reason=test", ...tail]);
       expect(r.status).not.toBe(0);
       expect(r.out).toContain("--agent requires a value");
     }
