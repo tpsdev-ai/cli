@@ -5,11 +5,12 @@
  * nothing.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
+import { snapshotPidRecord } from "../src/utils/pid-file.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 
@@ -46,13 +47,24 @@ function staleRecord(child: Bun.Subprocess): string {
   return record(child.pid, foreignStartToken(childToken(child.pid)));
 }
 
-/** Makes the first read the real record and the second read `second`. */
+/** Makes the first read the real record and the second read `second`, with the
+ *  second snapshot's raw bytes read from the path that state names. `raw` is
+ *  null when the state is missing or unreadable, or the read fails. */
 function installSecondRead(second: () => PidFileState): { reads: () => number; restore: () => void } {
   let reads = 0;
   const previous = setRelayStopRecordReader(() => {
     reads++;
-    if (reads === 1) return readRelayPidFile();
-    return second();
+    if (reads === 1) return snapshotPidRecord(relayPid);
+    const state = second();
+    let raw: Buffer | null = null;
+    if (state.kind !== "missing" && state.kind !== "unreadable") {
+      try {
+        raw = readFileSync(state.path);
+      } catch {
+        raw = null;
+      }
+    }
+    return { state, raw };
   });
   return { reads: () => reads, restore: () => setRelayStopRecordReader(previous) };
 }
@@ -116,11 +128,11 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       let reads = 0;
       const previousReader = setRelayStopRecordReader(() => {
-        const state = readRelayPidFile();
+        const snapshot = snapshotPidRecord(relayPid);
         reads++;
         // The record changes after the first read, before the re-read.
         if (reads === 1) writeFileSync(relayPid, staleRecord(child));
-        return state;
+        return snapshot;
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
@@ -152,12 +164,12 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       let reads = 0;
       const previousReader = setRelayStopRecordReader(() => {
-        const state = readRelayPidFile();
+        const snapshot = snapshotPidRecord(relayPid);
         reads++;
         if (reads === 1) {
           writeFileSync(relayPid, record(replacement.pid, childToken(replacement.pid)));
         }
-        return state;
+        return snapshot;
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));

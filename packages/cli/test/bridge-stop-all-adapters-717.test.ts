@@ -619,8 +619,9 @@ describe("child environment", () => {
 });
 
 describe("guarded pid-file reads", () => {
-  // The only case whose child never exits: it proves the armed timer, the kill and
-  // the named error, which every prompt child above leaves unexercised (~8 s).
+  // The only FIFO case whose child never exits on its own: it proves the armed
+  // timer, the kill and the named error, which the prompt FIFO cases below leave
+  // unexercised (~8 s).
   fifoTest("a hung FIFO child is killed at the armed deadline and reports the named error", async () => {
     await expect(runFifoRead("await new Promise(() => {});")).rejects.toThrow("FIFO child deadline exceeded");
   }, FIFO_TEST_TIMEOUT);
