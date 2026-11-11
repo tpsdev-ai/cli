@@ -34,10 +34,13 @@ The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
 tracks `cd` through one resolution state, scans command substitutions (`$(...)`
-and backtick spans, each with its own `cd` and nested state; a backtick span it
-cannot parse reliably is refused), resolves wrapped interpreters and literal
-invocations, and applies the install classifier; a run block and a followed
-script differ only in their initial state. Here-document bodies are install-screened;
+and backtick spans, each with its own `cd` and nested state; one left-to-right
+lexer carries quote state and span nesting together, so a substitution body
+whose own lexing ends inside a quote or an unclosed span is refused rather than
+skipped, as is a line whose open quote or span never closes; a substitution
+that does not close on its logical line is not followed), resolves wrapped
+interpreters and literal invocations, and applies the install classifier; a run
+block and a followed script differ only in their initial state. Here-document bodies are install-screened;
 a here-document passed to a shell is refused rather than executed. It is a fail-closed
 lint for reviewed changes: it passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install

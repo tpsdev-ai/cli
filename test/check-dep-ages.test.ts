@@ -3307,3 +3307,60 @@ describe("the workflow guard treats a single-quoted $() as literal text (#820 ro
     }
   });
 });
+
+describe("the workflow guard keeps one quote state across nested substitution bodies (#820 round 10)", () => {
+  // An old-style backtick body ends at the next unescaped backtick whatever
+  // quotes it holds, and the outer double quote stays open across it. A lexer
+  // that lets the body's quotes change the outer state then reads the next
+  // apostrophe as opening a single quote and skips the live substitution after
+  // it.
+  const probes: Array<[string, string]> = [
+    ["a quote and apostrophe inside a backtick body", "echo \"`echo \"x` don't $(bash scripts/evil.sh)\""],
+    ["an apostrophe and no space inside a backtick body", "echo \"`echo \"x`don't$(bash scripts/evil.sh)\""],
+    ["an apostrophe before a backtick then a substitution", "echo \"`echo \"x' ` $(bash scripts/evil.sh)\""],
+    ["a hidden backtick install inside a backtick body", "echo \"`echo \"x` don't `bash scripts/evil.sh`\""],
+  ];
+
+  it("lexes a quoted ) inside $() and still follows an install in its place", () => {
+    const root = makeTreeFixture({ "scripts/inst.sh": "npm ci\n" });
+    try {
+      const balanced = assertNpmCiWorkflowTree(
+        workflowStep('echo "$(echo ")")"', "."),
+        new Set(),
+        root,
+        "workflow-paren-quoted",
+      );
+      expect(balanced.installs).toBe(0);
+      expect(balanced.unresolved).toEqual([]);
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('echo "$(bash scripts/inst.sh)"', "."),
+        new Set(),
+        root,
+        "workflow-paren-install",
+      )).toThrow(/cannot bind the npm install/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  for (const [label, line] of probes) {
+    for (const asScript of [false, true]) {
+      it(`refuses ${label} as a ${asScript ? "followed script" : "run block"}`, () => {
+        const root = makeTreeFixture({
+          "scripts/evil.sh": "npm ci\n",
+          ...(asScript ? { "scripts/install.sh": `set -euo pipefail\n${line}\n` } : {}),
+        });
+        try {
+          expect(() => assertNpmCiWorkflowTree(
+            workflowStep(asScript ? "bash scripts/install.sh" : line, "."),
+            new Set(),
+            root,
+            "workflow-lexer-probe",
+          )).toThrow(/cannot bind the npm install|unresolved/);
+        } finally {
+          rmSync(root, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
