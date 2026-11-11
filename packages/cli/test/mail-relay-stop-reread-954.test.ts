@@ -71,6 +71,12 @@ function record(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
 }
 
+/** The refusal guidance every re-read branch appends, naming the pid the first
+ *  read planned to stop. */
+function guidance(pid: number): string {
+  return `The relay process (pid ${pid}) may still be running; check it with ps -p ${pid} and stop it yourself.`;
+}
+
 function staleRecord(child: Bun.Subprocess): string {
   return record(child.pid, foreignStartToken(childToken(child.pid)));
 }
@@ -211,7 +217,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
       }
 
       expect(error?.message).toContain(`holds a stale record for pid ${child.pid}, but it does not prove the process this command verified is gone`);
-      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reads).toBe(2);
       expect(signals).toEqual([]);
       expect(readFileSync(relayPid, "utf8")).toBe(rewritten);
@@ -241,7 +247,8 @@ describe("mail relay stop re-reads the record before signalling", () => {
       }
 
       expect(error?.message).toContain(`now holds a stale record for pid ${other.pid}, not the pid ${child.pid}`);
-      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(error?.message).not.toContain(`ps -p ${other.pid}`);
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(true);
@@ -268,15 +275,20 @@ describe("mail relay stop re-reads the record before signalling", () => {
       });
       const signals: number[] = [];
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
       try {
-        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`,
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
         );
       } finally {
         setRelayStopSignal(previousSignal);
         setRelayStopRecordReader(previousReader);
       }
 
+      expect(error?.message).toContain(`Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`);
+      expect(error?.message).toContain(guidance(planned.pid));
+      expect(error?.message).not.toContain(`ps -p ${replacement.pid}`);
       expect(reads).toBe(2);
       expect(signals).toEqual([]);
       expect(pidState(planned.pid)).toBe("alive");
@@ -299,15 +311,19 @@ describe("mail relay stop re-reads the record before signalling", () => {
         startToken: foreignStartToken(childToken(child.pid)),
       }));
       const signalling = captureSignals();
+      let error: Error | null = null;
       try {
-        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} still names pid ${child.pid}, but its start token changed before it was signalled`,
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
         );
       } finally {
         signalling.restore();
         reader.restore();
       }
 
+      expect(error?.message).toContain(`Mail relay pid file ${relayPid} still names pid ${child.pid}, but its start token changed before it was signalled`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(pidState(child.pid)).toBe("alive");
@@ -323,15 +339,19 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       const reader = installSecondRead(() => ({ kind: "unreadable", path: relayPid }));
       const signalling = captureSignals();
+      let error: Error | null = null;
       try {
-        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} could not be re-read`,
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
         );
       } finally {
         signalling.restore();
         reader.restore();
       }
 
+      expect(error?.message).toContain(`Mail relay pid file ${relayPid} could not be re-read`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(pidState(child.pid)).toBe("alive");
@@ -359,7 +379,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
       }
 
       expect(error?.message).toContain("disappeared before it was signalled");
-      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running; check it with ps -p ${child.pid}`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(true);
@@ -388,7 +408,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
       }
 
       expect(error?.message).toContain(`Mail relay pid file ${relayPid} is now invalid`);
-      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(true);
@@ -405,15 +425,19 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       const reader = installSecondRead(() => ({ kind: "unverified", path: relayPid, pid: child.pid, startToken: null }));
       const signalling = captureSignals();
+      let error: Error | null = null;
       try {
-        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} now names pid ${child.pid}, but that process's identity cannot be verified`,
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
         );
       } finally {
         signalling.restore();
         reader.restore();
       }
 
+      expect(error?.message).toContain(`Mail relay pid file ${relayPid} now names pid ${child.pid}, but that process's identity cannot be verified`);
+      expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
       expect(pidState(child.pid)).toBe("alive");
