@@ -752,6 +752,8 @@ describe("bridge stop re-read exit status (cli#970)", () => {
         return snapshot;
       });
       const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
       const previous = setBridgeStopSignal((pid) => {
         signals.push(pid);
         process.kill(pid, "SIGKILL");
@@ -761,6 +763,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       } finally {
         setBridgeStopSignal(previous);
         setBridgeStopRecordReader(previousReader);
+        restore();
       }
 
       expect(replaced).toBe(true);
@@ -768,6 +771,176 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       expect(readFileSync(path, "utf8")).toBe(replacementBytes);
       expect(pidState(planned.pid)).toBe("gone");
       expect(pidState(replacement.pid)).toBe("alive");
+      expect(lines).toContain(
+        `Bridge (pid ${planned.pid}) stopped; pid file ${path} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record replaced by a non-running record inside the signal window is kept and named",
+    async () => {
+      const planned = spawnSleep();
+      const gone = await spawnReapableChild();
+      const goneToken = tokenOf(gone);
+      killAndWaitGone(gone, goneToken);
+      // A record for a process that is gone: the bytes change, the state does not run.
+      const replacementBytes = record(gone, null);
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+        // A new record lands between the signal and the removal.
+        writeFileSync(path, replacementBytes);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([planned.pid]);
+      expect(readFileSync(path, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Bridge (pid ${planned.pid}) stopped; pid file ${path} no longer holds the record this stop read and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a first-read stale record replaced by a live bridge when an earlier record is signalled is kept and named",
+    async () => {
+      const alpha = spawnSleep();
+      const dead = await spawnReapableChild();
+      const deadToken = tokenOf(dead);
+      killAndWaitGone(dead, deadToken);
+      const alphaPath = join(runDir, "bridge-alpha.pid");
+      const stalePath = join(runDir, "bridge-beta.pid");
+      writeFileSync(alphaPath, record(alpha.pid, tokenOf(alpha.pid)));
+      writeFileSync(stalePath, record(dead, null));
+      expect(readPidFile(stalePath).kind).toBe("stale");
+
+      const replacement = spawnSleep();
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        // Only alpha is signalled. While it stops, a new bridge writes beta's record.
+        process.kill(pid, "SIGKILL");
+        writeFileSync(stalePath, replacementBytes);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([alpha.pid]);
+      expect(pidState(alpha.pid)).toBe("gone");
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(readFileSync(stalePath, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Stale pid file not removed; pid file ${stalePath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a signal that fails with ESRCH keeps a record replaced in the signal window and names it",
+    async () => {
+      const planned = spawnSleep();
+      const replacement = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+        // A new record lands before the failed signal is classified.
+        writeFileSync(path, replacementBytes);
+        throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([planned.pid]);
+      // The ESRCH branch never waits for the exit; collect the child so the
+      // liveness probe cannot see an unreaped one.
+      await planned.exited;
+      expect(pidState(planned.pid)).toBe("gone");
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(readFileSync(path, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Recorded bridge process (pid ${planned.pid}) is gone; pid file ${path} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a duplicate record whose bytes changed after the first record stopped the process is kept and named",
+    async () => {
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(firstPath, record(child.pid, token));
+      writeFileSync(secondPath, record(child.pid, token));
+      const plannedSecond = bridgePidFiles().find((entry) => entry.path === secondPath);
+      expect(plannedSecond?.state.kind).toBe("running");
+
+      const replacement = spawnSleep();
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      // The second record's re-read sees the snapshot taken before the first
+      // record stopped the process; the file itself has already changed.
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        if (readPath === secondPath) {
+          writeFileSync(secondPath, replacementBytes);
+          return plannedSecond!;
+        }
+        return snapshotPidRecord(readPath);
+      });
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+        restore();
+      }
+
+      expect(signals).toEqual([child.pid]);
+      expect(readFileSync(secondPath, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(lines).toContain(
+        `Pid file not removed; pid file ${secondPath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
     },
     TIMEOUT,
   );
