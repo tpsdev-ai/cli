@@ -1,1 +1,0 @@
-- **Bridge outbound replies carry the constructed adapter name, and an adapter-name refusal escapes every character outside printable ASCII.**

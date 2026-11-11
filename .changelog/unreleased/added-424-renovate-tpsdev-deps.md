@@ -1,1 +1,0 @@
-- **Reject nonrelease `@tpsdev-ai/*` dependencies in regular, non-symlinked `package.json` files outside `node_modules` and `.git` (Closes #424).**

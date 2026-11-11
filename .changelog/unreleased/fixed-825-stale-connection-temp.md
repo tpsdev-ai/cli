@@ -1,1 +1,0 @@
-- **A subsequent connection-state record write or host-record listing attempts to remove temp files left by a crash that are older than the age threshold.**

@@ -1,1 +1,0 @@
-- **The `shell-quote` override now resolves 1.11.0, outside the range of GHSA-pqg4-j6r4-53mv.** cli does not import `shell-quote`; it reaches the install only through `react-devtools-core`. `bun audit` reports no vulnerabilities.

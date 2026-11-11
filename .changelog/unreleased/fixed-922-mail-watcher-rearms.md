@@ -1,1 +1,0 @@
-- **A stopped inbox watcher is re-armed from the rescan tick.** After a watcher error, the next rescan tick creates a new watcher; repeated failures back off by 1, 2, 4 … ticks (capped). New mail is watched again as soon as the watcher re-arms, and the stopped, re-armed and still-failing states are logged without a line for every tick a failing re-arm skips.

@@ -1,1 +1,0 @@
-- **`BridgeCore` enforces the `[a-z]+` adapter-name grammar shared with `bridgePidFiles`, refusing invalid names before writing state (Closes #725).**

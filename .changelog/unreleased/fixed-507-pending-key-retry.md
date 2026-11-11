@@ -1,1 +1,0 @@
-- **A Flair public key of exactly `pending` now fails mail verification retryably instead of being rejected as malformed (Closes #507).**

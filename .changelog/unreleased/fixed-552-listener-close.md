@@ -1,1 +1,0 @@
-- **The TCP, host WebSocket, and join WebSocket listeners now settle `close()` with a peer connected and resolve at once when closed.** Each terminates its accepted sockets and force-stops its server rather than waiting on them. Before, a connected peer left `close()` pending, so a branch daemon stopped with `tps branch stop` did not reach `process.exit`.

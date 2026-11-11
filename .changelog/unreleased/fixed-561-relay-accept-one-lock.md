@@ -1,1 +1,0 @@
-- **Relay acceptance serializes receivers with a stable recipient lock and publishes into the selected mailbox.** A timeout publishes no mail record or acceptance marker.

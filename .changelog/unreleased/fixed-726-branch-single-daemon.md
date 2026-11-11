@@ -1,1 +1,0 @@
-- **`tps branch start` refuses to spawn while the recorded process is running (pid + start token match) (Closes #726).** Unverified, unreadable and invalid records also refuse spawning; stale records are replaced on a successful launch. A daemon removes the pid file on shutdown only when a fresh read matches its own pid and start token.

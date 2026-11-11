@@ -1,1 +1,0 @@
-- **Changelog entries are now one fragment file per change under `.changelog/unreleased/`, so pull requests no longer conflict on `CHANGELOG.md`'s `[Unreleased]` block (Closes #449).**

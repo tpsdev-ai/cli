@@ -1,1 +1,0 @@
-- **Mail-task auto-commit handles an unborn HEAD.** The mail auto-commit gate leaves a clean unborn HEAD alone and skips after an indeterminate HEAD probe or failed stale rebase abort.

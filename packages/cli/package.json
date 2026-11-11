@@ -1,6 +1,6 @@
 {
   "name": "@tpsdev-ai/cli",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "TPS Report CLI \u2014 because every agent needs the proper paperwork.",
   "type": "module",
   "bin": {
@@ -19,10 +19,10 @@
     "./utils/relay": "./dist/src/utils/relay.js"
   },
   "optionalDependencies": {
-    "@tpsdev-ai/cli-darwin-arm64": "0.8.0",
-    "@tpsdev-ai/cli-darwin-x64": "0.8.0",
-    "@tpsdev-ai/cli-linux-arm64": "0.8.0",
-    "@tpsdev-ai/cli-linux-x64": "0.8.0"
+    "@tpsdev-ai/cli-darwin-arm64": "0.9.0",
+    "@tpsdev-ai/cli-darwin-x64": "0.9.0",
+    "@tpsdev-ai/cli-linux-arm64": "0.9.0",
+    "@tpsdev-ai/cli-linux-x64": "0.9.0"
   },
   "scripts": {
     "build": "tsc",
