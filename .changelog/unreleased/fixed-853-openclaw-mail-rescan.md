@@ -1,1 +1,0 @@
-- **Recover missed OpenClaw mail watch events**: Periodically rescan bound inboxes and log mail promoted by the rescan.

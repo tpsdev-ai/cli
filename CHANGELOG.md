@@ -20,6 +20,892 @@ node scripts/changelog-fragments.mjs check    # what CI checks
 below this one and deletes them as part of a version cut. **Do not add anything to this section by
 hand**: `check` and `promote` refuse while it holds anything but this note.
 
+## [0.9.0] — 2026-11-11
+
+### Added
+
+- **Audit main daily; on failure, attempt to comment on or open the tracking issue, leaving the run failed if listing or writing fails.**
+
+- **`scripts/promote-latest.sh` dispatches the Docker image build after `latest` has moved (Refs #420).**
+
+  After a successful move, the script runs `gh workflow run docker.yml --repo
+  tpsdev-ai/cli -f version=<version>`. A dispatch that fails leaves the promote
+  in place and exits 6; `--no-docker` skips the dispatch.
+
+- **Reject nonrelease `@tpsdev-ai/*` dependencies in regular, non-symlinked `package.json` files outside `node_modules` and `.git` (Closes #424).**
+
+- **`github_review` refuses `APPROVE` without an authenticated, passing evidence record for the same repository, PR, dispatch, reviewer, session, commit and configured CI job (#426).**
+
+  `scripts/reviewer/run-review-jobs.mjs` writes the record when given the
+  evidence arguments: each job's planned `run:` scripts and its launcher's exit
+  status as `docker exec` returned it. `APPROVE` is also refused unless the store
+  and its key resolve outside every `sandboxMountRoots` path. `REQUEST_CHANGES`
+  and `COMMENT` are unaffected. Its digest is recorded in the audit draft and in
+  an acknowledged signed audit record when that write succeeds.
+
+- **Changelog entries are now one fragment file per change under `.changelog/unreleased/`, so pull requests no longer conflict on `CHANGELOG.md`'s `[Unreleased]` block (Closes #449).**
+
+- **A real-Flair CI lane.**
+  Runs the named test files: memory and registration
+  cases, the mail Agent-read guards, the Presence contract (a capped task
+  served to a signed reader, and a refused Bearer token) and the review-trigger
+  case (Flair stamps a signed non-admin write with its signer, and the loop skips
+  an event that only claims the agent's attribution). A guard scans repository
+  `*.test.ts` and `*.test.js` files outside `node_modules` and `dist`; any reference
+  to `TPS_TEST_REAL_FLAIR` requires lane naming and workflow path coverage.
+  Named files must have at least one expected case.
+  The lane runs against `@tpsdev-ai/flair@0.58.0` on Harper.
+
+- **Add a 7-day release-age gate for dependency resolutions and locked external versions.**
+
+  Bun refuses young versions at resolution time. `scripts/check-dep-ages.mjs` checks every
+  external version in `bun.lock`; young versions require a dated exception in
+  `docs/dep-age-exceptions.md`. Invalid exception lines fail the gate.
+
+- **A signer inventory test classifies every `TPS-Ed25519` site in the packages'
+  src trees.** The scan lists each occurrence of the literal (string, template
+  or concatenation operand) and each reference to a binding that holds it. Every
+  site must be either a signer mapped to a test that drives it against the
+  shared verifying Flair stub, or an explicit non-signer with a reason. An
+  unclassified site, a stale entry, or a reference the scan cannot resolve fails
+  the inventory, and the stub refuses an unsigned caller through the real
+  request path.
+
+- **Release-age exclusions need unexpired dated exceptions.**
+  CI reads `minimumReleaseAge` and `minimumReleaseAgeExcludes` with Bun's TOML parser. It fails when Bun cannot
+  be run or rejects bunfig.toml, and when the threshold is missing, not a non-negative number, or below 7 days.
+  Each excluded name needs an unexpired dated entry and an exact declaration. Its declarations in dependencies,
+  devDependencies, optionalDependencies, peerDependencies and the root package.json's overrides must be exact
+  pins; its override in a nested package.json, and a `resolutions` key of its name or `**/` and its name, are
+  refused. Outside node_modules and .git, it follows in-root manifest and directory symlinks and refuses outside-root links.
+  When `minimumReleaseAgeExcludes` is non-empty, the gate also refuses root `workspaces` patterns it cannot model
+  (for example `!` negation, extended globs, `..` or empty alternatives in a brace group, brace/class mixes); it exits 2 naming
+  the pattern. `docs/dep-age-exceptions.md` lists the refused shapes.
+
+- **A CI lane runs `tps heartbeat` against a real, pinned OpenClaw release.**
+  The dead-gateway case asserts the persisted error and exit 1; the live case
+  starts the real gateway on an ephemeral port and asserts an online record and
+  exit 0. The lane installs an exact OpenClaw version from a committed lockfile that
+  pins the tarball integrity into a temp prefix with install scripts disabled,
+  and leaves the lockfile unchanged.
+
+- **The release-age gate checks tracked `package-lock.json` files (Closes #797).**
+  It requires a v2 or v3 npm lockfile and ages npm entries by canonical registry tarball URL, or recorded name@version
+  without `resolved`, regardless of `inBundle`. It refuses versionless entries,
+  URL/name/version disagreement, non-canonical registry URLs (including query
+  strings and percent-encoded path components), and git URLs. Root, link and unencoded local entries are
+  skipped. CI installs tracked npm lockfiles through a helper that reads the manifest and lock from `GITHUB_SHA`
+  under GitHub Actions (validated as 40 hex characters), or `HEAD` locally, and compares the installed lock against
+  those bytes afterward.
+
+### Changed
+
+- **The Docker image workflow builds each platform natively, smokes that platform's OCI archive, and assembles one manifest index (Closes #353).**
+
+  `linux/amd64` and `linux/arm64` build on their own runners, without QEMU.
+  Each leg loads its own OCI archive and checks its nono against
+  `docker/nono.sha256` and its `--version` against `.nono-version`, then uploads
+  the archive. A `publish` job copies each archive with `--all
+  --preserve-digests` into a local `registry:2`, records the platform's
+  image-manifest digest, assembles the index from those digests, and checks the
+  index's non-attestation entries are exactly `PLATFORMS`. After the index
+  verifies, a second local registry rehearses the index copy whether or not
+  `publish` is set. Only `publish=true` logs in to
+  ghcr.io and copies that index to the computed tags.
+
+- **Breaking: the TUI approve and merge actions are removed**. Pulse notification mail uses
+  the `pulse` principal. `pulse start` requires `mergeAuthority`, `ghAgent`, and
+  `author`; transitions require their notification recipient before changing
+  state. The keyring-PAT, office-health and owner-inference agent lists come from
+  the credentials manifest's `agents` list; pulse's reviewer list stays in pulse
+  configuration.
+
+  **Upgrade:** a Pulse config that relied on the defaults must set `mergeAuthority`, `ghAgent` and `author` in `~/.tps/pulse/config.json`, and provision the `pulse` principal (a local signing key registered in Flair, for example `tps agent create --id pulse` while Flair is available), which `pulse start` also requires.
+
+- **Breaking: `tps memory archive`/`unarchive` fail closed and PATCH only the governance fields; `search` signs as `TPS_AGENT_ID`; `approve`/`reject` are unsupported.**
+
+  Archive and unarchive read the record first and refuse, without writing, when
+  that read fails or returns an incomplete record; the update is a server-side
+  PATCH carrying only `archived`, `archivedBy`, and `archivedAt`. Search signs as
+  the operator and passes the target agent as the search's `agentId` parameter.
+  `approve` and `reject` exit non-zero: Flair has no operation that promotes or
+  rejects a memory by id.
+
+  **Upgrade:** scripts that call `tps memory approve` or `reject` must stop; the commands now exit non-zero.
+
+- **`tps agent create` registers a `pending` agent's key through Flair's `POST
+  /AgentKeyRegister` when the route accepts it and the stored key reads back
+  equal.** It sends the generated key through that route over its operator
+  credential. Definitive refusals exit non-zero with the agent, the Flair URL,
+  the refusal name and a remedy; an error response with no recognized refusal,
+  or an unreadable error body, remains unconfirmed with its HTTP status; an
+  unrecognized 404 or 405 names the minimum Flair
+  version that serves the route as the likely cause. After a successful or
+  ambiguous POST, a read-back that fails or does not return the generated key
+  reports this attempt unconfirmed with a re-run-create remedy. Flair
+  drops `publicKey` on `Agent` PUT and PATCH.
+
+- **Mail placement intents carry a phase; MailClient recovery, the CLI lease sweep and promotion skip or preserve non-`placing` intents (Refs #617).** Phase names here are the phase `phaseOf` resolves. It checks `version`, `presentations`, `firstPresentedAt` and `claim` before `phase`, and an unsupported value in any of them (a `claim` that is not a valid presentation claim, `null` included) resolves to `unknown` whatever `phase` says: `version: 2` with no `phase`, and `version: 2` with `phase: "failed"`, both resolve to `unknown`. An intent with no `phase`, a recognized `version` (absent or `1`), valid liveness values (`presentations` a non-negative safe integer, `firstPresentedAt` a parseable timestamp, each optional) and no `claim` resolves to `placing`; a valid `claim` is accepted only on an `in_progress` intent, so an intent with no `phase` and a `claim`, or a `failed` intent carrying one, resolves to `unknown`. So an otherwise-valid older intent whose `file` is a plain basename is handled exactly as before, and records with no intent are handled as before. On those paths, a record whose intent resolves to `in_progress` or `unknown` (an unsupported value in the recognized `phase`, `version`, `presentations`, `firstPresentedAt` or `claim` fields; other extra fields are ignored) is never finished, replaced, presented or checked out. Such an intent is not quarantined solely for that value, and it keeps only its own file's delivery gate closed. An intent that resolves to `failed` leaves its per-file (filename) gate open, while its message ID stays refused by the consumed-ID (replay) gate; it is not presented on those paths. It stays until an operator removes it, and its payload follows ordinary `cur/` archive and GC retention. One exception to preserving a non-`placing` intent: once a `failed` payload has left `cur/`, a different message may reuse the name. Its placement moves the marker to `.placement-<hash>.failed-<messageId>.json`, which keeps the old consumed ID retained, if that tombstone name is unoccupied or is the marker's own inode (treated as an interrupted move). An occupied tombstone refuses the reuse by name and keeps both files, and the new message is not delivered. While the payload is still in `cur/`, the new message waits.
+
+  A placement intent whose `file` is not a plain basename (empty, `.`, `..`, or containing `/`, `\` or NUL) is now refused on write and quarantined on read. That includes an older intent the previous parser accepted when its hashed name matched: the one exception to legacy parity.
+
+- **MailClient adds a per-message delivery API; CLI recovery and actions guard placement phase (Refs #617).**
+
+  Unresolved `placing`/`in_progress` work defers `deliverNext()` commits.
+  The token set covers MailClients of one module copy; claims from other copies
+  in the same process are treated as live until process exit or lease expiry.
+  Release failed handoffs before retrying. Completion
+  checks the issued token and recorded device, inode, size and SHA-256.
+  On later calls, an unclaimed `in_progress` intent becomes `failed` before
+  a presentation beyond the fifth, or after the deadline of 24 hours from
+  first presentation. The failure transition does not delete an existing payload;
+  a kill after the phase write can prevent its log line.
+
+  CLI recovery dispatch claims, ack and nack check placement phase under the
+  mailbox lock. The OpenClaw plugin guards its envelope-less verification
+  branch and its ack/nack stamps too.
+
+- **The agent event loop processes one mail delivery at a time (Refs #617).**
+
+  Handler completion requests finalization; a turn-limit return or thrown
+  handler requests release. Deferred finalization and release are retried on
+  the same delivery. Deadline quarantine requires the mailbox lock and storage
+  to become available. A failed storage operation can leave the durable transition
+  uncertain. A stop prevents
+  the next `deliverNext()` call; a check already waiting can return a delivery,
+  which the loop processes and attempts to settle before shutdown removes the
+  PID file. Deferred settlement is retried; a stop bounds the retries, and the
+  last deferral or refusal is logged. Any refusal can leave the intent pending,
+  blocking that message until resolved.
+
+  A handler that never returns cannot reach the presentation or deadline checks.
+
+  A committed unfinished hand-over can be re-presented after a kill when
+  recovery can verify it. A durably finalized delivery is not presented again.
+  Delivery API consumers receive a JSON-encoded
+  `[canonical mailbox path, messageId]` key, stable across presentations at that path.
+
+- **`tps roster dashboard` and `tps office status` read per-agent presence from the Presence roster of the Flair instance they query.**
+
+  Both views read `GET /Presence` from the queried Flair instance instead of the
+  viewer's OrgEvent catch-up feed. Agents push heartbeats, their activity and
+  their current task to Flair; Flair derives each agent's status and whether its
+  activity is still fresh when it serves the read. The dashboard's last column
+  is `Last Seen`: the presence status and the age of the agent's last heartbeat.
+  Office status shows the same in `LAST SEEN`, and also the agent's current task
+  or activity in `ACTIVITY`, or `was: <last activity>` (Flair's `lastActivity`)
+  once Flair reports the activity stale. Only agents in the Agent list are
+  displayed. A listed agent with no stored Presence row on the queried instance
+  reads `no presence on this instance`. An older local row can remain after an
+  agent moves. Presence is not federated. The presence columns read
+  `unavailable`, not an empty column, when the read cannot be signed (it is then
+  not sent) or fails, or when the roster has a missing or invalid field the
+  views read or two records for one agent. Cross-field checks reject stale
+  task/activity (a stale record with a current task or non-`idle` activity),
+  fresh activity equality (fresh activity differing from lastActivity), and
+  offline freshness (an offline record with fresh activity). Other combinations
+  are not checked, including status versus a future heartbeat. Office status
+  prints no blocker line. It prints the table's values with C0, DEL and C1
+  control characters replaced by a visible placeholder (U+FFFD); a long value
+  is not truncated and can widen its row.
+
+- **Refusals from setup-failure cleanup and the bound teardown print inspection guidance, not a `git worktree remove` command, for a path the base no longer lists.**
+
+  When `git worktree list` fails, the refusal reports that failure with the same
+  guidance (#676).
+
+- **The Docker Integration lane fails, instead of skipping, when the root-only set-runtime real-owner case loses a prerequisite (Closes #801).**
+
+  The lane's `test` service sets `TPS_TEST_REQUIRE_REAL_OWNER=1`; a missing
+  prerequisite then fails the case and names it. Other lanes keep the skip
+  with the same reason.
+
+- **`tps mail relay stop` exits non-zero when it refuses an unreadable or unverified pid record, and `tps bridge status --json` adds a `records` array.**
+
+  Stop prints the record's guidance, signals no process and exits non-zero.
+  Bridge status `--json` keeps the existing `running`, `pid`, `port`, `adapter`
+  and `bridges` fields unchanged, and adds `records` with one
+  `{ adapter, path, state }` entry per pid record. One liveness probe per
+  unverified pid decides both its `records` entry and its `bridges` entry:
+  `state` is the record kind (`running`, `invalid`, `stale`, `unverified`,
+  `unreadable`), an unverified record whose pid the probe does not find alive is `stale`, a record
+  whose kind carries a `pid` includes it, and an `invalid` or `unreadable` record includes
+  its `reason` when it has one.
+
+- **The reviewer's skip allowlist accepts `actions/cache` at v6.1.0, pinned to its release commit.** A workflow that pins that commit is no longer refused as an unreviewed ref.
+
+- **Superseded pull-request runs are cancelled once a replacement starts, and smoke runs linux-x64 only on a pull request.**
+
+  A newer push cancels a pull request's pending or in-progress run of these
+  workflows, once that push starts a run. Smoke starts a pull-request run only
+  when its path filter matches; a push to main keeps all four targets.
+
+  A manual re-run of an older PR run cancels the current head's run only while
+  that run is pending or in progress; a replacement head run may then be needed.
+  A stale run does not supply a completed check for the current head.
+
+- **CI test jobs fail after a bounded time instead of hanging (Closes #799).**
+
+  Every job in `.github/workflows/test.yml` today is covered and sets
+  `timeout-minutes`; a structure test fails a covered job that omits it or a
+  job not named in the test. An exempt job may omit a timeout but needs a reason
+  in the test.
+
+- **Heartbeat skips the gateway probe only when `runtime` parses as `native` and
+  has a single top-level plain `runtime: native` line,** with optional trailing spaces,
+  tabs or a `#` comment; every other form is probed. Set it with
+  `tps agent set-runtime --id <id> --runtime <openclaw|native>`.
+
+- **The mailbox lock's default retry interval is 2 ms instead of 25 ms (Closes #538).**
+
+### Removed
+
+- **The unused root CLI tree (root `src/`, `bin/tps.ts`, `scripts/stall-monitor.ts`) is deleted; the CLI lives in `packages/cli` (Closes #379).**
+
+- **The unpublished `@tpsdev-ai/pi-tps-mail` package is deleted (Closes #384).**
+
+### Fixed
+
+- **TPS help requests print usage before dispatch.** Option values and wrapped-command arguments remain data.
+
+- **Office supervisor**: `shutdown_children` sends the stop signal, polls until the whole-second `SECONDS` deadline (at least the grace, at most the grace plus one second and one poll), stopping early when all tracked PIDs exit, attempts KILL for every tracked PID still alive, clears the tracked list and only then removes the PID file. A signal that arrives between a launch and the tracking of its PID is recorded by the handler and acted on right after the PID is tracked.
+
+- **`tps skill show <name>` and `tps skill revoke <name>` read the skill name from the positional argument; `--name` still wins (Closes #360).**
+
+- **CLI Claude Code, Codex and Gemini runners require launcher release or an interactive TTY `--no-sandbox` opt-out (Closes #363).**
+  Conflicting sandbox flags and values other than `true` or `false` are refused by name.
+
+- **Promotion locking, npm timeouts, and combined SemVer suffixes.** `promote-latest.sh` serializes runs with a repo-local lock. Each npm call runs under a Node supervisor with a `NPM_TIMEOUT_SECONDS` deadline (range 1..2147483), timed from just after spawn, and a 2-second TERM grace. At the deadline it sends TERM if npm is running; after grace it sends KILL if npm is still running. A timed-out write or a signal during a promote write keeps the lock and exits 7; its reason file lists each uncertain write by operation and attempted version when it can be written. The lock refusal prints the holder's PID, or `unknown` if the `pid` file is absent. The version check accepts prerelease plus build metadata.
+
+- **Breaking: updates touch only existing records, and `MailClient` requires a verifier (Closes #380).**
+
+  The deploy bot (`scripts/deploy-bot.ts` and its copy under
+  `packages/cli/scripts/`) and the channel bridge's outbound consumer
+  (`BridgeCore.watchOutbox`) moved `new/` records into `cur/` themselves.
+  Failed verification refuses delivery and attempts dead-lettering. Each also re-drives retryable `dlq/`
+  entries: the deploy bot on every poll, the bridge at a configurable
+  interval, defaulting to 30 seconds.
+
+  `@tpsdev-ai/agent`'s `MailClient` throws when constructed without a verifier;
+  embedders must pass one. It also shares the envelope policy and locked consumed-ID replay store with `promote()`,
+  which now live in `@tpsdev-ai/agent`.
+
+  **Upgrade:** pass a verifier (a `FlairClient`) when constructing `MailClient`.
+
+  The writer scan allows promotion, the locked existing-only `updateExistingRecord()`
+  helper, `MailClient`, the container outbox/cur archive (`relay.ts`) and the
+  office internal-mail store (`internal-mail.ts`). The delegation check covers
+  `checkMessages`, `setBridgeSentAtPath`, `ackMessageAtPath`, `nackMessage` and `patchMailFile`.
+
+- **`bun run audit` invokes `bun audit`, the command CI's Dependency Audit runs; the root `ws` dependency now equals its override (Closes #390).**
+
+- **Mail events are logged under Node when `node:sqlite` is available, as well as Bun: a `node:sqlite` adapter writes the same `archive.db` (Closes #395).** Setup, migration, read, write and close failures produce diagnostics per archive path, operation and error code.
+
+- **Reply-obligation timers and contexts clear on a stop matched to the active incarnation (Closes #403)**. Restart recovery requires readable obligations and verifiable inbound mail.
+
+- **The Docker Image workflow is dispatched with a version and refuses one npm
+  has not published.** It ran on the Release workflow's completion, while the
+  packages were still staged, so the image build's `npm install` failed with
+  ETARGET. It now runs only when dispatched with a version, and it pushes the
+  image only after the version has the required shape, npm has published it,
+  and the image builds and passes its smoke checks. `:latest` is pushed only
+  when the version equals npm's `latest` when the tags are computed. An npm
+  version lookup with a matching E404 and no conflicting npm code stops with
+  "npm could not find" and conditional staged-release guidance. Other
+  inconclusive version results, and failed, empty, or malformed latest results,
+  stop with "could not verify".
+
+- **Branch handler responses resolve logical aliases to the local identity.** Replies and forwards use the inbox routing fallback when the wire recipient has no local inbox.
+
+- **The channel bridge signs every inbound channel message as its own identity (Refs #433).** The bridge signs with the existing bridge principal and its own key, never the host agent's, through the same path `tps mail send` uses; the channel author and content ride inside the signed body, and the signed envelope's trust is `external`. A bridge with no key is refused by name and no mail record is written. The legacy unsigned `sendMail()` helper is removed; the roster invite writes through the shared signed delivery path.
+
+- **The openclaw-tps-mail outbound adapter signs every channel send (Refs #433).** A send the plugin routes to a local mailbox, the outbox, a remote branch or a branch-office sandbox is now a v1 signed envelope from the same signing path `tps mail send` uses. A recipient's `promote()` accepts it only when the recipient can resolve the sender's key and the remaining mailbox checks pass. A sender with no Ed25519 private key is refused by name before anything is written. The reply thread rides inside the signed envelope, and the record no longer carries an unsigned wrapper `replyToId`.
+
+- **Within the turn budget, the agent runtime refuses calls outside its advertised trust-specific tool list.** On the over-limit turn, the loop stops without executing or refusing those calls.
+
+- **CLI-internal producers and `MailClient.sendMail` now sign mail before delivery (Refs #433).** Pulse notifications, topic publish and catch-up, hire onboarding, roster invites, bootstrap introduction and health probe, and branch replies and forwards use the v1 signed envelope. The agent runtime and CLI share strict Ed25519 key parsing and the default two-location resolver. A recipient still requires a matching Flair principal and passing mailbox policy; the bootstrap health check now proves that decision. The agent runtime derives sender and a trust label from the verified envelope.
+
+- **Topic catch-up verifies stored publisher envelopes.** Publication stores a signed topic envelope; catch-up delivers it unchanged. Unsigned legacy entries and signature failures are skipped with named warnings. CLI promotion and native `MailClient` accept topic addresses only for local subscribers and allowed publishers. A receiver running an earlier release rejects these topic-addressed envelopes, so upgrade receivers before relying on catch-up.
+
+- **Each job of a `needs` closure runs in its own sandbox container, from a fresh clone of the assigned commit (Closes #435).** The host-side driver `scripts/reviewer/run-review-jobs.mjs` starts one container per job and the launcher runs only the job that container is for, and it attaches no host mount beyond that job's own clone, so a change inside `.git/`, a process that starts its own session, and anything else the job leaves in its tree cannot reach the next job.
+
+- **The review driver runs each container as the clone's owner.** (Refs #435).
+
+- **After resolution selects the current image, the reviewer launcher refuses a `default` step in a plan with a Node pin (`node-mismatch`; Closes #437).**
+
+  A planned `run:` step carries `node`: `default`, or the version the most
+  recent preceding `setup-node` pins. Conflicting in-matrix pins are refused as
+  `conflicting`; a different selected image as `wrong-image`.
+
+- **The openclaw-github-review test lane runs under the shared HOME-isolation guard (Closes #438).** Its launcher makes the guard's launch-time checks before it creates or deletes anything. The child gets the allowlisted environment. A caller-supplied `--reporter-outfile` is refused, by one check in `scripts/test-home-guard.mjs` that all three launchers now call. A temp dir inside an operator home is refused. The report directory is resolved (symlinks followed) and refused when it resolves at or above an operator home, `$HOME` included, or inside `~/.tps`, `~/.flair`, `~/agents` or `~/.config`; the report, log and seal files themselves must not be symlinks. The `~/.tps` metadata diagnostic fails a run on a recorded difference in the `~/.tps` of the HOME the launcher started with. Its test preload uses the shared root check, so a bare `bun test` in that directory is refused like the other lanes. When the plugin's TypeScript compiler is missing, the launcher skips the build only if neither `node_modules/` nor `dist/` exists, and otherwise refuses to run.
+
+- **Correction to the 0.7.0 notes: the `latest` promote is not all-six-or-none.** `scripts/promote-latest.sh` re-reads each move and attempts a rollback; a rollback that fails is reported and needs manual repair (Refs #441).
+
+- **The codex runtime records liveness on Flair's Presence resource instead of writing `Agent.status` (Closes #444).** In Flair `Agent.status` is the principal's lifecycle state (a value other than `active` deactivates it), so the shutdown write of `"offline"` deactivated the agent — its requests were then refused with `401 principal_deactivated`, and the agent could no longer self-update back to `active`. The runtime now POSTs `/Presence` with the agent's own credential: one beat at startup, then one every 5 minutes on its own timer, and one bounded final `activity: "idle"` beat on SIGINT/SIGTERM. A Presence failure only logs and never writes the Agent row.
+
+- **`scripts/promote-latest.sh` runs `npm dist-tag add` with the script's own stdin/stdout/stderr, so npm's browser 2FA can run when the script runs from a terminal (Closes #445).**
+
+  Both adds (promote and rollback) ran inside a command substitution, so npm's stdout was not a TTY and npm could not prompt for 2FA; the first add exited `EOTP` without moving the tag. Neither add is captured now. npm prompts for 2FA only when stdin and stdout are both a terminal, so keep both stdin and stdout attached to a terminal when running the script. A move still needs a zero exit from the add and a registry re-read that shows the target.
+
+- **Fix symlinked entry checks in `scripts/test-suite.mjs` and `scripts/check-test-reports.mjs`.** Node’s default symlink resolution broke the old comparison; both scripts now compare canonical paths.
+
+- **The `tps` launcher preserves non-zero platform binary exits and maps signals to a non-zero code (Closes #480).**
+
+  Previously, either case ran the JS fallback: success returned 0 without a
+  banner; otherwise it printed the missing-binding banner and returned 1.
+  Fallback now runs when the platform package could not be resolved or the
+  binary could not start. A missing JS entry prints reinstall guidance and exits 1.
+
+- **First delivery never replaces or writes through an existing `cur/` record (Closes #482).**
+
+  A delivery never replaces an existing `cur/` record: both writers place it with an exclusive hard link.
+
+- **Breaking: the bridge, roster dashboard and `tps agent commit` require a configured
+  agent identity**. Each refuses by name when none is set rather than falling
+  back to the literal `anvil`.
+
+  **Upgrade:** anything that relied on the implicit `anvil` identity must set `TPS_AGENT_ID`.
+
+- **A webhook delivery that finds a completion record for its `X-GitHub-Delivery` ID returns 200 without calling GitHub (Closes #490).** The record is written after the event is handled; until it exists, a redelivery can repeat the re-request.
+
+- **Report failed cur/ stamps**. Retry failed ack/nack stamp writes.
+
+- **Mail verification decodes uniform-case hex and canonical base64/base64url public keys to exactly 32 bytes (Closes #493).**
+
+- **The office relay logs local write failures and attempts dead-letter storage (Closes #494).**
+
+- **Breaking: `tps branch start` and memory governance actions refuse by name without an identity.**
+
+  Branch start takes `TPS_AGENT_ID` or the id persisted by `tps branch init --agent`. Memory `review`, `approve`, `reject`, `archive`, `unarchive`, `purge`, `list`, `show`, and `search` take `TPS_AGENT_ID`; `review` and `list` can use their agent-id argument.
+
+  **Upgrade:** a branch initialized without `--agent` and a memory command run without an identity (they used the host name and `admin`) must now get `TPS_AGENT_ID`.
+
+- **A Flair public key of exactly `pending` now fails mail verification retryably instead of being rejected as malformed (Closes #507).**
+
+- **Relay delivery and ACK accept the 64-hex delivery ids that GitHub-webhook outbox records carry.**
+
+  `tps office sync` and `tps office connect` log a relayed delivery that fails wire-schema validation, naming the branch and the invalid fields.
+
+- **A relayed resend within its retention window creates no additional inbox record, keyed by authenticated branch and delivery id (Closes #513).**
+
+  A relayed inbox record is now named by a key derived from the authenticated
+  branch id and the delivery id. A resend of the same id from the same branch is
+  matched to that record by its name, including when the inbox write succeeded
+  but the acceptance receipt was not written (a crash between the two). A
+  recognised resend creates no additional record, and the record keeps its file
+  name and id. When the match is in a mailbox root that acceptance holds for
+  writing (the recipient's own always is), its `receivedAt` is refreshed; a match
+  in a root scanned read-only is returned without that rewrite. The same id from
+  a different branch is still delivered.
+
+  The retention window lasts while the record is in the mailbox (new, cur or the
+  dead-letter queue) or its acceptance receipt is unexpired (seven days by
+  default). After a local ACK has removed the record, a matching receipt means a
+  resend writes no record at all. Once both the record and the receipt are gone,
+  a resend is eligible for a new delivery attempt, and the ordinary inbox and
+  dead-letter paths apply to it.
+
+  A record under the keyed name that does not parse as a mail record refuses the
+  delivery, with no ACK and no replacement. Repair or move it aside so a retry
+  can be accepted.
+
+- **Verify pending mail placement copies before committing them (Closes #515)**
+
+  Cleanup preserves pending files; `MailClient` resolves trust tier before placement.
+
+- **Sandboxed agent launch keeps `--config`, prepares the worktree with checkout deferred, and ignores flags inside a wrapped
+  payload.** For a selected runtime whose workspace has a base repository, `tps
+  agent start` reads `--config` once into a private snapshot used for parsing,
+  the attested re-exec and its read-file grant; when a base repository exists and the workspace is absent,
+  the parent creates the worktree with the checkout suppressed
+  and the hook path and fsmonitor disabled. Relative workspaces use the source config
+  pathname’s directory; the child uses the parent’s absolute workspace and refuses
+  a pending-worktree mismatch with `WorktreeLifecycleError` before checkout.
+  The sandbox-flag scan reads parsed arguments before a wrapped payload.
+
+- **Fix `tps secrets-guard` mode parsing (Closes #517).**
+
+  A child argument `--check` or `--no-guard` leaves the guard's mode unchanged.
+
+- **The nono agent launch path refuses profile access to protected credential paths and writable launch directories overlapping nono profile directories.**
+
+- **Host-side relay acceptance validates stored records and refuses payload conflicts without ACK.** MailClient retains its signature-verified replay gate.
+
+- **`tps office connect` announces a relayed message after its inbox record is published (Closes #524).** Conflicts and deliveries dead-lettered after a write failure are not announced. Quarantining a corrupt existing record can precede publication, ACK and announcement of the incoming delivery.
+
+- **Attempt aged owed-nack release before the unresolved-inbound hold; treat missing `cur/` records during lookup/read as resolved for retention (Closes #525, Closes #526).**
+
+- **MailClient requires a pending placement intent to recover linked new/→cur/ records (Closes #527).** An interrupted placement left by an earlier version has no intent, so it is not delivered on recovery; after verification and the replay-history check succeed, its new/ link is removed and the record stays in cur/, and if either fails the link stays in new/ for a later retry.
+
+- **openclaw-tps-mail: lock obligation writes and retention; keep receipts for held or ambiguous obligations.**
+
+- **Inbox-routed branch relay deliveries are recorded before ACK.** Inbox payload conflicts are refused without ACK. Reply, forward and drop handler outcomes are outside this guarantee. Promotion rejects repeated signed-envelope messageIds.
+
+- **Relay ACKs accepted deliveries even if the announcement callback throws or rejects.**
+
+- **Scope TPS version detection to its argument prefix (Closes #550).**
+
+- **The TCP, host WebSocket, and join WebSocket listeners now settle `close()` with a peer connected and resolve at once when closed.** Each terminates its accepted sockets and force-stops its server rather than waiting on them. Before, a connected peer left `close()` pending, so a branch daemon stopped with `tps branch stop` did not reach `process.exit`.
+
+- **cli test files: a guard checks spy and module-mock teardown, and a test preload checks process.env.** A cli
+  test file that contains `spyOn`, `mock`, `jest` or `vi` as an identifier fails
+  the guard unless a top-level `afterEach` uses a zero-argument arrow containing only
+  the Bun `mock.restore()` call, with bindings resolved through named imports,
+  aliases or namespace imports from `bun:test`; a cli test file that calls `mock.module()` fails it. The
+  preload appends an `afterAll` hook to each `.test`/`.spec` file bun loads,
+  which fails the file when `process.env` differs from when bun loaded it,
+  naming the names added, removed or changed.
+
+- **Relay acceptance leaves records without a `relayDelivery` property in place.** Malformed records with that property are quarantined only in the recipient's own mailbox, even when its value is invalid (e.g. `null`).
+
+- **Relay acceptance serializes receivers with a stable recipient lock and publishes into the selected mailbox.** A timeout publishes no mail record or acceptance marker.
+
+- **Breaking: a guard flag before the `secrets-guard` subcommand is refused (Closes #563).**
+
+  `tps --check secrets-guard …` and `tps --no-guard secrets-guard …` exit 1
+  with `InvalidSecretsGuardMode` and run no child. Put the flag after the
+  subcommand: `tps secrets-guard --check` or `tps secrets-guard --no-guard …`.
+
+- **Deduplicate relay resends after local ACK while the receipt remains.** A fixed set of lock stripes serializes acceptance; a failed acceptance that throws rolls back what the attempt wrote, and incomplete rollback refuses delivery with a possible-duplicate warning; the receipt TTL also applies to flat per-branch markers.
+
+- **The Docker integration image is built with a `BUN_VERSION` build arg instead of a floating `oven/bun` tag (Closes #578).** The Docker Integration job derives it from the root `package.json` `packageManager` and fails when the image's Bun differs from that pin. Locally, compose accepts any nonempty `BUN_VERSION`. Image tags are mutable; a digest pin is not part of this change.
+
+- **Relay acceptance receipts store a digest and byte length of the accepted payload, not the payload itself (Closes #579).**
+
+  A schema-valid receipt already on disk that holds the payload is compared
+  by its digest while it remains within its TTL.
+
+- **`tps agent create` names both remedy branches when a failed key read-back leaves the Agent row's existence unknown (Refs #593).**
+
+  With the row's existence unknown, the remedy now names `flair agent remove <id>`
+  (which also deletes that agent's Memory and Soul rows) as well as
+  `flair agent add <id> --keys-dir <dir>`; the definite no-row remedy is unchanged.
+
+- **Non-OK Flair response errors name the entry point, method, requested pathname, status and an allow-listed code (else `unrecognized_error`), without raw response bodies (Closes #597).**
+
+  The client reads an allow-listed string from the response's `error` field
+  when present; other values become `unrecognized_error`. Response error messages exclude
+  raw bodies and other response text. The reported pathname excludes query and
+  fragment; encoded parameters stay encoded when the wrapper or caller encodes
+  them. Wrapper methods encode ids; `request()` sends its caller's path.
+  Caught transport failures use `Flair <entry> <method> <pathname> transport
+  error: <reason>` with only a fixed reason class and no message text, including
+  when inspecting the failure throws. Failed
+  successful-response JSON parses use `Flair <entry> <method> <pathname> →
+  <status>: malformed response body`; `request()` and `registerAgent()` accept
+  204 without parsing. Local checks interpolate ids (promotion refusals,
+  invalid principal records, governance read refusals and missing agents);
+  private-key read failures interpolate the key path and agent id. Governance
+  read failures also embed the caught error's message. These local messages
+  are outside the response bound.
+
+- **MailClient recovers verified interrupted placements with matching identity (Closes #600).** Recovery verifies a `cur/` copy and, under the mailbox lock, matches its recorded identity and pre-verification raw bytes. `checkNewMail()` then finishes the intent before returning the message; `deliverNext()` returns the message with the intent still in progress and keeps it until `completeDelivery()` finishes it. Verifier unavailability or a lock failure defers recovery; quarantine is attempted for a `placing` record that verifies as neither supported format, or as both, after the identity and byte checks. A present mismatched copy or an older-build intent without identity whose only copy is in `cur/` is withheld with its intent pending.
+
+- **Relay acceptance locks recipient and observed same-ID candidate roots.** Shared-stripe and same-ID-move guarantees require the same resolved lock directory (`TPS_MAIL_DIR` aligned with `MailClient.mailDir`); a different `MailClient.mailDir` is outside this guarantee. Recipient and candidate mailbox locks stay held in path order. Root changes while waiting trigger bounded discovery retries. Branch-receiver publication remains outside the stripe; the exported scan's earlier-root contention still raises a generic error.
+
+- **`tps agent create` prints "registered" only when the key pair is
+  consistent and Flair accepts a request signed with the private key.** Before
+  any Flair request it signs a probe with the private key and refuses when the
+  `.pub` file does not verify that signature, instead of using the `.pub` bytes
+  unchecked. A partial identity (an entry, a dangling symlink included, at any
+  identity path, without both `.key` and `.pub`) is refused before any file is
+  written; `create` used to generate a new pair over it, or through the link.
+  An identity file `create` reads (`.key` and `.pub`, and `.meta.json`, `.seed`
+  and `.x25519.pub` when present) that cannot be read, and a `.meta.json` that
+  is not JSON, are refused by name. The probe loads the private key as the
+  Flair client signs with it (an unencrypted PEM key, a raw 32-byte seed or
+  base64 PKCS8 DER): an encrypted PEM key is refused as encrypted, and any
+  other readable key file the client cannot load is refused too. After Flair
+  reads back the registered key, `create` sends one request signed with the
+  private key and requires Flair to accept it and its response to carry the
+  registered key. A refusal names the agent, what it found and the remedy, and
+  exits non-zero.
+
+- **MailClient promotion and dead-letter moves take the relay acceptance stripe from the configured mail directory, so CLI acceptance holding that stripe defers them (Closes #616).**
+
+  MailClient took the stripe from its process `TPS_MAIL_DIR`, so a MailClient
+  whose environment named a different root than its configured `mailDir` locked
+  a stripe under that other root. Acceptance, promotion and dead-letter moves now
+  derive their lock roots from resolved real paths in one shared module;
+  placement recovery and the other mailbox lock sites still lock the mailbox
+  root path as given.
+
+- **The task loop and `tps agent logs` read Flair's catch-up envelope rather than a list (Closes #624).** A `task.assigned` event now reaches the task handler, and `FlairClient.getEventsSince` returns the read's outcome, so a caller can tell an empty feed from an unreadable one.
+
+  A read is unavailable, with a bounded reason, when the request is refused or fails, the signing key cannot be read, `since` is not a valid date, or a page fails validation (its envelope, its events' fields, positions and order, or a `nextAfter` that does not follow from them). `tps agent logs` then says the OrgEvents are unavailable and still shows mail; the task loop handles and persists nothing from that read.
+
+  The task loop keeps its feed position in `~/.tps/cursors/<agent>-task-loop.json` as `{ position, updatedAt }`, written atomically, and sends it on every read. With no usable cursor file it sets the position one hour back, once, and reads nothing until that position is saved, retrying a failed save with the same position; an unreadable file is logged and treated as no cursor, and a legacy `{ since }` file resumes from its timestamp. `tps office status` shows the cursor's timestamp in either format.
+
+  The saved position never passes a task before its handler succeeds, provided that once saved, the cursor file is not removed or corrupted; the feed only appends (a new event sorts after those already served), with positions within five minutes of the server's time; and an event does not expire before its handler succeeds. Delivery also needs the loop to keep running, its reads and the initial save to succeed eventually, and the handler to eventually return successfully for each earlier task (a handler that keeps failing holds the loop at that task); then each task after the starting position is handled, meaning its handler returns successfully, at least once, not exactly once. The position is saved after a read's handlers run, when it advances: a crash between a handler returning and that save replays the task, and after a failed save (logged) a restart replays the events since the last successful save if it occurs before a later save succeeds. Handlers must be idempotent.
+
+- **The codex runtime's review-trigger loop reads the agent's own catch-up feed (Closes #631).** It uses a different cursor filename from the task loop and accepts loop IDs through 79 characters, including a 64-character agent ID plus `-review-trigger`.
+
+- **Attempt bounded publication of codex PR URLs from Flair and mail tasks** as `pr.opened`.
+  Only an accepted POST can reach the review loop; exhausted retries call
+  `console.warn` and return without an event if no POST was accepted.
+  The review loop filters events attributed to the agent by stored `authorId`;
+  an admin caller may supply `authorId`. It requests configured reviewers on the
+  repository named by the PR URL, skips classified terminal failures (including
+  HTTP 404/422), and gives other failures bounded attempts. A malformed
+  `reviewTrigger` refuses runtime startup.
+
+- **Breaking: a relative `workspace` in `agent.yaml` resolves against the config file's directory, and a launched child receives the absolute path.** An absolute workspace remains absolute and is normalized. A `workspace` or `repo` string starting with `~` is refused, because `~` is not expanded, and so is a `workspace` or `repo` key whose value is null (in YAML a bare `~` or nothing after the key), not a string, or an empty or blank string. For the native AgentRuntime, default `mailDir` and `memoryPath` derive from the resolved workspace (Closes #658).
+
+  **Upgrade:** a relative `workspace` or `repo` that was meant relative to the launch directory must be rewritten relative to the config file or made absolute; a value starting with `~` must be written as an absolute path.
+
+- **A launch that creates a worktree attempts to write an ownership marker, and cleanup attempts to remove that worktree only while the marker still matches.** Immediately after `git worktree add`, setup attempts to write a random nonce to the worktree's admin git directory with exclusive create, reports the record to the caller, then reads its identity facts. A marker it cannot write is a setup failure: the record has no marker and cleanup refuses, naming the path and, while the base still lists it, printing a POSIX-quoted `git -C <base> worktree remove --force <path>` command. When a later setup step fails, cleanup attempts to remove the worktree it created if the marker and any recorded identity facts still match, and otherwise refuses with that command (while the base still lists the path); the removal itself can fail. The setup-failure cleanup, the launch fallback and the `onStop` teardown route attempt removal of a created worktree only when the admin directory holds the exact recorded nonce; teardown does not compare HEAD, which the runtime may move. A change at the pinned path between that check and the removal is not covered (cli#706). On the `onStop` teardown route, ownership is decided by the nonce and the recorded `.git` pointer, not by the directory's identity, so a replacement directory that keeps the original `.git` pointer and is in place before that check is not detected. The worktree is added detached, so no branch is created or removed.
+
+- **`tps agent start` removes `config-*` launch snapshots whose recorded launcher is dead (Closes #667).**
+
+  A forced termination leaves the private config snapshot under `~/.tps/launch`
+  behind. A snapshot is now created under a `.pending-config-*` name and renamed
+  to `config-*` after its owner record is written, so a published snapshot has
+  its owner record. The owner record
+  holds the launching pid and, when one is readable, its process start token. It
+  is opened without following a symlink at `owner.json` itself, must be a
+  regular file of at most 4 KiB, and is parsed strictly.
+
+  The next launch attempts to remove a published entry whose pid is gone, or
+  whose pid is alive under a different readable start token from the same
+  source; a live pid
+  is kept when either token is unavailable or the two come from different
+  sources, and so is a published entry whose owner record names a live pid under
+  the same readable token. A published entry with no readable owner record is
+  kept until its directory mtime is past a one-minute grace; an entry whose mtime
+  cannot be read is kept.
+
+- **A signal to the sandboxed launcher is passed on to the nono supervisor, and the released agent is then checked.**
+
+  A SIGINT, SIGTERM or SIGHUP is forwarded as received; the supervisor gets SIGKILL if it has not exited within the bound. The launcher never signals the agent's pid; it reads the identity captured before the release.
+
+- **A signal removes a worktree this launch created only after the stop check; a pre-existing worktree is untouched.**
+
+  A survivor keeps the worktree.
+
+- **`tps agent start` sweeps pending launch snapshots, never attestation directories; the mailbox lock, outbox lock and `tps status` share one pid check (#677, #681).**
+
+  A forced kill while a launch snapshot is pending can leave a
+  `.pending-config-*` directory under `~/.tps/launch`. The next launch attempts
+  to remove one whose owner record names a dead launcher, by the same pid and
+  start-token rule as published snapshots, or that has no readable owner record
+  and a directory mtime at least 24 hours old; a removal that fails is logged
+  and the directory is kept. One whose recorded launcher is still running is
+  kept.
+
+  The sweep selects only entries named `config-` or `.pending-config-` followed
+  by exactly six letters or digits, so a launch's attestation directory in the
+  same place, named after its agent id, is never selected, including for an
+  agent whose id is `config` or starts with `config-`.
+
+  The `@tpsdev-ai/agent` mailbox lock, the cli's outbox lock and `tps status`
+  check a recorded pid with one rule: a pid that is not an integer from 1 to
+  2147483647 is never treated as a live process, and one whose probe is refused
+  with `EPERM` (permission denied) is. `tps status` reported a pid refused with
+  `EPERM` as a zombie, and did not check a recorded pid of 0.
+
+- **A launch's worktree cleanup now passes Git a pinned pathname.** Setup cleanup and record retries check ownership in `verifiedCreatedWorktree`; bound `onStop` checks it separately, and path-only `onStop` checks the base's worktree registry without an ownership marker. Marker-mismatch refusals include a manual command when registration is present and readable. A change at the pinned path during removal is not covered (cli#706), and a directory left at the pinned path after Git succeeds is reported, not deleted.
+
+- **A selected runtime uses `repo` when `workspace` is absent.** `tps agent start --runtime codex|gemini|claude-code` resolves its workspace from `workspace`, then `repo`, then its default (Closes #679).
+
+- **A selected runtime expands `${NAME}` references in `workspace` and `repo`.** An interactive `tps agent start --runtime codex|gemini|claude-code --no-sandbox` expands those two keys with the native loader's rule, and an unset variable fails the start with the loader's `Missing environment variable` error; other keys are read as before (Closes #680).
+
+- **`pidState` now backs the remaining CLI pid probes (Closes #683).**
+
+  `tps agent list`, `tps agent status`, `tps agent healthcheck`, the branch
+  daemon status and stop wait, connection state, the mail bridge, the LLM proxy,
+  the mail relay and the launch attestation use the one rule. The mail relay
+  keeps a pid file naming a process this user cannot signal (EPERM) and reports
+  it running; an invalid pid is handled as a missing process. `tps branch stop`
+  signalling is handled in #702.
+
+- **A relay acceptance receipt is classified and parsed from its own properties only.** A digest receipt needs both digest fields as own properties; a receipt with neither takes the legacy body-digest path, and an invalid digest receipt does not match.
+
+- **Removal advice naming an absent worktree path is dropped.**
+
+  On a signal, an unconfirmed removal keeps the launch state, names what remains (the original path, the moved-aside path or the registration), and exits with the refusal code (78, or the supervised refusal code when supervised).
+
+- **The Office Manager trims surrounding whitespace from a curl `url` in the workspace manifest.** Whitespace around the URL, including non-ASCII whitespace such as U+00A0 and U+3000, is removed before the URL is checked, and curl and the `[curl]` log lines get the URL without it; a URL that is still invalid after trimming is refused with `Invalid URL` (Closes #687).
+
+- **The review launcher reads a worktree's `.git` entry to classify unreachable metadata.**
+
+- **`tps branch stop` keeps the pid file and fails when the signal is refused with EPERM (Closes #702).**
+
+  A process this user may not signal is alive; the stop classifies the refusal
+  with the shared `pidState` classifier and reports the pid instead of removing
+  its pid file and saying the daemon is not running. A process the same
+  classifier reports gone still has its stale pid file removed.
+
+- **A mail lock whose owner exited but was not reaped can be reclaimed on Linux.**
+
+- **Launch worktree removal records the pinned path and leaves a locked worktree alone.** A launch now refuses an absent registered workspace instead of treating it as existing. With a removal record the refusal names the pinned tree and how to move it back or delete it and prune the registration; without a record it points at `git -C <base> worktree prune` and a relaunch.
+
+- **`bridge stop` stops a bridge started through a discovered adapter name.** It finds `bridge-<adapter>.pid` records whose adapter part is lowercase ASCII letters, plus the legacy `mail-bridge.pid`, instead of only `bridge-openclaw.pid` and `mail-bridge.pid`. A missing run directory has no records; any other error reading it is reported with the path and error code and fails the command. A record that does not exit keeps its pid file and the remaining records are still handled. The shared pid reader opens with the available nonblocking and no-follow flags, checks the descriptor is a regular file, and reads that descriptor. Non-regular files and final-component symlinks refused by the no-follow flag are classified without being read.
+
+- **`tps branch stop` checks the recorded token immediately before signalling.**
+  `ps` tokens have one-second precision; PID reuse between the check and signal
+  remains possible. Unverified live records are refused; stale and invalid
+  records are removed if unlink succeeds. Missing, stale and invalid records leave daemon state unknown.
+
+- **The OpenClaw mail plugin handles an error from its inbox watcher (#720).** An `error` event on the `new/` watcher used to go unhandled; it is now logged as a `tps-mail: new/ watcher for <agent> stopped` warning, and mail in that inbox is still picked up by the periodic rescan.
+
+- **`tps mail relay status`, `tps mail relay stop` and `tps bridge status` (human output) describe bad or unverifiable pid files instead of reporting "not running".**
+
+  An invalid, stale, unverified or unreadable pid file is no longer reported
+  as the relay or bridge not running. `tps mail relay status` names the record
+  and reports the relay's state as unknown or unverified. `tps bridge status` (human output,
+  when no bridge record is running) prints
+  `Bridge state unknown (<kind> pid file <path>).` for each such record.
+  `tps mail relay stop` names an
+  invalid or stale record, signals no process for it, removes it when the
+  unlink succeeds, and leaves the relay's state unknown. When a signalled
+  relay's recorded pid is proved gone, stop now prints a line beginning
+  `Recorded relay process (pid N) is gone (`.
+
+- **`BridgeCore` enforces the `[a-z]+` adapter-name grammar shared with `bridgePidFiles`, refusing invalid names before writing state (Closes #725).**
+
+- **`tps branch start` refuses to spawn while the recorded process is running (pid + start token match) (Closes #726).** Unverified, unreadable and invalid records also refuse spawning; stale records are replaced on a successful launch. A daemon removes the pid file on shutdown only when a fresh read matches its own pid and start token.
+
+- **Branch pid records are claimed and removed under one inter-process lock (Closes #730).** When launching a detached daemon, `tps branch init` and `tps branch start` read, classify, spawn and write the record while holding it; `tps branch stop`, daemon shutdown, stale-record replacement and `tps office kill`'s branch-record handling use the same lock. A command that cannot acquire the lock within its timeout refuses, naming the lock path. At a final read the file's bytes are compared byte-for-byte with the bytes read earlier: a replacement is preserved, an unreadable file or symlink is kept and the removal is refused, and a missing record is reported.
+
+- **A daemon-launching `tps branch start` checks the recorded process before resolving the branch agent id (Closes #734).** A daemon-launching `tps branch init` checks the recorded process after its join and conf-presence guards and before the keypair, before writing the conf and before the join; init resolves no agent id (unchanged).
+
+- **Breaking: commands that set a failure exit code now exit non-zero.** The entry point
+  exits with the status the command set instead of replacing it with 0, so a
+  failure path that sets `process.exitCode` reaches the caller.
+
+  **Upgrade:** scripts that ignored these failures (the entry point exited 0) will now see the non-zero status and must handle it.
+
+- **`tps office kill` prints each collected failure once.** It still exits
+  non-zero, but no longer repeats the same failure in a second aggregate line.
+
+- **`tps office kill` and the host connection writer share one lock per host state record.** `office kill`
+  holds it across its final read and removal; `writeHostState` takes it for each write.
+  The connector's `stop()` removes a valid record under that lock only for the same branch,
+  the same PID, and the same start token when one is present. Writes after `stop()` begins are suppressed under the lock; a late connection skips writing.
+  Blocking callers use a 5 s deadline plus the probes' own timeouts; a timeout names the lock
+  path and a removal remedy. `office kill` collects host-record lock failures and continues shutdown before
+  exiting non-zero. If an attempt fails after a channel is assigned, the relay attempts to close it before retry.
+  A close that rejects is reported and retained for `stop()`. If a close still rejects at `stop()`, the record
+  is kept and `stop()` rejects with its path. Stalled closes are not detected: the transports resolve after
+  their own timeout (cli#774). Inbound host-record updates coalesce on a timer and retry failed zero-wait writes
+  with capped backoff. Stop and disconnect cancel pending updates. Failures report the record path.
+  Lock release is best effort: lock-directory removal errors are ignored, and the next
+  acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps records classified as unreadable or invalid
+  by the locked read and reports their path, instructing the operator to inspect the record and remove it if no connector
+  for that host is running. Other removal failures except a missing file are rethrown.
+  `tps office connect` awaits `stop()` on SIGINT and SIGTERM and exits 1 if it rejects, reporting the failed disconnect;
+  `office kill` sends SIGTERM and attempts record removal after confirming exit.
+
+- **Heartbeat and office join exit statuses.** `tps heartbeat` exits 1 for workspace write failures or failed gateway RPC
+  probes, and `tps office join --tunnel-via` exits 1 when Flair spoke or
+  supervision provisioning fails. A guard test checks approved AST contexts
+  for no-argument and explicit-zero direct `process.exit(...)` calls.
+
+- **`tps office connect` runs its checked shutdown on SIGTERM as well as SIGINT (#762).**
+
+  `tps office kill` stops the connector with SIGTERM, so the relay now stops and
+  the host connection record is cleared under the record lock. A failed clear
+  prints `Disconnect failed: ...` and exits non-zero; a second signal while the
+  shutdown runs starts no second shutdown.
+
+- **`tps branch init` prints the join token only after the listener binds.** On a bind failure it names the port and exits non-zero without a token.
+
+  On both the `ws` and `tcp` transports, a failure to bind (for example, the
+  port is already in use) reports the address and exits non-zero; it prints no
+  token for a listener that was never running.
+
+- **The Codex runtime shares a bounded loop-stop drain between signal shutdown
+  and rejection cleanup.** Stopped loops discard late reads. Mail awaiting dispatch at shutdown stays unacknowledged.
+
+- **Rejected relay disconnect closes are reported; `stop()` retries retained channels.** A rejected close retains the channel; a successful retry in `stop()` removes it and can clear the host record, and a retry that rejects keeps the record and throws `HostChannelCloseError`. Connect-time host-record write failures are reported before reconnecting.
+
+- **`agent set-runtime` reports when the config changed after its replacement was written and no rollback was attempted (Refs #795).**
+
+- **The codex runtime's mail-task auto-commit keeps the pre-task baseline across a stale-rebase abort and resolves `autoCommit.repo` against the config file's directory.**
+
+  The runtime resolves `autoCommit.repo ?? workspace` once and runs the mail auto-commit gate's Git
+  probes and the rebase abort there. An interrupted rebase is detected with
+  `git rev-parse --path-format=absolute --git-path`; a failed probe skips
+  auto-commit and reports it. A successful abort keeps the pre-task baseline, so
+  a restored HEAD different from the pre-task HEAD causes a commit attempt (for
+  example a commit made on that branch before the rebase). A final HEAD
+  different from the restored one skips as indeterminate. The clean message
+  states that Git status is clean and HEAD matches its pre-task value. A
+  relative `autoCommit.repo` resolves against the original config file's
+  directory, with the same environment-variable expansion as `workspace`, and
+  the launch snapshot carries the absolute value; a relative value with no
+  config file to anchor it is refused. Sender notices are attempts: a failed
+  signed send is logged and acknowledgement is attempted.
+
+  **`autoCommit.repo` is resolved only by the Codex runtime.** A Gemini or Claude Code launch neither resolves nor expands it, so an unset variable there cannot stop the launch; an empty YAML entry reads as absent, and the runtime's workspace fallback applies.
+  **An empty or blank `autoCommit.repo` string is refused.** After environment expansion, a blank value names the field and the remedy: omit it to use the workspace, or give a path.
+  **A rebase-path probe that does not return an absolute path is indeterminate.** A Git that does not support `--path-format` echoes the flag; auto-commit skips and reports the probe and its output.
+  **An empty final `git rev-parse HEAD` read is indeterminate.** The gate skips and reports the probe instead of reading the empty value as a change.
+
+- **Host and branch connection state writes are atomic, and a branch state write failure is logged best-effort without stopping message handling (Closes #808).**
+
+  A write or rename failure leaves the previous record intact, and the
+  temporary file is synced before the rename. The parent directory sync after
+  the rename is best-effort. The logger attempts to append a branch state
+  write failure report to the branch log. Failed appends are counted; the count
+  appears on the next successful append by the same running daemon and is lost
+  if the daemon exits or restarts. Nothing is written to stderr, and handling
+  continues.
+
+- **The auto-commit helper refuses when its working-tree status probe fails.** A non-zero exit, spawn error or signal from `git status --porcelain` throws without committing or pushing, after attempting to publish a blocker event for the task; the error names the repository, the probe and its failure, with stderr's control characters (U+0000-U+001F, U+007F-U+009F) replaced by spaces and stderr capped at 300 characters (cli#824).
+
+- **A subsequent connection-state record write or host-record listing attempts to remove temp files left by a crash that are older than the age threshold.**
+
+- **Rewriting a connection-state record keeps the observed permission bits (0o777), so a record tightened to 0600 stays 0600.**
+
+- **A sandboxed Codex launch refuses an `autoCommit.repo` outside the launch-option
+  paths checked** (workdir, cwd, `--allow` directories and exact `--allow-file`
+  files). Profile-only `filesystem.allow` / `filesystem.write` grants are not
+  consulted. The refusal names the repository, the launch-option paths checked
+  and the remedy (put the repository under the workspace, or run that agent
+  without the sandbox).
+
+- **Mail-task auto-commit handles an unborn HEAD.** The mail auto-commit gate leaves a clean unborn HEAD alone and skips after an indeterminate HEAD probe or failed stale rebase abort.
+
+- **The reviewer sandbox image retries transient download failures.** Each of its four downloads (node, bun, gh, js-yaml) retries a failed or partial transfer up to five times with a bounded timeout; the checksum check after each download is unchanged.
+
+- **Recover missed OpenClaw mail watch events**: Periodically rescan bound inboxes and log mail promoted by the rescan.
+
+- **Sandboxed Codex launch:** a launch that reaches the autoCommit repository check refuses a present non-string, non-null `autoCommit.repo` before `nono run`, naming the field, original config file, and type, with the launch's applicable refusal exit status. Earlier launch failures keep their own messages; a config-load error, including an unset variable inside that value, stops with the loader's error before `nono run`.
+
+- **OpenAI token refresh saves updated credentials to the TPS provider store.** Reader and sync share Codex file selection. A failed write warns for that target without trying a later file; when selection fails, sync warns if a candidate exists. Refresh rejects missing or non-string access tokens, present non-string refresh tokens, and non-finite or negative expiry durations before saving. Credential saves use an exclusive 0600 temporary file, fsync it, rename it, and attempt a best-effort parent-directory fsync that never fails the write.
+
+- **An unreadable lock owner with a changed sampled identity causes a retry.** A live owner in another process on that retry reports `duplicate in progress`. A live owner in the same process still raises `MailLockOwnerError`, which the webhook returns as a 503 naming the lock path, and a stable unreadable owner still fails closed with its named lock path (Closes #863).
+
+- **Retry retained OpenClaw mail**: Retry failed promotions that leave their source in new/, with a per-source-identity failure limit and a diagnostic when exhausted.
+
+- **Skip mailbox dot-files.** Use a shared filename predicate for `new/` consumers.
+
+- **Relay stop waits for an in-flight connect and retries a late-connect close that rejects; an unconfirmed close throws `HostChannelCloseError` and keeps the host record.**
+
+- **Cache the verified Socket Firewall binary so a cached CI job does not depend on the download host (Refs #898).**
+
+  Jobs attempt to restore the verified binary with actions/cache before the
+  pre-fetch and use it only when the checksum tool found on the job's PATH
+  reports the pinned sha256; a cold cache downloads with a bounded exponential
+  backoff. A binary whose checksum does not match is discarded.
+
+- **Breaking: refuse a value-less `--agent` in `mail ack`/`nack`/`gc`:** an `--agent` with no value is refused, so it does not fall back to the default agent; `ack`/`nack` also refuse a trailing positional agent and honour `--agent=<id>`, `gc` refuses a positional agent, and the `ack` and `nack` usage lines and both mail help texts name `--agent <id>` instead of a positional `[agent]`.
+
+  **Upgrade:** pass the agent as `--agent <id>`; a trailing positional agent on `ack` or `nack`, which the parser never read, and a positional agent on `gc` are now refused.
+
+- **Breaking: one flag reader for the CLI subcommand blocks:** `agent`, `mail`, `memory`, `bridge` and `skill` now share one `--flag` reader that stops at the first `--` after the subcommand (a `--` before it is passed), accepts `--name value` and `--name=value`, and refuses a repeated flag with a usage error naming it; a conflicting repeat that meow rejects is reported as a usage error instead of an uncaught stack. `tps agent run --message` is still read directly and takes only the `--name value` form.
+
+  **Upgrade:** a command line that repeats a flag the shared reader handles is refused; pass each flag once.
+
+  `tps flair sync` does not use this reader: give its interval as `--interval <seconds>`, because `--interval=<seconds>` is not recognised as a request for a daemon and runs one sync.
+
+- **The branch relay leaves a young unparseable outbox file in place and retries the send pass after 5 seconds instead of quarantining it.** A file that still does not parse once it is at least 5 seconds old is quarantined, and the log line names its age in milliseconds.
+
+- **A stopped inbox watcher is re-armed from the rescan tick.** After a watcher error, the next rescan tick creates a new watcher; repeated failures back off by 1, 2, 4 … ticks (capped). New mail is watched again as soon as the watcher re-arms, and the stopped, re-armed and still-failing states are logged without a line for every tick a failing re-arm skips.
+
+- **`tps mail relay stop` re-reads the pid record before signalling; `tps office status` classifies the relay record instead of checking that its pid file exists.** Stop signals only a record that is still `running` with the same pid and start token; a re-read that still names a running relay under a different pid, or the same pid with a changed start token, exits non-zero with no process signalled. `tps office status <agent>` reports `running` only for a running relay record; in text output a stale, unverified, invalid or unreadable record is named, while `--json` reports `relay-unknown` for it (unless a sandbox container reports its own state) and does not name the kind.
+
+- **`tps mail relay stop` compares a relay pid record's bytes before removing it.** The stop reads the record once immediately before signalling, signals only when it still names the same pid and start token, and compares the record's bytes with that read before it unlinks the path. It applies the same compare before removing a stale or invalid record. A record a new relay wrote is kept. A kept record (bytes differ) whose start token matches a different live process is named as belonging to that process; any other kept readable record is reported as no longer holding the record this stop read. A stale or invalid record replaced before removal is kept and the stop exits 0, as it does when the relay it targeted did stop. Relay pid records are written without a lock, so a record written between the compare and the unlink can still be removed. A record that cannot be read at the final check is kept and the stop exits non-zero.
+
+- **`agent set-runtime` keeps the config's permission bits and group.** The
+  replacement file no longer copies setuid, setgid or sticky bits, and it keeps
+  the original group and owner where the process may. Group-only retry is limited
+  to EPERM/EACCES; any other ownership error, a failed retry or a chmod failure
+  refuses the write, leaving the original config in place.
+  Before `--`, `agent create --runtime` with no value is refused, naming the
+  accepted values.
+
+- **The branch daemon installs its SIGTERM and SIGINT handlers before it starts listening (Refs #744).**
+  A stop signal sent as soon as the port opens now runs the daemon's shutdown
+  path instead of the runtime's default handler.
+
+- **Bridge outbound replies carry the constructed adapter name, and an adapter-name refusal escapes every character outside printable ASCII.**
+
+- **`tps mail check` says why a message is re-delivered.**
+
+  A `cur/` record that is re-verified and re-presented after its 30-minute
+  checkout lease expired is marked as re-delivered. For ackable mail it prints
+  `tps mail ack <id> --agent <agent>`; for external-tier mail it says
+  that `tps mail ack` and `tps mail nack` refuse it. `--json` carries the `redelivered` field.
+
+- **MailClient resolves its mail root and mailbox directory to canonical path strings once per operation, then derives subsequent paths without resolving again.**
+
+  The mailbox lock, the maildir paths and the replay state derive from the
+  canonical mailbox string. Bridge-principal trust, the relay acceptance
+  stripe paths for promotion and dead-lettering, and the recipient inboxes
+  that `deliverOutbox()` moves records into derive from the canonical mail-root string.
+  No resolved canonical root is cached at construction. When the symlink at the
+  configured mail path, or at the agent's mailbox directory, is repointed while
+  a client is alive, the new target is selected at the start of the next operation. A
+  plain rename of the configured directory is not followed: the next operation
+  creates the configured path again and uses that, not the renamed directory.
+  The relay stripe is a cooperative lock among MailClients that resolve the same
+  canonical path. The OS follows same-user filesystem changes to that path during
+  an operation; the stripe does not exclude them.
+
+- **`office connect` attempts announcements for recovered relayed deliveries.**
+  On a resend, a matching record still in the mailbox outside the dead-letter
+  queue is due an announcement if acceptance receipt recovery and sync succeed.
+  The callback is attempted unless a matching, unexpired announcement marker's
+  file and directory sync successfully. The ACK follows a successful marker check or
+  a completed callback and successful marker write and sync. Callback errors,
+  or a marker that cannot be written and synced, withhold that attempt's ACK.
+  A resend that still finds the record and recovers its receipt attempts the
+  callback again unless an announcement marker counts. Cleanup attempts removal
+  of the temp file or renamed marker; the retained-marker sync check is the
+  fallback. A marker counts only
+  for the payload it records, and only once syncing its file and directory
+  succeeds. A resend of the same payload whose
+  marker counts is not announced again, but a crash between the announcement
+  and its marker, a marker failure, a marker older than the acceptance receipt
+  TTL (7 days by default), or two acceptances of the same delivery at once can
+  announce it again.
+
+- **`tps office kill` checks each record's start token immediately before signalling it.** Host
+  state records written by the relay carry the process start token when it is available, and the
+  branch pid file is read at the path its writer uses. A record classified as unverified is not
+  signalled: it is kept and named, and the command exits non-zero. A pid reused
+  after the check and before the signal is not detected, and the `ps` fallback token has one-second
+  precision.
+
+- **office kill re-lists host records after each signalling pass and again after the branch step, within a bounded number of passes.** A record first seen at a pass limit is named, not stopped in that pass; a new record path created after the last listing is not seen. A listing failure or an unprocessed record at either bound makes the command exit non-zero.
+
+- **`tps office kill` treats a Linux zombie as stopped.** A process that has exited but whose parent has not
+  reaped it still answers `kill(pid, 0)`; `office kill` now reads `/proc/<pid>/stat` and attempts to remove the record
+  instead of reporting a failed stop.
+
+- **Outbox queueing no longer fails when a concurrent drain moves a record.** The existence check reads the record once instead of checking and then reading it; a record moved from `new/` to `sent/` is found in `sent/` and reported as a duplicate.
+
+- **Relay and bridge pid files carry a start token; a stop checks it immediately before signalling and refuses a mismatch.** A pid can still be reused between that check and the signal, and the `ps` fallback compares start time only to the second. `bridge stop` re-reads each record immediately before its own signal. The writer reads the token through the agent API, which may return null or a `ps`-derived token. A stale record is removed; a record whose identity cannot be confirmed is refused with the pid file named, and an EPERM from the stop signal keeps the file and exits non-zero. `bridge stop` classifies both known pid files before acting, handles each record independently, prints every record's outcome, reports a pid file it cannot remove as kept with the error code, and exits non-zero when a stop fails or a record is kept without a verified stop.
+
+- **A relay connection bounds the channels it retains after a failed close, and reports the first host-record refresh failure.** At most four failed channels are kept for `stop()` to close, so a persistent close failure does not make shutdown wait on one close per reconnect. The heartbeat and health callbacks name the record path and the error on their first persist failure per connection and stay silent until a write succeeds.
+
+- **Renovate's setup-action runtime rule matches by dependency name.** The github-actions `uses-with` rule now matches `depName`, so setup-node's `node` dependency (package `actions/node-versions`) is skipped.
+
+- **Renovate no longer proposes several update categories that the reviewer gates refuse.** It skips `engines`, peer-dependency and OpenClaw updates, and bun and node runtime-version updates through the `npm`, `bun` and `github-actions` managers; Docker node image updates stay enabled. The `dependencies` of the published packages under `packages/` keep their ranges (`widen`). The reviewer action allowlist accepts actions/checkout v4.4.0 at its release commit.
+
+- **`agent set-runtime` orders ownership before mode, verifies the temporary file before the rename, and warns after the rename when the owner could not be preserved.**
+
+  `agent create` validates `--runtime` before refusing an existing config, so
+  an invalid value gets the accepted-values refusal either way.
+
+### Security
+
+- **`tps mail watch --exec` presents only mail that verifies, without consuming it (Closes #375).** The watcher verifies each record in `new/` IN PLACE — the same signature and envelope-binding checks `promote()` applies (the wrapper sender against the signed sender, and the signed recipient against the mailbox), factored into a shared function that moves, leases and writes nothing — and passes only the records that verify to `onMessage` and the `--exec` hook. It calls no consumer path (`promote`, `checkMessages`, a lease or an ack) and never moves a record out of `new/`. A record that does not verify is skipped and logged, never presented. The verified body is written to the hook as UTF-8, and the four `TPS_MAIL_*` variables the watcher sets for the hook come from verified fields (the verified envelope id as `TPS_MAIL_ID`, plus `TPS_MAIL_FROM`/`TPS_MAIL_TO`/`TPS_MAIL_TIMESTAMP`). A verified record whose envelope id the watcher's lookup finds in the consumed ledger is skipped and logged; when the consumed history cannot be read, the error is logged, the file is left untouched, and the record is retried on the next scan if the file remains. `promote()` and the watcher refuse an envelope whose signed `body` is not a string.
+
+- **Check selected-runtime sandbox grants (Closes #483).**
+
+- **The tracked-lock installer now uses the release-age gate's registry and refuses configuration that could redirect it.** Before npm runs it refuses an `.npmrc` in the install directory, an `npm_config_*` variable or an unprefixed proxy variable that could change the fetch, `NODE_EXTRA_CA_CERTS`, `NODE_OPTIONS`, `NODE_TLS_REJECT_UNAUTHORIZED`, and a lock entry whose `resolved` URL is missing or outside that registry or whose `integrity` is missing or not sha512.
+
+- **The release npm upgrade uses an exact pin** CI checks its publish age against `bunfig.toml`; the release job repeats the check before upgrading.
+
+- **handlebars resolves to 4.7.10.** It is the first release patched for GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f and GHSA-xw65-4hp5-5hc7. Both manifests declare `^4.7.10`, which keeps that floor; 4.7.10 is now older than 7 days, so handlebars is no longer excluded from the install-time release-age window.
+
+- **The `shell-quote` override now resolves 1.11.0, outside the range of GHSA-pqg4-j6r4-53mv.** cli does not import `shell-quote`; it reaches the install only through `react-devtools-core`. `bun audit` reports no vulnerabilities.
+
+- **The CLI workspace now depends on zod 4.6.7, outside the range of GHSA-mrhx-c7xc-m3w5.** Report defaults, ids, timestamps, records and `Expected string, received …` error text keep their zod 3 behaviour. Three differences are deliberate: `.int()` now requires a safe integer, so a value beyond `Number.MAX_SAFE_INTEGER` may not be the integer that was sent (adjacent integers can collapse to one double); `z.number()` now refuses `Infinity`; and an empty `identity.default_name` reports zod 4's length message (`Too small: expected string to have >=1 characters`) rather than zod 3's.
+
 ## [0.8.0] — 2026-09-30
 
 **Breaking:** see **Breaking: `tps mail send` requires a usable sender signing key, refuses a recipient it has no route for, and prints only delivery metadata with `--json` (cli#429, cli#389).** under **Changed**.

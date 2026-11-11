@@ -1,1 +1,0 @@
-- **Rejected relay disconnect closes are reported; `stop()` retries retained channels.** A rejected close retains the channel; a successful retry in `stop()` removes it and can clear the host record, and a retry that rejects keeps the record and throws `HostChannelCloseError`. Connect-time host-record write failures are reported before reconnecting.

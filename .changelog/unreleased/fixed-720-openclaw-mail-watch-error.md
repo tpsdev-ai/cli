@@ -1,1 +1,0 @@
-- **The OpenClaw mail plugin handles an error from its inbox watcher (#720).** An `error` event on the `new/` watcher used to go unhandled; it is now logged as a `tps-mail: new/ watcher for <agent> stopped` warning, and mail in that inbox is still picked up by the periodic rescan.

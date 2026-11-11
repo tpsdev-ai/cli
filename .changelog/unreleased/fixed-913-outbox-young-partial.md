@@ -1,1 +1,0 @@
-- **The branch relay leaves a young unparseable outbox file in place and retries the send pass after 5 seconds instead of quarantining it.** A file that still does not parse once it is at least 5 seconds old is quarantined, and the log line names its age in milliseconds.

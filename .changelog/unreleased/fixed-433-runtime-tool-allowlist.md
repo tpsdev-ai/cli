@@ -1,1 +1,0 @@
-- **Within the turn budget, the agent runtime refuses calls outside its advertised trust-specific tool list.** On the over-limit turn, the loop stops without executing or refusing those calls.

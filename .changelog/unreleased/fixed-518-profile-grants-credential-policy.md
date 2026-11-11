@@ -1,1 +1,0 @@
-- **The nono agent launch path refuses profile access to protected credential paths and writable launch directories overlapping nono profile directories.**

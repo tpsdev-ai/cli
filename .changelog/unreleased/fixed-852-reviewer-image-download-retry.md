@@ -1,1 +1,0 @@
-- **The reviewer sandbox image retries transient download failures.** Each of its four downloads (node, bun, gh, js-yaml) retries a failed or partial transfer up to five times with a bounded timeout; the checksum check after each download is unchanged.

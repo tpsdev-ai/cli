@@ -1,1 +1,0 @@
-- **handlebars resolves to 4.7.10.** It is the first release patched for GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f and GHSA-xw65-4hp5-5hc7. Both manifests declare `^4.7.10`, which keeps that floor; 4.7.10 is now older than 7 days, so handlebars is no longer excluded from the install-time release-age window.

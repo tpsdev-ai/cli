@@ -1,1 +1,0 @@
-- **Relay stop waits for an in-flight connect and retries a late-connect close that rejects; an unconfirmed close throws `HostChannelCloseError` and keeps the host record.**
