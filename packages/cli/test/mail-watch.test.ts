@@ -598,7 +598,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
         () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
       );
 
-      // A SECOND file: the same wrapper bytes under a different name, written
+      // A SECOND file: the same signed envelope under a different file name and
+      // wrapper id, written
       // after the first was presented. The barrier below makes a scan list both
       // copies, so a second presentation of that id would show up.
       const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
