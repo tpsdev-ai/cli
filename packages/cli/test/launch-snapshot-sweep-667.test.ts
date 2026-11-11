@@ -322,6 +322,29 @@ console.log("REMOVED " + JSON.stringify(sweepStaleLaunchSnapshots(${JSON.stringi
     }
   });
 
+  test("keeps a snapshot whose forced probe answer is alive and removes one the same seam reports gone", () => {
+    const fixture = makeFixture();
+    try {
+      // Each forced answer is the opposite of the real probe's: pid 999999 is
+      // gone, so forcing "alive" and keeping it proves the seam was consulted;
+      // this process is alive, so forcing "gone" and removing it proves the
+      // same.
+      const alive = makeSnapshot(fixture.launch, "config-alive0");
+      writeOwner(alive, { pid: 999_999, startToken: null });
+      ageSnapshot(alive);
+      const gone = makeSnapshot(fixture.launch, "config-gone00");
+      writeOwner(gone, { pid: process.pid, startToken: processStartToken(process.pid) });
+      ageSnapshot(gone);
+
+      const forcedPidState = (pid: number) => (pid === 999_999 ? "alive" : "gone");
+      expect(sweepStaleLaunchSnapshots(fixture.launch, { pidState: forcedPidState })).toEqual([gone]);
+      expect(existsSync(alive)).toBe(true);
+      expect(existsSync(gone)).toBe(false);
+    } finally {
+      rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
   test("refuses an owner record whose pid or start token has the wrong shape", () => {
     const fixture = makeFixture();
     try {

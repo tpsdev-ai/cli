@@ -94,6 +94,28 @@ export function parsePidFile(raw: string): ParsedPidFile {
   return { kind: "record", pid, startToken: null };
 }
 
+export interface PidRecordSnapshot {
+  state: PidFileState;
+  raw: Buffer | null;
+}
+
+/** Read a pid record and keep the bytes the classification was made from.
+ *  A failed read yields `raw: null`. */
+export function snapshotPidRecord(path: string): PidRecordSnapshot {
+  let bytes: Buffer | null = null;
+  const state = readPidFile(path, processStartToken, (_text, raw) => {
+    bytes = raw;
+  });
+  return { state, raw: bytes };
+}
+
+/** Byte equality for two snapshots' raw file contents; a failed read is only
+ *  equal to another failed read. */
+export function pidRecordBytesEqual(a: Buffer | null, b: Buffer | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.equals(b);
+}
+
 export type PidFileRemoval = "removed" | "already gone";
 
 /**

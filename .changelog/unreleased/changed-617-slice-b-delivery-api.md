@@ -1,6 +1,4 @@
-- **MailClient adds a per-message delivery API; CLI recovery and actions guard placement phase (Refs #617, slice b).**
-
-  Agent event-loop wiring is unchanged.
+- **MailClient adds a per-message delivery API; CLI recovery and actions guard placement phase (Refs #617).**
 
   Unresolved `placing`/`in_progress` work defers `deliverNext()` commits.
   The token set covers MailClients of one module copy; claims from other copies

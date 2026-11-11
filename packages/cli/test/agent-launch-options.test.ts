@@ -355,7 +355,7 @@ test("a registered worktree with a missing directory is refused before grants", 
   }
   expect(error).toBeInstanceOf(WorktreeLifecycleError);
   expect((error as Error).message).toBe(
-    `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+    `worktree workspace is missing for a registered worktree: ${input.workspace}; if the directory was removed on purpose, run git -C '${_base}' worktree prune and launch again (it re-adds the worktree)`,
   );
 }));
 
@@ -477,7 +477,7 @@ test("a dangling workspace symlink to a registered target is refused before gran
     }
     expect(error).toBeInstanceOf(WorktreeLifecycleError);
     expect((error as Error).message).toBe(
-      `worktree workspace is missing for a registered worktree: ${input.workspace}`,
+      `worktree workspace is missing for a registered worktree: ${input.workspace}; if the directory was removed on purpose, run git -C '${_base}' worktree prune and launch again (it re-adds the worktree)`,
     );
   }
 }));
@@ -660,20 +660,40 @@ for (const target of ["dangling", "loop"] as const) {
   }));
 }
 
-test("cleanup reports a retained worktree removal failure", () => fixture((_input, base, root) => {
-  const workspace = join(root, "locked-worktree");
+test("cleanup reports a retained worktree removal failure", () => fixture((_input, _base, root) => {
+  const workspace = join(root, "removal-failure-worktree");
   const start = onStart("probe", workspace, { deferCheckout: true });
   expect(start.changed).toBe(true);
   expect(start.cleanupBinding).toBeDefined();
-  const locked = spawnSync("git", ["worktree", "lock", workspace], { cwd: base, encoding: "utf8" });
-  expect(locked.status, locked.stderr).toBe(0);
+  const bin = join(root, "bin");
+  mkdirSync(bin);
+  const git = Bun.which("git");
+  expect(git).not.toBeNull();
+  writeFileSync(
+    join(bin, "git"),
+    [
+      "#!/bin/sh",
+      'if [ "$1" = "worktree" ] && [ "$2" = "remove" ]; then',
+      '  echo "fatal: injected removal failure" >&2',
+      "  exit 1",
+      "fi",
+      `exec "${git}" "$@"`,
+      "",
+    ].join("\n"),
+  );
+  chmodSync(join(bin, "git"), 0o755);
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${bin}:${oldPath}`;
   let error: unknown;
   try {
     onStop("probe", workspace, start.cleanupBinding);
   } catch (err) {
     error = err;
+  } finally {
+    process.env.PATH = oldPath;
   }
   expect(error).toBeInstanceOf(WorktreeLifecycleError);
   expect((error as Error).message).toContain(`worktree cleanup failed for probe (${workspace})`);
+  expect((error as Error).message).toContain("injected removal failure");
   expect(existsSync(workspace)).toBe(true);
 }));

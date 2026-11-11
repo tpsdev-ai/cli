@@ -16,7 +16,7 @@ import { branchStatePath, clearBranchState, writeBranchState } from "../utils/co
 import { discoverManifests } from "../utils/manifest.js";
 import { runHandlerPipeline, type HandlerAction } from "../utils/mail-handler.js";
 import type { TransportChannel, TpsMessage, TransportServer } from "../utils/transport.js";
-import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "../utils/pid-file.js";
+import { pidRecordBytesEqual, readPidFile, removePidFile, serializePidRecord, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
 import { acquireMailLockSync, mailLockPath } from "../utils/mail-lock.js";
 
 let activeHostChannel: TransportChannel | null = null;
@@ -253,26 +253,6 @@ async function branchTestPauseAsync(phase: string, path: string): Promise<void> 
   }
 }
 
-export interface PidRecordSnapshot {
-  state: PidFileState;
-  raw: Buffer | null;
-}
-
-export function snapshotPidRecord(path: string): PidRecordSnapshot {
-  let bytes: Buffer | null = null;
-  const state = readPidFile(path, processStartToken, (_text, raw) => {
-    bytes = raw;
-  });
-  return { state, raw: bytes };
-}
-
-/** Byte equality for two snapshots' raw file contents; a failed read is only
- *  equal to another failed read. */
-export function pidRecordBytesEqual(a: Buffer | null, b: Buffer | null): boolean {
-  if (a === null || b === null) return a === b;
-  return a.equals(b);
-}
-
 /** Spawn the branch daemon with its pid record claimed under the branch lock. */
 function spawnBranchDaemon(): number {
   const path = pidPath();
@@ -485,15 +465,31 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   console.log("Branch identity created.");
   console.log(`Fingerprint: sha256:${kp.fingerprint}`);
-  console.log(`Listening on 0.0.0.0:${port}`);
-  console.log("\nJoin token (run on host):");
-  console.log(`  tps office join <name> \"${token}\"`);
-  console.log("\nWaiting for host to connect... (Ctrl+C to cancel)");
 
-  const joined =
-    transport === "ws"
-      ? await listenForJoinWs(kp, port, 120_001)
-      : await listenForJoin(kp, port, 120_001);
+  // Announce the port and the token only once the join listener has bound
+  // (cli#780): a bind failure must not advertise a listener that never existed.
+  let bound = false;
+  const announceListener = () => {
+    bound = true;
+    console.log(`Listening on 0.0.0.0:${port}`);
+    console.log("\nJoin token (run on host):");
+    console.log(`  tps office join <name> \"${token}\"`);
+    console.log("\nWaiting for host to connect... (Ctrl+C to cancel)");
+  };
+
+  let joined: Awaited<ReturnType<typeof listenForJoin>>;
+  try {
+    joined =
+      transport === "ws"
+        ? await listenForJoinWs(kp, port, 120_001, announceListener)
+        : await listenForJoin(kp, port, 120_001, announceListener);
+  } catch (e) {
+    if (bound) throw e;
+    const message = e instanceof Error ? e.message : String(e);
+    console.error(`Failed to listen on 0.0.0.0:${port}: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   const hostRecord = {
     hostId: joined.hostId,

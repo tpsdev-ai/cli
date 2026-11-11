@@ -1,13 +1,18 @@
 import { afterEach, expect, mock, setSystemTime, spyOn, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { hostStateLockRoot, hostStatePath, readHostState } from "../src/utils/connection-state.js";
+import { hostStateLockRoot, hostStatePath } from "../src/utils/connection-state.js";
 import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/identity.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
 import { connectAndKeepAlive } from "../src/utils/relay.js";
 import type { TransportChannel } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
+
+/** Read the on-disk record to check what the relay write left behind. */
+function readHostRecord(branch: string): Record<string, unknown> | null {
+  try { return JSON.parse(readFileSync(hostStatePath(branch), "utf-8")); } catch { return null; }
+}
 
 afterEach(() => { mock.restore(); });
 
@@ -108,7 +113,7 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     // not merely racing the close that is still in flight.
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
     // Compare unfiltered console.error calls before and after stop() with the expected one-argument arrays in order.
     // The in-loop close failure logs before stop(); pin that line here, while
@@ -116,7 +121,7 @@ test("a persistently rejected normal-disconnect close keeps the record and stop 
     for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
     expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
     expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine], [expectedCloseLine]]);
@@ -171,7 +176,7 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     for (let i = 0; connects < 2 && i < 400; i++) await Bun.sleep(5);
     expect(connects).toBeGreaterThanOrEqual(2);
     expect(sends).toBe(1);
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     const expectedCloseLine = `[relay] Failed channel close for host state record ${path}: close refused`;
     // Compare unfiltered console.error calls before and after stop() with the expected one-argument arrays in order.
     // The catch-path close failure logs before stop(); pin that line here,
@@ -179,7 +184,7 @@ test("a rejected heartbeat send whose channel close refuses keeps the record and
     for (let i = 0; diagnostic.mock.calls.length === 0 && i < 400; i++) await Bun.sleep(5);
     expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine]]);
     await expect(stop()).rejects.toMatchObject({ name: "HostChannelCloseError" });
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     expect(closes).toBeGreaterThanOrEqual(2);
     // stop() retries the retained channel; its line is a second, separate one.
     expect(diagnostic.mock.calls).toStrictEqual([[expectedCloseLine], [expectedCloseLine]]);
@@ -218,9 +223,9 @@ test("a normal disconnect whose close resolves lets stop clear the record", asyn
     const branch = await prepareBranch(root);
     stop = await connectAndKeepAlive(branch);
     await started;
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     await stop();
-    expect(readHostState(branch)).toBeNull();
+    expect(readHostRecord(branch)).toBeNull();
   } finally {
     await stop?.().catch(() => {});
     connect.mockRestore();
@@ -261,7 +266,7 @@ test("an initial health probe write failure reports path and reason without reco
     const path = hostStatePath(branch);
     for (let i = 0; fetchSpy.mock.calls.length === 0 && i < 200; i++) await Bun.sleep(5);
     expect(fetchSpy).toHaveBeenCalled();
-    const record = readHostState(branch);
+    const record = readHostRecord(branch);
     expect(record).not.toBeNull();
     lockRoot = holdHostLock(path);
     resolveFetch(new Response("ok"));
@@ -317,11 +322,11 @@ test("a periodic health probe write failure reports path and reason without reco
     const branch = await prepareBranch(root);
     stop = await connectAndKeepAlive(branch);
     const path = hostStatePath(branch);
-    for (let i = 0; ((readHostState(branch)?.services === undefined) || !health) && i < 200; i++) await Bun.sleep(5);
+    for (let i = 0; ((readHostRecord(branch)?.services === undefined) || !health) && i < 200; i++) await Bun.sleep(5);
     expect(health).toBeDefined();
     await Bun.sleep(20);
     diagnostic.mockClear();
-    const record = readHostState(branch);
+    const record = readHostRecord(branch);
     expect(record).not.toBeNull();
     lockRoot = holdHostLock(path);
     await health!();
@@ -402,7 +407,8 @@ test("a connect-time host record write failure is reported before reconnecting",
 test("a second connect-time host record write failure is reported before reconnecting", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-connect-write-second-791-"));
   const savedEnv = savedRelayEnv();
-  const never = new Promise<TransportChannel>(() => {});
+  let releaseConnect!: (channel: TransportChannel) => void;
+  const nextConnect = new Promise<TransportChannel>((resolve) => { releaseConnect = resolve; });
   const backoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   let connects = 0;
@@ -416,11 +422,11 @@ test("a second connect-time host record write failure is reported before reconne
   };
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
-    if (connects > 1) return never;
+    if (connects > 1) return nextConnect;
     return {
       async send() {
         // The first connect-time write has landed; block the second.
-        firstWriteVisible = readHostState(branch) !== null;
+        firstWriteVisible = readHostRecord(branch) !== null;
         lockRoot = holdHostLock(path);
       },
       onMessage() {},
@@ -444,9 +450,18 @@ test("a second connect-time host record write failure is reported before reconne
     // The first write succeeded; only the second attempt's write failed, and
     // it logged once. The complete captured list is compared unfiltered.
     expect(diagnostic.mock.calls).toStrictEqual([[expectedLine]]);
-    expect(readHostState(branch)).not.toBeNull();
+    expect(readHostRecord(branch)).not.toBeNull();
     releaseLock();
+    releaseConnect({
+      async send() {},
+      onMessage() {},
+      offMessage() {},
+      async close() {},
+      isAlive() { return true; },
+      peerFingerprint() { return "remote"; },
+    });
     await stop();
+    expect(readHostRecord(branch)).toBeNull();
   } finally {
     releaseLock();
     await stop?.().catch(() => {});

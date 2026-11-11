@@ -6,8 +6,8 @@ import { fileURLToPath } from "node:url";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { listHostStatePaths, withHostStateRecordLock } from "../utils/connection-state.js";
-import { readPidFile, removePidFile } from "../utils/pid-file.js";
-import { branchTestPause, pidPath as branchPidPath, pidRecordBytesEqual, snapshotPidRecord, withBranchPidLock, type PidRecordSnapshot } from "./branch.js";
+import { pidRecordBytesEqual, readPidFile, removePidFile, snapshotPidRecord, type PidRecordSnapshot } from "../utils/pid-file.js";
+import { branchTestPause, pidPath as branchPidPath, withBranchPidLock } from "./branch.js";
 import { fingerprint, loadHostIdentity, lookupBranch, registerBranch, revokeBranch } from "../utils/identity.js";
 import { NoiseIkTransport } from "../utils/noise-ik-transport.js";
 import { provisionTeam } from "../utils/provision.js";
@@ -138,6 +138,30 @@ function lastSeenFromPaths(paths: string[]): string {
     .filter((path) => existsSync(path))
     .map((path) => statSync(path).mtime.toISOString());
   return timestamps[0] ?? new Date(0).toISOString();
+}
+
+/** The checked shutdown `office connect` registers for SIGINT and SIGTERM:
+ *  stop the relay, clear the host record, report a failed disconnect and exit
+ *  non-zero. One handler serves both signals; a signal that arrives while it
+ *  runs starts no second shutdown. */
+export function createConnectShutdown(
+  stop: () => Promise<void>,
+  exit: (code: number) => void = (code) => process.exit(code),
+  report: (line: string) => void = (line) => console.error(line),
+): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await stop();
+    } catch (error) {
+      report(`Disconnect failed: ${(error as Error).message}`);
+      exit(1);
+      return;
+    }
+    exit(0);
+  };
 }
 
 function validateAgent(agent?: string): string {
@@ -606,14 +630,15 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const timestamp = new Date().toISOString();
       const agent = validateAgent(args.agent);
       const ws = workspacePath(agent);
-      const relayRunning = existsSync(relayPidFile(agent));
+      const relayState = readPidFile(relayPidFile(agent));
+      const relayRunning = relayState.kind === "running";
       const counts = outboxCounts(agent);
       const sb = findContainer(agent);
       
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
       if (args.json) {
-        const status = sb ? sb.state : relayRunning ? "relay-running" : "not running";
+        const status = sb ? sb.state : relayRunning ? "relay-running" : relayState.kind === "missing" ? "not running" : "relay-unknown";
         const lastSeen = lastSeenFromPaths([
           relayPidFile(agent),
           soundstageMarker,
@@ -637,7 +662,19 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
         console.log(`Office: not running`);
       }
 
-      console.log(`Relay: ${relayRunning ? "running" : "stopped"}`);
+      if (relayState.kind === "running") {
+        console.log("Relay: running");
+      } else if (relayState.kind === "missing") {
+        console.log("Relay: stopped");
+      } else if (relayState.kind === "unverified") {
+        console.log(`Relay: unverified (pid ${relayState.pid}, pid file ${relayState.path}).`);
+      } else if (relayState.kind === "stale") {
+        console.log(`Relay: unknown (stale pid file ${relayState.path}).`);
+      } else if (relayState.kind === "invalid") {
+        console.log(`Relay: unknown (invalid pid file ${relayState.path}).`);
+      } else {
+        console.log(`Relay: state unknown (pid file ${relayState.path} could not be read).`);
+      }
       console.log(`Outbox pending: ${counts.newCount} (cur=${counts.curCount}, failed=${counts.failedCount})`);
 
       const pausedDir = join(ws, "mail", "outbox", "paused");
@@ -909,15 +946,11 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       });
 
       console.log(`Persistent connection active for '${args.agent}'. Press Ctrl+C to disconnect.`);
-      process.on("SIGINT", async () => {
-        try {
-          await stop();
-        } catch (error) {
-          console.error(`Disconnect failed: ${(error as Error).message}`);
-          process.exit(1);
-        }
-        process.exit(0);
-      });
+      // `office kill` and service managers stop the connector with SIGTERM, so
+      // both signals run the same checked shutdown.
+      const shutdown = createConnectShutdown(stop);
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
       // bun drops the no-op interval; hold the loop until SIGTERM/SIGINT.
       await new Promise<void>(() => {});
       return;
@@ -1224,9 +1257,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       if (failures.length > 0) {
-        // Print collected failures before exiting non-zero.
+        // Print each collected failure once; the top-level handler exits
+        // non-zero without printing this error's message again.
         for (const line of failures) console.error(line);
-        throw new Error(failures.join(" "));
+        throw Object.assign(new Error(failures.join(" ")), { reported: true });
       }
 
       console.log(`Kill switch engaged. Terminated ${killed} TPS process(es).`);

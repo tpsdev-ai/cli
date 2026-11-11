@@ -109,9 +109,8 @@ test("connectAndKeepAlive writes a host record that readPidFile verifies as runn
 test("stop() reports an invalid host record and keeps it", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-invalid-record-748-"));
   const savedEnv = savedRelayEnv();
-  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(
-    new Promise<TransportChannel>(() => {}),
-  );
+  const connection = deferred<TransportChannel>();
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(connection.promise);
   try {
     const branch = await prepareBranch(root);
     const stop = await connectAndKeepAlive(branch);
@@ -119,7 +118,12 @@ test("stop() reports an invalid host record and keeps it", async () => {
     mkdirSync(join(root, ".tps", "connections"), { recursive: true });
     writeFileSync(path, "{ not json");
 
-    await expect(stop()).rejects.toThrow(path);
+    const stopping = stop();
+    connection.resolve({
+      async send() {}, onMessage() {}, offMessage() {}, async close() {},
+      isAlive() { return true; }, peerFingerprint() { return "remote"; },
+    });
+    await expect(stopping).rejects.toThrow(path);
 
     expect(readFileSync(path, "utf8")).toBe("{ not json");
   } finally {
@@ -134,16 +138,20 @@ test("stop() reports an invalid host record and keeps it", async () => {
 test("stop() reports a host record that is not a regular file and keeps it", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-unreadable-record-748-"));
   const savedEnv = savedRelayEnv();
-  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(
-    new Promise<TransportChannel>(() => {}),
-  );
+  const connection = deferred<TransportChannel>();
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockReturnValue(connection.promise);
   try {
     const branch = await prepareBranch(root);
     const stop = await connectAndKeepAlive(branch);
     const path = hostStatePath(branch);
     mkdirSync(path, { recursive: true });
 
-    await expect(stop()).rejects.toThrow(path);
+    const stopping = stop();
+    connection.resolve({
+      async send() {}, onMessage() {}, offMessage() {}, async close() {},
+      isAlive() { return true; }, peerFingerprint() { return "remote"; },
+    });
+    await expect(stopping).rejects.toThrow(path);
 
     expect(readdirSync(path)).toEqual([]);
   } finally {
@@ -163,10 +171,11 @@ test("stop() suppresses the host record write of a connection that resolves afte
     const stop = await connectAndKeepAlive(branch);
     const path = hostStatePath(branch);
 
-    await stop();
-    expect(existsSync(path)).toBe(false);
-
     let closed = false;
+    const stopping = stop();
+    await Bun.sleep(20);
+    expect(existsSync(path)).toBe(false);
+    expect(closed).toBe(false);
     connection.resolve({
       async send() {},
       onMessage() {},
@@ -175,6 +184,7 @@ test("stop() suppresses the host record write of a connection that resolves afte
       isAlive() { return true; },
       peerFingerprint() { return "remote"; },
     });
+    await stopping;
     for (let i = 0; !closed && i < 200; i++) await Bun.sleep(5);
     expect(closed).toBe(true);
     expect(existsSync(path)).toBe(false);
@@ -269,8 +279,13 @@ test.each([["close resolves", false], ["close rejects", true]] as const)("a host
     }
   } finally {
     if (lockRoot) rmSync(lockRoot, { recursive: true, force: true });
+    const stopping = stop?.();
+    retry.resolve({
+      async send() {}, onMessage() {}, offMessage() {}, async close() {},
+      isAlive() { return true; }, peerFingerprint() { return "remote"; },
+    });
     try {
-      await stop?.();
+      await stopping;
       if (closeFails) expect(closes).toBe(2);
     } finally {
       connect.mockRestore();
@@ -284,7 +299,7 @@ test.each([["close resolves", false], ["close rejects", true]] as const)("a host
 test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejects keeps the record and fails %s", async (mode) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-stop-close-748-"));
   const savedEnv = savedRelayEnv();
-  const listeners = new Set(process.listeners("SIGINT"));
+  const listeners = new Set([...process.listeners("SIGINT"), ...process.listeners("SIGTERM")]);
   let stop: (() => Promise<void>) | undefined;
   let sigint: (() => Promise<void>) | undefined;
   let closes = 0;
@@ -312,6 +327,7 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
     const path = hostStatePath(branch);
     for (let i = 0; closes === 0 && i < 200; i++) await Bun.sleep(5);
     sigint = process.listeners("SIGINT").find((listener) => !listeners.has(listener)) as (() => Promise<void>) | undefined;
+    const sigterm = process.listeners("SIGTERM").find((listener) => !listeners.has(listener));
     expect(closes).toBe(1);
     const record = readFileSync(path, "utf8");
 
@@ -319,6 +335,9 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
       await expect(stop!()).rejects.toMatchObject({ name: "HostChannelCloseError", message: expect.stringContaining(path) });
     } else {
       expect(sigint).toBeDefined();
+      // One checked shutdown for both signals (cli#762): a second signal while it
+      // runs reaches the same single-flight guard instead of starting a second stop.
+      expect(sigterm).toBe(sigint);
       await expect(sigint!()).rejects.toBe(exited);
       expect(exit).toHaveBeenCalledTimes(1);
       expect(exit).toHaveBeenCalledWith(1);
@@ -331,8 +350,10 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
     rejectClose = false;
     await stop?.();
     await sigint?.().catch((error) => { if (error !== exited) throw error; });
-    for (const listener of process.listeners("SIGINT")) {
-      if (!listeners.has(listener)) process.off("SIGINT", listener);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      for (const listener of process.listeners(signal)) {
+        if (!listeners.has(listener)) process.off(signal, listener);
+      }
     }
     exit.mockRestore();
     output.mockRestore();

@@ -1,1 +1,0 @@
-- **When Flair is reachable, `tps agent create` reports registration only after the generated key reads back equal.** It re-reads the agent's stored `publicKey` over the operator credential; it exits non-zero unless the stored key reads back equal to the generated key, naming the agent, the Flair URL and the remedy.

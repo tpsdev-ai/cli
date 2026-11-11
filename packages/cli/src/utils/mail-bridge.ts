@@ -6,12 +6,19 @@
  * for backward compatibility.
  */
 
-export { BridgeCore, validateAgentId } from "../bridge/core.js";
+export {
+  assertBridgeAdapterName,
+  BRIDGE_ADAPTER_NAME_RE,
+  BridgeCore,
+  validateAgentId,
+  validateBridgeAdapterName,
+} from "../bridge/core.js";
 export type { BridgeEnvelope } from "../bridge/adapter.js";
 export { OpenClawAdapter } from "../bridge/openclaw-adapter.js";
 export { StdioAdapter } from "../bridge/stdio-adapter.js";
 
 import { BridgeCore } from "../bridge/core.js";
+import { validateBridgeAdapterName } from "../bridge/adapter.js";
 import { OpenClawAdapter, type OpenClawAdapterConfig } from "../bridge/openclaw-adapter.js";
 import { pidState, type PidState } from "@tpsdev-ai/agent";
 import { readdirSync } from "node:fs";
@@ -41,10 +48,19 @@ export interface BridgePidFileEntry {
 /** `BridgeCore.start` writes `bridge-<adapter>.pid`. Discovery accepts an
  *  adapter part of lowercase ASCII letters only. The legacy name
  *  `mail-bridge.pid` is treated as the OpenClaw bridge. */
-const BRIDGE_PID_NAME = /^(?:bridge-([a-z]+)|mail-bridge)\.pid$/;
+const BRIDGE_PID_PREFIX = "bridge-";
+const BRIDGE_PID_SUFFIX = ".pid";
+const LEGACY_PID_NAME = "mail-bridge.pid";
 const LEGACY_ADAPTER = "openclaw";
 /** The OpenClaw records, in the order the start check reads them. */
 const OPENCLAW_PID_NAMES = ["bridge-openclaw.pid", "mail-bridge.pid"] as const;
+
+function bridgePidRecordAdapter(name: string): string | null {
+  if (name === LEGACY_PID_NAME) return LEGACY_ADAPTER;
+  if (!name.startsWith(BRIDGE_PID_PREFIX) || !name.endsWith(BRIDGE_PID_SUFFIX)) return null;
+  const adapter = name.slice(BRIDGE_PID_PREFIX.length, -BRIDGE_PID_SUFFIX.length);
+  return validateBridgeAdapterName(adapter) ? adapter : null;
+}
 
 function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntry | null {
   let port: number | undefined;
@@ -60,12 +76,23 @@ function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntr
   return { path, state, port, adapter };
 }
 
+/** The run-directory listing `bridgePidFiles` uses; replaceable in tests. */
+let listRunDir = (dir: string): string[] => readdirSync(dir);
+
+/** Replace the run-directory listing; returns the previous reader. A test uses
+ *  this to count how many times one `status --json` call reads the directory. */
+export function setRunDirReader(reader: (dir: string) => string[]): (dir: string) => string[] {
+  const previous = listRunDir;
+  listRunDir = reader;
+  return previous;
+}
+
 /** The bridge pid records discovery accepts, with their strict classification. */
 export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
   const pidDir = join(homeDir(), ".tps", "run");
   let names: string[];
   try {
-    names = readdirSync(pidDir);
+    names = listRunDir(pidDir);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code ?? "unknown";
     if (code === "ENOENT") return [];
@@ -74,8 +101,9 @@ export function bridgePidFiles(adapter?: string): BridgePidFileEntry[] {
     );
   }
   const entries: BridgePidFileEntry[] = [];
-  for (const name of names.filter((entry) => BRIDGE_PID_NAME.test(entry)).sort()) {
-    const recordAdapter = BRIDGE_PID_NAME.exec(name)?.[1] ?? LEGACY_ADAPTER;
+  for (const name of [...names].sort()) {
+    const recordAdapter = bridgePidRecordAdapter(name);
+    if (recordAdapter === null) continue;
     if (adapter !== undefined && recordAdapter !== adapter) continue;
     const entry = classifyBridgePidFile(join(pidDir, name), recordAdapter);
     if (entry) entries.push(entry);
@@ -100,20 +128,62 @@ export interface BridgeRunningRecord {
   port?: number;
 }
 
-function runningRecordsFrom(
+/** The liveness probe the `status --json` snapshot uses; replaceable in tests. */
+let statusProbe: (pid: number) => PidState = pidState;
+
+/** Replace the `status --json` liveness probe; returns the previous probe. A
+ *  test uses this to count how often one `status --json` call probes a pid. */
+export function setStatusProbe(probe: (pid: number) => PidState): (pid: number) => PidState {
+  const previous = statusProbe;
+  statusProbe = probe;
+  return previous;
+}
+
+/** Probe each unverified pid in `entries` once; a pid recorded in more than one
+ *  record is probed once. */
+export function probeUnverifiedPids(
   entries: BridgePidFileEntry[],
   probe: (pid: number) => PidState,
+): Map<number, PidState> {
+  const liveness = new Map<number, PidState>();
+  for (const entry of entries) {
+    const { state } = entry;
+    if (state.kind !== "unverified" || liveness.has(state.pid)) continue;
+    liveness.set(state.pid, probe(state.pid));
+  }
+  return liveness;
+}
+
+/** The running records among `entries`: each `running` entry, plus an
+ *  `unverified` entry whose pid the probe reports alive. `liveness` carries the
+ *  probe result per unverified pid, so a caller that already probed does not
+ *  probe again. */
+export function runningRecordsFrom(
+  entries: BridgePidFileEntry[],
+  probe: (pid: number) => PidState = pidState,
+  liveness: Map<number, PidState> = probeUnverifiedPids(entries, probe),
 ): BridgeRunningRecord[] {
   const running: BridgeRunningRecord[] = [];
   for (const entry of entries) {
     const { state, port } = entry;
     let pid: number | undefined;
     if (state.kind === "running") pid = state.pid;
-    else if (state.kind === "unverified" && probe(state.pid) === "alive") pid = state.pid;
+    else if (state.kind === "unverified" && liveness.get(state.pid) === "alive") pid = state.pid;
     if (pid === undefined) continue;
     running.push(port === undefined ? { adapter: entry.adapter, pid } : { adapter: entry.adapter, pid, port });
   }
   return running;
+}
+
+/** The running records and the one probe result per unverified pid that a
+ *  `status --json` document derives both its `bridges` entry and its `records`
+ *  entry from. */
+export function bridgeStatusSnapshot(entries: BridgePidFileEntry[]): {
+  running: BridgeRunningRecord[];
+  liveness: Map<number, PidState>;
+} {
+  const liveness = probeUnverifiedPids(entries, statusProbe);
+  return { running: runningRecordsFrom(entries, statusProbe, liveness), liveness };
 }
 
 function statusOf(

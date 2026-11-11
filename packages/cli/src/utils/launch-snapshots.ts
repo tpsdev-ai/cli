@@ -49,7 +49,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 
 export const LAUNCH_SNAPSHOT_PREFIX = "config-";
 /** A snapshot in the making, renamed to `config-*` once its owner record is written. */
@@ -150,12 +150,15 @@ function tokenSource(token: string): string {
  * "dead" — pid gone, or pid alive under a different readable start token from
  * the same source. While the pid is alive, a token from another source, or
  * either token unavailable (the recorded token, or the current one), is
- * "unverifiable": it is kept, never treated as dead. A pid that pidState
- * classifies as "invalid" is "unreadable", like an owner record that cannot be
+ * "unverifiable": it is kept, never treated as dead. A pid that the probe
+ * (default: pidState) classifies as "invalid" is "unreadable", like an owner record that cannot be
  * read.
  */
-function ownerState(owner: LaunchSnapshotOwner): "alive" | "dead" | "unverifiable" | "unreadable" {
-  const pid = pidState(owner.pid);
+function ownerState(
+  owner: LaunchSnapshotOwner,
+  probe: (pid: number) => PidState,
+): "alive" | "dead" | "unverifiable" | "unreadable" {
+  const pid = probe(owner.pid);
   if (pid === "invalid") return "unreadable";
   if (pid === "gone") return "dead";
   if (owner.startToken === null) return "unverifiable";
@@ -166,9 +169,9 @@ function ownerState(owner: LaunchSnapshotOwner): "alive" | "dead" | "unverifiabl
 }
 
 /** The entry's recorded owner is dead, or it has no readable owner record and is at least `graceMs` old. */
-function isStale(path: string, graceMs: number, now: number): boolean {
+function isStale(path: string, graceMs: number, now: number, probe: (pid: number) => PidState): boolean {
   const owner = readLaunchSnapshotOwner(path);
-  const state = owner === null ? "unreadable" : ownerState(owner);
+  const state = owner === null ? "unreadable" : ownerState(owner, probe);
   if (state === "dead") return true;
   if (state !== "unreadable") return false;
   let mtimeMs: number;
@@ -184,6 +187,8 @@ function isStale(path: string, graceMs: number, now: number): boolean {
 export interface SweepLaunchSnapshotsOptions {
   graceMs?: number;
   now?: number;
+  /** Probe a recorded pid; defaults to the shared pidState. */
+  pidState?: (pid: number) => PidState;
 }
 
 /**
@@ -202,6 +207,7 @@ export function sweepStaleLaunchSnapshots(
 ): string[] {
   const graceMs = options.graceMs ?? LAUNCH_SNAPSHOT_OWNER_GRACE_MS;
   const now = options.now ?? Date.now();
+  const probe = options.pidState ?? pidState;
   const removed: string[] = [];
 
   for (const entry of readdirSync(launchDir, { withFileTypes: true })) {
@@ -210,7 +216,7 @@ export function sweepStaleLaunchSnapshots(
     if (entry.isSymbolicLink() || !entry.isDirectory()) continue;
 
     const path = join(launchDir, entry.name);
-    if (!isStale(path, kind === "pending" ? LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS : graceMs, now)) continue;
+    if (!isStale(path, kind === "pending" ? LAUNCH_SNAPSHOT_PENDING_OWNER_GRACE_MS : graceMs, now, probe)) continue;
 
     try {
       // rm does not traverse a symlink in place of the entry.

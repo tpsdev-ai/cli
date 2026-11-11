@@ -15,11 +15,18 @@ import {
   writeFileSync,
   rmSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homeDir } from "../utils/home.js";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { promote, recoverPromoted, redriveRetryable, ackMessageAtPath, setBridgeSentAtPath, type PromoteOk } from "../utils/mail.js";
-import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+import {
+  assertBridgeAdapterName,
+  BRIDGE_ADAPTER_NAME_RE,
+  printableName,
+  validateBridgeAdapterName,
+  type BridgeAdapter,
+  type BridgeEnvelope,
+} from "./adapter.js";
 import { signOutboundBody } from "../utils/mail-sign.js";
 import { requireLocalAgentId } from "../utils/local-agent.js";
 
@@ -28,6 +35,7 @@ const AGENT_ID_RE = /^[a-zA-Z0-9_-]{1,64}$/;
 export function validateAgentId(id: string): boolean {
   return AGENT_ID_RE.test(id);
 }
+export { assertBridgeAdapterName, BRIDGE_ADAPTER_NAME_RE, validateBridgeAdapterName };
 
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
 import { configureBridgeIdentity, processStartToken } from "@tpsdev-ai/agent";
@@ -45,6 +53,8 @@ export interface BridgeCoreConfig {
 
 export class BridgeCore {
   private readonly bridgeAgentId: string;
+  /** The adapter name read once and validated at construction; every name-derived path and record uses it. */
+  private readonly adapterName: string;
   private readonly mailDir: string;
   private readonly defaultAgentId: string;
   private readonly defaultChannelId: string;
@@ -58,9 +68,13 @@ export class BridgeCore {
     config: BridgeCoreConfig = {},
     log?: (msg: string) => void,
   ) {
-    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(process.env.HOME ?? homedir(), ".tps", "mail");
+    // One read of the name: the value validated is the value used (a getter could return another on a second read).
+    const adapterName = adapter.name;
+    assertBridgeAdapterName(adapterName);
+    this.adapterName = adapterName;
+    this.mailDir = config.mailDir ?? process.env.TPS_MAIL_DIR ?? join(homeDir(), ".tps", "mail");
     this.defaultAgentId = requireLocalAgentId("bridge default agent id", config.defaultAgentId);
-    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapter.name, config.bridgeAgentId);
+    this.bridgeAgentId = configureBridgeIdentity(this.mailDir, adapterName, config.bridgeAgentId);
     this.defaultChannelId = config.defaultChannelId ?? "";
     this.discordContextPrompt = config.discordContextPrompt ?? "Respond conversationally. If this is a greeting or casual question, reply briefly. Only switch to implementation mode if explicitly asked to write or fix code.";
     this.redriveMs = config.redriveMs ?? 30_000;
@@ -68,6 +82,13 @@ export class BridgeCore {
   }
 
   async start(): Promise<void> {
+    const currentName = this.adapter.name;
+    if (currentName !== this.adapterName) {
+      assertBridgeAdapterName(currentName);
+      throw new Error(
+        `Bridge adapter name changed from ${printableName(this.adapterName)} to ${printableName(currentName)} after construction; refusing to start. Construct a new bridge for the new name.`,
+      );
+    }
     // Start adapter with inbound callback
     await this.adapter.start((envelope) => this.handleInbound(envelope));
 
@@ -75,23 +96,23 @@ export class BridgeCore {
     this.stopOutbound = this.watchOutbox();
 
     // PID file
-    const pidDir = join(homedir(), ".tps", "run");
+    const pidDir = join(homeDir(), ".tps", "run");
     mkdirSync(pidDir, { recursive: true });
     writeFileSync(
-      join(pidDir, `bridge-${this.adapter.name}.pid`),
-      `${JSON.stringify({ pid: process.pid, startToken: processStartToken(process.pid), adapter: this.adapter.name })}\n`,
+      join(pidDir, `bridge-${this.adapterName}.pid`),
+      `${JSON.stringify({ pid: process.pid, startToken: processStartToken(process.pid), adapter: this.adapterName })}\n`,
       "utf-8",
     );
 
-    this.log(`[bridge:${this.adapter.name}] Started (agent=${this.bridgeAgentId}, default=${this.defaultAgentId})`);
+    this.log(`[bridge:${this.adapterName}] Started (agent=${this.bridgeAgentId}, default=${this.defaultAgentId})`);
   }
 
   async stop(): Promise<void> {
     this.stopOutbound?.();
     await this.adapter.stop();
-    const pidPath = join(homedir(), ".tps", "run", `bridge-${this.adapter.name}.pid`);
+    const pidPath = join(homeDir(), ".tps", "run", `bridge-${this.adapterName}.pid`);
     rmSync(pidPath, { force: true });
-    this.log(`[bridge:${this.adapter.name}] Stopped`);
+    this.log(`[bridge:${this.adapterName}] Stopped`);
   }
 
   private handleInbound(envelope: BridgeEnvelope): string {
@@ -177,7 +198,7 @@ Message: ${envelope.content}`;
       } else {
         // Plain text reply — route back to the channel this agent is bridging
         envelope = {
-          channel: this.adapter.name,
+          channel: this.adapterName,
           channelId: this.defaultChannelId ?? "",
           content: verifiedBody,
           senderId: "agent",

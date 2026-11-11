@@ -15,6 +15,69 @@ import { readPidFile } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
+const START_TIMEOUT = 10_000;
+/** Room the FIFO child's deadline leaves before the timeout of the test that
+ *  arms it, so a hung child reports the named error rather than bun's generic
+ *  timeout. */
+const FIFO_DEADLINE_MARGIN = 2_000;
+const FIFO_TEST_TIMEOUT = 10_000;
+const FIFO_DEADLINE = FIFO_TEST_TIMEOUT - FIFO_DEADLINE_MARGIN;
+/** This test also starts a real bridge before the FIFO read, so its timeout
+ *  covers START_TIMEOUT as well. */
+const FIFO_STOP_TEST_TIMEOUT = FIFO_TEST_TIMEOUT + START_TIMEOUT;
+
+/** The time a FIFO test needs: what it spends before the FIFO read, the read's
+ *  deadline, and the margin. A timeout below this fails registration. */
+function checkFifoTimeout(name: string, timeoutMs: number, preReadMs: number): void {
+  const needed = preReadMs + FIFO_DEADLINE + FIFO_DEADLINE_MARGIN;
+  if (timeoutMs < needed) {
+    throw new Error(`FIFO test "${name}": timeout ${timeoutMs} ms is below ${needed} ms (pre-read ${preReadMs} + FIFO_DEADLINE ${FIFO_DEADLINE} + margin ${FIFO_DEADLINE_MARGIN})`);
+  }
+}
+
+/** Names of the tests registered through fifoTest. A count, not an identity:
+ *  the runFifoRead refusal below is the real backstop. */
+const fifoCases: string[] = [];
+/** Set only while a fifoTest body runs: when it started, the timeout it was
+ *  registered with, and each deadline it armed. runFifoRead refuses without it.
+ *  Sound because bun runs this file's tests serially; test.concurrent here would break it. */
+let fifoBudget: { startedAt: number; timeoutMs: number; armed: { elapsedMs: number; deadlineMs: number }[] } | null = null;
+/** Below this, a FIFO read is refused rather than armed with a deadline too short to mean anything. */
+const FIFO_MIN_DEADLINE = 1_000;
+
+/** The deadline a FIFO read is armed with: FIFO_DEADLINE, cut to what the
+ *  test's own budget has left after the time it has already spent and the
+ *  margin. Derived, not passed in, so the armed deadline always ends at least
+ *  FIFO_DEADLINE_MARGIN before the test's timeout and a hung child reports the
+ *  named error rather than bun's generic timeout. */
+function fifoDeadline(elapsedMs: number, timeoutMs: number): number {
+  const deadline = Math.min(FIFO_DEADLINE, timeoutMs - elapsedMs - FIFO_DEADLINE_MARGIN);
+  if (deadline < FIFO_MIN_DEADLINE) {
+    throw new Error(`FIFO read budget exceeded: ${elapsedMs} ms elapsed of ${timeoutMs} ms leaves ${deadline} ms after the ${FIFO_DEADLINE_MARGIN} ms margin (minimum ${FIFO_MIN_DEADLINE} ms)`);
+  }
+  return deadline;
+}
+
+/** The only way to register a test that runs a FIFO read: its own timeout is
+ *  checked where it is declared, so no list can drift from the call sites. */
+function fifoTest(name: string, fn: () => Promise<void>, timeoutMs: number, preReadMs = 0): void {
+  checkFifoTimeout(name, timeoutMs, preReadMs);
+  fifoCases.push(name);
+  test(name, async () => {
+    const budget = { startedAt: Date.now(), timeoutMs, armed: [] as { elapsedMs: number; deadlineMs: number }[] };
+    fifoBudget = budget;
+    try {
+      await fn();
+      // Every deadline this test actually armed ended inside its budget, margin included.
+      expect(budget.armed.length).toBeGreaterThan(0);
+      for (const { elapsedMs, deadlineMs } of budget.armed) {
+        expect(elapsedMs + deadlineMs + FIFO_DEADLINE_MARGIN).toBeLessThanOrEqual(timeoutMs);
+      }
+    } finally {
+      fifoBudget = null;
+    }
+  }, timeoutMs);
+}
 const CORE_URL = new URL("../src/bridge/core.js", import.meta.url).href;
 const STDIO_URL = new URL("../src/bridge/stdio-adapter.js", import.meta.url).href;
 const COMMANDS_URL = new URL("../src/commands/bridge.js", import.meta.url).href;
@@ -22,7 +85,6 @@ const MAIL_BRIDGE_URL = new URL("../src/utils/mail-bridge.js", import.meta.url).
 const BUILT_PID_FILE_URL = new URL("../dist/src/utils/pid-file.js", import.meta.url).href;
 const BUILT_MAIL_BRIDGE_URL = new URL("../dist/src/utils/mail-bridge.js", import.meta.url).href;
 const BUILT_COMMANDS_URL = new URL("../dist/src/commands/bridge.js", import.meta.url).href;
-const FIFO_DEADLINE = 2_000;
 
 function cannotListRestrictedDirectory(): boolean {
   const directory = mkdtempSync(join(tmpdir(), "tps-bridge-717-mode-"));
@@ -95,7 +157,7 @@ function spawnSleep(): Bun.Subprocess {
 
 function spawnScript(script: string, env: Record<string, string>): Bun.Subprocess {
   const child = Bun.spawn(["bun", script], {
-    env: { ...process.env, HOME: home, ...env },
+    env: { ...process.env, ...env, HOME: home },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -106,7 +168,7 @@ function spawnScript(script: string, env: Record<string, string>): Bun.Subproces
 
 async function waitForRunning(path: string, child: Bun.Subprocess): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < 10_000) {
+  while (Date.now() - start < START_TIMEOUT) {
     if (readPidFile(path).kind === "running") return;
     if (child.exitCode !== null) {
       throw new Error(`bridge child exited (${child.exitCode}) before writing ${path}`);
@@ -135,17 +197,30 @@ async function runStartDecision(): Promise<{ stdout: string; exitCode: number }>
 }
 
 async function runFifoRead(script: string): Promise<Record<string, unknown>> {
+  if (fifoBudget === null) throw new Error("runFifoRead runs only inside a test registered with fifoTest");
+  const budget = fifoBudget;
   const path = join(home, "fifo-read.mts");
   writeFileSync(path, script);
   const child = spawnScript(path, {});
+  // Sampled at arming time, after the write and the spawn, so the recorded
+  // elapsed time covers everything the test spent before the timer starts.
+  const elapsedMs = Date.now() - budget.startedAt;
+  let deadlineMs: number;
+  try {
+    deadlineMs = fifoDeadline(elapsedMs, budget.timeoutMs);
+  } catch (error) {
+    child.kill("SIGKILL");
+    throw error;
+  }
+  budget.armed.push({ elapsedMs, deadlineMs });
   let expired = false;
   const timer = setTimeout(() => {
     expired = true;
     child.kill("SIGKILL");
-  }, FIFO_DEADLINE);
+  }, deadlineMs);
   try {
     const exitCode = await child.exited;
-    if (expired) throw new Error(`FIFO child deadline exceeded (${FIFO_DEADLINE} ms)`);
+    if (expired) throw new Error(`FIFO child deadline exceeded (${deadlineMs} ms)`);
     const stdout = await new Response(child.stdout).text();
     const stderr = await new Response(child.stderr).text();
     if (exitCode !== 0) throw new Error(`FIFO child exited ${exitCode}: ${stderr}`);
@@ -420,6 +495,14 @@ describe("bridge status names the adapter of each running record", () => {
         port: 7891,
         adapter: "openclaw",
         bridges: [{ adapter: "openclaw", pid: child.pid, port: 7891 }],
+        records: [
+          {
+            adapter: "openclaw",
+            path: join(runDir, "bridge-openclaw.pid"),
+            state: "running",
+            pid: child.pid,
+          },
+        ],
       });
     },
     TIMEOUT,
@@ -474,14 +557,76 @@ describe("bridge status names the adapter of each running record", () => {
       expect(JSON.parse(lines[0])).toEqual({
         running: false,
         bridges: [{ adapter: "discord", pid: discord.pid }],
+        records: [
+          {
+            adapter: "discord",
+            path: join(runDir, "bridge-discord.pid"),
+            state: "running",
+            pid: discord.pid,
+          },
+        ],
       });
     },
     TIMEOUT,
   );
 });
 
-describe("guarded pid-file reads", () => {
+describe("FIFO deadline bounds", () => {
+  test("a FIFO test timeout below pre-read + deadline + margin is refused, and exactly enough is accepted", () => {
+    const needed = START_TIMEOUT + FIFO_DEADLINE + FIFO_DEADLINE_MARGIN;
+    expect(() => checkFifoTimeout("probe", needed - 1, START_TIMEOUT)).toThrow("is below");
+    expect(() => checkFifoTimeout("probe", needed, START_TIMEOUT)).not.toThrow();
+    expect(() => checkFifoTimeout("probe", FIFO_DEADLINE + FIFO_DEADLINE_MARGIN - 1, 0)).toThrow("is below");
+    // fifoTest itself refuses before registering anything, so these probes add no test.
+    expect(() => fifoTest("probe", async () => {}, FIFO_DEADLINE + FIFO_DEADLINE_MARGIN - 1)).toThrow("is below");
+    expect(() => fifoTest("probe", async () => {}, needed - 1, START_TIMEOUT)).toThrow("is below");
+  });
+
+  test("every test that runs a FIFO read is registered through fifoTest", () => {
+    expect(fifoCases).toHaveLength(5);
+  });
+
+  test("runFifoRead refuses outside a fifoTest", async () => {
+    await expect(runFifoRead("")).rejects.toThrow("only inside a test registered with fifoTest");
+  });
+
+  test("the armed FIFO deadline never runs past the test's budget less the margin", () => {
+    expect(fifoDeadline(0, FIFO_TEST_TIMEOUT)).toBe(FIFO_DEADLINE);
+    expect(fifoDeadline(3_000, FIFO_TEST_TIMEOUT)).toBe(FIFO_TEST_TIMEOUT - 3_000 - FIFO_DEADLINE_MARGIN);
+    expect(fifoDeadline(START_TIMEOUT, FIFO_STOP_TEST_TIMEOUT)).toBe(FIFO_DEADLINE);
+    for (const [elapsed, timeout] of [[0, FIFO_TEST_TIMEOUT], [3_000, FIFO_TEST_TIMEOUT], [12_500, FIFO_STOP_TEST_TIMEOUT]] as const) {
+      expect(elapsed + fifoDeadline(elapsed, timeout) + FIFO_DEADLINE_MARGIN).toBeLessThanOrEqual(timeout);
+    }
+    expect(() => fifoDeadline(FIFO_TEST_TIMEOUT - FIFO_DEADLINE_MARGIN - FIFO_MIN_DEADLINE + 1, FIFO_TEST_TIMEOUT)).toThrow("FIFO read budget exceeded");
+  });
+});
+
+describe("child environment", () => {
   test(
+    "a caller's env cannot override the temp HOME",
+    async () => {
+      const script = join(home, "print-home.mts");
+      writeFileSync(script, 'console.log("HOME:" + process.env.HOME);');
+      const child = spawnScript(script, { HOME: join(home, "other") });
+      const exitCode = await child.exited;
+      const stdout = await new Response(child.stdout).text();
+
+      expect(exitCode).toBe(0);
+      expect(stdout.trim()).toBe(`HOME:${home}`);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("guarded pid-file reads", () => {
+  // The only FIFO case whose child never exits on its own: it proves the armed
+  // timer, the kill and the named error, which the prompt FIFO cases below leave
+  // unexercised (~8 s).
+  fifoTest("a hung FIFO child is killed at the armed deadline and reports the named error", async () => {
+    await expect(runFifoRead("await new Promise(() => {});")).rejects.toThrow("FIFO child deadline exceeded");
+  }, FIFO_TEST_TIMEOUT);
+
+  fifoTest(
     "a discovered regular record replaced by a FIFO is classified without being read and kept",
     async () => {
       const fifo = join(runDir, "bridge-fifo.pid");
@@ -498,10 +643,10 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(fifo)})));
       expect(result).toEqual({ kind: "unreadable", path: fifo, reason: "is not a regular file" });
       expect(existsSync(fifo)).toBe(true);
     },
-    10_000,
+    FIFO_TEST_TIMEOUT,
   );
 
-  test("a final-component symlink is classified without reading its target and kept", async () => {
+  fifoTest("a final-component symlink is classified without reading its target and kept", async () => {
     const target = join(runDir, "target");
     const path = join(runDir, "bridge-openclaw.pid");
     expect(Bun.spawnSync(["mkfifo", target]).exitCode).toBe(0);
@@ -514,9 +659,9 @@ console.log("RESULT:" + JSON.stringify(readPidFile(${JSON.stringify(path)})));
 
     expect(result).toEqual({ kind: "unreadable", path, reason: "could not be opened (ELOOP: symlink resolution refused)" });
     expect(existsSync(path)).toBe(true);
-  }, 10_000);
+  }, FIFO_TEST_TIMEOUT);
 
-  test("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
+  fifoTest("a FIFO replacement before stop's fresh check is kept without signalling", async () => {
     const path = join(runDir, "bridge-fifo.pid");
     writeFileSync(path, "");
 
@@ -556,9 +701,9 @@ console.log("RESULT:" + JSON.stringify({ fresh, signals, message, reads }));
     expect(result.signals).toEqual([]);
     expect(result.message).toContain("the pid file was kept");
     expect(existsSync(path)).toBe(true);
-  }, 10_000);
+  }, FIFO_TEST_TIMEOUT);
 
-  test(
+  fifoTest(
     "a FIFO record is reported as kept while the other records are stopped",
     async () => {
       const child = await startStdioBridge();
@@ -583,6 +728,7 @@ console.log("RESULT:" + JSON.stringify({ adapters, message }));
       expect(existsSync(stdioPid)).toBe(false);
       expect(existsSync(fifo)).toBe(true);
     },
-    10_000,
+    FIFO_STOP_TEST_TIMEOUT,
+    START_TIMEOUT,
   );
 });

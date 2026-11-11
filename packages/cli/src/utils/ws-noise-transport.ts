@@ -337,7 +337,8 @@ export class WsNoiseTransport implements WireTransport {
 export async function listenForJoinWs(
   branchKeyPair: TpsKeyPair,
   port: number,
-  timeoutMs: number = 120_000
+  timeoutMs: number = 120_000,
+  onListening?: () => void
 ): Promise<{
   channel: TransportChannel;
   server: TransportServer;
@@ -356,9 +357,16 @@ export async function listenForJoinWs(
   };
 
   await new Promise<void>((resolve, reject) => {
+    // The WebSocketServer re-emits the HTTP server's listen error; without a
+    // listener that second emission would crash before the bind rejection
+    // reaches the caller.
+    wss.once("error", () => {});
     httpServer.once("error", reject);
     httpServer.listen(port, "0.0.0.0", () => resolve());
   });
+  // Bound: report it before waiting for the join, so a caller never advertises a
+  // port that is not accepting connections.
+  onListening?.();
 
   // Wrap as a TransportServer (for close(); onConnection not used in join mode)
   const serverWrapper: TransportServer = {
@@ -501,6 +509,11 @@ export async function listenForHostWs(
 
   return {
     onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },
+    port: () => {
+      const address = httpServer.address();
+      if (!address || typeof address === "string") return 0;
+      return address.port;
+    },
     // Settles once the listener has stopped, with or without a live host
     // channel, and resolves at once when it is already closed. `wss.close()`
     // leaves accepted sockets open when the HTTP server is external, and a

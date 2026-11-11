@@ -1094,8 +1094,8 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(stdout.split(/\r?\n/).filter((line) => line !== "")).toEqual([
       `Host state record (pid ${hostPid}) stopped; record removed: ${hostPath}.`,
     ]);
+    // Printed once: office kill reports each failure once (cli#742).
     expect(stderr.split(/\r?\n/).filter((line) => line !== "")).toEqual([
-      `Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`,
       `Branch pid file ${pidFile} was replaced; the branch pid file was not removed.`,
     ]);
     expect(existsSync(hostPath)).toBe(false);

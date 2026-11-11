@@ -19,8 +19,8 @@
  *      recipient dead-letters an unsigned body TERMINAL, so an unsigned reply is
  *      a dead letterbox; the signing path honors the runtime's configured
  *      `flairKeyPath` and refuses to fall back to unsigned;
- *   3. completeRuntimeMail() — ack AFTER the completion boundary (reply
- *      persisted AND any auto-commit finished). Acking is what stops cli#377's
+ *   3. completeRuntimeMail() — ack AFTER the completion boundary (the reply
+ *      attempted AND any auto-commit finished). Acking is what stops cli#377's
  *      lease sweep re-presenting — and re-dispatching to a tool-holding model —
  *      a finished task forever;
  *   4. runtimeBootPreflight() — one Flair check at boot, loud on failure.
@@ -80,8 +80,10 @@ export function sendRuntimeMail(cfg: RuntimeMailConfig, to: string, body: string
 }
 
 /**
- * The completion boundary. Call this ONLY after the reply has been persisted
- * AND any auto-commit has finished — acking earlier deletes the `cur/` record
+ * The completion boundary. Call this ONLY after the reply has been attempted
+ * AND any auto-commit has finished. A failed reply send is logged and the ack
+ * is still attempted: the task already ran, and re-running it to retry the reply
+ * would repeat its side effects. Acking earlier deletes the `cur/` record
  * that the auto-commit scope guard reads (cli#380 defect 7), and NOT acking
  * leaves the record to be re-presented (and the task re-run) every lease period
  * forever.

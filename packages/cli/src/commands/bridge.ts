@@ -8,7 +8,7 @@
  */
 
 import { requireLocalAgentId } from "../utils/local-agent.js";
-import { bridgePidFiles, bridgeRunningRecords, openClawBridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
+import { bridgePidFiles, bridgeStatusSnapshot, openClawBridgeStatus, startBridgeDaemon } from "../utils/mail-bridge.js";
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
@@ -277,10 +277,18 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
     }
 
     case "status": {
-      const running = bridgeRunningRecords();
       if (args.json) {
+        // One directory read and one classification pass feed every field, and
+        // a single `pidState` probe per unverified pid decides both that
+        // record's kind and its promotion into `bridges`, so no two fields of
+        // the document can describe different snapshots.
+        const entries = bridgePidFiles();
+        const { running, liveness } = bridgeStatusSnapshot(entries);
         // The top-level `running`, `pid` and `port` describe the OpenClaw
-        // record only; `bridges` lists every running record.
+        // record only. `bridges` lists running records PLUS unverified records
+        // whose pid is alive; `records` lists every pid record with its kind, its
+        // pid when the kind has one, and a reason when an unreadable or invalid
+        // record has one. An unverified record the probe finds gone is listed as `stale`.
         const openclaw = running.find((entry) => entry.adapter === "openclaw");
         const status = {
           running: openclaw !== undefined,
@@ -288,15 +296,61 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           ...(openclaw?.port === undefined ? {} : { port: openclaw.port }),
           ...(openclaw === undefined ? {} : { adapter: openclaw.adapter }),
           ...(running.length === 0 ? {} : { bridges: running }),
+          records: entries.map(({ adapter, path, state }) => {
+            if (state.kind === "unverified") {
+              return {
+                adapter,
+                path,
+                state: liveness.get(state.pid) === "alive" ? "unverified" : "stale",
+                pid: state.pid,
+              };
+            }
+            const pid = state.kind === "running" || state.kind === "stale" ? state.pid : undefined;
+            const reason =
+              state.kind === "invalid" || state.kind === "unreadable" ? state.reason : undefined;
+            return {
+              adapter,
+              path,
+              state: state.kind,
+              ...(pid === undefined ? {} : { pid }),
+              ...(reason === undefined ? {} : { reason }),
+            };
+          }),
         };
         console.log(JSON.stringify(status));
-      } else if (running.length > 0) {
-        for (const entry of running) {
-          const port = entry.port === undefined ? "" : `, port=${entry.port}`;
-          console.log(`Bridge running: adapter=${entry.adapter}, pid=${entry.pid}${port}`);
-        }
       } else {
-        console.log("Bridge is not running.");
+        const entries = bridgePidFiles();
+        const running = entries.filter(({ state }) => state.kind === "running");
+        if (running.length > 0) {
+          for (const { state, adapter, port } of running) {
+            if (state.kind !== "running") continue;
+            const portText = port === undefined ? "" : `, port=${port}`;
+            console.log(`Bridge running: adapter=${adapter}, pid=${state.pid}${portText}`);
+          }
+        } else {
+          // A bad or unverified record says nothing about a bridge process.
+          const unproven = entries.filter(
+            ({ state }) =>
+              state.kind === "invalid" ||
+              state.kind === "stale" ||
+              state.kind === "unverified" ||
+              state.kind === "unreadable",
+          );
+          if (unproven.length === 0) {
+            console.log("Bridge is not running.");
+          } else {
+            for (const { state } of unproven) {
+              if (
+                state.kind === "invalid" ||
+                state.kind === "stale" ||
+                state.kind === "unverified" ||
+                state.kind === "unreadable"
+              ) {
+                console.log(`Bridge state unknown (${state.kind} pid file ${state.path}).`);
+              }
+            }
+          }
+        }
       }
       break;
     }

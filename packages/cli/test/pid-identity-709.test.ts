@@ -12,7 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
+import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
@@ -228,7 +228,7 @@ describe("relay stop identity", () => {
 
       expect(signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(false);
-      expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+      expect(logs.join("\n")).toMatch(/was stale and was removed/i);
       expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,
@@ -298,7 +298,7 @@ describe("relay stop identity", () => {
 
       expect(signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(false);
-      expect(logs.join("\n")).toMatch(/stale pid file removed/i);
+      expect(logs.join("\n")).toMatch(/was stale and was removed/i);
     },
     TIMEOUT,
   );
@@ -327,7 +327,7 @@ describe("relay stop identity", () => {
         }
         expect(signals).toEqual([]);
         expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
       }
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -402,12 +402,13 @@ describe("relay stop identity", () => {
       const token = processStartToken(child.pid);
       expect(token).not.toBeNull();
       writeFileSync(relayPid, relayRecord(child.pid, token));
+      const previousRemoval = setRelayPidRemoval(() => {
+        // Replace the remover with a stub that throws, so the removal-failure
+        // path runs for every uid, root included, without relying on a mode
+        // bit.
+        throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
+      });
       const previous = setRelayStopSignal((pid) => {
-        // A non-empty directory in the file's place fails unlink for every uid,
-        // root included.
-        rmSync(relayPid);
-        mkdirSync(relayPid);
-        writeFileSync(join(relayPid, "keep"), "x");
         process.kill(pid, "SIGTERM");
       });
       let message = "";
@@ -419,6 +420,7 @@ describe("relay stop identity", () => {
       } finally {
         restore();
         setRelayStopSignal(previous);
+        setRelayPidRemoval(previousRemoval);
       }
 
       expect(message).toContain(relayPid);
@@ -579,7 +581,7 @@ describe("json pid interpretation", () => {
         }
         expect(signals).toEqual([]);
         expect(existsSync(relayPid)).toBe(false);
-        expect(logs.join("\n")).toMatch(/invalid pid file removed/i);
+        expect(logs.join("\n")).toMatch(/was invalid and was removed/i);
       }
     },
     TIMEOUT,
@@ -1166,7 +1168,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
       });
 
       expect(result.status).toBe(0);
-      expect(result.stdout).toMatch(/stale pid file removed/);
+      expect(result.stdout).toMatch(/was stale and was removed/);
       expect(existsSync(relayPid)).toBe(false);
       expect(pidState(child.pid)).toBe("alive");
     },

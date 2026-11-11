@@ -1,4 +1,4 @@
-- **The agent event loop processes one mail delivery at a time (Refs #617, slice c).**
+- **The agent event loop processes one mail delivery at a time (Refs #617).**
 
   Handler completion requests finalization; a turn-limit return or thrown
   handler requests release. Deferred finalization and release are retried on

@@ -1,1 +1,0 @@
-- **the local branch-connection listing in runOffice's status action, unreachable since `tps office status` became the Flair office view (#133), is removed** together with its reader; office kill's handling of the connections directory is unchanged.

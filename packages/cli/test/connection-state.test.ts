@@ -5,17 +5,22 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   writeHostState,
-  readHostState,
   clearHostState,
-  connectionAlive,
   hostStatePath,
   hostStateLockRoot,
   writeBranchState,
-  readBranchState,
+  branchStatePath,
   sweepStaleConnectionTemps,
+  type BranchConnectionState,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
+
+/** Read a connection record the way an operator would, so the assertions below
+ *  pin the writer's output rather than a reader in the module under test. */
+function readRecord<T>(path: string): T | null {
+  try { return JSON.parse(readFileSync(path, "utf-8")) as T; } catch { return null; }
+}
 
 afterEach(() => { mock.restore(); });
 
@@ -44,7 +49,7 @@ describe("connection-state", () => {
       messagesReceived: 0,
       pid: process.pid,
     });
-    const row = readHostState("austin");
+    const row = readRecord<HostConnectionState>(hostStatePath("austin"));
     expect(row?.branch).toBe("austin");
   });
 
@@ -64,25 +69,7 @@ describe("connection-state", () => {
       pid: process.pid,
     });
     clearHostState("x");
-    expect(readHostState("x")).toBeNull();
-  });
-
-  test("alive checks pid", () => {
-    home = mkdtempSync(join(tmpdir(), "conn-state-"));
-    process.env.HOME = home;
-    writeHostState({
-      branch: "live",
-      connectedAt: "",
-      lastHeartbeatSent: "",
-      lastHeartbeatAck: null,
-      reconnectCount: 0,
-      bytesSent: 0,
-      bytesReceived: 0,
-      messagesSent: 0,
-      messagesReceived: 0,
-      pid: process.pid,
-    });
-    expect(connectionAlive("live")).toBe(true);
+    expect(readRecord(hostStatePath("x"))).toBeNull();
   });
 
   const completeState = (): HostConnectionState => ({
@@ -251,7 +238,7 @@ describe("connection-state", () => {
     const dir = join(home, ".tps", "connections");
     const record = hostStatePath("branch-a");
     writeHostState(writeState("branch-a", 1));
-    expect(readHostState("branch-a")?.messagesReceived).toBe(1);
+    expect(readRecord<HostConnectionState>(hostStatePath("branch-a"))?.messagesReceived).toBe(1);
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);
     expect(statSync(record).mode & 0o777).toBe(0o600);
   });
@@ -271,7 +258,7 @@ describe("connection-state", () => {
     writeHostState(writeState("branch-a", 1));
 
     expect(existsSync(stale)).toBe(false);
-    expect(readHostState("branch-a")?.messagesReceived).toBe(1);
+    expect(readRecord<HostConnectionState>(hostStatePath("branch-a"))?.messagesReceived).toBe(1);
   });
 
   test("a fresh temp file of the writer's shape is kept", () => {
@@ -370,7 +357,7 @@ describe("connection-state", () => {
 
     writeBranchState({ connectedAt: "c", lastSeen: "d", messagesReceived: 2, messagesPushed: 2 });
 
-    expect(readBranchState()?.messagesReceived).toBe(2);
+    expect(readRecord<BranchConnectionState>(branchStatePath())?.messagesReceived).toBe(2);
     expect(statSync(record).mode & 0o777).toBe(0o600);
   });
 
@@ -389,7 +376,7 @@ describe("connection-state", () => {
     process.env.HOME = home;
     const dir = join(home, ".tps", "connections");
     writeBranchState({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
-    expect(readBranchState()).toEqual({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
+    expect(readRecord<BranchConnectionState>(branchStatePath())).toEqual({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 });
     expect(readFileSync(join(dir, "host.json"), "utf-8"))
       .toBe(JSON.stringify({ connectedAt: "a", lastSeen: "b", messagesReceived: 2, messagesPushed: 3 }, null, 2));
     expect(readdirSync(dir).filter((name) => name.includes(".tmp"))).toEqual([]);

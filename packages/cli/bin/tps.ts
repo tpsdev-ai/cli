@@ -49,11 +49,52 @@ const getRuntimeFlag = (action: "create" | "set-runtime"): string | undefined =>
   return values[0];
 };
 
+/** Refuse a repeated flag by name, then exit. */
+const refuseRepeatedFlag = (name: string): never => {
+  console.error(`Usage error: --${name} can only be given once`);
+  process.exit(1);
+};
+
+/**
+ * Shared reader for the subcommand flag blocks.
+ *
+ * A `--` before the subcommand is meow's positionals separator, not the end of
+ * the subcommand's own options, so the scan passes it. The first `--` after the
+ * subcommand ends option parsing, so a positional payload that begins with a
+ * flag (`mail send <agent> -- --agent=x`) is never read as one. Accepts
+ * `--name value` and `--name=value`, and refuses more than one value for the
+ * same flag.
+ */
+const getFlag = (name: string): string | undefined => {
+  const args = helpArgs.argv;
+  const commandIndex = args.indexOf(helpArgs.positionals[0] ?? "");
+  const values: (string | undefined)[] = [];
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === "--" && index > commandIndex) break;
+    if (arg === `--${name}`) {
+      const next = args[index + 1];
+      if (next === undefined || next.startsWith("-")) {
+        values.push(undefined);
+      } else {
+        values.push(next);
+        index++;
+      }
+    } else if (arg.startsWith(`--${name}=`)) {
+      values.push(arg.slice(`--${name}=`.length));
+    }
+  }
+  if (values.length > 1) refuseRepeatedFlag(name);
+  return values[0];
+};
+
 const [rawCommand, rawAction] = helpArgs.positionals;
 const agentRuntime = rawCommand === "agent" && (rawAction === "create" || rawAction === "set-runtime")
   ? getRuntimeFlag(rawAction) : undefined;
 
-const cli = meow(
+function parseCli() {
+  try {
+    return meow(
   `
   Usage
     $ tps <command> [options]
@@ -127,7 +168,19 @@ const cli = meow(
     flags: cliFlagDefinitions,
     argv: helpArgs.argv,
   }
-);
+    );
+  } catch (err) {
+    // A conflicting repeat (`--agent a --agent=b`) reaches here as a meow
+    // parse error; report it as a usage error naming the flag, without a stack.
+    const message = err instanceof Error ? err.message : String(err);
+    const repeated = /^The flag (--[\w-]+) can only be set once\.?$/.exec(message);
+    if (repeated) refuseRepeatedFlag(repeated[1]!.slice(2));
+    console.error(`Usage error: ${message}`);
+    process.exit(1);
+  }
+}
+
+const cli = parseCli();
 
 const [command, ...rest] = cli.input;
 
@@ -205,7 +258,7 @@ const USAGE: Record<string, string> = {
   auth: "Usage:\n  tps auth login <provider>\n  tps auth status\n  tps auth revoke <provider>\n  tps auth refresh <provider>",
   office: "Usage:\n  tps office start <agent>\n  tps office stop <agent>\n  tps office list\n  tps office status [agent]\n  tps office exec <agent> -- <command...>\n  tps office join <name> <join-token>\n  tps office revoke <name>\n  tps office sync <name>\n  tps office connect <name>\n  tps office setup <agent> [--dry-run]\n  tps office kill",
   context: "Usage:\n  tps context read <workstream>\n  tps context update <workstream> --summary \"...\"\n  tps context list",
-  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
+  mail: "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt> [--agent <id>]  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]",
   identity: "Usage:\n  tps identity init [--expires-in 90d]\n  tps identity show\n  tps identity register <branch> [--expires-in 90d] [--trust standard]\n  tps identity list\n  tps identity revoke <branch> --reason \"...\"\n  tps identity verify <branch>",
   secrets: [
           "Usage:",
@@ -418,11 +471,6 @@ async function main() {
         );
         process.exit(1);
       }
-
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
 
       const { runAgent } = await import("../src/commands/agent.js");
 
@@ -822,15 +870,35 @@ async function main() {
       const validMailActions = ["send", "check", "list", "stats", "log", "read", "watch", "search", "relay", "topic", "subscribe", "unsubscribe", "publish", "ack", "nack", "gc"];
       if (!action || !validMailActions.includes(action)) {
         console.log(
-          "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [agent]          Mark a message as done\n  tps mail nack <id> --reason <txt>  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
+          "Usage:\n  tps mail send <agent> <message>   Send signed mail to a local or remote agent\n  tps mail send <agent> --stdin [--reply-to <messageId>]  Read the body from stdin; --reply-to threads it to a signed messageId\n                                    Every send is signed with the sender's key (~/.flair/keys/<id>.key and/or\n                                    ~/.tps/identity/<id>.key; two different keys are refused); with no usable key\n                                    it fails and writes nothing. --message-id <id> signs with that envelope id (a\n                                    re-send of the same message); --json prints delivery metadata, never the body\n  tps mail check [agent]             Read available messages (leases processing)\n  tps mail ack <id> [--agent <id>]   Mark a message as done\n  tps mail nack <id> --reason <txt> [--agent <id>]  Mark a message as failed\n  tps mail gc [--agent <id>]         Garbage collect done/expired mail\n  tps mail watch [agent]             Watch inbox, non-consuming [--exec cmd args] [--daemon install|uninstall|status]\n                                    --exec hook: presented ONLY records that verify (verified body on stdin; the four\n                                    TPS_MAIL_ID/FROM/TO/TIMESTAMP vars the watcher sets for the hook come from verified fields);\n                                    unverifiable records are skipped and logged.\n  tps mail list [agent]              List all messages (read + unread)\n  tps mail read <agent> <id>         Show a specific message by ID (prefix ok)\n  tps mail search <query>            Search mail history using full-text search\n  tps mail log [agent]               Show audit log [--since YYYY-MM-DD] [--limit N]\n  tps mail relay [start|stop|status] Mail relay daemon\n  tps mail topic create <name>       Create a topic [--desc \"...\"]\n  tps mail topic list                List all topics\n  tps mail subscribe <topic>         Subscribe to a topic [--id <agentId>] [--from-beginning]\n  tps mail unsubscribe <topic>       Unsubscribe from a topic [--id <agentId>]\n  tps mail publish <topic> <message> Publish to a topic [--from <agentId>]"
         );
         process.exit(1);
       }
 
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
+      if ((action === "ack" || action === "nack") && rest.length > 2) {
+        console.error(`Unexpected argument: ${rest[2]}`);
+        console.error(`Usage: tps mail ${action} <id>${action === "nack" ? " --reason <text>" : ""} [--agent <id>]`);
+        process.exit(1);
+      }
+
+      if (action === "gc" && rest.length > 1) {
+        console.error(`Unexpected argument: ${rest[1]}`);
+        console.error("Usage: tps mail gc [--agent <id>]");
+        process.exit(1);
+      }
+
+      if (action === "ack" || action === "nack" || action === "gc") {
+        const hasEmptyAgent = process.argv.some((arg, index) => {
+          if (arg === "--agent=") return true;
+          if (arg !== "--agent") return false;
+          const next = process.argv[index + 1];
+          return next === undefined || next === "" || next.startsWith("-");
+        });
+        if (hasEmptyAgent) {
+          console.error("--agent requires a value");
+          process.exit(1);
+        }
+      }
 
       const { runMail } = await import("../src/commands/mail.js");
 
@@ -901,8 +969,8 @@ async function main() {
           // cli#429: stdin body / reply-to threading (send only); `unsigned` is
           // passed through only so `mail send` refuses it by name.
           stdin: action === "send" ? Boolean(cli.flags.stdin) : undefined,
-          replyTo: action === "send" ? ((cli.flags.replyTo as string | undefined) ?? getFlag("reply-to")) : undefined,
-          sendMessageId: action === "send" ? ((cli.flags.messageId as string | undefined) ?? getFlag("message-id")) : undefined,
+          replyTo: action === "send" ? getFlag("reply-to") : undefined,
+          sendMessageId: action === "send" ? getFlag("message-id") : undefined,
           unsigned: action === "send" ? Boolean(cli.flags.unsigned) : undefined,
         });
       }
@@ -1292,10 +1360,6 @@ async function main() {
     }
 
     case "memory": {
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
       const governanceActions = ["review", "approve", "reject", "archive", "unarchive", "purge", "list", "show", "search"];
       if (governanceActions.includes(rest[0] ?? "")) {
         const { runMemory } = await import("../src/commands/memory.js");
@@ -1395,11 +1459,6 @@ async function main() {
         process.exit(1);
       }
 
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
-
       const { runBridge } = await import("../src/commands/bridge.js");
       await runBridge({
         action,
@@ -1439,16 +1498,11 @@ async function main() {
         process.exit(1);
       }
 
-      const getFlag = (name: string): string | undefined => {
-        const idx = process.argv.indexOf(`--${name}`);
-        return idx >= 0 ? process.argv[idx + 1] : undefined;
-      };
-
       const { runSkill, skillNameFromCli } = await import("../src/commands/skill.js");
       await runSkill({
         action: action === "add-pack" ? "addPack" : action,
-        agent: getFlag("agent") ?? cli.flags.agent,
-        name: skillNameFromCli(action, rest, getFlag("name") ?? cli.flags.name),
+        agent: getFlag("agent"),
+        name: skillNameFromCli(action, rest, getFlag("name")),
         version: getFlag("version"),
         source: action === "register" ? rest[1] : (action === "add-pack" ? rest[1] : undefined),
         file: action === "scan" ? rest[1] : (action === "register" ? rest[1] : undefined),
@@ -1498,10 +1552,6 @@ async function main() {
       }
       if (action === "sync") {
         const { runFlairSync } = await import("../src/commands/flair-sync.js");
-        const getFlag = (name: string): string | undefined => {
-          const idx = process.argv.indexOf(`--${name}`);
-          return idx >= 0 ? process.argv[idx + 1] : undefined;
-        };
         const hasInterval = process.argv.includes("--interval");
         const intervalVal = hasInterval ? (cli.flags.interval ? Number(cli.flags.interval) : 300) : undefined;
         await runFlairSync({
@@ -1573,6 +1623,10 @@ main()
     process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
   })
   .catch((err) => {
-    console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
+    // A command that already printed its failures marks the error so its
+    // lines are not repeated here.
+    if (err?.reported !== true) {
+      console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
+    }
     process.exit(1);
   });

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import * as fs from "node:fs";
-import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,21 +18,6 @@ afterEach(() => {
 // The real fs.watch, taken before any test spies on it: each test wraps this
 // one, never whatever fs.watch is at that moment.
 const realWatch = fs.watch;
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolve(address.port));
-    });
-  });
-}
 
 async function waitUntil(ready: () => boolean): Promise<void> {
   const deadline = Date.now() + 5000;
@@ -137,6 +121,8 @@ describe("branch relay authenticated channels", () => {
       const otherFingerprint = fingerprint(otherHost.encryption.publicKey);
       expect(otherFingerprint).not.toBe(hostFingerprint);
       const observe = async (listener: typeof ws.listenForHostWs, ...args: Parameters<typeof ws.listenForHostWs>) => {
+        // The branch must ask for port 0; a pre-chosen port is exactly the #889 race.
+        expect(args[2]).toBe(0);
         const actual = await listener(...args);
         const onConnection = actual.onConnection.bind(actual);
         spyOn(actual, "onConnection").mockImplementation((handler) => {
@@ -165,13 +151,18 @@ describe("branch relay authenticated channels", () => {
       }
       let startupError: unknown;
       async function start(peer: TpsKeyPair): Promise<number> {
-        const port = await freePort();
+        startupError = undefined;
         fs.writeFileSync(join(root, "identity", "host.json"), JSON.stringify({ publicKey: Buffer.from(peer.encryption.publicKey).toString("base64url") }));
-        writeBranchConf(port, "127.0.0.1", transport, undefined, "local");
+        // Bind port 0 and read the bound port back: no port is selected ahead
+        // of the listener, so a port another process takes in between cannot
+        // fail the start.
+        writeBranchConf(0, "127.0.0.1", transport, undefined, "local");
         void runBranch({ action: "start" }).catch((error: unknown) => { startupError = error; });
         await waitUntil(() => server !== undefined || startupError !== undefined);
         if (startupError) throw startupError;
-        return port;
+        const bound = server?.port?.();
+        if (!bound) throw new Error("listener did not report its bound port");
+        return bound;
       }
       async function connect(peer: TpsKeyPair, port: number): Promise<TransportChannel> {
         const client = transport === "ws" ? new ws.WsNoiseTransport(peer) : new tcp.NoiseIkTransport(peer);

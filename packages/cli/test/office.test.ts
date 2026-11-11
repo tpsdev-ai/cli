@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync, mkdirSync, writeFileSync, chmodSync, existsSync, r
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
+import { processStartToken } from "@tpsdev-ai/agent";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 
@@ -108,6 +109,90 @@ describe("office command", () => {
     expect(status.status).toBe(0);
     expect(status.stdout).toContain("Paused messages (loop detected): 1");
     expect(status.stdout).toContain("Review:");
+  });
+
+  test("status reports a stale relay record as unknown, not running", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // A valid record whose pid cannot be alive on this host.
+    writeFileSync(relayPid, `${JSON.stringify({ pid: 2147483647, startToken: "proc:1" })}\n`);
+
+    const r = run(["office", "status", "brancha"]);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: unknown (stale pid file ${relayPid}).`);
+    expect(r.stdout).not.toContain("Relay: running");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("relay-unknown");
+  });
+
+  test("status reports an unverified relay record as unverified, not running", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // A live pid with no start token: not proven gone, identity unconfirmed.
+    writeFileSync(relayPid, `${JSON.stringify({ pid: process.pid, startToken: null })}\n`);
+
+    const r = run(["office", "status", "brancha"]);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: unverified (pid ${process.pid}, pid file ${relayPid}).`);
+    expect(r.stdout).not.toContain("Relay: running");
+  });
+
+  test("status reports a running relay record as running (cli#970)", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // This test process: alive, with its own start token, so the record verifies.
+    const startToken = processStartToken(process.pid);
+    expect(startToken).not.toBeNull();
+    writeFileSync(relayPid, `${JSON.stringify({ pid: process.pid, startToken })}\n`);
+
+    const r = run(["office", "status", "brancha"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("Relay: running");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("relay-running");
+  });
+
+  test("status reports an invalid relay record as unknown, not running (cli#970)", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    writeFileSync(relayPid, "not-a-pid\n");
+
+    const r = run(["office", "status", "brancha"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: unknown (invalid pid file ${relayPid}).`);
+    expect(r.stdout).not.toContain("Relay: running");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("relay-unknown");
+  });
+
+  test("status reports an unreadable relay record as state unknown, not running (cli#970)", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // A directory where the record should be: not a regular file, so it cannot
+    // be read, including under root (as in the Docker lane).
+    mkdirSync(relayPid);
+
+    const r = run(["office", "status", "brancha"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: state unknown (pid file ${relayPid} could not be read).`);
+    expect(r.stdout).not.toContain("Relay: running");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("relay-unknown");
   });
 
   test("team members resolve to the shared team sandbox (ops-17)", () => {
