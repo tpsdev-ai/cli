@@ -7,7 +7,10 @@
   envelope stored for that id (same id, timestamp and payload) only when it
   still verifies with the sender's current key and both the inbound delegation
   chain and `--reply-to` match, so the branch can recognise it as a duplicate;
-  otherwise nothing is sent and the re-send is refused by name. A remote send
+  otherwise nothing is sent and the re-send is refused by name. A stored entry
+  that is missing or older than 7 days is signed again under that id (new
+  timestamp), so a branch that already has it sees a same-id conflict, not a
+  duplicate. A remote send
   that generated its id stores that signed envelope too, so the retry the
   unconfirmed message prints re-sends the same bytes. A connection the branch
   closes before the ACK reports delivery unconfirmed as well. A

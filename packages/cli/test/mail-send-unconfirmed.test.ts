@@ -35,6 +35,7 @@ import {
   MAX_MAIL_ACK_TIMEOUT_MS,
   parseMailAckTimeoutMs,
   RemoteDeliveryTimeoutError,
+  remoteDeliveryWorstCaseMs,
   resolveMailAckTimeoutMs,
 } from "../src/utils/relay.js";
 import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
@@ -610,6 +611,30 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(branch.deliveries).toHaveLength(1);
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 25_000);
+
+  test("a missing stored entry is signed again under the same id, which the branch refuses as a conflict", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "66666666-6666-4666-8666-666666666661";
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"], {}, 15_000, "conflict body");
+    expect(first.status).toBe(0);
+    const firstTimestamp = JSON.parse(readFileSync(sentEnvelopeFile(id), "utf-8")).timestamp;
+    // readSentEnvelope finds nothing, so the re-send SIGNS again under the same
+    // id: the wire payload carries a fresh timestamp instead of the stored one.
+    rmSync(sentEnvelopeFile(id));
+    const second = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "1000"], {}, 15_000, "conflict body");
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
+    expect(branch.deliveries[1].timestamp).not.toBe(firstTimestamp);
+    expect(JSON.parse(readFileSync(sentEnvelopeFile(id), "utf-8")).timestamp).toBe(branch.deliveries[1].timestamp);
+    // The branch keys its record by (branch, id) and compares the payload, so the
+    // new timestamp is a same-id conflict: it refuses the delivery and sends no
+    // ACK, and the sender exits unconfirmed.
+    expect(branch.acceptErrors.map((error: any) => error.message)).toEqual([
+      `relayed delivery conflict for branch remote-a message ${id}`,
+    ]);
+    expect(second.status).toBe(75);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
 
   test("a send without --message-id stores its generated id for the printed retry", async () => {
     await startBranchServer({ recordInbox: true, ackDelayMs: 700 });
@@ -1272,6 +1297,45 @@ describe("the connect bound and the ACK window are separate", () => {
     expect((caught as Error).message).toContain("exceeded 200ms after connect (send)");
     expect(closed).toBe(true);
     expect(elapsedMs).toBeLessThan(settleBoundMs);
+  }, 5_000);
+
+  test("the exported worst case covers every window the relay runs", async () => {
+    // connect 100 + send (100 + 100) + ACK window 100. The sibling cases pin
+    // the two components the send bound is made of ("exceeded 200ms after
+    // connect (send)") and the separate ACK window.
+    expect(remoteDeliveryWorstCaseMs({ timeoutMs: 100, ackTimeoutMs: 100 })).toBe(400);
+    const id = "aaaaaaaa-0000-4000-8000-000000000003";
+    const channel: TransportChannel = {
+      send() {
+        return new Promise<void>(() => {});
+      },
+      onMessage() {},
+      offMessage() {},
+      async close() {},
+      isAlive() {
+        return true;
+      },
+      peerFingerprint() {
+        return "d".repeat(64);
+      },
+    };
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    const total = remoteDeliveryWorstCaseMs({ timeoutMs: 100, ackTimeoutMs: 100 });
+    const startedAt = Date.now();
+    let caught: unknown;
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id, to: "local", from: "agent-a", body: "never settles" },
+        { timeoutMs: 100, ackTimeoutMs: 100 },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    expect(caught).toBeInstanceOf(RemoteDeliveryTimeoutError);
+    // The relay's own timers reject inside the total it reports to callers.
+    expect(elapsedMs).toBeLessThanOrEqual(total + 1_000);
   }, 5_000);
 
   test("a slow send leaves the full ACK window after the send resolves", async () => {

@@ -1010,7 +1010,8 @@ export class MailDeliveryUnconfirmedError extends Error {
   }
 }
 
-/** Thrown when a remote delivery exceeds its overall bound. NAMED so a caller
+/** Thrown when a remote delivery exceeds one of its own timers — the connection
+ *  bound, or the send bound after connect. NAMED so a caller
  *  can tell a bounded timeout (the transport was CLOSED) from any other
  *  failure — connect to an unreachable branch has no application-level timeout
  *  of its own. */
@@ -1032,6 +1033,40 @@ export interface RemoteBranchDeliveryOptions {
    *  `TPS_MAIL_ACK_TIMEOUT_MS` environment variable, else
    *  `DEFAULT_MAIL_ACK_TIMEOUT_MS`. */
   ackTimeoutMs?: number;
+}
+
+/** The three timers one delivery runs under, as `deliverToRemoteBranch`
+ *  computes them. */
+interface RemoteDeliveryWindows {
+  /** Bound for the connection. */
+  connectMs: number;
+  /** Wait for the ACK, started when the deliver is sent. */
+  ackTimeoutMs: number;
+  /** Bound for the send itself (the connection bound plus the ACK window). */
+  sendMs: number;
+}
+
+function resolveRemoteDeliveryWindows(opts: RemoteBranchDeliveryOptions): RemoteDeliveryWindows {
+  const ackTimeoutMs = opts.ackTimeoutMs === undefined
+    ? resolveMailAckTimeoutMs()
+    : parseMailAckTimeoutMs(String(opts.ackTimeoutMs), "ackTimeoutMs");
+  const connectMs =
+    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
+      ? opts.timeoutMs
+      : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
+  // The send bound is the connection bound plus the ACK window. A timer delay
+  // past MAX_TIMER_DELAY_MS is clamped to 1 ms, which fails the attempt at once.
+  return { connectMs, ackTimeoutMs, sendMs: connectMs + ackTimeoutMs };
+}
+
+/** The relay's WORST-CASE total for one delivery with these options: the
+ *  connection bound, then the send bound (the connection bound plus the ACK
+ *  window), then the full ACK window, which starts when the send resolves.
+ *  A caller that needs a bound ABOVE the delivery's own calls this instead of
+ *  copying the arithmetic. */
+export function remoteDeliveryWorstCaseMs(opts: RemoteBranchDeliveryOptions = {}): number {
+  const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
+  return connectMs + sendMs + ackTimeoutMs;
 }
 
 export async function deliverToRemoteBranch(
@@ -1064,16 +1099,8 @@ export async function deliverToRemoteBranch(
   // The connection has its own deadline: a slow or unreachable branch must not
   // consume the ACK window, and a connect that returns just before the deadline
   // must still get the full ACK window (started after the deliver is sent).
-  const ackTimeoutMs = opts.ackTimeoutMs === undefined
-    ? resolveMailAckTimeoutMs()
-    : parseMailAckTimeoutMs(String(opts.ackTimeoutMs), "ackTimeoutMs");
-  const connectMs =
-    typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
-      ? opts.timeoutMs
-      : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
-  // The send bound is the connection bound plus the ACK window. A timer delay
-  // past MAX_TIMER_DELAY_MS is clamped to 1 ms, which fails the attempt at once.
-  if (connectMs + ackTimeoutMs > MAX_TIMER_DELAY_MS) {
+  const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
+  if (sendMs > MAX_TIMER_DELAY_MS) {
     throw new MailAckTimeoutConfigError(
       `the ${ackTimeoutMs}ms ACK window plus the ${connectMs}ms connection bound exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
     );
@@ -1188,7 +1215,6 @@ export async function deliverToRemoteBranch(
   // Bound the send by itself (the connection bound plus the ACK window, the
   // safety net for a send that never settles). Its timer stays referenced so a
   // send that hangs cannot let the process exit without a result.
-  const sendMs = connectMs + ackTimeoutMs;
   let sendTimer: ReturnType<typeof setTimeout> | null = null;
   const sendDeadline = new Promise<never>((_resolve, reject) => {
     sendTimer = setTimeout(() => {

@@ -6,9 +6,10 @@ import { buildSignedEnvelope, pubkeyFromSeed } from "../../../packages/cli/test/
  * Startup used to AWAIT each owed-nack retry in turn, and connecting to an
  * unreachable remote branch has no application-level timeout — so one dead
  * branch could stall recovery for this agent and every later one. The retry now
- * runs IN THE BACKGROUND, not awaited on the startup path, each under an overall
- * timeout (the connection AND the existing ACK wait) that closes the transport
- * on expiry and logs BY NAME.
+ * runs IN THE BACKGROUND, not awaited on the startup path, with a connection
+ * bound; the relay bounds the send above it and then waits the ACK window, and
+ * the background backstop sits above that whole bound (cli#962 round 13). A
+ * timeout the relay reports is logged BY NAME.
  *
  * The wire transport is mocked so "a connect that never resolves" is exactly
  * reproducible. The mock DELEGATES to the real relay unless the hang toggle is
@@ -18,6 +19,13 @@ import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";import { tmpdir } from "node:os";
 
+// The branch side of the wire, for the case that needs a REAL peer: a Noise IK
+// listener that ACKs late. Imported from source (the plugin has no subpath for
+// it), the way cur-record-write.test.ts imports the transport.
+import { generateKeyPair, loadHostIdentity, registerBranch, saveKeyPair } from "../../../packages/cli/src/utils/identity.js";
+import { listenForHost } from "../../../packages/cli/src/utils/noise-ik-transport.js";
+import { MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../../../packages/cli/src/utils/wire-mail.js";
+
 // The REAL relay module is captured with a STATIC import (the locality suite's
 // pattern) and spread eagerly; the mock only replaces `deliverToRemoteBranch`,
 // and only when `relay.hang` is set.
@@ -25,13 +33,13 @@ import * as realRelay from "@tpsdev-ai/cli/utils/relay";
 const realRelayExports = { ...realRelay };
 const relay = {
   hang: false,
-  deliver: [] as Array<{ branchId: string; msg: any }>,
+  deliver: [] as Array<{ branchId: string; msg: any; opts?: any }>,
 };
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   ...realRelayExports,
   deliverToRemoteBranch: (branchId: string, msg: any, opts?: any) => {
     if (relay.hang) return new Promise<void>(() => {}); // connect never resolves
-    relay.deliver.push({ branchId, msg });
+    relay.deliver.push({ branchId, msg, opts });
     return (realRelayExports.deliverToRemoteBranch as any)(branchId, msg, opts);
   },
 }));
@@ -57,6 +65,8 @@ let controller: AbortController;
 let origHome: string | undefined;
 let origKeys: string | undefined;
 let origTimeout: string | undefined;
+let origAckTimeout: string | undefined;
+let origVaultKey: string | undefined;
 
 beforeEach(() => {
   mailDir = mkdtempSync(join(tmpdir(), "tps-nackrec-mail-"));
@@ -71,6 +81,11 @@ beforeEach(() => {
   origHome = process.env.HOME;
   origKeys = process.env.TPS_TEST_KEYS_DIR;
   origTimeout = process.env.TPS_NACK_RETRY_TIMEOUT_MS;
+  origAckTimeout = process.env.TPS_MAIL_ACK_TIMEOUT_MS;
+  // The relay's `loadHostIdentity` migrates host.seed into a vault, which needs
+  // a passphrase; without one it exits the process (the CLI tests set the same).
+  origVaultKey = process.env.TPS_VAULT_KEY;
+  process.env.TPS_VAULT_KEY = "nack-recovery-test";
   process.env.HOME = home;
   process.env.TPS_TEST_KEYS_DIR = keysDir;
   process.env.TPS_NACK_RETRY_TIMEOUT_MS = "1000";
@@ -81,6 +96,8 @@ afterEach(() => {
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
   if (origTimeout === undefined) delete process.env.TPS_NACK_RETRY_TIMEOUT_MS; else process.env.TPS_NACK_RETRY_TIMEOUT_MS = origTimeout;
+  if (origAckTimeout === undefined) delete process.env.TPS_MAIL_ACK_TIMEOUT_MS; else process.env.TPS_MAIL_ACK_TIMEOUT_MS = origAckTimeout;
+  if (origVaultKey === undefined) delete process.env.TPS_VAULT_KEY; else process.env.TPS_VAULT_KEY = origVaultKey;
   for (const d of [mailDir, home, keysDir]) {
     try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ }
   }
@@ -163,6 +180,9 @@ describe("cli#389 round 12 — an owed-nack retry is bounded and off the startup
     seedOwedNack(inboundId, reason);
     routeSenderRemote(SENDER); // flint addressed as its own branch → remote-branch
     relay.hang = true; // the connection never resolves
+    // A short ACK window keeps the retry's backstop (the relay's whole bound for
+    // these windows, plus NACK_RETRY_BACKSTOP_MS) inside this test's poll.
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = "200";
 
     const { startPromise, warned, infos } = start();
     const t0 = Date.now();
@@ -173,7 +193,7 @@ describe("cli#389 round 12 — an owed-nack retry is bounded and off the startup
     const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 1000);
     const elapsed = Date.now() - t0;
     expect(swept, "startup's later steps ran without awaiting the retry").toBe(true);
-    expect(elapsed, "and did NOT wait for the retry's overall timeout").toBeLessThan(1000);
+    expect(elapsed, "and did NOT wait for the retry's backstop").toBeLessThan(1000);
 
     // …and the retry itself times out BY NAME.
     const timedOut = await pollUntil(
@@ -185,5 +205,54 @@ describe("cli#389 round 12 — an owed-nack retry is bounded and off the startup
 
     controller.abort();
     try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+});
+
+describe("cli#962 round 13 — the backstop sits above the relay's whole bound", () => {
+  it("R13-a: an ACK after the old backstop but inside the relay's window settles the retry, with no timeout log", async () => {
+    const inboundId = "msg-r13-late-ack";
+    const reason = "receipt-malformed";
+    seedOwedNack(inboundId, reason);
+    routeSenderRemote(SENDER); // the sender is its own branch → remote-branch
+    // A REAL branch on the wire: a Noise IK listener holding the host's public
+    // key as its peer, which answers the deliver 2500 ms later.
+    const hostKp = generateKeyPair();
+    saveKeyPair(hostKp, resolve(home, ".tps", "identity"), "host");
+    const branchKp = generateKeyPair();
+    registerBranch(SENDER, branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
+    const ackDelayMs = 2500;
+    const server = await listenForHost(branchKp, new Uint8Array(hostKp.encryption.publicKey), 0, (msg, channel) => {
+      if (msg.type !== MSG_MAIL_DELIVER) return;
+      const body = msg.body as { id: string };
+      setTimeout(() => {
+        void channel.send({ type: MSG_MAIL_ACK, seq: 0, ts: new Date().toISOString(), body: { id: body.id, accepted: true } });
+      }, ackDelayMs);
+    });
+    writeFileSync(
+      resolve(home, ".tps", "branch-office", SENDER, "remote.json"),
+      JSON.stringify({ host: "127.0.0.1", port: server.port?.() ?? 0, transport: "tcp" }),
+      "utf-8",
+    );
+    // A 100 ms connection bound and a 3000 ms ACK window: the ACK arrives at
+    // 2500 ms, past the old backstop (100 + 2000) and inside the window.
+    process.env.TPS_NACK_RETRY_TIMEOUT_MS = "100";
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = "3000";
+    try {
+      const { startPromise, warned } = start();
+      const delivered = await pollUntil(
+        () => warned.some((m) => m.includes("nack delivered to") && m.includes(inboundId)),
+        6000,
+      );
+      expect(delivered, "the late ACK settled the retry").toBe(true);
+      expect(warned.filter((m) => m.includes("nack-retry-timeout"))).toEqual([]);
+      // The windows the retry passed are the ones its backstop is computed from.
+      expect(relay.deliver).toHaveLength(1);
+      expect(relay.deliver[0]?.opts?.timeoutMs).toBe(100);
+      expect(relay.deliver[0]?.opts?.ackTimeoutMs).toBe(3000);
+      controller.abort();
+      try { await startPromise; } catch { /* aborted */ }
+    } finally {
+      await server.close();
+    }
   }, 20000);
 });
