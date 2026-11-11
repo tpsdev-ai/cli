@@ -13,5 +13,5 @@
   acquirer reclaims a remaining lock only if its owner is provably dead. `stop()` keeps records classified as unreadable or invalid
   by the locked read and reports their path, instructing the operator to inspect the record and remove it if no connector
   for that host is running. Other removal failures except a missing file are rethrown.
-  `tps office connect` awaits `stop()` on SIGINT and exits 1 if it rejects, reporting the failed disconnect.
-  On SIGTERM the process exits without that cleanup; `office kill` sends it and attempts record removal after confirming exit.
+  `tps office connect` awaits `stop()` on SIGINT and SIGTERM and exits 1 if it rejects, reporting the failed disconnect;
+  `office kill` sends SIGTERM and attempts record removal after confirming exit.

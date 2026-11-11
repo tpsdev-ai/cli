@@ -1,1 +1,0 @@
-- **The heartbeat lane's live-case cleanup reports the failing gateway stop and then the failing log close, after the assertion that failed.**

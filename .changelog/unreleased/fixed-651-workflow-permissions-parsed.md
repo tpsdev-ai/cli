@@ -1,1 +1,0 @@
-- **The workflow permissions test reads write grants from the parsed workflow and comments from the trimmed source line of the parsed node (Closes #651).**

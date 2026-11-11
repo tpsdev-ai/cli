@@ -1,1 +1,0 @@
-- **`tps mail ack` usage names `--agent <id>`.** The usage line and both mail help texts showed a positional `[agent]` that the parser never read; they now show the `--agent <id>` flag the command takes.

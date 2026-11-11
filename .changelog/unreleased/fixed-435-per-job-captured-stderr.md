@@ -1,1 +1,0 @@
-- **The docker and git runners retain captured stderr and append spawn errors.** (Refs #435).

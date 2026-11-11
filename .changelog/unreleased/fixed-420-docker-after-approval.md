@@ -9,7 +9,3 @@
   "npm could not find" and conditional staged-release guidance. Other
   inconclusive version results, and failed, empty, or malformed latest results,
   stop with "could not verify".
-
-  Slice 1 of #420 changes `.github/workflows/docker.yml` and adds
-  `.github/scripts/docker-image-tags.sh`; dispatching the workflow from the
-  promote step is slice 2.
