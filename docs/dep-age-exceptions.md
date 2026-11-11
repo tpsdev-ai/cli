@@ -30,7 +30,104 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
 
 Refusals name the workflow, job, step and physical line. Variable or substitution
 indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
-Installs inside other script files or composite actions are not inspected. Helper
+The guard follows repository scripts a workflow invokes by a literal path,
+recursively, and local composite actions (`uses: ./...`). One scanner reads
+workflow and action `run:` blocks and followed shell files: it splits clauses,
+tracks `cd` through one resolution state, scans command substitutions (`$(...)`
+and backtick spans, each with its own `cd` and nested state; one left-to-right
+lexer carries quote state and span nesting together, so a substitution body
+whose own lexing ends inside a quote or an unclosed span on its own logical line
+is refused rather than skipped; a line that ends inside a quote at the end of a
+run block or script is not refused (bash fails it with a syntax error), and the
+passes that track quotes outside this lexer are a known limit (cli#975); a
+substitution that does not close on its logical line is not followed; a
+backslash-escaped double quote inside a double-quoted backtick body is not
+unescaped before the body is scanned (cli#975)), resolves wrapped interpreters
+and literal invocations, and follows scripts. A run block and a followed script
+differ in their initial state: the install classifier runs on followed shell
+files, and a run block's lines are screened by the physical-line check above.
+A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
+`do`, `!` or the `time` prefix is judged at its next word; `for`, `case` and
+`select` headers are not invocations (their command substitutions are scanned
+as usual); any other shell reserved word the guard does not model makes the
+clause unresolved. An `npx` invocation in a workflow or composite-action
+`run:` block is not classified by either pass. Here-document bodies are
+install-screened;
+a here-document passed to a shell is refused rather than executed; a `<<<`
+here-string and a `<<` inside `$((...))` also match the header pattern, so the
+lines below them are treated as a here-document body (cli#975). It refuses what it cannot
+resolve in the shapes it parses; a prefix assignment whose value the lexer
+cannot close skips the clause, and nested quoting inside substitutions is a
+known limit (cli#975). It passes an install only as a bounded global
+install or when it resolves to a tracked lockfile, and any invocation or install
+it cannot resolve is refused unless a reviewed allowlist entry names it; an
+unresolved-invocation refusal names the step and the invocation path. It is not a boundary
+against an author who deliberately evades it; review is, and a runtime npm
+guard in CI is the structural fix, tracked separately (cli#948). Installs inside
+followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
+`package.json` are not inspected. A `$'...'` span is a quote in which a backslash
+escapes the next character and `$(` and a backtick are literal.
+
+In a followed shell script, a logical line (continuations joined, word-boundary
+comments stripped, here-document headers matched after comment stripping,
+here-document bodies kept) is an install when, after lowercasing and deleting
+backslashes and quotes, it contains `npx` as a word, or `npm` as a word followed
+later by `ci`, `install`, `i`, `add`, `exec` or `x`. Only these verbs are
+classified; `update`, `dedupe`, `clean-install` and aliases such as `ic` and
+`install-test` are not (cli#975). A followed file is shell text only when its
+name ends in `.sh` or `.bash` or its first line is a bash/sh shebang; an
+extensionless file invoked by a shell without a shebang is scanned as non-shell,
+so an install in it is not inspected (cli#975). Every install clause on a
+line is judged, in order. An install must use the tracked-lock helper, a bounded
+global install, or bind to a tracked lockfile; an install line whose npm/npx
+shape cannot be read is refused, as are `--no-package-lock`, `npx`, `npm exec`
+and `npm x`, which do not read a lockfile. `--prefix`/`-C` bind the install to
+the literal directory they name; `--workspace`/`-w`/`--workspaces` are refused,
+because npm workspaces read the root lockfile; a repeated directory flag is
+refused. `scripts/npm-ci-tracked-lock.sh` is the approved install
+implementation: its own lines are not screened by that classifier, and a helper
+call is followed only as the literal whole-line shape of a run block, or of a
+followed shell file other than the helper itself; any other spelling, and a
+helper call whose cwd or directory argument is not resolved, is refused.
+
+An interpreter invocation is followed when its script argument resolves to a
+repository file: a literal path; a variable the script binds exactly once to a
+literal or script-directory-relative path; or a computed token whose literal
+suffix (`$VAR/scripts/entry.sh`) names an existing repository file. That suffix
+form is resolved without the single-assignment check and without an unknown-cwd
+refusal. In a run block, whose scan has no bindings, the suffix is matched to a
+repository file without proving the executed path: `BASE=/tmp` then
+`bash "$BASE/scripts/entry.sh"` follows the repository's `scripts/entry.sh` even
+though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or here-document-to-shell
+invocation is refused unless it is on the reviewed allowlist, as is a wrapped
+interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
+non-literal. A clause whose first word is an assignment whose value holds a
+closed command substitution and that has more words after it is refused, unless
+it prefixes an unquoted `cd`, `pushd` or `popd` (cli#975): a run
+block offers computing the value on its own line, and a followed script offers computing the value on its
+own line or naming the script in a reviewed entry. A `$(` the lexer reads as
+literal text (single quotes, ANSI-C quoting, an escaped dollar) is not a
+substitution, so the clause is scanned.
+The allowlist pins the target, the single assignment to the variable and any
+content source; a `source` must be derived from the pinned assignment, and an
+entry whose assignment is an env-overridable default (`${VAR:-...}`) is refused.
+
+An install or relative invocation after a non-literal `cd`, `pushd`, `popd` or
+`cd -` is refused. The unknown cwd is sticky: a later relative `cd` keeps it
+unknown, and only a `cd` that resolves inside the repository — an absolute path,
+a path anchored to the repository root, or a path derived from the script's own
+directory — makes it known again. A literal absolute `cd` outside the repository
+leaves it unknown. A `cd` inside a subshell, pipeline, conditional or function
+body is applied to later lines as if it ran unconditionally (cli#975).
+A step whose `working-directory` is not a literal relative path (a `${{ ... }}`
+expression or any other `$`, or a leading `/`) starts at an unknown cwd, so a
+relative invocation or a cwd-bound install on it is unresolved, except a
+computed token whose literal suffix names an existing repository file (see
+above).
+
+Installs inside followed JavaScript or TypeScript scripts, node `-e`/`-p` or
+node here-document payloads, and `npm run`/`bun run` targets in `package.json`
+are not inspected; here-document bodies are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including
 literal `node scripts/heartbeat-real-openclaw-lane.mjs --pin` substitutions), helper

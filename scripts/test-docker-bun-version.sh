@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Fixtures for scripts/docker-bun-version.sh and scripts/assert-bun-version.sh.
-# HELPER overrides the helper under test (used to run a mutant).
+# The helper under test is resolved from this script's directory.
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-helper="${HELPER:-$here/docker-bun-version.sh}"
+# The helper is a literal path so the workflow guard can resolve it. HELPER is
+# refused because every fixture below runs that literal path: a mutation test
+# that sets HELPER would exercise the real helper and could pass. Mutate the
+# helper in place instead.
+if [ -n "${HELPER:-}" ]; then
+  printf 'test-docker-bun-version: HELPER is not an override; edit scripts/docker-bun-version.sh in place and re-run (got: %s)\n' "$HELPER" >&2
+  exit 2
+fi
+helper="$here/docker-bun-version.sh"
 assert="$here/assert-bun-version.sh"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
