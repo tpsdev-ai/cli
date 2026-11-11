@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { pidState, processIsGone, processStartToken } from "@tpsdev-ai/agent";
 import { runBridge, setBridgeStopRecordReader, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
@@ -154,6 +154,44 @@ function spawnSleep(): Bun.Subprocess {
   const child = Bun.spawn(["sleep", "60"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   children.push(child);
   return child;
+}
+
+/** Starts `sleep` as the child of a shell this process also starts. The shell
+ *  reaps it, so a killed process disappears without this process waiting on
+ *  it, which a synchronous reader cannot do. */
+async function spawnReapableChild(): Promise<number> {
+  const shell = Bun.spawn(["sh", "-c", "sleep 60 & echo $!; wait"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  children.push(shell);
+  const reader = shell.stdout.getReader();
+  const { value } = await reader.read();
+  reader.releaseLock();
+  const pid = Number(new TextDecoder().decode(value).trim());
+  if (!Number.isInteger(pid) || pid < 1) throw new Error(`no child pid on stdout: ${value}`);
+  return pid;
+}
+
+/** Kill `pid` and block until the process is gone, so the next reader call sees
+ *  it. The synchronous wait ends on its own; it does not depend on this
+ *  process reaping the pid. */
+function killAndWaitGone(pid: number, token: string): void {
+  process.kill(pid, "SIGKILL");
+  const deadline = Date.now() + 5_000;
+  while (!processIsGone(pid, token)) {
+    if (Date.now() >= deadline) throw new Error(`pid ${pid} is still present`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+
+/** A token from the same source as `real` whose value the child cannot carry,
+ *  so the record is stale by construction on Linux and macOS. */
+function foreignStartToken(real: string): string {
+  if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
+  if (real.startsWith("proc:")) return "proc:1";
+  throw new Error(`unexpected start token source: ${real}`);
 }
 
 function spawnScript(script: string, env: Record<string, string>): Bun.Subprocess {
@@ -347,24 +385,70 @@ describe("bridge stop re-read exit status (cli#970)", () => {
   }
 
   test(
-    "a record that turned stale for the same pid is a completed stop and is removed",
+    "a process killed and reaped before the re-read is a completed stop and the record is removed",
     async () => {
-      const child = spawnSleep();
+      const pid = await spawnReapableChild();
+      const token = tokenOf(pid);
       const path = join(runDir, "bridge-alpha.pid");
-      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+      writeFileSync(path, record(pid, token));
 
-      const restoreReader = installReader(() => ({ kind: "stale", path, pid: child.pid }));
+      let reads = 0;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        reads++;
+        // The process the up-front read verified dies before the re-read.
+        if (reads === 1) killAndWaitGone(pid, token);
+        return readPidFile(readPath);
+      });
       const signals: number[] = [];
-      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      const previous = setBridgeStopSignal((signalled) => signals.push(signalled));
       try {
         await runBridge({ action: "stop" });
       } finally {
         setBridgeStopSignal(previous);
-        restoreReader();
+        setBridgeStopRecordReader(previousReader);
       }
 
+      expect(reads).toBe(1);
       expect(signals).toEqual([]);
       expect(existsSync(path)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
+    async () => {
+      const child = spawnSleep();
+      const plannedToken = tokenOf(child.pid);
+      const path = join(runDir, "bridge-alpha.pid");
+      const rewritten = record(child.pid, foreignStartToken(plannedToken));
+      writeFileSync(path, record(child.pid, plannedToken));
+
+      let reads = 0;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        reads++;
+        // The record changes after the up-front read, before the re-read.
+        if (reads === 1) writeFileSync(path, rewritten);
+        return readPidFile(readPath);
+      });
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((signalled) => signals.push(signalled));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+      }
+
+      expect(error?.message).toContain(`holds a stale record for pid ${child.pid}, but it does not prove the process this stop verified is gone`);
+      expect(error?.message).toContain(`The bridge process (pid ${child.pid}) may still be running`);
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,

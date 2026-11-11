@@ -13,7 +13,7 @@ import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
 import { readPidFile, removePidFile, type PidFileState } from "../utils/pid-file.js";
-import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
+import { pidState, pidStateFromProbeError, processIsGone } from "@tpsdev-ai/agent";
 
 /** The signal sender for `bridge stop`; replaceable in tests so they can
  *  assert that an unverifiable pid file sends nothing. */
@@ -206,16 +206,21 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         const fresh = bridgeStopRecordReader?.(state.path) ?? readPidFile(state.path);
         if (fresh.kind !== "running" || fresh.pid !== state.pid || fresh.startToken !== state.startToken) {
           const unproven = `The bridge process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
-          if (fresh.kind === "stale" && fresh.pid === state.pid) {
-            // A stale record for the pid the plan verified proves that pid's
-            // process is gone: the pid is gone, or it now carries a different
-            // start token.
+          if (fresh.kind === "stale" && fresh.pid === state.pid && processIsGone(state.pid, state.startToken)) {
+            // A stale re-read for the pid this stop verified is a completed
+            // stop only when the process it verified — this pid with this start
+            // token — is gone. The stale classification compares the re-read
+            // record's own token, which a rewrite can change.
             const removal = remove(fresh.path);
             if (removal === "removed") {
               console.log(`Stale pid file removed: ${fresh.path}.`);
             } else if (removal === "already gone") {
               console.log(`Pid file already gone: ${fresh.path}.`);
             }
+          } else if (fresh.kind === "stale" && fresh.pid === state.pid) {
+            failures.push(
+              `Bridge pid file ${fresh.path} holds a stale record for pid ${fresh.pid}, but it does not prove the process this stop verified is gone; it was not signalled and the pid file was kept. ${unproven}`,
+            );
           } else if (fresh.kind === "missing") {
             failures.push(
               `Bridge pid file ${state.path} disappeared before it was signalled; it was not signalled. ${unproven}`,

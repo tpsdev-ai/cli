@@ -6,7 +6,7 @@ import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
-import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
+import { pidState, pidStateFromProbeError, processIsGone } from "@tpsdev-ai/agent";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
@@ -783,11 +783,16 @@ export async function runMail(args: MailArgs): Promise<void> {
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
           const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
-          if (current.kind === "stale" && current.pid === state.pid) {
-            // A stale record for the pid this command read proves that pid's
-            // process is gone: the pid is gone, or it now carries a different
-            // start token.
+          if (current.kind === "stale" && current.pid === state.pid && processIsGone(state.pid, state.startToken)) {
+            // A stale re-read for the pid this command verified is a completed
+            // stop only when the process that read verified — this pid with
+            // this start token — is gone. The stale classification compares the
+            // re-read record's own token, which a rewrite can change.
             console.log(`Mail relay stopped (pid=${state.pid}); pid file ${current.path} is stale.`);
+          } else if (current.kind === "stale" && current.pid === state.pid) {
+            throw new Error(
+              `Mail relay pid file ${current.path} holds a stale record for pid ${current.pid}, but it does not prove the process this command verified is gone; this command signalled no process. ${unproven}`,
+            );
           } else if (current.kind === "missing") {
             throw new Error(
               `Mail relay pid file ${state.path} disappeared before it was signalled; this command signalled no process. ${unproven}`,
