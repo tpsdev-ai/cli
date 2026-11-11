@@ -6,5 +6,5 @@
   pins; its override in a nested package.json, and a `resolutions` key of its name or `**/` and its name, are
   refused. Outside node_modules and .git, it follows in-root manifest and directory symlinks and refuses outside-root links.
   When `minimumReleaseAgeExcludes` is non-empty, the gate also refuses root `workspaces` patterns it cannot model
-  (`!` negation, extended globs, `..` or empty alternatives in a brace group, brace/class mixes); it exits 2 naming
+  (for example `!` negation, extended globs, `..` or empty alternatives in a brace group, brace/class mixes); it exits 2 naming
   the pattern. `docs/dep-age-exceptions.md` lists the refused shapes.
