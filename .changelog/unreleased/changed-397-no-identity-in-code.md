@@ -5,4 +5,4 @@
   the credentials manifest's `agents` list; pulse's reviewer list stays in pulse
   configuration.
 
-  **Upgrade:** a Pulse config that relied on the defaults must set `mergeAuthority`, `ghAgent` and `author` in `~/.tps/pulse/config.json`.
+  **Upgrade:** a Pulse config that relied on the defaults must set `mergeAuthority`, `ghAgent` and `author` in `~/.tps/pulse/config.json`, and provision the `pulse` principal (a local signing key registered in Flair, for example `tps agent create --id pulse` while Flair is available), which `pulse start` also requires.
