@@ -1302,7 +1302,8 @@ describe("the connect bound and the ACK window are separate", () => {
       await sawDeliver;
       expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
       expect((caught as Error).message).toContain("closed before the ACK");
-      // The 5 s ACK window is the only other way to settle; the close must win.
+      // Without the close notification the 5 s ACK window would settle it;
+      // the close must win.
       expect(Date.now() - startedAt).toBeLessThan(3_000);
     } finally {
       await server.close();
