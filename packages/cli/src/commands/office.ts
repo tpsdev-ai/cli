@@ -140,6 +140,30 @@ function lastSeenFromPaths(paths: string[]): string {
   return timestamps[0] ?? new Date(0).toISOString();
 }
 
+/** The checked shutdown `office connect` registers for SIGINT and SIGTERM:
+ *  stop the relay, clear the host record, report a failed disconnect and exit
+ *  non-zero. One handler serves both signals; a signal that arrives while it
+ *  runs starts no second shutdown. */
+export function createConnectShutdown(
+  stop: () => Promise<void>,
+  exit: (code: number) => void = (code) => process.exit(code),
+  report: (line: string) => void = (line) => console.error(line),
+): () => Promise<void> {
+  let running = false;
+  return async () => {
+    if (running) return;
+    running = true;
+    try {
+      await stop();
+    } catch (error) {
+      report(`Disconnect failed: ${(error as Error).message}`);
+      exit(1);
+      return;
+    }
+    exit(0);
+  };
+}
+
 function validateAgent(agent?: string): string {
   if (!agent) {
     console.error("Agent name is required.");
@@ -922,15 +946,11 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       });
 
       console.log(`Persistent connection active for '${args.agent}'. Press Ctrl+C to disconnect.`);
-      process.on("SIGINT", async () => {
-        try {
-          await stop();
-        } catch (error) {
-          console.error(`Disconnect failed: ${(error as Error).message}`);
-          process.exit(1);
-        }
-        process.exit(0);
-      });
+      // `office kill` and service managers stop the connector with SIGTERM, so
+      // both signals run the same checked shutdown.
+      const shutdown = createConnectShutdown(stop);
+      process.on("SIGTERM", shutdown);
+      process.on("SIGINT", shutdown);
       // bun drops the no-op interval; hold the loop until SIGTERM/SIGINT.
       await new Promise<void>(() => {});
       return;
