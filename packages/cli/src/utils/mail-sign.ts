@@ -128,6 +128,13 @@ export function signOutboundBody(
   // --reply-to is refused the same way with or without a key.
   if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
 
+  // A prior chain of 16 hops already fills the maximum a receiver accepts, so
+  // the hop this send appends would make the envelope undeliverable. Refuse it
+  // by name here, before signing or storing anything.
+  if ((opts.priorChain?.length ?? 0) >= 16) {
+    throw new Error("delegation chain exceeds the maximum of 16 hops");
+  }
+
   const privkey = readOutboundSigningKey(from, opts.keyPath);
   if (!privkey) {
     if (opts.requireKey) throw noKeyError(from, opts.keyPath);

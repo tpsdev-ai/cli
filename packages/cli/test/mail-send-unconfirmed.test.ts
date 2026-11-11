@@ -41,7 +41,7 @@ import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/uti
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile } from "./helpers/stub-flair.js";
 import { readSentEnvelope, SENT_ENVELOPE_TTL_MS, storeSentEnvelope } from "../src/utils/sent-envelope.js";
-import { signEnvelope, type Envelope, type FlairClient } from "@tpsdev-ai/agent";
+import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "@tpsdev-ai/agent";
 import * as ed from "@noble/ed25519";
 
 afterEach(() => {
@@ -636,6 +636,25 @@ describe("a --message-id re-send re-checks the key and the stored envelope", () 
     expect(branch.deliveries).toHaveLength(1);
   }, 25_000);
 
+  test("a structurally invalid stored envelope is reported as invalid, not as a key failure", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "77777777-7777-7777-7777-777777777772";
+    await firstSend(id);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8")) as Envelope;
+    // A version no receiver accepts is checked before any key is read.
+    stored.v = 2;
+    writeFileSync(path, JSON.stringify(stored));
+    const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain(
+      `the stored message at ${path} is not a valid signed envelope (unsupported version)`,
+    );
+    expect(second.stderr).not.toContain("does not verify against agent");
+    expect(branch.deliveries).toHaveLength(1);
+  }, 25_000);
+
   test("an invalid --reply-to on a re-send is refused before the store is read", async () => {
     await startBranchServer({ recordInbox: true });
     pointRemoteAtServer();
@@ -809,6 +828,92 @@ describe("a --message-id re-send of delegated mail", () => {
     expect(branch.deliveries).toHaveLength(1);
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 30_000);
+});
+
+describe("an inbound chain a re-send could not reproduce is refused on a fresh send", () => {
+  /** A signed chain of `hopCount` entries: one human origin then agent hops. */
+  function signedChain(hopCount: number): string {
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates", signature: null },
+    ];
+    const keys: Record<string, Buffer> = {};
+    for (let i = 1; i < hopCount; i += 1) {
+      const agent = `agent-${String.fromCharCode(97 + i)}`;
+      chain.push({ agent, kind: "agent", timestamp: now, rationale: "forwards", signature: null });
+      keys[agent] = Buffer.alloc(32, i);
+    }
+    const signed = signEnvelope(
+      {
+        v: 1,
+        from: chain[chain.length - 1].agent,
+        to: "flint",
+        body: "inbound delegation",
+        messageId: "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+        timestamp: now,
+        delegationChain: chain,
+      },
+      keys,
+    );
+    return JSON.stringify(signed.delegationChain);
+  }
+
+  test("a 16-entry chain is refused by name, stores nothing and sends nothing", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "99999999-9999-4999-8999-999999999991";
+    const result = await runSend(
+      ["--stdin", "--message-id", id, "--ack-timeout", "2000"],
+      { TPS_INBOUND_CHAIN_JSON: signedChain(16) },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("delegation chain exceeds the maximum of 16 hops");
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    expect(branch.deliveries).toHaveLength(0);
+    expect(inboxRecords("remote-a")).toHaveLength(0);
+  }, 20_000);
+
+  test("an agent hop with no signature is refused by name", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const now = new Date().toISOString();
+    const id = "99999999-9999-4999-8999-999999999992";
+    const result = await runSend(
+      ["--stdin", "--message-id", id, "--ack-timeout", "2000"],
+      {
+        TPS_INBOUND_CHAIN_JSON: JSON.stringify([
+          { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates", signature: null },
+          { agent: "agent-b", kind: "agent", timestamp: now, rationale: "forwards" },
+        ]),
+      },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('inbound delegation chain hop 1 for "agent-b"');
+    expect(result.stderr).toContain("must carry its signature string");
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    expect(branch.deliveries).toHaveLength(0);
+  }, 20_000);
+
+  test("an agent hop with a null signature is refused by name", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const now = new Date().toISOString();
+    const id = "99999999-9999-4999-8999-999999999993";
+    const result = await runSend(
+      ["--stdin", "--message-id", id, "--ack-timeout", "2000"],
+      {
+        TPS_INBOUND_CHAIN_JSON: JSON.stringify([
+          { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates", signature: null },
+          { agent: "agent-b", kind: "agent", timestamp: now, rationale: "forwards", signature: null },
+        ]),
+      },
+    );
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('inbound delegation chain hop 1 for "agent-b"');
+    expect(result.stderr).toContain("must carry its signature string");
+    expect(existsSync(sentEnvelopeFile(id))).toBe(false);
+    expect(branch.deliveries).toHaveLength(0);
+  }, 20_000);
 });
 
 describe("the stored signed envelope has a reuse window", () => {

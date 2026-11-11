@@ -7,4 +7,8 @@
   envelope stored for that id (same id, timestamp and payload) only when it
   still verifies with the sender's current key and both the inbound delegation
   chain and `--reply-to` match, so the branch can recognise it as a duplicate;
-  otherwise nothing is sent and the re-send is refused by name.
+  otherwise nothing is sent and the re-send is refused by name. A
+  `TPS_INBOUND_CHAIN_JSON` chain is refused before signing when it has 16 or
+  more entries (`delegation chain exceeds the maximum of 16 hops`) or when a
+  hop's `signature` is not the one its kind carries (a string for an agent hop,
+  `null` for a human hop).

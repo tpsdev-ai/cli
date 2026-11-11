@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseSignedEnvelope, type ChainEntry, type Envelope, type FlairClient, type VerifyOk, type VerifyReject } from "@tpsdev-ai/agent";
+import { parseSignedEnvelope, type ChainEntry, type Envelope, type FlairClient } from "@tpsdev-ai/agent";
 import * as ed from "@noble/ed25519";
 import canonicalize from "canonicalize";
 
@@ -87,31 +87,37 @@ function decodeSignature(value: string | null | undefined): Uint8Array | null {
   }
 }
 
+/** The result of checking a stored envelope. A `structural` failure means the
+ *  bytes are not a valid signed envelope at all; a `signature` failure means the
+ *  shape is valid but a key or signature check refused it. The caller reports
+ *  them differently. */
+type StoredVerifyResult = { ok: true } | { ok: false; kind: "structural" | "signature"; reason: string };
+
 /**
  * Verify a stored envelope with the sender's CURRENT key: the outer signature
  * and the sender's own (last) chain entry. Earlier delegation hops are NOT
- * resolved or verified — the fresh send never verified them, and the outer
- * signature covers every byte of the chain, so a re-send is never stricter
- * than the send it repeats.
+ * resolved or verified — their keys are normally not on this host. The outer
+ * signature covers every byte of the chain, and the chain prefix is required to
+ * be the one this invocation would embed.
  */
-async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Promise<VerifyOk | VerifyReject> {
-  if (envelope.v !== 1) return { ok: false, reason: "unsupported version" };
+async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Promise<StoredVerifyResult> {
+  if (envelope.v !== 1) return { ok: false, kind: "structural", reason: "unsupported version" };
   const chain = envelope.delegationChain;
-  if (!Array.isArray(chain) || chain.length === 0) return { ok: false, reason: "missing chain" };
-  if (chain.length > 16) return { ok: false, reason: "chain too long" };
+  if (!Array.isArray(chain) || chain.length === 0) return { ok: false, kind: "structural", reason: "missing chain" };
+  if (chain.length > 16) return { ok: false, kind: "structural", reason: "chain too long" };
   const tip = chain[chain.length - 1];
-  if (tip.agent !== envelope.from) return { ok: false, reason: "chain tip / from mismatch" };
+  if (tip.agent !== envelope.from) return { ok: false, kind: "structural", reason: "chain tip / from mismatch" };
   for (const entry of chain) {
     if (entry.kind === "human" && entry.signature !== null) {
-      return { ok: false, reason: "human entry must have null signature" };
+      return { ok: false, kind: "structural", reason: "human entry must have null signature" };
     }
   }
   const info = await client.getAgent(envelope.from);
-  if (!info) return { ok: false, reason: `no current key for agent "${envelope.from}"` };
+  if (!info) return { ok: false, kind: "signature", reason: `no current key for agent "${envelope.from}"` };
   const publicKey = new Uint8Array(info.publicKey);
 
   const entrySig = decodeSignature(tip.signature);
-  if (!entrySig) return { ok: false, reason: "sender's chain entry signature invalid" };
+  if (!entrySig) return { ok: false, kind: "signature", reason: "sender's chain entry signature invalid" };
   const entryForSig = {
     agent: tip.agent,
     kind: tip.kind,
@@ -121,15 +127,15 @@ async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Pr
   } as const;
   const entryCanonical = canonicalize({ prior: chain.slice(0, -1), entry: entryForSig });
   if (entryCanonical === undefined || !(await ed.verifyAsync(entrySig, new TextEncoder().encode(entryCanonical), publicKey))) {
-    return { ok: false, reason: "sender's chain entry signature invalid" };
+    return { ok: false, kind: "signature", reason: "sender's chain entry signature invalid" };
   }
 
   const outerSig = decodeSignature(envelope.signature);
-  if (!outerSig) return { ok: false, reason: "outer signature invalid" };
+  if (!outerSig) return { ok: false, kind: "signature", reason: "outer signature invalid" };
   const { signature: _, ...withoutSignature } = envelope;
   const outerCanonical = canonicalize(withoutSignature);
   if (outerCanonical === undefined || !(await ed.verifyAsync(outerSig, new TextEncoder().encode(outerCanonical), publicKey))) {
-    return { ok: false, reason: "outer signature invalid" };
+    return { ok: false, kind: "signature", reason: "outer signature invalid" };
   }
   return { ok: true };
 }
@@ -247,6 +253,11 @@ export async function readSentEnvelope(
   assertSameInboundChain(signed, expected);
   const verified = await verifyStoredEnvelope(signed, client);
   if (!verified.ok) {
+    if (verified.kind === "structural") {
+      throw new StoredEnvelopeError(
+        `the stored message at ${path} is not a valid signed envelope (${verified.reason})`,
+      );
+    }
     throw new StoredEnvelopeError(
       `the stored signed message at ${path} does not verify against agent "${expected.from}"'s current key (${verified.reason}); refusing to send`,
     );
