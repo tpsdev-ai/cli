@@ -6,7 +6,7 @@ import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
-import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
+import { pidState, pidStateFromProbeError, processIsGone } from "@tpsdev-ai/agent";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
@@ -717,12 +717,13 @@ export async function runMail(args: MailArgs): Promise<void> {
           }
           return `pid file ${path} no longer holds the record this stop read and was kept.`;
         };
-        // A bad record says nothing about the relay process: describe the
-        // record, remove it when the re-read still holds the same bytes, and
-        // leave state unknown. A record replaced in between is kept.
+        // A stale record proves the recorded process gone (readPidFile already
+        // checked the pid and start token): describe the record, remove it when
+        // the re-read still holds the same bytes, and leave state unknown. A
+        // record replaced in between is kept.
         const reportBadRecord = (snapshot: PidRecordSnapshot): void => {
           const state = snapshot.state;
-          if (state.kind !== "invalid" && state.kind !== "stale") return;
+          if (state.kind !== "stale") return;
           const { kind, path } = state;
           const current = snapshotPidRecord(path);
           if (current.state.kind === "unreadable") {
@@ -735,7 +736,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             !pidRecordBytesEqual(current.raw, snapshot.raw)
           ) {
             console.log(
-              `Mail relay pid file ${path} was ${kind}; ${describeKeptRecord(path, current.state, state.kind === "stale" ? state.pid : undefined)} This command signalled no process, and the relay's state is unknown.`,
+              `Mail relay pid file ${path} was ${kind}; ${describeKeptRecord(path, current.state, state.pid)} This command signalled no process, and the relay's state is unknown.`,
             );
             return;
           }
@@ -767,7 +768,14 @@ export async function runMail(args: MailArgs): Promise<void> {
             `Mail relay pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if the relay is not running.`,
           );
         }
-        if (state.kind === "invalid" || state.kind === "stale") {
+        if (state.kind === "invalid") {
+          // An invalid record was never verified: it may be a torn write from a
+          // live relay. Keep it and refuse, as the unreadable branch does.
+          throw new Error(
+            `Mail relay pid file ${state.path} is invalid (${state.reason}), so the relay's process identity cannot be verified. Check whether a relay is running, and remove ${state.path} by hand only if none is.`,
+          );
+        }
+        if (state.kind === "stale") {
           reportBadRecord(classification);
           break;
         }
@@ -782,27 +790,44 @@ export async function runMail(args: MailArgs): Promise<void> {
         const decision = readStopRecord();
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
-          if (current.kind === "missing") {
-            console.log("Mail relay pid file disappeared before it was signalled; this command signalled no process.");
-          } else if (current.kind === "invalid" || current.kind === "stale") {
-            console.log(
-              `Mail relay pid file ${current.path} is now ${current.kind}; this command signalled no process.`,
+          const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
+          if (current.kind === "stale" && current.pid === state.pid && processIsGone(state.pid, state.startToken)) {
+            // A stale re-read for the pid this command verified is a completed
+            // stop only when the process that read verified — this pid with
+            // this start token — is gone. The stale classification compares the
+            // re-read record's own token, which a rewrite can change.
+            console.log(`Mail relay stopped (pid=${state.pid}); pid file ${current.path} is stale.`);
+          } else if (current.kind === "stale" && current.pid === state.pid) {
+            throw new Error(
+              `Mail relay pid file ${current.path} holds a stale record for pid ${current.pid}, but it does not prove the process this command verified is gone; this command signalled no process. ${unproven}`,
+            );
+          } else if (current.kind === "missing") {
+            throw new Error(
+              `Mail relay pid file ${state.path} disappeared before it was signalled; this command signalled no process. ${unproven}`,
+            );
+          } else if (current.kind === "invalid") {
+            throw new Error(
+              `Mail relay pid file ${current.path} is now invalid; this command signalled no process. ${unproven}`,
+            );
+          } else if (current.kind === "stale") {
+            throw new Error(
+              `Mail relay pid file ${current.path} now holds a stale record for pid ${current.pid}, not the pid ${state.pid} this command read; this command signalled no process. ${unproven}`,
             );
           } else if (current.kind === "unreadable") {
             throw new Error(
-              `Mail relay pid file ${current.path} could not be re-read, so its process identity cannot be verified; this command signalled no process. Check that process and stop it yourself, or remove ${current.path} if the relay is not running.`,
+              `Mail relay pid file ${current.path} could not be re-read, so its process identity cannot be verified; this command signalled no process. ${unproven} Remove ${current.path} if the relay is not running.`,
             );
           } else if (current.kind === "unverified") {
             throw new Error(
-              `Mail relay pid file ${current.path} now names pid ${current.pid}, but that process's identity cannot be verified; this command signalled no process. Check that pid and stop it yourself, or remove ${current.path} if the relay is not running.`,
+              `Mail relay pid file ${current.path} now names pid ${current.pid}, but that process's identity cannot be verified; this command signalled no process. ${unproven} Remove ${current.path} if the relay is not running.`,
             );
           } else if (current.pid !== state.pid) {
             throw new Error(
-              `Mail relay pid file ${current.path} now names pid ${current.pid}, not the pid ${state.pid} that was read; this command signalled no process.`,
+              `Mail relay pid file ${current.path} now names pid ${current.pid}, not the pid ${state.pid} that was read; this command signalled no process. ${unproven}`,
             );
           } else {
             throw new Error(
-              `Mail relay pid file ${current.path} still names pid ${current.pid}, but its start token changed before it was signalled; this command signalled no process.`,
+              `Mail relay pid file ${current.path} still names pid ${current.pid}, but its start token changed before it was signalled; this command signalled no process. ${unproven}`,
             );
           }
           break;

@@ -111,6 +111,20 @@ describe("office command", () => {
     expect(status.stdout).toContain("Review:");
   });
 
+  test("status reports a missing relay record as not running, not unknown", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+
+    const r = run(["office", "status", "brancha"]);
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain("Relay: stopped");
+    expect(r.stdout).not.toContain("Relay: unknown");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("not running");
+  });
+
   test("status reports a stale relay record as unknown, not running", () => {
     const ws = join(tempRoot, ".tps", "branch-office", "brancha");
     mkdirSync(ws, { recursive: true });
