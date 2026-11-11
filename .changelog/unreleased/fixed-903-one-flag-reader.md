@@ -1,1 +1,3 @@
-- **One flag reader for the CLI subcommand blocks:** `agent`, `mail`, `memory`, `bridge`, `skill` and `flair sync` now share one `--flag` reader that stops at the first `--` after the subcommand (a `--` before it is passed), accepts `--name value` and `--name=value`, and refuses a repeated flag with a usage error naming it; a conflicting repeat that meow rejects is reported as a usage error instead of an uncaught stack.
+- **Breaking: one flag reader for the CLI subcommand blocks:** `agent`, `mail`, `memory`, `bridge`, `skill` and `flair sync` now share one `--flag` reader that stops at the first `--` after the subcommand (a `--` before it is passed), accepts `--name value` and `--name=value`, and refuses a repeated flag with a usage error naming it; a conflicting repeat that meow rejects is reported as a usage error instead of an uncaught stack.
+
+  **Upgrade:** a command line that repeats a flag in these blocks is refused; pass each flag once.

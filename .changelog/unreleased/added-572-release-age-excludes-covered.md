@@ -5,5 +5,6 @@
   devDependencies, optionalDependencies, peerDependencies and the root package.json's overrides must be exact
   pins; its override in a nested package.json, and a `resolutions` key of its name or `**/` and its name, are
   refused. Outside node_modules and .git, it follows in-root manifest and directory symlinks and refuses outside-root links.
-  Real-Bun tests cover install-time refusal, the exclusion that admits a young version, and overrides and
-  resolutions of an excluded transitive dependency.
+  When `minimumReleaseAgeExcludes` is non-empty, the gate also refuses root `workspaces` patterns it cannot model
+  (`!` negation, extended globs, `..` or empty alternatives in a brace group, brace/class mixes); it exits 2 naming
+  the pattern. `docs/dep-age-exceptions.md` lists the refused shapes.

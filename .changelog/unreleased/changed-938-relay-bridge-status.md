@@ -7,5 +7,5 @@
   unverified pid decides both its `records` entry and its `bridges` entry:
   `state` is the record kind (`running`, `invalid`, `stale`, `unverified`,
   `unreadable`), an unverified record whose pid the probe does not find alive is `stale`, a record
-  whose kind carries a `pid` includes it, and an `unreadable` record includes
+  whose kind carries a `pid` includes it, and an `invalid` or `unreadable` record includes
   its `reason` when it has one.

@@ -1,8 +1,7 @@
 - **Non-OK Flair response errors name the entry point, method, requested pathname, status and an allow-listed code (else `unrecognized_error`), without raw response bodies (Closes #597).**
 
   The client reads an allow-listed string from the response's `error` field
-  when present; other values become `unrecognized_error`. The exported list is
-  a frozen array; membership is module-private. Response error messages exclude
+  when present; other values become `unrecognized_error`. Response error messages exclude
   raw bodies and other response text. The reported pathname excludes query and
   fragment; encoded parameters stay encoded when the wrapper or caller encodes
   them. Wrapper methods encode ids; `request()` sends its caller's path.

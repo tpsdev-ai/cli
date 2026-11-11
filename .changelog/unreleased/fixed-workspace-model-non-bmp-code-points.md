@@ -1,1 +1,0 @@
-- **The release-age gate's workspace model now reads a non-BMP directory name as one code point.** A `?` and a `[...]` member each consume one code point, so a supplementary-character directory is not a workspace under `packages/??`; the install case that pins this measures the running Bun only.
