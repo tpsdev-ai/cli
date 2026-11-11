@@ -485,15 +485,31 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   console.log("Branch identity created.");
   console.log(`Fingerprint: sha256:${kp.fingerprint}`);
-  console.log(`Listening on 0.0.0.0:${port}`);
-  console.log("\nJoin token (run on host):");
-  console.log(`  tps office join <name> \"${token}\"`);
-  console.log("\nWaiting for host to connect... (Ctrl+C to cancel)");
 
-  const joined =
-    transport === "ws"
-      ? await listenForJoinWs(kp, port, 120_001)
-      : await listenForJoin(kp, port, 120_001);
+  // Announce the port and the token only once the join listener has bound
+  // (cli#780): a bind failure must not advertise a listener that never existed.
+  let bound = false;
+  const announceListener = () => {
+    bound = true;
+    console.log(`Listening on 0.0.0.0:${port}`);
+    console.log("\nJoin token (run on host):");
+    console.log(`  tps office join <name> \"${token}\"`);
+    console.log("\nWaiting for host to connect... (Ctrl+C to cancel)");
+  };
+
+  let joined: Awaited<ReturnType<typeof listenForJoin>>;
+  try {
+    joined =
+      transport === "ws"
+        ? await listenForJoinWs(kp, port, 120_001, announceListener)
+        : await listenForJoin(kp, port, 120_001, announceListener);
+  } catch (e) {
+    if (bound) throw e;
+    const message = e instanceof Error ? e.message : String(e);
+    console.error(`Failed to listen on 0.0.0.0:${port}: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
 
   const hostRecord = {
     hostId: joined.hostId,
