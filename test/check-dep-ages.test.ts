@@ -4635,3 +4635,116 @@ describe("the guard's clause words are load-bearing (#820 round 19)", () => {
     }
   });
 });
+
+describe("the workflow guard's known limits from review round 20 (cli#975)", () => {
+  // Each case below passes silently or binds the wrong lockfile on c642dce2.
+  // It is pinned as an expected failure: when the shape is handled, the pin
+  // goes red and the change is deliberate.
+
+  it.failing("refuses a run-block computed suffix whose variable names a directory outside the repository (cli#975)", () => {
+    const root = makeTreeFixture({
+      "scripts/entry.sh": "echo repo file\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep('BASE=/tmp\nbash "$BASE/scripts/entry.sh"', "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-known-limit-suffix",
+      )).toThrow(/cannot resolve a dynamic script path|cannot establish/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses the same computed suffix in a followed script, where the binding is available", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": 'BASE=/tmp\nbash "$BASE/scripts/entry.sh"\n',
+      "scripts/entry.sh": "echo repo file\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-known-limit-suffix-script",
+      )).toThrow(/unresolved script invocation in scripts\/outer\.sh \(line 2\) token "\$BASE\/scripts\/entry\.sh"/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.failing.each([
+    ["update"],
+    ["dedupe"],
+    ["clean-install"],
+    ["ic"],
+    ["install-test"],
+  ])("refuses npm %s in a followed script as an install (cli#975)", (verb) => {
+    const root = makeTreeFixture({ "scripts/install.sh": `npm ${verb}\n` });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install.sh", "."),
+        new Set(),
+        root,
+        "workflow-known-limit-verb",
+      )).toThrow(/cannot bind the npm install to a tracked lockfile/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.failing("scans an extensionless file invoked by a shell as shell text (cli#975)", () => {
+    const root = makeTreeFixture({ "scripts/install": "npm ci\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/install", "."),
+        new Set(),
+        root,
+        "workflow-known-limit-extensionless",
+      )).toThrow(/cannot bind the npm install to a tracked lockfile/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.failing.each([
+    ["a here-string", "tr a b <<< text\nbash scripts/install.sh"],
+    ["an arithmetic shift", "echo $((1 << SHIFT))\nbash scripts/install.sh"],
+  ])("follows the install below %s that matches the here-document pattern (cli#975)", (_shape, run) => {
+    const root = makeTreeFixture({ "scripts/install.sh": "npm ci\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(run, "."),
+        new Set(),
+        root,
+        "workflow-known-limit-heredoc",
+      )).toThrow(/cannot bind the npm install to a tracked lockfile/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.failing.each([
+    ["a subshell", "(cd plugins/a && true)"],
+    ["a conditional", '[ -n "$X" ] && cd plugins/a'],
+    ["a function body", "f() {\n  cd plugins/a\n}"],
+  ])("does not apply a cd in %s to the next line's install (cli#975)", (_shape, line) => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${line}\nnpm ci\n`,
+      "plugins/a/package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["plugins/a/package-lock.json"]),
+        root,
+        "workflow-known-limit-cd",
+      )).toThrow(/cannot bind an npm install/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

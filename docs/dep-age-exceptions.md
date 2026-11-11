@@ -53,7 +53,9 @@ as usual); any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed. It refuses what it cannot
+a here-document passed to a shell is refused rather than executed; a `<<<`
+here-string and a `<<` inside `$((...))` also match the header pattern, so the
+lines below them are treated as a here-document body (cli#975). It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
@@ -70,7 +72,12 @@ In a followed shell script, a logical line (continuations joined, word-boundary
 comments stripped, here-document headers matched after comment stripping,
 here-document bodies kept) is an install when, after lowercasing and deleting
 backslashes and quotes, it contains `npx` as a word, or `npm` as a word followed
-later by `ci`, `install`, `i`, `add`, `exec` or `x`. Every install clause on a
+later by `ci`, `install`, `i`, `add`, `exec` or `x`. Only these verbs are
+classified; `update`, `dedupe`, `clean-install` and aliases such as `ic` and
+`install-test` are not (cli#975). A followed file is shell text only when its
+name ends in `.sh` or `.bash` or its first line is a bash/sh shebang; an
+extensionless file invoked by a shell without a shebang is scanned as non-shell,
+so an install in it is not inspected (cli#975). Every install clause on a
 line is judged, in order. An install must use the tracked-lock helper, a bounded
 global install, or bind to a tracked lockfile; an install line whose npm/npx
 shape cannot be read is refused, as are `--no-package-lock`, `npx`, `npm exec`
@@ -88,7 +95,10 @@ repository file: a literal path; a variable the script binds exactly once to a
 literal or script-directory-relative path; or a computed token whose literal
 suffix (`$VAR/scripts/entry.sh`) names an existing repository file. That suffix
 form is resolved without the single-assignment check and without an unknown-cwd
-refusal. Any other computed, external, `-c`/`-s` or here-document-to-shell
+refusal. In a run block, whose scan has no bindings, the suffix is matched to a
+repository file without proving the executed path: `BASE=/tmp` then
+`bash "$BASE/scripts/entry.sh"` follows the repository's `scripts/entry.sh` even
+though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or here-document-to-shell
 invocation is refused unless it is on the reviewed allowlist, as is a wrapped
 interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
 non-literal. A clause whose first word is an assignment whose value holds a
@@ -106,7 +116,8 @@ An install or relative invocation after a non-literal `cd`, `pushd`, `popd` or
 unknown, and only a `cd` that resolves inside the repository — an absolute path,
 a path anchored to the repository root, or a path derived from the script's own
 directory — makes it known again. A literal absolute `cd` outside the repository
-leaves it unknown.
+leaves it unknown. A `cd` inside a subshell, pipeline, conditional or function
+body is applied to later lines as if it ran unconditionally (cli#975).
 A step whose `working-directory` is not a literal relative path (a `${{ ... }}`
 expression or any other `$`, or a leading `/`) starts at an unknown cwd, so a
 relative invocation or a cwd-bound install on it is unresolved, except a
