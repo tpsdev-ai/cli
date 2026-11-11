@@ -782,27 +782,39 @@ export async function runMail(args: MailArgs): Promise<void> {
         const decision = readStopRecord();
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
-          if (current.kind === "missing") {
-            console.log("Mail relay pid file disappeared before it was signalled; this command signalled no process.");
-          } else if (current.kind === "invalid" || current.kind === "stale") {
-            console.log(
-              `Mail relay pid file ${current.path} is now ${current.kind}; this command signalled no process.`,
+          const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
+          if (current.kind === "stale" && current.pid === state.pid) {
+            // A stale record for the pid this command read proves that pid's
+            // process is gone: the pid is gone, or it now carries a different
+            // start token.
+            console.log(`Mail relay stopped (pid=${state.pid}); pid file ${current.path} is stale.`);
+          } else if (current.kind === "missing") {
+            throw new Error(
+              `Mail relay pid file ${state.path} disappeared before it was signalled; this command signalled no process. ${unproven}`,
+            );
+          } else if (current.kind === "invalid") {
+            throw new Error(
+              `Mail relay pid file ${current.path} is now invalid; this command signalled no process. ${unproven}`,
+            );
+          } else if (current.kind === "stale") {
+            throw new Error(
+              `Mail relay pid file ${current.path} now holds a stale record for pid ${current.pid}, not the pid ${state.pid} this command read; this command signalled no process. ${unproven}`,
             );
           } else if (current.kind === "unreadable") {
             throw new Error(
-              `Mail relay pid file ${current.path} could not be re-read, so its process identity cannot be verified; this command signalled no process. Check that process and stop it yourself, or remove ${current.path} if the relay is not running.`,
+              `Mail relay pid file ${current.path} could not be re-read, so its process identity cannot be verified; this command signalled no process. ${unproven} Remove ${current.path} if the relay is not running.`,
             );
           } else if (current.kind === "unverified") {
             throw new Error(
-              `Mail relay pid file ${current.path} now names pid ${current.pid}, but that process's identity cannot be verified; this command signalled no process. Check that pid and stop it yourself, or remove ${current.path} if the relay is not running.`,
+              `Mail relay pid file ${current.path} now names pid ${current.pid}, but that process's identity cannot be verified; this command signalled no process. ${unproven} Remove ${current.path} if the relay is not running.`,
             );
           } else if (current.pid !== state.pid) {
             throw new Error(
-              `Mail relay pid file ${current.path} now names pid ${current.pid}, not the pid ${state.pid} that was read; this command signalled no process.`,
+              `Mail relay pid file ${current.path} now names pid ${current.pid}, not the pid ${state.pid} that was read; this command signalled no process. ${unproven}`,
             );
           } else {
             throw new Error(
-              `Mail relay pid file ${current.path} still names pid ${current.pid}, but its start token changed before it was signalled; this command signalled no process.`,
+              `Mail relay pid file ${current.path} still names pid ${current.pid}, but its start token changed before it was signalled; this command signalled no process. ${unproven}`,
             );
           }
           break;

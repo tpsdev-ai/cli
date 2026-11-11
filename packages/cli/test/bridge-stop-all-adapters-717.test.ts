@@ -9,9 +9,10 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, sym
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
+import { runBridge, setBridgeStopRecordReader, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
+import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
@@ -334,6 +335,128 @@ describe("bridge stop finds the discovered bridge pid records", () => {
       );
       expect(stopError?.message).toContain(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
       expect(() => bridgeStatus("openclaw")).toThrow(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("bridge stop re-read exit status (cli#970)", () => {
+  function installReader(state: () => PidFileState): () => void {
+    const previous = setBridgeStopRecordReader(() => state());
+    return () => setBridgeStopRecordReader(previous);
+  }
+
+  test(
+    "a record that turned stale for the same pid is a completed stop and is removed",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "stale", path, pid: child.pid }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(false);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that disappeared before the re-read exits non-zero and keeps the message's pid to check",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "missing" }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain("disappeared before it was signalled");
+      expect(error?.message).toContain(`The bridge process (pid ${child.pid}) may still be running`);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that turned invalid before the re-read exits non-zero",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "invalid", path, reason: "not a JSON object" }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`Bridge pid file ${path} is now invalid`);
+      expect(error?.message).toContain(`The bridge process (pid ${child.pid}) may still be running`);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that turned stale under a different pid exits non-zero",
+    async () => {
+      const child = spawnSleep();
+      const other = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "stale", path, pid: other.pid }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`now holds a stale record for pid ${other.pid}, not the planned pid ${child.pid}`);
+      expect(error?.message).toContain(`The bridge process (pid ${child.pid}) may still be running`);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,
   );

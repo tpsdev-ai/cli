@@ -120,7 +120,7 @@ afterEach(() => {
 
 describe("mail relay stop re-reads the record before signalling", () => {
   test(
-    "a record that turned stale between the reads is reported and sends no signal",
+    "a record that turned stale for the same pid between the reads is a completed stop and sends no signal",
     async () => {
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
@@ -147,8 +147,37 @@ describe("mail relay stop re-reads the record before signalling", () => {
 
       expect(reads).toBe(2);
       expect(signals).toEqual([]);
-      expect(logs.join("\n")).toContain(`Mail relay pid file ${relayPid} is now stale`);
-      expect(logs.join("\n")).toContain("signalled no process");
+      expect(logs.join("\n")).toContain(`Mail relay stopped (pid=${child.pid}); pid file ${relayPid} is stale.`);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    20_000,
+  );
+
+  test(
+    "a second read that is stale under a different pid exits non-zero and sends no signal",
+    async () => {
+      const child = spawnChild();
+      const other = spawnChild();
+      writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
+
+      const reader = installSecondRead(() => ({ kind: "stale", path: relayPid, pid: other.pid }));
+      const signalling = captureSignals();
+      let error: Error | null = null;
+      try {
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        signalling.restore();
+        reader.restore();
+      }
+
+      expect(error?.message).toContain(`now holds a stale record for pid ${other.pid}, not the pid ${child.pid}`);
+      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running`);
+      expect(reader.reads()).toBe(2);
+      expect(signalling.signals).toEqual([]);
       expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
@@ -245,54 +274,58 @@ describe("mail relay stop re-reads the record before signalling", () => {
   );
 
   test(
-    "a second read that is missing is reported and sends no signal",
+    "a second read that is missing exits non-zero and sends no signal",
     async () => {
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
 
       const reader = installSecondRead(() => ({ kind: "missing" }));
       const signalling = captureSignals();
-      const { logs, restore } = captureLogs();
+      let error: Error | null = null;
       try {
-        await runMail({ action: "relay", agent: "stop" });
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
       } finally {
-        restore();
         signalling.restore();
         reader.restore();
       }
 
+      expect(error?.message).toContain("disappeared before it was signalled");
+      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running; check it with ps -p ${child.pid}`);
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
-      expect(logs.join("\n")).toContain(
-        "Mail relay pid file disappeared before it was signalled; this command signalled no process.",
-      );
+      expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
     20_000,
   );
 
   test(
-    "a second read that is invalid is reported and sends no signal",
+    "a second read that is invalid exits non-zero and sends no signal",
     async () => {
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
 
       const reader = installSecondRead(() => ({ kind: "invalid", path: relayPid, reason: "not a JSON object" }));
       const signalling = captureSignals();
-      const { logs, restore } = captureLogs();
+      let error: Error | null = null;
       try {
-        await runMail({ action: "relay", agent: "stop" });
+        error = await runMail({ action: "relay", agent: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
       } finally {
-        restore();
         signalling.restore();
         reader.restore();
       }
 
+      expect(error?.message).toContain(`Mail relay pid file ${relayPid} is now invalid`);
+      expect(error?.message).toContain(`The relay process (pid ${child.pid}) may still be running`);
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
-      expect(logs.join("\n")).toContain(
-        `Mail relay pid file ${relayPid} is now invalid; this command signalled no process.`,
-      );
+      expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
     20_000,

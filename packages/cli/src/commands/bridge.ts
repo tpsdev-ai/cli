@@ -12,7 +12,7 @@ import { bridgePidFiles, bridgeStatusSnapshot, openClawBridgeStatus, startBridge
 import { BridgeCore } from "../bridge/core.js";
 import { DiscordAdapter } from "../bridge/discord-adapter.js";
 import { StdioAdapter } from "../bridge/stdio-adapter.js";
-import { readPidFile, removePidFile } from "../utils/pid-file.js";
+import { readPidFile, removePidFile, type PidFileState } from "../utils/pid-file.js";
 import { pidState, pidStateFromProbeError } from "@tpsdev-ai/agent";
 
 /** The signal sender for `bridge stop`; replaceable in tests so they can
@@ -23,6 +23,18 @@ let sendBridgeStopSignal: BridgeStopSignal = (pid) => process.kill(pid, "SIGTERM
 export function setBridgeStopSignal(fn: BridgeStopSignal): BridgeStopSignal {
   const previous = sendBridgeStopSignal;
   sendBridgeStopSignal = fn;
+  return previous;
+}
+
+/** The pid-record reader for `bridge stop`'s pre-signal re-read; replaceable in
+ *  tests so a record can change between the up-front classification and the
+ *  re-read. */
+type BridgeStopRecordReader = (path: string) => PidFileState;
+let bridgeStopRecordReader: BridgeStopRecordReader | null = null;
+
+export function setBridgeStopRecordReader(fn: BridgeStopRecordReader | null): BridgeStopRecordReader | null {
+  const previous = bridgeStopRecordReader;
+  bridgeStopRecordReader = fn;
   return previous;
 }
 
@@ -191,32 +203,46 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         // The up-front classification is the plan, not the decision: re-read
         // this file immediately before acting on it and signal only the same
         // pid with the same token.
-        const fresh = readPidFile(state.path);
+        const fresh = bridgeStopRecordReader?.(state.path) ?? readPidFile(state.path);
         if (fresh.kind !== "running" || fresh.pid !== state.pid || fresh.startToken !== state.startToken) {
-          if (fresh.kind === "missing") {
-            console.log(`Pid file already gone: ${state.path}.`);
-          } else if (fresh.kind === "stale" || fresh.kind === "invalid") {
+          const unproven = `The bridge process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
+          if (fresh.kind === "stale" && fresh.pid === state.pid) {
+            // A stale record for the pid the plan verified proves that pid's
+            // process is gone: the pid is gone, or it now carries a different
+            // start token.
             const removal = remove(fresh.path);
             if (removal === "removed") {
-              console.log(`${fresh.kind === "stale" ? "Stale" : "Invalid"} pid file removed: ${fresh.path}.`);
+              console.log(`Stale pid file removed: ${fresh.path}.`);
             } else if (removal === "already gone") {
               console.log(`Pid file already gone: ${fresh.path}.`);
             }
+          } else if (fresh.kind === "missing") {
+            failures.push(
+              `Bridge pid file ${state.path} disappeared before it was signalled; it was not signalled. ${unproven}`,
+            );
+          } else if (fresh.kind === "invalid") {
+            failures.push(
+              `Bridge pid file ${fresh.path} is now invalid; it was not signalled and the pid file was kept. ${unproven}`,
+            );
+          } else if (fresh.kind === "stale") {
+            failures.push(
+              `Bridge pid file ${fresh.path} now holds a stale record for pid ${fresh.pid}, not the planned pid ${state.pid}; it was not signalled and the pid file was kept. ${unproven}`,
+            );
           } else if (fresh.kind === "unreadable") {
             failures.push(
-              `Bridge pid file ${fresh.path} ${fresh.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. Check that process and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+              `Bridge pid file ${fresh.path} ${fresh.reason ?? "could not be read"}, so its process identity cannot be verified; the pid file was kept. ${unproven}`,
             );
           } else if (fresh.kind === "unverified") {
             failures.push(
-              `Bridge pid file ${fresh.path} names pid ${fresh.pid}, but that process's identity cannot be verified; the pid file was kept. Check that pid and stop it yourself, or remove ${fresh.path} if the bridge is not running.`,
+              `Bridge pid file ${fresh.path} names pid ${fresh.pid}, but that process's identity cannot be verified; the pid file was kept. ${unproven}`,
             );
           } else if (fresh.pid !== state.pid) {
             failures.push(
-              `Bridge pid file ${fresh.path} now names pid ${fresh.pid}, which is not the planned pid ${state.pid}; it was not signalled and the pid file was kept.`,
+              `Bridge pid file ${fresh.path} now names pid ${fresh.pid}, which is not the planned pid ${state.pid}; it was not signalled and the pid file was kept. ${unproven}`,
             );
           } else {
             failures.push(
-              `Bridge pid file ${fresh.path} still names pid ${fresh.pid}, but the process identity changed since it was planned; it was not signalled and the pid file was kept.`,
+              `Bridge pid file ${fresh.path} still names pid ${fresh.pid}, but the process identity changed since it was planned; it was not signalled and the pid file was kept. ${unproven}`,
             );
           }
           continue;
