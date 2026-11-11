@@ -1144,6 +1144,11 @@ const INBOUND_PERSIST_RETRY_BASE_MS = 50;
 const INBOUND_PERSIST_RETRY_MAX_MS = 1000;
 /** Most failed channels a connection retains for a later stop() close. */
 const MAX_RETAINED_FAILED_CHANNELS = 4;
+/** How long stop() waits for a connect attempt that was in flight when it began
+ *  (and for that attempt's tracked late-connect close). If the attempt does not
+ *  settle within this deadline, its close is unconfirmed, so stop() keeps the
+ *  host record instead of clearing it. */
+const LATE_CONNECT_CLOSE_WAIT_MS = 5_000;
 
 /**
  * Wrap a host record persist for the heartbeat and health callbacks: report the
@@ -1190,6 +1195,9 @@ export async function connectAndKeepAlive(
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
   let pendingChannelClose: Promise<void> | null = null;
+  // Set while a connect attempt (and, when stop() intervened, its tracked
+  // late-connect close) is in flight, so stop() can wait for it.
+  let pendingConnect: Promise<void> | null = null;
   // A channel whose reference was dropped without a confirmed close keeps the
   // host record on stop(), even when every other retained channel closes.
   let unconfirmedChannelClose = false;
@@ -1264,17 +1272,30 @@ export async function connectAndKeepAlive(
     while (!stopped) {
       try {
         const transport = remote.transport === "tcp" ? new NoiseIkTransport(hostKp) : new WsNoiseTransport(hostKp);
-        const channel = await transport.connect({
-          host: String(remote.host),
-          port: Number(remote.port),
-          branchId,
-          hostPublicKey: branch.encryptionKey!,
-        });
-        if (stopped) {
-          // stop() began while the connect was pending: close and do not write.
-          try { await channel.close(); } catch {}
-          return;
+        const connectAttempt = (async (): Promise<TransportChannel | null> => {
+          const connected = await transport.connect({
+            host: String(remote.host),
+            port: Number(remote.port),
+            branchId,
+            hostPublicKey: branch.encryptionKey!,
+          });
+          if (stopped) {
+            // stop() began while the connect was pending: close and do not write.
+            // Track the close like the in-loop paths, so a rejected close is
+            // retained for stop() to retry and report.
+            await trackChannelClose(connected);
+            return null;
+          }
+          return connected;
+        })();
+        pendingConnect = connectAttempt.then(() => {}, () => {});
+        let channel: TransportChannel | null;
+        try {
+          channel = await connectAttempt;
+        } finally {
+          pendingConnect = null;
         }
+        if (channel === null) return;
         currentChannel = channel;
         cancelInboundPersist();
 
@@ -1397,7 +1418,30 @@ export async function connectAndKeepAlive(
     stopped = true;
     cancelInboundPersist();
     stopPrune();
-    if (pendingChannelClose !== null) await pendingChannelClose;
+    let lateConnectCloseBounded = false;
+    if (pendingConnect !== null) {
+      let lateConnectTimer: ReturnType<typeof setTimeout> | undefined;
+      const deadline = new Promise<"timeout">((resolve) => {
+        lateConnectTimer = setTimeout(() => resolve("timeout"), LATE_CONNECT_CLOSE_WAIT_MS);
+      });
+      try {
+        const outcome = await Promise.race([pendingConnect.then(() => "settled" as const), deadline]);
+        // If the connect attempt (or its tracked close) has not settled by the
+        // deadline, the close is unconfirmed: keep the record.
+        if (outcome === "timeout") unconfirmedChannelClose = true;
+        // A late connect tracks its close on `pendingChannelClose`; a close that
+        // never settles must share the same deadline, not block stop() forever.
+        if (pendingChannelClose !== null) {
+          const closeOutcome = await Promise.race([pendingChannelClose, deadline]);
+          if (closeOutcome === "timeout") unconfirmedChannelClose = true;
+          lateConnectCloseBounded = true;
+        }
+      } finally {
+        if (lateConnectTimer !== undefined) clearTimeout(lateConnectTimer);
+      }
+    }
+    // The in-loop close path keeps its pre-existing unbounded wait.
+    if (!lateConnectCloseBounded && pendingChannelClose !== null) await pendingChannelClose;
     if (currentChannel !== null) {
       retainFailedChannel(currentChannel);
       currentChannel = null;

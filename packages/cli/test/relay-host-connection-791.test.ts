@@ -407,7 +407,8 @@ test("a connect-time host record write failure is reported before reconnecting",
 test("a second connect-time host record write failure is reported before reconnecting", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-connect-write-second-791-"));
   const savedEnv = savedRelayEnv();
-  const never = new Promise<TransportChannel>(() => {});
+  let releaseConnect!: (channel: TransportChannel) => void;
+  const nextConnect = new Promise<TransportChannel>((resolve) => { releaseConnect = resolve; });
   const backoff = fastReconnectBackoff();
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   let connects = 0;
@@ -421,7 +422,7 @@ test("a second connect-time host record write failure is reported before reconne
   };
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     connects++;
-    if (connects > 1) return never;
+    if (connects > 1) return nextConnect;
     return {
       async send() {
         // The first connect-time write has landed; block the second.
@@ -451,7 +452,16 @@ test("a second connect-time host record write failure is reported before reconne
     expect(diagnostic.mock.calls).toStrictEqual([[expectedLine]]);
     expect(readHostRecord(branch)).not.toBeNull();
     releaseLock();
+    releaseConnect({
+      async send() {},
+      onMessage() {},
+      offMessage() {},
+      async close() {},
+      isAlive() { return true; },
+      peerFingerprint() { return "remote"; },
+    });
     await stop();
+    expect(readHostRecord(branch)).toBeNull();
   } finally {
     releaseLock();
     await stop?.().catch(() => {});
