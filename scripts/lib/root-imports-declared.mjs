@@ -1,16 +1,21 @@
 /**
  * scripts/lib/root-imports-declared.mjs — cli#871.
  *
- * Reports bare specifiers imported by root test and script files that the root
- * package.json does not declare in dependencies or devDependencies. Imports
- * are read with Bun's own scanner, not a regex.
+ * Reports bare specifiers that root test and script files import by value and
+ * that the root package.json does not declare in dependencies or
+ * devDependencies. Imports are read with Bun's own scanner, not a regex.
  *
  * A bare specifier passes when it is a Node/Bun builtin (`node:` and `bun:`
  * prefixes, or the whole specifier is in `node:module`'s `builtinModules`) or when its package name
  * (scope and name for a scoped package, first segment otherwise) is declared.
- * Relative and absolute imports pass.
+ * Relative and absolute imports pass. A `#` specifier (a package.json
+ * `imports` entry) is reported under its own name, `#x`; the root manifest has
+ * no `imports` field.
  *
- * NOT covered: a dynamic import whose specifier is not a literal string
+ * NOT covered: a type-only import (`import type { X } from "pkg"`,
+ * `export type { X } from "pkg"`, or an import of `type` names only), which
+ * Bun's TypeScript loader removes before the scan; `require.resolve("pkg")`;
+ * a dynamic import whose specifier is not a literal string
  * (`await import(name)`), packages imported only from outside test/ and
  * scripts/, and whether a declared range resolves for a published consumer.
  * The root test lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files and does

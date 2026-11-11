@@ -156,8 +156,9 @@ describe("root imports are declared", () => {
 					'import { readFileSync } from "node:fs";',
 					'import { describe } from "bun:test";',
 					'import { helper } from "./helper";',
+					'import { absolute } from "/abs/helper";',
 					'import { agent } from "@tpsdev-ai/agent";',
-					"void readFileSync; void describe; void helper; void agent;",
+					"void readFileSync; void describe; void helper; void absolute; void agent;",
 					"",
 				].join("\n"),
 			);
@@ -165,6 +166,45 @@ describe("root imports are declared", () => {
 				devDependencies: { "@tpsdev-ai/agent": "workspace:*" },
 			});
 			expect(undeclared).toEqual([]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	// A stated limitation, pinned so a scanner change shows up here instead of
+	// silently changing what the changelog and the lib's docblock claim.
+	it("does not see a type-only import: the TypeScript loader removes it before the scan", () => {
+		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+		try {
+			writeFileSync(
+				join(dir, "fixture.ts"),
+				[
+					'import type { A } from "undeclared-import-type";',
+					'export type { B } from "undeclared-export-type";',
+					'import { type C } from "undeclared-type-names";',
+					'import { value } from "undeclared-value";',
+					"export type Uses = A | C;",
+					"void value;",
+					"",
+				].join("\n"),
+			);
+			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
+			expect(undeclared).toEqual([
+				{ file: "fixture.ts", specifier: "undeclared-value", packageName: "undeclared-value" },
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("reports a # specifier under its own name", () => {
+		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+		try {
+			writeFileSync(join(dir, "fixture.ts"), 'import internal from "#internal";\nvoid internal;\n');
+			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
+			expect(undeclared).toEqual([
+				{ file: "fixture.ts", specifier: "#internal", packageName: "#internal" },
+			]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
