@@ -1680,8 +1680,9 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       // substitution. With more words after it the clause is a prefix
       // environment assignment plus a command, and the value cannot be
       // evaluated, so the clause is refused: a run block throws and a followed
-      // script records an unresolved entry. A `cd`, `pushd` or `popd` clause is
-      // handled above and continues before this check, so it is not refused
+      // script records an unresolved entry. An unquoted `cd`, `pushd` or
+      // `popd` clause is handled above and continues before this check, so it
+      // is not refused
       // (cli#975). An assignment-only clause is judged
       // by that substitution's own scan below. A value the lexer cannot close
       // (nested quotes, cli#975) keeps the earlier skip: its clause words are

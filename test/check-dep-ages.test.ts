@@ -4750,10 +4750,11 @@ describe("the workflow guard's known limits from review round 20 (cli#975)", () 
 });
 
 describe("the workflow guard's known limits from review round 21 (cli#975)", () => {
-  // A `cd`, `pushd` or `popd` clause is handled before the prefix-assignment
-  // check, so an assignment whose value holds a closed command substitution is
-  // not refused when it prefixes one of them. Each case is pinned as an
-  // expected failure: when the shape is handled, the pin goes red.
+  // An unquoted `cd`, `pushd` or `popd` clause is handled before the
+  // prefix-assignment check, so an assignment whose value holds a closed
+  // command substitution is not refused when it prefixes one of them. Each
+  // case is pinned as an expected failure: when the shape is handled, the pin
+  // goes red.
 
   const shapes = [
     ['CDPATH="$(mktemp -d)" cd sub'],
