@@ -13,7 +13,7 @@
  * tests drive the REAL WS/Noise transport and the branch acceptance path
  * (`deliverRelayedToLocal`), not a stub channel.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -29,12 +29,19 @@ import {
   deliverToRemoteBranch,
   MailDeliveryUnconfirmedError,
   parseMailAckTimeoutMs,
+  RemoteDeliveryTimeoutError,
   resolveMailAckTimeoutMs,
 } from "../src/utils/relay.js";
+import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
+import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { getInbox } from "../src/utils/mail.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile } from "./helpers/stub-flair.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const PROLOGUE = Buffer.from("tps-v1");
@@ -58,6 +65,10 @@ const LISTENER_CLOSE_DEADLINE_MS = 1_500;
 interface BranchBehavior {
   /** Wait this long before ACKing (the sender's window may be shorter). */
   ackDelayMs?: number;
+  /** Wait this long before answering the Noise handshake (a slow connect). */
+  handshakeDelayMs?: number;
+  /** Never ACK: the sender's window must be what ends the wait. */
+  noAck?: boolean;
   accepted?: boolean;
   error?: string;
   /** Run the real branch acceptance path before ACKing. */
@@ -109,6 +120,7 @@ async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer
         const raw = Buffer.from(data as ArrayBuffer);
         if (!responder.rx) {
           responder.recv(raw);
+          if (behavior.handshakeDelayMs) await sleep(behavior.handshakeDelayMs);
           ws.send(Buffer.from(responder.send()));
           return;
         }
@@ -116,13 +128,19 @@ async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer
         if (msg.type !== MSG_MAIL_DELIVER) return;
         const body = msg.body as MailDeliverBody;
         branch.deliveries.push(body);
+        // The real branch receiver sends NO ACK when acceptance refuses the
+        // delivery (a same-id payload conflict), so the sender sees its own
+        // window expire rather than an accepted ACK.
+        let accepted = true;
         if (behavior.recordInbox) {
           try {
             deliverRelayedToLocal("remote-a", body);
           } catch (error) {
             branch.acceptErrors.push(error);
+            accepted = false;
           }
         }
+        if (behavior.noAck || !accepted) return;
         if (behavior.ackDelayMs) await sleep(behavior.ackDelayMs);
         const ack = {
           type: MSG_MAIL_ACK,
@@ -249,12 +267,12 @@ function pointRemoteAtServer(): void {
   );
 }
 
-function inboxRecords(): string[] {
-  const inbox = getInbox("local");
+function inboxRecords(agent = "local"): string[] {
+  const inbox = getInbox(agent);
   return existsSync(inbox.fresh) ? readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")) : [];
 }
 
-async function runSend(args: string[], env: Record<string, string> = {}, ms = 15_000): Promise<{ status: number; stdout: string; stderr: string }> {
+async function runSend(args: string[], env: Record<string, string> = {}, ms = 15_000, body = "unconfirmed delivery test"): Promise<{ status: number; stdout: string; stderr: string }> {
   const keysDir = join(root, "keys");
   writeKeyFile(keysDir, "flint", FLINT_SEED);
   const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", "remote-a", ...args], {
@@ -274,7 +292,7 @@ async function runSend(args: string[], env: Record<string, string> = {}, ms = 15
     stdout: "pipe",
     stderr: "pipe",
   });
-  proc.stdin.write("unconfirmed delivery test");
+  proc.stdin.write(body);
   proc.stdin.end();
   const timer = setTimeout(() => proc.kill(), ms);
   try {
@@ -426,4 +444,164 @@ describe("tps mail send exit codes", () => {
     expect(r.stderr).toContain("TPS_MAIL_ACK_TIMEOUT_MS must be a positive integer");
     expect(branch.deliveries).toEqual([]);
   }, 20_000);
+});
+
+describe("a CLI re-send with the same --message-id sends the same signed message", () => {
+  test("two spawns with the same id both exit 0 and leave one inbox record", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "55555555-5555-5555-5555-555555555555";
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"]);
+    const second = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"]);
+    expect(first.status).toBe(0);
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toContain("conflict");
+    expect(branch.acceptErrors).toEqual([]);
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
+    expect(new Set(branch.deliveries.map((delivery) => delivery.timestamp)).size).toBe(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    await expectConnectionEndedAfter("a CLI re-send");
+  }, 25_000);
+
+  test("the same id with a different body is refused before sending", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "66666666-6666-6666-6666-666666666666";
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"], {}, 15_000, "first body");
+    const second = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "2000"], {}, 15_000, "second body");
+    expect(first.status).toBe(0);
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("already used to sign a different message");
+    expect(branch.deliveries).toHaveLength(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 25_000);
+});
+
+describe("flags and ids the remote wire cannot carry are refused by name", () => {
+  test("a --message-id outside the wire id shape is refused instead of silently dropped", async () => {
+    await startBranchServer({});
+    pointRemoteAtServer();
+    const r = await runSend(["--stdin", "--message-id", "not-a-uuid.0001"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("cannot be delivered to a remote branch");
+    expect(branch.deliveries).toEqual([]);
+  }, 20_000);
+
+  test("--ack-timeout -3 is refused by name before anything is sent", async () => {
+    await startBranchServer({});
+    pointRemoteAtServer();
+    const r = await runSend(["--stdin", "--ack-timeout", "-3"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--ack-timeout must be a positive integer");
+    expect(branch.deliveries).toEqual([]);
+  }, 20_000);
+
+  test("a bare --ack-timeout is refused by name before anything is sent", async () => {
+    await startBranchServer({});
+    pointRemoteAtServer();
+    const r = await runSend(["--stdin", "--ack-timeout"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("--ack-timeout must be a positive integer");
+    expect(branch.deliveries).toEqual([]);
+  }, 20_000);
+});
+
+describe("the connect bound and the ACK window are separate", () => {
+  test("a connect that never completes rejects as a connect timeout", async () => {
+    const silent = net.createServer(() => {});
+    const sockets = new Set<net.Socket>();
+    silent.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    await new Promise<void>((done) => silent.listen(0, "127.0.0.1", () => done()));
+    const silentPort = (silent.address() as net.AddressInfo).port;
+    writeFileSync(
+      join(root, ".tps", "branch-office", "remote-a", "remote.json"),
+      JSON.stringify({ host: "127.0.0.1", port: silentPort, transport: "ws" }),
+    );
+    try {
+      let caught: unknown;
+      try {
+        await deliverToRemoteBranch(
+          "remote-a",
+          { id: "77777777-7777-7777-7777-777777777777", to: "local", from: "flint", body: "slow connect" },
+          { timeoutMs: 200, ackTimeoutMs: 5_000 },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(RemoteDeliveryTimeoutError);
+      expect((caught as Error).message).toContain("(connect)");
+      expect((caught as Error).message).not.toContain("connect + ack");
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((done) => silent.close(() => done()));
+    }
+  }, 10_000);
+
+  test("a slow connect leaves the full ACK window, so a missing ACK is unconfirmed", async () => {
+    await startBranchServer({ handshakeDelayMs: 500, noAck: true });
+    pointRemoteAtServer();
+    let caught: unknown;
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id: "88888888-8888-8888-8888-888888888888", to: "local", from: "flint", body: "slow handshake" },
+        { timeoutMs: 800, ackTimeoutMs: 500 },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
+    expect(caught).not.toBeInstanceOf(RemoteDeliveryTimeoutError);
+    await expectConnectionEndedAfter("a slow-handshake delivery");
+  }, 15_000);
+
+  test("a send that throws leaves no unhandled rejection from the ACK window", async () => {
+    const id = "99999999-9999-9999-9999-999999999999";
+    // The ACK can settle before the send promise does; a send failure then
+    // leaves that rejection unawaited unless it has its own handler.
+    let deliver: ((msg: TpsMessage) => void) | null = null;
+    const channel: TransportChannel = {
+      async send() {
+        deliver?.({ type: MSG_MAIL_ACK, seq: 0, ts: new Date().toISOString(), body: { id, accepted: false, error: "refused during send" } });
+        throw new Error("send failed");
+      },
+      onMessage(handler) {
+        deliver = handler;
+      },
+      offMessage() {
+        deliver = null;
+      },
+      async close() {},
+      isAlive() {
+        return true;
+      },
+      peerFingerprint() {
+        return "a".repeat(64);
+      },
+    };
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    const seen: unknown[] = [];
+    const onUnhandled = (reason: unknown) => seen.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      let caught: unknown;
+      try {
+        await deliverToRemoteBranch(
+          "remote-a",
+          { id, to: "local", from: "flint", body: "throwing send" },
+          { timeoutMs: 200, ackTimeoutMs: 50 },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      expect((caught as Error).message).toBe("send failed");
+      await sleep(200);
+      expect(seen).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  }, 10_000);
 });

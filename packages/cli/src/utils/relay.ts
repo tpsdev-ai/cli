@@ -924,10 +924,9 @@ export function startRelay(agentId: string): () => void {
   return stop;
 }
 
-/** The overall bound for a remote delivery (the connection AND the ACK wait)
- *  when the caller does not give one. The ACK window (below) is added to it, so
- *  a missing ACK is reported as unconfirmed at its own, configurable deadline
- *  rather than as this overall timeout. */
+/** The default bound for the CONNECTION part of a remote delivery, when the
+ *  caller does not give one. The ACK window (below) is separate and starts when
+ *  the deliver is sent, so a slow connect never shortens it. */
 export const DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS = 20_000;
 
 /** The default wait for the branch's MSG_MAIL_ACK after a MAIL_DELIVER. */
@@ -974,7 +973,8 @@ export function resolveMailAckTimeoutMs(env: NodeJS.ProcessEnv = process.env, fl
 
 /** A delivery whose ACK did not arrive inside the window. The transport was
  *  closed, but the branch may already have written the record — so a re-send
- *  must reuse the message id for the branch to recognise it. */
+ *  must reuse the message id: the CLI then re-sends the SAME signed envelope
+ *  (same id, timestamp and payload), which the branch recognises as a duplicate. */
 export class MailDeliveryUnconfirmedError extends Error {
   readonly messageId: string;
   readonly branchId: string;
@@ -983,7 +983,8 @@ export class MailDeliveryUnconfirmedError extends Error {
   constructor(messageId: string, branchId: string, ackTimeoutMs: number) {
     super(
       `Delivery unconfirmed: no ACK from branch "${branchId}" for message ${messageId} within ${ackTimeoutMs}ms; ` +
-        `the message may still arrive. If you re-send, reuse --message-id ${messageId} so the branch can recognise it as a duplicate.`,
+        `the message may still arrive. If you re-send, reuse --message-id ${messageId}: ` +
+        `it re-sends the same signed envelope (same id, timestamp and payload), so the branch can recognise it as a duplicate.`,
     );
     this.name = "MailDeliveryUnconfirmedError";
     this.messageId = messageId;
@@ -1004,11 +1005,11 @@ export class RemoteDeliveryTimeoutError extends Error {
 }
 
 export interface RemoteBranchDeliveryOptions {
-  /** Overall bound for one delivery attempt (the connection and the ACK wait),
-   *  in milliseconds. On expiry the in-flight transport/channel is CLOSED and
-   *  the attempt rejects with a `RemoteDeliveryTimeoutError`. Omitted/<=0 uses
-   *  `DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS` plus the ACK window, so the ACK
-   *  window elapses first. */
+  /** Bound for the CONNECTION, in milliseconds. On expiry the in-flight
+   *  transport is CLOSED and the attempt rejects with a
+   *  `RemoteDeliveryTimeoutError`. Omitted/<=0 uses
+   *  `DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS`. The ACK window is separate and starts
+   *  when the deliver is sent. */
   timeoutMs?: number;
   /** Wait for the branch's MSG_MAIL_ACK, in milliseconds. Omitted uses the
    *  `TPS_MAIL_ACK_TIMEOUT_MS` environment variable, else
@@ -1043,109 +1044,140 @@ export async function deliverToRemoteBranch(
   const hostKp = await loadHostIdentity();
   const transport = transportType === "ws" ? new WsNoiseTransport(hostKp) : new NoiseIkTransport(hostKp);
 
-  // cli#389 round 12 (CodeRabbit, Major): one OVERALL bound spanning the
-  // connection AND the ACK wait. Without it, `connect` to an unreachable branch
-  // (the initial open/connect has no application-level timeout) can hang a
-  // caller forever; on expiry the transport is CLOSED so no half-open socket is
-  // left behind.
+  // The connection has its own deadline: a slow or unreachable branch must not
+  // consume the ACK window, and a connect that returns just before the deadline
+  // must still get the full ACK window (started after the deliver is sent).
   const ackTimeoutMs = opts.ackTimeoutMs === undefined
     ? resolveMailAckTimeoutMs()
     : parseMailAckTimeoutMs(String(opts.ackTimeoutMs), "ackTimeoutMs");
-  const overallMs =
+  const connectMs =
     typeof opts.timeoutMs === "number" && opts.timeoutMs > 0
       ? opts.timeoutMs
-      : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS + ackTimeoutMs;
-  // A closer for the channel once it exists, so BOTH the expiry handler and the
+      : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
+  // A closer for the channel once it exists, so EVERY expiry path and the
   // finally can tear it down. Starts as a no-op (there is nothing to close
   // before connect returns).
   const channelCloser: { close: () => Promise<void> } = { close: async () => {} };
-  let timer: ReturnType<typeof setTimeout> | null = null;
+  const closeTransport = () => {
+    try {
+      transport.close();
+    } catch {
+      /* best effort */
+    }
+    try {
+      void channelCloser.close();
+    } catch {
+      /* best effort */
+    }
+  };
 
-  const overallDeadline = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(() => {
-      // During connect there is no channel yet, so tear the TRANSPORT down;
-      // after connect, close the channel too. Both are idempotent/best-effort.
-      try {
-        transport.close();
-      } catch {
-        /* best effort */
+  let connectTimer: ReturnType<typeof setTimeout> | null = null;
+  const connectDeadline = new Promise<never>((_resolve, reject) => {
+    connectTimer = setTimeout(() => {
+      closeTransport();
+      reject(new RemoteDeliveryTimeoutError(`Remote delivery to branch "${branchId}" exceeded ${connectMs}ms (connect)`));
+    }, connectMs);
+    if (connectTimer && typeof (connectTimer as { unref?: () => void }).unref === "function") {
+      (connectTimer as { unref: () => void }).unref();
+    }
+  });
+
+  let channel: TransportChannel;
+  try {
+    channel = await Promise.race([
+      transport.connect({ host, port, branchId, hostPublicKey }),
+      connectDeadline,
+    ]);
+  } finally {
+    if (connectTimer) clearTimeout(connectTimer);
+  }
+  channelCloser.close = () => channel.close().catch(() => {});
+
+  const msgId = message.id || randomUUID();
+  const payload = {
+    id: msgId,
+    from: message.from || "host",
+    to: message.to,
+    content: message.body,
+    timestamp: message.timestamp || new Date().toISOString(),
+  };
+
+  const ch = channel;
+  let ackTimer: ReturnType<typeof setTimeout> | null = null;
+  let ackSettled = false;
+  let beginAckWindow = () => {};
+  const acked = new Promise<void>((resolve, reject) => {
+    const handler = (msg: TpsMessage) => {
+      if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
+        ackSettled = true;
+        if (ackTimer) clearTimeout(ackTimer);
+        ch.offMessage(handler);
+        // Honor the branch's honest ACK: accepted:false means the write
+        // failed (inbox full, mode error, etc). Surface as a real delivery
+        // error rather than treating any ACK as success.
+        const ackBody = msg.body as any;
+        if (ackBody?.accepted === false) {
+          reject(new Error(`Branch refused delivery: ${ackBody?.error ?? "unknown reason"}`));
+        } else {
+          resolve();
+        }
       }
-      try {
-        void channelCloser.close();
-      } catch {
-        /* best effort */
+    };
+    // The ACK window starts when the deliver is SENT (called below), not before
+    // the connection is made.
+    beginAckWindow = () => {
+      if (ackSettled) return;
+      ackTimer = setTimeout(() => {
+        ackSettled = true;
+        ch.offMessage(handler);
+        reject(new MailDeliveryUnconfirmedError(String(msgId), branchId, ackTimeoutMs));
+      }, ackTimeoutMs);
+      if (ackTimer && typeof (ackTimer as { unref?: () => void }).unref === "function") {
+        (ackTimer as { unref: () => void }).unref();
       }
-      reject(new RemoteDeliveryTimeoutError(`Remote delivery to branch "${branchId}" exceeded ${overallMs}ms (connect + ack)`));
-    }, overallMs);
-    // Never let the guard timer keep the process alive on its own.
-    if (timer && typeof (timer as { unref?: () => void }).unref === "function") {
-      (timer as { unref: () => void }).unref();
+    };
+    ch.onMessage(handler);
+  });
+  // A failed `ch.send` below leaves this promise unawaited; its ACK-window
+  // rejection must still be handled.
+  void acked.catch(() => {});
+
+  // Safety net for a send that never settles. Measured from after the connect,
+  // so it cannot pre-empt the ACK window that starts with the deliver.
+  const attemptMs = connectMs + ackTimeoutMs;
+  let attemptTimer: ReturnType<typeof setTimeout> | null = null;
+  const attemptDeadline = new Promise<never>((_resolve, reject) => {
+    attemptTimer = setTimeout(() => {
+      closeTransport();
+      reject(new RemoteDeliveryTimeoutError(`Remote delivery to branch "${branchId}" exceeded ${attemptMs}ms after connect (send + ack)`));
+    }, attemptMs);
+    if (attemptTimer && typeof (attemptTimer as { unref?: () => void }).unref === "function") {
+      (attemptTimer as { unref: () => void }).unref();
     }
   });
 
   const send = (async () => {
-    const channel = await transport.connect({
-      host,
-      port,
-      branchId,
-      hostPublicKey,
-    });
-    channelCloser.close = () => channel.close().catch(() => {});
-
-    const msgId = message.id || randomUUID();
-    const payload = {
-      id: msgId,
-      from: message.from || "host",
-      to: message.to,
-      content: message.body,
-      timestamp: message.timestamp || new Date().toISOString(),
-    };
-
-    const ch = channel;
-    const acked = new Promise<void>((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        ch.offMessage(handler);
-        reject(new MailDeliveryUnconfirmedError(String(msgId), branchId, ackTimeoutMs));
-      }, ackTimeoutMs);
-
-      const handler = (msg: TpsMessage) => {
-        if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
-          clearTimeout(timeout);
-          ch.offMessage(handler);
-          // Honor the branch's honest ACK: accepted:false means the write
-          // failed (inbox full, mode error, etc). Surface as a real delivery
-          // error rather than treating any ACK as success.
-          const ackBody = msg.body as any;
-          if (ackBody?.accepted === false) {
-            reject(new Error(`Branch refused delivery: ${ackBody?.error ?? "unknown reason"}`));
-          } else {
-            resolve();
-          }
-        }
-      };
-      ch.onMessage(handler);
-    });
-
     await ch.send({
       type: MSG_MAIL_DELIVER,
       seq: 0,
       ts: payload.timestamp,
       body: payload,
     });
-
+    beginAckWindow();
     await acked;
     // Close immediately after ACK — don't hold the connection open for a
     // drain window. Inbound message sync is handled by connectAndKeepAlive /
     // tps mail sync, not by individual send operations. (#mail-send-hang)
   })();
-  // If the overall deadline wins, the send arm may still settle later; make sure
+  // If the attempt deadline wins, the send arm may still settle later; make sure
   // its rejection is never an unhandled one.
   void send.catch(() => {});
 
   try {
-    await Promise.race([send, overallDeadline]);
+    await Promise.race([send, attemptDeadline]);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (attemptTimer) clearTimeout(attemptTimer);
+    if (ackTimer) clearTimeout(ackTimer);
     try {
       await channelCloser.close();
     } catch {

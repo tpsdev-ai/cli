@@ -1,0 +1,144 @@
+/**
+ * sent-envelope.ts — the SIGNED envelope of an outbound message, keyed by its
+ * envelope `messageId`, so `tps mail send --message-id <id>` can re-send the
+ * same signed bytes rather than sign a fresh envelope. Signing again would put
+ * a fresh `timestamp` inside the envelope and a fresh signature on it; the
+ * branch compares the accepted payload (from, to, timestamp and content), so a
+ * freshly signed copy of the same message is a payload CONFLICT, not a
+ * duplicate. Storing the first signed envelope is what makes the id a stable
+ * delivery key.
+ */
+import { createHash } from "node:crypto";
+import { mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+/** How long a stored signed envelope can be reused, in milliseconds. It
+ *  matches the branch's acceptance-receipt window: a re-send later than this
+ *  is a new delivery attempt. */
+export const SENT_ENVELOPE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+const DIR_NAME = ".sent-envelopes";
+
+/** A stored signed envelope that cannot be read, parsed or matched. Refusing
+ *  is the only safe answer: re-signing would send a different signed message
+ *  under an id the branch may already hold. */
+export class StoredEnvelopeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "StoredEnvelopeError";
+  }
+}
+
+interface EnvelopeFields {
+  messageId: string;
+  from: string;
+  to: string;
+  body: string;
+  timestamp: string;
+}
+
+/** The stored path for one id. The id is hashed because the envelope id shape
+ *  permits `.` and `..`, which must never reach a path segment. */
+function envelopePath(root: string, messageId: string): string {
+  const key = createHash("sha256").update(messageId, "utf8").digest("hex");
+  return join(root, DIR_NAME, `${key}.json`);
+}
+
+function parseStored(raw: string, path: string): EnvelopeFields {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is not valid JSON; refusing to send`);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is not an envelope; refusing to send`);
+  }
+  const env = parsed as Record<string, unknown>;
+  if (
+    typeof env.messageId !== "string" ||
+    typeof env.from !== "string" ||
+    typeof env.to !== "string" ||
+    typeof env.body !== "string" ||
+    typeof env.timestamp !== "string"
+  ) {
+    throw new StoredEnvelopeError(`the stored signed message at ${path} is missing envelope fields; refusing to send`);
+  }
+  return { messageId: env.messageId, from: env.from, to: env.to, body: env.body, timestamp: env.timestamp };
+}
+
+/** Read the signed envelope stored for `messageId` when it is the same message.
+ *  Returns undefined when no entry exists. */
+export function readSentEnvelope(
+  root: string,
+  messageId: string,
+  expected: { from: string; to: string; body: string },
+): string | undefined {
+  const path = envelopePath(root, messageId);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new StoredEnvelopeError(
+      `cannot read the stored signed message at ${path}: ${error instanceof Error ? error.message : String(error)}; refusing to send`,
+    );
+  }
+  const env = parseStored(raw, path);
+  if (env.messageId !== messageId || env.from !== expected.from || env.to !== expected.to || env.body !== expected.body) {
+    throw new StoredEnvelopeError(`--message-id ${messageId} was already used to sign a different message; use a new --message-id`);
+  }
+  return raw;
+}
+
+/** Store the first signed envelope for `messageId`, or return the one another
+ *  process stored first for the same message. */
+export function storeSentEnvelope(
+  root: string,
+  messageId: string,
+  signed: string,
+  expected: { from: string; to: string; body: string },
+): string {
+  const dir = join(root, DIR_NAME);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  pruneExpired(dir);
+  const path = envelopePath(root, messageId);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      writeFileSync(path, signed, { encoding: "utf-8", mode: 0o600, flag: "wx" });
+      return signed;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw new StoredEnvelopeError(
+          `cannot store the signed message for --message-id ${messageId} at ${path}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+      const existing = readSentEnvelope(root, messageId, expected);
+      if (existing !== undefined) return existing;
+      if (attempt >= 1) {
+        throw new StoredEnvelopeError(`the stored signed message for --message-id ${messageId} vanished while writing; retry`);
+      }
+    }
+  }
+}
+
+/** Drop entries older than the reuse window. Best effort: a leftover entry
+ *  only makes a later re-send use an older signed message, never sends one. */
+function pruneExpired(dir: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  const cutoff = Date.now() - SENT_ENVELOPE_TTL_MS;
+  for (const name of entries) {
+    if (!name.endsWith(".json")) continue;
+    const path = join(dir, name);
+    try {
+      if (statSync(path).mtimeMs < cutoff) unlinkSync(path);
+    } catch {
+      /* another process pruned it, or it is unreadable; leave it */
+    }
+  }
+}

@@ -16,6 +16,8 @@ import { signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
 import { removePidFile, type PidFileState } from "../utils/pid-file.js";
+import { readSentEnvelope, storeSentEnvelope } from "../utils/sent-envelope.js";
+import { isValidMailDeliveryId } from "../utils/wire-mail.js";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -106,6 +108,17 @@ function signedMessageId(signedBody: string): string | undefined {
   try {
     const env = JSON.parse(signedBody) as { messageId?: unknown };
     return typeof env.messageId === "string" ? env.messageId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The signed envelope's timestamp, which is the wire `timestamp` the branch
+ *  records and compares, so a re-send of the SAME signed envelope matches. */
+function signedMessageTimestamp(signedBody: string): string | undefined {
+  try {
+    const env = JSON.parse(signedBody) as { timestamp?: unknown };
+    return typeof env.timestamp === "string" ? env.timestamp : undefined;
   } catch {
     return undefined;
   }
@@ -258,13 +271,23 @@ function signOutboundOrFail(
     if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
       throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
     }
-    const signed = signOutboundBody(from, to, body, {
-      requireKey: true,
-      replyToId: opts.replyToId,
-      messageId: opts.messageId,
-      rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
-      priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
-    });
+    const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+    // A re-send of an explicit id reuses the signed envelope stored for it:
+    // signing again would change its timestamp and signature, and the branch
+    // treats a same-id payload mismatch as a conflict, not a duplicate.
+    let signed = opts.messageId === undefined
+      ? undefined
+      : readSentEnvelope(mailRoot, opts.messageId, { from, to, body });
+    if (signed === undefined) {
+      signed = signOutboundBody(from, to, body, {
+        requireKey: true,
+        replyToId: opts.replyToId,
+        messageId: opts.messageId,
+        rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
+        priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
+      });
+      if (opts.messageId !== undefined) signed = storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body });
+    }
     // cli#429: every route limits the SIGNED envelope (the body plus its
     // signature, chain and envelope fields) to MAX_BODY_BYTES, not the
     // plaintext — so check it HERE, before any route, and refuse by name. A body
@@ -410,10 +433,18 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.error(`Refusing to send: ${(err as Error).message}`);
           process.exit(1);
         }
+        const wireId = signedMessageId(args.message);
+        if (wireId !== undefined && !isValidMailDeliveryId(wireId)) {
+          console.error(
+            `Refusing to send: --message-id "${wireId}" cannot be delivered to a remote branch; ` +
+              `the wire delivery id must be a UUID or a 64-character lowercase hex id.`,
+          );
+          process.exit(1);
+        }
         try {
           await deliverToRemoteBranch(
             route.branchId,
-            { id: signedMessageId(args.message), to, from, body: args.message },
+            { id: wireId, to, from, body: args.message, timestamp: signedMessageTimestamp(args.message) },
             { ackTimeoutMs },
           );
         } catch (err) {
