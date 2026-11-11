@@ -46,6 +46,14 @@ let savedEnv: Record<string, string | undefined>;
 let httpServer: ReturnType<typeof createServer> | null;
 let wss: WebSocketServer | null;
 let port: number;
+/** Accepted sockets, so teardown can end them instead of waiting on them. */
+let connections: Set<net.Socket>;
+
+/** How long the branch may take to see a sender's connection end after a
+ *  delivery settles, and how long each listener close may take. Both bounds are
+ *  named so a stall fails with its own message instead of a hook timeout. */
+const CONNECTION_END_DEADLINE_MS = 2_000;
+const LISTENER_CLOSE_DEADLINE_MS = 1_500;
 
 interface BranchBehavior {
   /** Wait this long before ACKing (the sender's window may be shorter). */
@@ -82,6 +90,11 @@ async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer
   branch = { deliveries: [], acceptErrors: [] };
   port = await freePort();
   httpServer = createServer();
+  connections = new Set();
+  httpServer.on("connection", (socket) => {
+    connections.add(socket);
+    socket.once("close", () => connections.delete(socket));
+  });
   wss = new WebSocketServer({ server: httpServer, path: "/tps/wire" });
 
   wss.on("connection", (ws) => {
@@ -158,19 +171,76 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  if (wss) {
-    for (const client of wss.clients) client.terminate();
-    await new Promise<void>((done) => wss!.close(() => done()));
+  const server = httpServer;
+  const serverWss = wss;
+  try {
+    if (server) {
+      // `http.Server.close()` calls back only after every accepted socket has
+      // ended, and under Bun terminating the WebSocket side does not always
+      // release the server's socket — so the hook used to hang until its own
+      // timeout. End the accepted sockets and stop the WebSocket server first,
+      // and bound each close so a stall reports itself here.
+      for (const socket of connections) socket.destroy();
+      connections.clear();
+      server.closeAllConnections?.();
+      if (serverWss) {
+        await withinDeadline(
+          "wss.close",
+          new Promise<void>((done) => serverWss.close(() => done())),
+        );
+      }
+      await withinDeadline(
+        "httpServer.close",
+        new Promise<void>((done) => server.close(() => done())),
+      );
+    }
+  } finally {
+    wss = null;
+    httpServer = null;
+    // Restored even when a close above stalled or threw: the env-leak preload
+    // fails the whole file on a leftover TPS_* variable.
+    for (const [key, value] of Object.entries(savedEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(root, { recursive: true, force: true });
   }
-  if (httpServer) await new Promise<void>((done) => httpServer!.close(() => done()));
-  wss = null;
-  httpServer = null;
-  for (const [key, value] of Object.entries(savedEnv)) {
-    if (value === undefined) delete process.env[key];
-    else process.env[key] = value;
-  }
-  rmSync(root, { recursive: true, force: true });
 });
+
+/** Settle `op` or reject naming what hung, instead of letting a hook time out. */
+function withinDeadline<T>(what: string, op: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} did not settle within ${LISTENER_CLOSE_DEADLINE_MS}ms`)),
+      LISTENER_CLOSE_DEADLINE_MS,
+    );
+    op.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+/** After every outcome — success, unconfirmed, refused — the sender's channel
+ *  must end the branch's connection; a path that left it open would keep the
+ *  listener busy and fail here by name rather than as a teardown hang. */
+async function expectConnectionEndedAfter(outcome: string): Promise<void> {
+  const start = Date.now();
+  while (connections.size > 0 && Date.now() - start < CONNECTION_END_DEADLINE_MS) await sleep(10);
+  const clients = wss?.clients.size ?? 0;
+  if (connections.size > 0 || clients > 0) {
+    throw new Error(
+      `after ${outcome}: the branch still had ${connections.size} open connection(s) and ${clients} client(s) ` +
+        `${Date.now() - start}ms after the delivery settled (deadline ${CONNECTION_END_DEADLINE_MS}ms)`,
+    );
+  }
+}
 
 function pointRemoteAtServer(): void {
   writeFileSync(
@@ -249,6 +319,7 @@ describe("deliverToRemoteBranch reports a late ACK as unconfirmed", () => {
     );
     expect(branch.deliveries.map((delivery) => delivery.id)).toEqual(["11111111-1111-1111-1111-111111111111"]);
     expect(inboxRecords()).toHaveLength(1);
+    await expectConnectionEndedAfter("an accepted delivery");
   }, 15_000);
 
   test("an ACK outside a short configured window rejects as unconfirmed, naming the id", async () => {
@@ -269,6 +340,7 @@ describe("deliverToRemoteBranch reports a late ACK as unconfirmed", () => {
     expect(error.message).toContain("may still arrive");
     expect(error.message).toContain(`--message-id ${id}`);
     expect(error.message).not.toContain("Branch refused delivery");
+    await expectConnectionEndedAfter("an unconfirmed delivery");
   }, 15_000);
 
   test("accepted:false keeps the existing refused-delivery failure", async () => {
@@ -287,6 +359,7 @@ describe("deliverToRemoteBranch reports a late ACK as unconfirmed", () => {
     expect(caught).toBeInstanceOf(Error);
     expect(caught).not.toBeInstanceOf(MailDeliveryUnconfirmedError);
     expect((caught as Error).message).toBe("Branch refused delivery: inbox full");
+    await expectConnectionEndedAfter("a refused delivery");
   }, 15_000);
 
   test("a re-send with the same id leaves exactly one inbox record and still ACKs", async () => {
@@ -301,6 +374,7 @@ describe("deliverToRemoteBranch reports a late ACK as unconfirmed", () => {
     expect(branch.acceptErrors).toEqual([]);
     expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
     expect(inboxRecords()).toHaveLength(1);
+    await expectConnectionEndedAfter("a re-send");
   }, 15_000);
 });
 
