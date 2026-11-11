@@ -3690,3 +3690,156 @@ describe("the workflow guard claims a removal regresses (#820 round 12)", () => 
     }
   });
 });
+
+describe("the workflow guard refuses a prefix assignment before a command (#820 round 13)", () => {
+  const line = 'V="$(date)" bash scripts/inst.sh';
+
+  it("refuses the clause in a run block", () => {
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-prefix-assignment",
+      )).toThrow(/cannot resolve a prefix assignment whose value holds a command substitution.*compute the value on its own line, or name the script in a reviewed entry/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records the clause in a followed script as unresolved", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": `${line}\n`,
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-prefix-assignment-script",
+      )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 1\) token bash scripts\/inst\.sh.*compute the value on its own line, or name the script in a reviewed entry/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows the script when a reviewed entry names the unresolved clause", () => {
+    const root = makeTreeFixture({
+      "scripts/inner.sh": `${line}\n`,
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/inner.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-prefix-assignment-reviewed",
+        [{ script: "scripts/inner.sh", line: 1, token: "bash scripts/inst.sh", target: "scripts/inst.sh", assignment: line, reason: "prefix assignment reviewed for this test" }],
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("still skips an assignment-only clause", () => {
+    for (const asScript of [false, true]) {
+      const root = makeTreeFixture({
+        ...(asScript ? { "scripts/inner.sh": 'V="$(date)"\n' } : {}),
+        "package-lock.json": "{}\n",
+      });
+      try {
+        const report = assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/inner.sh" : 'V="$(date)"', "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-prefix-assignment-only",
+        );
+        expect(report.installs).toBe(0);
+        expect(report.unresolved).toEqual([]);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("follows a script after a plain prefix assignment", () => {
+    for (const asScript of [false, true]) {
+      const root = makeTreeFixture({
+        "scripts/inst.sh": "npm ci\n",
+        "package-lock.json": "{}\n",
+        ...(asScript ? { "scripts/inner.sh": "V=plain bash scripts/inst.sh\n" } : {}),
+      });
+      try {
+        const report = assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/inner.sh" : "V=plain bash scripts/inst.sh", "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-prefix-assignment-plain",
+        );
+        expect(report.installs).toBe(1);
+        expect(report.followed).toContain("scripts/inst.sh");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+});
+
+describe("the workflow guard's ANSI-C branches in shellTokens and parenSpan (#820 round 13)", () => {
+  it.each([
+    ["a run block", false],
+    ["a followed script", true],
+  ])("follows a script after an ANSI-C quoted quote in `shellTokens` in %s", (_label, asScript) => {
+    const line = "sep=$'\\''; bash scripts/inst.sh";
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-ansi-shell-tokens",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a run block", false],
+    ["a followed script", true],
+  ])("follows a script after an ANSI-C quoted quote in `parenSpan` in %s", (_label, asScript) => {
+    const line = `echo "$(echo $'\\'' && bash scripts/inst.sh)"`;
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-ansi-paren-span",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

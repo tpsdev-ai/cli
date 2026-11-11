@@ -517,7 +517,7 @@ export const REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST: readonly ReviewedWrappedPayload
   },
 ];
 
-type UnresolvedEntry = { script: string; line: number; token: string; label: string; chain: string[] };
+type UnresolvedEntry = { script: string; line: number; token: string; label: string; chain: string[]; remedy?: string };
 
 type TreeContext = {
   root: string;
@@ -1056,8 +1056,8 @@ function commandSubstitutions(line: string, tail = "", quoteContinued = false): 
   return { bodies, unparsed };
 }
 
-function pushUnresolved(ctx: TreeContext, rel: string, line: number, token: string, label: string, chain: string[]) {
-  const entry = { script: rel, line, token, label, chain };
+function pushUnresolved(ctx: TreeContext, rel: string, line: number, token: string, label: string, chain: string[], remedy?: string) {
+  const entry = { script: rel, line, token, label, chain, remedy };
   const key = `${rel}\0${line}\0${token}`;
   if (ctx.unresolvedEntries.some((existing) => `${existing.script}\0${existing.line}\0${existing.token}` === key)) return;
   ctx.unresolvedEntries.push(entry);
@@ -1504,7 +1504,8 @@ function clauseInvocations(
  * file — with one set of rules. Clause splitting, cd tracking, command
  * substitutions (each with its own cd and nested state), wrapped interpreters,
  * here-document bodies, the install classifier and script resolution all live
- * here; the two callers differ only in their initial state.
+ * here; the two callers differ in their initial state, including whether the
+ * install classifier runs.
  */
 function scanShellText(ctx: TreeContext, initial: ShellState, text: string): void {
   const state: ShellState = { ...initial };
@@ -1581,12 +1582,32 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
         handleInstall(ctx, state.file, entry.text, clauseText, number, lineAt(state, number), state.cwd, state.cwdUnknown, state.staged);
         clauseInstall = true;
       }
-      // A clause that is one assignment whose value holds a command
-      // substitution is judged by that substitution's own scan below; the
-      // substitution's nested quotes make the clause's words unreliable.
+      // A clause whose first word is an assignment whose value holds a command
+      // substitution. With more words after it the clause is a prefix
+      // environment assignment plus a command, and the value cannot be
+      // evaluated, so the clause is refused: a run block throws and a followed
+      // script records an unresolved entry. An assignment-only clause is judged
+      // by that substitution's own scan below. A value the lexer cannot close
+      // (nested quotes inside the substitution, cli#975) keeps the earlier skip:
+      // its clause words are not the shell's words.
+      const assignment = clause.tokens[0] === undefined ? null : assignmentToken(clause.tokens[0].text);
+      const substitution = assignment === null ? null : commandSubstitutions(assignment.value);
+      const assignmentSubstitution =
+        substitution !== null && substitution.bodies.length > 0 && substitution.unparsed.length === 0;
       const assignmentClause =
         clause.tokens[0] !== undefined && /^[A-Za-z_][A-Za-z0-9_]*=.*\$\(/.test(clause.tokens[0].text);
-      if (!assignmentClause) {
+      if (assignmentSubstitution && clause.tokens.length > 1) {
+        const token = clause.tokens.slice(1).map((item) => item.text).join(" ");
+        const remedy = "compute the value on its own line, or name the script in a reviewed entry";
+        if (state.source === "followed-script") {
+          pushUnresolved(ctx, state.file, number, token, state.label, state.chain, remedy);
+          continue;
+        }
+        throw new Error(
+          `${state.label}: cannot resolve a prefix assignment whose value holds a command substitution: ${entry.text} (physical line ${number}); ${remedy}`,
+        );
+      }
+      if (!assignmentSubstitution && !assignmentClause) {
         for (const item of clauseInvocations(ctx, state, clause, entry.text, number)) {
           if (item.embedded && reviewedWrapped) continue;
           followInvocation(ctx, state, item.invocation, entry.text, number);
@@ -2227,8 +2248,9 @@ function assertUnresolvedInvocationsKnown(
   const allowed = new Set(allowlist.map(unresolvedKey));
   for (const entry of observed.values()) {
     if (allowed.has(unresolvedKey(entry))) continue;
+    const remedy = entry.remedy === undefined ? "" : `; ${entry.remedy}`;
     throw new Error(
-      `assertNpmCiWorkflowTree: unresolved script invocation in ${entry.script} (line ${entry.line}) token ${entry.token}: not on UNRESOLVED_INVOCATION_ALLOWLIST in test/helpers/npm-ci-workflow-guard.ts; a computed path is refused until reviewed; step ${entry.label}; invocation ${entry.chain.join(" -> ")}`,
+      `assertNpmCiWorkflowTree: unresolved script invocation in ${entry.script} (line ${entry.line}) token ${entry.token}: not on UNRESOLVED_INVOCATION_ALLOWLIST in test/helpers/npm-ci-workflow-guard.ts; a computed path is refused until reviewed; step ${entry.label}; invocation ${entry.chain.join(" -> ")}${remedy}`,
     );
   }
 }
