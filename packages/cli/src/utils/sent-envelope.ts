@@ -111,7 +111,7 @@ async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Pr
   const publicKey = new Uint8Array(info.publicKey);
 
   const entrySig = decodeSignature(tip.signature);
-  if (!entrySig) return { ok: false, reason: "chain entry signature invalid" };
+  if (!entrySig) return { ok: false, reason: "sender's chain entry signature invalid" };
   const entryForSig = {
     agent: tip.agent,
     kind: tip.kind,
@@ -121,7 +121,7 @@ async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Pr
   } as const;
   const entryCanonical = canonicalize({ prior: chain.slice(0, -1), entry: entryForSig });
   if (entryCanonical === undefined || !(await ed.verifyAsync(entrySig, new TextEncoder().encode(entryCanonical), publicKey))) {
-    return { ok: false, reason: "chain entry signature invalid" };
+    return { ok: false, reason: "sender's chain entry signature invalid" };
   }
 
   const outerSig = decodeSignature(envelope.signature);

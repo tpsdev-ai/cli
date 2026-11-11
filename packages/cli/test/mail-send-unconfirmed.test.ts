@@ -771,6 +771,44 @@ describe("a --message-id re-send of delegated mail", () => {
     expect(branch.deliveries).toHaveLength(1);
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 30_000);
+
+  test("refuses a stored envelope whose sender chain entry was altered", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "88888888-8888-4888-8888-888888888884";
+    const first = await runSend(
+      delegatedArgs(id),
+      { TPS_INBOUND_CHAIN_JSON: inboundChainWithForeignHop() },
+      15_000,
+      "delegated body",
+    );
+    expect(first.status).toBe(0);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8")) as Envelope;
+    // Corrupt the sender's own (last) chain entry signature, then re-make ONLY
+    // the outer signature with the sender's key. signEnvelope leaves a non-null
+    // entry signature alone, so the outer signature covers the altered entry
+    // and verifies: the entry's own signature is the check that must refuse it.
+    const tip = stored.delegationChain[stored.delegationChain.length - 1];
+    const sig: string = tip.signature as string;
+    const prefix = "ed25519:";
+    const body64 = sig.slice(prefix.length);
+    const at = Math.floor(body64.length / 2);
+    const flipped = body64[at] === "A" ? "B" : "A";
+    tip.signature = `${prefix}${body64.slice(0, at)}${flipped}${body64.slice(at + 1)}`;
+    const resigned = signEnvelope(stored, { flint: FLINT_SEED });
+    writeFileSync(path, JSON.stringify(resigned));
+    const second = await runSend(
+      delegatedArgs(id),
+      { TPS_INBOUND_CHAIN_JSON: JSON.stringify(resigned.delegationChain.slice(0, -1)) },
+      15_000,
+      "delegated body",
+    );
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("sender's chain entry signature");
+    expect(branch.deliveries).toHaveLength(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
 });
 
 describe("the stored signed envelope has a reuse window", () => {
