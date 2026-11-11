@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { closeSync, existsSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { acquireMailLockSync, mailLockPath, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
+import { acquireMailLockSync, mailLockPath, processStartToken } from "@tpsdev-ai/agent";
 import { isPidRecordPid, isPidRecordStartToken } from "./pid-file.js";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
@@ -254,12 +254,6 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
   }, timeoutMs);
 }
 
-export function readHostState(branch: string): HostConnectionState | null {
-  const p = hostStatePath(branch);
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, "utf-8")); } catch { return null; }
-}
-
 /** True for the same PID, and the same start token when one is present. */
 function recordNamesOwnProcess(state: HostConnectionState): boolean {
   if (state.pid !== process.pid) return false;
@@ -352,18 +346,6 @@ export function writeBranchState(state: BranchConnectionState): void {
   writeFileAtomic(branchStatePath(), JSON.stringify(state, null, 2), 0o666);
 }
 
-export function readBranchState(): BranchConnectionState | null {
-  const p = branchStatePath();
-  if (!existsSync(p)) return null;
-  try { return JSON.parse(readFileSync(p, "utf-8")); } catch { return null; }
-}
-
 export function clearBranchState(): void {
   try { rmSync(branchStatePath(), { force: true }); } catch {}
-}
-
-export function connectionAlive(branch: string, probe: (pid: number) => PidState = pidState): boolean | null {
-  const state = readHostState(branch);
-  if (!state) return null;
-  return probe(state.pid) === "alive";
 }

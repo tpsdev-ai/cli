@@ -1237,9 +1237,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       }
 
       if (failures.length > 0) {
-        // Print collected failures before exiting non-zero.
+        // Print each collected failure once; the top-level handler exits
+        // non-zero without printing this error's message again.
         for (const line of failures) console.error(line);
-        throw new Error(failures.join(" "));
+        throw Object.assign(new Error(failures.join(" ")), { reported: true });
       }
 
       console.log(`Kill switch engaged. Terminated ${killed} TPS process(es).`);
