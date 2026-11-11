@@ -17,13 +17,14 @@ const realSetTimeout = globalThis.setTimeout;
 /** Reconnect waits run on a short real timer. */
 const TEST_RECONNECT_BACKOFF_MS = 100;
 
-function fastReconnectBackoff() {
+function fastReconnectBackoff(onDelay?: (delay: number) => void) {
   return spyOn(globalThis, "setTimeout").mockImplementation(((
     callback: (...args: unknown[]) => void,
     delay?: number,
     ...args: unknown[]
   ) => {
     if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
+      onDelay?.(delay);
       return realSetTimeout(callback, TEST_RECONNECT_BACKOFF_MS, ...args);
     }
     return realSetTimeout(callback, delay, ...args);
@@ -342,12 +343,14 @@ for (const closePath of ["reconnect", "graceful"] as const) {
  *  connect resolves only after stop() begins. */
 async function lateConnectScenario(options: {
   lateClose: (call: number) => Promise<void>;
+  onDelay?: (delay: number) => void;
 }) {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-late-connect-896-"));
   const savedEnv = savedRelayEnv();
   let connectCalls = 0;
   let firstCloses = 0;
   let lateCloses = 0;
+  let lateSends = 0;
   let secondConnectStarted!: () => void;
   const secondConnect = new Promise<void>((resolve) => { secondConnectStarted = resolve; });
   let releaseConnect!: () => void;
@@ -361,14 +364,14 @@ async function lateConnectScenario(options: {
     peerFingerprint() { return "remote"; },
   };
   const lateChannel: TransportChannel = {
-    async send() { throw new Error("late connect must not write"); },
+    async send() { lateSends++; throw new Error("late connect must not write"); },
     onMessage() {},
     offMessage() {},
     async close() { await options.lateClose(++lateCloses); },
     isAlive() { return true; },
     peerFingerprint() { return "remote"; },
   };
-  const fastBackoff = fastReconnectBackoff();
+  const fastBackoff = fastReconnectBackoff(options.onDelay);
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     const call = ++connectCalls;
@@ -395,7 +398,7 @@ async function lateConnectScenario(options: {
     return {
       root, savedEnv, path, stop, diagnostic, fastBackoff, connect,
       releaseConnect,
-      counts: () => ({ firstCloses, lateCloses, connectCalls }),
+      counts: () => ({ firstCloses, lateCloses, lateSends, connectCalls }),
       cleanup: async () => {
         releaseConnect();
         await stop?.().catch(() => {});
@@ -454,7 +457,7 @@ for (const retry of ["rejects", "resolves"] as const) {
   }, 20_000);
 }
 
-test("a late connect whose close succeeds the first time is not retried and the record clears", async () => {
+test("a late connect is closed without a write or a retry and the record clears", async () => {
   const scenario = await lateConnectScenario({ lateClose: async () => {} });
   try {
     let stopSettled = false;
@@ -469,8 +472,29 @@ test("a late connect whose close succeeds the first time is not retried and the 
     expect(error).toBeNull();
     expect(scenario.counts().firstCloses).toBe(1);
     expect(scenario.counts().lateCloses).toBe(1);
+    expect(scenario.counts().lateSends, "no write may reach a channel that connected after stop()").toBe(0);
     expect(scenario.diagnostic).not.toHaveBeenCalled();
     expect(existsSync(scenario.path)).toBe(false);
+  } finally {
+    await scenario.cleanup();
+  }
+}, 20_000);
+
+test("stop() arms the late-connect deadline at 5 s", async () => {
+  const delays: number[] = [];
+  const scenario = await lateConnectScenario({
+    lateClose: () => new Promise<void>(() => {}),
+    onDelay: (delay) => delays.push(delay),
+  });
+  try {
+    const stopping = scenario.stop().catch((error: unknown) => error);
+    // stop() arms its deadline synchronously, before it awaits the connect.
+    expect(delays, "the late-connect wait must be the 5 s deadline").toContain(5_000);
+    scenario.releaseConnect();
+    const error = await stopping;
+    expect(error).toMatchObject({ name: "HostChannelCloseError" });
+    expect(scenario.counts().lateCloses).toBe(1);
+    expect(existsSync(scenario.path)).toBe(true);
   } finally {
     await scenario.cleanup();
   }
