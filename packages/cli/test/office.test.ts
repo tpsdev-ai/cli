@@ -110,6 +110,38 @@ describe("office command", () => {
     expect(status.stdout).toContain("Review:");
   });
 
+  test("status reports a stale relay record as unknown, not running", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // A valid record whose pid cannot be alive on this host.
+    writeFileSync(relayPid, `${JSON.stringify({ pid: 2147483647, startToken: "proc:1" })}\n`);
+
+    const r = run(["office", "status", "brancha"]);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: unknown (stale pid file ${relayPid}).`);
+    expect(r.stdout).not.toContain("Relay: running");
+
+    const j = run(["office", "status", "brancha", "--json"]);
+    expect(j.status).toBe(0);
+    expect(JSON.parse(j.stdout).agents[0].status).toBe("relay-unknown");
+  });
+
+  test("status reports an unverified relay record as unverified, not running", () => {
+    const ws = join(tempRoot, ".tps", "branch-office", "brancha");
+    mkdirSync(ws, { recursive: true });
+    const relayPid = join(ws, "relay.pid");
+    // A live pid with no start token: not proven gone, identity unconfirmed.
+    writeFileSync(relayPid, `${JSON.stringify({ pid: process.pid, startToken: null })}\n`);
+
+    const r = run(["office", "status", "brancha"]);
+
+    expect(r.status).toBe(0);
+    expect(r.stdout).toContain(`Relay: unverified (pid ${process.pid}, pid file ${relayPid}).`);
+    expect(r.stdout).not.toContain("Relay: running");
+  });
+
   test("team members resolve to the shared team sandbox (ops-17)", () => {
     const teamRoot = join(tempRoot, ".tps", "branch-office", "team-x");
     mkdirSync(join(teamRoot, "workspace"), { recursive: true });

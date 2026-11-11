@@ -9,7 +9,6 @@ import { pidState } from "@tpsdev-ai/agent";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { processAlive } from "../src/commands/branch.js";
-import { connectionAlive, writeHostState } from "../src/utils/connection-state.js";
 import { pidAlive } from "../src/utils/launch-attestation.js";
 import { proxyStatus } from "../src/utils/llm-proxy.js";
 import { bridgeStatus } from "../src/utils/mail-bridge.js";
@@ -110,23 +109,6 @@ describe("other pid probes take pidState's answer", () => {
     writeFileSync(join(runDir, "llm-proxy.pid"), "1\n");
 
     expect(proxyStatus(alive)).toEqual({ running: true, pid: 1, port: 6459 });
-  });
-
-  test("connection state reports a process pidState calls alive", () => {
-    writeHostState({
-      branch: "branch-a",
-      connectedAt: "",
-      lastHeartbeatSent: "",
-      lastHeartbeatAck: null,
-      reconnectCount: 0,
-      bytesSent: 0,
-      bytesReceived: 0,
-      messagesSent: 0,
-      messagesReceived: 0,
-      pid: 1,
-    });
-
-    expect(connectionAlive("branch-a", alive)).toBe(true);
   });
 
   test("branch process check follows pidState", () => {

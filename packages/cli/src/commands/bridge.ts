@@ -287,8 +287,8 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
         // The top-level `running`, `pid` and `port` describe the OpenClaw
         // record only. `bridges` lists running records PLUS unverified records
         // whose pid is alive; `records` lists every pid record with its kind, its
-        // pid when the kind has one, and a reason when an unreadable record has
-        // one. An unverified record the probe finds gone is listed as `stale`.
+        // pid when the kind has one, and a reason when an unreadable or invalid
+        // record has one. An unverified record the probe finds gone is listed as `stale`.
         const openclaw = running.find((entry) => entry.adapter === "openclaw");
         const status = {
           running: openclaw !== undefined,
@@ -306,12 +306,14 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
               };
             }
             const pid = state.kind === "running" || state.kind === "stale" ? state.pid : undefined;
+            const reason =
+              state.kind === "invalid" || state.kind === "unreadable" ? state.reason : undefined;
             return {
               adapter,
               path,
               state: state.kind,
               ...(pid === undefined ? {} : { pid }),
-              ...(state.kind === "unreadable" && state.reason !== undefined ? { reason: state.reason } : {}),
+              ...(reason === undefined ? {} : { reason }),
             };
           }),
         };

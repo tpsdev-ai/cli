@@ -14,11 +14,16 @@ import {
   clearHostState,
   hostStateLockRoot,
   hostStatePath,
-  readHostState,
   writeHostState,
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
+
+/** Read the on-disk record, so the assertions pin what office kill and
+ *  writeHostState leave behind. */
+function readHostRecord(branch: string): HostConnectionState | null {
+  try { return JSON.parse(readFileSync(hostStatePath(branch), "utf-8")); } catch { return null; }
+}
 
 const TIMEOUT = 60_000;
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -268,7 +273,7 @@ describe("host state record lock", () => {
           "could not be acquired within 5000 ms; refusing to write the host state record.",
         );
         expect(existsSync(written)).toBe(false);
-        expect(readHostState("host-a")?.pid).toBe(predecessor.pid);
+        expect(readHostRecord("host-a")?.pid).toBe(predecessor.pid);
 
         writeFileSync(goHost, "");
         goHostSent = true;
@@ -335,7 +340,7 @@ describe("host state record lock", () => {
 
       clearHostState("host-a");
 
-      const current = readHostState("host-a");
+      const current = readHostRecord("host-a");
       expect(current?.pid).toBe(other.pid);
       expect(readFileSync(path, "utf8")).toContain(String(other.pid));
     },
@@ -352,7 +357,7 @@ describe("host state record lock", () => {
 
       clearHostState("host-a");
 
-      expect(readHostState("host-a")?.startToken).toBe(foreign);
+      expect(readHostRecord("host-a")?.startToken).toBe(foreign);
       expect(existsSync(path)).toBe(true);
     },
     TIMEOUT,
@@ -365,7 +370,7 @@ describe("host state record lock", () => {
 
       clearHostState("host-a");
 
-      expect(readHostState("host-a")).toBeNull();
+      expect(readHostRecord("host-a")).toBeNull();
     },
     TIMEOUT,
   );
@@ -383,7 +388,7 @@ describe("host state record lock", () => {
 
       writeHostState(hostState("host-a", process.pid, childToken(process.pid)));
 
-      expect(readHostState("host-a")?.pid).toBe(process.pid);
+      expect(readHostRecord("host-a")?.pid).toBe(process.pid);
       expect(existsSync(lockDir)).toBe(false);
     },
     TIMEOUT,
@@ -404,7 +409,7 @@ describe("host state record lock", () => {
         expect(() => writeHostState(hostState("host-a", process.pid, childToken(process.pid)))).toThrow(
           `Host state record lock ${lockDir} could not be acquired within 5000 ms; refusing to write the host state record.`,
         );
-        expect(readHostState("host-a")).toBeNull();
+        expect(readHostRecord("host-a")).toBeNull();
       } finally {
         rmSync(lockRoot, { recursive: true, force: true });
       }
