@@ -1623,6 +1623,10 @@ main()
     process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
   })
   .catch((err) => {
-    console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
+    // A command that already printed its failures marks the error so its
+    // lines are not repeated here.
+    if (err?.reported !== true) {
+      console.error(err?.name === "WorktreeLifecycleError" ? `${err.name}: ${err.message}` : err?.message || err);
+    }
     process.exit(1);
   });

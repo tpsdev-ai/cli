@@ -323,6 +323,7 @@ describe("office kill identity", () => {
       const output = `${result.stdout}${result.stderr}`;
       expect(output).toContain(hostPath);
       expect(output).toContain("could not be parsed");
+      expect(output.split(`Host state record ${hostPath} could not be parsed`).length - 1).toBe(1);
       expect(readFileSync(hostPath, "utf8")).toBe(content);
     },
     TIMEOUT,
