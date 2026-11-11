@@ -220,7 +220,8 @@ class NoiseIkServer implements TransportServer {
 export async function listenForJoin(
   branchKeyPair: TpsKeyPair,
   port: number,
-  timeoutMs: number = 120_000
+  timeoutMs: number = 120_000,
+  onListening?: () => void
 ): Promise<{
   channel: TransportChannel;
   server: TransportServer;
@@ -306,6 +307,9 @@ export async function listenForJoin(
     server.listen(port, "0.0.0.0", () => resolve());
     server.once("error", reject);
   });
+  // Bound: report it before waiting for the join, so a caller never advertises a
+  // port that is not accepting connections.
+  onListening?.();
 
   const timeoutP =
     timeoutMs > 0
