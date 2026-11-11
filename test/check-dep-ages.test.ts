@@ -4245,7 +4245,7 @@ describe("a computed script suffix is confined to the repository (#820 round 18)
     }
   });
 
-  it("pins the refusal of a script-directory cd that leaves the root", () => {
+  it("refuses a script-directory cd that leaves the root", () => {
     const prefix = 'here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\ncd /tmp\ncd "$here/../.."\n';
     const installRoot = makeTreeFixture({ "scripts/outer.sh": `${prefix}npm ci\n` });
     const invokeRoot = makeTreeFixture({
@@ -4258,13 +4258,13 @@ describe("a computed script suffix is confined to the repository (#820 round 18)
         new Set(["package-lock.json"]),
         installRoot,
         "workflow-script-dir-cd",
-      )).toThrow(/scripts\/\.\.\/\.\.\/package-lock\.json is not a lockfile the gate reads/);
+      )).toThrow(/cannot bind an npm install after a non-literal directory change/);
       expect(() => assertNpmCiWorkflowTree(
         workflowStep("bash scripts/outer.sh", "."),
         new Set(["package-lock.json"]),
         invokeRoot,
         "workflow-script-dir-cd",
-      )).toThrow(/leaves the repository root/);
+      )).toThrow(/unresolved script invocation/);
     } finally {
       rmSync(installRoot, { recursive: true, force: true });
       rmSync(invokeRoot, { recursive: true, force: true });
@@ -4400,6 +4400,236 @@ describe("the workflow guard's documented refusals have removal tests (#820 roun
         root,
         "workflow-shell-s",
       )).toThrow(/token -s/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a cd and a repository path resolve to normalized paths (#820 round 19)", () => {
+  const here = 'here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"\n';
+
+  it("refuses an install after a script-directory cd chain that leaves the root", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${here}cd "$here/../.."\ncd ..\ncd ..\ncd ..\nnpm ci\n`,
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-cd-normalized",
+      )).toThrow(/cannot bind an npm install after a non-literal directory change/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves a script-directory cd chain to the directory it names, not its spelling", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${here}cd "$here/sub/.."\ncd ..\nnpm ci\n`,
+      "scripts/sub/package-lock.json": "{}\n",
+    });
+    try {
+      let error: unknown;
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/outer.sh", "."),
+          new Set(["scripts/sub/package-lock.json"]),
+          root,
+          "workflow-cd-normalized",
+        );
+      } catch (caught) { error = caught; }
+      expect(error).toBeInstanceOf(Error);
+      expect((error as Error).message).toContain("package-lock.json is not a lockfile the gate reads");
+      expect((error as Error).message).not.toContain("scripts/sub/package-lock.json");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("binds a script-directory cd that names the repository root", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${here}cd "$here/.."\nnpm ci\n`,
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-cd-normalized",
+      );
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a repository-root anchor", 'cd "$(git rev-parse --show-toplevel)/../.."\n'],
+    ["a script-directory binding", 'here="$(dirname "${BASH_SOURCE[0]}")/../../.."\ncd "$here"\n'],
+  ])("treats %s that leaves the repository as an unknown cwd", (_label, prefix) => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${prefix}npm ci\n`,
+      "package-lock.json": "{}\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-cd-unknown",
+      )).toThrow(/cannot bind an npm install after a non-literal directory change/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["dotted", "/scripts/./npm-ci-tracked-lock.sh"],
+    ["double-slash", "//scripts/npm-ci-tracked-lock.sh"],
+  ])("refuses a %s literal helper spelling in a followed script", (_label, suffix) => {
+    const root = makeTreeFixture({
+      "scripts/npm-ci-tracked-lock.sh": "echo helper\n",
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    writeFileSync(join(root, "scripts", "outer.sh"), `bash ${root}${suffix} --via npm --in-place plugins/untracked\n`);
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["plugins/untracked/package-lock.json"]),
+        root,
+        "workflow-path-normalized",
+      )).toThrow(/tracked-lock helper call is not the literal accepted shape/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a dotted helper spelling behind a bound variable (pin)", () => {
+    const root = makeTreeFixture({
+      "scripts/npm-ci-tracked-lock.sh": "echo helper\n",
+      "plugins/untracked/package-lock.json": "{}\n",
+    });
+    writeFileSync(join(root, "scripts", "outer.sh"), `ROOT=${root}\nbash "$ROOT/scripts/./npm-ci-tracked-lock.sh" --via npm --in-place plugins/untracked\n`);
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["plugins/untracked/package-lock.json"]),
+        root,
+        "workflow-path-normalized",
+      )).toThrow(/tracked-lock helper call is not the literal accepted shape/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a literal root cd", (root: string) => `cd ${root}/./packages/a\nnpm ci\n`],
+    ["a bound root cd", (root: string) => `ROOT=${root}\ncd "$ROOT/./packages/a"\nnpm ci\n`],
+  ])("binds an install after %s", (_label, script) => {
+    const root = makeTreeFixture({
+      "scripts/keep.txt": "",
+      "packages/a/package-lock.json": "{}\n",
+    });
+    writeFileSync(join(root, "scripts", "outer.sh"), script(root));
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["packages/a/package-lock.json"]),
+        root,
+        "workflow-path-normalized",
+      );
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("a select loop variable is a binding (#820 round 19)", () => {
+  it("does not resolve a select-assigned variable to its earlier assignment", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": 'gate="scripts/noop.sh"\nselect gate in scripts/evil.sh <<< 1; do bash "$gate"; break; done\n',
+      "scripts/noop.sh": "echo ok\n",
+      "scripts/evil.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-select",
+      )).toThrow(/unresolved script invocation .*token "?\$gate"?/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not treat a select header as an invocation", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "select s in scripts/install.sh; do break; done\n",
+      "scripts/install.sh": "npm ci\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-select",
+      );
+      expect(report.installs).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the guard's clause words are load-bearing (#820 round 19)", () => {
+  const installFixture = {
+    "scripts/install.sh": "npm ci --prefix plugins/other\n",
+    "plugins/other/package-lock.json": "{}\n",
+  };
+  const refusal = /plugins\/other\/package-lock\.json is not a lockfile the gate reads/;
+
+  it.each([
+    ["then", "if true; then bash scripts/install.sh; fi"],
+    ["elif", "if false; then :; elif bash scripts/install.sh; then :; fi"],
+    ["else", "if false; then :; else bash scripts/install.sh; fi"],
+    ["time", "time bash scripts/install.sh"],
+    ["exec", "exec bash scripts/install.sh"],
+    ["sudo", "sudo bash scripts/install.sh"],
+    ["xargs", "xargs bash scripts/install.sh"],
+    ["nohup", "nohup bash scripts/install.sh"],
+  ])("follows the script after %s", (_word, line) => {
+    const root = makeTreeFixture({ ...installFixture, "scripts/outer.sh": `${line}\n` });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(),
+        root,
+        "workflow-clause-word",
+      )).toThrow(refusal);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows an install inside a for loop", () => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": "for i in 1; do\nnpm ci\nbreak\ndone\n",
+      "package-lock.json": "{}\n",
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep("bash scripts/outer.sh", "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-clause-word",
+      );
+      expect(report.installs).toBe(1);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

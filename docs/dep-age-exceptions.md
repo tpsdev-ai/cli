@@ -103,9 +103,10 @@ entry whose assignment is an env-overridable default (`${VAR:-...}`) is refused.
 
 An install or relative invocation after a non-literal `cd`, `pushd`, `popd` or
 `cd -` is refused. The unknown cwd is sticky: a later relative `cd` keeps it
-unknown, and only a `cd` to an absolute path inside the repository, to a path
-anchored to the repository root, or to the script's own directory makes it
-known again. A literal absolute `cd` outside the repository leaves it unknown.
+unknown, and only a `cd` that resolves inside the repository — an absolute path,
+a path anchored to the repository root, or a path derived from the script's own
+directory — makes it known again. A literal absolute `cd` outside the repository
+leaves it unknown.
 A step whose `working-directory` is not a literal relative path (a `${{ ... }}`
 expression or any other `$`, or a leading `/`) starts at an unknown cwd, so a
 relative invocation or a cwd-bound install on it is unresolved, except a

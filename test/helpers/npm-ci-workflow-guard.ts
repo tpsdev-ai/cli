@@ -35,15 +35,30 @@ export function scanQuotedValue(value: string): string[] | null {
 }
 
 function resolveRepoDir(base: string, target: string, label: string): string {
-  const parts = base.split("/").filter((segment) => segment !== "" && segment !== ".");
-  for (const segment of target.split("/")) {
-    if (segment === "" || segment === ".") continue;
-    if (segment === "..") {
-      if (parts.length === 0) throw new Error(`${label}: ${target} leaves the repository root`);
-      parts.pop();
-    } else parts.push(segment);
-  }
+  const parts: string[] = [];
+  const fold = (path: string) => {
+    for (const segment of path.split("/")) {
+      if (segment === "" || segment === ".") continue;
+      if (segment === "..") {
+        if (parts.length === 0) throw new Error(`${label}: ${path} leaves the repository root`);
+        parts.pop();
+      } else parts.push(segment);
+    }
+  };
+  // The base is normalized too: an anchor such as `scripts/../..` names the
+  // path it resolves to, not a literal segment sequence.
+  fold(base);
+  fold(target);
   return parts.join("/");
+}
+
+/** resolveRepoDir for a followed script's own anchor: a path that leaves the root is null, not an error. */
+function tryResolveRepoDir(base: string, target: string, label: string): string | null {
+  try {
+    return resolveRepoDir(base, target, label);
+  } catch {
+    return null;
+  }
 }
 
 type PhysicalLine = { text: string; line: number };
@@ -557,12 +572,19 @@ type TreeContext = {
 
 const SCRIPT_FILE = String.raw`(?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|bash|mjs|cjs|js|ts)`;
 const PREFIX_COMMANDS = new Set(["env", "command", "exec", "sudo", "xargs", "nohup", "time"]);
-// Words after which the next word is the command of the clause.
-const SHELL_KEYWORDS = new Set(["then", "elif", "else", "do", "!", "if", "while", "until", "{", "("]);
+// Words after which the next word is the command of the clause. `{`, `(` and
+// `}` are not here: shellTokens emits them as single-character tokens and
+// splitClauses splits on them before any word is judged.
+const SHELL_KEYWORDS = new Set(["then", "elif", "else", "do", "!", "if", "while", "until"]);
 // Words that start a clause the guard does not treat as an invocation.
-const SHELL_HEADERS = new Set(["for", "case", "select", "in", "fi", "done", "esac", "function", "[[", "]]", "((", "))", "}"]);
-// Every bash reserved word: one the guard does not model is refused, never skipped.
-const SHELL_RESERVED = new Set([...SHELL_KEYWORDS, ...SHELL_HEADERS, "time", "coproc"]);
+const SHELL_HEADERS = new Set(["for", "case", "select", "in", "fi", "done", "esac", "function", "[[", "]]"]);
+// Bash's own reserved-word list, written out: independent of the two sets above,
+// so dropping a word from them cannot drop it from this one. A reserved word the
+// guard does not model is refused, never skipped.
+const SHELL_RESERVED = new Set([
+  "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
+  "function", "if", "in", "select", "then", "time", "until", "while", "{", "}", "[[", "]]",
+]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const JS_INTERPRETERS = new Set(["node", "bun", "deno", "tsx"]);
 const INTERPRETERS = new Set([...SHELL_INTERPRETERS, ...JS_INTERPRETERS]);
@@ -1119,7 +1141,7 @@ function assignmentToken(text: string): { name: string; value: string } | null {
   return match === null ? null : { name: match[1], value: match[2] };
 }
 
-/** Variable bindings in one shell script: assignments with their prefixes, read/mapfile, and for-loop names. */
+/** Variable bindings in one shell script: assignments with their prefixes, read/mapfile, and for/select loop names. */
 function collectBindings(content: string): Map<string, VariableBinding[]> {
   const bindings = new Map<string, VariableBinding[]>();
   const add = (name: string, text: string, value: string) => {
@@ -1171,7 +1193,7 @@ function collectBindings(content: string): Map<string, VariableBinding[]> {
             if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) add(name, tokens[argument].text, "");
           }
         }
-        if (text === "for" && tokens[at + 1] !== undefined) {
+        if ((text === "for" || text === "select") && tokens[at + 1] !== undefined) {
           const name = stripOuterQuotes(tokens[at + 1].text);
           if (/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) add(name, tokens[at + 1].text, "");
         }
@@ -1200,14 +1222,14 @@ function scriptDirBase(
       const list = bindings.get(name) ?? [];
       if (list.length !== 1) return null;
       const base = scriptDirBase(list[0].value, scriptDir, bindings, new Set([...seen, name]));
-      return base === null ? null : resolveRepoDir(base, alias[2] ?? "", "script dir");
+      return base === null ? null : tryResolveRepoDir(base, alias[2] ?? "", "script dir");
     }
     const dirname = path.match(/^\$\(dirname\s+(?:"\$0"|"\$\{?BASH_SOURCE(?:\[0\])?\}?")\s*\)(.*)$/);
-    if (dirname !== null && !/[$`]/.test(dirname[1])) return resolveRepoDir(scriptDir, dirname[1], "script dir");
+    if (dirname !== null && !/[$`]/.test(dirname[1])) return tryResolveRepoDir(scriptDir, dirname[1], "script dir");
     return null;
   }
   const direct = raw.match(/^\$\(dirname\s+(?:"\$0"|"\$\{?BASH_SOURCE(?:\[0\])?\}?")\s*\)(.*)$/);
-  if (direct !== null && !/[$`]/.test(direct[1])) return resolveRepoDir(scriptDir, direct[1], "script dir");
+  if (direct !== null && !/[$`]/.test(direct[1])) return tryResolveRepoDir(scriptDir, direct[1], "script dir");
   const alias = raw.match(/^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?(\/.*)?$/);
   if (alias !== null) {
     const name = alias[1];
@@ -1215,7 +1237,7 @@ function scriptDirBase(
     const list = bindings.get(name) ?? [];
     if (list.length !== 1) return null;
     const base = scriptDirBase(list[0].value, scriptDir, bindings, new Set([...seen, name]));
-    return base === null ? null : resolveRepoDir(base, alias[2] ?? "", "script dir");
+    return base === null ? null : tryResolveRepoDir(base, alias[2] ?? "", "script dir");
   }
   return null;
 }
@@ -1261,11 +1283,8 @@ function resolveAssignmentReference(
 }
 
 function repoRelativePath(ctx: TreeContext, value: string): string | null {
-  const normalized = value.replace(/\/+$/, "");
-  if (normalized === ctx.root) return "";
-  if (!normalized.startsWith(`${ctx.root}/`)) return null;
-  const rel = normalized.slice(ctx.root.length + 1);
-  return rel === "" || rel.split("/").some((segment) => segment === "..") ? null : rel;
+  if (value !== ctx.root && !value.startsWith(`${ctx.root}/`)) return null;
+  return tryResolveRepoDir("", value.slice(ctx.root.length), "repository path");
 }
 
 /**
@@ -1296,16 +1315,16 @@ function resolveCdTarget(
   if (toplevel !== null) {
     const suffix = toplevel[1] ?? "";
     if (/[$`]/.test(suffix)) return null;
-    const rel = joinVariableSuffix("", suffix);
-    const path = rel === "" ? "" : resolveRepoDir("", rel, at);
-    return path.startsWith("..") ? null : { kind: "absolute", path };
+    const path = tryResolveRepoDir("", joinVariableSuffix("", suffix), at);
+    return path === null ? null : { kind: "absolute", path };
   }
   if (!/[$`]/.test(target)) {
     if (target.startsWith("/")) {
       const rel = repoRelativePath(ctx, target);
       return rel === null ? null : { kind: "absolute", path: rel };
     }
-    return { kind: "cwd", path: resolveRepoDir(directory, target, at) };
+    const rel = tryResolveRepoDir(directory, target, at);
+    return rel === null ? null : { kind: "cwd", path: rel };
   }
   if (bindings === undefined) return null;
   const name = tokenVariableName(target);
@@ -1315,13 +1334,15 @@ function resolveCdTarget(
   const resolved = resolveAssignmentReference(name, bindings, scriptDir);
   if (resolved === null) return null;
   if (resolved.kind === "scriptDir") {
-    return { kind: "scriptDir", path: joinVariableSuffix(resolved.path, suffix) };
+    const path = tryResolveRepoDir(resolved.path, suffix, at);
+    return path === null ? null : { kind: "scriptDir", path };
   }
   if (resolved.kind === "absolute") {
     const rel = repoRelativePath(ctx, joinVariableSuffix(resolved.path, suffix));
     return rel === null ? null : { kind: "absolute", path: rel };
   }
-  return { kind: "cwd", path: resolveRepoDir(directory, joinVariableSuffix(resolved.path, suffix), at) };
+  const rel = tryResolveRepoDir(directory, joinVariableSuffix(resolved.path, suffix), at);
+  return rel === null ? null : { kind: "cwd", path: rel };
 }
 
 function resolveScriptArgument(ctx: TreeContext, token: ShellToken, directory: string, at: string, scriptDir = "", rootOnly = false, bindings?: Map<string, VariableBinding[]>): Invocation {
