@@ -312,6 +312,7 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
     const path = hostStatePath(branch);
     for (let i = 0; closes === 0 && i < 200; i++) await Bun.sleep(5);
     sigint = process.listeners("SIGINT").find((listener) => !listeners.has(listener)) as (() => Promise<void>) | undefined;
+    const sigterm = process.listeners("SIGTERM").find((listener) => !listeners.has(listener));
     expect(closes).toBe(1);
     const record = readFileSync(path, "utf8");
 
@@ -319,6 +320,9 @@ test.each(["stop", "SIGINT"])("a retained channel whose close persistently rejec
       await expect(stop!()).rejects.toMatchObject({ name: "HostChannelCloseError", message: expect.stringContaining(path) });
     } else {
       expect(sigint).toBeDefined();
+      // One checked shutdown for both signals (cli#762): a second signal while it
+      // runs reaches the same single-flight guard instead of starting a second stop.
+      expect(sigterm).toBe(sigint);
       await expect(sigint!()).rejects.toBe(exited);
       expect(exit).toHaveBeenCalledTimes(1);
       expect(exit).toHaveBeenCalledWith(1);
