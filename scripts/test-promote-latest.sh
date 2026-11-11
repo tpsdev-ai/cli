@@ -1433,29 +1433,53 @@ fi
 
 # ── AL. the supervisor's bound: a TERM-ignoring child is KILLed after the grace ─
 # The fake npm's default stalled add ignores TERM and would finish on its own
-# after 3.5 s. The call must end within the deadline (1 s) plus the grace (2 s);
-# the margin below is 5 s. The supervisor's own log records TERM and KILL.
+# after 3.5 s. The supervised call must end within the deadline (1 s) plus the
+# grace (2 s); the margin below is 5 s. The supervisor's own log records TERM,
+# KILL, and the start/end of each supervised call, so this bound times the
+# stalled call itself; the other calls and the rollback in the same promotion
+# do not count toward a bound that is about one call.
 d="$(new_fixture supervisor-bound)"
 write_state "$d/state.json" "0.5.4" "0.5.3"
 node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-# Date.now() is a wall clock shared by every process (python3's monotonic is
-# per-process in some builds, e.g. macOS 3.9, so it cannot time across two).
-t0="$(node -p 'Date.now()')"
 NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
-t1="$(node -p 'Date.now()')"
-elapsed="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
 assert_eq "AL bound: exit" 7 "$RC"
 assert_contains "AL bound: supervisor attempted TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
 assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
-if node -e 'process.exit(Number(process.argv[1]) >= 2.5 ? 0 : 1)' "$elapsed"; then
+# Calls run one at a time, so the start line before the first TERM and the end
+# line after it bracket the call the deadline signalled.
+elapsed="$(node -e '
+const fs = require("fs");
+const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean);
+let start = null;
+let signalled = false;
+for (const line of lines) {
+  const parts = line.split(" ");
+  const tag = parts[0];
+  if (tag === "start") {
+    if (!signalled) start = Number(parts[1]);
+  } else if (tag === "TERM" || tag === "KILL") {
+    signalled = true;
+  } else if (tag === "end" && signalled && start !== null) {
+    process.stdout.write(((Number(parts[1]) - start) / 1000).toFixed(2));
+    process.exit(0);
+  }
+}
+process.exit(1);
+' "$d/supervisor.log" || true)"
+if [ -z "$elapsed" ]; then
+  bad "AL bound: at least deadline + grace" "no start/end pair around TERM in the supervisor log"
+  bad "AL bound: inside deadline + grace + 5s" "no start/end pair around TERM in the supervisor log"
+elif node -e 'process.exit(Number(process.argv[1]) >= 2.5 ? 0 : 1)' "$elapsed"; then
   ok "AL bound: at least deadline + grace" "${elapsed}s"
 else
   bad "AL bound: at least deadline + grace" "${elapsed}s — below the 1 s deadline + 2 s grace"
 fi
-if node -e 'process.exit(Number(process.argv[1]) < 8 ? 0 : 1)' "$elapsed"; then
-  ok "AL bound: inside deadline + grace + 5s" "${elapsed}s"
-else
-  bad "AL bound: inside deadline + grace + 5s" "${elapsed}s"
+if [ -n "$elapsed" ]; then
+  if node -e 'process.exit(Number(process.argv[1]) < 8 ? 0 : 1)' "$elapsed"; then
+    ok "AL bound: inside deadline + grace + 5s" "${elapsed}s"
+  else
+    bad "AL bound: inside deadline + grace + 5s" "${elapsed}s"
+  fi
 fi
 
 # ── AM. an unwritable reason file: the lock is kept, exit 7, one error ───────
@@ -1480,8 +1504,11 @@ else
 fi
 
 # ── AN. a delayed commit lands after the client stopped; next run refuses ────
-# The local registry applies the PUT only when the client's connection closes; the
-# client's deadline is 1 s, so the write lands after the supervisor stopped npm.
+# The local registry applies the PUT only when the client's connection closes and
+# never answers it. The deadline below is well above the ordinary calls in this
+# promotion, so only the held PUT reaches it; the client is stopped there and the
+# write lands after it. A 1 s deadline also applied to the earlier reads, whose
+# own slowness could take the ordinary failure path first.
 d="$(new_fixture delayed-commit)"
 if [ "$real_ready" -ne 1 ]; then
   printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN delayed-commit"
@@ -1489,7 +1516,7 @@ elif start_registry "$d" delayed-put; then
   mkdir -p "$d/home" "$d/npm-cache"
   raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
     npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-    NPM_TIMEOUT_SECONDS=1 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+    NPM_TIMEOUT_SECONDS=10 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
     python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"

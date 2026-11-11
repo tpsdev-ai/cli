@@ -38,14 +38,21 @@ if (
 const [command, ...args] = argv.slice(3);
 
 const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
-function logSignal(name) {
+function logLine(line) {
   if (!logPath) return;
   try {
-    fs.appendFileSync(logPath, name + '\n');
+    fs.appendFileSync(logPath, line + '\n');
   } catch {
     // The log is diagnostic only; never fail the call for it.
   }
 }
+function logSignal(name) {
+  logLine(name);
+}
+
+// One supervisor owns one call, so a start/end pair brackets this call's own
+// duration even though the promotion makes other calls before and after it.
+logLine('start ' + Date.now());
 
 const child = spawn(command, args, { stdio: 'inherit' });
 
@@ -71,8 +78,13 @@ function send(signal) {
   return true;
 }
 
+let exitLogged = false;
 function exitWithStatus() {
   if (!exitInfo) return;
+  if (!exitLogged) {
+    exitLogged = true;
+    logLine('end ' + Date.now());
+  }
   if (timedOut) process.exit(124);
   if (exitInfo.signal) process.exit(128 + (os.constants.signals[exitInfo.signal] || 0));
   process.exit(typeof exitInfo.code === 'number' ? exitInfo.code : 1);
