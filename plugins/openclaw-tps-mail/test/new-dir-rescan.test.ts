@@ -48,6 +48,9 @@ describe("new/ periodic rescan (cli#853)", () => {
   let verifyGate: Promise<void> | undefined;
   let releaseVerify: (() => void) | undefined;
   let verifyUnavailable: boolean;
+  let verifyBadSignature: boolean;
+  let consoleErrors: string[];
+  let consoleErrorSpy: ReturnType<typeof spyOn>;
   let watchSpy: ReturnType<typeof spyOn>;
   let watcher: fs.FSWatcher | undefined;
   let closedWatchers: Set<object>;
@@ -74,6 +77,11 @@ describe("new/ periodic rescan (cli#853)", () => {
     verifyGate = undefined;
     releaseVerify = undefined;
     verifyUnavailable = false;
+    verifyBadSignature = false;
+    consoleErrors = [];
+    consoleErrorSpy = spyOn(console, "error").mockImplementation((...args: any[]) => {
+      consoleErrors.push(args.map(String).join(" "));
+    });
     readSpy = undefined;
     blockedRelayRoots = [];
     watcher = undefined;
@@ -84,7 +92,9 @@ describe("new/ periodic rescan (cli#853)", () => {
         async getAgent(name: string) {
           if (verifyGate) await verifyGate;
           if (verifyUnavailable) throw new Error("injected verification outage");
-          return name === "flint" ? { publicKey: Buffer.from(ed.getPublicKey(seed)) } : null;
+          if (name !== "flint") return null;
+          const keySeed = verifyBadSignature ? Buffer.alloc(32, 0x09) : seed;
+          return { publicKey: Buffer.from(ed.getPublicKey(keySeed)) };
         },
       }),
     }));
@@ -125,6 +135,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     promoteSpy.mockRestore();
     timerSpy.mockRestore();
     watchSpy.mockRestore();
+    consoleErrorSpy.mockRestore();
     for (const path of blockedRelayRoots) fs.rmSync(path, { recursive: true, force: true });
     fs.rmSync(root, { recursive: true, force: true });
   });
@@ -505,6 +516,28 @@ describe("new/ periodic rescan (cli#853)", () => {
     verifyUnavailable = false;
     expect(await until(() => dispatches.length === 1)).toBe(true);
     expect(promoteSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries a rejected message whose dead-letter move fails, then suppresses it undispatched", async () => {
+    await boot();
+    verifyBadSignature = true;
+    const dlq = join(root, "recipient", "dlq");
+    fs.writeFileSync(dlq, "blocks dead-letter directory creation");
+    const path = plant("rejected-retained");
+    const diagnostic = `tps-mail: promotion retry limit reached for ${path}; source suppressed`;
+
+    expect(await until(() => logs.includes(diagnostic))).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
+    expect(logs.filter((line) => line === diagnostic)).toHaveLength(1);
+    expect(fs.existsSync(path)).toBe(true);
+    expect(fs.readFileSync(path, "utf8")).toContain("rejected-retained");
+    expect(dispatches).toEqual([]);
+    expect(consoleErrors.filter((line) => line.includes("failed to dead-letter"))).toHaveLength(MAX_NEW_FILE_TRANSIENT_FAILURES);
+
+    const before = ticks;
+    expect(await until(() => ticks >= before + 2)).toBe(true);
+    expect(promoteSpy).toHaveBeenCalledTimes(MAX_NEW_FILE_TRANSIENT_FAILURES);
+    expect(dispatches).toEqual([]);
   });
 
   it("keeps a verification rejection suppressed after it moves to dlq", async () => {

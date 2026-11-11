@@ -85,7 +85,7 @@ import {
   type ReceiptRecord,
   type ReceiptScanDirs,
 } from "./obligations.js";
-import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
+import type { OpenClawPluginApi } from "openclaw/plugin-sdk/core";
 import { formatStampDiagnostic, type ObligationPresence } from "./diagnostics.js";
 import { detectHostOpenClawVersion, evaluateHostSilentReplyGuard } from "./host-version.js";
 import type { ChannelPlugin } from "openclaw/plugin-sdk/core";
@@ -95,7 +95,7 @@ import type {
   ChannelOutboundContext,
 } from "openclaw/plugin-sdk/channel-contract";
 
-// The pinned openclaw (2026.5.22) exports no `plugin-sdk/channels` subpath, and
+// The pinned openclaw (2026.8.1) exports no `plugin-sdk/channels` subpath, and
 // ChannelGatewayAdapter / ChannelConfigAdapter have no public NAMED export at
 // all. Derive both from the public ChannelPlugin contract — its `gateway` and
 // `config` members — so the SDK type stays the source of truth rather than a
