@@ -902,7 +902,7 @@ hand**: `check` and `promote` refuse while it holds anything but this note.
 
 - **handlebars resolves to 4.7.10.** It is the first release patched for GHSA-8r5x-fm3f-whwj, GHSA-p8wg-vrv2-v86f and GHSA-xw65-4hp5-5hc7. Both manifests declare `^4.7.10`, which keeps that floor; 4.7.10 is now older than 7 days, so handlebars is no longer excluded from the install-time release-age window.
 
-- **The `shell-quote` override now resolves 1.11.0, outside the range of GHSA-pqg4-j6r4-53mv.** cli does not import `shell-quote`; it reaches the install only through `react-devtools-core`. `bun audit` reports no vulnerabilities.
+- **The `shell-quote` override now resolves 1.12.0, outside the range of GHSA-pqg4-j6r4-53mv.** cli does not import `shell-quote`; it reaches the install only through `react-devtools-core`. `bun audit` reports no vulnerabilities.
 
 - **The CLI workspace now depends on zod 4.6.7, outside the range of GHSA-mrhx-c7xc-m3w5.** Report defaults, ids, timestamps, records and `Expected string, received …` error text keep their zod 3 behaviour. Three differences are deliberate: `.int()` now requires a safe integer, so a value beyond `Number.MAX_SAFE_INTEGER` may not be the integer that was sent (adjacent integers can collapse to one double); `z.number()` now refuses `Infinity`; and an empty `identity.default_name` reports zod 4's length message (`Too small: expected string to have >=1 characters`) rather than zod 3's.
 
