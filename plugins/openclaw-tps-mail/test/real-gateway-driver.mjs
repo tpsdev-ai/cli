@@ -4,16 +4,19 @@
  *
  * It runs under node (OpenClaw's plugin loader needs node:sqlite) and in one
  * process:
- *   1. starts a loopback-only model stub (Anthropic Messages wire shape) that
+ *   1. starts a loopback-only model stub (OpenAI Responses wire shape) that
  *      emits a progress text and a tool call, then — after the tool result — the
  *      final text;
  *   2. starts a loopback Flair stub that serves the two test agents' public
  *      keys;
  *   3. launches the pinned real `openclaw gateway run` with an isolated HOME,
- *      TMPDIR and state dir, loads the BUILT openclaw-tps-mail plugin, and writes
+ *      TMPDIR and state dir, loads the BUILT openclaw-tps-mail plugin under the
+ *      channel config the plugin's README documents (no streaming), and writes
  *      one signed mail into the agent's new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
- *      the ack, then writes a JSON report for the Bun test that spawned it.
+ *      the ack, re-reads the reply count after the ack and again after the
+ *      gateway stops, reads the cur/ record and the obligation record, then
+ *      writes a JSON report for the Bun test that spawned it.
  *
  * No external network is used: every HTTP target is 127.0.0.1 and every model
  * and Flair answer is generated here.
@@ -42,6 +45,7 @@ const OPENCLAW = join(PLUGIN, "node_modules", "openclaw", "openclaw.mjs");
 const GATEWAY_BOOT_DEADLINE_MS = 30_000;
 const REPLY_DEADLINE_MS = 45_000;
 const ACK_DEADLINE_MS = 15_000;
+const CUR_MOVE_DEADLINE_MS = 5_000;
 const STOP_DEADLINE_MS = 5_000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -63,9 +67,15 @@ const report = {
   unexpected: [],
   dispatchStarts: 0,
   replyCount: 0,
+  replyCountAfterAck: 0,
+  replyCountAfterStop: 0,
   replyBody: null,
   replyHeaders: null,
   curFiles: [],
+  curRecord: null,
+  obligationRecord: null,
+  inboundNewFiles: [],
+  readErrors: [],
   inboundId: null,
   ackTimedOut: false,
   ackLines: [],
@@ -74,6 +84,19 @@ const report = {
 
 function writeReport() {
   writeFileSync(REPORT, JSON.stringify(report, null, 2), "utf8");
+}
+
+function readJson(path, label) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"));
+  } catch (err) {
+    report.readErrors.push(`${label} (${path}): ${err?.message ?? String(err)}`);
+    return null;
+  }
+}
+
+function replyFilesOnDisk() {
+  return readdirSync(join(MAIL, "agent-b", "new")).filter((f) => f.endsWith(".json"));
 }
 
 // ── prerequisites: node must satisfy the pinned OpenClaw's engines ─────────
@@ -129,7 +152,7 @@ for (const dir of [
 writeFileSync(join(HOME, ".flair", "keys", "agent-a.key"), seedA);
 writeFileSync(join(HOME, ".flair", "keys", "agent-b.key"), seedB);
 
-// ── model stub (Anthropic Messages) ────────────────────────────────────────
+// ── model stub (OpenAI Responses) ──────────────────────────────────────────
 const requests = [];
 let modelCalls = 0;
 const model = createServer((req, res) => {
@@ -255,9 +278,6 @@ const config = {
   agents: {
     defaults: {
       workspace: WORKSPACE,
-      blockStreamingDefault: "on",
-      blockStreamingBreak: "message_end",
-      blockStreamingChunk: { minChars: 1, maxChars: 1000 },
       model: { primary: "stub/stub-model" },
     },
     entries: { "agent-a": { workspace: WORKSPACE } },
@@ -278,7 +298,7 @@ const config = {
     entries: { "openclaw-tps-mail": { enabled: true, config: { mailDir: MAIL } } },
   },
   channels: {
-    "tps-mail": { enabled: true, streaming: { block: { enabled: true } }, accounts: { default: { mailDir: MAIL } } },
+    "tps-mail": { enabled: true, accounts: { default: { mailDir: MAIL } } },
   },
   bindings: [{ agentId: "agent-a", match: { channel: "tps-mail", accountId: "default" } }],
 };
@@ -360,7 +380,7 @@ try {
     report.replyHeaders = reply.headers ?? null;
   }
 
-  await until(() => readdirSync(join(MAIL, "agent-a", "cur")).length > 0, 5_000, "cur/ move");
+  await until(() => readdirSync(join(MAIL, "agent-a", "cur")).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
   report.curFiles = readdirSync(join(MAIL, "agent-a", "cur"));
 
   try {
@@ -374,6 +394,9 @@ try {
     // report still carries the reply and the log so the failing line is named.
     report.ackTimedOut = true;
   }
+  // B2: a second reply may land after the reply wait; count again once the ack
+  // has (or has not) arrived.
+  report.replyCountAfterAck = replyFilesOnDisk().length;
   report.modelCalls = modelCalls;
   report.status = "ok";
 } catch (err) {
@@ -383,6 +406,16 @@ try {
     child.kill("SIGTERM");
     await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
     if (child.exitCode === null) child.kill("SIGKILL");
+  }
+  // B2: read the settled state only after the gateway has stopped — a second
+  // reply or a late stamp from a still-running gateway would race this read.
+  report.replyCountAfterStop = replyFilesOnDisk().length;
+  report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
+  if (report.curFiles.length > 0) {
+    report.curRecord = readJson(join(MAIL, "agent-a", "cur", report.curFiles[0]), "cur record");
+  }
+  if (report.inboundId) {
+    report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
   }
   await new Promise((r) => model.close(r));
   await new Promise((r) => flair.close(r));

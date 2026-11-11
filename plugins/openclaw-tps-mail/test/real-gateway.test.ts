@@ -8,13 +8,18 @@
  * tool result; the gateway is the real `openclaw gateway run` with an isolated
  * HOME/TMPDIR/state dir and the BUILT plugin.
  *
- * What this pins, end to end:
+ * What this pins, end to end, under the channel config the plugin README
+ * documents (no streaming):
  *   - exactly one dispatch for the mail;
  *   - the reply carries the turn's final text, not its first;
- *   - the triggering mail is in cur/ (acked), and there is no second reply.
+ *   - exactly one reply, counted after the ack and again after the gateway
+ *     stops;
+ *   - the triggering mail is in cur/ with a string ackedAt, the inbound new/
+ *     is empty, and its obligation record is `acked`.
  *
  * Every wait in the driver has a named deadline. The only network targets are
- * 127.0.0.1 model/Flair stubs.
+ * 127.0.0.1 model/Flair stubs; the model stub answers the OpenAI Responses
+ * events the configured provider sends.
  */
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -36,11 +41,17 @@ type Report = {
   unexpected: Array<{ method: string; url: string }>;
   dispatchStarts: number;
   replyCount: number;
+  replyCountAfterAck: number;
+  replyCountAfterStop: number;
   replyBody: string | null;
   replyFrom?: string;
   replyTo?: string;
   replyHeaders?: Record<string, string> | null;
   curFiles: string[];
+  curRecord: { id?: string; ackedAt?: unknown } | null;
+  obligationRecord: { state?: string } | null;
+  inboundNewFiles: string[];
+  readErrors: string[];
   inboundId: string | null;
   ackLines: string[];
   logs: string[];
@@ -91,6 +102,12 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
       expect(r.curFiles).toHaveLength(1);
       expect(r.curFiles[0]).toContain(r.inboundId!);
+      expect(r.replyCountAfterAck).toBe(1);
+      expect(r.replyCountAfterStop).toBe(1);
+      expect(r.inboundNewFiles).toEqual([]);
+      expect(r.readErrors).toEqual([]);
+      expect(typeof r.curRecord?.ackedAt).toBe("string");
+      expect(r.obligationRecord?.state).toBe("acked");
       expect(r.ackLines).toHaveLength(1);
       expect(r.ackLines[0]).toContain(r.inboundId!);
       expect(r.ackLines[0]).toContain("receipt found");
