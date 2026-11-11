@@ -9,8 +9,8 @@
  * prefixes, or the whole specifier is in `node:module`'s `builtinModules`) or when its package name
  * (scope and name for a scoped package, first segment otherwise) is declared.
  * Relative and absolute imports pass. A `#` specifier (a package.json
- * `imports` entry) is reported under its own name, `#x`; the root manifest has
- * no `imports` field. A .tsx or .jsx file that contains JSX is reported as
+ * `imports` entry) is reported under its whole name (`#x`, `#x/y`); the root
+ * manifest has no `imports` field. A .tsx or .jsx file that contains JSX is reported as
  * importing `react`: Bun's scanner adds the JSX runtime (`react/jsx-runtime`
  * or `react/jsx-dev-runtime`) and `react` as requires.
  *
@@ -69,6 +69,8 @@ function loaderFor(file) {
 }
 
 function packageName(specifier) {
+	// A `#` specifier is a package.json `imports` key; the whole key is its name.
+	if (specifier.startsWith("#")) return specifier;
 	if (!specifier.startsWith("@")) return specifier.split("/")[0] ?? "";
 	return specifier.split("/").slice(0, 2).join("/");
 }

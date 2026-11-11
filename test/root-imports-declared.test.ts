@@ -10,6 +10,7 @@
 
 import { describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -145,7 +146,8 @@ describe("root imports are declared", () => {
 					'import { absolute } from "/abs/helper";',
 					'import { agent } from "@tpsdev-ai/agent";',
 					'import onlyInDependencies from "declared-in-dependencies";',
-					"void readFileSync; void describe; void helper; void absolute; void agent; void onlyInDependencies;",
+					'import bunPrefixOnly from "bun:prefix-only-fixture";',
+					"void readFileSync; void describe; void helper; void absolute; void agent; void onlyInDependencies; void bunPrefixOnly;",
 					"",
 				].join("\n"),
 			);
@@ -155,6 +157,10 @@ describe("root imports are declared", () => {
 				devDependencies: { "@tpsdev-ai/agent": "workspace:*" },
 			});
 			expect(undeclared).toEqual([]);
+			// Each case passes only through the rule it pins, never as a runtime builtin
+			// (Bun lists `bun:test` and `ws` in builtinModules).
+			expect(builtinModules).not.toContain("bun:prefix-only-fixture");
+			expect(builtinModules).not.toContain("declared-in-dependencies");
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -189,10 +195,14 @@ describe("root imports are declared", () => {
 	it("reports a # specifier under its own name", () => {
 		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
 		try {
-			writeFileSync(join(dir, "fixture.ts"), 'import internal from "#internal";\nvoid internal;\n');
+			writeFileSync(
+				join(dir, "fixture.ts"),
+				'import internal from "#internal";\nimport sub from "#internal/sub";\nvoid internal; void sub;\n',
+			);
 			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
 			expect(undeclared).toEqual([
 				{ file: "fixture.ts", specifier: "#internal", packageName: "#internal" },
+				{ file: "fixture.ts", specifier: "#internal/sub", packageName: "#internal/sub" },
 			]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
