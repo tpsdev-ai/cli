@@ -24,7 +24,8 @@ import { createServer } from "node:http";
 import { WebSocketServer } from "ws";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
-import { generateKeyPair, registerBranch, saveKeyPair } from "../src/utils/identity.js";
+import { generateKeyPair, loadHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
+import { listenForHost } from "../src/utils/noise-ik-transport.js";
 import {
   DEFAULT_MAIL_ACK_TIMEOUT_MS,
   deliverRelayedToLocal,
@@ -1183,7 +1184,7 @@ describe("the connect bound and the ACK window are separate", () => {
     }
   }, 10_000);
 
-  test("a send that never settles rejects on the send+ack bound and closes the channel", async () => {
+  test("a send that never settles rejects on the send bound and closes the channel", async () => {
     const id = "aaaaaaaa-0000-4000-8000-000000000001";
     let closed = false;
     const channel: TransportChannel = {
@@ -1203,8 +1204,9 @@ describe("the connect bound and the ACK window are separate", () => {
       },
     };
     spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
-    // The call must settle well inside this bound; only the send+ack deadline
-    // (100ms connect + 100ms ACK) can end a send that never settles.
+    // The call must settle well inside this bound; only the send deadline
+    // (the 100ms connection bound plus the 100ms ACK window) can end a send
+    // that never settles.
     const settleBoundMs = 3_000;
     const startedAt = Date.now();
     let caught: unknown;
@@ -1263,6 +1265,49 @@ describe("the connect bound and the ACK window are separate", () => {
       connectSpy.mockRestore();
     }
   }, 10_000);
+
+  test("a real Noise IK branch that closes before the ACK rejects as unconfirmed", async () => {
+    const hostKp = await loadHostIdentity();
+    let deliverSeen: () => void = () => {};
+    const sawDeliver = new Promise<void>((resolve) => {
+      deliverSeen = resolve;
+    });
+    const server = await listenForHost(
+      branchKp,
+      new Uint8Array(hostKp.encryption.publicKey),
+      0,
+      (msg, channel) => {
+        if (msg.type !== MSG_MAIL_DELIVER) return;
+        deliverSeen();
+        // Close the real socket after the deliver is read, before any ACK.
+        void channel.close();
+      },
+    );
+    try {
+      writeFileSync(
+        join(root, ".tps", "branch-office", "remote-a", "remote.json"),
+        JSON.stringify({ host: "127.0.0.1", port: server.port?.() ?? 0, transport: "tcp" }),
+      );
+      const startedAt = Date.now();
+      let caught: unknown;
+      try {
+        await deliverToRemoteBranch(
+          "remote-a",
+          { id: "cccccccc-0000-4000-8000-000000000003", to: "local", from: "agent-a", body: "close before ack over noise" },
+          { timeoutMs: 2_000, ackTimeoutMs: 5_000 },
+        );
+      } catch (error) {
+        caught = error;
+      }
+      await sawDeliver;
+      expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
+      expect((caught as Error).message).toContain("closed before the ACK");
+      // The 5 s ACK window is the only other way to settle; the close must win.
+      expect(Date.now() - startedAt).toBeLessThan(3_000);
+    } finally {
+      await server.close();
+    }
+  }, 15_000);
 
   test("a branch that closes before the ACK exits 75 at once", async () => {
     await startBranchServer({ closeBeforeAck: true });
