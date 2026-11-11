@@ -137,7 +137,7 @@ function queue(to: string, body: string, from: string, deliveryId: string | unde
  * Known limit: a writer that re-stamps the file's mtime on every pass keeps it
  * young. OutboxYoungRetryScheduler schedules at most one retry timer per grace
  * period; each pass still re-reads, parses, stats and logs the young file, and
- * in the branch daemon an fs.watch event triggers an immediate pass.
+ * in the branch daemon an fs.watch event triggers an immediate pass while a host channel is alive.
  * Known limit: the skew tolerance was measured on a local filesystem, so a
  * network filesystem with a larger clock skew may need more than 1 s.
  */
