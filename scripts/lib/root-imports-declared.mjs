@@ -6,7 +6,7 @@
  * are read with Bun's own scanner, not a regex.
  *
  * A bare specifier passes when it is a Node/Bun builtin (`node:` and `bun:`
- * prefixes, and `node:module`'s `builtinModules`) or when its package name
+ * prefixes, or the whole specifier is in `node:module`'s `builtinModules`) or when its package name
  * (scope and name for a scoped package, first segment otherwise) is declared.
  * Relative and absolute imports pass.
  *
@@ -73,7 +73,10 @@ export function findUndeclaredImports(root, files, manifest) {
 			if (specifier.startsWith(".") || specifier.startsWith("/")) continue;
 			if (specifier.startsWith("node:") || specifier.startsWith("bun:")) continue;
 			const name = packageName(specifier);
-			if (BUILTINS.has(name) || declared.has(name)) continue;
+			// A builtin is matched by the whole specifier: builtinModules lists the
+			// builtin subpaths it has (fs/promises, path/posix, ...); Node and Bun
+			// both look up `events/lib/x` and `buffer/` as npm packages instead.
+			if (BUILTINS.has(specifier) || declared.has(name)) continue;
 			undeclared.push({ file, specifier, packageName: name });
 		}
 	}

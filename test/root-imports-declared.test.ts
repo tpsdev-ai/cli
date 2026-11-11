@@ -87,10 +87,10 @@ describe("root imports are declared", () => {
 			expect(undeclared).toEqual([
 				{ file: "fixture.ts", specifier: "left-pad", packageName: "left-pad" },
 			]);
-			const message = formatUndeclared(undeclared);
-			expect(message).toContain("fixture.ts");
-			expect(message).toContain('"left-pad"');
-			expect(message).toContain("left-pad");
+			expect(formatUndeclared(undeclared).split("\n")).toEqual([
+				"root files import packages the root manifest does not declare:",
+				'  fixture.ts imports "left-pad" (package: left-pad)',
+			]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
 		}
@@ -116,6 +116,31 @@ describe("root imports are declared", () => {
 			expect(undeclared).toEqual([
 				{ file: "fixture.ts", specifier: "left-pad/lib/x", packageName: "left-pad" },
 				{ file: "fixture.ts", specifier: "@undeclared/pkg/sub/path", packageName: "@undeclared/pkg" },
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("matches a builtin by the whole specifier, not by its first segment", () => {
+		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+		try {
+			writeFileSync(
+				join(dir, "fixture.ts"),
+				[
+					'import { readFile } from "fs/promises";',
+					'import { posix } from "path/posix";',
+					'import EventEmitter from "events";',
+					'import shim from "events/lib/x";',
+					'import { Buffer } from "buffer/";',
+					"void readFile; void posix; void EventEmitter; void shim; void Buffer;",
+					"",
+				].join("\n"),
+			);
+			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
+			expect(undeclared).toEqual([
+				{ file: "fixture.ts", specifier: "events/lib/x", packageName: "events" },
+				{ file: "fixture.ts", specifier: "buffer/", packageName: "buffer" },
 			]);
 		} finally {
 			rmSync(dir, { recursive: true, force: true });
