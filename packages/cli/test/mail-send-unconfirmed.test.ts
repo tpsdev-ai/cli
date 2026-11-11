@@ -30,6 +30,7 @@ import {
   DEFAULT_MAIL_ACK_TIMEOUT_MS,
   deliverRelayedToLocal,
   deliverToRemoteBranch,
+  MailAckTimeoutConfigError,
   MailDeliveryUnconfirmedError,
   MAX_MAIL_ACK_TIMEOUT_MS,
   parseMailAckTimeoutMs,
@@ -328,6 +329,31 @@ async function signedStoredEnvelope(
   };
 }
 
+/** Run a script in a NEW Bun process that inherits the test HOME but opens no
+ *  server and no socket of its own. The bound kills a child that never exits. */
+async function runChild(script: string, ms: number): Promise<{ status: number; stderr: string }> {
+  const proc = Bun.spawn([process.execPath, "--eval", script], {
+    cwd: root,
+    env: {
+      ...process.env,
+      HOME: root,
+      TPS_MAIL_DIR: join(root, "mail"),
+      TPS_IDENTITY_DIR: join(root, "identity"),
+      TPS_REGISTRY_DIR: join(root, "registry"),
+      TPS_VAULT_KEY: "mail-962-test",
+    },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const timer = setTimeout(() => proc.kill(), ms);
+  try {
+    const [stderr, status] = await Promise.all([new Response(proc.stderr).text(), proc.exited]);
+    return { status, stderr };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function runSend(
   args: string[],
   env: Record<string, string> = {},
@@ -396,6 +422,28 @@ describe("the ACK window is configurable and refuses bad values by name", () => 
       /--ack-timeout must be at most 2147463647 milliseconds/,
     );
     expect(() => parseMailAckTimeoutMs("2147483647", "--ack-timeout")).toThrow(/must be at most 2147463647 milliseconds/);
+  });
+
+  test("deliverToRemoteBranch refuses a computed bound past the timer limit before connecting", async () => {
+    // A 25 s connection bound plus the largest accepted ACK window is past the
+    // largest timer delay, so the attempt must be refused by name without
+    // opening a connection.
+    const connectSpy = spyOn(WsNoiseTransport.prototype, "connect").mockImplementation(() => {
+      throw new Error("connect must not be called");
+    });
+    let caught: unknown;
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id: "66666666-6666-4666-8666-666666666666", to: "local", from: "agent-a", body: "too long" },
+        { timeoutMs: 25_000, ackTimeoutMs: MAX_MAIL_ACK_TIMEOUT_MS },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(MailAckTimeoutConfigError);
+    expect((caught as Error).message).toContain("timer limit");
+    expect(connectSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -1233,7 +1281,7 @@ describe("the connect bound and the ACK window are separate", () => {
     const channel: TransportChannel = {
       async send() {
         // The write takes 200 ms; the ACK follows 450 ms after it resolves, so
-        // it is inside the 500 ms window that starts with the send.
+        // it is inside the 500 ms window that starts when the send resolves.
         await sleep(200);
         ackTimer = setTimeout(() => {
           deliver?.({ type: MSG_MAIL_ACK, seq: 0, ts: new Date().toISOString(), body: { id, accepted: true } });
@@ -1323,4 +1371,46 @@ describe("the connect bound and the ACK window are separate", () => {
     expect(r.stderr).toContain("--message-id");
     expect(elapsedMs).toBeLessThan(5_000);
   }, 15_000);
+});
+
+describe("the ACK and send timers keep the process alive until the attempt settles", () => {
+  const RELAY_PATH = resolve(import.meta.dir, "../src/utils/relay.ts");
+  const WS_PATH = resolve(import.meta.dir, "../src/utils/ws-noise-transport.ts");
+
+  /** A child with no real transport: connect returns a handle-free channel. */
+  function childScript(sendBody: string, opts: string): string {
+    return `
+import { deliverToRemoteBranch, MailDeliveryUnconfirmedError, RemoteDeliveryTimeoutError } from ${JSON.stringify(RELAY_PATH)};
+import { WsNoiseTransport } from ${JSON.stringify(WS_PATH)};
+WsNoiseTransport.prototype.connect = async () => ({
+  async send() { ${sendBody} },
+  onMessage() {},
+  offMessage() {},
+  async close() {},
+  isAlive() { return true; },
+  peerFingerprint() { return "d".repeat(64); },
+});
+deliverToRemoteBranch("remote-a", { id: "dddddddd-0000-4000-8000-000000000004", to: "local", from: "agent-a", body: "child" }, ${opts}).then(
+  () => process.exit(70),
+  (error) => {
+    if (error instanceof MailDeliveryUnconfirmedError) process.exit(75);
+    if (error instanceof RemoteDeliveryTimeoutError) process.exit(74);
+    console.error(String(error));
+    process.exit(71);
+  },
+);
+`;
+  }
+
+  test("a send that resolves with no ACK ends the child with 75, not a silent exit", async () => {
+    const child = await runChild(childScript("", "{ timeoutMs: 1000, ackTimeoutMs: 150 }"), 5_000);
+    expect(child.stderr).toBe("");
+    expect(child.status).toBe(75);
+  }, 10_000);
+
+  test("a send that never resolves ends the child with 74, not a silent exit", async () => {
+    const child = await runChild(childScript("return new Promise(() => {});", "{ timeoutMs: 100, ackTimeoutMs: 100 }"), 5_000);
+    expect(child.stderr).toBe("");
+    expect(child.status).toBe(74);
+  }, 10_000);
 });
