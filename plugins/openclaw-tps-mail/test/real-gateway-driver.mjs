@@ -18,8 +18,8 @@
  *      gateway stops, reads the cur/ record and the obligation record, then
  *      writes a JSON report for the Bun test that spawned it.
  *
- * No external network is used: every HTTP target is 127.0.0.1 and every model
- * and Flair answer is generated here.
+ * No external network is used: every HTTP target the driver creates is
+ * 127.0.0.1, and every model and Flair answer is generated here.
  *
  * usage: node real-gateway-driver.mjs <spec.json>
  */
@@ -265,7 +265,7 @@ const flairPort = flair.address().port;
 report.flairPort = flairPort;
 
 // A free loopback port for the gateway: bind, read, close. The window is only
-// used to choose the port; the gateway binds it immediately afterwards.
+// used to choose the port; the gateway binds it when it starts.
 const gatewayProbe = createServer(() => {});
 await new Promise((r) => gatewayProbe.listen(0, "127.0.0.1", r));
 const gatewayPort = gatewayProbe.address().port;
@@ -315,6 +315,7 @@ const env = {
 };
 
 let child;
+let stopped = false;
 let logs = "";
 try {
   child = spawn(
@@ -402,20 +403,27 @@ try {
 } catch (err) {
   report.error = err?.message ?? String(err);
 } finally {
-  if (child && !child.killed) {
+  if (child && child.exitCode === null) {
     child.kill("SIGTERM");
     await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
-    if (child.exitCode === null) child.kill("SIGKILL");
+    if (child.exitCode === null) {
+      child.kill("SIGKILL");
+      await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
+    }
   }
+  stopped = !child || child.exitCode !== null;
   // B2: read the settled state only after the gateway has stopped — a second
   // reply or a late stamp from a still-running gateway would race this read.
-  report.replyCountAfterStop = replyFilesOnDisk().length;
-  report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
-  if (report.curFiles.length > 0) {
-    report.curRecord = readJson(join(MAIL, "agent-a", "cur", report.curFiles[0]), "cur record");
-  }
-  if (report.inboundId) {
-    report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
+  if (!stopped) report.readErrors.push("gateway did not stop within the deadline; settled state not read");
+  if (stopped) {
+    report.replyCountAfterStop = replyFilesOnDisk().length;
+    report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
+    if (report.curFiles.length > 0) {
+      report.curRecord = readJson(join(MAIL, "agent-a", "cur", report.curFiles[0]), "cur record");
+    }
+    if (report.inboundId) {
+      report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
+    }
   }
   await new Promise((r) => model.close(r));
   await new Promise((r) => flair.close(r));

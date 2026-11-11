@@ -11,15 +11,15 @@
  * What this pins, end to end, under the channel config the plugin README
  * documents (no streaming):
  *   - exactly one dispatch for the mail;
- *   - the reply carries the turn's final text, not its first;
+ *   - the reply carries the turn's final text;
  *   - exactly one reply, counted after the ack and again after the gateway
  *     stops;
  *   - the triggering mail is in cur/ with a string ackedAt, the inbound new/
  *     is empty, and its obligation record is `acked`.
  *
- * Every wait in the driver has a named deadline. The only network targets are
- * 127.0.0.1 model/Flair stubs; the model stub answers the OpenAI Responses
- * events the configured provider sends.
+ * Every wait in the driver has a named deadline. The test's network targets are
+ * 127.0.0.1 stubs (the model and Flair); the gateway binds loopback. The model
+ * stub answers the OpenAI Responses events the configured provider sends.
  */
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
