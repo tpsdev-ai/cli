@@ -12,7 +12,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } 
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
+import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
@@ -402,12 +402,12 @@ describe("relay stop identity", () => {
       const token = processStartToken(child.pid);
       expect(token).not.toBeNull();
       writeFileSync(relayPid, relayRecord(child.pid, token));
+      const previousRemoval = setRelayPidRemoval(() => {
+        // Force unlink to fail for every uid, root included, without relying on
+        // a mode bit.
+        throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
+      });
       const previous = setRelayStopSignal((pid) => {
-        // A non-empty directory in the file's place fails unlink for every uid,
-        // root included.
-        rmSync(relayPid);
-        mkdirSync(relayPid);
-        writeFileSync(join(relayPid, "keep"), "x");
         process.kill(pid, "SIGTERM");
       });
       let message = "";
@@ -419,6 +419,7 @@ describe("relay stop identity", () => {
       } finally {
         restore();
         setRelayStopSignal(previous);
+        setRelayPidRemoval(previousRemoval);
       }
 
       expect(message).toContain(relayPid);

@@ -1,0 +1,1 @@
+- **`tps mail relay stop` keeps a relay pid record that a new relay wrote before removal.** After the targeted relay exits, the stop removes the record only while it still holds the bytes it read; a record a new relay wrote is kept and named as belonging to a different process, and the stop exits 0.
