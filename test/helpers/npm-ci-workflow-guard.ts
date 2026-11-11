@@ -479,6 +479,22 @@ export const UNRESOLVED_INVOCATION_ALLOWLIST: readonly UnresolvedInvocationAllow
   { script: "scripts/test-promote-latest.sh", line: 367, token: '"$registry_js"', target: "scripts/test-promote-latest.sh", assignment: 'registry_js="$work/registry.js"', reason: "$registry_js is the generated registry fixture written by this script (no npm install)" },
   { script: "scripts/test-promote-latest.sh", line: 765, token: '"$work/mkstate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mkstate.mjs\" <<'MK'", reason: "$work/mkstate.mjs is the generated fixture writer written by this script (no npm install)" },
   { script: "scripts/test-promote-latest.sh", line: 767, token: '"$work/latest.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/latest.mjs\" <<'LM'", reason: "$work/latest.mjs is the generated fixture reader written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1561, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1573, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1585, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1597, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1609, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1625, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1641, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1661, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1689, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1706, token: '"$work/mutate-supervisor.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate-supervisor.mjs\" <<'MUTSUP'", reason: "$work/mutate-supervisor.mjs is the generated supervisor mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1736, token: '"$work/mutate-supervisor.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate-supervisor.mjs\" <<'MUTSUP'", reason: "$work/mutate-supervisor.mjs is the generated supervisor mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1756, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1777, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1806, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1841, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
+  { script: "scripts/test-promote-latest.sh", line: 1869, token: '"$work/mutate.mjs"', target: "scripts/test-promote-latest.sh", assignment: "cat >\"$work/mutate.mjs\" <<'MUT'", reason: "$work/mutate.mjs is the generated mutation helper written by this script (no npm install)" },
   { script: "scripts/reviewer/image-checks.sh", line: 434, token: "-c", target: "scripts/reviewer/image-checks.sh", assignment: `gitcreds="$(docker run --rm "$IMG" sh -c 'git config --list --show-origin 2>/dev/null | grep -iE "credential|extraheader|authorization|://[^/@[:space:]]+@"' 2>/dev/null)"`, reason: "reads the image's git config in a container; the payload runs no npm install" },
   { script: "scripts/reviewer/per-job-isolation-checks.sh", line: 170, token: '"$HOSTMOD/scripts/reviewer/evidence-harness.mjs"', target: "scripts/reviewer/per-job-isolation-checks.sh", assignment: "cat >\"$HOSTMOD/scripts/reviewer/evidence-harness.mjs\" <<'JS'", reason: "$HOSTMOD is the scratch host module generated by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 142, token: "-c", target: "scripts/test-tps-office-supervisor.sh", assignment: 'part_c_gate_output="$(su -s /bin/bash nobody -c "TPS_TEST_REQUIRE_NONO=1 TPS_TEST_NONROOT_GATE_FIXTURE=1 bash \'$repo_root/scripts/test-tps-office-supervisor.sh\'" 2>&1)"', reason: "runs this test script again as an unprivileged user (no npm install)" },
@@ -504,13 +520,17 @@ export const REVIEWED_SCRIPT_LINE_ALLOWLIST: readonly ReviewedScriptLineEntry[] 
 ];
 
 /**
- * Exact run-block logical lines whose wrapped interpreter payload is a
- * non-literal string. The line is reviewed as a whole; its payload is not
- * parsed, so a wrapped interpreter anywhere else is refused.
+ * Exact logical lines whose wrapped interpreter payload is a non-literal string.
+ * The line is reviewed as a whole; its payload is not parsed, so a wrapped
+ * interpreter anywhere else is refused.
  */
 export type ReviewedWrappedPayloadEntry = { text: string; reason: string };
 
 export const REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST: readonly ReviewedWrappedPayloadEntry[] = [
+  {
+    text: "if docker run --rm \"$IMG\" sh -c 'test -e \"${GH_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/gh}\" || test -e \"$HOME/.config/gh\" || test -e /home/reviewer/.config/gh' >/dev/null 2>&1; then",
+    reason: "reads whether a gh config directory exists in the image; the payload runs no npm install",
+  },
   {
     text: "docker run --rm -v \"$HOME/.local/nono-pin-bookworm:/out\" -e COMMIT=\"${{ steps.pin.outputs.commit }}\" rust:bookworm bash -c '",
     reason: "builds the pinned nono in a bookworm container: the payload installs distro packages and builds Rust, and runs no npm or npx",
@@ -537,7 +557,12 @@ type TreeContext = {
 
 const SCRIPT_FILE = String.raw`(?:\.\/)?(?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.(?:sh|bash|mjs|cjs|js|ts)`;
 const PREFIX_COMMANDS = new Set(["env", "command", "exec", "sudo", "xargs", "nohup", "time"]);
-const SHELL_KEYWORDS = new Set(["then", "elif", "else", "do", "!"]);
+// Words after which the next word is the command of the clause.
+const SHELL_KEYWORDS = new Set(["then", "elif", "else", "do", "!", "if", "while", "until", "{", "("]);
+// Words that start a clause the guard does not treat as an invocation.
+const SHELL_HEADERS = new Set(["for", "case", "select", "in", "fi", "done", "esac", "function", "[[", "]]", "((", "))", "}"]);
+// Every bash reserved word: one the guard does not model is refused, never skipped.
+const SHELL_RESERVED = new Set([...SHELL_KEYWORDS, ...SHELL_HEADERS, "time", "coproc"]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const JS_INTERPRETERS = new Set(["node", "bun", "deno", "tsx"]);
 const INTERPRETERS = new Set([...SHELL_INTERPRETERS, ...JS_INTERPRETERS]);
@@ -574,7 +599,7 @@ function scriptExists(ctx: TreeContext, rel: string): boolean {
   }
 }
 
-/** Resolve the literal suffix of a computed script path to one repository file. */
+/** Resolve the literal suffix of a computed script path to one repository file; one that leaves the root is not resolved. */
 function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] = []): string | null {
   const value = stripOuterQuotes(token);
   const variable = value.match(/^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?(?:[%#][^}]*)?\}?|\([^)]*\)|`[^`]*`)/);
@@ -584,7 +609,13 @@ function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] =
   if (suffix === "" || !SCRIPT_EXTENSION.test(suffix)) return null;
   const rel = suffix.replace(/^\.\//, "");
   for (const base of ["", ...bases]) {
-    const candidate = base === "" ? rel : resolveRepoDir(base, rel, "dynamic suffix");
+    let candidate: string;
+    try {
+      candidate = resolveRepoDir(base, rel, "dynamic suffix");
+    } catch {
+      // A suffix that leaves the repository root is not a repository file.
+      continue;
+    }
     if (scriptExists(ctx, candidate)) return candidate;
   }
   return null;
@@ -844,7 +875,11 @@ function splitClauses(line: string): Clause[] {
   return clauses;
 }
 
-/** Skip VAR=val assignments and env/command/exec/sudo/xargs/nohup/time prefixes. */
+/**
+ * Skip VAR=val assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
+ * the reserved words that introduce a command clause; a `for`/`case`/`select`
+ * header is not an invocation.
+ */
 function commandWord(tokens: ShellToken[]): { index: number; token: ShellToken } | null {
   let index = 0;
   let sawPrefix = false;
@@ -855,8 +890,18 @@ function commandWord(tokens: ShellToken[]): { index: number; token: ShellToken }
       index++;
       continue;
     }
-    if (!token.quoted && (PREFIX_COMMANDS.has(text) || SHELL_KEYWORDS.has(text))) {
-      sawPrefix = sawPrefix || PREFIX_COMMANDS.has(text);
+    if (!token.quoted && SHELL_HEADERS.has(text)) return null;
+    if (!token.quoted && PREFIX_COMMANDS.has(text)) {
+      // `command -v`/`-V` looks a name up; it runs no command.
+      if (text === "command") {
+        const next = tokens[index + 1];
+        if (next !== undefined && !next.quoted && /^-[vV]$/.test(next.text)) return null;
+      }
+      sawPrefix = true;
+      index++;
+      continue;
+    }
+    if (!token.quoted && SHELL_KEYWORDS.has(text)) {
       index++;
       continue;
     }
@@ -1288,12 +1333,24 @@ function resolveScriptArgument(ctx: TreeContext, token: ShellToken, directory: s
       const suffix = tokenVariableSuffix(token.text);
       if (resolved === null || /[$`]/.test(suffix)) return { dynamic: token.text };
       if (resolved.kind === "scriptDir") {
-        const path = joinVariableSuffix(resolved.path, suffix);
+        let path: string;
+        try {
+          path = resolveRepoDir("", joinVariableSuffix(resolved.path, suffix), at);
+        } catch {
+          return { dynamic: token.text };
+        }
         return scriptExists(ctx, path) ? { rel: path } : { dynamic: token.text };
       }
       if (resolved.kind === "absolute") {
         const rel = repoRelativePath(ctx, joinVariableSuffix(resolved.path, suffix));
-        return rel !== null && scriptExists(ctx, rel) ? { rel } : { dynamic: token.text };
+        if (rel === null) return { dynamic: token.text };
+        let path: string;
+        try {
+          path = resolveRepoDir("", rel, at);
+        } catch {
+          return { dynamic: token.text };
+        }
+        return scriptExists(ctx, path) ? { rel: path } : { dynamic: token.text };
       }
       if (rootOnly) return { dynamic: token.text };
       const rel = resolveRepoDir(directory, joinVariableSuffix(resolved.path, suffix), at);
@@ -1456,6 +1513,10 @@ function clauseInvocations(
   if ((quote === "'" || quote === '"') && !word.token.text.endsWith(quote)) return embedded();
   const command = stripOuterQuotes(word.token.text);
   const base = command.split("/").pop() ?? command;
+  // A reserved word the guard does not model is never a command it can judge.
+  if (!word.token.quoted && SHELL_RESERVED.has(command)) {
+    return [{ invocation: { dynamic: command }, embedded: false }];
+  }
   if (!word.token.quoted && (command === "source" || command === ".")) {
     const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
     found.push({ invocation: argument === undefined ? { dynamic: command } : resolveInvocation(ctx, state, argument, at), embedded: false });
@@ -1561,7 +1622,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     }
 
     let clauseInstall = false;
-    const reviewedWrapped = state.source === "run-block" && REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
+    const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
       const word = commandWord(clause.tokens);
       if (word !== null) {
@@ -1817,7 +1878,12 @@ function npmInstallDirectory(line: string, directory: string, at: string): strin
   let sawDirectoryFlag = false;
   for (let index = 0; index < parsed.args.length; index++) {
     const text = parsed.args[index];
-    const equals = text.match(/^(--prefix|-C|--workspace|-w)=(.*)$/);
+    // npm workspaces share the root lockfile and never read a nested one, so a
+    // workspace filter cannot bind an install to the directory it names.
+    if (text === "--workspaces" || /^(?:--workspace|-w)(?:=|$)/.test(text)) {
+      throw new Error(`${at}: an npm install with a workspace flag is refused: npm workspaces read the root lockfile: ${line}`);
+    }
+    const equals = text.match(/^(--prefix|-C)=(.*)$/);
     const flag = equals !== null ? equals[1] : NPM_DIRECTORY_FLAGS.has(text) ? text : null;
     if (flag === null) continue;
     if (sawDirectoryFlag) {

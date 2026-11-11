@@ -46,8 +46,13 @@ unescaped before the body is scanned (cli#975)), resolves wrapped interpreters
 and literal invocations, and follows scripts. A run block and a followed script
 differ in their initial state: the install classifier runs on followed shell
 files, and a run block's lines are screened by the physical-line check above.
-An `npx` invocation in a workflow or composite-action `run:` block is not
-classified by either pass. Here-document bodies are install-screened;
+A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
+`do`, `!` or the `time` prefix is judged at its next word; `for`, `case` and
+`select` headers are not invocations (their command substitutions are scanned
+as usual); any other shell reserved word the guard does not model makes the
+clause unresolved. An `npx` invocation in a workflow or composite-action
+`run:` block is not classified by either pass. Here-document bodies are
+install-screened;
 a here-document passed to a shell is refused rather than executed. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
@@ -69,9 +74,10 @@ later by `ci`, `install`, `i`, `add`, `exec` or `x`. Every install clause on a
 line is judged, in order. An install must use the tracked-lock helper, a bounded
 global install, or bind to a tracked lockfile; an install line whose npm/npx
 shape cannot be read is refused, as are `--no-package-lock`, `npx`, `npm exec`
-and `npm x`, which do not read a lockfile. `--prefix`/`-C`/`--workspace`/`-w`
-bind the install to the literal directory they name; a repeated directory flag
-is refused. `scripts/npm-ci-tracked-lock.sh` is the approved install
+and `npm x`, which do not read a lockfile. `--prefix`/`-C` bind the install to
+the literal directory they name; `--workspace`/`-w`/`--workspaces` are refused,
+because npm workspaces read the root lockfile; a repeated directory flag is
+refused. `scripts/npm-ci-tracked-lock.sh` is the approved install
 implementation: its own lines are not screened by that classifier, and a helper
 call is followed only as the literal whole-line shape of a run block, or of a
 followed shell file other than the helper itself; any other spelling, and a
