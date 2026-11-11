@@ -1122,4 +1122,45 @@ describe("the connect bound and the ACK window are separate", () => {
       process.off("unhandledRejection", onUnhandled);
     }
   }, 10_000);
+
+  test("a send that never settles rejects on the send+ack bound and closes the channel", async () => {
+    const id = "aaaaaaaa-0000-4000-8000-000000000001";
+    let closed = false;
+    const channel: TransportChannel = {
+      send() {
+        return new Promise<void>(() => {});
+      },
+      onMessage() {},
+      offMessage() {},
+      async close() {
+        closed = true;
+      },
+      isAlive() {
+        return true;
+      },
+      peerFingerprint() {
+        return "b".repeat(64);
+      },
+    };
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+    // The call must settle well inside this bound; only the send+ack deadline
+    // (100ms connect + 100ms ACK) can end a send that never settles.
+    const settleBoundMs = 3_000;
+    const startedAt = Date.now();
+    let caught: unknown;
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id, to: "local", from: "agent-a", body: "hung send" },
+        { timeoutMs: 100, ackTimeoutMs: 100 },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    expect(caught).toBeInstanceOf(RemoteDeliveryTimeoutError);
+    expect((caught as Error).message).toContain("exceeded 200ms after connect (send + ack)");
+    expect(closed).toBe(true);
+    expect(elapsedMs).toBeLessThan(settleBoundMs);
+  }, 5_000);
 });
