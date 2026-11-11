@@ -18,8 +18,9 @@
  *      gateway stops, reads the cur/ record and the obligation record, then
  *      writes a JSON report for the Bun test that spawned it.
  *
- * No external network is used: every HTTP target the driver creates is
- * 127.0.0.1, and every model and Flair answer is generated here.
+ * Every HTTP target the driver creates is 127.0.0.1, and every model and
+ * Flair answer is generated here. The driver does not block or observe any
+ * outbound traffic the gateway itself may attempt.
  *
  * usage: node real-gateway-driver.mjs <spec.json>
  */
