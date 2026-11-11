@@ -58,6 +58,8 @@ describe("branch daemon outbox retry lifecycle", () => {
   let savedEnv: Record<string, string | undefined>;
   let server: TransportServer | undefined;
   let channel: TransportChannel | undefined;
+  // The daemon's side of the connection, captured from onConnection.
+  let serverChannel: TransportChannel | undefined;
   let baselineSignals: { sigterm: Function[]; sigint: Function[] };
   let retryRuns: Array<() => void>;
   let retrySchedulers: OutboxYoungRetryScheduler[];
@@ -81,6 +83,7 @@ describe("branch daemon outbox retry lifecycle", () => {
     mkdirSync(process.env.TPS_IDENTITY_DIR, { recursive: true });
     server = undefined;
     channel = undefined;
+    serverChannel = undefined;
     retryRuns = [];
     retrySchedulers = [];
     watchers = [];
@@ -119,10 +122,6 @@ describe("branch daemon outbox retry lifecycle", () => {
     return join(root, ".tps", "outbox", "new");
   }
 
-  function outboxSentDir(): string {
-    return join(root, ".tps", "outbox", "sent");
-  }
-
   function writeYoungFile(name: string, content: string): void {
     mkdirSync(outboxNewDir(), { recursive: true });
     writeFileSync(join(outboxNewDir(), name), content, "utf-8");
@@ -148,6 +147,13 @@ describe("branch daemon outbox retry lifecycle", () => {
     spyOn(tcp, "listenForHost").mockImplementation((async (...args: Parameters<typeof originalListen>) => {
       const actual = await originalListen(...args);
       server = actual;
+      const originalOnConnection = actual.onConnection.bind(actual);
+      spyOn(actual, "onConnection").mockImplementation((handler: (channel: TransportChannel) => void) => {
+        originalOnConnection((opened) => {
+          serverChannel = opened;
+          handler(opened);
+        });
+      });
       return actual;
     }) as typeof tcp.listenForHost);
 
@@ -228,7 +234,7 @@ describe("branch daemon outbox retry lifecycle", () => {
     expect(exitCode).toBe(0);
   }, 20_000);
 
-  test("a retry sends through pickTarget's live host channel and sends nothing once it is gone", async () => {
+  test("a retry sends through pickTarget's live host channel and sends nothing once that channel closes", async () => {
     watchRetries();
     const { shutdown } = await startDaemon();
     const deliveries: TpsMessage[] = [];
@@ -253,18 +259,30 @@ describe("branch daemon outbox retry lifecycle", () => {
     expect(deliveries[0]!.seq).toBe(0);
     expect((deliveries[0]!.body as { id: string }).id).toBe("retry-1");
 
+    // Stop the scheduled timer, then drop the connection. The daemon keeps its
+    // channel reference but that channel is no longer alive, so the retry has
+    // to go through pickTarget's isAlive() guard.
+    retrySchedulers[0]!.cancel();
+    await channel!.close();
+    const deadChannel = serverChannel!;
+    await waitUntil(() => !serverChannel!.isAlive(), "the server-side channel to close");
+
+    writeYoungFile(
+      "young-retry-2.json",
+      JSON.stringify({ id: "retry-2", to: "host-a", from: "agent-a", body: "complete", timestamp: new Date().toISOString() }),
+    );
+    const sendSpy = spyOn(deadChannel, "send");
+    retryRuns[0]!();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(deliveries.length).toBe(1);
+    expect(readdirSync(outboxNewDir())).toContain("young-retry-2.json");
+
     let exitCode: number | undefined;
     spyOn(process, "exit").mockImplementation(((code?: number) => {
       exitCode = code;
     }) as never);
     await shutdown();
     expect(exitCode).toBe(0);
-
-    writeYoungFile("young-after-stop.json", "{");
-    const deliveriesBefore = deliveries.length;
-    retryRuns[0]!();
-    expect(deliveries.length).toBe(deliveriesBefore);
-    expect(readdirSync(outboxNewDir())).toContain("young-after-stop.json");
-    expect(readdirSync(outboxSentDir())).not.toContain(".malformed-young-after-stop.json");
   }, 20_000);
 });

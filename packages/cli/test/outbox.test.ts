@@ -327,9 +327,9 @@ describe("outbox", () => {
       const name = "2026-05-16-boundary.json";
       const file = join(newDir, name);
       writeFileSync(file, "{", "utf-8");
-      const now = Date.now();
-      utimesSync(file, new Date(now + offsetMs), new Date(now + offsetMs));
+      const now = 1_700_000_000_000;
       const clock = spyOn(Date, "now").mockReturnValue(now);
+      utimesSync(file, new Date(now + offsetMs), new Date(now + offsetMs));
       const errors = spyOn(console, "error").mockImplementation(() => {});
       try {
         const result = drainOutboxWithStats(false);
