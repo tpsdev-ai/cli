@@ -1797,6 +1797,14 @@ export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 /** cli#922 item 1: the cap on the rescan-tick backoff between watcher re-arm attempts. */
 export const MAX_WATCHER_REARM_BACKOFF_TICKS = 32;
 
+/**
+ * cli#922 item 1: the wait before the next re-arm attempt, in rescan ticks.
+ * Attempt 1 waits 1 tick and doubles per consecutive failure, capped.
+ */
+export function rearmBackoffTicks(failures: number): number {
+  return Math.min(2 ** (failures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
+}
+
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<TpsMailAccount>) => {
     const { account, cfg, log } = ctx;
@@ -2477,7 +2485,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           log?.info?.(`tps-mail: new/ watcher for ${agentId} re-armed`);
         } catch (err: any) {
           rearmFailures++;
-          rearmDelayTicks = Math.min(2 ** (rearmFailures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
+          rearmDelayTicks = rearmBackoffTicks(rearmFailures);
           log?.warn?.(
             `tps-mail: new/ watcher for ${agentId} still failing after ${rearmFailures} re-arm attempt(s): ` +
               `${err?.message ?? String(err)}; next attempt in ${rearmDelayTicks} rescan tick(s)`,

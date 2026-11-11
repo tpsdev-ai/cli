@@ -9,7 +9,7 @@ import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
 import { relayAcceptanceLockRoot, signEnvelope } from "@tpsdev-ai/agent";
 import * as mail from "@tpsdev-ai/cli/utils/mail";
-import pluginModule, { MAX_NEW_FILE_TRANSIENT_FAILURES, NEW_DIR_RESCAN_MS } from "../src/index.js";
+import pluginModule, { MAX_NEW_FILE_TRANSIENT_FAILURES, NEW_DIR_RESCAN_MS, rearmBackoffTicks } from "../src/index.js";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 const seed = Buffer.alloc(32, 0x01);
@@ -51,6 +51,7 @@ describe("new/ periodic rescan (cli#853)", () => {
   let watchSpy: ReturnType<typeof spyOn>;
   let watcher: fs.FSWatcher | undefined;
   let closedWatchers: Set<object>;
+  let watcherEvents: Array<{ kind: "watch" | "close"; watcher: object }>;
   let timerSpy: ReturnType<typeof spyOn>;
   let promoteSpy: ReturnType<typeof spyOn>;
   let readSpy: ReturnType<typeof spyOn> | undefined;
@@ -77,6 +78,7 @@ describe("new/ periodic rescan (cli#853)", () => {
     blockedRelayRoots = [];
     watcher = undefined;
     closedWatchers = new Set();
+    watcherEvents = [];
     mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({
       createMailVerifyClient: async () => ({
         async getAgent(name: string) {
@@ -91,11 +93,7 @@ describe("new/ periodic rescan (cli#853)", () => {
       notifyWatch = (filename) => {
         if (!suppressWatch) { watchCalls++; listener("rename", filename); }
       };
-      const created = Object.assign(new EventEmitter(), {
-        close() { closedWatchers.add(created); },
-      }) as unknown as fs.FSWatcher;
-      watcher = created;
-      return created;
+      return stubWatcher();
     }) as typeof fs.watch);
     timerSpy = spyOn(globalThis, "setInterval").mockImplementation(((fn: any, ms: number, ...args: any[]) => {
       if (ms !== NEW_DIR_RESCAN_MS) return realSetInterval(fn, ms, ...args);
@@ -105,6 +103,18 @@ describe("new/ periodic rescan (cli#853)", () => {
     }) as typeof setInterval);
     promoteSpy = spyOn(mail, "promote").mockImplementation(realPromote);
   });
+
+  function stubWatcher(): fs.FSWatcher {
+    const created = Object.assign(new EventEmitter(), {
+      close() {
+        closedWatchers.add(created);
+        watcherEvents.push({ kind: "close", watcher: created });
+      },
+    }) as unknown as fs.FSWatcher;
+    watcher = created;
+    watcherEvents.push({ kind: "watch", watcher: created });
+    return created;
+  }
 
   afterEach(async () => {
     controller.abort();
@@ -201,9 +211,18 @@ describe("new/ periodic rescan (cli#853)", () => {
   it("re-arms a stopped watcher on the rescan and delivers through the new watcher", async () => {
     await boot();
     expect(watchSpy).toHaveBeenCalledTimes(1);
-    watcher!.emit("error", new Error("injected watcher error"));
+    const stopped = watcher!;
+    stopped.emit("error", new Error("injected watcher error"));
     expect(await until(() => watchSpy.mock.calls.length === 2, intervalMs * 2)).toBe(true);
     expect(logs.filter((line) => line.includes("re-armed"))).toHaveLength(1);
+    // cli#922 item 5: the re-arm closes the stopped watcher and drops it from
+    // the account watcher set before the replacement is attached.
+    const stoppedCloses = () =>
+      watcherEvents.filter((event) => event.kind === "close" && event.watcher === stopped);
+    expect(stoppedCloses()).toHaveLength(1);
+    const closedAt = watcherEvents.indexOf(stoppedCloses()[0]!);
+    const nextWatchAt = watcherEvents.findIndex((event) => event.kind === "watch" && event.watcher !== stopped);
+    expect(nextWatchAt).toBeGreaterThan(closedAt);
     // Stop the rescan: delivery from here can only come from the new watcher.
     clearInterval(intervals[0]!);
     const ticksBefore = ticks;
@@ -213,6 +232,48 @@ describe("new/ periodic rescan (cli#853)", () => {
     expect(ticks).toBe(ticksBefore);
     expect(watchCalls).toBe(1);
     expect(dispatches).toEqual(["after-rearm"]);
+    // A stopped watcher left in the set would be closed a second time on stop.
+    controller.abort();
+    await start;
+    start = undefined;
+    expect(stoppedCloses()).toHaveLength(1);
+  });
+
+  it("re-arms on the next tick when the first attach throws", async () => {
+    watchSpy.mockImplementationOnce((() => {
+      throw new Error("injected initial attach failure");
+    }) as typeof fs.watch);
+    await boot();
+    expect(watchSpy).toHaveBeenCalledTimes(1);
+    expect(logs.some((line) => line.startsWith("tps-mail: failed to watch "))).toBe(true);
+    expect(await until(() => watchSpy.mock.calls.length === 2, intervalMs * 3)).toBe(true);
+    expect(logs.filter((line) => line.includes("re-armed"))).toHaveLength(1);
+  });
+
+  it("caps the re-arm backoff at 32 ticks", () => {
+    expect([1, 2, 3, 4, 5, 6, 7, 8].map(rearmBackoffTicks)).toEqual([1, 2, 4, 8, 16, 32, 32, 32]);
+  });
+
+  it("resets the backoff after a successful re-arm", async () => {
+    await boot();
+    const attemptTicks: number[] = [];
+    let attempts = 0;
+    watchSpy.mockImplementation((() => {
+      attemptTicks.push(ticks);
+      attempts++;
+      if (attempts === 1 || attempts === 2 || attempts === 4) throw new Error(`injected re-arm failure ${attempts}`);
+      return stubWatcher();
+    }) as typeof fs.watch);
+    watcher!.emit("error", new Error("injected watcher error"));
+    expect(await until(() => logs.some((line) => line.includes("re-armed")), intervalMs * 8)).toBe(true);
+    // Two failed attempts at ticks 1 and 2, then the successful one at tick 4.
+    expect(attemptTicks[1]! - attemptTicks[0]!).toBe(1);
+    expect(attemptTicks[2]! - attemptTicks[1]!).toBe(2);
+    watcher!.emit("error", new Error("injected watcher error after recovery"));
+    expect(await until(() => attemptTicks.length >= 5, intervalMs * 8)).toBe(true);
+    // The reset makes the next attempt follow the failure by one tick, not four.
+    expect(attemptTicks[4]! - attemptTicks[3]!).toBe(1);
+    expect(logs.filter((line) => line.includes("re-armed"))).toHaveLength(2);
   });
 
   it("backs off re-arm attempts on repeated failures", async () => {
