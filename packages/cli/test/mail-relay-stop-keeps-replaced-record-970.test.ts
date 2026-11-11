@@ -439,6 +439,70 @@ describe("mail relay stop keeps a record replaced before removal", () => {
   );
 
   test(
+    "a stale record left unreadable at the final check fails the stop",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, record(child.pid, foreignStartToken(childToken(child.pid))));
+      const stale = snapshotPidRecord(relayPid);
+      expect(stale.state.kind).toBe("stale");
+      // The classification read returns the stale snapshot; the re-read in
+      // `reportBadRecord` then finds a directory at the path.
+      leaveUnreadableRecord();
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        reads++;
+        return stale;
+      });
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} was stale and could not be read at the final check`,
+        );
+      } finally {
+        setRelayStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(1);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(statSync(relayPid).isDirectory()).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
+    "an invalid record left unreadable at the final check fails the stop",
+    async () => {
+      const child = spawnChild();
+      writeFileSync(relayPid, "not a pid record\n");
+      const invalid = snapshotPidRecord(relayPid);
+      expect(invalid.state.kind).toBe("invalid");
+      // The classification read returns the invalid snapshot; the re-read in
+      // `reportBadRecord` then finds a directory at the path.
+      leaveUnreadableRecord();
+
+      let reads = 0;
+      const previousReader = setRelayStopRecordReader(() => {
+        reads++;
+        return invalid;
+      });
+      try {
+        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
+          `Mail relay pid file ${relayPid} was invalid and could not be read at the final check`,
+        );
+      } finally {
+        setRelayStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(1);
+      expect(existsSync(relayPid)).toBe(true);
+      expect(statSync(relayPid).isDirectory()).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    CASE_TIMEOUT_MS,
+  );
+
+  test(
     "an unchanged stale record is still removed",
     async () => {
       const child = spawnChild();

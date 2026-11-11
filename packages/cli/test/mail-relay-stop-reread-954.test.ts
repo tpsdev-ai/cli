@@ -48,20 +48,23 @@ function staleRecord(child: Bun.Subprocess): string {
 }
 
 /** Makes the first read the real record and the second read `second`, with the
- *  second snapshot's raw bytes read from the file it describes. A null here
- *  would compare unequal on every path and keep a record spuriously. */
+ *  second snapshot's raw bytes read from the path that state names. `raw` is
+ *  null when the state is missing or unreadable, or the read fails. */
 function installSecondRead(second: () => PidFileState): { reads: () => number; restore: () => void } {
   let reads = 0;
   const previous = setRelayStopRecordReader(() => {
     reads++;
     if (reads === 1) return snapshotPidRecord(relayPid);
-    let raw: Buffer | null;
-    try {
-      raw = readFileSync(relayPid);
-    } catch {
-      raw = null;
+    const state = second();
+    let raw: Buffer | null = null;
+    if (state.kind !== "missing" && state.kind !== "unreadable") {
+      try {
+        raw = readFileSync(state.path);
+      } catch {
+        raw = null;
+      }
     }
-    return { state: second(), raw };
+    return { state, raw };
   });
   return { reads: () => reads, restore: () => setRelayStopRecordReader(previous) };
 }
