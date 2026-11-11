@@ -1178,18 +1178,28 @@ describe("CLI — npm lockfiles", () => {
     expect(output).not.toContain("Checking");
   }, 30_000);
 
-  it("collects the real aliased entry under the recorded package name", () => {
-    const lockfile = "plugins/openclaw-tps-mail/package-lock.json";
-    const lock = JSON.parse(readFileSync(join(REPO, lockfile), "utf8"));
-    const aliasPath = "node_modules/openclaw/node_modules/node-domexception";
-    expect(lock.packages[aliasPath].name).toBe("@nolyfill/domexception");
+  it("collects an npm-written aliased entry under the recorded package name", () => {
+    // npm records the real registry package in `name` and the alias in the
+    // install path, so the lookup must read the former. The entry is verbatim
+    // from plugins/openclaw-tps-mail/package-lock.json on main 645d48d4, where
+    // npm auto-installed the openclaw peer and wrote this node-domexception
+    // alias under it.
+    const lockfile = "package-lock.json";
+    const lock = npmLock({
+      "node_modules/openclaw/node_modules/node-domexception": {
+        name: "@nolyfill/domexception",
+        version: "1.0.28",
+        resolved: "https://registry.npmjs.org/@nolyfill/domexception/-/domexception-1.0.28.tgz",
+        integrity:
+          "sha512-tlc/FcYIv5i8RYsl2iDil4A0gOihaas1R5jPcIC4Zw3GhjKsVilw90aHcVlhZPTBLGBzd379S+VcnsDjd9ChiA==",
+        license: "MIT",
+        peer: true,
+        engines: { node: ">=12.4.0" },
+      },
+    });
     const { deps, problems } = collectNpmLockDeps(lock, lockfile);
     expect(problems).toEqual([]);
-    expect(deps).toContainEqual({
-      name: lock.packages[aliasPath].name,
-      version: lock.packages[aliasPath].version,
-      lockfile,
-    });
+    expect(deps).toEqual([{ name: "@nolyfill/domexception", version: "1.0.28", lockfile }]);
   });
 });
 
