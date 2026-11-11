@@ -13,6 +13,9 @@
  * NOT covered: a dynamic import whose specifier is not a literal string
  * (`await import(name)`), packages imported only from outside test/ and
  * scripts/, and whether a declared range resolves for a published consumer.
+ * The root test lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files and does
+ * not descend into a directory reached through a symlink, so JavaScript inside
+ * shell scripts or built in template strings, and .mts/.cts files, are not read.
  */
 
 import { readFileSync } from "node:fs";

@@ -96,6 +96,32 @@ describe("root imports are declared", () => {
 		}
 	});
 
+	it("derives the package name from a subpath import", () => {
+		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+		try {
+			writeFileSync(
+				join(dir, "fixture.ts"),
+				[
+					'import a from "js-yaml/dist/js-yaml.mjs";',
+					'import b from "@tpsdev-ai/agent/package.json";',
+					'import c from "left-pad/lib/x";',
+					'import d from "@undeclared/pkg/sub/path";',
+					"void a; void b; void c; void d;",
+					"",
+				].join("\n"),
+			);
+			const undeclared = findUndeclaredImports(dir, ["fixture.ts"], {
+				devDependencies: { "js-yaml": "*", "@tpsdev-ai/agent": "*" },
+			});
+			expect(undeclared).toEqual([
+				{ file: "fixture.ts", specifier: "left-pad/lib/x", packageName: "left-pad" },
+				{ file: "fixture.ts", specifier: "@undeclared/pkg/sub/path", packageName: "@undeclared/pkg" },
+			]);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("accepts builtins, a relative import and a declared scoped package", () => {
 		const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
 		try {
