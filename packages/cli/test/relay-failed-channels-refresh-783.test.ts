@@ -338,6 +338,160 @@ for (const closePath of ["reconnect", "graceful"] as const) {
   }
 }
 
+/** A first connection that writes the host record, then a reconnect whose
+ *  connect resolves only after stop() begins. */
+async function lateConnectScenario(options: {
+  lateClose: (call: number) => Promise<void>;
+}) {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-late-connect-896-"));
+  const savedEnv = savedRelayEnv();
+  let connectCalls = 0;
+  let firstCloses = 0;
+  let lateCloses = 0;
+  let secondConnectStarted!: () => void;
+  const secondConnect = new Promise<void>((resolve) => { secondConnectStarted = resolve; });
+  let releaseConnect!: () => void;
+  const connectGate = new Promise<void>((resolve) => { releaseConnect = resolve; });
+  const firstChannel: TransportChannel = {
+    async send() {},
+    onMessage() {},
+    offMessage() {},
+    async close() { firstCloses++; },
+    isAlive() { return false; },
+    peerFingerprint() { return "remote"; },
+  };
+  const lateChannel: TransportChannel = {
+    async send() { throw new Error("late connect must not write"); },
+    onMessage() {},
+    offMessage() {},
+    async close() { await options.lateClose(++lateCloses); },
+    isAlive() { return true; },
+    peerFingerprint() { return "remote"; },
+  };
+  const fastBackoff = fastReconnectBackoff();
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    const call = ++connectCalls;
+    if (call === 1) {
+      await yieldRealTimer();
+      return firstChannel;
+    }
+    if (call === 2) {
+      secondConnectStarted();
+      await connectGate;
+      return lateChannel;
+    }
+    throw new Error("unexpected connect call");
+  });
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    stop = await connectAndKeepAlive(branch);
+    // The first connection writes the record before its reconnect begins.
+    for (let i = 0; !existsSync(path) && i < 400; i++) await Bun.sleep(5);
+    expect(existsSync(path)).toBe(true);
+    await secondConnect;
+    return {
+      root, savedEnv, path, stop, diagnostic, fastBackoff, connect,
+      releaseConnect,
+      counts: () => ({ firstCloses, lateCloses, connectCalls }),
+      cleanup: async () => {
+        releaseConnect();
+        await stop?.().catch(() => {});
+        connect.mockRestore();
+        diagnostic.mockRestore();
+        fastBackoff.mockRestore();
+        restoreRelayEnv(savedEnv);
+        rmSync(root, { recursive: true, force: true });
+      },
+    };
+  } catch (error) {
+    releaseConnect();
+    await stop?.().catch(() => {});
+    connect.mockRestore();
+    diagnostic.mockRestore();
+    fastBackoff.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+for (const retry of ["rejects", "resolves"] as const) {
+  test(`stop() waits for a late connect and retries its rejected close; retry ${retry}`, async () => {
+    const scenario = await lateConnectScenario({
+      lateClose: async (call) => {
+        if (call === 1) throw new Error("late close refused");
+        if (retry === "rejects") throw new Error("late close retry refused");
+      },
+    });
+    try {
+      let stopSettled = false;
+      const stopping = scenario.stop().then(
+        () => { stopSettled = true; return null; },
+        (error: unknown) => { stopSettled = true; return error; },
+      );
+      await Bun.sleep(20);
+      expect(stopSettled, "stop() must wait for the in-flight connect").toBe(false);
+      scenario.releaseConnect();
+      const error = await stopping;
+      expect(scenario.counts().connectCalls).toBe(2);
+      expect(scenario.counts().firstCloses).toBe(1);
+      expect(scenario.counts().lateCloses).toBe(2);
+      if (retry === "resolves") {
+        expect(error).toBeNull();
+        expect(existsSync(scenario.path)).toBe(false);
+        expect(scenario.diagnostic).toHaveBeenCalledTimes(1);
+      } else {
+        expect(error).toMatchObject({ name: "HostChannelCloseError" });
+        expect(existsSync(scenario.path)).toBe(true);
+        expect(scenario.diagnostic).toHaveBeenCalledTimes(2);
+      }
+    } finally {
+      await scenario.cleanup();
+    }
+  }, 20_000);
+}
+
+test("a late connect whose close succeeds the first time is not retried and the record clears", async () => {
+  const scenario = await lateConnectScenario({ lateClose: async () => {} });
+  try {
+    let stopSettled = false;
+    const stopping = scenario.stop().then(
+      () => { stopSettled = true; return null; },
+      (error: unknown) => { stopSettled = true; return error; },
+    );
+    await Bun.sleep(20);
+    expect(stopSettled, "stop() must wait for the in-flight connect").toBe(false);
+    scenario.releaseConnect();
+    const error = await stopping;
+    expect(error).toBeNull();
+    expect(scenario.counts().firstCloses).toBe(1);
+    expect(scenario.counts().lateCloses).toBe(1);
+    expect(scenario.diagnostic).not.toHaveBeenCalled();
+    expect(existsSync(scenario.path)).toBe(false);
+  } finally {
+    await scenario.cleanup();
+  }
+}, 20_000);
+
+test("stop() keeps the host record when an in-flight connect does not settle by the deadline", async () => {
+  const scenario = await lateConnectScenario({ lateClose: async () => {} });
+  try {
+    const started = performance.now();
+    const error = await scenario.stop().catch((e) => e);
+    expect(error).toMatchObject({ name: "HostChannelCloseError" });
+    // The wait is bounded by the named deadline: the test's backoff spy maps it
+    // to the short real timer, so a stop that never returns would fail the timeout.
+    expect(performance.now() - started).toBeGreaterThanOrEqual(TEST_RECONNECT_BACKOFF_MS);
+    expect(scenario.counts().lateCloses).toBe(0);
+    expect(existsSync(scenario.path)).toBe(true);
+  } finally {
+    await scenario.cleanup();
+  }
+}, 20_000);
+
 test("a failed host record refresh is reported once per connection until a write succeeds", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-refresh-report-783-"));
   const savedEnv = savedRelayEnv();
