@@ -102,7 +102,8 @@ though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, ext
 invocation is refused unless it is on the reviewed allowlist, as is a wrapped
 interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
 non-literal. A clause whose first word is an assignment whose value holds a
-closed command substitution and that has more words after it is refused: a run
+closed command substitution and that has more words after it is refused, unless
+the command it prefixes is `cd`, `pushd` or `popd` (cli#975): a run
 block offers computing the value on its own line, and a followed script offers computing the value on its
 own line or naming the script in a reviewed entry. A `$(` the lexer reads as
 literal text (single quotes, ANSI-C quoting, an escaped dollar) is not a

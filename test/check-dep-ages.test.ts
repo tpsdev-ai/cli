@@ -4637,9 +4637,9 @@ describe("the guard's clause words are load-bearing (#820 round 19)", () => {
 });
 
 describe("the workflow guard's known limits from review round 20 (cli#975)", () => {
-  // Each case below passes silently or binds the wrong lockfile on c642dce2.
-  // It is pinned as an expected failure: when the shape is handled, the pin
-  // goes red and the change is deliberate.
+  // Each it.failing case below passes silently or binds the wrong lockfile on
+  // c642dce2. It is pinned as an expected failure: when the shape is handled,
+  // the pin goes red and the change is deliberate.
 
   it.failing("refuses a run-block computed suffix whose variable names a directory outside the repository (cli#975)", () => {
     const root = makeTreeFixture({
@@ -4742,9 +4742,60 @@ describe("the workflow guard's known limits from review round 20 (cli#975)", () 
         new Set(["plugins/a/package-lock.json"]),
         root,
         "workflow-known-limit-cd",
-      )).toThrow(/cannot bind an npm install/);
+      )).toThrow(/cannot bind (?:an|the) npm install/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
   });
+});
+
+describe("the workflow guard's known limits from review round 21 (cli#975)", () => {
+  // A `cd`, `pushd` or `popd` clause is handled before the prefix-assignment
+  // check, so an assignment whose value holds a closed command substitution is
+  // not refused when it prefixes one of them. Each case is pinned as an
+  // expected failure: when the shape is handled, the pin goes red.
+
+  const shapes = [
+    ['CDPATH="$(mktemp -d)" cd sub'],
+    ['V="$(date)" cd sub'],
+    ['V="$(date)" pushd sub'],
+    ['V="$(date)" popd'],
+  ];
+
+  it.failing.each(shapes)(
+    "refuses the prefix assignment in %s in a run block (cli#975)",
+    (line) => {
+      const root = makeTreeFixture({ "package-lock.json": "{}\n" });
+      try {
+        expect(() => assertNpmCiWorkflowTree(
+          workflowStep(line, "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-known-limit-cd-assignment",
+        )).toThrow(/cannot resolve|unresolved/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.failing.each(shapes)(
+    "refuses the prefix assignment in %s in a followed script (cli#975)",
+    (line) => {
+      const root = makeTreeFixture({
+        "scripts/outer.sh": `${line}\n`,
+        "package-lock.json": "{}\n",
+      });
+      try {
+        expect(() => assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/outer.sh", "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-known-limit-cd-assignment-script",
+        )).toThrow(/cannot resolve|unresolved/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 });
