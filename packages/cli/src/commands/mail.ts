@@ -12,7 +12,7 @@ import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { parseInboundChain } from "../utils/agent-keys.js";
-import { assertValidReplyToId, readOutboundSigningKey, requireOutboundSigningKey, signOutboundBody } from "../utils/mail-sign.js";
+import { assertValidReplyToId, requireOutboundSigningKey, signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
 import { removePidFile, pidRecordBytesEqual, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
@@ -262,20 +262,14 @@ function validateAgent(agent?: string): string {
 // The envelope builder itself lives in utils/mail-sign.ts (shared with the
 // agent runtimes) so the two cannot drift; it validates --reply-to (the ONE
 // id rule) before it reads any key.
-// The verify client for a stored envelope: the sender's CURRENT key, plus any
-// earlier delegation hop whose key this host can read. A hop this host cannot
-// resolve is null, so verifyEnvelope refuses instead of trusting it.
+// The verify client for a stored envelope: the sender's CURRENT key only.
+// Earlier delegation hops are not resolved — the fresh send never verified
+// them, and the sender's outer signature covers every byte of the chain.
 async function storedEnvelopeVerifyClient(from: string, seed: Buffer): Promise<FlairClient> {
   const senderKey = Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(seed)));
   return {
     async getAgent(name: string) {
-      if (name === from) return { publicKey: senderKey };
-      try {
-        const other = readOutboundSigningKey(name);
-        return other ? { publicKey: Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(other))) } : null;
-      } catch {
-        return null;
-      }
+      return name === from ? { publicKey: senderKey } : null;
     },
   };
 }
@@ -295,15 +289,18 @@ async function signOutboundOrFail(
     // unreadable, corrupt or conflicting key is refused here, not after a hit.
     if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
     const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+    // The inbound delegation chain this invocation would embed on a fresh send.
+    const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
     // A re-send of an explicit id reuses the signed envelope stored for it:
     // signing again would change its timestamp and signature, and the branch
     // treats a same-id payload mismatch as a conflict, not a duplicate. The
-    // stored bytes must match this message and verify with the CURRENT key.
+    // stored bytes must match this message, carry the same inbound chain, and
+    // verify with the CURRENT key.
     let client: FlairClient | undefined;
     let signed: string | undefined;
     if (opts.messageId !== undefined) {
       client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
-      signed = await readSentEnvelope(mailRoot, opts.messageId, { from, to, body, replyToId: opts.replyToId }, client);
+      signed = await readSentEnvelope(mailRoot, opts.messageId, { from, to, body, replyToId: opts.replyToId, priorChain }, client);
     }
     if (signed === undefined) {
       signed = signOutboundBody(from, to, body, {
@@ -311,10 +308,10 @@ async function signOutboundOrFail(
         replyToId: opts.replyToId,
         messageId: opts.messageId,
         rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
-        priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
+        priorChain,
       });
       if (opts.messageId !== undefined) {
-        signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId }, client!);
+        signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId, priorChain }, client!);
       }
     }
     // cli#429: every route limits the SIGNED envelope (the body plus its

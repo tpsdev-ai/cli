@@ -11,7 +11,9 @@
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { parseSignedEnvelope, verifyEnvelope, type FlairClient } from "@tpsdev-ai/agent";
+import { parseSignedEnvelope, type ChainEntry, type Envelope, type FlairClient, type VerifyOk, type VerifyReject } from "@tpsdev-ai/agent";
+import * as ed from "@noble/ed25519";
+import canonicalize from "canonicalize";
 
 /** How long a stored signed envelope can be reused, in milliseconds. The window
  *  defaults to the branch's acceptance-receipt window; the branch's value is
@@ -37,6 +39,99 @@ interface EnvelopeFields {
   to: string;
   body: string;
   timestamp: string;
+}
+
+/** What this invocation expects the stored envelope to hold: the message it
+ *  sends, the --reply-to it names, and the inbound delegation chain it would
+ *  embed on a fresh send (`null` when TPS_INBOUND_CHAIN_JSON is absent or
+ *  empty). */
+interface StoredEnvelopeExpectation {
+  from: string;
+  to: string;
+  body: string;
+  replyToId?: string;
+  priorChain?: ChainEntry[] | null;
+}
+
+/** The chain a fresh send embeds when TPS_INBOUND_CHAIN_JSON is absent: one
+ *  origination entry, timestamped with the envelope timestamp. */
+function defaultPriorChain(timestamp: string): ChainEntry[] {
+  return [
+    {
+      agent: "system",
+      kind: "human",
+      timestamp,
+      rationale: "tps mail send (no inbound chain)",
+      signature: null,
+    },
+  ];
+}
+
+/** True when the stored chain prefix (every entry before the sender's own) is
+ *  exactly the prior chain this invocation would embed, compared canonically. */
+function sameInboundChain(prefix: ChainEntry[], expected: ChainEntry[]): boolean {
+  if (prefix.length !== expected.length) return false;
+  const stored = canonicalize(prefix);
+  const wanted = canonicalize(expected);
+  return stored !== undefined && stored === wanted;
+}
+
+function decodeSignature(value: string | null | undefined): Uint8Array | null {
+  if (value == null) return null;
+  const prefix = "ed25519:";
+  if (!value.startsWith(prefix)) return null;
+  try {
+    return new Uint8Array(Buffer.from(value.slice(prefix.length), "base64"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Verify a stored envelope with the sender's CURRENT key: the outer signature
+ * and the sender's own (last) chain entry. Earlier delegation hops are NOT
+ * resolved or verified — the fresh send never verified them, and the outer
+ * signature covers every byte of the chain, so a re-send is never stricter
+ * than the send it repeats.
+ */
+async function verifyStoredEnvelope(envelope: Envelope, client: FlairClient): Promise<VerifyOk | VerifyReject> {
+  if (envelope.v !== 1) return { ok: false, reason: "unsupported version" };
+  const chain = envelope.delegationChain;
+  if (!Array.isArray(chain) || chain.length === 0) return { ok: false, reason: "missing chain" };
+  if (chain.length > 16) return { ok: false, reason: "chain too long" };
+  const tip = chain[chain.length - 1];
+  if (tip.agent !== envelope.from) return { ok: false, reason: "chain tip / from mismatch" };
+  for (const entry of chain) {
+    if (entry.kind === "human" && entry.signature !== null) {
+      return { ok: false, reason: "human entry must have null signature" };
+    }
+  }
+  const info = await client.getAgent(envelope.from);
+  if (!info) return { ok: false, reason: `no current key for agent "${envelope.from}"` };
+  const publicKey = new Uint8Array(info.publicKey);
+
+  const entrySig = decodeSignature(tip.signature);
+  if (!entrySig) return { ok: false, reason: "chain entry signature invalid" };
+  const entryForSig = {
+    agent: tip.agent,
+    kind: tip.kind,
+    timestamp: tip.timestamp,
+    rationale: tip.rationale,
+    signature: undefined,
+  } as const;
+  const entryCanonical = canonicalize({ prior: chain.slice(0, -1), entry: entryForSig });
+  if (entryCanonical === undefined || !(await ed.verifyAsync(entrySig, new TextEncoder().encode(entryCanonical), publicKey))) {
+    return { ok: false, reason: "chain entry signature invalid" };
+  }
+
+  const outerSig = decodeSignature(envelope.signature);
+  if (!outerSig) return { ok: false, reason: "outer signature invalid" };
+  const { signature: _, ...withoutSignature } = envelope;
+  const outerCanonical = canonicalize(withoutSignature);
+  if (outerCanonical === undefined || !(await ed.verifyAsync(outerSig, new TextEncoder().encode(outerCanonical), publicKey))) {
+    return { ok: false, reason: "outer signature invalid" };
+  }
+  return { ok: true };
 }
 
 /** The stored path for one id. The id is hashed because the envelope id shape
@@ -69,6 +164,19 @@ function parseStored(raw: string, path: string): EnvelopeFields {
   return { messageId: env.messageId, from: env.from, to: env.to, body: env.body, timestamp: env.timestamp };
 }
 
+/** Refuse a stored envelope whose chain prefix (every entry before the
+ *  sender's own) is not the inbound chain THIS invocation would embed: a
+ *  delegated send embeds the inbound chain it was given without verifying it,
+ *  so a re-send must carry the same delegation history as the fresh send. */
+function assertSameInboundChain(envelope: Envelope, expected: StoredEnvelopeExpectation): void {
+  const priorChain = expected.priorChain ?? defaultPriorChain(envelope.timestamp);
+  if (!sameInboundChain(envelope.delegationChain.slice(0, -1), priorChain)) {
+    throw new StoredEnvelopeError(
+      `the inbound delegation chain differs from the stored message's; refusing to re-send --message-id ${envelope.messageId}`,
+    );
+  }
+}
+
 /** Read the signed envelope stored for `messageId` when it is the same message
  *  and still verifies with the sender's CURRENT key. Returns undefined when no
  *  entry exists. The entry is only ours if it is a regular file, readable only
@@ -77,7 +185,7 @@ function parseStored(raw: string, path: string): EnvelopeFields {
 export async function readSentEnvelope(
   root: string,
   messageId: string,
-  expected: { from: string; to: string; body: string; replyToId?: string },
+  expected: StoredEnvelopeExpectation,
   client: FlairClient,
 ): Promise<string | undefined> {
   const path = envelopePath(root, messageId);
@@ -132,10 +240,15 @@ export async function readSentEnvelope(
   if ((signed.replyToId ?? undefined) !== (expected.replyToId ?? undefined)) {
     throw new StoredEnvelopeError(`--message-id ${messageId} was already used to sign a message with a different --reply-to; use a new --message-id`);
   }
-  const verified = await verifyEnvelope(signed, client);
+  // A delegated send embeds the inbound chain it was given without verifying
+  // it. The stored envelope's chain prefix must therefore be the chain THIS
+  // invocation would embed; otherwise a re-send would carry a different
+  // delegation history than the fresh send.
+  assertSameInboundChain(signed, expected);
+  const verified = await verifyStoredEnvelope(signed, client);
   if (!verified.ok) {
     throw new StoredEnvelopeError(
-      `the stored signed message at ${path} does not verify against the current key for agent "${expected.from}" (${verified.reason}); refusing to send`,
+      `the stored signed message at ${path} does not verify against agent "${expected.from}"'s current key (${verified.reason}); refusing to send`,
     );
   }
   return raw;
@@ -147,7 +260,7 @@ export async function storeSentEnvelope(
   root: string,
   messageId: string,
   signed: string,
-  expected: { from: string; to: string; body: string; replyToId?: string },
+  expected: StoredEnvelopeExpectation,
   client: FlairClient,
 ): Promise<string> {
   const dir = join(root, DIR_NAME);

@@ -303,7 +303,7 @@ async function signedStoredEnvelope(
     messageId: id,
     timestamp: now,
     delegationChain: [
-      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: "system", kind: "human", timestamp: now, rationale: "tps mail send (no inbound chain)", signature: null },
       { agent: expected.from, kind: "agent", timestamp: now, rationale: "test send", signature: null },
     ],
     ...(replyToId !== undefined ? { replyToId } : {}),
@@ -569,7 +569,8 @@ describe("a --message-id re-send re-checks the key and the stored envelope", () 
     await firstSend(id);
     const second = await runSend(secondArgs(id), {}, 15_000, "re-send body", { seed: Buffer.alloc(32, 0x03) });
     expect(second.status).toBe(1);
-    expect(second.stderr).toContain("does not verify against the current key");
+    expect(second.stderr).toContain("does not verify against agent");
+    expect(second.stderr).toContain("current key");
     expect(branch.deliveries).toHaveLength(1);
   }, 25_000);
 
@@ -619,7 +620,8 @@ describe("a --message-id re-send re-checks the key and the stored envelope", () 
     writeFileSync(path, JSON.stringify(stored));
     const second = await runSend(secondArgs(id), {}, 15_000, "re-send body");
     expect(second.status).toBe(1);
-    expect(second.stderr).toContain("does not verify against the current key");
+    expect(second.stderr).toContain("does not verify against agent");
+    expect(second.stderr).toContain("current key");
     expect(branch.deliveries).toHaveLength(1);
   }, 25_000);
 
@@ -672,6 +674,103 @@ describe("a --message-id re-send re-checks the key and the stored envelope", () 
     expect(second.stderr).toContain("not a regular file");
     expect(branch.deliveries).toHaveLength(1);
   }, 25_000);
+});
+
+describe("a --message-id re-send of delegated mail", () => {
+  /** An inbound chain whose agent hop's key is not on this host: the sender
+   *  embeds it on a fresh send, and a re-send must not resolve it. */
+  function inboundChainWithForeignHop(): string {
+    const now = new Date().toISOString();
+    const signed = signEnvelope(
+      {
+        v: 1,
+        from: "agent-b",
+        to: "flint",
+        body: "inbound delegation",
+        messageId: "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f",
+        timestamp: now,
+        delegationChain: [
+          { agent: "agent-a", kind: "human", timestamp: now, rationale: "originates", signature: null },
+          { agent: "agent-b", kind: "agent", timestamp: now, rationale: "forwards", signature: null },
+        ],
+      },
+      { "agent-b": Buffer.alloc(32, 0x0b) },
+    );
+    return JSON.stringify(signed.delegationChain);
+  }
+
+  const delegatedArgs = (id: string) => ["--stdin", "--message-id", id, "--ack-timeout", "2000"];
+
+  test("re-sends when an earlier hop's key is not on this host", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "88888888-8888-4888-8888-888888888881";
+    const inboundChain = inboundChainWithForeignHop();
+    const first = await runSend(delegatedArgs(id), { TPS_INBOUND_CHAIN_JSON: inboundChain }, 15_000, "delegated body");
+    expect(first.status).toBe(0);
+    const second = await runSend(delegatedArgs(id), { TPS_INBOUND_CHAIN_JSON: inboundChain }, 15_000, "delegated body");
+    expect(second.status).toBe(0);
+    expect(second.stderr).not.toContain("does not verify");
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
+    expect(new Set(branch.deliveries.map((delivery) => delivery.timestamp)).size).toBe(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    await expectConnectionEndedAfter("a delegated re-send");
+  }, 30_000);
+
+  test("refuses a re-send whose inbound chain differs", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "88888888-8888-4888-8888-888888888882";
+    const first = await runSend(
+      delegatedArgs(id),
+      { TPS_INBOUND_CHAIN_JSON: inboundChainWithForeignHop() },
+      15_000,
+      "delegated body",
+    );
+    expect(first.status).toBe(0);
+    // The same id, but this invocation has no inbound chain: it would embed a
+    // different delegation history than the stored message carries.
+    const second = await runSend(delegatedArgs(id), {}, 15_000, "delegated body");
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("inbound delegation chain differs from the stored message's");
+    expect(branch.deliveries).toHaveLength(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
+
+  test("refuses a stored envelope whose earlier hop was altered", async () => {
+    await startBranchServer({ recordInbox: true });
+    pointRemoteAtServer();
+    const id = "88888888-8888-4888-8888-888888888883";
+    const first = await runSend(
+      delegatedArgs(id),
+      { TPS_INBOUND_CHAIN_JSON: inboundChainWithForeignHop() },
+      15_000,
+      "delegated body",
+    );
+    expect(first.status).toBe(0);
+    const path = sentEnvelopeFile(id);
+    const stored = JSON.parse(readFileSync(path, "utf-8")) as Envelope;
+    // Change one byte of the earlier hop's rationale. Re-sign the sender's own
+    // hop over the altered prefix and keep the ORIGINAL outer signature, so the
+    // outer signature is the check that covers the change.
+    stored.delegationChain[1].rationale = `${stored.delegationChain[1].rationale}!`;
+    const outerSignature = stored.signature;
+    stored.delegationChain[stored.delegationChain.length - 1].signature = null;
+    const resigned = signEnvelope(stored, { flint: FLINT_SEED });
+    resigned.signature = outerSignature;
+    writeFileSync(path, JSON.stringify(resigned));
+    const second = await runSend(
+      delegatedArgs(id),
+      { TPS_INBOUND_CHAIN_JSON: JSON.stringify(resigned.delegationChain.slice(0, -1)) },
+      15_000,
+      "delegated body",
+    );
+    expect(second.status).toBe(1);
+    expect(second.stderr).toContain("does not verify against agent");
+    expect(second.stderr).toContain("outer signature invalid");
+    expect(branch.deliveries).toHaveLength(1);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
 });
 
 describe("the stored signed envelope has a reuse window", () => {
