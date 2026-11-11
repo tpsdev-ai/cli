@@ -3700,12 +3700,21 @@ describe("the workflow guard refuses a prefix assignment before a command (#820 
       "package-lock.json": "{}\n",
     });
     try {
-      expect(() => assertNpmCiWorkflowTree(
-        workflowStep(line, "."),
-        new Set(["package-lock.json"]),
-        root,
-        "workflow-prefix-assignment",
-      )).toThrow(/cannot resolve a prefix assignment whose value holds a command substitution.*compute the value on its own line, or name the script in a reviewed entry/);
+      let message = "";
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep(line, "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-prefix-assignment",
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain(
+        "compute the value on its own line, or add the step to the reviewed exact-block allowlist",
+      );
+      expect(message).not.toContain("name the script in a reviewed entry");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -3718,12 +3727,21 @@ describe("the workflow guard refuses a prefix assignment before a command (#820 
       "package-lock.json": "{}\n",
     });
     try {
-      expect(() => assertNpmCiWorkflowTree(
-        workflowStep("bash scripts/inner.sh", "."),
-        new Set(["package-lock.json"]),
-        root,
-        "workflow-prefix-assignment-script",
-      )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 1\) token bash scripts\/inst\.sh.*compute the value on its own line, or name the script in a reviewed entry/);
+      let message = "";
+      try {
+        assertNpmCiWorkflowTree(
+          workflowStep("bash scripts/inner.sh", "."),
+          new Set(["package-lock.json"]),
+          root,
+          "workflow-prefix-assignment-script",
+        );
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain(
+        "compute the value on its own line, or name the script in a reviewed entry",
+      );
+      expect(message).not.toContain("reviewed exact-block allowlist");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -3790,6 +3808,42 @@ describe("the workflow guard refuses a prefix assignment before a command (#820 
       } finally {
         rmSync(root, { recursive: true, force: true });
       }
+    }
+  });
+});
+
+describe("the workflow guard reads a literal $() in a prefix assignment through the lexer (#820 round 14)", () => {
+  // The skip is the lexer's verdict: only a substitution it cannot close keeps
+  // the clause unscanned. A `$(` inside single quotes, ANSI-C quotes or behind
+  // an escaped dollar is literal text the shell does not run.
+  const shapes: Array<[string, string]> = [
+    ["a single-quoted $( in a prefix assignment", "V='$(date)' bash scripts/inst.sh"],
+    ["an ANSI-C quoted $( in a prefix assignment", "V=$'$(date)' bash scripts/inst.sh"],
+    ["an escaped $( in a double-quoted prefix assignment", 'V="\\$(date)" bash scripts/inst.sh'],
+    ["a single-quoted literal $( after text in a prefix assignment", "V='lit$(x)' bash scripts/inst.sh"],
+  ];
+  const cases = shapes.flatMap(([label, line]) => [
+    [`${label}, run block`, line, false] as const,
+    [`${label}, followed script`, line, true] as const,
+  ]);
+
+  it.each(cases)("follows the invoked script after %s", (_label, line, asScript) => {
+    const root = makeTreeFixture({
+      "scripts/inst.sh": "npm ci\n",
+      "package-lock.json": "{}\n",
+      ...(asScript ? { "scripts/inner.sh": `${line}\n` } : {}),
+    });
+    try {
+      const report = assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/inner.sh" : line, "."),
+        new Set(["package-lock.json"]),
+        root,
+        "workflow-literal-substitution-prefix",
+      );
+      expect(report.installs).toBe(1);
+      expect(report.followed).toContain("scripts/inst.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 });

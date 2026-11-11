@@ -49,8 +49,9 @@ files, and a run block's lines are screened by the physical-line check above.
 An `npx` invocation in a workflow or composite-action `run:` block is not
 classified by either pass. Here-document bodies are install-screened;
 a here-document passed to a shell is refused rather than executed. It refuses what it cannot
-resolve in the shapes it parses; nested quoting inside substitutions is a known
-limit (cli#975). It passes an install only as a bounded global
+resolve in the shapes it parses; a prefix assignment whose value holds a
+substitution the lexer cannot close skips the clause, and nested quoting inside
+substitutions is a known limit (cli#975). It passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
 it cannot resolve is refused unless a reviewed allowlist entry names it; an
 unresolved-invocation refusal names the step and the invocation path. It is not a boundary
@@ -84,8 +85,12 @@ refusal. Any other computed, external, `-c`/`-s` or here-document-to-shell
 invocation is refused unless it is on the reviewed allowlist, as is a wrapped
 interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
 non-literal. A clause whose first word is an assignment whose value holds a
-closed command substitution and that has more words after it is refused
-(compute the value on its own line, or name the script in a reviewed entry).
+closed command substitution and that has more words after it is refused: a run
+block offers computing the value on its own line or adding the step to the
+exact-block allowlist, and a followed script offers computing the value on its
+own line or naming the script in a reviewed entry. A `$(` the lexer reads as
+literal text (single quotes, ANSI-C quoting, an escaped dollar) is not a
+substitution, so the clause is scanned.
 The allowlist pins the target, the single assignment to the variable and any
 content source; a `source` must be derived from the pinned assignment, and an
 entry whose assignment is an env-overridable default (`${VAR:-...}`) is refused.

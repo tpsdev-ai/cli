@@ -1587,22 +1587,24 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       // environment assignment plus a command, and the value cannot be
       // evaluated, so the clause is refused: a run block throws and a followed
       // script records an unresolved entry. An assignment-only clause is judged
-      // by that substitution's own scan below. A value the lexer cannot close
-      // (nested quotes inside the substitution, cli#975) keeps the earlier skip:
-      // its clause words are not the shell's words.
+      // by that substitution's own scan below. A value holding a substitution
+      // the lexer cannot close (nested quotes, cli#975) keeps the earlier skip:
+      // its clause words are not the shell's words. A `$(` the lexer reads as
+      // literal (single quotes, ANSI-C quoting, an escaped dollar) is not a
+      // substitution, so the clause is scanned normally.
       const assignment = clause.tokens[0] === undefined ? null : assignmentToken(clause.tokens[0].text);
       const substitution = assignment === null ? null : commandSubstitutions(assignment.value);
       const assignmentSubstitution =
         substitution !== null && substitution.bodies.length > 0 && substitution.unparsed.length === 0;
-      const assignmentClause =
-        clause.tokens[0] !== undefined && /^[A-Za-z_][A-Za-z0-9_]*=.*\$\(/.test(clause.tokens[0].text);
+      const assignmentClause = assignment !== null && substitution !== null && substitution.unparsed.length > 0;
       if (assignmentSubstitution && clause.tokens.length > 1) {
         const token = clause.tokens.slice(1).map((item) => item.text).join(" ");
-        const remedy = "compute the value on its own line, or name the script in a reviewed entry";
         if (state.source === "followed-script") {
+          const remedy = "compute the value on its own line, or name the script in a reviewed entry";
           pushUnresolved(ctx, state.file, number, token, state.label, state.chain, remedy);
           continue;
         }
+        const remedy = "compute the value on its own line, or add the step to the reviewed exact-block allowlist";
         throw new Error(
           `${state.label}: cannot resolve a prefix assignment whose value holds a command substitution: ${entry.text} (physical line ${number}); ${remedy}`,
         );
