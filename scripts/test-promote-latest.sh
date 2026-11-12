@@ -67,10 +67,11 @@
 #     start/end pair (AT). The parser refuses a log with more than one signalled
 #     call, because a timing bound read from the first of them would time the
 #     wrong call (S-a).
-#   * the log path is opened once before the spawn, non-blocking and only as a
-#     regular file: a FIFO placed there neither stalls the supervised call nor
-#     changes its status (BB), a path swapped to a FIFO mid-call does not block
-#     the exit (BD), and an unset or empty PROMOTE_SUPERVISOR_LOG writes no file
+#   * the log path is opened once before the spawn, non-blocking, and kept only
+#     when fstat reports a regular file: a FIFO placed there neither stalls the
+#     supervised call nor changes its status (BB), a FIFO with a live reader is
+#     left unwritten (BE), a path swapped to a FIFO mid-call does not block the
+#     exit (BD), and an unset or empty PROMOTE_SUPERVISOR_LOG writes no file
 #     (BC).
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
@@ -865,6 +866,29 @@ if (which === 'skip_end_on_timeout') {
   process.exit(0);
 }
 
+if (which === 'log_blocking_open') {
+  const old =
+    'fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NONBLOCK';
+  const neu = 'fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT';
+  if (!s.includes(old)) {
+    console.error('supervisor non-blocking open mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(old, neu));
+  process.exit(0);
+}
+
+if (which === 'log_keep_fd') {
+  const old = 'if (fs.fstatSync(fd).isFile()) {';
+  const neu = 'if (fs.fstatSync(fd) || true) {';
+  if (!s.includes(old)) {
+    console.error('supervisor file-type mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(old, neu));
+  process.exit(0);
+}
+
 if (which === 'log_no_stat') {
   const start = "const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';";
   const endMarker = '\nfunction logSignal(name) {';
@@ -1629,10 +1653,12 @@ fi
 
 # ── AN. a delayed commit lands after the client stopped; next run refuses ────
 # The local registry applies the PUT only when the client's connection closes and
-# never answers it. The 5 s deadline is well above the ordinary reads in this
-# promotion (~0.3 s each), so only a held PUT reaches it; the client is stopped
-# there and the write lands after it. A 1 s deadline also applied to those reads,
-# whose own slowness could take the ordinary failure path first.
+# never answers it. The 5 s deadline keeps a wide margin over the ordinary reads
+# in this promotion (~0.3 s each); a pathologically slow read could also reach it,
+# and the case then fails on a named assertion rather than passing. The client is
+# stopped at the held PUT, and the write lands after it. A 1 s deadline also
+# applied to those reads, whose own slowness could take the ordinary failure path
+# first.
 d="$(new_fixture delayed-commit)"
 if [ "$real_ready" -ne 1 ]; then
   printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN delayed-commit"
@@ -1723,17 +1749,17 @@ assert_eq "AT start-failure: the log holds only that pair" 2 "$(wc -l <"$d/super
 # ── AU..BA. the log parser's rule table: one fixture per rule ────────────────
 # One row per rule in supervisor-log.mjs: both anchors on each of its three line
 # regexes, the single trailing newline it strips, the empty file, and each of its
-# six refusals. Each refusal row carries its own defect in a log that is
+# seven refusals. Each refusal row carries its own defect in a log that is
 # otherwise a complete signalled call, so the parser parses it only when it
 # applies that rule; the empty file and the unsignalled call are the rows whose
 # log is the defect. Each refusal asserts its own parse.err message, not only an
 # exit code; the last row is BA, the valid twin.
 parser_rows="$work/parser-rows.txt"
 cat >"$parser_rows" <<'PARSER_ROWS'
-parser start line: leading token|xstart 100\nTERM\nend 200\nstart 300\nTERM\nend 400\n|1|an unknown line: xstart 100|
-parser start line: extra token|start 100 extra\nTERM\nend 200\nstart 300\nTERM\nend 400\n|1|an unknown line: start 100 extra|
-parser end line: leading token|start 100\nTERM\nend 200\nstart 300\nTERM\nxend 400\n|1|an unknown line: xend 400|
-parser end line: extra token|start 100\nTERM\nend 200\nstart 300\nTERM\nend 400 extra\n|1|an unknown line: end 400 extra|
+parser start line: leading token|xstart 100\nTERM\nend 200\n|1|an unknown line: xstart 100|
+parser start line: extra token|start 100 extra\nTERM\nend 200\n|1|an unknown line: start 100 extra|
+parser end line: leading token|start 100\nTERM\nxend 200\n|1|an unknown line: xend 200|
+parser end line: extra token|start 100\nTERM\nend 200 extra\n|1|an unknown line: end 200 extra|
 parser signal line: leading token|start 100\nTERM\nxTERM\nend 200\n|1|an unknown line: xTERM|
 parser signal line: extra token|start 100\nTERM\nTERM extra\nend 200\n|1|an unknown line: TERM extra|
 parser trailing blank line|start 100\nTERM\nend 200\n\n|1|an unknown line: |
@@ -1762,6 +1788,50 @@ while IFS='|' read -r parser_label parser_log parser_rc parser_msg parser_elapse
     assert_eq "$parser_label: elapsed" "$parser_elapsed" "$(cat "$d/elapsed")"
   fi
 done <"$parser_rows"
+
+# ── B4(d) proof: relax each anchor rule in turn; its row's log must parse ─────
+# Each of the four anchor rows holds exactly one otherwise valid signalled call,
+# so widening only that rule leaves nothing else for the parser to refuse.
+relax_parser="$work/relax-parser.mjs"
+cat >"$relax_parser" <<'RELAX'
+import fs from 'node:fs';
+const [src, dst, which] = process.argv.slice(2);
+const s = fs.readFileSync(src, 'utf8');
+const rules = {
+  start_leading: ['const startLine = /^start (\\d+)$/;', 'const startLine = /^x?start (\\d+)$/;'],
+  start_extra: ['const startLine = /^start (\\d+)$/;', 'const startLine = /^start (\\d+)(?: extra)?$/;'],
+  end_leading: ['const endLine = /^end (\\d+)$/;', 'const endLine = /^x?end (\\d+)$/;'],
+  end_extra: ['const endLine = /^end (\\d+)$/;', 'const endLine = /^end (\\d+)(?: extra)?$/;'],
+};
+const rule = rules[which];
+if (!rule || !s.includes(rule[0])) {
+  console.error('parser rule not found: ' + which);
+  process.exit(3);
+}
+fs.writeFileSync(dst, s.replace(rule[0], rule[1]));
+RELAX
+relax_rows="$work/relax-rows.txt"
+printf '%s\n' \
+  'start_leading|xstart 100\nTERM\nend 200\n' \
+  'start_extra|start 100 extra\nTERM\nend 200\n' \
+  'end_leading|start 100\nTERM\nxend 200\n' \
+  'end_extra|start 100\nTERM\nend 200 extra\n' >"$relax_rows"
+while IFS='|' read -r relax_name relax_log; do
+  [ -n "$relax_name" ] || continue
+  d="$(new_fixture "relax-${relax_name//_/-}")"
+  printf '%b' "$relax_log" >"$d/log.txt"
+  if ! node "$relax_parser" "$supervisor_log_parser" "$d/relaxed.mjs" "$relax_name"; then
+    bad "B4(d) relaxed ${relax_name}" "could not build the relaxed parser"
+    continue
+  fi
+  rc=0
+  node "$d/relaxed.mjs" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$(cat "$d/elapsed")" = "0.10" ]; then
+    ok "B4(d) relaxed ${relax_name}: its row parses" "0.10s"
+  else
+    bad "B4(d) relaxed ${relax_name}: its row parses" "exit $rc, elapsed [$(cat "$d/elapsed")] $(head -n 1 "$d/parse.err")"
+  fi
+done <"$relax_rows"
 
 # ── S-a mutation: allow a second signalled call; its rule's row must catch it ─
 # The mutant keeps every other rule and drops only the uniqueness refusal, so it
@@ -2175,6 +2245,125 @@ else
   bad "M16 mutation (f): spawn-error end line caught" "could not build the mutant supervisor"
 fi
 
+# ── BE. a FIFO with a live reader: the isFile() check alone keeps it unwritten ─
+# BB's FIFO has no reader, so the supervisor's non-blocking write open fails with
+# ENXIO before fstat runs. Here a reader holds the FIFO open read-write before the
+# supervisor starts, so that open succeeds and only `fstat(...).isFile()` stands
+# between the supervisor and the FIFO. The child exits 7; the supervisor must keep
+# that status, end inside a 6 s bound, and leave the reader with zero bytes. A
+# supervisor that keeps the descriptor writes its start line there. The reader is
+# bounded by a stop file and a 5 s budget of its own, so a mutant cannot hang it.
+run_reader_fifo_case() { # <supervisor-path> <fixture-dir> -> RF_READY, RF_RC, RF_ELAPSED, RF_BYTES
+  local sup="$1"
+  local d="$2"
+  local reader pid watchdog t0 t1 tries
+  mkfifo "$d/log.fifo"
+  : >"$d/fifo-bytes"
+  cat >"$d/reader.mjs" <<'FIFO_READER'
+import fs from 'node:fs';
+const [fifo, outPath, readyPath, stopPath, budgetMs] = process.argv.slice(2);
+const fd = fs.openSync(fifo, fs.constants.O_RDWR | fs.constants.O_NONBLOCK);
+fs.writeFileSync(readyPath, '');
+const out = fs.openSync(outPath, 'a');
+const buf = Buffer.alloc(65536);
+const deadline = Date.now() + Number(budgetMs);
+const tick = () => {
+  for (;;) {
+    let n;
+    try {
+      n = fs.readSync(fd, buf, 0, buf.length, null);
+    } catch (err) {
+      if (err.code === 'EAGAIN') break;
+      throw err;
+    }
+    if (n === 0) {
+      fs.closeSync(out);
+      fs.closeSync(fd);
+      process.exit(0);
+    }
+    fs.writeSync(out, buf, 0, n);
+  }
+  if (fs.existsSync(stopPath) || Date.now() >= deadline) {
+    fs.closeSync(out);
+    fs.closeSync(fd);
+    process.exit(0);
+  }
+  setTimeout(tick, 20);
+};
+tick();
+FIFO_READER
+  RF_READY=0
+  RF_RC=-1
+  RF_ELAPSED=0
+  RF_BYTES=0
+  "${NODE_BIN:-node}" "$d/reader.mjs" "$d/log.fifo" "$d/fifo-bytes" "$d/reader-ready" "$d/reader-stop" 5000 \
+    >"$d/reader.out" 2>"$d/reader.err" &
+  reader=$!
+  tries=0
+  while [ "$tries" -lt 100 ]; do
+    if [ -f "$d/reader-ready" ]; then
+      RF_READY=1
+      break
+    fi
+    sleep 0.05
+    tries=$((tries + 1))
+  done
+  if [ "$RF_READY" -eq 1 ]; then
+    t0="$(node -p 'Date.now()')"
+    PROMOTE_SUPERVISOR_LOG="$d/log.fifo" "${NODE_BIN:-node}" "$sup" 5 1 -- \
+      "${NODE_BIN:-node}" -e 'process.exit(7)' >"$d/out.txt" 2>"$d/err.txt" &
+    pid=$!
+    "${NODE_BIN:-node}" -e \
+      'setTimeout(() => { try { process.kill(Number(process.argv[1]), "SIGKILL"); } catch (e) {} }, 6000)' \
+      "$pid" >/dev/null 2>&1 &
+    watchdog=$!
+    wait "$pid" 2>/dev/null
+    RF_RC=$?
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+    t1="$(node -p 'Date.now()')"
+    RF_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
+  fi
+  # The reader exits when the stop file appears, or at its own 5 s budget; this
+  # poll is a second bound so a reader stuck in an unexpected call cannot hang
+  # the harness.
+  : >"$d/reader-stop"
+  tries=0
+  while kill -0 "$reader" 2>/dev/null && [ "$tries" -lt 40 ]; do
+    sleep 0.05
+    tries=$((tries + 1))
+  done
+  if kill -0 "$reader" 2>/dev/null; then kill "$reader" 2>/dev/null; fi
+  wait "$reader" 2>/dev/null
+  RF_BYTES="$(wc -c <"$d/fifo-bytes" | tr -d ' ')"
+}
+
+d="$(new_fixture fifo-reader-log)"
+run_reader_fifo_case "$here/npm-supervisor.mjs" "$d"
+assert_eq "BE fifo-reader: the reader opened the FIFO" 1 "$RF_READY"
+assert_eq "BE fifo-reader: exit status kept" 7 "$RF_RC"
+if node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$RF_ELAPSED"; then
+  ok "BE fifo-reader: inside the bound" "${RF_ELAPSED}s"
+else
+  bad "BE fifo-reader: inside the bound" "${RF_ELAPSED}s — the call did not end inside 6 s"
+fi
+assert_eq "BE fifo-reader: zero bytes reached the reader" 0 "$RF_BYTES"
+
+# ── BE mutation: drop only the isFile() check; the reader must receive bytes ─
+be="$work/mut-log-keep-fd"
+mkdir -p "$be"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$be/npm-supervisor.mjs" log_keep_fd; then
+  d="$(new_fixture mut-fifo-reader-log)"
+  run_reader_fifo_case "$be/npm-supervisor.mjs" "$d"
+  if [ "$RF_RC" = "7" ] && [ "$RF_BYTES" -gt 0 ]; then
+    ok "BE mutation: isFile() check caught" "mutant kept the FIFO descriptor and $RF_BYTES byte(s) reached the reader"
+  else
+    bad "BE mutation: isFile() check caught" "mutant kept the FIFO descriptor but the reader saw $RF_BYTES byte(s) (rc $RF_RC) — BE is blind"
+  fi
+else
+  bad "BE mutation: isFile() check caught" "could not build the mutant supervisor"
+fi
+
 # ── BB. a FIFO at the log path never blocks the supervised call ──────────────
 # The supervisor opens the path once, before the spawn, with O_NONBLOCK; opening
 # a FIFO with no reader fails at once, so logging is off and nothing is written.
@@ -2229,6 +2418,21 @@ else
   bad "S-b mutation: FIFO hang caught" "could not build the mutant supervisor"
 fi
 
+# ── BB mutation: the write open without O_NONBLOCK blocks before the spawn ────
+bb2="$work/mut-log-blocking-open"
+mkdir -p "$bb2"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$bb2/npm-supervisor.mjs" log_blocking_open; then
+  d="$(new_fixture mut-fifo-blocking-open)"
+  run_fifo_case "$bb2/npm-supervisor.mjs" "$d"
+  if [ "$FIFO_RC" = "124" ] && node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$FIFO_ELAPSED"; then
+    bad "BB mutation: blocking open caught" "mutant still ended at its deadline in ${FIFO_ELAPSED}s — BB is blind"
+  else
+    ok "BB mutation: blocking open caught" "the open blocked before the spawn, so the watchdog killed the call at ${FIFO_ELAPSED}s (rc $FIFO_RC)"
+  fi
+else
+  bad "BB mutation: blocking open caught" "could not build the mutant supervisor"
+fi
+
 # ── BC. an unset or empty log path writes nothing, and statuses are unchanged ─
 # Both runs use an empty working directory under the fixture, so a file the
 # supervisor created for the log would show up there and in the fixture count.
@@ -2253,17 +2457,24 @@ assert_eq "BC log paths: the fixture tree is unchanged" "$root_before" "$(find "
 
 # ── BD. a log path swapped to a FIFO mid-call never blocks the exit ──────────
 # The supervisor opens the log once, before the spawn, and writes every later
-# line to that descriptor. A regular file there at startup is opened; replacing
-# the path with a FIFO while the child runs must not reach an open(2). The child
-# exits with its own status after the swap, inside a 6 s bound; the case's own
-# watchdog kills a hung supervisor and reports it. A supervisor that reopens the
-# path on every append blocks in logEnd() on the readerless FIFO and never exits.
-run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SWAP_HUNG
+# line to that descriptor. The fixture hard-links the regular file before the
+# call, so the file the supervisor opened stays readable under its second name.
+# It polls that name until the `start` line appears (bounded at 5 s; a named
+# failure if it never does), which proves the supervisor opened the regular file
+# before the path is replaced with a FIFO. The child then exits with its own
+# status, inside a 6 s bound, and the original file must hold the `end` line too:
+# the supervisor kept writing to the descriptor it opened. A supervisor that
+# reopens the path on every append blocks in logEnd() on the readerless FIFO and
+# never exits; the case's own watchdog kills a hung supervisor and reports it.
+run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SWAP_HUNG, SWAP_STARTED, SWAP_ENDED
   local sup="$1"
   local d="$2"
-  local pid watchdog t0 t1
+  local pid watchdog t0 t1 tries
   : >"$d/log.swap"
+  ln "$d/log.swap" "$d/log.orig"
   SWAP_HUNG=0
+  SWAP_STARTED=0
+  SWAP_ENDED=0
   t0="$(node -p 'Date.now()')"
   PROMOTE_SUPERVISOR_LOG="$d/log.swap" "${NODE_BIN:-node}" "$sup" 30 1 -- \
     "${NODE_BIN:-node}" -e 'setTimeout(() => process.exit(7), 1200)' \
@@ -2273,15 +2484,27 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
     'setTimeout(() => { try { process.kill(Number(process.argv[1]), "SIGKILL"); } catch (e) {} }, 6000)' \
     "$pid" >/dev/null 2>&1 &
   watchdog=$!
-  "${NODE_BIN:-node}" -e 'setTimeout(() => {}, 400)'
-  rm -f "$d/log.swap"
-  mkfifo "$d/log.swap"
+  tries=0
+  while [ "$tries" -lt 100 ]; do
+    if grep -q '^start ' "$d/log.orig" 2>/dev/null; then
+      SWAP_STARTED=1
+      break
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    sleep 0.05
+    tries=$((tries + 1))
+  done
+  if [ "$SWAP_STARTED" -eq 1 ]; then
+    rm -f "$d/log.swap"
+    mkfifo "$d/log.swap"
+  fi
   wait "$pid" 2>/dev/null
   SWAP_RC=$?
   kill "$watchdog" 2>/dev/null
   wait "$watchdog" 2>/dev/null
   t1="$(node -p 'Date.now()')"
   SWAP_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
+  if grep -q '^end ' "$d/log.orig" 2>/dev/null; then SWAP_ENDED=1; fi
   if [ "$SWAP_RC" = "137" ] || node -e 'process.exit(Number(process.argv[1]) >= 6 ? 0 : 1)' "$SWAP_ELAPSED"; then
     SWAP_HUNG=1
   fi
@@ -2289,6 +2512,7 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
 
 d="$(new_fixture fifo-swap-log)"
 run_swap_case "$here/npm-supervisor.mjs" "$d"
+assert_eq "BD swapped log: the supervisor logged start before the swap" 1 "$SWAP_STARTED"
 assert_eq "BD swapped log: exit status is the child's" 7 "$SWAP_RC"
 if [ "$SWAP_HUNG" -eq 1 ]; then
   bad "BD swapped log: exit inside the bound" "the supervisor hung: no exit within 6 s after its log path became a FIFO (rc $SWAP_RC, ${SWAP_ELAPSED}s)"
@@ -2297,6 +2521,7 @@ elif node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$SWAP_ELAPSED"
 else
   bad "BD swapped log: exit inside the bound" "${SWAP_ELAPSED}s — past the 6 s bound"
 fi
+assert_eq "BD swapped log: the opened file holds the end line" 1 "$SWAP_ENDED"
 
 # ── BD mutation: reopen the log by path on every append; BD must catch the hang ─
 bd="$work/mut-log-append-path"

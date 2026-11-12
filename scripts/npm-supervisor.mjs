@@ -15,7 +15,8 @@
 // PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is opened once,
 // before the spawn, with O_NONBLOCK; the descriptor is kept only when fstat says
 // it is a regular file (otherwise it is closed and logging is off). If the open
-// fails, logging is off too. Every later line is written to that descriptor,
+// fails, or fstat cannot inspect the descriptor it returned, logging is off too.
+// Every later line is written to that descriptor,
 // never by path, so a path replaced during the call is never opened. The
 // descriptor stays open for the life of the process; process exit closes it.
 // Each supervised call appends `start <ms>` before the spawn, `end <ms>` when the
@@ -47,16 +48,29 @@ const [command, ...args] = argv.slice(3);
 const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
 let logFd = -1;
 if (requestedLogPath !== '') {
+  let fd = -1;
   try {
-    const fd = fs.openSync(
+    fd = fs.openSync(
       requestedLogPath,
       fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NONBLOCK,
     );
-    if (fs.fstatSync(fd).isFile()) logFd = fd;
-    else fs.closeSync(fd);
+    if (fs.fstatSync(fd).isFile()) {
+      logFd = fd;
+      fd = -1;
+    }
   } catch {
-    // The path cannot be opened for append, so logging is off: a write here
-    // could fail the call for no diagnostic gain.
+    // Covers an open that failed and an fstat that could not inspect the
+    // descriptor the open returned. Either way logging is off: a diagnostic
+    // line is not worth failing the call. A descriptor that did not become the
+    // log is closed below, so a throwing fstat leaks none.
+  } finally {
+    if (fd >= 0) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Already closed or not closeable; logging is off either way.
+      }
+    }
   }
 }
 function logLine(line) {
