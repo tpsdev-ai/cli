@@ -1,12 +1,12 @@
 /**
  * sent-envelope.ts — the SIGNED envelope of an outbound message, keyed by its
  * envelope `messageId`, so `tps mail send --message-id <id>` can re-send the
- * same signed bytes rather than sign a fresh envelope. Signing again would put
- * a fresh `timestamp` inside the envelope and a fresh signature on it; the
- * branch compares the accepted payload (from, to, timestamp and content), so a
- * freshly signed copy of the same message is a payload CONFLICT, not a
- * duplicate. Storing the first signed envelope is what makes the id a stable
- * delivery key.
+ * same signed bytes rather than sign a fresh envelope. Signing again puts the
+ * current millisecond in `timestamp` and a fresh signature on the envelope;
+ * the branch compares the accepted payload (from, to, timestamp and content),
+ * so a re-signed copy of the same message is a payload CONFLICT unless it
+ * lands in the same millisecond. Storing the first signed envelope is what
+ * makes the id a stable delivery key.
  */
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";

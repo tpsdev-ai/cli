@@ -289,6 +289,13 @@ function inboxRecords(agent = "local"): string[] {
   return existsSync(inbox.fresh) ? readdirSync(inbox.fresh).filter((f) => f.endsWith(".json")) : [];
 }
 
+/** The id an operator would send with after reading the exit-75 text: the
+ *  message's own id unless the text points at a new --message-id. A case that
+ *  follows the printed advice must fail when the advice is wrong. */
+function advisedResendId(stderr: string, id: string, freshId: string): string {
+  return /re-send with a new --message-id/.test(stderr) ? freshId : id;
+}
+
 function sentEnvelopeFile(id: string): string {
   const key = createHash("sha256").update(id, "utf8").digest("hex");
   return join(root, "mail", ".sent-envelopes", `${key}.json`);
@@ -703,16 +710,57 @@ describe("a CLI re-send with the same --message-id sends the same signed message
       `relayed delivery conflict for branch remote-a message ${id}`,
     ]);
     expect(second.status).toBe(75);
-    // The re-signed path says what happened (no stored envelope was available)
-    // and what the operator can do, instead of promising a duplicate the branch
-    // has just refused.
+    // The new-envelope path says what this send did — it signed AND STORED an
+    // envelope under the id, which is also true when a first send of that id
+    // loses its ACK — and then names both outcomes of a same-id re-send
+    // instead of promising only a duplicate or only a conflict.
     expect(second.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 1000ms; ` +
-        `this send signed a new envelope under that id because no stored envelope was available, ` +
-        `so a branch that already holds a message with that id refuses this one as a same-id conflict. ` +
-        `Check the branch's inbox; if the message is not there, re-send with a new --message-id.`,
+        `this send signed and stored a new envelope under --message-id ${id}; ` +
+        `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
+        `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
+        `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
+        `which the branch inbox accepts as a duplicate. Check the branch's inbox first.`,
     );
     expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
+
+  test("a first send of an explicit id that loses its ACK prints advice that is true for a first send", async () => {
+    await startBranchServer({ recordInbox: true, ackDelayMs: 700 });
+    pointRemoteAtServer();
+    const id = "66666666-6666-4666-8666-666666666671";
+    // The branch writes its inbox record, then ACKs too late for the sender's
+    // window: the delivery landed and only the ACK was lost, which is the case
+    // the text must describe. No stored entry existed before this send, so the
+    // old "no stored envelope was available" wording was false here.
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "150"], {}, 15_000, "first explicit id body");
+    expect(first.status).toBe(75);
+    expect(first.stderr.trim()).toBe(
+      `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
+        `this send signed and stored a new envelope under --message-id ${id}; ` +
+        `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
+        `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
+        `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
+        `which the branch inbox accepts as a duplicate. Check the branch's inbox first.`,
+    );
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id]);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+  }, 30_000);
+
+  test("following that advice re-sends the stored envelope, so the receiver keeps one record", async () => {
+    await startBranchServer({ recordInbox: true, ackDelayMs: 700 });
+    pointRemoteAtServer();
+    const id = "66666666-6666-4666-8666-666666666672";
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "150"], {}, 15_000, "advice body");
+    expect(first.status).toBe(75);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    // Follow the advice as printed. A new id would deliver the message a second
+    // time: the branch keys its inbox record by the wire id.
+    const resendId = advisedResendId(first.stderr, id, "66666666-6666-4666-8666-666666666673");
+    const second = await runSend(["--stdin", "--message-id", resendId, "--ack-timeout", "5000"], {}, 15_000, "advice body");
+    expect(second.status).toBe(0);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    await expectConnectionEndedAfter("a first explicit-id retry");
   }, 30_000);
 
   test("a send without --message-id stores its generated id for the printed retry", async () => {
@@ -727,7 +775,7 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(first.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
         `the message may still arrive. If you re-send, reuse --message-id ${id}: ` +
-        `it reuses the stored envelope when one is available, so the branch can recognise it as a duplicate.`,
+        `it re-sends the stored envelope when one is still available, which the branch inbox accepts as a duplicate.`,
     );
     // The printed retry command names the generated id, so its signed envelope
     // must already be stored.

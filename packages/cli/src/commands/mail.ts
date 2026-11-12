@@ -357,7 +357,7 @@ async function storeExplicitSignedEnvelope(
 /** Store the signed envelope of a REMOTE send that generated its own id. The
  *  exit-75 message prints that id and tells the sender to re-send with it; only
  *  the stored bytes make that retry the same signed message (same id, timestamp
- *  and payload) the branch can accept as a duplicate. */
+ *  and payload) the branch inbox can accept as a duplicate. */
 async function storeGeneratedSignedEnvelope(
   from: string,
   to: string,
@@ -543,7 +543,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           await deliverToRemoteBranch(
             route.branchId,
             { id: wireId, to, from, body: args.message, timestamp: signedMessageTimestamp(args.message) },
-            { ackTimeoutMs, reSignedExplicitId: explicitStorePending },
+            { ackTimeoutMs, storedNewExplicitEnvelope: explicitStorePending },
           );
         } catch (err) {
           if (err instanceof MailDeliveryUnconfirmedError) {
