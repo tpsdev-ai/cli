@@ -192,7 +192,8 @@ strip_cr() { tr -d '\r'; }
 
 # ── supervisor log parser ────────────────────────────────────────────────────
 # Applies strict per-call framing to a PROMOTE_SUPERVISOR_LOG: every line is a
-# `start <ms>`, an `end <ms>`, or a signal name. A start while a call is open, an
+# `start <ms>`, an `end <ms>`, or a signal name, matched whole, so an extra token
+# or a blank line mid-file is an unknown line. A start while a call is open, an
 # end or signal with no open call, an unknown line, or a call left open at the
 # end of the log fails. On a valid log it prints the signalled call's own
 # duration in seconds, so a log that loses that call's end cannot pass by pairing
@@ -206,23 +207,25 @@ function fail(why) {
   process.exit(1);
 }
 
-const lines = fs.readFileSync(process.argv[2], 'utf8').split('\n').filter((line) => line !== '');
-const signals = ['INT', 'TERM', 'HUP', 'KILL'];
+const text = fs.readFileSync(process.argv[2], 'utf8');
+const body = text.endsWith('\n') ? text.slice(0, -1) : text;
+const lines = text === '' ? [] : body.split('\n');
+const startLine = /^start (\d+)$/;
+const endLine = /^end (\d+)$/;
+const signalLine = /^(INT|TERM|HUP|KILL)$/;
 const calls = [];
 let open = null;
 for (const line of lines) {
-  const [tag, raw] = line.split(' ');
-  if (tag === 'start') {
+  let match;
+  if ((match = startLine.exec(line)) !== null) {
     if (open !== null) fail('a start line while a call is open: ' + line);
-    if (raw === undefined || !/^\d+$/.test(raw)) fail('a start line without a timestamp: ' + line);
-    open = { start: Number(raw), signalled: false };
-  } else if (tag === 'end') {
+    open = { start: Number(match[1]), signalled: false };
+  } else if ((match = endLine.exec(line)) !== null) {
     if (open === null) fail('an end line with no open call: ' + line);
-    if (raw === undefined || !/^\d+$/.test(raw)) fail('an end line without a timestamp: ' + line);
-    open.end = Number(raw);
+    open.end = Number(match[1]);
     calls.push(open);
     open = null;
-  } else if (signals.includes(tag)) {
+  } else if (signalLine.test(line)) {
     if (open === null) fail('a signal line with no open call: ' + line);
     open.signalled = true;
   } else {
@@ -1655,14 +1658,51 @@ assert_eq "AT start-failure: one start line" 1 "$(grep -c '^start [0-9][0-9]*$' 
 assert_eq "AT start-failure: one end line" 1 "$(grep -c '^end [0-9][0-9]*$' "$d/supervisor.log" 2>/dev/null || true)"
 assert_eq "AT start-failure: the log holds only that pair" 2 "$(wc -l <"$d/supervisor.log" | tr -d ' ')"
 
-# ── AU. the log parser refuses framing the real supervisor never writes ─────
-d="$(new_fixture supervisor-log-missing-start)"
-printf 'end 100\nstart 200\nend 300\n' >"$d/log.txt"
-if node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err"; then
-  bad "AU parser: missing start refused" "parsed a log whose first end has no open call"
-else
-  ok "AU parser: missing start refused" "$(head -n 1 "$d/parse.err")"
-fi
+# ── AU/AW/AX/AY/AZ/BA. the log parser's refusals, one fixture per refusal ───
+# Each log is valid except for its one defect and holds a complete signalled
+# call, so a parser that ignores that defect parses the log and BA shows a valid
+# one. Each refusal asserts its own message on parse.err, not only an exit code.
+d="$(new_fixture parser-unmatched-end)"
+printf 'end 100\nstart 200\nTERM\nend 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "AU parser: unmatched end refused" 1 "$rc"
+assert_contains "AU parser: unmatched end message" "$(cat "$d/parse.err")" "an end line with no open call"
+
+d="$(new_fixture parser-signal-no-call)"
+printf 'TERM\nstart 200\nTERM\nend 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "AW parser: signal without a call refused" 1 "$rc"
+assert_contains "AW parser: signal without a call message" "$(cat "$d/parse.err")" "a signal line with no open call"
+
+d="$(new_fixture parser-extra-token)"
+printf 'start 200\nTERM extra\nend 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "AX parser: extra token refused" 1 "$rc"
+assert_contains "AX parser: extra token message" "$(cat "$d/parse.err")" "an unknown line"
+
+d="$(new_fixture parser-blank-line)"
+printf 'start 200\n\nTERM\nend 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "AY parser: blank line refused" 1 "$rc"
+assert_contains "AY parser: blank line message" "$(cat "$d/parse.err")" "an unknown line"
+
+d="$(new_fixture parser-left-open)"
+printf 'start 100\nTERM\nend 200\nstart 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "AZ parser: left open at end refused" 1 "$rc"
+assert_contains "AZ parser: left open at end message" "$(cat "$d/parse.err")" "a call left open at the end of the log"
+
+d="$(new_fixture parser-valid)"
+printf 'start 200\nTERM\nend 300\n' >"$d/log.txt"
+rc=0
+node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+assert_eq "BA parser: a valid signalled call parses" 0 "$rc"
+assert_eq "BA parser: that call's duration" 0.10 "$(cat "$d/elapsed")"
 
 # ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
 # The strict framing rejects the next call's start while the timed-out call is
@@ -1680,6 +1720,7 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$av/npm-superv
     bad "AV mutation: missing end on timeout caught" "AL timed $(cat "$d/elapsed")s from a log with no end for the signalled call"
   else
     ok "AV mutation: missing end on timeout caught" "AL red: $(head -n 1 "$d/parse.err")"
+    assert_contains "AV mutation: start while a call is open" "$(head -n 1 "$d/parse.err")" "a start line while a call is open"
   fi
   TOOL=""
 else
