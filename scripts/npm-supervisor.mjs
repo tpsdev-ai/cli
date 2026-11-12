@@ -14,7 +14,7 @@
 //
 // PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is opened once,
 // before the spawn, with O_NONBLOCK; the descriptor is kept only when fstat says
-// it is a regular file (otherwise it is closed and logging is off). If the open
+// it is a regular file (otherwise logging is off and closing it is attempted). If the open
 // fails, or fstat cannot inspect the descriptor it returned, logging is off too.
 // Every later line is written to that descriptor,
 // never by path, so a path replaced during the call is never opened. The
@@ -61,8 +61,8 @@ if (requestedLogPath !== '') {
   } catch {
     // Covers an open that failed and an fstat that could not inspect the
     // descriptor the open returned. Either way logging is off: a diagnostic
-    // line is not worth failing the call. A descriptor that did not become the
-    // log is closed below, so a throwing fstat attempts to close the descriptor.
+    // line is not worth failing the call. The finally below attempts to close a
+    // descriptor that did not become the log.
   } finally {
     if (fd >= 0) {
       try {

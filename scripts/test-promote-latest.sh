@@ -2326,9 +2326,8 @@ FIFO_READER
     t1="$(node -p 'Date.now()')"
     RF_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
   fi
-  # The reader exits when the stop file appears, or at its own 5 s budget; this
-  # poll is a second bound so a reader stuck in an unexpected call cannot hang
-  # the harness.
+  # The reader checks the stop file and its 5 s budget each time a read returns
+  # EAGAIN; this poll waits briefly, then the parent kills a reader still running.
   : >"$d/reader-stop"
   tries=0
   while kill -0 "$reader" 2>/dev/null && [ "$tries" -lt 40 ]; do
