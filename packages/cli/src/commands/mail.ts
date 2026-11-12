@@ -543,7 +543,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           await deliverToRemoteBranch(
             route.branchId,
             { id: wireId, to, from, body: args.message, timestamp: signedMessageTimestamp(args.message) },
-            { ackTimeoutMs },
+            { ackTimeoutMs, reSignedExplicitId: explicitStorePending },
           );
         } catch (err) {
           if (err instanceof MailDeliveryUnconfirmedError) {

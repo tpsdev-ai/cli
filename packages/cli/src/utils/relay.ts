@@ -995,20 +995,30 @@ export function resolveMailAckTimeoutMs(env: NodeJS.ProcessEnv = process.env, fl
 
 /** A delivery whose ACK did not arrive inside the window. The transport was
  *  closed, but the branch may already have written the record — so a re-send
- *  must reuse the message id: the CLI then re-sends the SAME signed envelope
- *  (same id, timestamp and payload), which the branch recognises as a duplicate. */
+ *  with the message id is the usual retry. When this attempt reused the stored
+ *  envelope, that retry is the SAME signed message (same id, timestamp and
+ *  payload), which the branch recognises as a duplicate. When it did not (no
+ *  stored envelope was available and it signed a new one), the message says so
+ *  instead of promising a duplicate. */
 export class MailDeliveryUnconfirmedError extends Error {
   readonly messageId: string;
   readonly branchId: string;
   readonly ackTimeoutMs: number;
 
   /** `why` replaces the default "no ACK ... within Xms" clause for an attempt
-   *  that ended early, such as a connection the branch closed before the ACK. */
-  constructor(messageId: string, branchId: string, ackTimeoutMs: number, why?: string) {
+   *  that ended early, such as a connection the branch closed before the ACK.
+   *  `reSignedExplicitId` says this attempt signed a new envelope under an
+   *  explicit id because no stored envelope was available, so the retry advice
+   *  names the same-id conflict instead of a duplicate. */
+  constructor(messageId: string, branchId: string, ackTimeoutMs: number, why?: string, reSignedExplicitId = false) {
     super(
       `Delivery unconfirmed: ${why ?? `no ACK from branch "${branchId}" for message ${messageId} within ${ackTimeoutMs}ms`}; ` +
-        `the message may still arrive. If you re-send, reuse --message-id ${messageId}: ` +
-        `it re-sends the same signed envelope (same id, timestamp and payload), so the branch can recognise it as a duplicate.`,
+        (reSignedExplicitId
+          ? `this send signed a new envelope under that id because no stored envelope was available, ` +
+            `so a branch that already holds a message with that id refuses this one as a same-id conflict. ` +
+            `Check the branch's inbox; if the message is not there, re-send with a new --message-id.`
+          : `the message may still arrive. If you re-send, reuse --message-id ${messageId}: ` +
+            `it reuses the stored envelope when one is available, so the branch can recognise it as a duplicate.`),
     );
     this.name = "MailDeliveryUnconfirmedError";
     this.messageId = messageId;
@@ -1040,6 +1050,11 @@ export interface RemoteBranchDeliveryOptions {
    *  `TPS_MAIL_ACK_TIMEOUT_MS` environment variable, else
    *  `DEFAULT_MAIL_ACK_TIMEOUT_MS`. */
   ackTimeoutMs?: number;
+  /** Set when this attempt signed a NEW envelope under an explicit
+   *  `--message-id` because no stored envelope was available. The unconfirmed
+   *  message then names the same-id conflict a re-send can hit, instead of
+   *  promising the branch recognises a duplicate. */
+  reSignedExplicitId?: boolean;
 }
 
 /** The three timers one delivery runs under, as `deliverToRemoteBranch`
@@ -1101,6 +1116,7 @@ export async function deliverToRemoteBranch(
   // whose timers cannot fit is refused by name without reading the route or
   // opening a connection.
   const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
+  const reSignedExplicitId = opts.reSignedExplicitId === true;
   const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId);
   const remotePath = join(branchDir, "remote.json");
   if (!existsSync(remotePath)) {
@@ -1218,6 +1234,7 @@ export async function deliverToRemoteBranch(
         branchId,
         ackTimeoutMs,
         `the connection to branch "${branchId}" closed before the ACK for message ${msgId}`,
+        reSignedExplicitId,
       );
       reject(error);
       rejectOnCloseBeforeAck(error);
@@ -1229,7 +1246,7 @@ export async function deliverToRemoteBranch(
       ackTimer = setTimeout(() => {
         ackSettled = true;
         ch.offMessage(handler);
-        reject(new MailDeliveryUnconfirmedError(String(msgId), branchId, ackTimeoutMs));
+        reject(new MailDeliveryUnconfirmedError(String(msgId), branchId, ackTimeoutMs, undefined, reSignedExplicitId));
       }, ackTimeoutMs);
     };
     ch.onMessage(handler);

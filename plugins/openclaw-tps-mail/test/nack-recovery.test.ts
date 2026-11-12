@@ -36,6 +36,18 @@ import { MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../../../packages/cli/src/utils/
 // pattern) and spread eagerly; the mock only replaces `deliverToRemoteBranch`,
 // and only when `relay.hang` is set.
 import * as realRelay from "@tpsdev-ai/cli/utils/relay";
+// The REAL routing module is captured the same way; `routing.fail` makes its
+// resolver throw for the case that checks the retry contains a resolver error.
+import * as realRouting from "@tpsdev-ai/cli/utils/mail-routing";
+const realResolveMailRoute = realRouting.resolveMailRoute;
+const routing = { fail: false };
+mock.module("@tpsdev-ai/cli/utils/mail-routing", () => ({
+  ...realRouting,
+  resolveMailRoute: (args: any) => {
+    if (routing.fail) throw new Error("route resolver failed");
+    return realResolveMailRoute(args);
+  },
+}));
 const realRelayExports = { ...realRelay };
 const relay = {
   hang: false,
@@ -80,6 +92,7 @@ beforeEach(() => {
   keysDir = mkdtempSync(join(tmpdir(), "tps-nackrec-keys-"));
   controller = new AbortController();
   relay.hang = false;
+  routing.fail = false;
   relay.deliver.length = 0;
 
   writeFileSync(join(keysDir, `${AGENT}.key`), KEY_SEED);
@@ -99,6 +112,7 @@ beforeEach(() => {
 
 afterEach(() => {
   try { controller.abort(); } catch { /* */ }
+  routing.fail = false;
   if (origHome === undefined) delete process.env.HOME; else process.env.HOME = origHome;
   if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR; else process.env.TPS_TEST_KEYS_DIR = origKeys;
   if (origTimeout === undefined) delete process.env.TPS_NACK_RETRY_TIMEOUT_MS; else process.env.TPS_NACK_RETRY_TIMEOUT_MS = origTimeout;
@@ -430,6 +444,38 @@ describe("cli#962 round 18 — the ACK window is read only for a remote-branch r
 
     const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
     expect(rec.nackPending).toBe(true);
+    expect(rec.nackSentAt).toBeUndefined();
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+});
+
+describe("cli#962 round 21 — a throwing route resolver does not escape the retry", () => {
+  it("R21-a: the failure is logged by name and the startup path keeps running", async () => {
+    const inboundId = "msg-r21-route-throws";
+    seedOwedNack(inboundId, "receipt-malformed");
+    routing.fail = true;
+
+    const { startPromise, warned, infos } = start();
+    let rejected: unknown;
+    void startPromise.catch((err: unknown) => { rejected = err; });
+
+    // The retention sweep runs after the retry loop: its line proves the
+    // thrown resolver did not abort the caller.
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran after the resolver threw").toBe(true);
+
+    const named = await pollUntil(
+      () => warned.some((m) => m.includes("nack-retry-route") && m.includes(inboundId) && m.includes(SENDER)),
+      1000,
+    );
+    expect(named, "the failed route is logged by name").toBe(true);
+    expect(rejected, "the retry did not reject its caller").toBeUndefined();
+    expect(relay.deliver.length, "nothing was handed to a route").toBe(0);
+
+    const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
+    expect(rec.nackPending, "the record keeps owing the nack").toBe(true);
     expect(rec.nackSentAt).toBeUndefined();
 
     controller.abort();

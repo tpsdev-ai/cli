@@ -1,10 +1,10 @@
 - **`tps mail send` reports a missing remote ACK as delivery unconfirmed, not failure.**
   A remote send waits 30 s for the branch's delivery ACK by default; set the wait
   with `--ack-timeout <ms>` or `TPS_MAIL_ACK_TIMEOUT_MS`. If no ACK arrives in
-  that window the command prints the message id, says the message may still
-  arrive, and exits 75 (EX_TEMPFAIL). A refused delivery keeps its current error
-  and exit status. A re-send with the same `--message-id` reuses the signed
-  envelope stored for that id (same id, timestamp and payload) only when it
+  that window the command prints the message id and exits 75 (EX_TEMPFAIL). A
+  refused delivery keeps its current error and exit status. A re-send with the
+  same `--message-id` reuses the signed envelope stored for that id (same id,
+  timestamp and payload) only when it
   still verifies with the sender's current key and both the inbound delegation
   chain and `--reply-to` match, so the branch can recognise it as a duplicate;
   otherwise nothing is sent and the re-send is refused by name. A stored entry

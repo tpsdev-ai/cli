@@ -701,6 +701,15 @@ describe("a CLI re-send with the same --message-id sends the same signed message
       `relayed delivery conflict for branch remote-a message ${id}`,
     ]);
     expect(second.status).toBe(75);
+    // The re-signed path says what happened (no stored envelope was available)
+    // and what the operator can do, instead of promising a duplicate the branch
+    // has just refused.
+    expect(second.stderr.trim()).toBe(
+      `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 1000ms; ` +
+        `this send signed a new envelope under that id because no stored envelope was available, ` +
+        `so a branch that already holds a message with that id refuses this one as a same-id conflict. ` +
+        `Check the branch's inbox; if the message is not there, re-send with a new --message-id.`,
+    );
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 30_000);
 
@@ -711,6 +720,13 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(first.status).toBe(75);
     const id = first.stderr.match(/for message ([0-9a-f-]{36}) within 150ms/)?.[1];
     expect(id).toBeDefined();
+    // The stored-envelope path keeps the generic sentence: this retry really
+    // does re-send the same signed bytes.
+    expect(first.stderr.trim()).toBe(
+      `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
+        `the message may still arrive. If you re-send, reuse --message-id ${id}: ` +
+        `it reuses the stored envelope when one is available, so the branch can recognise it as a duplicate.`,
+    );
     // The printed retry command names the generated id, so its signed envelope
     // must already be stored.
     expect(existsSync(sentEnvelopeFile(id!))).toBe(true);

@@ -1293,14 +1293,15 @@ function retryOwedNackInBackground(
 ): void {
   if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
-  // Resolve the sender's route FIRST, with the same resolver sendNackMail uses:
-  // only the remote-branch route waits on the ACK window, so a malformed
-  // TPS_MAIL_ACK_TIMEOUT_MS must not refuse a local, outbox or bridge retry.
-  const route = routeFor(mailDir, cfg, accountId, sender);
   let ackTimeoutMs: number | undefined;
   let backstopMs = timeoutMs + NACK_RETRY_BACKSTOP_MS;
-  if (route.kind === "remote-branch") {
-    try {
+  // Resolve the sender's route with the same resolver sendNackMail uses, inside
+  // the try: only the remote-branch route waits on the ACK window, and a
+  // resolver that throws must not escape this fire-and-forget retry into its
+  // caller.
+  try {
+    const route = routeFor(mailDir, cfg, accountId, sender);
+    if (route.kind === "remote-branch") {
       ackTimeoutMs = resolveMailAckTimeoutMs();
       // The bound and the backstop above it come from the relay
       // (`remoteDeliveryWorstCaseMs`), never from arithmetic copied here. Both
@@ -1315,7 +1316,9 @@ function retryOwedNackInBackground(
             `exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
         );
       }
-    } catch (err: any) {
+    }
+  } catch (err: any) {
+    if (err instanceof MailAckTimeoutConfigError) {
       // A malformed TPS_MAIL_ACK_TIMEOUT_MS — or one whose timers cannot fit —
       // must not fail the startup loop. The retry cannot compute its backstop
       // without a window it can hold, so it is not attempted and the record
@@ -1324,8 +1327,15 @@ function retryOwedNackInBackground(
         `tps-mail: nack-retry-config: the owed nack for ${inboundId} to ${sender} was not attempted (${err?.message ?? err}); ` +
           `the record keeps nackPending`,
       );
-      return;
+    } else {
+      // A resolver that throws is the same refusal: nothing was handed to a
+      // route, so the record keeps owing the nack, and the caller is untouched.
+      log?.warn?.(
+        `tps-mail: nack-retry-route: could not resolve the route for the owed nack for ${inboundId} to ${sender} ` +
+          `(${err?.message ?? err}); the retry was not attempted and the record keeps nackPending`,
+      );
     }
+    return;
   }
     // BACKSTOP: a remote-branch retry sits above the relay's whole bound, so it
   // only needs a later net to guarantee the fire-and-forget promise never hangs
