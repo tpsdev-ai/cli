@@ -12,7 +12,16 @@
 // same way. Exit status: the child's code (128+n if a signal killed it), 124 on a
 // deadline timeout, 127 if the command cannot start, 2 on a usage error.
 //
-// PROMOTE_SUPERVISOR_LOG, when set, records each ChildProcess.kill() attempt.
+// PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is opened once,
+// before the spawn, with O_NONBLOCK; the descriptor is kept only when fstat says
+// it is a regular file (otherwise logging is off and closing it is attempted). If the open
+// fails, or fstat cannot inspect the descriptor it returned, logging is off too.
+// Every later line is written to that descriptor,
+// never by path, so a path replaced during the call is never opened. The
+// descriptor stays open for the life of the process; process exit closes it.
+// Each supervised call attempts to append `start <ms>` before the spawn, `end <ms>`
+// when the call ends, and a signal name for each kill attempt. A failed write is
+// ignored, so any record can be missing.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -37,15 +46,49 @@ if (
 }
 const [command, ...args] = argv.slice(3);
 
-const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
-function logSignal(name) {
-  if (!logPath) return;
+const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
+let logFd = -1;
+if (requestedLogPath !== '') {
+  let fd = -1;
   try {
-    fs.appendFileSync(logPath, name + '\n');
+    fd = fs.openSync(
+      requestedLogPath,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NONBLOCK,
+    );
+    if (fs.fstatSync(fd).isFile()) {
+      logFd = fd;
+      fd = -1;
+    }
+  } catch {
+    // Covers an open that failed and an fstat that could not inspect the
+    // descriptor the open returned. Either way logging is off: a diagnostic
+    // line is not worth failing the call. The finally below attempts to close a
+    // descriptor that did not become the log.
+  } finally {
+    if (fd >= 0) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Already closed or not closeable; logging is off either way.
+      }
+    }
+  }
+}
+function logLine(line) {
+  if (logFd < 0) return;
+  try {
+    fs.writeSync(logFd, line + '\n');
   } catch {
     // The log is diagnostic only; never fail the call for it.
   }
 }
+function logSignal(name) {
+  logLine(name);
+}
+
+// One supervisor owns one call, so a start/end pair brackets this call's own
+// duration even though the promotion makes other calls before and after it.
+logLine('start ' + Date.now());
 
 const child = spawn(command, args, { stdio: 'inherit' });
 
@@ -71,8 +114,16 @@ function send(signal) {
   return true;
 }
 
+let endLogged = false;
+function logEnd() {
+  if (endLogged) return;
+  endLogged = true;
+  logLine('end ' + Date.now());
+}
+
 function exitWithStatus() {
   if (!exitInfo) return;
+  logEnd();
   if (timedOut) process.exit(124);
   if (exitInfo.signal) process.exit(128 + (os.constants.signals[exitInfo.signal] || 0));
   process.exit(typeof exitInfo.code === 'number' ? exitInfo.code : 1);
@@ -96,6 +147,8 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 }
 
 child.on('error', (err) => {
+  clearTimeout(deadlineTimer);
+  logEnd();
   process.stderr.write('npm-supervisor: could not start ' + command + ': ' + err.message + '\n');
   process.exit(127);
 });
