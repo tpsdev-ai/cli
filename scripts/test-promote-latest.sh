@@ -1658,51 +1658,47 @@ assert_eq "AT start-failure: one start line" 1 "$(grep -c '^start [0-9][0-9]*$' 
 assert_eq "AT start-failure: one end line" 1 "$(grep -c '^end [0-9][0-9]*$' "$d/supervisor.log" 2>/dev/null || true)"
 assert_eq "AT start-failure: the log holds only that pair" 2 "$(wc -l <"$d/supervisor.log" | tr -d ' ')"
 
-# ── AU/AW/AX/AY/AZ/BA. the log parser's refusals, one fixture per refusal ───
-# Each log is valid except for its one defect and holds a complete signalled
-# call, so a parser that ignores that defect parses the log and BA shows a valid
-# one. Each refusal asserts its own message on parse.err, not only an exit code.
-d="$(new_fixture parser-unmatched-end)"
-printf 'end 100\nstart 200\nTERM\nend 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "AU parser: unmatched end refused" 1 "$rc"
-assert_contains "AU parser: unmatched end message" "$(cat "$d/parse.err")" "an end line with no open call"
+# ── AU..BA. the log parser's rule table: one fixture per rule ────────────────
+# One row per rule in supervisor-log.mjs: both anchors on each of its three line
+# regexes, the single trailing newline it strips, the empty file, and each of its
+# six refusals. Each refusal row carries its own defect in a log that is
+# otherwise a complete signalled call, so the parser parses it only when it
+# applies that rule; the empty file and the unsignalled call are the rows whose
+# log is the defect. Each refusal asserts its own parse.err message, not only an
+# exit code; the last row is BA, the valid twin.
+parser_rows="$work/parser-rows.txt"
+cat >"$parser_rows" <<'PARSER_ROWS'
+parser start line: leading token|xstart 100\nTERM\nend 200\nstart 300\nTERM\nend 400\n|1|an unknown line: xstart 100|
+parser start line: extra token|start 100 extra\nTERM\nend 200\nstart 300\nTERM\nend 400\n|1|an unknown line: start 100 extra|
+parser end line: leading token|start 100\nTERM\nend 200\nstart 300\nTERM\nxend 400\n|1|an unknown line: xend 400|
+parser end line: extra token|start 100\nTERM\nend 200\nstart 300\nTERM\nend 400 extra\n|1|an unknown line: end 400 extra|
+parser signal line: leading token|start 100\nTERM\nxTERM\nend 200\n|1|an unknown line: xTERM|
+parser signal line: extra token|start 100\nTERM\nTERM extra\nend 200\n|1|an unknown line: TERM extra|
+parser trailing blank line|start 100\nTERM\nend 200\n\n|1|an unknown line: |
+parser empty file||1|no signalled call|
+parser no signalled call|start 100\nend 200\n|1|no signalled call|
+parser start while a call is open|start 100\nstart 200\nTERM\nend 300\n|1|a start line while a call is open: start 200|
+parser end with no open call|end 100\nstart 200\nTERM\nend 300\n|1|an end line with no open call: end 100|
+parser signal with no open call|TERM\nstart 200\nTERM\nend 300\n|1|a signal line with no open call: TERM|
+parser blank line mid-file|start 100\n\nTERM\nend 200\n|1|an unknown line: |
+parser call left open|start 100\nTERM\nend 200\nstart 300\n|1|a call left open at the end of the log|
+BA valid signalled call|start 200\nTERM\nend 300\n|0||0.10|
+PARSER_ROWS
 
-d="$(new_fixture parser-signal-no-call)"
-printf 'TERM\nstart 200\nTERM\nend 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "AW parser: signal without a call refused" 1 "$rc"
-assert_contains "AW parser: signal without a call message" "$(cat "$d/parse.err")" "a signal line with no open call"
-
-d="$(new_fixture parser-extra-token)"
-printf 'start 200\nTERM extra\nend 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "AX parser: extra token refused" 1 "$rc"
-assert_contains "AX parser: extra token message" "$(cat "$d/parse.err")" "an unknown line"
-
-d="$(new_fixture parser-blank-line)"
-printf 'start 200\n\nTERM\nend 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "AY parser: blank line refused" 1 "$rc"
-assert_contains "AY parser: blank line message" "$(cat "$d/parse.err")" "an unknown line"
-
-d="$(new_fixture parser-left-open)"
-printf 'start 100\nTERM\nend 200\nstart 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "AZ parser: left open at end refused" 1 "$rc"
-assert_contains "AZ parser: left open at end message" "$(cat "$d/parse.err")" "a call left open at the end of the log"
-
-d="$(new_fixture parser-valid)"
-printf 'start 200\nTERM\nend 300\n' >"$d/log.txt"
-rc=0
-node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
-assert_eq "BA parser: a valid signalled call parses" 0 "$rc"
-assert_eq "BA parser: that call's duration" 0.10 "$(cat "$d/elapsed")"
+while IFS='|' read -r parser_label parser_log parser_rc parser_msg parser_elapsed; do
+  [ -n "$parser_label" ] || continue
+  d="$(new_fixture "parser-${parser_label//[^a-zA-Z0-9]/-}")"
+  printf '%b' "$parser_log" >"$d/log.txt"
+  rc=0
+  node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || rc=$?
+  assert_eq "$parser_label: exit" "$parser_rc" "$rc"
+  if [ -n "$parser_msg" ]; then
+    assert_contains "$parser_label: message" "$(cat "$d/parse.err")" "$parser_msg"
+  fi
+  if [ -n "$parser_elapsed" ]; then
+    assert_eq "$parser_label: elapsed" "$parser_elapsed" "$(cat "$d/elapsed")"
+  fi
+done <"$parser_rows"
 
 # ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
 # The strict framing rejects the next call's start while the timed-out call is
