@@ -247,8 +247,11 @@ if (signalled.length > 1) fail('more than one signalled call');
 process.stdout.write(((signalled[0].end - signalled[0].start) / 1000).toFixed(2));
 LOG_PARSER
 
-# Counts the calls that carry a signal, with the same framing as the parser, so
-# a fixture can assert that AL's real log holds exactly one of them.
+# Counts the calls that carry a signal, so a fixture can assert that AL's real
+# log holds exactly one of them. It is deliberately laxer than the parser: a
+# `start` while a call is open just begins a new frame, and blank lines are
+# ignored. That cannot produce a false pass, because the parser then yields no
+# elapsed and both of AL's bound assertions go red on the empty value.
 count_signalled="$work/count-signalled.mjs"
 cat >"$count_signalled" <<'COUNT_SIGNALLED'
 import fs from 'node:fs';
@@ -1617,10 +1620,10 @@ fi
 
 # ── AN. a delayed commit lands after the client stopped; next run refuses ────
 # The local registry applies the PUT only when the client's connection closes and
-# never answers it. The deadline below is well above the ordinary calls in this
-# promotion, so only the held PUT reaches it; the client is stopped there and the
-# write lands after it. A 1 s deadline also applied to the earlier reads, whose
-# own slowness could take the ordinary failure path first.
+# never answers it. The 5 s deadline is well above the ordinary reads in this
+# promotion (~0.3 s each), so only a held PUT reaches it; the client is stopped
+# there and the write lands after it. A 1 s deadline also applied to those reads,
+# whose own slowness could take the ordinary failure path first.
 d="$(new_fixture delayed-commit)"
 if [ "$real_ready" -ne 1 ]; then
   printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN delayed-commit"
@@ -1628,7 +1631,7 @@ elif start_registry "$d" delayed-put; then
   mkdir -p "$d/home" "$d/npm-cache"
   raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
     npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-    NPM_TIMEOUT_SECONDS=10 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+    NPM_TIMEOUT_SECONDS=5 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
     python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
@@ -2021,6 +2024,11 @@ fi
 # keep_lock=0, so the EXIT trap removes the lock's pid file. The directory stays
 # only because the reason file is inside it, so the next run still refuses. AN
 # asserts the pid file.
+# The mutant only matters if this run reaches the delayed-commit path: a run
+# that stopped on an earlier read leaves no pid file either, through the
+# failure path's release_lock. So the run is also held to AN's deadline, and
+# exit 7 plus the registry's apply-after-disconnect are asserted first; a run
+# that stopped earlier goes red here instead of reporting the mutant caught.
 mut="$work/tool-release-uncertain-lock.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
   if [ "$real_ready" -eq 1 ]; then
@@ -2029,13 +2037,22 @@ if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
       mkdir -p "$d/home" "$d/npm-cache"
       raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
         npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-        NPM_TIMEOUT_SECONDS=1 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+        NPM_TIMEOUT_SECONDS=5 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
         python3 "$real_pty_runner" "$BASH_BIN" "$mut" 0.5.4 --yes --no-docker)"
       RC=$?
-      if [ -f "$d/root/.promote-latest.lock/pid" ]; then
-        bad "M12 mutation (e): lock release on delayed commit caught" "mutant kept the lock — AN is blind"
+      if [ "$RC" -ne 7 ]; then
+        bad "M12 mutation (e): lock release on delayed commit caught" "run never reached the delayed-commit path (exit $RC, expected 7); the mutant was not exercised"
       else
-        ok "M12 mutation (e): lock release on delayed commit caught" "mutant removed the pid file (AN asserts the pid file)"
+        sleep 2
+        if node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.exit((s.applied||[]).some((a)=>a.pkg==="@tpsdev-ai/cli-darwin-arm64" && a.version==="0.5.4" && (s.disconnected||[]).some((d)=>d.pkg===a.pkg && d.order<a.order))?0:1)' "$d/registry.state"; then
+          if [ -f "$d/root/.promote-latest.lock/pid" ]; then
+            bad "M12 mutation (e): lock release on delayed commit caught" "mutant kept the lock — AN is blind"
+          else
+            ok "M12 mutation (e): lock release on delayed commit caught" "mutant removed the pid file (AN asserts the pid file)"
+          fi
+        else
+          bad "M12 mutation (e): lock release on delayed commit caught" "run never reached the delayed-commit path (registry shows no apply after disconnect); the mutant was not exercised"
+        fi
       fi
     else
       bad "M12 mutation (e): lock release on delayed commit caught" "registry did not start"
