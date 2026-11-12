@@ -297,28 +297,40 @@ function sentEnvelopeDir(): string {
   return join(root, "mail", ".sent-envelopes");
 }
 
-/** Read one line from a child's stdout, or reject naming the bound. */
-async function firstStdoutLine(stream: ReadableStream<Uint8Array>, ms: number): Promise<string> {
+/** Read lines from a child's stdout, keeping any text after a newline for the
+ *  next call, and reject naming the bound when none arrives in time. */
+function peerLines(stream: ReadableStream<Uint8Array>): { next(ms: number): Promise<string> } {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
-  let text = "";
-  const read = (async () => {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) return null;
-      text += decoder.decode(value, { stream: true });
-      const newline = text.indexOf("\n");
-      if (newline >= 0) return text.slice(0, newline);
-    }
-  })();
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<null>((resolveTimeout) => {
-    timer = setTimeout(() => resolveTimeout(null), ms);
-  });
-  const line = await Promise.race([read, timeout]);
-  if (timer) clearTimeout(timer);
-  if (line === null) throw new Error(`the peer printed no port within ${ms}ms`);
-  return line;
+  let buffered = "";
+  const take = (): string | null => {
+    const newline = buffered.indexOf("\n");
+    if (newline < 0) return null;
+    const line = buffered.slice(0, newline);
+    buffered = buffered.slice(newline + 1);
+    return line;
+  };
+  return {
+    async next(ms: number): Promise<string> {
+      const ready = take();
+      if (ready !== null) return ready;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`the peer printed no line within ${ms}ms`)), ms);
+      });
+      try {
+        for (;;) {
+          const { value, done } = await Promise.race([reader.read(), timeout]);
+          if (done) throw new Error(`the peer's stdout ended before a line within ${ms}ms`);
+          buffered += decoder.decode(value, { stream: true });
+          const line = take();
+          if (line !== null) return line;
+        }
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    },
+  };
 }
 
 /** A signed envelope in the shape `tps mail send` stores, plus the verify
@@ -1459,11 +1471,12 @@ describe("the connect bound and the ACK window are separate", () => {
     }
   }, 15_000);
 
-  test("a real peer that never answers the close spends the close grace inside the total", async () => {
+  test("a real frozen peer that never answers the close settles inside the total that counts the close grace", async () => {
     // The peer is the real Noise IK listener (test/helpers/frozen-noise-branch.ts):
     // it completes the handshake, then freezes the moment the deliver arrives —
-    // it neither ACKs nor answers the close, so the delivery's await on the
-    // channel close can only end at the close grace.
+    // it neither ACKs nor answers the close. How long the channel's own close
+    // then waits is the runtime's socket teardown, so this case pins the bound
+    // the delivery settles inside, with one close grace counted in it.
     const hostKp = await loadHostIdentity();
     const peer = Bun.spawn([process.execPath, resolve(import.meta.dir, "helpers/frozen-noise-branch.ts")], {
       cwd: root,
@@ -1475,7 +1488,8 @@ describe("the connect bound and the ACK window are separate", () => {
       stderr: "pipe",
     });
     try {
-      const line = await firstStdoutLine(peer.stdout, 10_000);
+      const lines = peerLines(peer.stdout);
+      const line = await lines.next(10_000);
       const keys = JSON.parse(line) as { port: number; signingKey: string; encryptionKey: string };
       // The branch the HOST routes "remote-a" to is the peer's own keypair.
       registerBranch(
@@ -1489,7 +1503,10 @@ describe("the connect bound and the ACK window are separate", () => {
         JSON.stringify({ host: "127.0.0.1", port: keys.port, transport: "tcp" }),
       );
 
-      const opts = { timeoutMs: 500, ackTimeoutMs: 100 };
+      // An ACK window of 2 s: the peer reports its freeze on its own stdout line
+      // below, and no assertion here depends on how fast it processes the
+      // deliver.
+      const opts = { timeoutMs: 500, ackTimeoutMs: 2_000 };
       const total = remoteDeliveryWorstCaseMs(opts);
       const startedAt = Date.now();
       let caught: unknown;
@@ -1503,12 +1520,23 @@ describe("the connect bound and the ACK window are separate", () => {
         caught = error;
       }
       const elapsedMs = Date.now() - startedAt;
-      // The ACK window ended the attempt, not the connection bound.
+      // The peer reports the freeze itself: a missed premise fails here, naming
+      // it, instead of as a timing number below.
+      const frozenLine = await lines.next(10_000).catch(() => null);
+      if (frozenLine !== "frozen") {
+        throw new Error(
+          `the peer did not report that it froze (stdout line: ${JSON.stringify(frozenLine)}); ` +
+            "the close was answered by a live peer",
+        );
+      }
       expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
-      // The close could not settle until the grace ran out: the elapsed time
-      // proves the delivery really waited on it, so the total must include it.
-      expect(elapsedMs).toBeGreaterThan(CHANNEL_CLOSE_GRACE_MS - 100);
+      // The ACK window ended the attempt, not the connection bound.
+      expect(elapsedMs).toBeGreaterThan(opts.ackTimeoutMs - 100);
       expect(elapsedMs).toBeLessThanOrEqual(total);
+      // The total the delivery reports to callers counts one full close grace:
+      // the channel may wait that long after its own timers, and a caller's
+      // backstop is set from this total.
+      expect(total).toBe(2 * opts.timeoutMs + 2 * opts.ackTimeoutMs + CHANNEL_CLOSE_GRACE_MS);
     } finally {
       try {
         peer.kill("SIGKILL");
