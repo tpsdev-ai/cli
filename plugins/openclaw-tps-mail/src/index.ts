@@ -63,7 +63,15 @@ import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
 import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
-import { deliverToRemoteBranch, deliverToSandbox, remoteDeliveryWorstCaseMs, resolveAgentMailRoot, resolveMailAckTimeoutMs } from "@tpsdev-ai/cli/utils/relay";
+import {
+  MAX_TIMER_DELAY_MS,
+  MailAckTimeoutConfigError,
+  deliverToRemoteBranch,
+  deliverToSandbox,
+  remoteDeliveryWorstCaseMs,
+  resolveAgentMailRoot,
+  resolveMailAckTimeoutMs,
+} from "@tpsdev-ai/cli/utils/relay";
 import {
   TERMINAL_STATES,
   createObligation,
@@ -1282,12 +1290,27 @@ function retryOwedNackInBackground(
   if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
   let ackTimeoutMs: number;
+  let backstopMs: number;
   try {
     ackTimeoutMs = resolveMailAckTimeoutMs();
+    // The bound and the backstop above it come from the relay
+    // (`remoteDeliveryWorstCaseMs`), never from arithmetic copied here. Both
+    // checks sit in this try: a window the relay refuses, and a backstop a
+    // timer cannot hold (it would clamp to 1 ms and log a false timeout at
+    // once), are the same refusal, and neither may fail the startup loop.
+    const deliveryBoundMs = remoteDeliveryWorstCaseMs({ timeoutMs, ackTimeoutMs });
+    backstopMs = deliveryBoundMs + NACK_RETRY_BACKSTOP_MS;
+    if (backstopMs > MAX_TIMER_DELAY_MS) {
+      throw new MailAckTimeoutConfigError(
+        `the relay's ${deliveryBoundMs}ms worst-case delivery bound plus the ${NACK_RETRY_BACKSTOP_MS}ms retry backstop ` +
+          `exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
+      );
+    }
   } catch (err: any) {
-    // A malformed TPS_MAIL_ACK_TIMEOUT_MS must not fail the startup loop. The
-    // retry cannot compute its backstop without the window, so it is not
-    // attempted and the record keeps owing the nack.
+    // A malformed TPS_MAIL_ACK_TIMEOUT_MS — or one whose timers cannot fit —
+    // must not fail the startup loop. The retry cannot compute its backstop
+    // without a window it can hold, so it is not attempted and the record
+    // keeps owing the nack.
     log?.warn?.(
       `tps-mail: nack-retry-config: the owed nack for ${inboundId} to ${sender} was not attempted (${err?.message ?? err}); ` +
         `the record keeps nackPending`,
@@ -1298,10 +1321,7 @@ function retryOwedNackInBackground(
   // windows: the relay closes the transport and reports its own timeout (logged
   // by name in sendNackMail), so the retry only needs a later net to guarantee
   // the promise NEVER hangs the process here — e.g. a route that does not
-  // settle for some other reason. The bound comes from the relay
-  // (`remoteDeliveryWorstCaseMs`), never from arithmetic copied here.
-  const deliveryBoundMs = remoteDeliveryWorstCaseMs({ timeoutMs, ackTimeoutMs });
-  const backstopMs = deliveryBoundMs + NACK_RETRY_BACKSTOP_MS;
+  // settle for some other reason.
   const recCurPath = findCurPath(mailDir, agentId, inboundId);
   const ctx = makeYieldCtx(
     mailDir,

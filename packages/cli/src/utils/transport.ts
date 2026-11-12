@@ -63,6 +63,15 @@ export interface TransportServer {
 }
 
 /**
+ * How long a channel's `close()` waits for a peer that does not answer the
+ * close: both wire channels end their socket and then wait this long for the
+ * close to complete. `close()` resolves at this bound even when the peer never
+ * answers, so a delivery that awaits it (`deliverToRemoteBranch`) spends up to
+ * this long after its timers — `remoteDeliveryWorstCaseMs` counts it.
+ */
+export const CHANNEL_CLOSE_GRACE_MS = 2_000;
+
+/**
  * Settle a listener's `close()` with or without a live peer, and resolve at
  * once when the listener is already stopped (idempotent).
  *

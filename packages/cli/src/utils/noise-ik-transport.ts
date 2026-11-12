@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  CHANNEL_CLOSE_GRACE_MS,
   closeListener,
   type BranchTarget,
   type TransportChannel,
@@ -181,7 +182,7 @@ class NoiseIkChannel implements TransportChannel {
       this.socket.once("close", () => resolve());
       try { this.socket.end(); } catch { resolve(); }
       // Safety timeout — don't hang if close stalls
-      setTimeout(resolve, 2000).unref();
+      setTimeout(resolve, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 

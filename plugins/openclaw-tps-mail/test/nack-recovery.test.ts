@@ -16,8 +16,12 @@ import { buildSignedEnvelope, pubkeyFromSeed } from "../../../packages/cli/test/
  * on, so nothing else in the suite observes a behaviour change.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";import { tmpdir } from "node:os";
+
+// The plugin's refusal path computes the backstop from the relay's own total;
+// the accepted window's ceiling comes from the same module.
+import { MAX_MAIL_ACK_TIMEOUT_MS } from "@tpsdev-ai/cli/utils/relay";
 
 // The branch side of the wire, for the case that needs a REAL peer: a Noise IK
 // listener that ACKs late. Imported from source (the plugin has no subpath for
@@ -180,8 +184,10 @@ describe("cli#389 round 12 — an owed-nack retry is bounded and off the startup
     seedOwedNack(inboundId, reason);
     routeSenderRemote(SENDER); // flint addressed as its own branch → remote-branch
     relay.hang = true; // the connection never resolves
-    // A short ACK window keeps the retry's backstop (the relay's whole bound for
-    // these windows, plus NACK_RETRY_BACKSTOP_MS) inside this test's poll.
+    // A short connection bound and ACK window keep the retry's backstop (the
+    // relay's whole bound for these windows — which includes the channel close
+    // grace — plus NACK_RETRY_BACKSTOP_MS) inside this test's poll.
+    process.env.TPS_NACK_RETRY_TIMEOUT_MS = "100";
     process.env.TPS_MAIL_ACK_TIMEOUT_MS = "200";
 
     const { startPromise, warned, infos } = start();
@@ -254,5 +260,72 @@ describe("cli#962 round 13 — the backstop sits above the relay's whole bound",
     } finally {
       await server.close();
     }
+  }, 20000);
+});
+
+/** Wait `ms`, then report whether a line matching `pred` appeared. */
+async function quietFor(ms: number, warned: string[], pred: (m: string) => boolean): Promise<string[]> {
+  await new Promise((r) => setTimeout(r, ms));
+  return warned.filter(pred);
+}
+
+describe("cli#962 round 15 — a window the retry cannot hold", () => {
+  it("R15-a: a malformed ACK window names the owed nack, startup still completes, and the debt stays", async () => {
+    const inboundId = "msg-r15-bad-window";
+    const reason = "receipt-malformed";
+    seedOwedNack(inboundId, reason);
+    routeSenderRemote(SENDER);
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = "soon";
+
+    const { startPromise, warned, infos } = start();
+
+    // The post-loop retention sweep is the proof that the refusal did not fail
+    // or stall the startup path.
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran").toBe(true);
+
+    const named = await pollUntil(
+      () => warned.some((m) => m.includes("nack-retry-config") && m.includes(inboundId) && m.includes(SENDER)),
+      1000,
+    );
+    expect(named, "the refusal names the inbound id and the sender").toBe(true);
+    expect(relay.deliver.length, "nothing was handed to a route").toBe(0);
+
+    // No retry ran, so no timeout line may follow.
+    expect(await quietFor(300, warned, (m) => m.includes("nack-retry-timeout"))).toEqual([]);
+
+    const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
+    expect(rec.nackPending).toBe(true);
+    expect(rec.nackSentAt).toBeUndefined();
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+
+  it("R15-b: a window whose backstop would overflow the timer limit is refused, never armed at 1 ms", async () => {
+    const inboundId = "msg-r15-timer-overflow";
+    seedOwedNack(inboundId, "receipt-malformed");
+    routeSenderRemote(SENDER);
+    // The largest accepted window with the default connection bound leaves the
+    // relay's total one millisecond under the limit, so the backstop above it
+    // cannot be a timer. A setTimeout past the limit fires after 1 ms.
+    process.env.TPS_NACK_RETRY_TIMEOUT_MS = "20000";
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = String(MAX_MAIL_ACK_TIMEOUT_MS);
+
+    const { startPromise, warned, infos } = start();
+
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran").toBe(true);
+
+    const named = await pollUntil(
+      () => warned.some((m) => m.includes("nack-retry-config") && m.includes(inboundId)),
+      1000,
+    );
+    expect(named, "the refusal names the inbound id").toBe(true);
+    expect(relay.deliver.length, "nothing was handed to a route").toBe(0);
+    expect(await quietFor(300, warned, (m) => m.includes("nack-retry-timeout"))).toEqual([]);
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
   }, 20000);
 });

@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  CHANNEL_CLOSE_GRACE_MS,
   closeListener,
   type BranchTarget,
   type TransportChannel,
@@ -144,8 +145,8 @@ class WsNoiseChannel implements TransportChannel {
       if (this.ws.readyState !== WebSocket.CLOSING) {
         try { this.ws.close(1000, "done"); } catch { resolve(); }
       }
-      // Safety timeout — if close handshake stalls, don't hang forever
-      setTimeout(resolve, 2000).unref();
+      // Safety timeout — if the close handshake stalls, don't hang forever
+      setTimeout(resolve, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 

@@ -9,7 +9,7 @@ import { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES, canonicalMailboxRoo
 export { relayAcceptanceLockRoot, RELAY_ACCEPT_LOCK_STRIPES };
 import { acquireMailLockSync } from "./mail-lock.js";
 import { LoopDetector } from "./loop-detector.js";
-import { FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
+import { CHANNEL_CLOSE_GRACE_MS, FileSystemTransport, resolveTransport, TransportRegistry, type TransportChannel, type TpsMessage } from "./transport.js";
 import { NoiseIkTransport } from "./noise-ik-transport.js";
 import { WsNoiseTransport } from "./ws-noise-transport.js";
 import { WireDeliveryTransport } from "./wire-delivery.js";
@@ -941,9 +941,14 @@ export const MAIL_ACK_TIMEOUT_FLAG = "--ack-timeout";
 /** The largest delay a Node timer accepts; a larger one is clamped to 1 ms. */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/** The largest ACK window that keeps BOTH timers in range: the ACK timer itself
- *  and the send bound (the default connection bound plus the window). */
-export const MAX_MAIL_ACK_TIMEOUT_MS = MAX_TIMER_DELAY_MS - DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
+/** The largest ACK window that keeps EVERY timer one delivery runs inside the
+ *  timer limit: the ACK timer, the send bound (the default connection bound plus
+ *  the window), and the channel close grace the delivery awaits. A window is
+ *  refused by name below when the connection bound the caller passes makes the
+ *  total exceed the limit even so. */
+export const MAX_MAIL_ACK_TIMEOUT_MS = Math.floor(
+  (MAX_TIMER_DELAY_MS - 2 * DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS - CHANNEL_CLOSE_GRACE_MS) / 2,
+);
 
 /** Exit status for a delivery whose ACK did not arrive: EX_TEMPFAIL (75). */
 export const EXIT_DELIVERY_UNCONFIRMED = 75;
@@ -967,11 +972,12 @@ export function parseMailAckTimeoutMs(raw: string, source: string): number {
     throw new MailAckTimeoutConfigError(`${source} must be a positive integer number of milliseconds (got "${raw}")`);
   }
   // A longer window would make the ACK timer, or the send bound it is added to,
-  // exceed the largest delay a Node timer accepts (it clamps to 1 ms).
+  // or the worst-case total the delivery awaits, exceed the largest delay a
+  // Node timer accepts (it clamps to 1 ms).
   if (ms > MAX_MAIL_ACK_TIMEOUT_MS) {
     throw new MailAckTimeoutConfigError(
       `${source} must be at most ${MAX_MAIL_ACK_TIMEOUT_MS} milliseconds (got "${raw}"): ` +
-        `a longer window, plus the connection bound, would exceed the ${MAX_TIMER_DELAY_MS}ms timer limit`,
+        `a longer window, plus the connection bound and the channel close grace, would exceed the ${MAX_TIMER_DELAY_MS}ms timer limit`,
     );
   }
   return ms;
@@ -1056,17 +1062,33 @@ function resolveRemoteDeliveryWindows(opts: RemoteBranchDeliveryOptions): Remote
       : DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS;
   // The send bound is the connection bound plus the ACK window. A timer delay
   // past MAX_TIMER_DELAY_MS is clamped to 1 ms, which fails the attempt at once.
-  return { connectMs, ackTimeoutMs, sendMs: connectMs + ackTimeoutMs };
+  const windows = { connectMs, ackTimeoutMs, sendMs: connectMs + ackTimeoutMs };
+  const worstCaseMs = worstCaseFor(windows);
+  if (worstCaseMs > MAX_TIMER_DELAY_MS) {
+    throw new MailAckTimeoutConfigError(
+      `the ${ackTimeoutMs}ms ACK window plus the ${connectMs}ms connection bound and the ` +
+        `${CHANNEL_CLOSE_GRACE_MS}ms channel close grace come to ${worstCaseMs}ms, past the ` +
+        `${MAX_TIMER_DELAY_MS}ms timer limit`,
+    );
+  }
+  return windows;
 }
 
-/** The relay's WORST-CASE total for one delivery with these options: the
- *  connection bound, then the send bound (the connection bound plus the ACK
- *  window), then the full ACK window, which starts when the send resolves.
- *  A caller that needs a bound ABOVE the delivery's own calls this instead of
- *  copying the arithmetic. */
+/** The whole time one delivery can take with these windows: the connection
+ *  bound, then the send bound (the connection bound plus the ACK window), then
+ *  the full ACK window, which starts when the send resolves, then the channel
+ *  close grace, which the delivery awaits after its timers. */
+function worstCaseFor({ connectMs, ackTimeoutMs, sendMs }: RemoteDeliveryWindows): number {
+  return connectMs + sendMs + ackTimeoutMs + CHANNEL_CLOSE_GRACE_MS;
+}
+
+/** The relay's WORST-CASE total for one delivery with these options, from the
+ *  same windows `deliverToRemoteBranch` runs. A caller that needs a bound ABOVE
+ *  the delivery's own calls this instead of copying the arithmetic. Throws
+ *  `MailAckTimeoutConfigError` for a configuration whose total is past
+ *  `MAX_TIMER_DELAY_MS`. */
 export function remoteDeliveryWorstCaseMs(opts: RemoteBranchDeliveryOptions = {}): number {
-  const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
-  return connectMs + sendMs + ackTimeoutMs;
+  return worstCaseFor(resolveRemoteDeliveryWindows(opts));
 }
 
 export async function deliverToRemoteBranch(
@@ -1074,6 +1096,10 @@ export async function deliverToRemoteBranch(
   message: RelayMessage,
   opts: RemoteBranchDeliveryOptions = {}
 ): Promise<void> {
+  // Resolve (and validate) the windows BEFORE anything else: a configuration
+  // whose timers cannot fit is refused by name without reading the route or
+  // opening a connection.
+  const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
   const branchDir = join(process.env.HOME || homedir(), ".tps", "branch-office", branchId);
   const remotePath = join(branchDir, "remote.json");
   if (!existsSync(remotePath)) {
@@ -1099,12 +1125,6 @@ export async function deliverToRemoteBranch(
   // The connection has its own deadline: a slow or unreachable branch must not
   // consume the ACK window, and a connect that returns just before the deadline
   // must still get the full ACK window (started after the deliver is sent).
-  const { connectMs, ackTimeoutMs, sendMs } = resolveRemoteDeliveryWindows(opts);
-  if (sendMs > MAX_TIMER_DELAY_MS) {
-    throw new MailAckTimeoutConfigError(
-      `the ${ackTimeoutMs}ms ACK window plus the ${connectMs}ms connection bound exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
-    );
-  }
   // A closer for the channel once it exists, so EVERY expiry path and the
   // finally can tear it down. Starts as a no-op (there is nothing to close
   // before connect returns).

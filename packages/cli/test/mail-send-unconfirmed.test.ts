@@ -40,6 +40,7 @@ import {
 } from "../src/utils/relay.js";
 import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
+import { CHANNEL_CLOSE_GRACE_MS } from "../src/utils/transport.js";
 import { getInbox } from "../src/utils/mail.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
@@ -296,6 +297,30 @@ function sentEnvelopeDir(): string {
   return join(root, "mail", ".sent-envelopes");
 }
 
+/** Read one line from a child's stdout, or reject naming the bound. */
+async function firstStdoutLine(stream: ReadableStream<Uint8Array>, ms: number): Promise<string> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let text = "";
+  const read = (async () => {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) return null;
+      text += decoder.decode(value, { stream: true });
+      const newline = text.indexOf("\n");
+      if (newline >= 0) return text.slice(0, newline);
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<null>((resolveTimeout) => {
+    timer = setTimeout(() => resolveTimeout(null), ms);
+  });
+  const line = await Promise.race([read, timeout]);
+  if (timer) clearTimeout(timer);
+  if (line === null) throw new Error(`the peer printed no port within ${ms}ms`);
+  return line;
+}
+
 /** A signed envelope in the shape `tps mail send` stores, plus the verify
  *  client that resolves its sender to the seed's public key. */
 async function signedStoredEnvelope(
@@ -415,14 +440,25 @@ describe("the ACK window is configurable and refuses bad values by name", () => 
   });
 
   test("the largest window whose timers fit is accepted, and one more is refused by name", () => {
-    // The ACK timer and the send bound (connection + window) must both stay
-    // inside the largest delay a Node timer accepts.
-    expect(MAX_MAIL_ACK_TIMEOUT_MS).toBe(2_147_463_647);
+    // The ACK timer, the send bound (connection + window) and the worst-case
+    // total the delivery awaits (which adds the channel close grace) must all
+    // stay inside the largest delay a Node timer accepts.
+    expect(MAX_MAIL_ACK_TIMEOUT_MS).toBe(1_073_720_823);
     expect(parseMailAckTimeoutMs(String(MAX_MAIL_ACK_TIMEOUT_MS), "--ack-timeout")).toBe(MAX_MAIL_ACK_TIMEOUT_MS);
     expect(() => parseMailAckTimeoutMs(String(MAX_MAIL_ACK_TIMEOUT_MS + 1), "--ack-timeout")).toThrow(
-      /--ack-timeout must be at most 2147463647 milliseconds/,
+      /--ack-timeout must be at most 1073720823 milliseconds/,
     );
-    expect(() => parseMailAckTimeoutMs("2147483647", "--ack-timeout")).toThrow(/must be at most 2147463647 milliseconds/);
+    expect(() => parseMailAckTimeoutMs("2147483647", "--ack-timeout")).toThrow(/must be at most 1073720823 milliseconds/);
+  });
+
+  test("the exported total refuses a configuration past the timer limit", () => {
+    // The largest accepted window with the default connection bound fits (just);
+    // a larger connection bound does not, and the exported total refuses it the
+    // same way the delivery does.
+    expect(remoteDeliveryWorstCaseMs({ ackTimeoutMs: MAX_MAIL_ACK_TIMEOUT_MS })).toBe(2_147_483_646);
+    expect(() => remoteDeliveryWorstCaseMs({ timeoutMs: 25_000, ackTimeoutMs: MAX_MAIL_ACK_TIMEOUT_MS })).toThrow(
+      MailAckTimeoutConfigError,
+    );
   });
 
   test("deliverToRemoteBranch refuses a computed bound past the timer limit before connecting", async () => {
@@ -572,7 +608,7 @@ describe("tps mail send exit codes", () => {
     pointRemoteAtServer();
     const r = await runSend(["--stdin", "--ack-timeout", "2147483647"]);
     expect(r.status).toBe(1);
-    expect(r.stderr).toContain("--ack-timeout must be at most 2147463647 milliseconds");
+    expect(r.stderr).toContain("--ack-timeout must be at most 1073720823 milliseconds");
     expect(branch.deliveries).toEqual([]);
   }, 20_000);
 });
@@ -1300,10 +1336,11 @@ describe("the connect bound and the ACK window are separate", () => {
   }, 5_000);
 
   test("the exported worst case covers every window the relay runs", async () => {
-    // connect 100 + send (100 + 100) + ACK window 100. The sibling cases pin
-    // the two components the send bound is made of ("exceeded 200ms after
-    // connect (send)") and the separate ACK window.
-    expect(remoteDeliveryWorstCaseMs({ timeoutMs: 100, ackTimeoutMs: 100 })).toBe(400);
+    // connect 100 + send (100 + 100) + ACK window 100 + the 2000 ms channel close
+    // grace the delivery awaits. The sibling cases pin the two components the
+    // send bound is made of ("exceeded 200ms after connect (send)") and the
+    // separate ACK window.
+    expect(remoteDeliveryWorstCaseMs({ timeoutMs: 100, ackTimeoutMs: 100 })).toBe(2_400);
     const id = "aaaaaaaa-0000-4000-8000-000000000003";
     const channel: TransportChannel = {
       send() {
@@ -1421,6 +1458,66 @@ describe("the connect bound and the ACK window are separate", () => {
       await server.close();
     }
   }, 15_000);
+
+  test("a real peer that never answers the close spends the close grace inside the total", async () => {
+    // The peer is the real Noise IK listener (test/helpers/frozen-noise-branch.ts):
+    // it completes the handshake, then freezes the moment the deliver arrives —
+    // it neither ACKs nor answers the close, so the delivery's await on the
+    // channel close can only end at the close grace.
+    const hostKp = await loadHostIdentity();
+    const peer = Bun.spawn([process.execPath, resolve(import.meta.dir, "helpers/frozen-noise-branch.ts")], {
+      cwd: root,
+      env: {
+        ...process.env,
+        TPS_TEST_PEER_HOST_PUBKEY: Buffer.from(hostKp.encryption.publicKey).toString("base64url"),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    try {
+      const line = await firstStdoutLine(peer.stdout, 10_000);
+      const keys = JSON.parse(line) as { port: number; signingKey: string; encryptionKey: string };
+      // The branch the HOST routes "remote-a" to is the peer's own keypair.
+      registerBranch(
+        "remote-a",
+        new Uint8Array(Buffer.from(keys.signingKey, "base64url")),
+        undefined,
+        new Uint8Array(Buffer.from(keys.encryptionKey, "base64url")),
+      );
+      writeFileSync(
+        join(root, ".tps", "branch-office", "remote-a", "remote.json"),
+        JSON.stringify({ host: "127.0.0.1", port: keys.port, transport: "tcp" }),
+      );
+
+      const opts = { timeoutMs: 500, ackTimeoutMs: 100 };
+      const total = remoteDeliveryWorstCaseMs(opts);
+      const startedAt = Date.now();
+      let caught: unknown;
+      try {
+        await deliverToRemoteBranch(
+          "remote-a",
+          { id: "dddddddd-0000-4000-8000-000000000004", to: "local", from: "agent-a", body: "no close answer" },
+          opts,
+        );
+      } catch (error) {
+        caught = error;
+      }
+      const elapsedMs = Date.now() - startedAt;
+      // The ACK window ended the attempt, not the connection bound.
+      expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
+      // The close could not settle until the grace ran out: the elapsed time
+      // proves the delivery really waited on it, so the total must include it.
+      expect(elapsedMs).toBeGreaterThan(CHANNEL_CLOSE_GRACE_MS - 100);
+      expect(elapsedMs).toBeLessThanOrEqual(total);
+    } finally {
+      try {
+        peer.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      await peer.exited;
+    }
+  }, 20_000);
 
   test("a branch that closes before the ACK exits 75 at once", async () => {
     await startBranchServer({ closeBeforeAck: true });
