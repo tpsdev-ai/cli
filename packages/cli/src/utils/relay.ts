@@ -999,8 +999,9 @@ export function resolveMailAckTimeoutMs(env: NodeJS.ProcessEnv = process.env, fl
  *  envelope, that retry is the same signed message. When it did not — the
  *  first send of an explicit id, or a re-send whose stored entry was missing
  *  or expired — this send signed and stored a new envelope. Either way the
- *  text states the invariant that holds on both paths: the branch inbox
- *  records a relayed message id at most once. */
+ *  text states what holds on both paths: while the branch inbox still holds a
+ *  record for that id, it writes no second one; once that record is read, the
+ *  id can be accepted again (durable dedup: cli#999). */
 export class MailDeliveryUnconfirmedError extends Error {
   readonly messageId: string;
   readonly branchId: string;
@@ -1018,12 +1019,12 @@ export class MailDeliveryUnconfirmedError extends Error {
       `Delivery unconfirmed: ${why ?? `no ACK from branch "${branchId}" for message ${messageId} within ${ackTimeoutMs}ms`}; ` +
         (storedNewExplicitEnvelope
           ? `this send signed and stored a new envelope under --message-id ${messageId}; ` +
-            `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
+            `if the branch's inbox still holds a different payload under that id, it refuses this one as a same-id conflict, ` +
             `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
             `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-            `and the branch inbox records that id at most once. Check the branch's inbox first.`
+            `and while the first copy is still in the branch's inbox, a re-send with the same id adds no second copy. Check the branch's inbox first.`
           : `the message may still arrive. If you re-send, reuse --message-id ${messageId}: ` +
-            `it re-sends the stored envelope when one is still available, and the branch inbox records that id at most once.`),
+            `it re-sends the stored envelope when one is still available, and while the first copy is still in the branch's inbox, a re-send with the same id adds no second copy.`),
     );
     this.name = "MailDeliveryUnconfirmedError";
     this.messageId = messageId;

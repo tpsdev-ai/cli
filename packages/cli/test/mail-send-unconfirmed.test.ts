@@ -704,8 +704,8 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(branch.deliveries[1].timestamp).not.toBe(firstTimestamp);
     expect(JSON.parse(readFileSync(sentEnvelopeFile(id), "utf-8")).timestamp).toBe(branch.deliveries[1].timestamp);
     // The branch keys its record by (branch, id) and compares the payload, so the
-    // new timestamp is a same-id conflict: it refuses the delivery and sends no
-    // ACK, and the sender exits unconfirmed.
+    // new timestamp is a same-id conflict while the record is present: it refuses
+    // the delivery and sends no ACK, and the sender exits unconfirmed.
     expect(branch.acceptErrors.map((error: any) => error.message)).toEqual([
       `relayed delivery conflict for branch remote-a message ${id}`,
     ]);
@@ -716,10 +716,10 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(second.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 1000ms; ` +
         `this send signed and stored a new envelope under --message-id ${id}; ` +
-        `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
+        `if the branch's inbox still holds a different payload under that id, it refuses this one as a same-id conflict, ` +
         `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
         `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-        `and the branch inbox records that id at most once. Check the branch's inbox first.`,
+        `and while the first copy is still in the branch's inbox, a re-send with the same id adds no second copy. Check the branch's inbox first.`,
     );
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 30_000);
@@ -737,10 +737,10 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(first.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
         `this send signed and stored a new envelope under --message-id ${id}; ` +
-        `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
+        `if the branch's inbox still holds a different payload under that id, it refuses this one as a same-id conflict, ` +
         `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
         `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-        `and the branch inbox records that id at most once. Check the branch's inbox first.`,
+        `and while the first copy is still in the branch's inbox, a re-send with the same id adds no second copy. Check the branch's inbox first.`,
     );
     expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id]);
     expect(inboxRecords("remote-a")).toHaveLength(1);
@@ -801,7 +801,7 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(first.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
         `the message may still arrive. If you re-send, reuse --message-id ${id}: ` +
-        `it re-sends the stored envelope when one is still available, and the branch inbox records that id at most once.`,
+        `it re-sends the stored envelope when one is still available, and while the first copy is still in the branch's inbox, a re-send with the same id adds no second copy.`,
     );
     // The printed retry command names the generated id, so its signed envelope
     // must already be stored.

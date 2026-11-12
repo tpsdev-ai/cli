@@ -1607,9 +1607,9 @@ async function reconcileObligation(
  * CONNECTION; the relay bounds the send above it and waits `opts.ackTimeoutMs`
  * for the ACK. The relay CLOSES the transport when one of its timers expires.
  * An expired connection or send bound is logged BY NAME (`nack-retry-timeout`)
- * rather than as an ordinary delivery error, so an operator can tell a dead
- * branch from a refused one; an expired ACK window is logged as `could not
- * deliver the nack` and the record keeps nackPending.
+ * rather than as an ordinary delivery error, so an operator can distinguish a
+ * timeout from an explicit refusal; an expired ACK window is logged as `could
+ * not deliver the nack` and the record keeps nackPending.
  */
 async function sendNackMail(
   ctx: YieldContext,

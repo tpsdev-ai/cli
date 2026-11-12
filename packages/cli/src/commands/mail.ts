@@ -357,7 +357,9 @@ async function storeExplicitSignedEnvelope(
 /** Store the signed envelope of a REMOTE send that generated its own id. The
  *  exit-75 message prints that id and tells the sender to re-send with it; only
  *  the stored bytes make that retry the same signed message (same id, timestamp
- *  and payload), which the branch inbox records at most once. */
+ *  and payload). While the branch inbox still holds a record for that id, it
+ *  writes no second one; once that record is read, the id can be accepted again
+ *  (durable dedup: cli#999). */
 async function storeGeneratedSignedEnvelope(
   from: string,
   to: string,

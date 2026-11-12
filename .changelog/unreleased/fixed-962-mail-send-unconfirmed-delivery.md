@@ -9,12 +9,13 @@
   stored entry that fails those checks is refused by name and nothing is sent.
   A stored entry that is missing is signed again under that id and sent, and one
   older than 7 days is signed again when it can be cleared, otherwise the
-  re-send is refused. The branch inbox records a relayed message id at most
-  once, and a different payload under the same id is a same-id conflict. A
-  remote send that generated its id stores that signed envelope too, so the
-  retry the unconfirmed message prints re-sends the same bytes. A connection the
-  branch closes before the ACK reports delivery unconfirmed as well. A
-  `TPS_INBOUND_CHAIN_JSON` chain is refused before signing when it has 16 or
-  more entries (`delegation chain exceeds the maximum of 16 hops`) or when a
-  hop's `signature` is not the one its kind carries (a string for an agent hop,
-  `null` for a human hop).
+  re-send is refused. While the first copy is still in the branch's inbox, a
+  re-send with the same id adds no second copy, and if the branch's inbox still
+  holds a different payload under that id, it refuses this one as a same-id
+  conflict. A remote send that generated its id stores that signed envelope
+  too, so the retry the unconfirmed message prints re-sends the same bytes. A
+  connection the branch closes before the ACK reports delivery unconfirmed as
+  well. A `TPS_INBOUND_CHAIN_JSON` chain is refused before signing when it has
+  16 or more entries (`delegation chain exceeds the maximum of 16 hops`) or when
+  a hop's `signature` is not the one its kind carries (a string for an agent
+  hop, `null` for a human hop).

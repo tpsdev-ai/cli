@@ -4,9 +4,11 @@
  * same signed bytes rather than sign a fresh envelope. Signing again puts the
  * current millisecond in `timestamp` and a fresh signature on the envelope;
  * the branch compares the accepted payload (from, to, timestamp and content),
- * so a re-signed copy of the same message is a payload CONFLICT unless it
- * lands in the same millisecond. Storing the first signed envelope is what
- * makes the id a stable delivery key.
+ * so a re-signed copy of the same message can carry a different payload. While
+ * the branch inbox still holds a record for that id, it writes no second one;
+ * once that record is read, the id can be accepted again (durable dedup:
+ * cli#999). Storing the first signed envelope is what makes the id a stable
+ * delivery key.
  */
 import { createHash } from "node:crypto";
 import { lstatSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
@@ -185,8 +187,8 @@ function assertSameInboundChain(envelope: Envelope, expected: StoredEnvelopeExpe
 
 /** Read the signed envelope stored for `messageId` when it is the same message
  *  and still verifies with the sender's CURRENT key. Returns undefined when no
- *  entry exists, and for an entry older than `SENT_ENVELOPE_TTL_MS`, whose
- *  removal is attempted. The entry is only ours if it is a regular file,
+ *  entry exists; after file validation, an expired entry returns `undefined`
+ *  and removal is attempted. The entry is only ours if it is a regular file,
  *  readable only by its owner, and owned by this user: otherwise reusing it
  *  would send bytes this process cannot vouch for. */
 export async function readSentEnvelope(
@@ -298,8 +300,8 @@ export async function storeSentEnvelope(
   }
 }
 
-/** Drop entries older than the reuse window. Best effort: an entry it cannot
- *  remove is left in place, and the read still treats it as expired. */
+/** Drop entries older than the reuse window. Pruning is best effort; an entry
+ *  it cannot remove is left for a later read to validate or refuse. */
 function pruneExpired(dir: string): void {
   let entries: string[];
   try {
