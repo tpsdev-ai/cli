@@ -4,7 +4,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch } from "../src/utils/identity.js";
-import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
+import { WsNoiseTransport, WsNoiseChannel } from "../src/utils/ws-noise-transport.js";
+import { CHANNEL_CLOSE_GRACE_MS } from "../src/utils/transport.js";
+import { createHash } from "node:crypto";
+import { WebSocket } from "ws";
 import { createPatchShared } from "./helpers/patch-shared.js";
 
 const patchShared = createPatchShared();
@@ -187,4 +190,70 @@ describe("WsNoiseTransport", () => {
     await ch.close();
     await server.close();
   });
+
+  test("close terminates a WebSocket whose peer never answers the close frame", async () => {
+    // A raw WebSocket peer that completes the HTTP upgrade and then stops
+    // reading: the client's close frame is never answered.
+    const sockets = new Set<net.Socket>();
+    const peer = net.createServer((sock) => {
+      sockets.add(sock);
+      sock.on("close", () => sockets.delete(sock));
+      sock.on("error", () => {});
+      let request = "";
+      const onData = (chunk: Buffer) => {
+        request += chunk.toString("latin1");
+        const end = request.indexOf("\r\n\r\n");
+        if (end === -1) return;
+        sock.off("data", onData);
+        const headers = new Map<string, string>();
+        for (const line of request.slice(0, end).split("\r\n").slice(1)) {
+          const colon = line.indexOf(":");
+          if (colon > 0) headers.set(line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim());
+        }
+        const accept = createHash("sha1")
+          .update(`${headers.get("sec-websocket-key") ?? ""}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
+          .digest("base64");
+        sock.write(
+          "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+            `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        );
+        // Stay alive and silent: never read another byte.
+        sock.pause();
+      };
+      sock.on("data", onData);
+    });
+    await new Promise<void>((resolve, reject) => {
+      peer.listen(0, "127.0.0.1", () => resolve());
+      peer.once("error", reject);
+    });
+    const port = (peer.address() as net.AddressInfo).port;
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}`);
+    await new Promise<void>((resolve, reject) => {
+      ws.once("open", () => resolve());
+      ws.once("error", reject);
+    });
+
+    const channel = new WsNoiseChannel(ws, {} as any, {} as any, "peer-fp");
+    try {
+      const started = Date.now();
+      await channel.close();
+      const elapsed = Date.now() - started;
+
+      // terminate() destroys the socket; the `close` event that moves readyState
+      // to CLOSED follows. Bound the wait so a regression fails by name.
+      const closed = await new Promise<boolean>((resolve) => {
+        if (ws.readyState === WebSocket.CLOSED) return resolve(true);
+        const timer = setTimeout(() => resolve(ws.readyState === WebSocket.CLOSED), 1000);
+        ws.once("close", () => { clearTimeout(timer); resolve(true); });
+      });
+
+      expect(closed, "the ws readyState is CLOSED after close").toBe(true);
+      expect(elapsed, "close resolves within the grace plus a margin").toBeLessThan(CHANNEL_CLOSE_GRACE_MS + 1000);
+    } finally {
+      ws.terminate();
+      for (const sock of sockets) sock.destroy();
+      await new Promise<void>((resolve) => peer.close(() => resolve()));
+    }
+  }, 10_000);
 });

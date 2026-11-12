@@ -67,9 +67,10 @@ export interface TransportServer {
  * close. The two remote-branch channels (`WsNoiseChannel` via `ws.close`,
  * `NoiseIkChannel` via `socket.end`) start the close and then wait up to this
  * long for the close event; `PlainTcpChannel.close` ends its socket and does
- * not wait. `close()` resolves at this bound even when the peer never answers,
- * so a delivery that awaits it (`deliverToRemoteBranch`) spends up to this long
- * after its timers — `remoteDeliveryWorstCaseMs` counts it.
+ * not wait. When the grace expires with the peer still not answering, each of
+ * those two channels destroys the connection and then resolves, so a delivery
+ * that awaits it (`deliverToRemoteBranch`) spends up to this long after its
+ * timers — `remoteDeliveryWorstCaseMs` counts it.
  */
 export const CHANNEL_CLOSE_GRACE_MS = 2_000;
 

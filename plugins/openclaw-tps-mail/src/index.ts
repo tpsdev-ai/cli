@@ -1293,40 +1293,44 @@ function retryOwedNackInBackground(
 ): void {
   if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
-  let ackTimeoutMs: number;
-  let backstopMs: number;
-  try {
-    ackTimeoutMs = resolveMailAckTimeoutMs();
-    // The bound and the backstop above it come from the relay
-    // (`remoteDeliveryWorstCaseMs`), never from arithmetic copied here. Both
-    // checks sit in this try: a window the relay refuses, and a backstop a
-    // timer cannot hold (it would clamp to 1 ms and log a false timeout at
-    // once), are the same refusal, and neither may fail the startup loop.
-    const deliveryBoundMs = remoteDeliveryWorstCaseMs({ timeoutMs, ackTimeoutMs });
-    backstopMs = deliveryBoundMs + NACK_RETRY_BACKSTOP_MS;
-    if (backstopMs > MAX_TIMER_DELAY_MS) {
-      throw new MailAckTimeoutConfigError(
-        `the relay's ${deliveryBoundMs}ms worst-case delivery bound plus the ${NACK_RETRY_BACKSTOP_MS}ms retry backstop ` +
-          `exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
+  // Resolve the sender's route FIRST, with the same resolver sendNackMail uses:
+  // only the remote-branch route waits on the ACK window, so a malformed
+  // TPS_MAIL_ACK_TIMEOUT_MS must not refuse a local, outbox or bridge retry.
+  const route = routeFor(mailDir, cfg, accountId, sender);
+  let ackTimeoutMs: number | undefined;
+  let backstopMs = NACK_RETRY_BACKSTOP_MS;
+  if (route.kind === "remote-branch") {
+    try {
+      ackTimeoutMs = resolveMailAckTimeoutMs();
+      // The bound and the backstop above it come from the relay
+      // (`remoteDeliveryWorstCaseMs`), never from arithmetic copied here. Both
+      // checks sit in this try: a window the relay refuses, and a backstop a
+      // timer cannot hold (it would clamp to 1 ms and log a false timeout at
+      // once), are the same refusal, and neither may fail the startup loop.
+      const deliveryBoundMs = remoteDeliveryWorstCaseMs({ timeoutMs, ackTimeoutMs });
+      backstopMs = deliveryBoundMs + NACK_RETRY_BACKSTOP_MS;
+      if (backstopMs > MAX_TIMER_DELAY_MS) {
+        throw new MailAckTimeoutConfigError(
+          `the relay's ${deliveryBoundMs}ms worst-case delivery bound plus the ${NACK_RETRY_BACKSTOP_MS}ms retry backstop ` +
+            `exceeds the ${MAX_TIMER_DELAY_MS}ms timer limit`,
+        );
+      }
+    } catch (err: any) {
+      // A malformed TPS_MAIL_ACK_TIMEOUT_MS — or one whose timers cannot fit —
+      // must not fail the startup loop. The retry cannot compute its backstop
+      // without a window it can hold, so it is not attempted and the record
+      // keeps owing the nack.
+      log?.warn?.(
+        `tps-mail: nack-retry-config: the owed nack for ${inboundId} to ${sender} was not attempted (${err?.message ?? err}); ` +
+          `the record keeps nackPending`,
       );
+      return;
     }
-  } catch (err: any) {
-    // A malformed TPS_MAIL_ACK_TIMEOUT_MS — or one whose timers cannot fit —
-    // must not fail the startup loop. The retry cannot compute its backstop
-    // without a window it can hold, so it is not attempted and the record
-    // keeps owing the nack.
-    log?.warn?.(
-      `tps-mail: nack-retry-config: the owed nack for ${inboundId} to ${sender} was not attempted (${err?.message ?? err}); ` +
-        `the record keeps nackPending`,
-    );
-    return;
   }
-  // BACKSTOP, deliberately ABOVE the relay's whole bound for these same
-  // windows: the relay closes the transport and rejects at its own timers (an
-  // expired connection or send bound as `nack-retry-timeout` in sendNackMail,
-  // an expired ACK window as delivery unconfirmed), so the retry only needs a
-  // later net to guarantee the promise NEVER hangs the process here — e.g. a
-  // route that does not settle for some other reason.
+  // BACKSTOP: for a remote-branch retry it sits deliberately ABOVE the relay's
+  // whole bound, so it only needs a later net to guarantee the fire-and-forget
+  // promise never hangs the process here. A route that does not run the relay
+  // settles locally, so its bound is the backstop alone.
   const recCurPath = findCurPath(mailDir, agentId, inboundId);
   const ctx = makeYieldCtx(
     mailDir,
@@ -1358,8 +1362,8 @@ function retryOwedNackInBackground(
       if (!isLiveContext(ctx)) return;
       if (outcome === "expired") {
         log?.warn?.(
-          `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not settle within ${backstopMs}ms ` +
-            `(the relay's whole bound plus ${NACK_RETRY_BACKSTOP_MS}ms); the retry stopped waiting for it, and a record that ` +
+          `tps-mail: nack-retry-timeout: the owed nack for ${inboundId} to ${sender} did not settle within ${backstopMs}ms; ` +
+            `the retry stopped waiting for it, and a record that ` +
             `still owes the nack keeps nackPending`,
         );
       }

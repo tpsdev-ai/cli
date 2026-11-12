@@ -100,7 +100,7 @@ async function readFrame(socket: Socket, maxBytes = MAX_HANDSHAKE_BYTES): Promis
   });
 }
 
-class NoiseIkChannel implements TransportChannel {
+export class NoiseIkChannel implements TransportChannel {
   private alive = true;
   private closeEmitted = false;
   private emitter = new EventEmitter();
@@ -180,9 +180,16 @@ class NoiseIkChannel implements TransportChannel {
     if (this.socket.destroyed) return;
     await new Promise<void>((resolve) => {
       this.socket.once("close", () => resolve());
-      try { this.socket.end(); } catch { resolve(); }
-      // Safety timeout — don't hang if close stalls
-      setTimeout(resolve, CHANNEL_CLOSE_GRACE_MS).unref();
+      try { this.socket.end(); } catch { resolve(); return; }
+      // Safety timeout — don't hang if close stalls, and don't leave the socket
+      // (and the process) alive behind a peer that never answers: destroy it
+      // when the grace expires.
+      setTimeout(() => {
+        if (!this.socket.destroyed) {
+          try { this.socket.destroy(); } catch { /* best effort */ }
+        }
+        resolve();
+      }, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 

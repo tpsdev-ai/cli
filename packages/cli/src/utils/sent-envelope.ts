@@ -185,9 +185,10 @@ function assertSameInboundChain(envelope: Envelope, expected: StoredEnvelopeExpe
 
 /** Read the signed envelope stored for `messageId` when it is the same message
  *  and still verifies with the sender's CURRENT key. Returns undefined when no
- *  entry exists. The entry is only ours if it is a regular file, readable only
- *  by its owner, and owned by this user: otherwise reusing it would send bytes
- *  this process cannot vouch for. */
+ *  entry exists, and for an entry older than `SENT_ENVELOPE_TTL_MS`, which is
+ *  pruned. The entry is only ours if it is a regular file, readable only by its
+ *  owner, and owned by this user: otherwise reusing it would send bytes this
+ *  process cannot vouch for. */
 export async function readSentEnvelope(
   root: string,
   messageId: string,

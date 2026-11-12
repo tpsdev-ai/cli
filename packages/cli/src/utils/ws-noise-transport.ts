@@ -65,7 +65,7 @@ function waitForMessage(ws: WebSocket, timeoutMs: number): Promise<Buffer> {
   });
 }
 
-class WsNoiseChannel implements TransportChannel {
+export class WsNoiseChannel implements TransportChannel {
   private alive = true;
   private closeEmitted = false;
   private emitter = new EventEmitter();
@@ -143,10 +143,17 @@ class WsNoiseChannel implements TransportChannel {
       this.ws.once("close", () => resolve());
       // Initiate close; if already closing, the 'close' event will still fire
       if (this.ws.readyState !== WebSocket.CLOSING) {
-        try { this.ws.close(1000, "done"); } catch { resolve(); }
+        try { this.ws.close(1000, "done"); } catch { resolve(); return; }
       }
-      // Safety timeout — if the close handshake stalls, don't hang forever
-      setTimeout(resolve, CHANNEL_CLOSE_GRACE_MS).unref();
+      // Safety timeout — if the close handshake stalls, don't hang forever, and
+      // don't leave the socket (and the process) alive behind a peer that never
+      // answers: terminate it when the grace expires.
+      setTimeout(() => {
+        if (this.ws.readyState !== WebSocket.CLOSED) {
+          try { this.ws.terminate(); } catch { /* best effort */ }
+        }
+        resolve();
+      }, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 

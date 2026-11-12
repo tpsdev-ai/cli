@@ -331,3 +331,62 @@ describe("cli#962 round 15 — a window the retry cannot hold", () => {
     try { await startPromise; } catch { /* aborted */ }
   }, 20000);
 });
+
+describe("cli#962 round 18 — the ACK window is read only for a remote-branch retry", () => {
+  it("R18-a: a malformed ACK window does not refuse an owed nack to a LOCAL sender", async () => {
+    const inboundId = "msg-r18-local";
+    seedOwedNack(inboundId, "receipt-malformed");
+    // The recipient's own maildir exists: off the office that is a local route.
+    mkdirSync(resolve(mailDir, SENDER), { recursive: true });
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = "soon";
+
+    const { startPromise, warned, infos } = start();
+
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran").toBe(true);
+
+    const delivered = await pollUntil(
+      () => warned.some((m) => m.includes("nack delivered to") && m.includes(inboundId)),
+      3000,
+    );
+    expect(delivered, "the owed nack to a local sender was retried and delivered").toBe(true);
+    expect(
+      warned.filter((m) => m.includes("nack-retry-config")),
+      "the malformed window did not refuse the local retry",
+    ).toEqual([]);
+
+    const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
+    expect(rec.nackSentAt, "the retry was paid").toBeTruthy();
+    expect(rec.nackPending, "and the record no longer owes it").toBeFalsy();
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+
+  it("R18-b: a malformed ACK window still refuses an owed nack to a REMOTE-BRANCH sender", async () => {
+    const inboundId = "msg-r18-remote";
+    seedOwedNack(inboundId, "receipt-malformed");
+    routeSenderRemote(SENDER); // the sender is its own branch → remote-branch
+    process.env.TPS_MAIL_ACK_TIMEOUT_MS = "soon";
+
+    const { startPromise, warned, infos } = start();
+
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran").toBe(true);
+
+    const named = await pollUntil(
+      () => warned.some((m) => m.includes("nack-retry-config") && m.includes(inboundId) && m.includes(SENDER)),
+      1000,
+    );
+    expect(named, "the refusal names the inbound id and the sender").toBe(true);
+    expect(warned.filter((m) => m.includes("nack delivered to")), "nothing was delivered").toEqual([]);
+    expect(relay.deliver.length, "and nothing was handed to a route").toBe(0);
+
+    const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
+    expect(rec.nackPending).toBe(true);
+    expect(rec.nackSentAt).toBeUndefined();
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+});

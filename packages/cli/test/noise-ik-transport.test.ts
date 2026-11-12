@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch } from "../src/utils/identity.js";
-import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
+import { NoiseIkTransport, NoiseIkChannel } from "../src/utils/noise-ik-transport.js";
+import { CHANNEL_CLOSE_GRACE_MS } from "../src/utils/transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
 import { MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
@@ -184,4 +185,43 @@ describe("NoiseIkTransport", () => {
     await server.close();
     await new Promise<void>((resolve, reject) => proxy.close((err) => (err ? reject(err) : resolve())));
   });
+
+  test("close destroys a socket whose peer never closes its side", async () => {
+    let serverSock: net.Socket | undefined;
+    let accepted: () => void = () => {};
+    const peerAccepted = new Promise<void>((resolve) => { accepted = resolve; });
+    const peer = net.createServer({ allowHalfOpen: true }, (sock) => {
+      serverSock = sock;
+      // Keep our half open: ignore the peer's FIN and never close.
+      sock.on("end", () => {});
+      sock.on("error", () => {});
+      accepted();
+    });
+    await new Promise<void>((resolve, reject) => {
+      peer.listen(0, "127.0.0.1", () => resolve());
+      peer.once("error", reject);
+    });
+    const port = (peer.address() as net.AddressInfo).port;
+
+    const clientSock = net.createConnection({ host: "127.0.0.1", port });
+    await new Promise<void>((resolve, reject) => {
+      clientSock.once("connect", () => resolve());
+      clientSock.once("error", reject);
+    });
+    await peerAccepted;
+
+    const channel = new NoiseIkChannel(clientSock, {} as any, {} as any, "peer-fp");
+    try {
+      const started = Date.now();
+      await channel.close();
+      const elapsed = Date.now() - started;
+
+      expect(clientSock.destroyed, "the client socket is destroyed after close").toBe(true);
+      expect(elapsed, "close resolves within the grace plus a margin").toBeLessThan(CHANNEL_CLOSE_GRACE_MS + 1000);
+    } finally {
+      clientSock.destroy();
+      serverSock?.destroy();
+      await new Promise<void>((resolve) => peer.close(() => resolve()));
+    }
+  }, 10_000);
 });
