@@ -19,8 +19,9 @@
 // Every later line is written to that descriptor,
 // never by path, so a path replaced during the call is never opened. The
 // descriptor stays open for the life of the process; process exit closes it.
-// Each supervised call appends `start <ms>` before the spawn, `end <ms>` when the
-// call ends, and a signal name for each kill attempt.
+// Each supervised call attempts to append `start <ms>` before the spawn, `end <ms>`
+// when the call ends, and a signal name for each kill attempt. A failed write is
+// ignored, so any record can be missing.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';

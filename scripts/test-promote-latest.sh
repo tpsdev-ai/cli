@@ -50,7 +50,7 @@
 #     fixed and the broken script is not a test. The same holds for the log
 #     parser's uniqueness rule (allow a second signalled call) and for the
 #     supervisor log's one-time open (reopen the path by name on every append:
-#     the FIFO cases then hang past their bounds).
+#     BB and BD then hang past their bounds).
 #   * a timed-out mutating call (`dist-tag add`) leaves the run UNCERTAIN: exit 7,
 #     no "restored" line for that package, and the lock remains, with a reason
 #     file when it can be written (AD, AE); a later run refuses and prints the
@@ -65,7 +65,7 @@
 #     supervisor's own start/end lines. A supervisor log is read with strict
 #     per-call framing, and a command that cannot start still logs one
 #     start/end pair (AT). The parser refuses a log with more than one signalled
-#     call, because a timing bound read from the first of them would time the
+#     call, because a timing bound read from the first of them could time the
 #     wrong call (S-a).
 #   * the log path is opened once before the spawn, non-blocking, and kept only
 #     when fstat reports a regular file: a FIFO placed there neither stalls the
@@ -208,7 +208,8 @@ strip_cr() { tr -d '\r'; }
 # end or signal with no open call, an unknown line, or a call left open at the
 # end of the log fails, as does a log with more than one signalled call. On a
 # valid log it prints the signalled call's own duration in seconds, so a log that
-# loses that call's end cannot pass by pairing its start with the next call's end.
+# loses that call's end while the next call's start is present cannot pass by
+# pairing its start with the next call's end.
 supervisor_log_parser="$work/supervisor-log.mjs"
 cat >"$supervisor_log_parser" <<'LOG_PARSER'
 import fs from 'node:fs';
@@ -1835,8 +1836,8 @@ done <"$relax_rows"
 
 # ── S-a mutation: allow a second signalled call; its rule's row must catch it ─
 # The mutant keeps every other rule and drops only the uniqueness refusal, so it
-# prints the FIRST signalled call's duration — the wrong call — where the rule's
-# row expects exit 1.
+# prints the FIRST signalled call's duration, which is ambiguous (either call
+# could be the one meant), where the rule's row expects exit 1.
 mut_parser="$work/supervisor-log-any-signalled.mjs"
 cat >"$work/mutate-parser.mjs" <<'MUTPARSER'
 import fs from 'node:fs';
