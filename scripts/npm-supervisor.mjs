@@ -62,7 +62,7 @@ if (requestedLogPath !== '') {
     // Covers an open that failed and an fstat that could not inspect the
     // descriptor the open returned. Either way logging is off: a diagnostic
     // line is not worth failing the call. A descriptor that did not become the
-    // log is closed below, so a throwing fstat leaks none.
+    // log is closed below, so a throwing fstat attempts to close the descriptor.
   } finally {
     if (fd >= 0) {
       try {

@@ -2251,8 +2251,10 @@ fi
 # supervisor starts, so that open succeeds and only `fstat(...).isFile()` stands
 # between the supervisor and the FIFO. The child exits 7; the supervisor must keep
 # that status, end inside a 6 s bound, and leave the reader with zero bytes. A
-# supervisor that keeps the descriptor writes its start line there. The reader is
-# bounded by a stop file and a 5 s budget of its own, so a mutant cannot hang it.
+# supervisor that keeps the descriptor writes its start line there. The reader's
+# budget is checked after its read loop reaches EAGAIN; this fixture's writer
+# emits a few lines and stops, and the parent kills the reader if it is still
+# running after its stop file.
 run_reader_fifo_case() { # <supervisor-path> <fixture-dir> -> RF_READY, RF_RC, RF_ELAPSED, RF_BYTES
   local sup="$1"
   local d="$2"
@@ -2459,14 +2461,16 @@ assert_eq "BC log paths: the fixture tree is unchanged" "$root_before" "$(find "
 # The supervisor opens the log once, before the spawn, and writes every later
 # line to that descriptor. The fixture hard-links the regular file before the
 # call, so the file the supervisor opened stays readable under its second name.
-# It polls that name until the `start` line appears (bounded at 5 s; a named
-# failure if it never does), which proves the supervisor opened the regular file
-# before the path is replaced with a FIFO. The child then exits with its own
-# status, inside a 6 s bound, and the original file must hold the `end` line too:
-# the supervisor kept writing to the descriptor it opened. A supervisor that
-# reopens the path on every append blocks in logEnd() on the readerless FIFO and
-# never exits; the case's own watchdog kills a hung supervisor and reports it.
-run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SWAP_HUNG, SWAP_STARTED, SWAP_ENDED
+# The child polls for a release file (20 ms, with a 5 s cap that exits 9), so it
+# is still running when the swap happens. The harness polls the second name for
+# the `start` line (bounded at 5 s; a named failure if the line does not
+# appear), checks that no `end` line is there yet, replaces the path with a
+# readerless FIFO, then writes the release file. The child exits 7, inside a
+# 6 s bound, and the original file must hold the `end` line too: the supervisor
+# kept writing to the descriptor it opened. A supervisor that reopens the path
+# on each append blocks in logEnd() on the FIFO and does not exit; the case's own
+# watchdog kills a hung supervisor and reports it.
+run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SWAP_HUNG, SWAP_STARTED, SWAP_ENDED, SWAP_NO_END_BEFORE
   local sup="$1"
   local d="$2"
   local pid watchdog t0 t1 tries
@@ -2475,9 +2479,20 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
   SWAP_HUNG=0
   SWAP_STARTED=0
   SWAP_ENDED=0
+  SWAP_NO_END_BEFORE=0
   t0="$(node -p 'Date.now()')"
   PROMOTE_SUPERVISOR_LOG="$d/log.swap" "${NODE_BIN:-node}" "$sup" 30 1 -- \
-    "${NODE_BIN:-node}" -e 'setTimeout(() => process.exit(7), 1200)' \
+    "${NODE_BIN:-node}" -e '
+      const fs = require("node:fs");
+      const release = process.argv[1];
+      const cap = Date.now() + 5000;
+      const tick = () => {
+        if (fs.existsSync(release)) process.exit(7);
+        if (Date.now() >= cap) process.exit(9);
+        setTimeout(tick, 20);
+      };
+      tick();
+    ' "$d/release" \
     >"$d/out.txt" 2>"$d/err.txt" &
   pid=$!
   "${NODE_BIN:-node}" -e \
@@ -2495,8 +2510,10 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
     tries=$((tries + 1))
   done
   if [ "$SWAP_STARTED" -eq 1 ]; then
+    if grep -q '^end ' "$d/log.orig" 2>/dev/null; then SWAP_NO_END_BEFORE=1; fi
     rm -f "$d/log.swap"
     mkfifo "$d/log.swap"
+    : >"$d/release"
   fi
   wait "$pid" 2>/dev/null
   SWAP_RC=$?
@@ -2513,6 +2530,7 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
 d="$(new_fixture fifo-swap-log)"
 run_swap_case "$here/npm-supervisor.mjs" "$d"
 assert_eq "BD swapped log: the supervisor logged start before the swap" 1 "$SWAP_STARTED"
+assert_eq "BD swapped log: no end line before the swap" 0 "$SWAP_NO_END_BEFORE"
 assert_eq "BD swapped log: exit status is the child's" 7 "$SWAP_RC"
 if [ "$SWAP_HUNG" -eq 1 ]; then
   bad "BD swapped log: exit inside the bound" "the supervisor hung: no exit within 6 s after its log path became a FIFO (rc $SWAP_RC, ${SWAP_ELAPSED}s)"
