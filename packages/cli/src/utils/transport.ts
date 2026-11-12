@@ -64,10 +64,12 @@ export interface TransportServer {
 
 /**
  * How long a channel's `close()` waits for a peer that does not answer the
- * close: both wire channels end their socket and then wait this long for the
- * close to complete. `close()` resolves at this bound even when the peer never
- * answers, so a delivery that awaits it (`deliverToRemoteBranch`) spends up to
- * this long after its timers — `remoteDeliveryWorstCaseMs` counts it.
+ * close. The two remote-branch channels (`WsNoiseChannel` via `ws.close`,
+ * `NoiseIkChannel` via `socket.end`) start the close and then wait up to this
+ * long for the close event; `PlainTcpChannel.close` ends its socket and does
+ * not wait. `close()` resolves at this bound even when the peer never answers,
+ * so a delivery that awaits it (`deliverToRemoteBranch`) spends up to this long
+ * after its timers — `remoteDeliveryWorstCaseMs` counts it.
  */
 export const CHANNEL_CLOSE_GRACE_MS = 2_000;
 

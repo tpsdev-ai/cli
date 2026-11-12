@@ -33,6 +33,7 @@ import {
   MailAckTimeoutConfigError,
   MailDeliveryUnconfirmedError,
   MAX_MAIL_ACK_TIMEOUT_MS,
+  MAX_TIMER_DELAY_MS,
   parseMailAckTimeoutMs,
   RemoteDeliveryTimeoutError,
   remoteDeliveryWorstCaseMs,
@@ -471,6 +472,19 @@ describe("the ACK window is configurable and refuses bad values by name", () => 
     expect(() => remoteDeliveryWorstCaseMs({ timeoutMs: 25_000, ackTimeoutMs: MAX_MAIL_ACK_TIMEOUT_MS })).toThrow(
       MailAckTimeoutConfigError,
     );
+    // The refusal names its four terms with their own values, and they sum to
+    // the total it prints.
+    let refusal = "";
+    try {
+      remoteDeliveryWorstCaseMs({ timeoutMs: 25_000, ackTimeoutMs: MAX_MAIL_ACK_TIMEOUT_MS });
+    } catch (error) {
+      refusal = (error as Error).message;
+    }
+    const terms = (refusal.match(/\d+/g) ?? []).map(Number);
+    expect(terms).toHaveLength(6);
+    const [connectMs, sendMs, ackTimeoutMs, graceMs, totalMs, limitMs] = terms;
+    expect(connectMs + sendMs + ackTimeoutMs + graceMs).toBe(totalMs);
+    expect(limitMs).toBe(MAX_TIMER_DELAY_MS);
   });
 
   test("deliverToRemoteBranch refuses a computed bound past the timer limit before connecting", async () => {
@@ -1474,9 +1488,11 @@ describe("the connect bound and the ACK window are separate", () => {
   test("a real frozen peer that never answers the close settles inside the total that counts the close grace", async () => {
     // The peer is the real Noise IK listener (test/helpers/frozen-noise-branch.ts):
     // it completes the handshake, then freezes the moment the deliver arrives —
-    // it neither ACKs nor answers the close. How long the channel's own close
-    // then waits is the runtime's socket teardown, so this case pins the bound
-    // the delivery settles inside, with one close grace counted in it.
+    // it neither ACKs nor answers the close. On bun 1.3.10 (the CI pin)
+    // `socket.end()` settles the close at once even with a stopped peer; Node and
+    // bun 1.4.4 wait up to the grace. So this case pins the frozen premise, the
+    // ACK-window floor and the total the delivery settles inside, which counts
+    // one close grace — not that the grace was spent.
     const hostKp = await loadHostIdentity();
     const peer = Bun.spawn([process.execPath, resolve(import.meta.dir, "helpers/frozen-noise-branch.ts")], {
       cwd: root,

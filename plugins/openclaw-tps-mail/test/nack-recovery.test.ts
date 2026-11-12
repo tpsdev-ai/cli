@@ -8,8 +8,10 @@ import { buildSignedEnvelope, pubkeyFromSeed } from "../../../packages/cli/test/
  * branch could stall recovery for this agent and every later one. The retry now
  * runs IN THE BACKGROUND, not awaited on the startup path, with a connection
  * bound; the relay bounds the send above it and then waits the ACK window, and
- * the background backstop sits above that whole bound (cli#962 round 13). A
- * timeout the relay reports is logged BY NAME.
+ * the background backstop sits above that whole bound (cli#962 round 13). An
+ * expired connection or send bound is logged BY NAME (`nack-retry-timeout`); an
+ * expired ACK window rejects as delivery unconfirmed and is logged as
+ * `could not deliver the nack`.
  *
  * The wire transport is mocked so "a connect that never resolves" is exactly
  * reproducible. The mock DELEGATES to the real relay unless the hang toggle is

@@ -215,10 +215,11 @@ export function resolveObligationNackHoldDays(
  *  hung connect to its timeout quickly; production uses the default. */
 export const DEFAULT_NACK_RETRY_TIMEOUT_MS = 20_000;
 /** How far ABOVE the relay's whole delivery bound the background retry's
- *  backstop sits (cli#389 round 12, item 1). The relay closes the transport at
- *  its own timers and reports that timeout; the backstop only guarantees the
- *  retry promise cannot hang the process if the delivery does not settle for
- *  another reason. */
+ *  backstop sits (cli#389 round 12, item 1). The relay closes the transport when
+ *  its connection or send timer expires and rejects with its timeout error; an
+ *  expired ACK window rejects as delivery unconfirmed. The backstop only
+ *  guarantees the retry promise cannot hang the process if the delivery does
+ *  not settle for another reason. */
 const NACK_RETRY_BACKSTOP_MS = 2_000;
 function resolveNackRetryTimeoutMs(): number {
   const v = process.env.TPS_NACK_RETRY_TIMEOUT_MS;
@@ -1269,8 +1270,11 @@ async function deliverNack(
  * application-level timeout — stalled recovery for this agent and every later
  * one. The retry's connection is bounded; the relay bounds the send above that
  * and then waits the ACK window, closing the transport when one of its timers
- * expires. The background backstop sits above the relay's WHOLE bound and a
- * timeout the relay reports is logged BY NAME in sendNackMail.
+ * expires. The background backstop sits above the relay's WHOLE bound. Of the
+ * relay's timer expiries, an expired connection or send bound takes the
+ * `nack-retry-timeout` branch in sendNackMail; an expired ACK window rejects as
+ * delivery unconfirmed and is logged as `could not deliver the nack`, keeping
+ * nackPending.
  *
  * Never throws into the caller: it is fire-and-forget, so a rejection would
  * otherwise be unhandled.
@@ -1318,10 +1322,11 @@ function retryOwedNackInBackground(
     return;
   }
   // BACKSTOP, deliberately ABOVE the relay's whole bound for these same
-  // windows: the relay closes the transport and reports its own timeout (logged
-  // by name in sendNackMail), so the retry only needs a later net to guarantee
-  // the promise NEVER hangs the process here — e.g. a route that does not
-  // settle for some other reason.
+  // windows: the relay closes the transport and rejects at its own timers (an
+  // expired connection or send bound as `nack-retry-timeout` in sendNackMail,
+  // an expired ACK window as delivery unconfirmed), so the retry only needs a
+  // later net to guarantee the promise NEVER hangs the process here — e.g. a
+  // route that does not settle for some other reason.
   const recCurPath = findCurPath(mailDir, agentId, inboundId);
   const ctx = makeYieldCtx(
     mailDir,
@@ -1585,9 +1590,11 @@ async function reconcileObligation(
  *
  * `opts.timeoutMs` (cli#389 round 12, item 1) is the bound for a wire nack's
  * CONNECTION; the relay bounds the send above it and waits `opts.ackTimeoutMs`
- * for the ACK. The relay CLOSES the transport when one of its timers expires;
- * that timeout is logged BY NAME rather than as an ordinary delivery error, so
- * an operator can tell a dead branch from a refused one.
+ * for the ACK. The relay CLOSES the transport when one of its timers expires.
+ * An expired connection or send bound is logged BY NAME (`nack-retry-timeout`)
+ * rather than as an ordinary delivery error, so an operator can tell a dead
+ * branch from a refused one; an expired ACK window is logged as `could not
+ * deliver the nack` and the record keeps nackPending.
  */
 async function sendNackMail(
   ctx: YieldContext,

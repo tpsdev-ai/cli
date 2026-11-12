@@ -6,7 +6,8 @@
  * the deliver arrives, so it neither ACKs nor answers the close. Whether that
  * keeps the socket open depends on the runtime's own teardown: where the close
  * waits for the peer's FIN, a frozen peer is what makes the sender spend its
- * close grace.
+ * close grace. On bun 1.3.10 (the CI pin) the close settles at once even with a
+ * stopped peer; Node and bun 1.4.4 wait up to the grace.
  *
  * Before stopping it writes `frozen` as its own stdout line, synchronously, so
  * the test can assert that the freeze happened instead of inferring it from the

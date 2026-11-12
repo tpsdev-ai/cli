@@ -941,11 +941,12 @@ export const MAIL_ACK_TIMEOUT_FLAG = "--ack-timeout";
 /** The largest delay a Node timer accepts; a larger one is clamped to 1 ms. */
 export const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
-/** The largest ACK window that keeps EVERY timer one delivery runs inside the
- *  timer limit: the ACK timer, the send bound (the default connection bound plus
- *  the window), and the channel close grace the delivery awaits. A window is
- *  refused by name below when the connection bound the caller passes makes the
- *  total exceed the limit even so. */
+/** The largest ACK window that keeps one delivery's worst-case TOTAL inside
+ *  `MAX_TIMER_DELAY_MS`, with the default connection bound: the connection
+ *  bound, the send bound (the connection bound plus the window), the ACK window
+ *  and the channel close grace. A window is refused by name below when the
+ *  connection bound the caller passes makes the total exceed the limit even
+ *  so. */
 export const MAX_MAIL_ACK_TIMEOUT_MS = Math.floor(
   (MAX_TIMER_DELAY_MS - 2 * DEFAULT_REMOTE_DELIVERY_TIMEOUT_MS - CHANNEL_CLOSE_GRACE_MS) / 2,
 );
@@ -971,13 +972,13 @@ export function parseMailAckTimeoutMs(raw: string, source: string): number {
   if (!Number.isSafeInteger(ms) || ms <= 0) {
     throw new MailAckTimeoutConfigError(`${source} must be a positive integer number of milliseconds (got "${raw}")`);
   }
-  // A longer window would make the ACK timer, or the send bound it is added to,
-  // or the worst-case total the delivery awaits, exceed the largest delay a
-  // Node timer accepts (it clamps to 1 ms).
+  // A longer window would push the worst-case total the delivery awaits past
+  // the largest delay a Node timer accepts (it clamps to 1 ms).
   if (ms > MAX_MAIL_ACK_TIMEOUT_MS) {
     throw new MailAckTimeoutConfigError(
       `${source} must be at most ${MAX_MAIL_ACK_TIMEOUT_MS} milliseconds (got "${raw}"): ` +
-        `a longer window, plus the connection bound and the channel close grace, would exceed the ${MAX_TIMER_DELAY_MS}ms timer limit`,
+        `a longer window would push the worst-case total — the connection bound, the send bound ` +
+        `(the connection bound plus the window), the ACK window and the channel close grace — past the ${MAX_TIMER_DELAY_MS}ms timer limit`,
     );
   }
   return ms;
@@ -1066,9 +1067,9 @@ function resolveRemoteDeliveryWindows(opts: RemoteBranchDeliveryOptions): Remote
   const worstCaseMs = worstCaseFor(windows);
   if (worstCaseMs > MAX_TIMER_DELAY_MS) {
     throw new MailAckTimeoutConfigError(
-      `the ${ackTimeoutMs}ms ACK window plus the ${connectMs}ms connection bound and the ` +
-        `${CHANNEL_CLOSE_GRACE_MS}ms channel close grace come to ${worstCaseMs}ms, past the ` +
-        `${MAX_TIMER_DELAY_MS}ms timer limit`,
+      `the ${connectMs}ms connection bound, the ${windows.sendMs}ms send bound (the connection bound plus the ACK window), ` +
+        `the ${ackTimeoutMs}ms ACK window and the ${CHANNEL_CLOSE_GRACE_MS}ms channel close grace ` +
+        `come to ${worstCaseMs}ms, past the ${MAX_TIMER_DELAY_MS}ms timer limit`,
     );
   }
   return windows;
