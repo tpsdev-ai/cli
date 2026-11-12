@@ -2214,7 +2214,7 @@ root_before="$(find "$d/root" -type f | wc -l | tr -d ' ')"
 ) >"$d/out-unset.txt" 2>"$d/err-unset.txt"
 rc_unset=$?
 (
-  cd "$d/cwd-empty" && PROMOTE_SUPERVISOR_LOG= "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
+  cd "$d/cwd-empty" && PROMOTE_SUPERVISOR_LOG='' "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
     "${NODE_BIN:-node}" -e 'process.exit(4)'
 ) >"$d/out-empty.txt" 2>"$d/err-empty.txt"
 rc_empty=$?
