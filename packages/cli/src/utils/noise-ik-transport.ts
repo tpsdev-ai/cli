@@ -7,6 +7,7 @@ import { EventEmitter } from "node:events";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  CHANNEL_CLOSE_GRACE_MS,
   closeListener,
   type BranchTarget,
   type TransportChannel,
@@ -99,8 +100,9 @@ async function readFrame(socket: Socket, maxBytes = MAX_HANDSHAKE_BYTES): Promis
   });
 }
 
-class NoiseIkChannel implements TransportChannel {
+export class NoiseIkChannel implements TransportChannel {
   private alive = true;
+  private closeEmitted = false;
   private emitter = new EventEmitter();
   private rxBuffer: Buffer = Buffer.alloc(0);
 
@@ -110,9 +112,7 @@ class NoiseIkChannel implements TransportChannel {
     private readonly recvCipher: Cipher,
     private readonly peerFp: string
   ) {
-    this.socket.on("close", () => {
-      this.alive = false;
-    });
+    this.socket.on("close", () => this.emitClose());
 
     this.socket.on("data", (chunk: Buffer) => {
       try {
@@ -160,14 +160,36 @@ class NoiseIkChannel implements TransportChannel {
     this.emitter.off("message", handler);
   }
 
+  onClose(handler: () => void): void {
+    this.emitter.on("close", handler);
+  }
+
+  offClose(handler: () => void): void {
+    this.emitter.off("close", handler);
+  }
+
+  private emitClose(): void {
+    this.alive = false;
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.emitter.emit("close");
+  }
+
   async close(): Promise<void> {
     this.alive = false;
     if (this.socket.destroyed) return;
     await new Promise<void>((resolve) => {
       this.socket.once("close", () => resolve());
-      try { this.socket.end(); } catch { resolve(); }
-      // Safety timeout — don't hang if close stalls
-      setTimeout(resolve, 2000).unref();
+      try { this.socket.end(); } catch { resolve(); return; }
+      // Safety timeout — don't hang if close stalls, and don't leave the socket
+      // (and the process) alive behind a peer that never answers: destroy it
+      // when the grace expires.
+      setTimeout(() => {
+        if (!this.socket.destroyed) {
+          try { this.socket.destroy(); } catch { /* best effort */ }
+        }
+        resolve();
+      }, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 
@@ -479,7 +501,14 @@ export class NoiseIkTransport implements WireTransport {
     await withTimeout(writeFrame(socket, msg1), HANDSHAKE_TIMEOUT_MS, () => socket.destroy());
 
     const msg2 = await withTimeout(readFrame(socket), HANDSHAKE_TIMEOUT_MS, () => socket.destroy());
-    initiator.recv(msg2);
+    try {
+      initiator.recv(msg2);
+    } catch (error) {
+      // A reply that fails the handshake leaves nothing usable: tear the
+      // socket down before rethrowing, as the host-key check below does.
+      socket.destroy();
+      throw error;
+    }
 
     const gotHost = Buffer.from(initiator.rs);
     const expectedHost = Buffer.from(target.hostPublicKey);

@@ -4,7 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch } from "../src/utils/identity.js";
-import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
+import { NoiseIkTransport, NoiseIkChannel } from "../src/utils/noise-ik-transport.js";
+import { CHANNEL_CLOSE_GRACE_MS } from "../src/utils/transport.js";
 import { WireDeliveryTransport } from "../src/utils/wire-delivery.js";
 import { MailDeliverBodySchema, MSG_MAIL_ACK, MSG_MAIL_DELIVER } from "../src/utils/wire-mail.js";
 
@@ -184,4 +185,112 @@ describe("NoiseIkTransport", () => {
     await server.close();
     await new Promise<void>((resolve, reject) => proxy.close((err) => (err ? reject(err) : resolve())));
   });
+
+  test("a malformed msg2 fails connect and destroys the client socket", async () => {
+    const host = generateKeyPair();
+    const branch = generateKeyPair();
+    registerBranch("branch-malformed", branch.signing.publicKey, undefined, branch.encryption.publicKey);
+
+    let peerSocket: net.Socket | null = null;
+    let peerClosed: () => void = () => {};
+    const sawPeerClose = new Promise<void>((resolve) => {
+      peerClosed = resolve;
+    });
+    // A peer that answers msg1 with a framed but undecryptable msg2, then
+    // stays open: only the client's own teardown can close the connection.
+    const peer = net.createServer((sock) => {
+      peerSocket = sock;
+      sock.on("error", () => {});
+      sock.on("close", () => peerClosed());
+      let buffered = Buffer.alloc(0);
+      let replied = false;
+      sock.on("data", (chunk) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        if (replied || buffered.length < 2) return;
+        const len = buffered.readUInt16BE(0);
+        if (buffered.length < 2 + len) return;
+        replied = true;
+        const garbage = Buffer.alloc(64, 0xff);
+        const header = Buffer.alloc(2);
+        header.writeUInt16BE(garbage.length, 0);
+        sock.write(Buffer.concat([header, garbage]));
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      peer.listen(0, "127.0.0.1", () => resolve());
+      peer.once("error", reject);
+    });
+    const port = (peer.address() as net.AddressInfo).port;
+    const clientTransport = new NoiseIkTransport(branch);
+    try {
+      let caught: unknown;
+      try {
+        await clientTransport.connect({
+          host: "127.0.0.1",
+          port,
+          branchId: "branch-malformed",
+          hostPublicKey: host.encryption.publicKey,
+        });
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      // The socket is destroyed, not left open: the peer sees it close.
+      let closeTimer: ReturnType<typeof setTimeout> | null = null;
+      await Promise.race([
+        sawPeerClose,
+        new Promise<never>((_resolve, reject) => {
+          closeTimer = setTimeout(
+            () => reject(new Error("the client socket stayed open after the handshake failure")),
+            2_000,
+          );
+        }),
+      ]).finally(() => {
+        if (closeTimer) clearTimeout(closeTimer);
+      });
+      expect((clientTransport as any).inFlight).toBeNull();
+    } finally {
+      peerSocket?.destroy();
+      await new Promise<void>((resolve) => peer.close(() => resolve()));
+    }
+  }, 10_000);
+
+  test("close destroys a socket whose peer never closes its side", async () => {
+    let serverSock: net.Socket | undefined;
+    let accepted: () => void = () => {};
+    const peerAccepted = new Promise<void>((resolve) => { accepted = resolve; });
+    const peer = net.createServer({ allowHalfOpen: true }, (sock) => {
+      serverSock = sock;
+      // Keep our half open: ignore the peer's FIN and never close.
+      sock.on("end", () => {});
+      sock.on("error", () => {});
+      accepted();
+    });
+    await new Promise<void>((resolve, reject) => {
+      peer.listen(0, "127.0.0.1", () => resolve());
+      peer.once("error", reject);
+    });
+    const port = (peer.address() as net.AddressInfo).port;
+
+    const clientSock = net.createConnection({ host: "127.0.0.1", port });
+    await new Promise<void>((resolve, reject) => {
+      clientSock.once("connect", () => resolve());
+      clientSock.once("error", reject);
+    });
+    await peerAccepted;
+
+    const channel = new NoiseIkChannel(clientSock, {} as any, {} as any, "peer-fp");
+    try {
+      const started = Date.now();
+      await channel.close();
+      const elapsed = Date.now() - started;
+
+      expect(clientSock.destroyed, "the client socket is destroyed after close").toBe(true);
+      expect(elapsed, "close resolves within the grace plus a margin").toBeLessThan(CHANNEL_CLOSE_GRACE_MS + 1000);
+    } finally {
+      clientSock.destroy();
+      serverSock?.destroy();
+      await new Promise<void>((resolve) => peer.close(() => resolve()));
+    }
+  }, 10_000);
 });

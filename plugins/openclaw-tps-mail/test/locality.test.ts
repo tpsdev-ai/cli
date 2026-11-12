@@ -50,6 +50,9 @@ import * as obligationsModule from "../src/obligations.js";
 // The RECIPIENT's side of a delivered reply: the real promotion and ack the CLI
 // runs on a mailbox (cli#429 round 7 — a consumed reply must still be evidence).
 import { ackMessage, promote } from "@tpsdev-ai/cli/utils/mail";
+// The REAL relay module, spread into the mock below so a new export in relay.ts
+// reaches this file's plugin import instead of failing the whole suite.
+import * as realRelayExports from "@tpsdev-ai/cli/utils/relay";
 
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
 
@@ -68,6 +71,7 @@ const relay = {
   failDeliver: false,
 };
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
+  ...realRelayExports,
   deliverToRemoteBranch: async (branchId: string, msg: any) => {
     if (relay.failDeliver) throw new Error("relay down");
     relay.deliver.push({ branchId, msg });

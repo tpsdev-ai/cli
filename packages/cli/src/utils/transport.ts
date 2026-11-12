@@ -43,6 +43,10 @@ export interface TransportChannel {
   send(msg: TpsMessage): Promise<void>;
   onMessage(handler: (msg: TpsMessage) => void): void;
   offMessage(handler: (msg: TpsMessage) => void): void;
+  /** Register a handler for the transport closing, whether the peer or this
+   *  side closed it. Optional so an in-memory channel can omit it. */
+  onClose?(handler: () => void): void;
+  offClose?(handler: () => void): void;
   close(): Promise<void>;
   isAlive(): boolean;
   peerFingerprint(): string;
@@ -57,6 +61,18 @@ export interface TransportServer {
   onConnection(handler: (channel: TransportChannel) => void): void;
   close(): Promise<void>;
 }
+
+/**
+ * How long a channel's `close()` waits for a peer that does not answer the
+ * close. The two remote-branch channels (`WsNoiseChannel` via `ws.close`,
+ * `NoiseIkChannel` via `socket.end`) start the close and then wait up to this
+ * long for the close event; `PlainTcpChannel.close` ends its socket and does
+ * not wait. When the grace expires with the peer still not answering, each of
+ * those two channels destroys the connection and then resolves, so a delivery
+ * that awaits it (`deliverToRemoteBranch`) spends up to this long after its
+ * timers — `remoteDeliveryWorstCaseMs` counts it.
+ */
+export const CHANNEL_CLOSE_GRACE_MS = 2_000;
 
 /**
  * Settle a listener's `close()` with or without a live peer, and resolve at

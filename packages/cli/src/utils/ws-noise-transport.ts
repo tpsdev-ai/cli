@@ -4,6 +4,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
 import {
+  CHANNEL_CLOSE_GRACE_MS,
   closeListener,
   type BranchTarget,
   type TransportChannel,
@@ -64,8 +65,9 @@ function waitForMessage(ws: WebSocket, timeoutMs: number): Promise<Buffer> {
   });
 }
 
-class WsNoiseChannel implements TransportChannel {
+export class WsNoiseChannel implements TransportChannel {
   private alive = true;
+  private closeEmitted = false;
   private emitter = new EventEmitter();
 
   constructor(
@@ -74,9 +76,7 @@ class WsNoiseChannel implements TransportChannel {
     private readonly recvCipher: Cipher,
     private readonly peerFp: string
   ) {
-    ws.on("close", () => {
-      this.alive = false;
-    });
+    ws.on("close", () => this.emitClose());
 
     // Catch post-connection WS errors (e.g. ErrorEvent on reconnect) before
     // they propagate as unhandled process events and crash office connect. (#245)
@@ -121,6 +121,21 @@ class WsNoiseChannel implements TransportChannel {
     this.emitter.off("message", handler);
   }
 
+  onClose(handler: () => void): void {
+    this.emitter.on("close", handler);
+  }
+
+  offClose(handler: () => void): void {
+    this.emitter.off("close", handler);
+  }
+
+  private emitClose(): void {
+    this.alive = false;
+    if (this.closeEmitted) return;
+    this.closeEmitted = true;
+    this.emitter.emit("close");
+  }
+
   async close(): Promise<void> {
     this.alive = false;
     if (this.ws.readyState === WebSocket.CLOSED) return;
@@ -128,10 +143,17 @@ class WsNoiseChannel implements TransportChannel {
       this.ws.once("close", () => resolve());
       // Initiate close; if already closing, the 'close' event will still fire
       if (this.ws.readyState !== WebSocket.CLOSING) {
-        try { this.ws.close(1000, "done"); } catch { resolve(); }
+        try { this.ws.close(1000, "done"); } catch { resolve(); return; }
       }
-      // Safety timeout — if close handshake stalls, don't hang forever
-      setTimeout(resolve, 2000).unref();
+      // Safety timeout — if the close handshake stalls, don't hang forever, and
+      // don't leave the socket (and the process) alive behind a peer that never
+      // answers: terminate it when the grace expires.
+      setTimeout(() => {
+        if (this.ws.readyState !== WebSocket.CLOSED) {
+          try { this.ws.terminate(); } catch { /* best effort */ }
+        }
+        resolve();
+      }, CHANNEL_CLOSE_GRACE_MS).unref();
     });
   }
 
@@ -316,7 +338,14 @@ export class WsNoiseTransport implements WireTransport {
       ws.close(1008, "rejected");
       throw e;
     }
-    initiator.recv(msg2);
+    try {
+      initiator.recv(msg2);
+    } catch (error) {
+      // A reply that fails the handshake leaves nothing usable: close the
+      // socket before rethrowing, as the host-key check below does.
+      ws.close(1008, "rejected");
+      throw error;
+    }
 
     const gotHost = Buffer.from(initiator.rs);
     const expectedHost = Buffer.from(target.hostPublicKey);
