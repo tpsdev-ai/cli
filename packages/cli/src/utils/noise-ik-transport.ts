@@ -501,7 +501,14 @@ export class NoiseIkTransport implements WireTransport {
     await withTimeout(writeFrame(socket, msg1), HANDSHAKE_TIMEOUT_MS, () => socket.destroy());
 
     const msg2 = await withTimeout(readFrame(socket), HANDSHAKE_TIMEOUT_MS, () => socket.destroy());
-    initiator.recv(msg2);
+    try {
+      initiator.recv(msg2);
+    } catch (error) {
+      // A reply that fails the handshake leaves nothing usable: tear the
+      // socket down before rethrowing, as the host-key check below does.
+      socket.destroy();
+      throw error;
+    }
 
     const gotHost = Buffer.from(initiator.rs);
     const expectedHost = Buffer.from(target.hostPublicKey);

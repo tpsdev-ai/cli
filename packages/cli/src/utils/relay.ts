@@ -1179,6 +1179,15 @@ export async function deliverToRemoteBranch(
   let ackSettled = false;
   let beginAckWindow = () => {};
   let detachClose = () => {};
+  // A close before the ACK settles the send path too. A branch that closes
+  // while the deliver is still pending may already have written the message,
+  // so the caller must report an unconfirmed delivery rather than the send's
+  // own error (or a send-bound timeout), and must not wait the send bound out.
+  let rejectOnCloseBeforeAck: (error: Error) => void = () => {};
+  const closedBeforeAck = new Promise<never>((_resolve, reject) => {
+    rejectOnCloseBeforeAck = reject;
+  });
+  void closedBeforeAck.catch(() => {});
   const acked = new Promise<void>((resolve, reject) => {
     const handler = (msg: TpsMessage) => {
       if (msg.type === MSG_MAIL_ACK && (msg.body as any)?.id === msgId) {
@@ -1204,14 +1213,14 @@ export async function deliverToRemoteBranch(
       ackSettled = true;
       if (ackTimer) clearTimeout(ackTimer);
       ch.offMessage(handler);
-      reject(
-        new MailDeliveryUnconfirmedError(
-          String(msgId),
-          branchId,
-          ackTimeoutMs,
-          `the connection to branch "${branchId}" closed before the ACK for message ${msgId}`,
-        ),
+      const error = new MailDeliveryUnconfirmedError(
+        String(msgId),
+        branchId,
+        ackTimeoutMs,
+        `the connection to branch "${branchId}" closed before the ACK for message ${msgId}`,
       );
+      reject(error);
+      rejectOnCloseBeforeAck(error);
     };
     // The ACK window starts when the deliver is SENT (called below), not before
     // the connection is made.
@@ -1254,6 +1263,7 @@ export async function deliverToRemoteBranch(
           body: payload,
         }),
         sendDeadline,
+        closedBeforeAck,
       ]);
     } finally {
       if (sendTimer) clearTimeout(sendTimer);

@@ -338,7 +338,14 @@ export class WsNoiseTransport implements WireTransport {
       ws.close(1008, "rejected");
       throw e;
     }
-    initiator.recv(msg2);
+    try {
+      initiator.recv(msg2);
+    } catch (error) {
+      // A reply that fails the handshake leaves nothing usable: close the
+      // socket before rethrowing, as the host-key check below does.
+      ws.close(1008, "rejected");
+      throw error;
+    }
 
     const gotHost = Buffer.from(initiator.rs);
     const expectedHost = Buffer.from(target.hostPublicKey);

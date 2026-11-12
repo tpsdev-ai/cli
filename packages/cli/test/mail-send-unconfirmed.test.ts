@@ -1578,6 +1578,116 @@ describe("the connect bound and the ACK window are separate", () => {
   }, 15_000);
 });
 
+describe("a close before the ACK settles a pending send", () => {
+  interface ControlledChannel {
+    channel: TransportChannel;
+    closeFromPeer(): void;
+  }
+
+  function controlledChannel(send: (msg: TpsMessage) => Promise<void>): ControlledChannel {
+    let onClose: (() => void) | null = null;
+    return {
+      channel: {
+        send,
+        onMessage() {},
+        offMessage() {},
+        onClose(handler) {
+          onClose = handler;
+        },
+        offClose(handler) {
+          if (onClose === handler) onClose = null;
+        },
+        async close() {},
+        isAlive() {
+          return true;
+        },
+        peerFingerprint() {
+          return "e".repeat(64);
+        },
+      },
+      closeFromPeer() {
+        onClose?.();
+      },
+    };
+  }
+
+  test("a close while the send is pending reports unconfirmed, not the send's later error", async () => {
+    const id = "eeeeeeee-0000-4000-8000-000000000001";
+    let rejectSend: (error: Error) => void = () => {};
+    const pending = new Promise<void>((_resolve, reject) => {
+      rejectSend = reject;
+    });
+    const controlled = controlledChannel(() => pending);
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(controlled.channel);
+    const attempt = deliverToRemoteBranch(
+      "remote-a",
+      { id, to: "local", from: "agent-a", body: "close during send" },
+      { timeoutMs: 2_000, ackTimeoutMs: 2_000 },
+    );
+    await sleep(100);
+    controlled.closeFromPeer();
+    rejectSend(new Error("send failed after the close"));
+    let caught: unknown;
+    try {
+      await attempt;
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
+    expect((caught as Error).message).toContain(`closed before the ACK for message ${id}`);
+    expect((caught as Error).message).not.toContain("send failed after the close");
+  }, 10_000);
+
+  test("a close while the send never settles reports unconfirmed well inside the send bound", async () => {
+    const id = "eeeeeeee-0000-4000-8000-000000000002";
+    const controlled = controlledChannel(() => new Promise<void>(() => {}));
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(controlled.channel);
+    // The send bound is timeoutMs + ackTimeoutMs (4 s here): the close must
+    // settle the attempt without waiting it out.
+    const opts = { timeoutMs: 2_000, ackTimeoutMs: 2_000 };
+    const startedAt = Date.now();
+    const attempt = deliverToRemoteBranch(
+      "remote-a",
+      { id, to: "local", from: "agent-a", body: "hung send" },
+      opts,
+    );
+    await sleep(100);
+    controlled.closeFromPeer();
+    let caught: unknown;
+    try {
+      await attempt;
+    } catch (error) {
+      caught = error;
+    }
+    const elapsedMs = Date.now() - startedAt;
+    expect(caught).toBeInstanceOf(MailDeliveryUnconfirmedError);
+    expect((caught as Error).message).toContain("closed before the ACK");
+    expect(elapsedMs).toBeLessThan(opts.timeoutMs + opts.ackTimeoutMs);
+    expect(elapsedMs).toBeLessThan(1_500);
+  }, 10_000);
+
+  test("a send that rejects with no close keeps its own error", async () => {
+    const id = "eeeeeeee-0000-4000-8000-000000000003";
+    const controlled = controlledChannel(async () => {
+      throw new Error("send rejected alone");
+    });
+    spyOn(WsNoiseTransport.prototype, "connect").mockResolvedValue(controlled.channel);
+    let caught: unknown;
+    try {
+      await deliverToRemoteBranch(
+        "remote-a",
+        { id, to: "local", from: "agent-a", body: "send error" },
+        { timeoutMs: 2_000, ackTimeoutMs: 2_000 },
+      );
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    expect(caught).not.toBeInstanceOf(MailDeliveryUnconfirmedError);
+    expect((caught as Error).message).toBe("send rejected alone");
+  }, 10_000);
+});
+
 describe("the ACK and send timers keep the process alive until the attempt settles", () => {
   const RELAY_PATH = resolve(import.meta.dir, "../src/utils/relay.ts");
   const WS_PATH = resolve(import.meta.dir, "../src/utils/ws-noise-transport.ts");
