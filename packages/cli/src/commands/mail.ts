@@ -292,8 +292,8 @@ async function signOutboundOrFail(
     // The inbound delegation chain this invocation would embed on a fresh send.
     const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
     // A re-send of an explicit id reuses the signed envelope stored for it:
-    // signing again would change its timestamp and signature, and the branch
-    // treats a same-id payload mismatch as a conflict, not a duplicate. The
+    // signing again can change its timestamp and signature, and the branch
+    // treats a same-id payload mismatch as a conflict. The
     // stored bytes must match this message, carry the same inbound chain, and
     // verify with the CURRENT key.
     let client: FlairClient | undefined;
@@ -357,7 +357,7 @@ async function storeExplicitSignedEnvelope(
 /** Store the signed envelope of a REMOTE send that generated its own id. The
  *  exit-75 message prints that id and tells the sender to re-send with it; only
  *  the stored bytes make that retry the same signed message (same id, timestamp
- *  and payload) the branch inbox can accept as a duplicate. */
+ *  and payload), which the branch inbox records at most once. */
 async function storeGeneratedSignedEnvelope(
   from: string,
   to: string,

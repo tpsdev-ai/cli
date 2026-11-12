@@ -24,7 +24,7 @@ export const SENT_ENVELOPE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DIR_NAME = ".sent-envelopes";
 
 /** A stored signed envelope that cannot be read, parsed or matched. Refusing
- *  is the only safe answer: re-signing would send a different signed message
+ *  is the only safe answer: re-signing can send a different signed message
  *  under an id the branch may already hold. */
 export class StoredEnvelopeError extends Error {
   constructor(message: string) {
@@ -185,10 +185,10 @@ function assertSameInboundChain(envelope: Envelope, expected: StoredEnvelopeExpe
 
 /** Read the signed envelope stored for `messageId` when it is the same message
  *  and still verifies with the sender's CURRENT key. Returns undefined when no
- *  entry exists, and for an entry older than `SENT_ENVELOPE_TTL_MS`, which is
- *  pruned. The entry is only ours if it is a regular file, readable only by its
- *  owner, and owned by this user: otherwise reusing it would send bytes this
- *  process cannot vouch for. */
+ *  entry exists, and for an entry older than `SENT_ENVELOPE_TTL_MS`, whose
+ *  removal is attempted. The entry is only ours if it is a regular file,
+ *  readable only by its owner, and owned by this user: otherwise reusing it
+ *  would send bytes this process cannot vouch for. */
 export async function readSentEnvelope(
   root: string,
   messageId: string,
@@ -298,8 +298,8 @@ export async function storeSentEnvelope(
   }
 }
 
-/** Drop entries older than the reuse window. Best effort: read-time expiry
- *  ignores a leftover entry, and a failed prune never sends anything. */
+/** Drop entries older than the reuse window. Best effort: an entry it cannot
+ *  remove is left in place, and the read still treats it as expired. */
 function pruneExpired(dir: string): void {
   let entries: string[];
   try {

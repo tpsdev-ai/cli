@@ -996,12 +996,11 @@ export function resolveMailAckTimeoutMs(env: NodeJS.ProcessEnv = process.env, fl
 /** A delivery whose ACK did not arrive inside the window. The transport was
  *  closed, but the branch may already have written the record — so a re-send
  *  with the message id is the usual retry. When this attempt reused the stored
- *  envelope, that retry is the SAME signed message (same id, timestamp and
- *  payload), which the branch inbox accepts as a duplicate. When it did not —
- *  the first send of an explicit id, or a re-send whose stored entry was
- *  missing or expired — this send signed AND STORED a new envelope, so the
- *  text names both outcomes of a same-id re-send instead of promising a
- *  duplicate. */
+ *  envelope, that retry is the same signed message. When it did not — the
+ *  first send of an explicit id, or a re-send whose stored entry was missing
+ *  or expired — this send signed and stored a new envelope. Either way the
+ *  text states the invariant that holds on both paths: the branch inbox
+ *  records a relayed message id at most once. */
 export class MailDeliveryUnconfirmedError extends Error {
   readonly messageId: string;
   readonly branchId: string;
@@ -1012,7 +1011,8 @@ export class MailDeliveryUnconfirmedError extends Error {
    *  `storedNewExplicitEnvelope` says this attempt signed and stored a new
    *  envelope under an explicit id, because no stored envelope was reused: a
    *  first send of that id, or a re-send whose stored entry was missing or
-   *  expired. The text then names both outcomes of a same-id re-send. */
+   *  expired. The text then names the stored envelope and the inbox
+   *  invariant. */
   constructor(messageId: string, branchId: string, ackTimeoutMs: number, why?: string, storedNewExplicitEnvelope = false) {
     super(
       `Delivery unconfirmed: ${why ?? `no ACK from branch "${branchId}" for message ${messageId} within ${ackTimeoutMs}ms`}; ` +
@@ -1021,9 +1021,9 @@ export class MailDeliveryUnconfirmedError extends Error {
             `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
             `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
             `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-            `which the branch inbox accepts as a duplicate. Check the branch's inbox first.`
+            `and the branch inbox records that id at most once. Check the branch's inbox first.`
           : `the message may still arrive. If you re-send, reuse --message-id ${messageId}: ` +
-            `it re-sends the stored envelope when one is still available, which the branch inbox accepts as a duplicate.`),
+            `it re-sends the stored envelope when one is still available, and the branch inbox records that id at most once.`),
     );
     this.name = "MailDeliveryUnconfirmedError";
     this.messageId = messageId;
@@ -1058,7 +1058,7 @@ export interface RemoteBranchDeliveryOptions {
   /** Set when this attempt signed and stored a NEW envelope under an explicit
    *  `--message-id`, because no stored envelope was reused: a first send of
    *  that id, or a re-send whose stored entry was missing or expired. The
-   *  unconfirmed message then names both outcomes a same-id re-send can have. */
+   *  unconfirmed message then says what this send stored. */
   storedNewExplicitEnvelope?: boolean;
 }
 

@@ -712,15 +712,14 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(second.status).toBe(75);
     // The new-envelope path says what this send did — it signed AND STORED an
     // envelope under the id, which is also true when a first send of that id
-    // loses its ACK — and then names both outcomes of a same-id re-send
-    // instead of promising only a duplicate or only a conflict.
+    // loses its ACK — and then names the invariant the branch inbox keeps.
     expect(second.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 1000ms; ` +
         `this send signed and stored a new envelope under --message-id ${id}; ` +
         `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
         `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
         `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-        `which the branch inbox accepts as a duplicate. Check the branch's inbox first.`,
+        `and the branch inbox records that id at most once. Check the branch's inbox first.`,
     );
     expect(inboxRecords("remote-a")).toHaveLength(1);
   }, 30_000);
@@ -741,7 +740,7 @@ describe("a CLI re-send with the same --message-id sends the same signed message
         `if the branch already accepted a different payload under that id, it refuses this one as a same-id conflict, ` +
         `and a new --message-id is the way forward; otherwise this delivery may have succeeded, ` +
         `and re-sending with the same --message-id re-sends the envelope this send stored, ` +
-        `which the branch inbox accepts as a duplicate. Check the branch's inbox first.`,
+        `and the branch inbox records that id at most once. Check the branch's inbox first.`,
     );
     expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id]);
     expect(inboxRecords("remote-a")).toHaveLength(1);
@@ -763,6 +762,33 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     await expectConnectionEndedAfter("a first explicit-id retry");
   }, 30_000);
 
+  test("a first attempt that leaves no inbox record is recorded once by the retry", async () => {
+    // The deliver reaches the receiver, acceptance never runs and the ACK is
+    // lost: the branch holds no record and no acceptance marker for the id, so
+    // the printed retry is its FIRST acceptance. The inbox must end with one
+    // record, created by that retry.
+    const behavior: BranchBehavior = { recordInbox: false, ackDelayMs: 700 };
+    await startBranchServer(behavior);
+    pointRemoteAtServer();
+    const id = "66666666-6666-4666-8666-666666666674";
+    const first = await runSend(["--stdin", "--message-id", id, "--ack-timeout", "150"], {}, 15_000, "retry body");
+    expect(first.status).toBe(75);
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id]);
+    expect(branch.acceptErrors).toEqual([]);
+    expect(inboxRecords("remote-a")).toHaveLength(0);
+    // Follow the printed advice with the same --message-id.
+    behavior.recordInbox = true;
+    const resendId = advisedResendId(first.stderr, id, "66666666-6666-4666-8666-666666666675");
+    expect(resendId).toBe(id);
+    const second = await runSend(["--stdin", "--message-id", resendId, "--ack-timeout", "5000"], {}, 15_000, "retry body");
+    expect(second.status).toBe(0);
+    expect(branch.deliveries.map((delivery) => delivery.id)).toEqual([id, id]);
+    expect(inboxRecords("remote-a")).toHaveLength(1);
+    // The retry sent the stored bytes rather than signing again: same timestamp.
+    expect(branch.deliveries[1].timestamp).toBe(branch.deliveries[0].timestamp);
+    await expectConnectionEndedAfter("a retry after a first attempt that recorded nothing");
+  }, 30_000);
+
   test("a send without --message-id stores its generated id for the printed retry", async () => {
     await startBranchServer({ recordInbox: true, ackDelayMs: 700 });
     pointRemoteAtServer();
@@ -775,7 +801,7 @@ describe("a CLI re-send with the same --message-id sends the same signed message
     expect(first.stderr.trim()).toBe(
       `Delivery unconfirmed: no ACK from branch "remote-a" for message ${id} within 150ms; ` +
         `the message may still arrive. If you re-send, reuse --message-id ${id}: ` +
-        `it re-sends the stored envelope when one is still available, which the branch inbox accepts as a duplicate.`,
+        `it re-sends the stored envelope when one is still available, and the branch inbox records that id at most once.`,
     );
     // The printed retry command names the generated id, so its signed envelope
     // must already be stored.
