@@ -48,9 +48,9 @@
 #     path, call an uncertain package restored, and drop `<&0` from the npm
 #     launch; confirm a fixture catches each — a test that passes on both the
 #     fixed and the broken script is not a test. The same holds for the log
-#     parser's uniqueness rule (allow a second signalled call) and for the log
-#     path's regular-file check (drop it: the FIFO case then hangs past its
-#     bound).
+#     parser's uniqueness rule (allow a second signalled call) and for the
+#     supervisor log's one-time open (reopen the path by name on every append:
+#     the FIFO cases then hang past their bounds).
 #   * a timed-out mutating call (`dist-tag add`) leaves the run UNCERTAIN: exit 7,
 #     no "restored" line for that package, and the lock remains, with a reason
 #     file when it can be written (AD, AE); a later run refuses and prints the
@@ -67,9 +67,11 @@
 #     start/end pair (AT). The parser refuses a log with more than one signalled
 #     call, because a timing bound read from the first of them would time the
 #     wrong call (S-a).
-#   * the log path is checked once before the spawn: a FIFO placed there neither
-#     stalls the supervised call nor changes its status (BB), and an unset or
-#     empty PROMOTE_SUPERVISOR_LOG writes no file (BC).
+#   * the log path is opened once before the spawn, non-blocking and only as a
+#     regular file: a FIFO placed there neither stalls the supervised call nor
+#     changes its status (BB), a path swapped to a FIFO mid-call does not block
+#     the exit (BD), and an unset or empty PROMOTE_SUPERVISOR_LOG writes no file
+#     (BC).
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
 #     never answers makes the run uncertain (AJ); TERM during a pending PUT keeps
@@ -865,17 +867,24 @@ if (which === 'skip_end_on_timeout') {
 
 if (which === 'log_no_stat') {
   const start = "const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';";
-  const endMarker = 'function logLine(line) {';
+  const endMarker = '\nfunction logSignal(name) {';
   const a = s.indexOf(start);
   const b = s.indexOf(endMarker, a);
   if (a < 0 || b < 0) {
     console.error('supervisor log-check mutation target not found');
     process.exit(3);
   }
-  fs.writeFileSync(
-    dst,
-    s.slice(0, a) + "const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';\n\n" + s.slice(b),
-  );
+  // Reopen the path by name on every append, as the pre-fix supervisor did: the
+  // FIFO fixtures must catch the block this can cause.
+  const old = `const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
+function logLine(line) {
+  if (!logPath) return;
+  try {
+    fs.appendFileSync(logPath, line + '\\n');
+  } catch {
+  }
+}`;
+  fs.writeFileSync(dst, s.slice(0, a) + old + s.slice(b));
   process.exit(0);
 }
 
@@ -2167,11 +2176,12 @@ else
 fi
 
 # ── BB. a FIFO at the log path never blocks the supervised call ──────────────
-# The supervisor checks the path once, before the spawn, and a FIFO is not a
-# regular file, so nothing is written. The child ignores TERM, so the call must
-# end at the deadline (1 s) plus the grace (1 s) with the supervisor's 124, inside
-# a 6 s watchdog. A supervisor that appends to the FIFO first blocks in open(2)
-# and never spawns; the watchdog then ends the run past the bound.
+# The supervisor opens the path once, before the spawn, with O_NONBLOCK; opening
+# a FIFO with no reader fails at once, so logging is off and nothing is written.
+# The child ignores TERM, so the call must end at the deadline (1 s) plus the
+# grace (1 s) with the supervisor's 124, inside a 6 s watchdog. A mutant that
+# appends to the FIFO by path first blocks in open(2) and never spawns; the
+# watchdog then ends the run past the bound.
 run_fifo_case() { # <supervisor-path> <fixture-dir> -> FIFO_RC, FIFO_ELAPSED
   local sup="$1"
   local d="$2"
@@ -2204,7 +2214,7 @@ else
 fi
 assert_eq "BB fifo-log: the FIFO is untouched" fifo "$(if [ -p "$d/log.fifo" ]; then echo fifo; else echo other; fi)"
 
-# ── S-b mutation: drop the startup check; BB must catch the hang ─────────────
+# ── S-b mutation: reopen the log by path on every append; BB must catch it ───
 bb="$work/mut-log-no-stat"
 mkdir -p "$bb"
 if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$bb/npm-supervisor.mjs" log_no_stat; then
@@ -2240,6 +2250,68 @@ assert_eq "BC empty log: exit status kept" 4 "$rc_empty"
 assert_eq "BC unset log: working directory still empty" 0 "$(find "$d/cwd-unset" -mindepth 1 | wc -l | tr -d ' ')"
 assert_eq "BC empty log: working directory still empty" 0 "$(find "$d/cwd-empty" -mindepth 1 | wc -l | tr -d ' ')"
 assert_eq "BC log paths: the fixture tree is unchanged" "$root_before" "$(find "$d/root" -type f | wc -l | tr -d ' ')"
+
+# ── BD. a log path swapped to a FIFO mid-call never blocks the exit ──────────
+# The supervisor opens the log once, before the spawn, and writes every later
+# line to that descriptor. A regular file there at startup is opened; replacing
+# the path with a FIFO while the child runs must not reach an open(2). The child
+# exits with its own status after the swap, inside a 6 s bound; the case's own
+# watchdog kills a hung supervisor and reports it. A supervisor that reopens the
+# path on every append blocks in logEnd() on the readerless FIFO and never exits.
+run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SWAP_HUNG
+  local sup="$1"
+  local d="$2"
+  local pid watchdog t0 t1
+  : >"$d/log.swap"
+  SWAP_HUNG=0
+  t0="$(node -p 'Date.now()')"
+  PROMOTE_SUPERVISOR_LOG="$d/log.swap" "${NODE_BIN:-node}" "$sup" 30 1 -- \
+    "${NODE_BIN:-node}" -e 'setTimeout(() => process.exit(7), 1200)' \
+    >"$d/out.txt" 2>"$d/err.txt" &
+  pid=$!
+  "${NODE_BIN:-node}" -e \
+    'setTimeout(() => { try { process.kill(Number(process.argv[1]), "SIGKILL"); } catch (e) {} }, 6000)' \
+    "$pid" >/dev/null 2>&1 &
+  watchdog=$!
+  "${NODE_BIN:-node}" -e 'setTimeout(() => {}, 400)'
+  rm -f "$d/log.swap"
+  mkfifo "$d/log.swap"
+  wait "$pid" 2>/dev/null
+  SWAP_RC=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  t1="$(node -p 'Date.now()')"
+  SWAP_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
+  if [ "$SWAP_RC" = "137" ] || node -e 'process.exit(Number(process.argv[1]) >= 6 ? 0 : 1)' "$SWAP_ELAPSED"; then
+    SWAP_HUNG=1
+  fi
+}
+
+d="$(new_fixture fifo-swap-log)"
+run_swap_case "$here/npm-supervisor.mjs" "$d"
+assert_eq "BD swapped log: exit status is the child's" 7 "$SWAP_RC"
+if [ "$SWAP_HUNG" -eq 1 ]; then
+  bad "BD swapped log: exit inside the bound" "the supervisor hung: no exit within 6 s after its log path became a FIFO (rc $SWAP_RC, ${SWAP_ELAPSED}s)"
+elif node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$SWAP_ELAPSED"; then
+  ok "BD swapped log: exit inside the bound" "${SWAP_ELAPSED}s"
+else
+  bad "BD swapped log: exit inside the bound" "${SWAP_ELAPSED}s — past the 6 s bound"
+fi
+
+# ── BD mutation: reopen the log by path on every append; BD must catch the hang ─
+bd="$work/mut-log-append-path"
+mkdir -p "$bd"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$bd/npm-supervisor.mjs" log_no_stat; then
+  d="$(new_fixture mut-fifo-swap-log)"
+  run_swap_case "$bd/npm-supervisor.mjs" "$d"
+  if [ "$SWAP_HUNG" -eq 1 ]; then
+    ok "BD mutation: mid-call FIFO swap hang caught" "mutant hung ${SWAP_ELAPSED}s (rc $SWAP_RC) past the 6 s bound"
+  else
+    bad "BD mutation: mid-call FIFO swap hang caught" "mutant exited $SWAP_RC in ${SWAP_ELAPSED}s — BD is blind"
+  fi
+else
+  bad "BD mutation: mid-call FIFO swap hang caught" "could not build the mutant supervisor"
+fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
 # Companion only, NOT coverage — see the header. The real control is the macOS

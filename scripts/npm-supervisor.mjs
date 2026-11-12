@@ -12,11 +12,14 @@
 // same way. Exit status: the child's code (128+n if a signal killed it), 124 on a
 // deadline timeout, 127 if the command cannot start, 2 on a usage error.
 //
-// PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is checked once,
-// before the spawn: it is used only when it does not exist yet or is a regular
-// file, so a FIFO or a device there is never opened. Each supervised call appends
-// `start <ms>` before the spawn, `end <ms>` when the call ends, and a signal name
-// for each kill attempt.
+// PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is opened once,
+// before the spawn, with O_NONBLOCK; the descriptor is kept only when fstat says
+// it is a regular file (otherwise it is closed and logging is off). If the open
+// fails, logging is off too. Every later line is written to that descriptor,
+// never by path, so a path replaced during the call is never opened. The
+// descriptor stays open for the life of the process; process exit closes it.
+// Each supervised call appends `start <ms>` before the spawn, `end <ms>` when the
+// call ends, and a signal name for each kill attempt.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -42,22 +45,26 @@ if (
 const [command, ...args] = argv.slice(3);
 
 const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
-let logPath = '';
+let logFd = -1;
 if (requestedLogPath !== '') {
   try {
-    const stat = fs.statSync(requestedLogPath, { throwIfNoEntry: false });
-    if (stat === undefined || stat.isFile()) logPath = requestedLogPath;
+    const fd = fs.openSync(
+      requestedLogPath,
+      fs.constants.O_WRONLY | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NONBLOCK,
+    );
+    if (fs.fstatSync(fd).isFile()) logFd = fd;
+    else fs.closeSync(fd);
   } catch {
-    // The path cannot be inspected, so logging is off: an append here could
-    // block the call (a FIFO) or fail it for no diagnostic gain.
+    // The path cannot be opened for append, so logging is off: a write here
+    // could fail the call for no diagnostic gain.
   }
 }
 function logLine(line) {
-  if (!logPath) return;
+  if (logFd < 0) return;
   try {
-    fs.appendFileSync(logPath, line + '\n');
+    fs.writeSync(logFd, line + '\n');
   } catch {
-    // The log is diagnostic only; never fail or block the call for it.
+    // The log is diagnostic only; never fail the call for it.
   }
 }
 function logSignal(name) {
