@@ -47,7 +47,10 @@
 #     rollback failures from the reason, release the lock on the delayed-commit
 #     path, call an uncertain package restored, and drop `<&0` from the npm
 #     launch; confirm a fixture catches each — a test that passes on both the
-#     fixed and the broken script is not a test.
+#     fixed and the broken script is not a test. The same holds for the log
+#     parser's uniqueness rule (allow a second signalled call) and for the log
+#     path's regular-file check (drop it: the FIFO case then hangs past its
+#     bound).
 #   * a timed-out mutating call (`dist-tag add`) leaves the run UNCERTAIN: exit 7,
 #     no "restored" line for that package, and the lock remains, with a reason
 #     file when it can be written (AD, AE); a later run refuses and prints the
@@ -61,7 +64,12 @@
 #     child that ignores TERM is KILLed after the grace (AL), timed from the
 #     supervisor's own start/end lines. A supervisor log is read with strict
 #     per-call framing, and a command that cannot start still logs one
-#     start/end pair (AT).
+#     start/end pair (AT). The parser refuses a log with more than one signalled
+#     call, because a timing bound read from the first of them would time the
+#     wrong call (S-a).
+#   * the log path is checked once before the spawn: a FIFO placed there neither
+#     stalls the supervised call nor changes its status (BB), and an unset or
+#     empty PROMOTE_SUPERVISOR_LOG writes no file (BC).
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
 #     never answers makes the run uncertain (AJ); TERM during a pending PUT keeps
@@ -195,9 +203,9 @@ strip_cr() { tr -d '\r'; }
 # `start <ms>`, an `end <ms>`, or a signal name, matched whole, so an extra token
 # or a blank line mid-file is an unknown line. A start while a call is open, an
 # end or signal with no open call, an unknown line, or a call left open at the
-# end of the log fails. On a valid log it prints the signalled call's own
-# duration in seconds, so a log that loses that call's end cannot pass by pairing
-# its start with the next call's end.
+# end of the log fails, as does a log with more than one signalled call. On a
+# valid log it prints the signalled call's own duration in seconds, so a log that
+# loses that call's end cannot pass by pairing its start with the next call's end.
 supervisor_log_parser="$work/supervisor-log.mjs"
 cat >"$supervisor_log_parser" <<'LOG_PARSER'
 import fs from 'node:fs';
@@ -235,8 +243,33 @@ for (const line of lines) {
 if (open !== null) fail('a call left open at the end of the log');
 const signalled = calls.filter((call) => call.signalled);
 if (signalled.length === 0) fail('no signalled call');
+if (signalled.length > 1) fail('more than one signalled call');
 process.stdout.write(((signalled[0].end - signalled[0].start) / 1000).toFixed(2));
 LOG_PARSER
+
+# Counts the calls that carry a signal, with the same framing as the parser, so
+# a fixture can assert that AL's real log holds exactly one of them.
+count_signalled="$work/count-signalled.mjs"
+cat >"$count_signalled" <<'COUNT_SIGNALLED'
+import fs from 'node:fs';
+
+const lines = fs.readFileSync(process.argv[2], 'utf8').split('\n').filter((line) => line !== '');
+let open = false;
+let counted = false;
+let count = 0;
+for (const line of lines) {
+  if (/^start \d+$/.test(line)) {
+    open = true;
+    counted = false;
+  } else if (/^end \d+$/.test(line)) {
+    open = false;
+  } else if (open && !counted && /^(INT|TERM|HUP|KILL)$/.test(line)) {
+    count += 1;
+    counted = true;
+  }
+}
+process.stdout.write(String(count));
+COUNT_SIGNALLED
 
 # ── real-npm seam helpers ────────────────────────────────────────────────────
 # A small registry on 127.0.0.1, written at run time, with no dependency beyond
@@ -824,6 +857,22 @@ if (which === 'skip_end_on_timeout') {
     process.exit(3);
   }
   fs.writeFileSync(dst, s.replace(old, neu));
+  process.exit(0);
+}
+
+if (which === 'log_no_stat') {
+  const start = "const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';";
+  const endMarker = 'function logLine(line) {';
+  const a = s.indexOf(start);
+  const b = s.indexOf(endMarker, a);
+  if (a < 0 || b < 0) {
+    console.error('supervisor log-check mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(
+    dst,
+    s.slice(0, a) + "const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';\n\n" + s.slice(b),
+  );
   process.exit(0);
 }
 
@@ -1527,6 +1576,7 @@ assert_contains "AL bound: supervisor attempted TERM" "$(cat "$d/supervisor.log"
 assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
 # Calls run one at a time, and the log is read with strict per-call framing, so
 # the signalled call's own start and end bracket its duration.
+assert_eq "AL bound: exactly one signalled call" 1 "$(node "$count_signalled" "$d/supervisor.log")"
 elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
 if [ -z "$elapsed" ]; then
   bad "AL bound: at least deadline + grace" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"
@@ -1682,6 +1732,7 @@ parser end with no open call|end 100\nstart 200\nTERM\nend 300\n|1|an end line w
 parser signal with no open call|TERM\nstart 200\nTERM\nend 300\n|1|a signal line with no open call: TERM|
 parser blank line mid-file|start 100\n\nTERM\nend 200\n|1|an unknown line: |
 parser call left open|start 100\nTERM\nend 200\nstart 300\n|1|a call left open at the end of the log|
+parser more than one signalled call|start 100\nTERM\nend 200\nstart 300\nTERM\nend 400\n|1|more than one signalled call|
 BA valid signalled call|start 200\nTERM\nend 300\n|0||0.10|
 PARSER_ROWS
 
@@ -1699,6 +1750,36 @@ while IFS='|' read -r parser_label parser_log parser_rc parser_msg parser_elapse
     assert_eq "$parser_label: elapsed" "$parser_elapsed" "$(cat "$d/elapsed")"
   fi
 done <"$parser_rows"
+
+# ── S-a mutation: allow a second signalled call; its rule's row must catch it ─
+# The mutant keeps every other rule and drops only the uniqueness refusal, so it
+# prints the FIRST signalled call's duration — the wrong call — where the rule's
+# row expects exit 1.
+mut_parser="$work/supervisor-log-any-signalled.mjs"
+cat >"$work/mutate-parser.mjs" <<'MUTPARSER'
+import fs from 'node:fs';
+const [src, dst] = process.argv.slice(2);
+const s = fs.readFileSync(src, 'utf8');
+const rule = "if (signalled.length > 1) fail('more than one signalled call');\n";
+if (!s.includes(rule)) {
+  console.error('parser uniqueness rule not found');
+  process.exit(3);
+}
+fs.writeFileSync(dst, s.replace(rule, ''));
+MUTPARSER
+if node "$work/mutate-parser.mjs" "$supervisor_log_parser" "$mut_parser"; then
+  d="$(new_fixture parser-mut-two-signalled)"
+  printf '%b' 'start 1000\nTERM\nend 1200\nstart 5000\nTERM\nend 9000\n' >"$d/log.txt"
+  mut_rc=0
+  node "$mut_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err" || mut_rc=$?
+  if [ "$mut_rc" -eq 0 ] && [ "$(cat "$d/elapsed")" = "0.20" ]; then
+    ok "S-a mutation: second signalled call refused" "rule's row expects exit 1; mutant exited 0 with the FIRST call's 0.20 s"
+  else
+    bad "S-a mutation: second signalled call refused" "mutant exit $mut_rc, printed [$(cat "$d/elapsed")] — expected 0 and 0.20 to show the row goes red"
+  fi
+else
+  bad "S-a mutation: second signalled call refused" "could not build the mutant parser"
+fi
 
 # ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
 # The strict framing rejects the next call's start while the timed-out call is
@@ -2067,6 +2148,81 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m16/npm-super
 else
   bad "M16 mutation (f): spawn-error end line caught" "could not build the mutant supervisor"
 fi
+
+# ── BB. a FIFO at the log path never blocks the supervised call ──────────────
+# The supervisor checks the path once, before the spawn, and a FIFO is not a
+# regular file, so nothing is written. The child ignores TERM, so the call must
+# end at the deadline (1 s) plus the grace (1 s) with the supervisor's 124, inside
+# a 6 s watchdog. A supervisor that appends to the FIFO first blocks in open(2)
+# and never spawns; the watchdog then ends the run past the bound.
+run_fifo_case() { # <supervisor-path> <fixture-dir> -> FIFO_RC, FIFO_ELAPSED
+  local sup="$1"
+  local d="$2"
+  local pid watchdog t0 t1
+  mkfifo "$d/log.fifo"
+  t0="$(node -p 'Date.now()')"
+  PROMOTE_SUPERVISOR_LOG="$d/log.fifo" "${NODE_BIN:-node}" "$sup" 1 1 -- \
+    "${NODE_BIN:-node}" -e 'process.on("SIGTERM", () => {}); setTimeout(() => {}, 30000)' \
+    >"$d/out.txt" 2>"$d/err.txt" &
+  pid=$!
+  "${NODE_BIN:-node}" -e \
+    'setTimeout(() => { try { process.kill(Number(process.argv[1]), "SIGKILL"); } catch (e) {} }, 6000)' \
+    "$pid" >/dev/null 2>&1 &
+  watchdog=$!
+  wait "$pid" 2>/dev/null
+  FIFO_RC=$?
+  kill "$watchdog" 2>/dev/null
+  wait "$watchdog" 2>/dev/null
+  t1="$(node -p 'Date.now()')"
+  FIFO_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
+}
+
+d="$(new_fixture fifo-log)"
+run_fifo_case "$here/npm-supervisor.mjs" "$d"
+assert_eq "BB fifo-log: exit at the deadline" 124 "$FIFO_RC"
+if node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$FIFO_ELAPSED"; then
+  ok "BB fifo-log: inside deadline + grace" "${FIFO_ELAPSED}s"
+else
+  bad "BB fifo-log: inside deadline + grace" "${FIFO_ELAPSED}s — the call did not end at its deadline"
+fi
+assert_eq "BB fifo-log: the FIFO is untouched" fifo "$(if [ -p "$d/log.fifo" ]; then echo fifo; else echo other; fi)"
+
+# ── S-b mutation: drop the startup check; BB must catch the hang ─────────────
+bb="$work/mut-log-no-stat"
+mkdir -p "$bb"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$bb/npm-supervisor.mjs" log_no_stat; then
+  d="$(new_fixture mut-fifo-log)"
+  run_fifo_case "$bb/npm-supervisor.mjs" "$d"
+  if [ "$FIFO_RC" = "124" ] && node -e 'process.exit(Number(process.argv[1]) < 6 ? 0 : 1)' "$FIFO_ELAPSED"; then
+    bad "S-b mutation: FIFO hang caught" "mutant still ended at its deadline in ${FIFO_ELAPSED}s — BB is blind"
+  else
+    ok "S-b mutation: FIFO hang caught" "mutant ran ${FIFO_ELAPSED}s and was killed past the 6 s bound (BB catches it)"
+  fi
+else
+  bad "S-b mutation: FIFO hang caught" "could not build the mutant supervisor"
+fi
+
+# ── BC. an unset or empty log path writes nothing, and statuses are unchanged ─
+# Both runs use an empty working directory under the fixture, so a file the
+# supervisor created for the log would show up there and in the fixture count.
+d="$(new_fixture log-unset)"
+mkdir -p "$d/cwd-unset" "$d/cwd-empty"
+root_before="$(find "$d/root" -type f | wc -l | tr -d ' ')"
+(
+  cd "$d/cwd-unset" && env -u PROMOTE_SUPERVISOR_LOG "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
+    "${NODE_BIN:-node}" -e 'process.exit(3)'
+) >"$d/out-unset.txt" 2>"$d/err-unset.txt"
+rc_unset=$?
+(
+  cd "$d/cwd-empty" && PROMOTE_SUPERVISOR_LOG= "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
+    "${NODE_BIN:-node}" -e 'process.exit(4)'
+) >"$d/out-empty.txt" 2>"$d/err-empty.txt"
+rc_empty=$?
+assert_eq "BC unset log: exit status kept" 3 "$rc_unset"
+assert_eq "BC empty log: exit status kept" 4 "$rc_empty"
+assert_eq "BC unset log: working directory still empty" 0 "$(find "$d/cwd-unset" -mindepth 1 | wc -l | tr -d ' ')"
+assert_eq "BC empty log: working directory still empty" 0 "$(find "$d/cwd-empty" -mindepth 1 | wc -l | tr -d ' ')"
+assert_eq "BC log paths: the fixture tree is unchanged" "$root_before" "$(find "$d/root" -type f | wc -l | tr -d ' ')"
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
 # Companion only, NOT coverage — see the header. The real control is the macOS

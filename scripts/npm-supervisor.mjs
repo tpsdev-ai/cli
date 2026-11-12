@@ -12,9 +12,11 @@
 // same way. Exit status: the child's code (128+n if a signal killed it), 124 on a
 // deadline timeout, 127 if the command cannot start, 2 on a usage error.
 //
-// PROMOTE_SUPERVISOR_LOG, when set, must name a local regular file (not a FIFO or
-// a mount that can hang). Each supervised call appends `start <ms>` before the
-// spawn, `end <ms>` when the call ends, and a signal name for each kill attempt.
+// PROMOTE_SUPERVISOR_LOG, when set, names the log file. The path is checked once,
+// before the spawn: it is used only when it does not exist yet or is a regular
+// file, so a FIFO or a device there is never opened. Each supervised call appends
+// `start <ms>` before the spawn, `end <ms>` when the call ends, and a signal name
+// for each kill attempt.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -39,7 +41,17 @@ if (
 }
 const [command, ...args] = argv.slice(3);
 
-const logPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
+const requestedLogPath = process.env.PROMOTE_SUPERVISOR_LOG || '';
+let logPath = '';
+if (requestedLogPath !== '') {
+  try {
+    const stat = fs.statSync(requestedLogPath, { throwIfNoEntry: false });
+    if (stat === undefined || stat.isFile()) logPath = requestedLogPath;
+  } catch {
+    // The path cannot be inspected, so logging is off: an append here could
+    // block the call (a FIFO) or fail it for no diagnostic gain.
+  }
+}
 function logLine(line) {
   if (!logPath) return;
   try {
