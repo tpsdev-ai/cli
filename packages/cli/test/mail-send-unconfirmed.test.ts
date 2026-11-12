@@ -408,7 +408,9 @@ async function runSend(
 ): Promise<{ status: number; stdout: string; stderr: string }> {
   const keysDir = join(root, "keys");
   if (opts.writeKey !== false) writeKeyFile(keysDir, "flint", opts.seed ?? FLINT_SEED);
-  const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", opts.to ?? "remote-a", ...args], {
+  // --quiet-nono-check keeps a host without nono (CI) from printing the
+  // availability banner on stderr ahead of the text these cases assert on.
+  const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", opts.to ?? "remote-a", ...args, "--quiet-nono-check"], {
     cwd: root,
     env: {
       ...process.env,
