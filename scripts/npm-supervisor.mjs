@@ -12,7 +12,9 @@
 // same way. Exit status: the child's code (128+n if a signal killed it), 124 on a
 // deadline timeout, 127 if the command cannot start, 2 on a usage error.
 //
-// PROMOTE_SUPERVISOR_LOG, when set, records each ChildProcess.kill() attempt.
+// PROMOTE_SUPERVISOR_LOG, when set, must name a local regular file (not a FIFO or
+// a mount that can hang). Each supervised call appends `start <ms>` before the
+// spawn, `end <ms>` when the call ends, and a signal name for each kill attempt.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -43,7 +45,7 @@ function logLine(line) {
   try {
     fs.appendFileSync(logPath, line + '\n');
   } catch {
-    // The log is diagnostic only; never fail the call for it.
+    // The log is diagnostic only; never fail or block the call for it.
   }
 }
 function logSignal(name) {
@@ -78,13 +80,16 @@ function send(signal) {
   return true;
 }
 
-let exitLogged = false;
+let endLogged = false;
+function logEnd() {
+  if (endLogged) return;
+  endLogged = true;
+  logLine('end ' + Date.now());
+}
+
 function exitWithStatus() {
   if (!exitInfo) return;
-  if (!exitLogged) {
-    exitLogged = true;
-    logLine('end ' + Date.now());
-  }
+  logEnd();
   if (timedOut) process.exit(124);
   if (exitInfo.signal) process.exit(128 + (os.constants.signals[exitInfo.signal] || 0));
   process.exit(typeof exitInfo.code === 'number' ? exitInfo.code : 1);
@@ -108,6 +113,8 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
 }
 
 child.on('error', (err) => {
+  clearTimeout(deadlineTimer);
+  logEnd();
   process.stderr.write('npm-supervisor: could not start ' + command + ': ' + err.message + '\n');
   process.exit(127);
 });

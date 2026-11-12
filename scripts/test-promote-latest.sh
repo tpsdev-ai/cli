@@ -58,7 +58,10 @@
 #     uncertain write and a rollback failure on different packages are both
 #     listed (AO).
 #   * npm exiting during the TERM grace ends the call without a KILL (AG); a
-#     child that ignores TERM is KILLed after the grace (AL)
+#     child that ignores TERM is KILLed after the grace (AL), timed from the
+#     supervisor's own start/end lines. A supervisor log is read with strict
+#     per-call framing, and a command that cannot start still logs one
+#     start/end pair (AT).
 #   * the real npm CLI against a local registry: the OTP challenge is answered by
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
 #     never answers makes the run uncertain (AJ); TERM during a pending PUT keeps
@@ -186,6 +189,51 @@ PTY_RUNNER
 
 # strip the CR a pty adds on output, so the assertions see the tool's own lines
 strip_cr() { tr -d '\r'; }
+
+# ── supervisor log parser ────────────────────────────────────────────────────
+# Applies strict per-call framing to a PROMOTE_SUPERVISOR_LOG: every line is a
+# `start <ms>`, an `end <ms>`, or a signal name. A start while a call is open, an
+# end or signal with no open call, an unknown line, or a call left open at the
+# end of the log fails. On a valid log it prints the signalled call's own
+# duration in seconds, so a log that loses that call's end cannot pass by pairing
+# its start with the next call's end.
+supervisor_log_parser="$work/supervisor-log.mjs"
+cat >"$supervisor_log_parser" <<'LOG_PARSER'
+import fs from 'node:fs';
+
+function fail(why) {
+  process.stderr.write('supervisor log: ' + why + '\n');
+  process.exit(1);
+}
+
+const lines = fs.readFileSync(process.argv[2], 'utf8').split('\n').filter((line) => line !== '');
+const signals = ['INT', 'TERM', 'HUP', 'KILL'];
+const calls = [];
+let open = null;
+for (const line of lines) {
+  const [tag, raw] = line.split(' ');
+  if (tag === 'start') {
+    if (open !== null) fail('a start line while a call is open: ' + line);
+    if (raw === undefined || !/^\d+$/.test(raw)) fail('a start line without a timestamp: ' + line);
+    open = { start: Number(raw), signalled: false };
+  } else if (tag === 'end') {
+    if (open === null) fail('an end line with no open call: ' + line);
+    if (raw === undefined || !/^\d+$/.test(raw)) fail('an end line without a timestamp: ' + line);
+    open.end = Number(raw);
+    calls.push(open);
+    open = null;
+  } else if (signals.includes(tag)) {
+    if (open === null) fail('a signal line with no open call: ' + line);
+    open.signalled = true;
+  } else {
+    fail('an unknown line: ' + line);
+  }
+}
+if (open !== null) fail('a call left open at the end of the log');
+const signalled = calls.filter((call) => call.signalled);
+if (signalled.length === 0) fail('no signalled call');
+process.stdout.write(((signalled[0].end - signalled[0].start) / 1000).toFixed(2));
+LOG_PARSER
 
 # ── real-npm seam helpers ────────────────────────────────────────────────────
 # A small registry on 127.0.0.1, written at run time, with no dependency beyond
@@ -744,6 +792,35 @@ setTimeout(() => {
   step();
 }, startupMs);`;
   fs.writeFileSync(dst, s.slice(0, a) + replacement + s.slice(b + end.length));
+  process.exit(0);
+}
+
+if (which === 'drop_end_on_error') {
+  const old = `child.on('error', (err) => {
+  clearTimeout(deadlineTimer);
+  logEnd();`;
+  const neu = `child.on('error', (err) => {
+  clearTimeout(deadlineTimer);`;
+  if (!s.includes(old)) {
+    console.error('supervisor error-path end mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(old, neu));
+  process.exit(0);
+}
+
+if (which === 'skip_end_on_timeout') {
+  const old = `function exitWithStatus() {
+  if (!exitInfo) return;
+  logEnd();`;
+  const neu = `function exitWithStatus() {
+  if (!exitInfo) return;
+  if (!timedOut) logEnd();`;
+  if (!s.includes(old)) {
+    console.error('supervisor end-log mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(old, neu));
   process.exit(0);
 }
 
@@ -1445,30 +1522,12 @@ NPM_TIMEOUT_SECONDS=1 invoke "$d" 0.5.4 --yes --no-docker
 assert_eq "AL bound: exit" 7 "$RC"
 assert_contains "AL bound: supervisor attempted TERM" "$(cat "$d/supervisor.log" 2>/dev/null)" "TERM"
 assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log" 2>/dev/null)" "KILL"
-# Calls run one at a time, so the start line before the first TERM and the end
-# line after it bracket the call the deadline signalled.
-elapsed="$(node -e '
-const fs = require("fs");
-const lines = fs.readFileSync(process.argv[1], "utf8").split("\n").filter(Boolean);
-let start = null;
-let signalled = false;
-for (const line of lines) {
-  const parts = line.split(" ");
-  const tag = parts[0];
-  if (tag === "start") {
-    if (!signalled) start = Number(parts[1]);
-  } else if (tag === "TERM" || tag === "KILL") {
-    signalled = true;
-  } else if (tag === "end" && signalled && start !== null) {
-    process.stdout.write(((Number(parts[1]) - start) / 1000).toFixed(2));
-    process.exit(0);
-  }
-}
-process.exit(1);
-' "$d/supervisor.log" || true)"
+# Calls run one at a time, and the log is read with strict per-call framing, so
+# the signalled call's own start and end bracket its duration.
+elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
 if [ -z "$elapsed" ]; then
-  bad "AL bound: at least deadline + grace" "no start/end pair around TERM in the supervisor log"
-  bad "AL bound: inside deadline + grace + 5s" "no start/end pair around TERM in the supervisor log"
+  bad "AL bound: at least deadline + grace" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"
+  bad "AL bound: inside deadline + grace + 5s" "no signalled call's start/end pair"
 elif node -e 'process.exit(Number(process.argv[1]) >= 2.5 ? 0 : 1)' "$elapsed"; then
   ok "AL bound: at least deadline + grace" "${elapsed}s"
 else
@@ -1582,6 +1641,50 @@ reason="$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)"
 assert_contains "AR two timeouts: promote" "$reason" "(promote to 0.5.4"
 assert_contains "AR two timeouts: rollback" "$reason" "(rollback to 0.5.3"
 assert_eq "AR two timeouts: separate entries" 2 "$(printf '%s\n' "$reason" | grep -c '^  - @tpsdev-ai/cli-linux-arm64:')"
+
+# ── AT. the supervisor logs one start/end pair when the command cannot start ──
+# A spawn error ends the call before any exit event, so the end line has to come
+# from the error handler; without it the log holds a start with no end.
+d="$(new_fixture supervisor-start-failure)"
+PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- "$work/no-such-command" \
+  >"$d/out.txt" 2>"$d/err.txt"
+rc=$?
+assert_eq "AT start-failure: exit" 127 "$rc"
+assert_contains "AT start-failure: names the command" "$(cat "$d/err.txt")" "could not start"
+assert_eq "AT start-failure: one start line" 1 "$(grep -c '^start [0-9][0-9]*$' "$d/supervisor.log" 2>/dev/null || true)"
+assert_eq "AT start-failure: one end line" 1 "$(grep -c '^end [0-9][0-9]*$' "$d/supervisor.log" 2>/dev/null || true)"
+assert_eq "AT start-failure: the log holds only that pair" 2 "$(wc -l <"$d/supervisor.log" | tr -d ' ')"
+
+# ── AU. the log parser refuses framing the real supervisor never writes ─────
+d="$(new_fixture supervisor-log-missing-start)"
+printf 'end 100\nstart 200\nend 300\n' >"$d/log.txt"
+if node "$supervisor_log_parser" "$d/log.txt" >"$d/elapsed" 2>"$d/parse.err"; then
+  bad "AU parser: missing start refused" "parsed a log whose first end has no open call"
+else
+  ok "AU parser: missing start refused" "$(head -n 1 "$d/parse.err")"
+fi
+
+# ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
+# The strict framing rejects the next call's start while the timed-out call is
+# still open, so a supervisor that stops logging `end` on that path fails AL
+# instead of passing on a duration that spans two calls.
+av="$work/mut-skip-end"
+mkdir -p "$av"
+cp "$tool" "$av/promote-latest.sh"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$av/npm-supervisor.mjs" skip_end_on_timeout; then
+  d="$(new_fixture mut-skip-end)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  NPM_TIMEOUT_SECONDS=1 TOOL="$av/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  if node "$supervisor_log_parser" "$d/supervisor.log" >"$d/elapsed" 2>"$d/parse.err"; then
+    bad "AV mutation: missing end on timeout caught" "AL timed $(cat "$d/elapsed")s from a log with no end for the signalled call"
+  else
+    ok "AV mutation: missing end on timeout caught" "AL red: $(head -n 1 "$d/parse.err")"
+  fi
+  TOOL=""
+else
+  bad "AV mutation: missing end on timeout caught" "could not build the mutant supervisor"
+fi
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
@@ -1907,6 +2010,25 @@ if node "$work/mutate.mjs" "$tool" "$mut" drop_rollback_failures; then
   TOOL=""
 else
   bad "M15 mutation (d): dropped rollback failure caught" "could not build the mutant"
+fi
+
+# ── M16. mutation: drop the end line from the spawn-error path ────────────────
+# Fixture AT's command cannot start; a supervisor that logs no end there leaves
+# one start and no end, which AT's pair count must catch.
+m16="$work/mut-drop-end-on-error"
+mkdir -p "$m16"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m16/npm-supervisor.mjs" drop_end_on_error; then
+  d="$(new_fixture mut-drop-end-on-error)"
+  PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" "${NODE_BIN:-node}" "$m16/npm-supervisor.mjs" 5 1 -- "$work/no-such-command" \
+    >"$d/out.txt" 2>"$d/err.txt"
+  got_ends="$(grep -c '^end [0-9][0-9]*$' "$d/supervisor.log" 2>/dev/null || true)"
+  if [ "$got_ends" -eq 0 ]; then
+    ok "M16 mutation (f): spawn-error end line caught" "mutant logged a start and no end (fixture AT expects one of each)"
+  else
+    bad "M16 mutation (f): spawn-error end line caught" "mutant logged $got_ends end line(s) — fixture AT is blind"
+  fi
+else
+  bad "M16 mutation (f): spawn-error end line caught" "could not build the mutant supervisor"
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
