@@ -298,6 +298,12 @@ function sentEnvelopeDir(): string {
   return join(root, "mail", ".sent-envelopes");
 }
 
+/** Every stored signed envelope currently on disk. */
+function storedEnvelopeFiles(): string[] {
+  const dir = sentEnvelopeDir();
+  return existsSync(dir) ? readdirSync(dir).filter((file) => file.endsWith(".json")) : [];
+}
+
 /** Read lines from a child's stdout, keeping any text after a newline for the
  *  next call, and reject naming the bound when none arrives in time. */
 function peerLines(stream: ReadableStream<Uint8Array>): { next(ms: number): Promise<string> } {
@@ -398,11 +404,11 @@ async function runSend(
   env: Record<string, string> = {},
   ms = 15_000,
   body = "unconfirmed delivery test",
-  opts: { seed?: Buffer; writeKey?: boolean } = {},
+  opts: { seed?: Buffer; writeKey?: boolean; to?: string } = {},
 ): Promise<{ status: number; stdout: string; stderr: string }> {
   const keysDir = join(root, "keys");
   if (opts.writeKey !== false) writeKeyFile(keysDir, "flint", opts.seed ?? FLINT_SEED);
-  const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", "remote-a", ...args], {
+  const proc = Bun.spawn(["bun", TPS_BIN, "mail", "send", opts.to ?? "remote-a", ...args], {
     cwd: root,
     env: {
       ...process.env,
@@ -1199,6 +1205,16 @@ describe("flags and ids the remote wire cannot carry are refused by name", () =>
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("cannot be delivered to a remote branch");
     expect(branch.deliveries).toEqual([]);
+    expect(storedEnvelopeFiles(), "a refused send writes no stored envelope").toEqual([]);
+  }, 20_000);
+
+  test("a --message-id to an unroutable agent is refused and stores nothing", async () => {
+    const r = await runSend(["--stdin", "--message-id", "unroutable.0001"], {}, 15_000, "no route", {
+      to: "nobody",
+    });
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("Refusing to send to 'nobody': no route");
+    expect(storedEnvelopeFiles(), "a refused send writes no stored envelope").toEqual([]);
   }, 20_000);
 
   test("--ack-timeout -3 is refused by name before anything is sent", async () => {

@@ -1298,7 +1298,7 @@ function retryOwedNackInBackground(
   // TPS_MAIL_ACK_TIMEOUT_MS must not refuse a local, outbox or bridge retry.
   const route = routeFor(mailDir, cfg, accountId, sender);
   let ackTimeoutMs: number | undefined;
-  let backstopMs = NACK_RETRY_BACKSTOP_MS;
+  let backstopMs = timeoutMs + NACK_RETRY_BACKSTOP_MS;
   if (route.kind === "remote-branch") {
     try {
       ackTimeoutMs = resolveMailAckTimeoutMs();
@@ -1327,10 +1327,11 @@ function retryOwedNackInBackground(
       return;
     }
   }
-  // BACKSTOP: for a remote-branch retry it sits deliberately ABOVE the relay's
-  // whole bound, so it only needs a later net to guarantee the fire-and-forget
-  // promise never hangs the process here. A route that does not run the relay
-  // settles locally, so its bound is the backstop alone.
+    // BACKSTOP: a remote-branch retry sits above the relay's whole bound, so it
+  // only needs a later net to guarantee the fire-and-forget promise never hangs
+  // the process here. Every other route gets `timeoutMs` plus the same backstop:
+  // a local nack reads a transcript and signs before it writes, so a 2 s net
+  // logged a false timeout while the delivery was still running.
   const recCurPath = findCurPath(mailDir, agentId, inboundId);
   const ctx = makeYieldCtx(
     mailDir,

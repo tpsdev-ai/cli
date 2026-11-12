@@ -110,10 +110,22 @@ afterEach(() => {
 });
 
 /** The durable shape an owed nack leaves: a `failed` record with nackPending. */
-function seedOwedNack(inboundId: string, reason: string): void {
+function seedOwedNack(
+  inboundId: string,
+  reason: string,
+  opts: { senderKeyDelayMs?: number } = {},
+): void {
   const seed = Buffer.alloc(32, 1);
+  let delayPendingMs = opts.senderKeyDelayMs ?? 0;
   mock.module("@tpsdev-ai/cli/utils/mail-verify", () => ({ createMailVerifyClient: async () => ({
-    getAgent: async (name: string) => name === SENDER ? { publicKey: pubkeyFromSeed(seed) } : null,
+    getAgent: async (name: string) => {
+      if (name === SENDER && delayPendingMs > 0) {
+        const ms = delayPendingMs;
+        delayPendingMs = 0;
+        await new Promise((r) => setTimeout(r, ms));
+      }
+      return name === SENDER ? { publicKey: pubkeyFromSeed(seed) } : null;
+    },
   }) }));
   const cur = resolve(mailDir, AGENT, "cur");
   mkdirSync(cur, { recursive: true });
@@ -326,6 +338,40 @@ describe("cli#962 round 15 — a window the retry cannot hold", () => {
     expect(named, "the refusal names the inbound id").toBe(true);
     expect(relay.deliver.length, "nothing was handed to a route").toBe(0);
     expect(await quietFor(300, warned, (m) => m.includes("nack-retry-timeout"))).toEqual([]);
+
+    controller.abort();
+    try { await startPromise; } catch { /* aborted */ }
+  }, 20000);
+});
+
+describe("cli#962 round 20 — a non-remote retry's backstop sits above its send bound", () => {
+  it("R20-a: a local retry whose send settles after ~3 s logs no timeout and pays the nack", async () => {
+    const inboundId = "msg-r20-slow-local";
+    // The inbound's verification (inside the local send) takes 3 s: past the
+    // old 2000 ms backstop, well inside the configured connection bound.
+    seedOwedNack(inboundId, "receipt-malformed", { senderKeyDelayMs: 3000 });
+    // The recipient's own maildir exists: off the office that is a local route.
+    mkdirSync(resolve(mailDir, SENDER), { recursive: true });
+    process.env.TPS_NACK_RETRY_TIMEOUT_MS = "20000";
+
+    const { startPromise, warned, infos } = start();
+
+    const swept = await pollUntil(() => infos.some((m) => m.includes("obligation retention: removed")), 2000);
+    expect(swept, "startup's later steps ran").toBe(true);
+
+    const delivered = await pollUntil(
+      () => warned.some((m) => m.includes("nack delivered to") && m.includes(inboundId)),
+      10_000,
+    );
+    expect(delivered, "the slow local retry settled and the nack was paid").toBe(true);
+    expect(
+      warned.filter((m) => m.includes("nack-retry-timeout")),
+      "a send inside its bound logged no false timeout",
+    ).toEqual([]);
+
+    const rec = JSON.parse(readFileSync(resolve(mailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8"));
+    expect(rec.nackSentAt, "the retry was paid").toBeTruthy();
+    expect(rec.nackPending, "and the record no longer owes it").toBeFalsy();
 
     controller.abort();
     try { await startPromise; } catch { /* aborted */ }

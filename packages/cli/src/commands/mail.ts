@@ -279,7 +279,7 @@ async function signOutboundOrFail(
   to: string,
   body: string,
   opts: { replyToId?: string; messageId?: string },
-): Promise<string> {
+): Promise<{ signed: string; reusedStoredEnvelope: boolean }> {
   try {
     if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
       throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
@@ -327,14 +327,31 @@ async function signOutboundOrFail(
           `the body plus its signature, delegation chain and envelope fields — so shorten the body. Nothing was written.`,
       );
     }
-    if (!reusedStoredEnvelope && opts.messageId !== undefined) {
-      signed = await storeSentEnvelope(mailRoot, opts.messageId, signed, { from, to, body, replyToId: opts.replyToId, priorChain }, client!);
-    }
-    return signed;
+    return { signed, reusedStoredEnvelope };
   } catch (err) {
     console.error(`Refusing to send: ${(err as Error).message}`);
     process.exit(1);
   }
+}
+
+/** Store a signed envelope under an explicit `--message-id` once its route has
+ *  accepted the send, and return the stored bytes. The store used to run while
+ *  the message was signed, before the route resolved, so a send the route then
+ *  refused left a signed envelope (body included) under `.sent-envelopes/`
+ *  while the refusal said nothing was written. Another send of the same id may
+ *  have won the write, so every route sends the envelope the store holds. */
+async function storeExplicitSignedEnvelope(
+  from: string,
+  to: string,
+  body: string,
+  replyToId: string | undefined,
+  messageId: string,
+  signed: string,
+): Promise<string> {
+  const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+  const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+  return storeSentEnvelope(mailRoot, messageId, signed, { from, to, body, replyToId, priorChain }, client);
 }
 
 /** Store the signed envelope of a REMOTE send that generated its own id. The
@@ -446,10 +463,30 @@ export async function runMail(args: MailArgs): Promise<void> {
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
       // ship signed bodies, and so a send that cannot sign fails with nothing
       // written. cli#429.
-      args.message = await signOutboundOrFail(from, to, messageBody, {
+      const signedSend = await signOutboundOrFail(from, to, messageBody, {
         replyToId: args.replyTo,
         messageId: args.sendMessageId,
       });
+      args.message = signedSend.signed;
+      // An explicit `--message-id` is stored only once a route has accepted the
+      // send: a refusal must write nothing.
+      const explicitStorePending = !signedSend.reusedStoredEnvelope && args.sendMessageId !== undefined;
+      const storeExplicitForRoute = async (): Promise<void> => {
+        if (!explicitStorePending || args.sendMessageId === undefined || args.message === undefined) return;
+        try {
+          args.message = await storeExplicitSignedEnvelope(
+            from,
+            to,
+            messageBody,
+            args.replyTo,
+            args.sendMessageId,
+            args.message,
+          );
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      };
 
       // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
       // plugin so the two cannot drift: `resolveMailRoute` owns the
@@ -462,6 +499,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // Branch mode: queue outbound to be picked up by host on next connect.
       if (route.kind === "outbox") {
         assertValidBody(args.message);
+        await storeExplicitForRoute();
         queueOutboxMessage(to, args.message, from);
         if (args.json) {
           console.log(sendReceiptJson("outbox", args.message, { status: "queued", to, from, queue: "outbox" }));
@@ -490,14 +528,16 @@ export async function runMail(args: MailArgs): Promise<void> {
           process.exit(1);
         }
         // A generated id is printed in the unconfirmed message too, so store
-        // its signed envelope before the delivery that can print it.
-        if (args.sendMessageId === undefined) {
-          try {
+        // its signed envelope before the delivery that can print it. An
+        // explicit id is stored at the same point, after the wire-id refusal.
+        try {
+          if (explicitStorePending) await storeExplicitForRoute();
+          else if (args.sendMessageId === undefined) {
             await storeGeneratedSignedEnvelope(from, to, messageBody, args.replyTo, args.message);
-          } catch (err) {
-            console.error(`Refusing to send: ${(err as Error).message}`);
-            process.exit(1);
           }
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
         }
         try {
           await deliverToRemoteBranch(
@@ -534,6 +574,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // CLI's own bridge, shared with the plugin (cli#389).
       if (route.kind === "bridge") {
         assertValidBody(args.message);
+        await storeExplicitForRoute();
         deliverToSandbox(route.branchId, {
           to,
           from,
@@ -575,6 +616,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // Direct Maildir send: args.message was already signed by
       // signOutboundOrFail above; `route.kind === "local"`, or the CLI's
       // fallback for an office recipient with no maildir yet.
+      await storeExplicitForRoute();
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
         // Metadata only (cli#429): `sendMessage` returns the whole record, whose
