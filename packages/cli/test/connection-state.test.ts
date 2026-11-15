@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import {
   writeHostState,
   clearHostState,
+  refreshOwnedHostStateAt,
   hostStatePath,
   hostStateLockRoot,
   writeBranchState,
@@ -97,6 +98,52 @@ describe("connection-state", () => {
     }, 0);
     expect(checked).toBe(true);
     expect(existsSync(path)).toBe(false);
+  });
+
+  test("refreshOwnedHostStateAt creates nothing when no record exists", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-absent-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    refreshOwnedHostStateAt(path, completeState(), "conn-a");
+    expect(existsSync(path)).toBe(false);
+  });
+
+  test("refreshOwnedHostStateAt leaves another connection's record untouched", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-other-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b" });
+    const raw = readFileSync(path, "utf8");
+    refreshOwnedHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a");
+    expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+
+  test("refreshOwnedHostStateAt leaves an invalid record untouched", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-invalid-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    mkdirSync(join(home, ".tps", "connections"), { recursive: true });
+    writeFileSync(path, "{ not json");
+    refreshOwnedHostStateAt(path, completeState(), "conn-a");
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+  });
+
+  test("refreshOwnedHostStateAt leaves an unreadable record untouched", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-unreadable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    mkdirSync(path, { recursive: true });
+    refreshOwnedHostStateAt(path, completeState(), "conn-a");
+    expect(statSync(path).isDirectory()).toBe(true);
+  });
+
+  test("refreshOwnedHostStateAt writes the record it owns", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-write-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a" });
+    refreshOwnedHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "ack" }, "conn-a");
+    expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("ack");
   });
 
   function expectInvalidKept(state: unknown): void {

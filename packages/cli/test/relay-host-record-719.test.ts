@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { runOffice } from "../src/commands/office.js";
 import { hostStateLockRoot, hostStatePath } from "../src/utils/connection-state.js";
+import { registerService } from "../src/utils/service-registry.js";
 import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/identity.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
 import { readPidFile } from "../src/utils/pid-file.js";
@@ -512,4 +513,92 @@ for (const repeatedStop of [false, true]) {
       }
     }
   });
+}
+
+for (const kind of ["refresh", "inbound"] as const) {
+  test(`an older connection's ${kind} write leaves a replacement record intact`, async () => {
+    const root = mkdtempSync(join(tmpdir(), `tps-relay-owner-${kind}-779-`));
+    const savedEnv = savedRelayEnv();
+    const stops: Array<() => Promise<void>> = [];
+    const channels: Array<{ attached: boolean; detached: boolean; handler?: Parameters<TransportChannel["onMessage"]>[0] }> = [];
+    const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+      const state: { attached: boolean; detached: boolean; handler?: Parameters<TransportChannel["onMessage"]>[0] } = { attached: false, detached: false };
+      channels.push(state);
+      let alive = true;
+      return {
+        async send() {},
+        onMessage(callback) { state.attached = true; state.handler = callback; },
+        offMessage() { state.detached = true; },
+        async close() { alive = false; },
+        isAlive() { return alive; },
+        peerFingerprint() { return "remote"; },
+      };
+    });
+    const gate = deferred<void>();
+    let probeCount = 0;
+    const server = kind === "refresh"
+      ? Bun.serve({
+        hostname: "127.0.0.1",
+        port: 0,
+        fetch: async () => {
+          probeCount++;
+          // Hold the first connection's health probe until the replacement has
+          // claimed the record; later probes answer immediately.
+          if (probeCount === 1) await gate.promise;
+          return new Response("ok");
+        },
+      })
+      : undefined;
+    try {
+      const branch = await prepareBranch(root);
+      if (server) registerService("host-a", `http://127.0.0.1:${server.port}/`);
+      const path = hostStatePath(branch);
+      const start = async () => {
+        stops.push(await connectAndKeepAlive(branch));
+        for (let i = 0; i < 200 && !channels.at(-1)?.attached; i++) await Bun.sleep(5);
+        expect(channels.at(-1)?.attached).toBe(true);
+        return JSON.parse(readFileSync(path, "utf8"));
+      };
+      const first = await start();
+      expect(first.connectionId).toEqual(expect.any(String));
+      if (server) {
+        for (let i = 0; i < 200 && probeCount < 1; i++) await Bun.sleep(5);
+        expect(probeCount).toBe(1);
+      }
+      const replacement = await start();
+      expect(replacement.connectionId).not.toBe(first.connectionId);
+      // Let the replacement's own health probe land, so its record is at rest.
+      let atRest = replacement;
+      const ready = () => atRest.connectionId === replacement.connectionId
+        && Array.isArray(atRest.services)
+        && atRest.services.length === (server ? 1 : 0);
+      for (let i = 0; i < 400 && !ready(); i++) {
+        await Bun.sleep(5);
+        atRest = JSON.parse(readFileSync(path, "utf8"));
+      }
+      expect(ready()).toBe(true);
+      const bytes = readFileSync(path, "utf8");
+      if (server) {
+        gate.resolve();
+        await Bun.sleep(100);
+      } else {
+        channels[0]!.handler!({ type: MSG_HEARTBEAT, seq: 1, ts: new Date().toISOString(), body: {} });
+        await Bun.sleep(100);
+      }
+      expect(readFileSync(path, "utf8"), "replacement record after the older connection's write").toBe(bytes);
+      await stops[0]!();
+      expect(existsSync(path), "replacement record survives the older stop").toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(bytes);
+    } finally {
+      try {
+        for (const stop of stops) await stop();
+        for (let i = 0; i < 200 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+      } finally {
+        server?.stop(true);
+        connect.mockRestore();
+        restoreRelayEnv(savedEnv);
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
 }

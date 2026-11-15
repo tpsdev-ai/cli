@@ -257,6 +257,22 @@ export function writeHostStateAt(path: string, state: HostConnectionState, shoul
   }, timeoutMs);
 }
 
+/**
+ * Refresh a record this connection still owns. Under the record lock the
+ * record is read and written when the optional `shouldWrite` gate holds and
+ * ownership matches: an absent record or one owned by another connection is
+ * left alone (never recreated or replaced), and an invalid or unreadable
+ * record is left as it is.
+ */
+export function refreshOwnedHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  withHostStateRecordLock(path, "write the host state record", () => {
+    if (shouldWrite !== undefined && !shouldWrite()) return;
+    if (hostRecordOwnership(path, state.branch, connectionId).kind !== "owned") return;
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
+  }, timeoutMs);
+}
+
 /** True for the same PID, and the same start token when one is present. */
 function recordNamesOwnProcess(state: HostConnectionState): boolean {
   if (state.pid !== process.pid) return false;
@@ -320,6 +336,28 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
+type HostRecordOwnership =
+  | { kind: "owned" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * The one ownership rule: the record at `path` is owned when it is a valid
+ * record whose branch, process identity and, when given, connection id match
+ * this process. Removal and the owned write both decide on this result.
+ */
+function hostRecordOwnership(path: string, branch: string, connectionId?: string): HostRecordOwnership {
+  const current = readHostRecord(path, branch);
+  if (current.kind === "absent") return { kind: "absent" };
+  if (current.kind === "invalid") return { kind: "invalid" };
+  if (current.kind === "unreadable") return { kind: "unreadable", reason: current.reason };
+  if (!recordNamesOwnProcess(current.state)) return { kind: "other" };
+  if (connectionId !== undefined && current.state.connectionId !== connectionId) return { kind: "other" };
+  return { kind: "owned" };
+}
+
 export function clearHostState(branch: string): void {
   clearHostStateAt(hostStatePath(branch), branch);
 }
@@ -328,15 +366,13 @@ export function clearHostState(branch: string): void {
 export function clearHostStateAt(path: string, branch: string, connectionId?: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "remove the host state record", () => {
-    const current = readHostRecord(path, branch);
-    if (current.kind === "absent") return;
-    if (current.kind !== "record") {
+    const ownership = hostRecordOwnership(path, branch, connectionId);
+    if (ownership.kind === "absent" || ownership.kind === "other") return;
+    if (ownership.kind !== "owned") {
       throw new Error(
-        `Host state record ${path} is present but ${current.kind === "invalid" ? "is not a valid host state record" : current.reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+        `Host state record ${path} is present but ${ownership.kind === "invalid" ? "is not a valid host state record" : ownership.reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
       );
     }
-    if (!recordNamesOwnProcess(current.state)) return;
-    if (connectionId !== undefined && current.state.connectionId !== connectionId) return;
     try {
       rmSync(path, { force: true });
     } catch (error) {

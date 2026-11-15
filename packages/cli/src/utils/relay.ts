@@ -16,7 +16,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostStateAt, hostStatePath, writeHostStateAt, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1484,7 +1484,7 @@ export async function connectAndKeepAlive(
     inboundPersistTimer = undefined;
     if (stopped || inboundPersistState === undefined) return;
     try {
-      writeHostStateAt(recordPath, inboundPersistState, () => !stopped, 0);
+      refreshOwnedHostStateAt(recordPath, inboundPersistState, connectionId, () => !stopped, 0);
       cancelInboundPersist();
     } catch (error) {
       console.error(`[relay] Host state record ${recordPath} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
@@ -1553,24 +1553,29 @@ export async function connectAndKeepAlive(
           pid: process.pid,
           startToken: processStartToken(process.pid),
         };
-        // stop() sets stopped before clearing; the write gate is checked under the lock.
-        const persist = () => writeHostStateAt(recordPath, state, () => !stopped);
+        // stop() sets stopped before clearing; both gates are checked under the lock.
+        // The initial establishment write is the only write that may claim the
+        // record path; every later write is ownership-checked against it, so a
+        // connection whose record was replaced leaves the replacement intact.
+        const claim = () => writeHostStateAt(recordPath, state, () => !stopped);
+        const persist = () => refreshOwnedHostStateAt(recordPath, state, connectionId, () => !stopped);
         const refresh = hostStateRefresher(recordPath, persist);
-        // The connect-time writes stay outside the refresher so a refusal still
-        // reconnects, after one line naming the record path and reason.
-        const persistConnect = () => {
+        // The claim stays outside the refresher so a refusal still reconnects,
+        // after one line naming the record path and reason; so does the
+        // post-send update.
+        const connectWrite = (write: () => void) => {
           try {
-            persist();
+            write();
           } catch (error) {
             console.error(`[relay] Host state record ${recordPath} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
             throw error;
           }
         };
-        persistConnect();
+        connectWrite(claim);
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
         state.messagesSent++;
-        persistConnect();
+        connectWrite(persist);
 
         const hb = setInterval(async () => {
           if (stopped || !channel.isAlive()) return;
