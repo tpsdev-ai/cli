@@ -391,7 +391,7 @@ describe("the release-age gate and a real npm installer on the same lock", () =>
       const depB = pack(root, { name: "dep-b", version: "1.0.0" });
       const registry = startRegistry([{ ...depB, time: { "1.0.0": OLD } }]);
       try {
-        // A packument that advertises no tarball is how npm writes a version-only entry.
+        // A packument that advertises no tarball is how npm writes an entry without `resolved`.
         registry.setTarballAdvertised("dep-b", false);
         const project = await lockProject(root, registry, { dependencies: { "dep-b": "^1.0.0" } });
         expect(entry(project, "node_modules/dep-b")).toMatchObject({ version: "1.0.0" });
