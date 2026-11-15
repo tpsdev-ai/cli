@@ -110,21 +110,29 @@ function scriptKindFor(file) {
 	}
 }
 
-/** A call written `createRequire(...)`. */
-function isCreateRequireCall(node) {
-	return (
-		ts.isCallExpression(node) &&
-		ts.isIdentifier(node.expression) &&
-		node.expression.text === "createRequire"
-	);
-}
-
 /**
  * A node with any parentheses around it removed: a callee or a member-access
  * object the walk reads.
  */
 function unwrap(node) {
 	return ts.skipParentheses(node);
+}
+
+/**
+ * The name an identifier reads, with any parentheses around it removed, or null
+ * when the node is not an identifier. Every name this module compares goes
+ * through here, so a parenthesised expression is read like the bare one.
+ * A binding name (`const r = ...`) is an identifier too; a binding pattern is
+ * not, and returns null.
+ */
+function identifierText(node) {
+	const expression = unwrap(node);
+	return ts.isIdentifier(expression) ? expression.text : null;
+}
+
+/** A call written `createRequire(...)`. */
+function isCreateRequireCall(node) {
+	return ts.isCallExpression(node) && identifierText(node.expression) === "createRequire";
 }
 
 /**
@@ -146,16 +154,14 @@ function isProcessMainModuleRequire(node) {
 	if (accessName(access) !== "require") return false;
 	const target = unwrap(access.expression);
 	if (accessName(target) !== "mainModule") return false;
-	const root = unwrap(target.expression);
-	return ts.isIdentifier(root) && root.text === "process";
+	return identifierText(target.expression) === "process";
 }
 
 /** A call written `module.require(...)`, however each access is spelled. */
 function isModuleRequire(node) {
 	const access = unwrap(node);
 	if (accessName(access) !== "require") return false;
-	const object = unwrap(access.expression);
-	return ts.isIdentifier(object) && object.text === "module";
+	return identifierText(access.expression) === "module";
 }
 
 function literalArgument(node) {
@@ -188,21 +194,21 @@ export function scanLoaderImports(file, source) {
 	// name is treated as a loader for the whole file.
 	const bound = new Set();
 	const bind = (node) => {
+		const declared = ts.isVariableDeclaration(node) ? identifierText(node.name) : null;
 		if (
-			ts.isVariableDeclaration(node) &&
+			declared !== null &&
 			node.initializer !== undefined &&
-			isCreateRequireCall(ts.skipParentheses(node.initializer)) &&
-			ts.isIdentifier(node.name)
+			isCreateRequireCall(ts.skipParentheses(node.initializer))
 		) {
-			bound.add(node.name.text);
+			bound.add(declared);
 		}
 		if (
 			ts.isBinaryExpression(node) &&
 			node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-			isCreateRequireCall(ts.skipParentheses(node.right)) &&
-			ts.isIdentifier(node.left)
+			isCreateRequireCall(ts.skipParentheses(node.right))
 		) {
-			bound.add(node.left.text);
+			const assigned = identifierText(node.left);
+			if (assigned !== null) bound.add(assigned);
 		}
 		ts.forEachChild(node, bind);
 	};
@@ -211,9 +217,10 @@ export function scanLoaderImports(file, source) {
 	const collect = (node) => {
 		if (ts.isCallExpression(node)) {
 			const callee = unwrap(node.expression);
+			const calleeName = identifierText(callee);
 			const isLoader =
 				isCreateRequireCall(callee) ||
-				(ts.isIdentifier(callee) && bound.has(callee.text)) ||
+				(calleeName !== null && bound.has(calleeName)) ||
 				isModuleRequire(callee) ||
 				isProcessMainModuleRequire(callee);
 			if (isLoader) {

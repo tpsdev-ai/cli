@@ -14,6 +14,7 @@ import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import ts from "typescript";
 import {
 	findUndeclaredImports,
 	formatUndeclared,
@@ -41,6 +42,76 @@ function undeclaredIn(body: string) {
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
+}
+
+/** The entry a bare, unscoped specifier reports from `fixture.ts`. */
+function reportEntry(specifier: string) {
+	return { file: "fixture.ts", specifier, packageName: specifier };
+}
+
+/**
+ * `source` parsed with a ParenthesizedExpression around each identifier
+ * read as a callee, a member-access object, an assignment's left side or a call
+ * argument, then printed by TypeScript's printer. Property names, binding names
+ * and import specifiers are not wrapped. An already parenthesised expression is
+ * wrapped again instead of being skipped.
+ */
+function withParenthesisedExpressions(source: string): { printed: string; wrapped: number } {
+	const sourceFile = ts.createSourceFile(
+		"fixture.ts",
+		source,
+		ts.ScriptTarget.Latest,
+		true,
+		ts.ScriptKind.TS,
+	);
+	let wrapped = 0;
+	const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
+		const wrap = (node: ts.Expression): ts.Expression => {
+			const visited = ts.visitNode(node, visit) as ts.Expression;
+			if (!ts.isIdentifier(visited)) return visited;
+			wrapped += 1;
+			return ts.factory.createParenthesizedExpression(visited);
+		};
+		const visit = (node: ts.Node): ts.Node => {
+			if (ts.isCallExpression(node)) {
+				return ts.factory.updateCallExpression(
+					node,
+					wrap(node.expression),
+					node.typeArguments,
+					node.arguments.map((argument) => wrap(argument)),
+				);
+			}
+			if (ts.isPropertyAccessExpression(node)) {
+				return ts.factory.updatePropertyAccessExpression(
+					node,
+					wrap(node.expression),
+					node.name,
+				);
+			}
+			if (ts.isElementAccessExpression(node)) {
+				return ts.factory.updateElementAccessExpression(
+					node,
+					wrap(node.expression),
+					node.argumentExpression,
+				);
+			}
+			if (ts.isParenthesizedExpression(node)) {
+				return ts.factory.updateParenthesizedExpression(node, wrap(node.expression));
+			}
+			if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
+				return ts.factory.updateBinaryExpression(
+					node,
+					wrap(node.left),
+					node.operatorToken,
+					node.right,
+				);
+			}
+			return ts.visitEachChild(node, visit, context);
+		};
+		return (root) => ts.visitNode(root, visit) as ts.SourceFile;
+	};
+	const transformed = ts.transform(sourceFile, [transformer]).transformed[0];
+	return { printed: ts.createPrinter().printFile(transformed), wrapped };
 }
 
 describe("root imports are declared", () => {
@@ -221,244 +292,182 @@ describe("root imports are declared", () => {
 	});
 
 	describe("module loader forms", () => {
-		it("reports a literal argument to a function bound from createRequire", () => {
-			expect(
-				undeclaredIn(
-					[
-						'import { createRequire } from "node:module";',
-						"const load = createRequire(import.meta.url);",
-						'const pkg = load("undeclared-create-require-bound");',
-						"void pkg;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-create-require-bound",
-					packageName: "undeclared-create-require-bound",
-				},
-			]);
-		});
+		// Every loader form that must report a specifier, with the specifiers it
+		// reports. The generated-parentheses case below runs over this whole set.
+		const LOADER_FIXTURES: { name: string; source: string; specifiers: string[] }[] = [
+			{
+				name: "a literal argument to a function bound from createRequire",
+				source: [
+					'import { createRequire } from "node:module";',
+					"const load = createRequire(import.meta.url);",
+					'const pkg = load("undeclared-create-require-bound");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-create-require-bound"],
+			},
+			{
+				name: "a literal argument to createRequire called directly",
+				source: [
+					'import { createRequire } from "node:module";',
+					'const pkg = createRequire(import.meta.url)("undeclared-create-require-direct");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-create-require-direct"],
+			},
+			{
+				name: "a literal argument to module.require",
+				source: 'const pkg = module.require("undeclared-module-require");\nvoid pkg;\n',
+				specifiers: ["undeclared-module-require"],
+			},
+			{
+				name: "a literal argument to process.mainModule.require",
+				source: 'const pkg = process.mainModule.require("undeclared-main-module-require");\nvoid pkg;\n',
+				specifiers: ["undeclared-main-module-require"],
+			},
+			{
+				name: "loader member access split by whitespace or a comment",
+				source: [
+					'const a = module . require("undeclared-module-require-spaced");',
+					'const b = module /* c */ . require("undeclared-module-require-comment");',
+					'const c = process.mainModule . require("undeclared-main-module-require-spaced");',
+					'const d = process.mainModule /* c */ .require("undeclared-main-module-require-comment");',
+					"void a; void b; void c; void d;",
+					"",
+				].join("\n"),
+				specifiers: [
+					"undeclared-module-require-spaced",
+					"undeclared-module-require-comment",
+					"undeclared-main-module-require-spaced",
+					"undeclared-main-module-require-comment",
+				],
+			},
+			{
+				name: "a literal argument through computed member access",
+				source: [
+					'const a = module["require"]("undeclared-module-require-computed");',
+					'const b = process.mainModule["require"]("undeclared-main-module-require-computed");',
+					'const c = process["mainModule"]["require"]("undeclared-both-computed");',
+					"void a; void b; void c;",
+					"",
+				].join("\n"),
+				specifiers: [
+					"undeclared-module-require-computed",
+					"undeclared-main-module-require-computed",
+					"undeclared-both-computed",
+				],
+			},
+			{
+				name: "a literal argument to a function bound from a parenthesised createRequire",
+				source: [
+					'import { createRequire } from "node:module";',
+					"const load = (createRequire(import.meta.url));",
+					'const pkg = load("undeclared-create-require-parenthesised");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-create-require-parenthesised"],
+			},
+			{
+				name: "a dot-access loader name written with unicode escapes",
+				source: 'const pkg = module.r\\u0065quire("undeclared-escaped-dot-name");\nvoid pkg;\n',
+				specifiers: ["undeclared-escaped-dot-name"],
+			},
+			{
+				name: "a string-literal loader key written with unicode escapes",
+				source: 'const pkg = module["r\\u0065quire"]("undeclared-escaped-key-name");\nvoid pkg;\n',
+				specifiers: ["undeclared-escaped-key-name"],
+			},
+			{
+				name: "a loader bound to a createRequire name written with unicode escapes",
+				source: [
+					"const load = creat\\u0065Require(import.meta.url);",
+					'const pkg = load("undeclared-escaped-bind-name");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-escaped-bind-name"],
+			},
+			{
+				name: "a parenthesised loader callee",
+				source: 'const pkg = (module.require)("undeclared-parenthesised-callee");\nvoid pkg;\n',
+				specifiers: ["undeclared-parenthesised-callee"],
+			},
+			{
+				name: "a parenthesised bound loader",
+				source: [
+					'import { createRequire } from "node:module";',
+					"const load = createRequire(import.meta.url);",
+					'const pkg = (load)("undeclared-parenthesised-bound");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-parenthesised-bound"],
+			},
+			{
+				name: "a parenthesised member-access object",
+				source: 'const pkg = (module).require("undeclared-parenthesised-object");\nvoid pkg;\n',
+				specifiers: ["undeclared-parenthesised-object"],
+			},
+			{
+				name: "a literal argument to a parenthesised createRequire callee",
+				source: 'const pkg = (createRequire)(import.meta.url)("undeclared-parenthesised-create-require");\nvoid pkg;\n',
+				specifiers: ["undeclared-parenthesised-create-require"],
+			},
+			{
+				name: "a literal argument to a function bound from a parenthesised createRequire callee",
+				source: [
+					"const load = (createRequire)(import.meta.url);",
+					'const pkg = load("undeclared-parenthesised-create-require-bound");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-parenthesised-create-require-bound"],
+			},
+			{
+				name: "a literal argument to a loader bound by an assignment",
+				source: [
+					"let load;",
+					"load = createRequire(import.meta.url);",
+					'const pkg = load("undeclared-assigned-create-require");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-assigned-create-require"],
+			},
+			{
+				name: "a literal argument to a loader bound by a parenthesised assignment",
+				source: [
+					"let load;",
+					"(load) = createRequire(import.meta.url);",
+					'const pkg = load("undeclared-parenthesised-assignment");',
+					"void pkg;",
+					"",
+				].join("\n"),
+				specifiers: ["undeclared-parenthesised-assignment"],
+			},
+		];
 
-		it("reports a literal argument to createRequire called directly", () => {
-			expect(
-				undeclaredIn(
-					[
-						'import { createRequire } from "node:module";',
-						'const pkg = createRequire(import.meta.url)("undeclared-create-require-direct");',
-						"void pkg;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-create-require-direct",
-					packageName: "undeclared-create-require-direct",
-				},
-			]);
-		});
+		for (const fixture of LOADER_FIXTURES) {
+			it(`reports ${fixture.name}`, () => {
+				expect(undeclaredIn(fixture.source)).toEqual(fixture.specifiers.map(reportEntry));
+			});
+		}
 
-		it("reports a literal argument to module.require", () => {
-			expect(
-				undeclaredIn('const pkg = module.require("undeclared-module-require");\nvoid pkg;\n'),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-module-require",
-					packageName: "undeclared-module-require",
-				},
-			]);
-		});
-
-		it("reports a literal argument to process.mainModule.require", () => {
-			expect(
-				undeclaredIn(
-					'const pkg = process.mainModule.require("undeclared-main-module-require");\nvoid pkg;\n',
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-main-module-require",
-					packageName: "undeclared-main-module-require",
-				},
-			]);
-		});
-
-		it("reports loader member access split by whitespace or a comment", () => {
-			expect(
-				undeclaredIn(
-					[
-						'const a = module . require("undeclared-module-require-spaced");',
-						'const b = module /* c */ . require("undeclared-module-require-comment");',
-						'const c = process.mainModule . require("undeclared-main-module-require-spaced");',
-						'const d = process.mainModule /* c */ .require("undeclared-main-module-require-comment");',
-						"void a; void b; void c; void d;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-module-require-spaced",
-					packageName: "undeclared-module-require-spaced",
-				},
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-module-require-comment",
-					packageName: "undeclared-module-require-comment",
-				},
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-main-module-require-spaced",
-					packageName: "undeclared-main-module-require-spaced",
-				},
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-main-module-require-comment",
-					packageName: "undeclared-main-module-require-comment",
-				},
-			]);
-		});
-
-		it("reports a literal argument through computed member access", () => {
-			expect(
-				undeclaredIn(
-					[
-						'const a = module["require"]("undeclared-module-require-computed");',
-						'const b = process.mainModule["require"]("undeclared-main-module-require-computed");',
-						'const c = process["mainModule"]["require"]("undeclared-both-computed");',
-						"void a; void b; void c;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-module-require-computed",
-					packageName: "undeclared-module-require-computed",
-				},
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-main-module-require-computed",
-					packageName: "undeclared-main-module-require-computed",
-				},
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-both-computed",
-					packageName: "undeclared-both-computed",
-				},
-			]);
-		});
-
-		it("reports a literal argument to a function bound from a parenthesised createRequire", () => {
-			expect(
-				undeclaredIn(
-					[
-						'import { createRequire } from "node:module";',
-						"const load = (createRequire(import.meta.url));",
-						'const pkg = load("undeclared-create-require-parenthesised");',
-						"void pkg;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-create-require-parenthesised",
-					packageName: "undeclared-create-require-parenthesised",
-				},
-			]);
-		});
-
-		it("reports a dot-access loader name written with unicode escapes", () => {
-			expect(
-				undeclaredIn('const pkg = module.r\\u0065quire("undeclared-escaped-dot-name");\nvoid pkg;\n'),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-escaped-dot-name",
-					packageName: "undeclared-escaped-dot-name",
-				},
-			]);
-		});
-
-		it("reports a string-literal loader key written with unicode escapes", () => {
-			expect(
-				undeclaredIn(
-					'const pkg = module["r\\u0065quire"]("undeclared-escaped-key-name");\nvoid pkg;\n',
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-escaped-key-name",
-					packageName: "undeclared-escaped-key-name",
-				},
-			]);
-		});
-
-		it("reports a loader bound to a createRequire name written with unicode escapes", () => {
-			expect(
-				undeclaredIn(
-					[
-						"const load = creat\\u0065Require(import.meta.url);",
-						'const pkg = load("undeclared-escaped-bind-name");',
-						"void pkg;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-escaped-bind-name",
-					packageName: "undeclared-escaped-bind-name",
-				},
-			]);
-		});
-
-		it("reports a parenthesised loader callee", () => {
-			expect(
-				undeclaredIn('const pkg = (module.require)("undeclared-parenthesised-callee");\nvoid pkg;\n'),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-parenthesised-callee",
-					packageName: "undeclared-parenthesised-callee",
-				},
-			]);
-		});
-
-		it("reports a parenthesised bound loader", () => {
-			expect(
-				undeclaredIn(
-					[
-						'import { createRequire } from "node:module";',
-						"const load = createRequire(import.meta.url);",
-						'const pkg = (load)("undeclared-parenthesised-bound");',
-						"void pkg;",
-						"",
-					].join("\n"),
-				),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-parenthesised-bound",
-					packageName: "undeclared-parenthesised-bound",
-				},
-			]);
-		});
-
-		it("reports a parenthesised member-access object", () => {
-			expect(
-				undeclaredIn('const pkg = (module).require("undeclared-parenthesised-object");\nvoid pkg;\n'),
-			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-parenthesised-object",
-					packageName: "undeclared-parenthesised-object",
-				},
-			]);
+		it("reports the same specifiers with each callee, member-access object, assignment left and call argument identifier parenthesised", () => {
+			for (const fixture of LOADER_FIXTURES) {
+				const variant = withParenthesisedExpressions(fixture.source);
+				// A fixture that wrapped nothing would make this case vacuous.
+				expect({ fixture: fixture.name, wrapped: variant.wrapped > 0 }).toEqual({
+					fixture: fixture.name,
+					wrapped: true,
+				});
+				expect({ fixture: fixture.name, reported: undeclaredIn(variant.printed) }).toEqual({
+					fixture: fixture.name,
+					reported: fixture.specifiers.map(reportEntry),
+				});
+			}
 		});
 
 		it("does not report a module.require call in a comment, a string or a template literal", () => {
