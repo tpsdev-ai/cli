@@ -1887,6 +1887,31 @@ else
   bad "AV mutation: missing end on timeout caught" "could not build the mutant supervisor"
 fi
 
+# ── AW. mutation: a KILL at the deadline with no grace must turn AL red ──────
+# AL's lower bound is the signalled call's own start/end span, so a supervisor
+# that KILLs at the deadline and skips the grace must fail it; the whole-run
+# total AL used to time could not tell the two apart.
+aw="$work/mut-kill-at-deadline"
+mkdir -p "$aw"
+cp "$tool" "$aw/promote-latest.sh"
+if node -e 'const fs=require("node:fs"); const [src,dst]=process.argv.slice(1); const s=fs.readFileSync(src,"utf8"); const old="  }, Math.round(graceSeconds * 1000));"; if (s.split(old).length !== 2) { console.error("supervisor grace target not found"); process.exit(3); } fs.writeFileSync(dst, s.replace(old, "  }, 0);"));' "$here/npm-supervisor.mjs" "$aw/npm-supervisor.mjs"; then
+  d="$(new_fixture mut-kill-at-deadline)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  NPM_TIMEOUT_SECONDS=1 TOOL="$aw/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  aw_elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
+  if [ -z "$aw_elapsed" ]; then
+    bad "AW mutation: no-grace KILL caught" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"
+  elif node -e 'process.exit(Number(process.argv[1]) < 2.5 ? 0 : 1)' "$aw_elapsed"; then
+    ok "AW mutation: no-grace KILL caught" "AL red: the signalled call ended at ${aw_elapsed}s, below the 1 s deadline + 2 s grace"
+  else
+    bad "AW mutation: no-grace KILL caught" "the signalled call ran ${aw_elapsed}s — AL's lower bound is blind to a skipped grace"
+  fi
+  TOOL=""
+else
+  bad "AW mutation: no-grace KILL caught" "could not build the mutant supervisor"
+fi
+
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
 mut="$work/tool-no-existence.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" existence; then
@@ -2522,7 +2547,9 @@ run_swap_case() { # <supervisor-path> <fixture-dir> -> SWAP_RC, SWAP_ELAPSED, SW
   t1="$(node -p 'Date.now()')"
   SWAP_ELAPSED="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
   if grep -q '^end ' "$d/log.orig" 2>/dev/null; then SWAP_ENDED=1; fi
-  if [ "$SWAP_RC" = "137" ] || node -e 'process.exit(Number(process.argv[1]) >= 6 ? 0 : 1)' "$SWAP_ELAPSED"; then
+  if [ "$SWAP_RC" = "137" ]; then
+    SWAP_HUNG=1
+  elif node -e 'process.exit(Number(process.argv[1]) >= 6 ? 0 : 1)' "$SWAP_ELAPSED"; then
     SWAP_HUNG=1
   fi
 }
