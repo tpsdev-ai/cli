@@ -153,6 +153,11 @@ const { env, dropped } = isolatedChildEnv(process.env, {
     // The CLI mail helpers refuse in test mode without an explicit TPS_MAIL_DIR
     // (packages/cli/src/utils/mail.ts); make that requirement explicit here.
     TPS_MAIL_REQUIRE_EXPLICIT_DIR: "1",
+    // cli#874: the real-gateway test spawns the pinned OpenClaw under node.
+    // CI's `node` is the pinned 24.21.0; a developer can point this at another
+    // engine-compatible node without changing PATH. A bare name is path-free;
+    // an absolute path is the launcher owner's explicit choice.
+    TPS_LANE_NODE: process.env.TPS_LANE_NODE || "node",
   },
 });
 if (dropped.length > 0) {

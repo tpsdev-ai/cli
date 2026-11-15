@@ -16,10 +16,10 @@
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { createRequire } from "node:module";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
 import { createHash, randomUUID } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { hashes } from "@noble/ed25519";
@@ -36,13 +36,42 @@ const ANVIL_SEED = Buffer.alloc(32, 0x02);
 const pubkeyFromSeed = (seed: Buffer) => Buffer.from(ed.getPublicKey(new Uint8Array(seed)));
 
 // The runtime's own silent-reply normaliser (hashed filename; resolve it).
+// Importing that module evaluates OpenClaw's sqlite state DB; CI's Bun 1.3.10
+// has no `node:sqlite` for it. Load it in the engine the real-gateway case uses
+// (TPS_LANE_NODE: CI's pinned 24.21.0). Its export alias is minified, so pick
+// the function by name, not by export letter.
 const require = createRequire(import.meta.url);
 const openclawDist = join(dirname(require.resolve("openclaw/package.json")), "dist");
-const normFile = readdirSync(openclawDist).find((f) => /^normalize-reply-.*\.js$/.test(f));
-if (!normFile) throw new Error(`openclaw normalise-reply module not found under ${openclawDist}`);
-const { t: normalizeReplyPayload } = (await import(pathToFileURL(join(openclawDist, normFile)).href)) as {
-  t: (payload: any, opts?: any) => any;
-};
+const laneNode = process.env.TPS_LANE_NODE || "node";
+const NORMALIZE_SCRIPT = `
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+const dist = process.argv[1];
+const file = readdirSync(dist).find((f) => /^normalize-reply-.*\\.js$/.test(f));
+if (!file) { console.error("normalize-reply module not found"); process.exit(2); }
+const mod = await import(pathToFileURL(join(dist, file)).href);
+const fn = Object.entries(mod).find(([, v]) => typeof v === "function" && v.name === "normalizeReplyPayload")?.[1];
+if (!fn) { console.error("normalizeReplyPayload export not found"); process.exit(3); }
+const payload = JSON.parse(readFileSync(0, "utf8"));
+const skipped = [];
+const normalized = fn(payload, { onSkip: (reason) => skipped.push(reason) });
+process.stdout.write(JSON.stringify({ normalized, reason: skipped[0] ?? null }));
+`;
+
+function normalizeReplyPayload(payload: { text: string }, opts: { onSkip?: (reason: string) => void } = {}): any {
+  const res = spawnSync(laneNode, ["--input-type=module", "-e", NORMALIZE_SCRIPT, openclawDist], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+    timeout: 20_000,
+  });
+  if (res.status !== 0) {
+    throw new Error(`OpenClaw normaliser failed under ${laneNode} (status ${res.status}): ${res.stderr || res.stdout}`);
+  }
+  const out = JSON.parse(res.stdout) as { normalized: any; reason: string | null };
+  if (out.normalized === null && out.reason) opts.onSkip?.(out.reason);
+  return out.normalized;
+}
 
 import pluginModule from "../src/index.js";
 let capturedPlugin: any;
