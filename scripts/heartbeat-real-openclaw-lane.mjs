@@ -483,8 +483,8 @@ async function runLaneBody(root) {
 }
 
 /**
- * Run the lane body, then remove the temp tree. The lane's own failure stays
- * first; a removal failure is attached to it rather than replacing it.
+ * Run the lane body, then remove the temp tree. When both fail, the lane's own
+ * failure stays first and the removal failure is attached to it.
  */
 export async function runLane(options = {}) {
   const {
