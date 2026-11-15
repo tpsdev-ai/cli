@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import {
   writeHostState,
   clearHostState,
+  clearHostStateAt,
   refreshOwnedHostStateAt,
   hostStatePath,
   hostStateLockRoot,
@@ -144,6 +145,36 @@ describe("connection-state", () => {
     writeHostState({ ...completeState(), connectionId: "conn-a" });
     refreshOwnedHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "ack" }, "conn-a");
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("ack");
+  });
+
+  test("refreshOwnedHostStateAt reports unverifiable and leaves the record when this process's token cannot be read", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-unverifiable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
+    const raw = readFileSync(path, "utf8");
+    const outcome = refreshOwnedHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => null },
+    );
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+
+  test("clearHostStateAt keeps and reports a record whose ownership cannot be verified", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-clear-unverifiable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), startToken: "proc:other" });
+    const raw = readFileSync(path, "utf8");
+    expect(() => clearHostStateAt(path, "x", undefined, { startToken: () => null })).toThrow(
+      `Host state record ${path} is present but this process's start token could not be read, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+    );
+    expect(readFileSync(path, "utf8")).toBe(raw);
   });
 
   function expectInvalidKept(state: unknown): void {

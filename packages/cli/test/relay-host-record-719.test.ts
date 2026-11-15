@@ -450,6 +450,117 @@ test.each(["live", "unverifiable", "stop"])("inbound persistence under contentio
   }
 }, 30_000);
 
+test("an inbound refresh whose self token cannot be read keeps retrying and reports the transition once", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-self-token-779-"));
+  const savedEnv = savedRelayEnv();
+  const ownToken = processStartToken(process.pid);
+  let token: string | null = ownToken;
+  let stop: (() => Promise<void>) | undefined;
+  let handler: Parameters<TransportChannel["onMessage"]>[0] | undefined;
+  let alive = true;
+  let detached = false;
+  const channel: TransportChannel = {
+    async send() {},
+    onMessage(callback) { handler = callback; },
+    offMessage() { detached = true; },
+    async close() { alive = false; },
+    isAlive() { return alive; },
+    peerFingerprint() { return "remote"; },
+  };
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const branch = await prepareBranch(root);
+    stop = await connectAndKeepAlive(branch, { testHooks: { startToken: () => token } });
+    for (let i = 0; !handler && i < 200; i++) await Bun.sleep(5);
+    expect(handler).toBeDefined();
+    await Bun.sleep(20);
+    const path = hostStatePath(branch);
+    const before = JSON.parse(readFileSync(path, "utf8"));
+    token = null;
+    diagnostic.mockClear();
+    const message = { type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} };
+    for (let i = 0; i < 3; i++) {
+      handler!({ ...message, seq: i });
+      await Bun.sleep(20);
+    }
+    // Several refreshes (and their retries) skip the record; the diagnostic is
+    // reported once for the transition into unverifiable.
+    await Bun.sleep(200);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(before);
+    const skipped = diagnostic.mock.calls.filter(([line]) => String(line).includes("not refreshed"));
+    expect(skipped).toHaveLength(1);
+    expect(String(skipped[0][0])).toContain(
+      `[relay] host state record ${path} not refreshed: this process's start token could not be read, so ownership cannot be verified; the record keeps its last state and refreshes resume when the token reads again`,
+    );
+    // The token reads again: the pending retry writes without a new message,
+    // and the recovery is reported once.
+    token = ownToken;
+    for (let i = 0; JSON.parse(readFileSync(path, "utf8")).messagesReceived === before.messagesReceived && i < 400; i++) await Bun.sleep(5);
+    const after = JSON.parse(readFileSync(path, "utf8"));
+    expect(after.messagesReceived).toBe(before.messagesReceived + 3);
+    const recovered = diagnostic.mock.calls.filter(([line]) => String(line).includes("refresh recovered"));
+    expect(recovered).toHaveLength(1);
+    expect(String(recovered[0][0])).toContain(`[relay] host state record ${path} refresh recovered; writes resumed`);
+    expect(alive).toBe(true);
+  } finally {
+    token = ownToken;
+    await stop?.();
+    for (let i = 0; handler && !detached && i < 200; i++) await Bun.sleep(10);
+    connect.mockRestore();
+    diagnostic.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("an inbound write stops retrying once the record belongs to another connection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-inbound-other-779-"));
+  const savedEnv = savedRelayEnv();
+  let stop: (() => Promise<void>) | undefined;
+  let handler: Parameters<TransportChannel["onMessage"]>[0] | undefined;
+  let alive = true;
+  let detached = false;
+  const channel: TransportChannel = {
+    async send() {},
+    onMessage(callback) { handler = callback; },
+    offMessage() { detached = true; },
+    async close() { alive = false; },
+    isAlive() { return alive; },
+    peerFingerprint() { return "remote"; },
+  };
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockResolvedValue(channel);
+  const diagnostic = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const branch = await prepareBranch(root);
+    stop = await connectAndKeepAlive(branch);
+    for (let i = 0; !handler && i < 200; i++) await Bun.sleep(5);
+    expect(handler).toBeDefined();
+    await Bun.sleep(20);
+    const path = hostStatePath(branch);
+    const before = JSON.parse(readFileSync(path, "utf8"));
+    const original = readFileSync(path);
+    diagnostic.mockClear();
+    // Replace the record before the scheduled inbound write runs: the write
+    // sees another connection's id and ends its retries.
+    handler!({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
+    writeFileSync(path, JSON.stringify({ ...before, connectionId: "other-conn" }));
+    await Bun.sleep(20);
+    expect(diagnostic.mock.calls.filter(([line]) => String(line).includes("not refreshed"))).toHaveLength(0);
+    // Restore our record; a pending retry would write the inbound update here.
+    writeFileSync(path, original);
+    await Bun.sleep(300);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(before);
+  } finally {
+    await stop?.();
+    for (let i = 0; handler && !detached && i < 200; i++) await Bun.sleep(10);
+    connect.mockRestore();
+    diagnostic.mockRestore();
+    restoreRelayEnv(savedEnv);
+    rmSync(root, { recursive: true, force: true });
+  }
+}, 30_000);
+
 for (const repeatedStop of [false, true]) {
   test(repeatedStop
     ? "a successful stop does not inspect a replacement record when called again"
