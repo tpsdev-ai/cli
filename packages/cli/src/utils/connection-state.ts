@@ -71,8 +71,7 @@ export interface ConnectionTempSweep {
  * never followed. An entry that could not be inspected or removed is reported
  * in `left`; an entry already gone is in neither list.
  */
-export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
-  const dir = connectionsDir();
+export function sweepStaleConnectionTemps(now = Date.now(), dir = connectionsDir()): ConnectionTempSweep {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -168,7 +167,7 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * then rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
-  sweepStaleConnectionTemps();
+  sweepStaleConnectionTemps(Date.now(), dirname(filePath));
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
   // A regular record's observed permission bits are preserved; a symlinked
   // record is treated as absent, as before (the rename replaces the link with a
@@ -243,8 +242,11 @@ export function withHostStateRecordLock<T>(path: string, action: string, fn: () 
 }
 
 export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(state.branch);
+  writeHostStateAt(hostStatePath(state.branch), state, shouldWrite, timeoutMs);
+}
+
+export function writeHostStateAt(path: string, state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "write the host state record", () => {
     // Checked inside the lock: a caller that has begun stop() sets its
     // flag before it takes the lock to clear, so a write it starts afterwards
@@ -316,10 +318,13 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
-/** Records classified as unreadable or invalid by the locked read are kept and reported. */
 export function clearHostState(branch: string): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(branch);
+  clearHostStateAt(hostStatePath(branch), branch);
+}
+
+/** Records classified as unreadable or invalid by the locked read are kept and reported. */
+export function clearHostStateAt(path: string, branch: string): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "remove the host state record", () => {
     const current = readHostRecord(path, branch);
     if (current.kind === "absent") return;

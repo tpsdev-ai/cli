@@ -16,7 +16,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostState, hostStatePath, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { clearHostStateAt, hostStatePath, writeHostStateAt, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1393,7 +1393,7 @@ const LATE_CONNECT_CLOSE_WAIT_MS = 5_000;
  * a write succeeds. The message carries the record path and the error, not the
  * record's contents.
  */
-function hostStateRefresher(branchId: string, persist: () => void): () => void {
+function hostStateRefresher(recordPath: string, persist: () => void): () => void {
   let failureReported = false;
   return () => {
     try {
@@ -1402,7 +1402,7 @@ function hostStateRefresher(branchId: string, persist: () => void): () => void {
     } catch (error) {
       if (failureReported) return;
       failureReported = true;
-      console.error(`[relay] Host state record ${hostStatePath(branchId)} refresh failed; connection continues: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[relay] Host state record ${recordPath} refresh failed; connection continues: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
 }
@@ -1427,6 +1427,7 @@ export async function connectAndKeepAlive(
   branchId: string,
   opts: { onMessage?: (msg: TpsMessage) => void; onAccepted?: (msg: TpsMessage) => void } = {}
 ): Promise<() => Promise<void>> {
+  const recordPath = hostStatePath(branchId);
   let stopped = false;
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
@@ -1453,7 +1454,7 @@ export async function connectAndKeepAlive(
   /** The close-failure line: it prints the record path and the error text and
    *  does not read host state; it does not filter what `error.message` contains. */
   const channelCloseFailure = (error: unknown): string =>
-    `[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`;
+    `[relay] Failed channel close for host state record ${recordPath}: ${error instanceof Error ? error.message : String(error)}`;
   /** Track one channel's close as pending until it settles; retain the channel
    *  when close rejects so stop() can retry it. Shared by both in-loop close paths. */
   const trackChannelClose = async (channel: TransportChannel): Promise<void> => {
@@ -1482,10 +1483,10 @@ export async function connectAndKeepAlive(
     inboundPersistTimer = undefined;
     if (stopped || inboundPersistState === undefined) return;
     try {
-      writeHostState(inboundPersistState, () => !stopped, 0);
+      writeHostStateAt(recordPath, inboundPersistState, () => !stopped, 0);
       cancelInboundPersist();
     } catch (error) {
-      console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[relay] Host state record ${recordPath} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
       inboundPersistTimer = setTimeout(attemptInboundPersist, inboundPersistBackoff);
       inboundPersistBackoff = Math.min(inboundPersistBackoff * 2, INBOUND_PERSIST_RETRY_MAX_MS);
     }
@@ -1551,15 +1552,15 @@ export async function connectAndKeepAlive(
           startToken: processStartToken(process.pid),
         };
         // stop() sets stopped before clearing; the write gate is checked under the lock.
-        const persist = () => writeHostState(state, () => !stopped);
-        const refresh = hostStateRefresher(branchId, persist);
+        const persist = () => writeHostStateAt(recordPath, state, () => !stopped);
+        const refresh = hostStateRefresher(recordPath, persist);
         // The connect-time writes stay outside the refresher so a refusal still
         // reconnects, after one line naming the record path and reason.
         const persistConnect = () => {
           try {
             persist();
           } catch (error) {
-            console.error(`[relay] Host state record ${hostStatePath(branchId)} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
+            console.error(`[relay] Host state record ${recordPath} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
             throw error;
           }
         };
@@ -1689,11 +1690,11 @@ export async function connectAndKeepAlive(
       }
     }
     if (unconfirmedChannelClose || failedChannels.size > 0) {
-      const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
+      const error = new Error(`Channel close rejected; host state record ${recordPath} retained`);
       error.name = "HostChannelCloseError";
       throw error;
     }
-    clearHostState(branchId);
+    clearHostStateAt(recordPath, branchId);
   };
 }
 

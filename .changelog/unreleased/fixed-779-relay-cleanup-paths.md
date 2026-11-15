@@ -1,0 +1,1 @@
+- **Relay cleanup retains its connection record path** A relayed connection's stop removes the connection records it created, even if HOME changed meanwhile.
