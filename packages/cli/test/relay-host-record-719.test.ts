@@ -1,4 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { processStartToken } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -447,3 +448,68 @@ test.each(["live", "unverifiable", "stop"])("inbound persistence under contentio
     rmSync(root, { recursive: true, force: true });
   }
 }, 30_000);
+
+for (const repeatedStop of [false, true]) {
+  test(repeatedStop
+    ? "a successful stop does not inspect a replacement record when called again"
+    : "an older connection stop preserves a replacement record from the same process", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-relay-owner-779-"));
+    const savedEnv = savedRelayEnv();
+    const stops: Array<() => Promise<void>> = [];
+    const channels: Array<{ attached: boolean; detached: boolean }> = [];
+    const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+      const state = { attached: false, detached: false };
+      channels.push(state);
+      let alive = true;
+      return {
+        async send() {},
+        onMessage() { state.attached = true; },
+        offMessage() { state.detached = true; },
+        async close() { alive = false; },
+        isAlive() { return alive; },
+        peerFingerprint() { return "remote"; },
+      };
+    });
+    try {
+      const branch = await prepareBranch(root);
+      const path = hostStatePath(branch);
+      const start = async () => {
+        stops.push(await connectAndKeepAlive(branch));
+        for (let i = 0; i < 200 && !channels.at(-1)?.attached; i++) await Bun.sleep(5);
+        expect(channels.at(-1)?.attached).toBe(true);
+        return JSON.parse(readFileSync(path, "utf8"));
+      };
+      const first = await start();
+      expect(first.connectionId).toEqual(expect.any(String));
+      if (repeatedStop) {
+        await Promise.all([stops[0]!(), stops[0]!()]);
+        expect(existsSync(path)).toBe(false);
+      }
+      const replacement = await start();
+      expect(replacement.pid).toBe(first.pid);
+      expect(replacement.connectionId).not.toBe(first.connectionId);
+      const bytes = readFileSync(path, "utf8");
+      const inspect = spyOn(fs, "lstatSync");
+      try {
+        await stops[0]!();
+        if (repeatedStop) expect(inspect.mock.calls.filter(([target]) => target === path)).toHaveLength(0);
+        expect(existsSync(path), "replacement record survives old stop").toBe(true);
+        expect(readFileSync(path, "utf8")).toBe(bytes);
+      } finally {
+        inspect.mockRestore();
+      }
+      await stops[1]!();
+      expect(existsSync(path)).toBe(false);
+    } finally {
+      try {
+        for (const stop of stops) await stop();
+        for (let i = 0; i < 200 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+        expect(channels.some((channel) => channel.attached && !channel.detached)).toBe(false);
+      } finally {
+        connect.mockRestore();
+        restoreRelayEnv(savedEnv);
+        rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+}

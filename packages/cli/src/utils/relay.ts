@@ -1428,6 +1428,7 @@ export async function connectAndKeepAlive(
   opts: { onMessage?: (msg: TpsMessage) => void; onAccepted?: (msg: TpsMessage) => void } = {}
 ): Promise<() => Promise<void>> {
   const recordPath = hostStatePath(branchId);
+  const connectionId = randomUUID();
   let stopped = false;
   let reconnectCount = 0;
   let currentChannel: TransportChannel | null = null;
@@ -1540,6 +1541,7 @@ export async function connectAndKeepAlive(
         const now = new Date().toISOString();
         const state: HostConnectionState = {
           branch: branchId,
+          connectionId,
           connectedAt: now,
           lastHeartbeatSent: now,
           lastHeartbeatAck: null,
@@ -1652,7 +1654,8 @@ export async function connectAndKeepAlive(
 
   void loop();
 
-  return async () => {
+  let stopAttempt: Promise<void> | undefined;
+  const stop = async () => {
     stopped = true;
     cancelInboundPersist();
     stopPrune();
@@ -1694,7 +1697,16 @@ export async function connectAndKeepAlive(
       error.name = "HostChannelCloseError";
       throw error;
     }
-    clearHostStateAt(recordPath, branchId);
+    clearHostStateAt(recordPath, branchId, connectionId);
+  };
+  return () => {
+    if (stopAttempt === undefined) {
+      stopAttempt = stop().catch((error: unknown) => {
+        stopAttempt = undefined;
+        throw error;
+      });
+    }
+    return stopAttempt;
   };
 }
 

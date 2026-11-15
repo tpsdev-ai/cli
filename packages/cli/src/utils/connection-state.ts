@@ -29,6 +29,7 @@ export interface HostConnectionState {
   /** Process start token; absent from records written before it was captured. */
   startToken?: string | null;
   services?: ServiceHealth[];
+  connectionId?: string;
 }
 
 export interface BranchConnectionState {
@@ -306,6 +307,7 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
     || typeof state.messagesReceived !== "number"
     || !isPidRecordPid(state.pid)
     || !isPidRecordStartToken(state.startToken)
+    || (state.connectionId !== undefined && (typeof state.connectionId !== "string" || state.connectionId.length === 0))
     || (state.services !== undefined && (!Array.isArray(state.services) || !state.services.every((service: unknown) => {
       if (typeof service !== "object" || service === null || Array.isArray(service)) return false;
       const health = service as Record<string, unknown>;
@@ -323,7 +325,7 @@ export function clearHostState(branch: string): void {
 }
 
 /** Records classified as unreadable or invalid by the locked read are kept and reported. */
-export function clearHostStateAt(path: string, branch: string): void {
+export function clearHostStateAt(path: string, branch: string, connectionId?: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "remove the host state record", () => {
     const current = readHostRecord(path, branch);
@@ -334,6 +336,7 @@ export function clearHostStateAt(path: string, branch: string): void {
       );
     }
     if (!recordNamesOwnProcess(current.state)) return;
+    if (connectionId !== undefined && current.state.connectionId !== connectionId) return;
     try {
       rmSync(path, { force: true });
     } catch (error) {
