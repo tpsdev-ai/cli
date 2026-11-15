@@ -1,6 +1,6 @@
-import { isMailboxMessageFile } from "@tpsdev-ai/agent";
+import { isMailboxMessageFile, type FlairClient } from "@tpsdev-ai/agent";
 import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
-import { deliverToSandbox, deliverToRemoteBranch } from "../utils/relay.js";
+import { deliverToSandbox, deliverToRemoteBranch, EXIT_DELIVERY_UNCONFIRMED, MailDeliveryUnconfirmedError, parseMailAckTimeoutMs, resolveMailAckTimeoutMs } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
@@ -12,10 +12,13 @@ import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
 import { parseTaskEnvelope, formatTaskEnvelope, createTaskEnvelope } from "../utils/task-envelope.js";
 import { parseInboundChain } from "../utils/agent-keys.js";
-import { signOutboundBody } from "../utils/mail-sign.js";
+import { assertValidReplyToId, requireOutboundSigningKey, signOutboundBody } from "../utils/mail-sign.js";
 import { readStdinBodySync, EmptyStdinError, StdinTooLargeError } from "../utils/stdin-body.js";
 import { isValidEnvelopeId, ENVELOPE_ID_SHAPE_TEXT } from "../utils/envelope-id.js";
 import { removePidFile, pidRecordBytesEqual, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "../utils/pid-file.js";
+import { readSentEnvelope, storeSentEnvelope } from "../utils/sent-envelope.js";
+import { isValidMailDeliveryId } from "../utils/wire-mail.js";
+import * as ed from "@noble/ed25519";
 
 /** The signal sender for `mail relay stop`; replaceable in tests so they can
  *  assert that a stale or unverifiable pid file sends nothing. */
@@ -100,6 +103,28 @@ function sendReceiptJson(
   });
 }
 
+/** The signed envelope's messageId, which this path also uses as the wire
+ *  delivery id, so a caller's `--message-id` re-send reuses the id. */
+function signedMessageId(signedBody: string): string | undefined {
+  try {
+    const env = JSON.parse(signedBody) as { messageId?: unknown };
+    return typeof env.messageId === "string" ? env.messageId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The signed envelope's timestamp, which is the wire `timestamp` the branch
+ *  records and compares, so a re-send of the SAME signed envelope matches. */
+function signedMessageTimestamp(signedBody: string): string | undefined {
+  try {
+    const env = JSON.parse(signedBody) as { timestamp?: unknown };
+    return typeof env.timestamp === "string" ? env.timestamp : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 interface MailArgs {
   action: "send" | "check" | "list" | "stats" | "log" | "read" | "watch" | "search" | "relay" | "topic" | "subscribe" | "unsubscribe" | "publish" | "ack" | "nack" | "gc";
   agent?: string;
@@ -116,6 +141,8 @@ interface MailArgs {
   messageId?: string;
   /** cli#429: read the message body from stdin (fd 0) instead of argv. */
   stdin?: boolean;
+  /** cli#962: how long to wait for the branch's delivery ACK, in milliseconds. */
+  ackTimeout?: string;
   /** cli#429: the signed messageId this message replies to. */
   replyTo?: string;
   /**
@@ -235,28 +262,63 @@ function validateAgent(agent?: string): string {
 // The envelope builder itself lives in utils/mail-sign.ts (shared with the
 // agent runtimes) so the two cannot drift; it validates --reply-to (the ONE
 // id rule) before it reads any key.
-function signOutboundOrFail(
+// The verify client for a stored envelope: the sender's CURRENT key only.
+// Earlier delegation hops are not resolved — the fresh send never verified
+// them, and the sender's outer signature covers every byte of the chain.
+async function storedEnvelopeVerifyClient(from: string, seed: Buffer): Promise<FlairClient> {
+  const senderKey = Buffer.from(await ed.getPublicKeyAsync(new Uint8Array(seed)));
+  return {
+    async getAgent(name: string) {
+      return name === from ? { publicKey: senderKey } : null;
+    },
+  };
+}
+
+async function signOutboundOrFail(
   from: string,
   to: string,
   body: string,
   opts: { replyToId?: string; messageId?: string },
-): string {
+): Promise<{ signed: string; reusedStoredEnvelope: boolean }> {
   try {
     if (opts.messageId !== undefined && !isValidEnvelopeId(opts.messageId)) {
       throw new Error(`invalid --message-id: must be ${ENVELOPE_ID_SHAPE_TEXT}`);
     }
-    const signed = signOutboundBody(from, to, body, {
-      requireKey: true,
-      replyToId: opts.replyToId,
-      messageId: opts.messageId,
-      rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
-      priorChain: parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON),
-    });
+    // A re-send runs the same --reply-to validation and the same sender-key
+    // resolution as a fresh send BEFORE it consults the store, so a missing,
+    // unreadable, corrupt or conflicting key is refused here, not after a hit.
+    if (opts.replyToId !== undefined) assertValidReplyToId(opts.replyToId);
+    const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+    // The inbound delegation chain this invocation would embed on a fresh send.
+    const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+    // A re-send of an explicit id reuses the signed envelope stored for it:
+    // signing again can change its timestamp and signature, and the branch
+    // treats a same-id payload mismatch as a conflict. The
+    // stored bytes must match this message, carry the same inbound chain, and
+    // verify with the CURRENT key.
+    let client: FlairClient | undefined;
+    let signed: string | undefined;
+    if (opts.messageId !== undefined) {
+      client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+      signed = await readSentEnvelope(mailRoot, opts.messageId, { from, to, body, replyToId: opts.replyToId, priorChain }, client);
+    }
+    const reusedStoredEnvelope = signed !== undefined;
+    if (signed === undefined) {
+      signed = signOutboundBody(from, to, body, {
+        requireKey: true,
+        replyToId: opts.replyToId,
+        messageId: opts.messageId,
+        rationale: process.env.TPS_CHAIN_RATIONALE ?? `agent ${from} tps mail send`,
+        priorChain,
+      });
+    }
     // cli#429: every route limits the SIGNED envelope (the body plus its
     // signature, chain and envelope fields) to MAX_BODY_BYTES, not the
     // plaintext — so check it HERE, before any route, and refuse by name. A body
     // just under the limit passes the plaintext check (e.g. --stdin) and would
-    // otherwise fail later, with a different error, inside a route.
+    // otherwise fail later, with a different error, inside a route. The check
+    // runs BEFORE the store: an oversized envelope must not reserve its id when
+    // the refusal says nothing was written.
     try {
       assertValidBody(signed);
     } catch (err) {
@@ -265,11 +327,52 @@ function signOutboundOrFail(
           `the body plus its signature, delegation chain and envelope fields — so shorten the body. Nothing was written.`,
       );
     }
-    return signed;
+    return { signed, reusedStoredEnvelope };
   } catch (err) {
     console.error(`Refusing to send: ${(err as Error).message}`);
     process.exit(1);
   }
+}
+
+/** Store a signed envelope under an explicit `--message-id` once its route has
+ *  accepted the send, and return the stored bytes. The store used to run while
+ *  the message was signed, before the route resolved, so a send the route then
+ *  refused left a signed envelope (body included) under `.sent-envelopes/`
+ *  while the refusal said nothing was written. Another send of the same id may
+ *  have won the write, so every route sends the envelope the store holds. */
+async function storeExplicitSignedEnvelope(
+  from: string,
+  to: string,
+  body: string,
+  replyToId: string | undefined,
+  messageId: string,
+  signed: string,
+): Promise<string> {
+  const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+  const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+  return storeSentEnvelope(mailRoot, messageId, signed, { from, to, body, replyToId, priorChain }, client);
+}
+
+/** Store the signed envelope of a REMOTE send that generated its own id. The
+ *  exit-75 message prints that id and tells the sender to re-send with it; only
+ *  the stored bytes make that retry the same signed message (same id, timestamp
+ *  and payload). While the branch inbox still holds a record for that id, it
+ *  writes no second one; once that record is read, the id can be accepted again
+ *  (durable dedup: cli#999). */
+async function storeGeneratedSignedEnvelope(
+  from: string,
+  to: string,
+  body: string,
+  replyToId: string | undefined,
+  signed: string,
+): Promise<void> {
+  const messageId = signedMessageId(signed);
+  if (messageId === undefined) throw new Error("the signed message has no envelope id");
+  const mailRoot = process.env.TPS_MAIL_DIR || join(process.env.HOME || homedir(), ".tps", "mail");
+  const client = await storedEnvelopeVerifyClient(from, requireOutboundSigningKey(from));
+  const priorChain = parseInboundChain(process.env.TPS_INBOUND_CHAIN_JSON);
+  await storeSentEnvelope(mailRoot, messageId, signed, { from, to, body, replyToId, priorChain }, client);
 }
 
 function newestJsonMtime(dir: string, fresh = false): string | null {
@@ -296,6 +399,18 @@ export async function runMail(args: MailArgs): Promise<void> {
         process.exit(1);
       }
       const to = validateAgent(args.agent);
+
+      // cli#962: the ACK wait is a positive number of milliseconds. Refuse a bad
+      // flag before any input is read; a bad env var is refused when the remote
+      // route needs it.
+      if (args.ackTimeout !== undefined) {
+        try {
+          parseMailAckTimeoutMs(args.ackTimeout, "--ack-timeout");
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      }
 
       // Build the message body. Three sources, mutually exclusive (cli#429):
       //   --stdin   read the body from fd 0
@@ -350,10 +465,30 @@ export async function runMail(args: MailArgs): Promise<void> {
       // (branch-mode outbox, remote-branch, branch-office bridge, direct maildir)
       // ship signed bodies, and so a send that cannot sign fails with nothing
       // written. cli#429.
-      args.message = signOutboundOrFail(from, to, messageBody, {
+      const signedSend = await signOutboundOrFail(from, to, messageBody, {
         replyToId: args.replyTo,
         messageId: args.sendMessageId,
       });
+      args.message = signedSend.signed;
+      // An explicit `--message-id` is stored only once a route has accepted the
+      // send: a refusal must write nothing.
+      const explicitStorePending = !signedSend.reusedStoredEnvelope && args.sendMessageId !== undefined;
+      const storeExplicitForRoute = async (): Promise<void> => {
+        if (!explicitStorePending || args.sendMessageId === undefined || args.message === undefined) return;
+        try {
+          args.message = await storeExplicitSignedEnvelope(
+            from,
+            to,
+            messageBody,
+            args.replyTo,
+            args.sendMessageId,
+            args.message,
+          );
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+      };
 
       // (cli#389) ONE locality decision, shared with the openclaw-tps-mail
       // plugin so the two cannot drift: `resolveMailRoute` owns the
@@ -366,6 +501,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // Branch mode: queue outbound to be picked up by host on next connect.
       if (route.kind === "outbox") {
         assertValidBody(args.message);
+        await storeExplicitForRoute();
         queueOutboxMessage(to, args.message, from);
         if (args.json) {
           console.log(sendReceiptJson("outbox", args.message, { status: "queued", to, from, queue: "outbox" }));
@@ -378,7 +514,47 @@ export async function runMail(args: MailArgs): Promise<void> {
       // A recipient registered for remote delivery (GAL entry + remote.json).
       if (route.kind === "remote-branch") {
         assertValidBody(args.message);
-        await deliverToRemoteBranch(route.branchId, { to, from, body: args.message });
+        let ackTimeoutMs: number;
+        try {
+          ackTimeoutMs = resolveMailAckTimeoutMs(process.env, args.ackTimeout);
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+        const wireId = signedMessageId(args.message);
+        if (wireId !== undefined && !isValidMailDeliveryId(wireId)) {
+          console.error(
+            `Refusing to send: --message-id "${wireId}" cannot be delivered to a remote branch; ` +
+              `the wire delivery id must be a UUID or a 64-character lowercase hex id.`,
+          );
+          process.exit(1);
+        }
+        // A generated id is printed in the unconfirmed message too, so store
+        // its signed envelope before the delivery that can print it. An
+        // explicit id is stored at the same point, after the wire-id refusal.
+        try {
+          if (explicitStorePending) await storeExplicitForRoute();
+          else if (args.sendMessageId === undefined) {
+            await storeGeneratedSignedEnvelope(from, to, messageBody, args.replyTo, args.message);
+          }
+        } catch (err) {
+          console.error(`Refusing to send: ${(err as Error).message}`);
+          process.exit(1);
+        }
+        try {
+          await deliverToRemoteBranch(
+            route.branchId,
+            { id: wireId, to, from, body: args.message, timestamp: signedMessageTimestamp(args.message) },
+            { ackTimeoutMs, storedNewExplicitEnvelope: explicitStorePending },
+          );
+        } catch (err) {
+          if (err instanceof MailDeliveryUnconfirmedError) {
+            console.error(err.message);
+            process.exitCode = EXIT_DELIVERY_UNCONFIRMED;
+            return;
+          }
+          throw err;
+        }
         if (args.json) {
           console.log(
             sendReceiptJson("remote-branch", args.message, {
@@ -400,6 +576,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // CLI's own bridge, shared with the plugin (cli#389).
       if (route.kind === "bridge") {
         assertValidBody(args.message);
+        await storeExplicitForRoute();
         deliverToSandbox(route.branchId, {
           to,
           from,
@@ -441,6 +618,7 @@ export async function runMail(args: MailArgs): Promise<void> {
       // Direct Maildir send: args.message was already signed by
       // signOutboundOrFail above; `route.kind === "local"`, or the CLI's
       // fallback for an office recipient with no maildir yet.
+      await storeExplicitForRoute();
       const msg = sendMessage(to, args.message, from);
       if (args.json) {
         // Metadata only (cli#429): `sendMessage` returns the whole record, whose

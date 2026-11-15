@@ -184,6 +184,17 @@ esac
     expect(counts().fresh).toBe(1);
   });
 
+  test("a second delivery of the same id writes no second record and still ACKs accepted", async () => {
+    const body = delivery();
+    await deliver(body);
+    await deliver(body);
+    expect(counts().fresh).toBe(1);
+    expect(acks().map((ack) => ack.body)).toEqual([
+      { id: body.id, accepted: true },
+      { id: body.id, accepted: true },
+    ]);
+  });
+
   test("an inbox resend after GC removal republishes, then reuses the record", async () => {
     const body = delivery();
     await deliver(body);

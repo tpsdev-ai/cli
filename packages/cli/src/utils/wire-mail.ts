@@ -36,6 +36,13 @@ export const MailDeliverBodySchema = z.object({
 });
 export type MailDeliverBody = z.infer<typeof MailDeliverBodySchema>;
 
+/** Whether `id` can travel as the wire delivery id: a UUID or the 64-hex id of
+ *  an outbox record. An envelope id outside this shape is refused by name by a
+ *  remote send, never silently dropped by the receiver's schema. */
+export function isValidMailDeliveryId(id: string): boolean {
+  return DeliveryIdSchema.safeParse(id).success;
+}
+
 export const MailAckBodySchema = z.object({
   id: DeliveryIdSchema,
   accepted: z.boolean(),
