@@ -234,7 +234,7 @@ async function waitFor(pred: () => boolean, ms = 3000): Promise<void> {
  * bare `channelRuntime` is enough: the cur/ sweep skips a nacked record and the
  * obligation loop skips terminal ones, so nothing dispatches.
  */
-async function restartAccount(agentId: string): Promise<void> {
+async function restartAccount(agentId: string, settled?: () => boolean): Promise<void> {
   const cfg = {
     channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
     bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
@@ -247,6 +247,15 @@ async function restartAccount(agentId: string): Promise<void> {
     channelRuntime: {},
     abortSignal: abort.signal,
   });
+  if (settled) {
+    try {
+      await waitFor(settled, 3000);
+    } finally {
+      abort.abort();
+      await p.catch(() => {});
+    }
+    return;
+  }
   await new Promise((r) => setTimeout(r, 300)); // let the startup sweeps run
   abort.abort();
   try {
@@ -1372,11 +1381,16 @@ describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)"
         process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
         // The launcher's own key dir is not this fixture's: point the restart's
         // nack signer at the key the turn used.
+        const origKeys = process.env.TPS_TEST_KEYS_DIR;
         process.env.TPS_TEST_KEYS_DIR = join(root, "keys");
-        await restartAccount("agent-b");
-        const obligationPath = join(mailDir, "agent-b", ".obligations", `${o.inboundId}.json`);
-        await waitFor(() => readJsonSafe(obligationPath)?.state === "failed", 3000);
-        return { o, firstNackCount, firstState, firstWriteFailedWarns, rec: readJsonSafe(obligationPath), settledNackCount: nacks() };
+        try {
+          const obligationPath = join(mailDir, "agent-b", ".obligations", `${o.inboundId}.json`);
+          await restartAccount("agent-b", () => readJsonSafe(obligationPath)?.state === "failed" && nacks() > 0);
+          return { o, firstNackCount, firstState, firstWriteFailedWarns, rec: readJsonSafe(obligationPath), settledNackCount: nacks() };
+        } finally {
+          if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+          else process.env.TPS_TEST_KEYS_DIR = origKeys;
+        }
       },
     );
 
