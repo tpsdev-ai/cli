@@ -6,6 +6,7 @@ import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { procStat as fixtureProcStat } from "../../../test/fixtures/heartbeat-lane-fixture-teardown.mjs";
 
 const FIXTURE = fileURLToPath(new URL("../../../test/fixtures/heartbeat-lane-terminated.mjs", import.meta.url));
 const OWN_EXIT_FIXTURE = fileURLToPath(
@@ -34,13 +35,16 @@ function readText(path: string): string | null {
 
 /** Fields 3 and 5 of a Linux `/proc/<pid>/stat` line. Field 2 (comm) may
  *  contain spaces and parentheses, so both follow the space after the last
- *  `)`. Null when the pid has no entry; other read errors are rethrown. */
+ *  `)`. Null when the pid has no entry; a pid that exits between the open and
+ *  the read fails with ESRCH and is just as gone. Other read errors are
+ *  rethrown. */
 function procStat(pid: number): { state: string; pgrp: number } | null {
   let stat: string;
   try {
     stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") return null;
     throw error;
   }
   const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
@@ -173,6 +177,24 @@ async function terminatedFixture(signal: NodeJS.Signals, expectedStatus: number)
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+describe("the teardown reads a pid's stat entry", () => {
+  function failingReader(code: string): () => never {
+    return () => {
+      const error = new Error(`${code}: injected read error`) as NodeJS.ErrnoException;
+      error.code = code;
+      throw error;
+    };
+  }
+
+  test("a pid that exits mid-scan (ESRCH) is gone, not a teardown failure", () => {
+    expect(fixtureProcStat(1234, failingReader("ESRCH"))).toBeNull();
+  });
+
+  test("a read error other than ENOENT or ESRCH still propagates", () => {
+    expect(() => fixtureProcStat(1234, failingReader("EACCES"))).toThrow("EACCES: injected read error");
+  });
+});
 
 describe("a heartbeat-lane fixture stops its detached stub gateway when terminated", () => {
   test("SIGTERM stops the gateway's process group and re-exits with 143", async () => {
