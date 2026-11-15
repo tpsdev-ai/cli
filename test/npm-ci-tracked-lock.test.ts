@@ -5,6 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { startLocalRegistry, type LocalRegistry } from "./helpers/local-registry";
 import { npmCiLockDirs, parseWorkflow, scanQuotedValue } from "./helpers/npm-ci-workflow-guard";
 
 const REPO = fileURLToPath(new URL("..", import.meta.url));
@@ -265,34 +266,14 @@ function packedTarball(root: string): { bytes: Uint8Array; integrity: string } {
   return { bytes, integrity: `sha512-${createHash("sha512").update(bytes).digest("base64")}` };
 }
 
-/** A loopback registry that records every request and answers only the tarball. */
-function startRegistry(bytes: Uint8Array) {
-  const requests: string[] = [];
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(request) {
-      const path = new URL(request.url).pathname;
-      requests.push(`${request.method} ${path}`);
-      if (path === DEP_PATH) return new Response(bytes, { headers: { "content-type": "application/octet-stream" } });
-      return new Response("unexpected request", { status: 404 });
-    },
-  });
-  return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+/** The loopback registry, serving only the fixture tarball (no metadata). */
+function startRegistry(bytes: Uint8Array): LocalRegistry {
+  return startLocalRegistry([{ name: DEP, version: "1.0.0", tarball: bytes }]);
 }
 
-/** A second loopback server that records every request; any request is a leak. */
-function startEvil() {
-  const requests: string[] = [];
-  const server = Bun.serve({
-    hostname: "127.0.0.1",
-    port: 0,
-    fetch(request) {
-      requests.push(`${request.method} ${new URL(request.url).pathname}`);
-      return new Response("unexpected proxy request", { status: 404 });
-    },
-  });
-  return { url: `http://127.0.0.1:${server.port}`, requests, stop: () => server.stop(true) };
+/** A second loopback server that serves nothing; any request is a leak. */
+function startEvil(): LocalRegistry {
+  return startLocalRegistry([]);
 }
 
 async function runHelper(args: string[], cwd: string, extra: Record<string, string>) {
