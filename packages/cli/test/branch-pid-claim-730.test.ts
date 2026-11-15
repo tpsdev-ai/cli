@@ -21,6 +21,9 @@ import { probeStdoutUnderRoot, type IdentityVerdict } from "./helpers/branch-dae
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
 const EXIT_MS = 30_000;
+const STDERR_TAIL_BYTES = 4 * 1024;
+/** How long a gone daemon's "close" may lag its pid disappearing. */
+const EXIT_REPORT_MS = 2_000;
 
 let root: string;
 let pidFile: string;
@@ -30,6 +33,16 @@ let savedEnv: Record<string, string | undefined>;
 const daemons: { pid: number; startToken: string }[] = [];
 const unverifiedIdentityPids = new Set<number>();
 const children: ChildProcess[] = [];
+
+interface DaemonExit {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+}
+
+/** Exit status, and the last STDERR_TAIL_BYTES of stderr, per spawned daemon. */
+const daemonExits = new Map<number, DaemonExit>();
+const daemonStderrTails = new Map<number, string>();
+const daemonClosing = new Map<number, Promise<DaemonExit>>();
 
 async function freePort(): Promise<number> {
   const net = await import("node:net");
@@ -105,17 +118,47 @@ async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_M
   }
 }
 
+/** The daemon's exit status and stderr tail, for a wait that lost its daemon. */
+async function daemonExitReport(pid: number | undefined): Promise<string> {
+  if (pid === undefined) return "daemon pid unknown";
+  const closing = daemonClosing.get(pid);
+  const recorded =
+    daemonExits.get(pid) ??
+    (closing === undefined
+      ? null
+      : await Promise.race([
+          closing,
+          new Promise<null>((resolveWait) => setTimeout(() => resolveWait(null), EXIT_REPORT_MS)),
+        ]));
+  const status =
+    recorded === null
+      ? "exit status not captured"
+      : recorded.signal !== null
+        ? `killed by ${recorded.signal}`
+        : `exit code ${String(recorded.code)}`;
+  const tail = (daemonStderrTails.get(pid) ?? "").trim();
+  return `daemon ${pid} ${status}; stderr tail: ${tail === "" ? "(empty)" : tail}`;
+}
+
+/**
+ * Wait for `phase`'s pause file. With the daemon's pid, the file waited for is
+ * that process's own, so a daemon that has exited can never write it: the wait
+ * then fails at once, naming the exit status and the stderr tail, instead of
+ * waiting out the timeout for a file that can no longer appear.
+ */
 async function waitForReady(phase: string, daemonPid?: number): Promise<string> {
-  try {
-    return await waitFor(
-      () => {
-        const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
-        return name === undefined ? null : join(pauseDir, name);
-      },
-      `pause ${phase}`,
-    );
-  } catch (error) {
-    throw new Error(`${(error as Error).message}; ${daemonState(daemonPid)}`);
+  const prefix = daemonPid === undefined ? `ready-${phase}-` : `ready-${phase}-${daemonPid}`;
+  const deadline = Date.now() + WAIT_MS;
+  for (;;) {
+    const name = readdirSync(pauseDir).find((entry) => entry.startsWith(prefix));
+    if (name !== undefined) return join(pauseDir, name);
+    if (daemonPid !== undefined && (daemonExits.has(daemonPid) || pidExited(daemonPid))) {
+      throw new Error(`pause ${phase} never appeared: ${await daemonExitReport(daemonPid)}; ${daemonState(daemonPid)}`);
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for pause ${phase}; ${daemonState(daemonPid)}`);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
   }
 }
 
@@ -252,6 +295,28 @@ function spawnDaemon(phase: string): ChildProcess {
   delete env.TPS_BRANCH_DAEMON;
   const child = spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
   children.push(child);
+  const pid = child.pid;
+  if (pid !== undefined) {
+    let tail = "";
+    daemonStderrTails.set(pid, tail);
+    child.stderr?.setEncoding("utf8");
+    child.stderr?.on("data", (chunk: string) => {
+      tail = (tail + chunk).slice(-STDERR_TAIL_BYTES);
+      daemonStderrTails.set(pid, tail);
+    });
+    // "close" fires after the piped stderr drains, so the tail above is
+    // complete when this resolves.
+    daemonClosing.set(
+      pid,
+      new Promise<DaemonExit>((resolveExit) => {
+        child.once("close", (code, signal) => {
+          const exit = { code, signal };
+          daemonExits.set(pid, exit);
+          resolveExit(exit);
+        });
+      }),
+    );
+  }
   return child;
 }
 
@@ -647,6 +712,24 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(readPidFile(pidFile).kind).toBe("missing");
     expect(pidExited(daemon.pid!)).toBe(true);
     await waitForNotListening(port);
+  }, 40_000);
+
+  test("a daemon that exits before its pause point fails the wait at once and names its exit status", async () => {
+    // No prepareBranch: without branch.conf.json the daemon refuses at startup,
+    // before the listener and before the pause file, so the wait has to fail on
+    // the exit itself and carry the status and stderr, not wait out WAIT_MS.
+    const phase = "listening-before-steady-state";
+    const daemon = spawnDaemon(phase);
+    const started = Date.now();
+    const failure = await waitForReady(phase, daemon.pid).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain(`pause ${phase} never appeared`);
+    expect(failure!.message).toContain("exit code 1");
+    expect(failure!.message).toContain("branch.conf.json not found");
+    expect(Date.now() - started).toBeLessThan(10_000);
   }, 40_000);
 
   test("a second signal during shutdown does not run the shutdown path twice", async () => {
