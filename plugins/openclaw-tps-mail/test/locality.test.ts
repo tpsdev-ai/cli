@@ -70,12 +70,14 @@ const relay = {
   deliver: [] as Array<{ branchId: string; msg: any }>,
   bridge: [] as Array<{ branchId: string; msg: any }>,
   failDeliver: false,
+  throwAfterDeliver: false,
 };
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   ...realRelayExports,
   deliverToRemoteBranch: async (branchId: string, msg: any) => {
     if (relay.failDeliver) throw new Error("relay down");
     relay.deliver.push({ branchId, msg });
+    if (relay.throwAfterDeliver) throw new Error("relay threw after send");
   },
   // Mirrors the REAL deliverToSandbox (packages/cli/src/utils/relay.ts): it
   // writes the reduced record into the branch mail root's new/, carrying the
@@ -269,6 +271,7 @@ async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<
   relay.deliver.length = 0;
   relay.bridge.length = 0;
   relay.failDeliver = false;
+  relay.throwAfterDeliver = false;
   try {
     setup();
     return await fn();
@@ -1300,10 +1303,29 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
  *     and announces the sender exactly once;
  *   - a failure write that throws is ONE attempt with no announcement; the
  *     record resolves on the next start.
- * (The attributable-quarantine deadline path and the deadline re-arm are
- * already pinned by final-selection (e) and reply-obligation R8/R9.)
  */
 describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)", () => {
+  it("a wire send recorded before the delivery call throws resolves unconfirmed with no nack", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "400";
+    const outcome = await inFreshHome(
+      () => {
+        galEntry("rockit", "tps-rockit");
+        remoteBranch("tps-rockit");
+        relay.throwAfterDeliver = true;
+      },
+      () => routeViaDispatcher("rockit", ["anvil"]),
+    );
+
+    expect(outcome.obligation?.state, "no verdict from the send-then-throw").toBe("unconfirmed");
+    expect(relay.deliver.length, "the wire send was recorded before the throw").toBe(1);
+    expect(relay.deliver[0]!.branchId).toBe("tps-rockit");
+    expect(JSON.parse(relay.deliver[0]!.msg.body).body).toBe("final verdict");
+    expect(outcome.route).toBe("remote-branch");
+    expect(outcome.obligation?.failure).toBe("yielded-without-resumption");
+    expect(outcome.inboundNackedAt).toBeNull();
+    expect(outcome.nack, "no nack mail after the recorded send").toBeNull();
+  }, 20000);
+
   it("a failed `delivering` write sends nothing, fails the obligation by name and sends exactly one nack mail", async () => {
     obligations.failDeliveringTransition = true;
     const outcome = await inFreshHome(
