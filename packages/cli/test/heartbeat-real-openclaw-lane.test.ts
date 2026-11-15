@@ -1,11 +1,14 @@
 import { describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, makeCase, OPENCLAW_VERSION, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+
+const REPO = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
@@ -359,4 +362,146 @@ describe("cleanup fails the lane when the gateway does not exit", () => {
     });
     expect(child.exitCode).toBe(0);
   });
+});
+
+describe("the temp tree removal failure is attached after the lane failure", () => {
+  test("reports the lane failure first and the removal failure after it", async () => {
+    const laneFailure = new Error("live gateway: heartbeat exit status must be 0");
+    const removalFailure = Object.assign(new Error("EPERM: operation not permitted, rm"), { code: "EPERM" });
+    let removed = "";
+    let reported: unknown;
+    try {
+      await runLane({
+        action: async () => {
+          throw laneFailure;
+        },
+        removeTree: (path: string) => {
+          removed = path;
+          rmSync(path, { recursive: true, force: true });
+          throw removalFailure;
+        },
+      });
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBeInstanceOf(AggregateError);
+    const aggregate = reported as AggregateError;
+    expect(aggregate.errors).toEqual([laneFailure, removalFailure]);
+    expect(aggregate.message.split("\n")).toEqual([
+      laneFailure.message,
+      `cleanup also failed: ${removalFailure.message}`,
+    ]);
+    expect(removed).toContain("tps-heartbeat-lane-");
+  });
+
+  test("a removal failure with no lane failure still fails the lane", async () => {
+    const removalFailure = new Error("EBUSY: resource busy or locked, rm");
+    let reported: unknown;
+    try {
+      await runLane({
+        action: async () => {},
+        removeTree: (path: string) => {
+          rmSync(path, { recursive: true, force: true });
+          throw removalFailure;
+        },
+      });
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBe(removalFailure);
+  });
+});
+
+type InstallCall = { command: string; args: string[]; options: { cwd?: string } };
+
+function recordingSpawn() {
+  const calls: InstallCall[] = [];
+  const spawnInstall = (command: string, args: string[], options: InstallCall["options"]) => {
+    calls.push({ command, args, options });
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  return { calls, spawnInstall };
+}
+
+const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
+const FIXTURE = "test/fixtures/heartbeat-openclaw";
+const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
+
+describe("the local fallback installs from the committed fixture lock", () => {
+  test("runs the tracked-lock helper on the committed fixture instead of npm install", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
+    try {
+      const { calls, spawnInstall } = recordingSpawn();
+      const binDir = installOpenClaw(root, { spawn: spawnInstall, pathEnv: "", env: {} });
+      expect(calls).toHaveLength(1);
+      const [call] = calls;
+      expect(call.command).toBe("bash");
+      expect(call.args).toEqual([HELPER, "--via", "npm", FIXTURE, join(root, "openclaw"), ...CI_ARGS]);
+      expect(call.options.cwd).toBe(REPO);
+      expect(binDir).toBe(join(root, "openclaw", "node_modules", ".bin"));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the sfw path when sfw is on PATH", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
+    try {
+      const stubs = join(root, "stubs");
+      mkdirSync(stubs);
+      writeFileSync(join(stubs, "sfw"), "#!/bin/sh\n");
+      chmodSync(join(stubs, "sfw"), 0o755);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: stubs });
+      expect(calls[0].args).toEqual([HELPER, "--via", "sfw", FIXTURE, join(root, "run", "openclaw"), ...CI_ARGS]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  function fixtureRepo(root: string): string {
+    const repo = join(root, "repo");
+    mkdirSync(join(repo, "scripts", "lib"), { recursive: true });
+    mkdirSync(join(repo, "test", "fixtures", "heartbeat-openclaw"), { recursive: true });
+    cpSync(join(REPO, "scripts", "npm-ci-tracked-lock.sh"), join(repo, "scripts", "npm-ci-tracked-lock.sh"));
+    cpSync(join(REPO, "scripts", "lib", "npm-ci-revision.sh"), join(repo, "scripts", "lib", "npm-ci-revision.sh"));
+    for (const file of ["package.json", "package-lock.json"]) {
+      cpSync(join(REPO, "test", "fixtures", "heartbeat-openclaw", file), join(repo, "test", "fixtures", "heartbeat-openclaw", file));
+    }
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+    };
+    git("init", "-q");
+    git("add", "-A");
+    git("-c", "user.email=lane-fixture@example.com", "-c", "user.name=lane-fixture", "commit", "-qm", "fixture");
+    return repo;
+  }
+
+  test("the real helper accepts that argv and installs the committed lock", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-helper-"));
+    try {
+      const repo = fixtureRepo(root);
+      const stubs = join(root, "stubs");
+      mkdirSync(stubs);
+      const recordPath = join(root, "npm-args.txt");
+      writeFileSync(join(stubs, "npm"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(recordPath)}\n`);
+      chmodSync(join(stubs, "npm"), 0o755);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const env = { PATH: `${stubs}:/usr/local/bin:/usr/bin:/bin`, HOME: home };
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, pathEnv: stubs, env });
+      expect(binDir).toBe(join(throwaway, "openclaw", "node_modules", ".bin"));
+      const argv = readFileSync(recordPath, "utf-8").trim().split("\n");
+      expect(argv[0]).toBe("ci");
+      expect(argv[argv.indexOf("--prefix") + 1]).toBe(join(throwaway, "openclaw"));
+      for (const arg of CI_ARGS) expect(argv).toContain(arg);
+      expect(argv.some((arg) => arg.startsWith("--registry="))).toBe(true);
+      const lock = readFileSync(join(repo, "test", "fixtures", "heartbeat-openclaw", "package-lock.json"), "utf-8");
+      expect(readFileSync(join(throwaway, "openclaw", "package-lock.json"), "utf-8")).toBe(lock);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });
