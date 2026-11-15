@@ -77,7 +77,8 @@
 #     the typed code on the `npm-otp` retry and the tag moves (AI); a PUT that
 #     never answers makes the run uncertain (AJ); TERM during a pending PUT keeps
 #     the lock (AS); a PUT the server applies after the client was killed is still
-#     listed by a later refusal (AN).
+#     listed by a later refusal (AN); a read slower than the put deadline still
+#     reaches that pending PUT (AN2).
 #     TPS_TEST_REQUIRE_REAL_NPM=1 makes a missing npm, node or python3 a failure
 #     instead of a skip.
 #   * the fixtures run under bash 3.2 too (BASH_BIN; the macOS CI leg pins it),
@@ -304,11 +305,16 @@ function record(req, body) {
   requests.push({ method: req.method, url: req.url, otp: req.headers['npm-otp'] || null, body: body });
   persist();
 }
+// The first GET waits REGISTRY_FIRST_READ_DELAY_MS before it is answered, so a
+// case can prove that a slow read still fits the read deadline.
+const firstReadDelayMs = Number(process.env.REGISTRY_FIRST_READ_DELAY_MS || 0);
+let firstReadDelayed = false;
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => { body += c; });
   req.on('end', () => {
     record(req, body);
+    const handle = () => {
     const tag = req.url.match(/^\/-\/package\/@tpsdev-ai(?:%2f|\/)([^/]+)\/dist-tags(?:\/([^/]+))?$/);
     if (tag) {
       const pkg = '@tpsdev-ai/' + tag[1];
@@ -365,6 +371,13 @@ const server = http.createServer((req, res) => {
     }
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end('{}');
+    };
+    if (req.method === 'GET' && firstReadDelayMs > 0 && !firstReadDelayed) {
+      firstReadDelayed = true;
+      setTimeout(handle, firstReadDelayMs);
+      return;
+    }
+    handle();
   });
 });
 server.listen(0, '127.0.0.1', () => {
@@ -625,6 +638,24 @@ if (cmd === 'view') {
 }
 FAKE_NPM
 chmod +x "$fake_npm"
+
+# ── the fixture's npm with its own deadline for the mutating call ────────────
+# AN, AN2 and M12 give the reads and the held PUT separate bounded deadlines:
+# reads run under the tool's NPM_TIMEOUT_SECONDS, and `dist-tag add` runs under a
+# shorter deadline this wrapper enforces with the same supervisor. A slow read
+# therefore cannot consume the write's budget before the case reaches the PUT.
+put_deadline_npm="$work/npm-put-deadline"
+cat >"$put_deadline_npm" <<'PUT_NPM'
+#!/bin/bash
+set -uo pipefail
+case "${1:-} ${2:-}" in
+  "dist-tag add")
+    exec node "${REAL_NPM_SUPERVISOR:?}" "${NPM_PUT_DEADLINE_SECONDS:?}" 2 -- "${REAL_NPM_BIN:?}" "$@"
+    ;;
+esac
+exec "${REAL_NPM_BIN:?}" "$@"
+PUT_NPM
+chmod +x "$put_deadline_npm"
 
 # ── the fake `gh` ────────────────────────────────────────────────────────────
 # The promote script dispatches `gh workflow run docker.yml --repo tpsdev-ai/cli
@@ -1654,12 +1685,10 @@ fi
 
 # ── AN. a delayed commit lands after the client stopped; next run refuses ────
 # The local registry applies the PUT only when the client's connection closes and
-# never answers it. The 5 s deadline keeps a wide margin over the ordinary reads
-# in this promotion (~0.3 s each); a pathologically slow read could also reach it,
-# and the case then fails on a named assertion rather than passing. The client is
-# stopped at the held PUT, and the write lands after it. A 1 s deadline also
-# applied to those reads, whose own slowness could take the ordinary failure path
-# first.
+# never answers it. The reads run under the tool's 5 s deadline; the fixture's
+# npm wrapper gives the mutating call its own 1 s deadline, so a slow read cannot
+# take the ordinary failure path before the case reaches the held PUT. The client
+# is stopped at the held PUT, and the write lands after it.
 d="$(new_fixture delayed-commit)"
 if [ "$real_ready" -ne 1 ]; then
   printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN delayed-commit"
@@ -1667,7 +1696,9 @@ elif start_registry "$d" delayed-put; then
   mkdir -p "$d/home" "$d/npm-cache"
   raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
     npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-    NPM_TIMEOUT_SECONDS=5 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+    NPM_TIMEOUT_SECONDS=5 NPM_BIN="$put_deadline_npm" REAL_NPM_BIN="$npm_bin" \
+    REAL_NPM_SUPERVISOR="$work/npm-supervisor.mjs" NPM_PUT_DEADLINE_SECONDS=1 \
+    NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
     python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
@@ -1686,6 +1717,32 @@ elif start_registry "$d" delayed-put; then
   assert_contains "AN delayed-commit: refusal prints the reason" "$ERR" "target 0.5.4, previous latest 0.5.3"
 else
   bad "AN delayed-commit: registry started" "no port file"
+fi
+stop_registry
+
+# ── AN2. a slow first read outlasts the PUT deadline and still reaches it ────
+# The registry holds the first read for 2 s: longer than the 1 s deadline on the
+# mutating call, shorter than the 5 s read deadline. The run must get past that
+# read, reach the held PUT and end UNCERTAIN (7), as AN does.
+d="$(new_fixture slow-first-read)"
+if [ "$real_ready" -ne 1 ]; then
+  printf 'SKIP  %-42s npm, node or python3 not installed\n' "AN2 slow-first-read"
+elif REGISTRY_FIRST_READ_DELAY_MS=2000 start_registry "$d" delayed-put; then
+  mkdir -p "$d/home" "$d/npm-cache"
+  raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
+    npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
+    NPM_TIMEOUT_SECONDS=5 NPM_BIN="$put_deadline_npm" REAL_NPM_BIN="$npm_bin" \
+    REAL_NPM_SUPERVISOR="$work/npm-supervisor.mjs" NPM_PUT_DEADLINE_SECONDS=1 \
+    NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+    python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
+  RC=$?
+  OUT="$(printf '%s\n' "$raw" | strip_cr)"
+  ERR="$OUT"
+  assert_eq "AN2 slow read: exit" 7 "$RC"
+  assert_eq "AN2 slow read: reached the held PUT" 1 "$(node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(String((s.requests||[]).some((r)=>r.method==="PUT") ? 1 : 0));' "$d/registry.state")"
+  assert_contains "AN2 slow read: reason names the package" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "@tpsdev-ai/cli-darwin-arm64: target 0.5.4"
+else
+  bad "AN2 slow read: registry started" "no port file"
 fi
 stop_registry
 
@@ -2131,9 +2188,10 @@ fi
 # asserts the pid file.
 # The mutant only matters if this run reaches the delayed-commit path: a run
 # that stopped on an earlier read leaves no pid file either, through the
-# failure path's release_lock. So the run is also held to AN's deadline, and
-# exit 7 plus the registry's apply-after-disconnect are asserted first; a run
-# that stopped earlier goes red here instead of reporting the mutant caught.
+# failure path's release_lock. So the run uses AN's separate read and put
+# deadlines, and exit 7 plus the registry's apply-after-disconnect are asserted
+# first. A run that stopped earlier goes red here instead of reporting the
+# mutant caught.
 mut="$work/tool-release-uncertain-lock.sh"
 if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
   if [ "$real_ready" -eq 1 ]; then
@@ -2142,7 +2200,9 @@ if node "$work/mutate.mjs" "$tool" "$mut" release_uncertain_lock; then
       mkdir -p "$d/home" "$d/npm-cache"
       raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
         npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-        NPM_TIMEOUT_SECONDS=5 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+        NPM_TIMEOUT_SECONDS=5 NPM_BIN="$put_deadline_npm" REAL_NPM_BIN="$npm_bin" \
+        REAL_NPM_SUPERVISOR="$work/npm-supervisor.mjs" NPM_PUT_DEADLINE_SECONDS=1 \
+        NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
         python3 "$real_pty_runner" "$BASH_BIN" "$mut" 0.5.4 --yes --no-docker)"
       RC=$?
       if [ "$RC" -ne 7 ]; then
