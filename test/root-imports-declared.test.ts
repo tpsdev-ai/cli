@@ -32,6 +32,17 @@ function rootManifest(): RootManifest {
 	return JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")) as RootManifest;
 }
 
+/** The undeclared packages reported for one fixture body in a throwaway directory. */
+function undeclaredIn(body: string) {
+	const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+	try {
+		writeFileSync(join(dir, "fixture.ts"), body);
+		return findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 describe("root imports are declared", () => {
 	it("passes on the root tree with the root manifest", () => {
 		const files = SCANNED_DIRS.flatMap((dir) => listSourceFiles(ROOT, dir));
@@ -208,6 +219,118 @@ describe("root imports are declared", () => {
 			rmSync(dir, { recursive: true, force: true });
 		}
 	});
+
+	describe("module loader forms", () => {
+		it("reports a literal argument to a function bound from createRequire", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						"const load = createRequire(import.meta.url);",
+						'const pkg = load("undeclared-create-require-bound");',
+						"void pkg;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-create-require-bound",
+					packageName: "undeclared-create-require-bound",
+				},
+			]);
+		});
+
+		it("reports a literal argument to createRequire called directly", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						'const pkg = createRequire(import.meta.url)("undeclared-create-require-direct");',
+						"void pkg;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-create-require-direct",
+					packageName: "undeclared-create-require-direct",
+				},
+			]);
+		});
+
+		it("reports a literal argument to module.require", () => {
+			expect(
+				undeclaredIn('const pkg = module.require("undeclared-module-require");\nvoid pkg;\n'),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-module-require",
+					packageName: "undeclared-module-require",
+				},
+			]);
+		});
+
+		it("reports a literal argument to process.mainModule.require", () => {
+			expect(
+				undeclaredIn(
+					'const pkg = process.mainModule.require("undeclared-main-module-require");\nvoid pkg;\n',
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-main-module-require",
+					packageName: "undeclared-main-module-require",
+				},
+			]);
+		});
+
+		it("does not report a module.require call in a comment, a string or a template literal", () => {
+			expect(
+				undeclaredIn(
+					[
+						'// module.require("commented-out-pkg")',
+						'const text = "module.require(\\"in-string-pkg\\")";',
+						'const template = `process.mainModule.require("in-template-pkg")`;',
+						"void text; void template;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([]);
+		});
+
+		it("does not report a file: specifier as a package", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						'import local from "file:./local.ts";',
+						"const load = createRequire(import.meta.url);",
+						'const other = load("file:./other.ts");',
+						"void local; void other;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([]);
+		});
+
+		it("does not report a data: specifier as a package", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						'import inline from "data:text/javascript,export default 1";',
+						"const load = createRequire(import.meta.url);",
+						'const other = load("data:text/javascript,export default 2");',
+						"void inline; void other;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([]);
+		});
+	});
+
 	it("lists and checks exactly the six claimed extensions, outside node_modules and symlinked directories", () => {
 		const root = mkdtempSync(join(tmpdir(), "root-imports-"));
 		try {
