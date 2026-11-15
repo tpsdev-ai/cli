@@ -17,7 +17,7 @@ const realSetTimeout = globalThis.setTimeout;
 /** Reconnect waits run on a short real timer. */
 const TEST_RECONNECT_BACKOFF_MS = 100;
 
-function fastReconnectBackoff(onDelay?: (delay: number) => void) {
+function fastReconnectBackoff(onDelay?: (delay: number) => void, onTimerFired?: (delay: number) => void) {
   return spyOn(globalThis, "setTimeout").mockImplementation(((
     callback: (...args: unknown[]) => void,
     delay?: number,
@@ -25,7 +25,10 @@ function fastReconnectBackoff(onDelay?: (delay: number) => void) {
   ) => {
     if (typeof delay === "number" && delay >= 4_000 && delay <= 60_000) {
       onDelay?.(delay);
-      return realSetTimeout(callback, TEST_RECONNECT_BACKOFF_MS, ...args);
+      return realSetTimeout(() => {
+        onTimerFired?.(delay);
+        callback(...args);
+      }, TEST_RECONNECT_BACKOFF_MS);
     }
     return realSetTimeout(callback, delay, ...args);
   }) as typeof setTimeout);
@@ -344,6 +347,7 @@ for (const closePath of ["reconnect", "graceful"] as const) {
 async function lateConnectScenario(options: {
   lateClose: (call: number) => Promise<void>;
   onDelay?: (delay: number) => void;
+  onTimerFired?: (delay: number) => void;
 }) {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-late-connect-896-"));
   const savedEnv = savedRelayEnv();
@@ -371,7 +375,7 @@ async function lateConnectScenario(options: {
     isAlive() { return true; },
     peerFingerprint() { return "remote"; },
   };
-  const fastBackoff = fastReconnectBackoff(options.onDelay);
+  const fastBackoff = fastReconnectBackoff(options.onDelay, options.onTimerFired);
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
     const call = ++connectCalls;
@@ -501,14 +505,19 @@ test("stop() arms the late-connect deadline at 5 s", async () => {
 }, 20_000);
 
 test("stop() keeps the host record when an in-flight connect does not settle by the deadline", async () => {
-  const scenario = await lateConnectScenario({ lateClose: async () => {} });
+  const delays: number[] = [];
+  let deadlineFired = false;
+  const scenario = await lateConnectScenario({
+    lateClose: async () => {},
+    onDelay: (delay) => { delays.push(delay); },
+    onTimerFired: (delay) => { if (delay === 5_000) deadlineFired = true; },
+  });
   try {
-    const started = performance.now();
+    delays.length = 0;
     const error = await scenario.stop().catch((e) => e);
+    expect(delays).toEqual([5_000]);
+    expect(deadlineFired).toBe(true);
     expect(error).toMatchObject({ name: "HostChannelCloseError" });
-    // The wait is bounded by the named deadline: the test's backoff spy maps it
-    // to the short real timer, so a stop that never returns would fail the timeout.
-    expect(performance.now() - started).toBeGreaterThanOrEqual(TEST_RECONNECT_BACKOFF_MS);
     expect(scenario.counts().lateCloses).toBe(0);
     expect(existsSync(scenario.path)).toBe(true);
   } finally {
