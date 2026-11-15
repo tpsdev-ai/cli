@@ -542,7 +542,7 @@ describe("the release-age gate and a real npm installer on the same lock", () =>
     });
   });
 
-  it("a versionless entry is refused with exit 2 before the installer can resolve it", async () => {
+  it("a versionless entry is refused with exit 2, and the installer rejects the lock after one metadata request", async () => {
     await withLane(async (root) => {
       prepare(root);
       const depVersionless = pack(root, { name: "dep-versionless", version: "1.0.0" });
@@ -561,6 +561,7 @@ describe("the release-age gate and a real npm installer on the same lock", () =>
         expect(install.status).not.toBe(0);
         expect(install.stderr).toContain("Invalid: lock file's dep-versionless@ does not satisfy dep-versionless@1.0.0");
         registry.assertNoUnexpected();
+        expect(install.requests).toEqual(["GET /dep-versionless"]);
 
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(2);
