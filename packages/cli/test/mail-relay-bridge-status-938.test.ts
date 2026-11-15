@@ -300,8 +300,12 @@ describe("tps bridge status --json records", () => {
         path: unreadablePath,
         state: "unreadable",
       });
-      expect(typeof unreadable.reason).toBe("string");
-      expect(unreadable.reason.length).toBeGreaterThan(0);
+      // The JSON reason is the real read failure's reason, whatever errno
+      // wording the platform uses.
+      const classified = readPidFile(unreadablePath);
+      expect(classified.kind).toBe("unreadable");
+      if (classified.kind !== "unreadable") throw new Error("expected an unreadable record");
+      expect(unreadable.reason).toBe(classified.reason);
     },
     TIMEOUT,
   );

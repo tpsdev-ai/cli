@@ -41,6 +41,8 @@ export interface BridgeConfig {
 export interface BridgePidFileEntry {
   path: string;
   state: PidFileState;
+  /** The bytes `state` was classified from; a failed read is null. */
+  raw: Buffer | null;
   port?: number;
   adapter: string;
 }
@@ -64,16 +66,18 @@ function bridgePidRecordAdapter(name: string): string | null {
 
 function classifyBridgePidFile(path: string, adapter: string): BridgePidFileEntry | null {
   let port: number | undefined;
-  const state = readPidFile(path, undefined, (content) => {
+  let raw: Buffer | null = null;
+  const state = readPidFile(path, undefined, (content, bytes) => {
+    raw = bytes;
     try {
-      const raw = JSON.parse(content);
-      if (typeof raw.port === "number") port = raw.port;
+      const parsed = JSON.parse(content);
+      if (typeof parsed.port === "number") port = parsed.port;
     } catch {
       /* not JSON */
     }
   });
   if (state.kind === "missing") return null;
-  return { path, state, port, adapter };
+  return { path, state, raw, port, adapter };
 }
 
 /** The run-directory listing `bridgePidFiles` uses; replaceable in tests. */

@@ -638,6 +638,10 @@ export async function runOffice(args: OfficeArgs): Promise<void> {
       const soundstageMarker = join(branchRoot(), agent, "soundstage.json");
       const isSoundstage = existsSync(soundstageMarker);
       if (args.json) {
+        // A sandbox container's state wins over the relay record because this
+        // one status field names the office, and it named the container before
+        // it could name the relay (pre-existing, not a relay-state bug). The
+        // text output below still prints the relay line alongside.
         const status = sb ? sb.state : relayRunning ? "relay-running" : relayState.kind === "missing" ? "not running" : "relay-unknown";
         const lastSeen = lastSeenFromPaths([
           relayPidFile(agent),

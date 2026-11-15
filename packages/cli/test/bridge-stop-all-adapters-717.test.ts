@@ -5,13 +5,14 @@
  * per-record reporting as the openclaw record.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
+import { pidState, processIsGone, processStartToken } from "@tpsdev-ai/agent";
+import { runBridge, setBridgeStopRecordReader, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
-import { readPidFile } from "../src/utils/pid-file.js";
+import { readPidFile, snapshotPidRecord } from "../src/utils/pid-file.js";
+import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
 const TIMEOUT = 30_000;
@@ -155,6 +156,44 @@ function spawnSleep(): Bun.Subprocess {
   return child;
 }
 
+/** Starts `sleep` as the child of a shell this process also starts. The shell
+ *  reaps it, so a killed process disappears without this process waiting on
+ *  it, which a synchronous reader cannot do. */
+async function spawnReapableChild(): Promise<number> {
+  const shell = Bun.spawn(["sh", "-c", "sleep 60 & echo $!; wait"], {
+    stdin: "ignore",
+    stdout: "pipe",
+    stderr: "ignore",
+  });
+  children.push(shell);
+  const reader = shell.stdout.getReader();
+  const { value } = await reader.read();
+  reader.releaseLock();
+  const pid = Number(new TextDecoder().decode(value).trim());
+  if (!Number.isInteger(pid) || pid < 1) throw new Error(`no child pid on stdout: ${value}`);
+  return pid;
+}
+
+/** Kill `pid` and block until the process is gone, so the next reader call sees
+ *  it. The synchronous wait ends on its own; it does not depend on this
+ *  process reaping the pid. */
+function killAndWaitGone(pid: number, token: string): void {
+  process.kill(pid, "SIGKILL");
+  const deadline = Date.now() + 5_000;
+  while (!processIsGone(pid, token)) {
+    if (Date.now() >= deadline) throw new Error(`pid ${pid} is still present`);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+  }
+}
+
+/** A token from the same source as `real` whose value the child cannot carry,
+ *  so the record is stale by construction on Linux and macOS. */
+function foreignStartToken(real: string): string {
+  if (real.startsWith("ps:")) return "ps:Thu Jan 1 00:00:00 1970";
+  if (real.startsWith("proc:")) return "proc:1";
+  throw new Error(`unexpected start token source: ${real}`);
+}
+
 function spawnScript(script: string, env: Record<string, string>): Bun.Subprocess {
   const child = Bun.spawn(["bun", script], {
     env: { ...process.env, ...env, HOME: home },
@@ -234,6 +273,12 @@ async function runFifoRead(script: string): Promise<Record<string, unknown>> {
 
 function record(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
+}
+
+/** The refusal guidance every re-read branch appends, naming the pid the
+ *  up-front read planned to stop. */
+function guidance(pid: number): string {
+  return `The bridge process (pid ${pid}) may still be running; check it with ps -p ${pid} and stop it yourself.`;
 }
 
 function tokenOf(pid: number): string {
@@ -334,6 +379,568 @@ describe("bridge stop finds the discovered bridge pid records", () => {
       );
       expect(stopError?.message).toContain(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
       expect(() => bridgeStatus("openclaw")).toThrow(`Bridge run directory ${runDir} could not be read (ENOTDIR)`);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("bridge stop re-read exit status (cli#970)", () => {
+  function installReader(state: () => PidFileState): () => void {
+    const previous = setBridgeStopRecordReader((readPath) => {
+      const value = state();
+      let raw: Buffer | null = null;
+      if (value.kind !== "missing" && value.kind !== "unreadable") {
+        try {
+          raw = readFileSync(value.path);
+        } catch {
+          raw = null;
+        }
+      }
+      return { state: value, raw };
+    });
+    return () => setBridgeStopRecordReader(previous);
+  }
+
+  test(
+    "a process killed and reaped before the re-read is a completed stop and the record is left",
+    async () => {
+      const pid = await spawnReapableChild();
+      const token = tokenOf(pid);
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(pid, token));
+
+      let reads = 0;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        reads++;
+        // The process the up-front read verified dies before the re-read.
+        if (reads === 1) killAndWaitGone(pid, token);
+        return snapshotPidRecord(readPath);
+      });
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((signalled) => signals.push(signalled));
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+      }
+
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      // The proven-gone re-read leaves the record, as relay does: it may
+      // belong to a new bridge.
+      expect(existsSync(path)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(record(pid, token));
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
+    async () => {
+      const child = spawnSleep();
+      const plannedToken = tokenOf(child.pid);
+      const path = join(runDir, "bridge-alpha.pid");
+      const rewritten = record(child.pid, foreignStartToken(plannedToken));
+      writeFileSync(path, record(child.pid, plannedToken));
+
+      let reads = 0;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        reads++;
+        // The record changes after the up-front read, before the re-read.
+        if (reads === 1) writeFileSync(path, rewritten);
+        return snapshotPidRecord(readPath);
+      });
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((signalled) => signals.push(signalled));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+      }
+
+      expect(error?.message).toContain(`holds a stale record for pid ${child.pid}, but it does not prove the process this stop verified is gone`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that disappeared before the re-read exits non-zero and keeps the message's pid to check",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "missing" }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain("disappeared before it was signalled");
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that turned invalid before the re-read exits non-zero",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "invalid", path, reason: "not a JSON object" }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`Bridge pid file ${path} is now invalid`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that turned stale under a different pid exits non-zero",
+    async () => {
+      const child = spawnSleep();
+      const other = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "stale", path, pid: other.pid }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`now holds a stale record for pid ${other.pid}, not the planned pid ${child.pid}`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(error?.message).not.toContain(`ps -p ${other.pid}`);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+      expect(pidState(other.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record that became unreadable before the re-read keeps the message's pid to check",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "unreadable", path, reason: "could not be opened (EACCES)" }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain("could not be opened (EACCES)");
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record whose identity cannot be verified on the re-read keeps the message's pid to check",
+    async () => {
+      const child = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, tokenOf(child.pid)));
+
+      const restoreReader = installReader(() => ({ kind: "unverified", path, pid: child.pid, startToken: null }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`Bridge pid file ${path} names pid ${child.pid}, but that process's identity cannot be verified`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record replaced by another running pid keeps the message's pid to check",
+    async () => {
+      const planned = spawnSleep();
+      const replacement = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      let reads = 0;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        reads++;
+        // The record changes after the up-front read, before the re-read.
+        if (reads === 1) writeFileSync(path, record(replacement.pid, tokenOf(replacement.pid)));
+        return snapshotPidRecord(readPath);
+      });
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+      }
+
+      expect(error?.message).toContain(`now names pid ${replacement.pid}, which is not the planned pid ${planned.pid}`);
+      expect(error?.message).toContain(guidance(planned.pid));
+      expect(error?.message).not.toContain(`ps -p ${replacement.pid}`);
+      expect(reads).toBe(1);
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(planned.pid)).toBe("alive");
+      expect(pidState(replacement.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record whose start token changed for the same running pid keeps the message's pid to check",
+    async () => {
+      const child = spawnSleep();
+      const plannedToken = tokenOf(child.pid);
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(child.pid, plannedToken));
+
+      const restoreReader = installReader(() => ({
+        kind: "running",
+        path,
+        pid: child.pid,
+        startToken: foreignStartToken(plannedToken),
+      }));
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        restoreReader();
+      }
+
+      expect(error?.message).toContain(`still names pid ${child.pid}, but the process identity changed since it was planned`);
+      expect(error?.message).toContain(guidance(child.pid));
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+      expect(pidState(child.pid)).toBe("alive");
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "an invalid record at the first read exits non-zero, keeps the record, and sends no signal",
+    async () => {
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, "not-a-pid\n");
+      expect(readPidFile(path).kind).toBe("invalid");
+
+      const signals: number[] = [];
+      const previous = setBridgeStopSignal((pid) => signals.push(pid));
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+      }
+
+      expect(error?.message).toContain(`Bridge pid file ${path} is invalid`);
+      expect(error?.message).toMatch(/Check whether a bridge is running/);
+      expect(error?.message).toContain("by hand only if none is");
+      expect(signals).toEqual([]);
+      expect(existsSync(path)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record replaced by a live bridge inside the signal window is kept and its process is not signalled",
+    async () => {
+      const planned = spawnSleep();
+      const replacement = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      let replaced = false;
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        const snapshot = snapshotPidRecord(readPath);
+        if (!replaced) {
+          // The re-read sees the planned record; a new bridge writes its own
+          // record before the stop reaches its removal step.
+          replaced = true;
+          writeFileSync(path, replacementBytes);
+        }
+        return snapshot;
+      });
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+        restore();
+      }
+
+      expect(replaced).toBe(true);
+      expect(signals).toEqual([planned.pid]);
+      expect(readFileSync(path, "utf8")).toBe(replacementBytes);
+      expect(pidState(planned.pid)).toBe("gone");
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(lines).toContain(
+        `Bridge (pid ${planned.pid}) stopped; pid file ${path} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a record replaced by a non-running record inside the signal window is kept and named",
+    async () => {
+      const planned = spawnSleep();
+      const gone = await spawnReapableChild();
+      const goneToken = tokenOf(gone);
+      killAndWaitGone(gone, goneToken);
+      // A record for a process that is gone: the bytes change, the state does not run.
+      const replacementBytes = record(gone, null);
+      const path = join(runDir, "bridge-alpha.pid");
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+        // A new record lands between the signal and the removal.
+        writeFileSync(path, replacementBytes);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([planned.pid]);
+      expect(readFileSync(path, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Bridge (pid ${planned.pid}) stopped; pid file ${path} no longer holds the record this stop read and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a first-read stale record replaced by a live bridge when an earlier record is signalled is kept and named",
+    async () => {
+      const alpha = spawnSleep();
+      const dead = await spawnReapableChild();
+      const deadToken = tokenOf(dead);
+      killAndWaitGone(dead, deadToken);
+      const alphaPath = join(runDir, "bridge-alpha.pid");
+      const stalePath = join(runDir, "bridge-beta.pid");
+      writeFileSync(alphaPath, record(alpha.pid, tokenOf(alpha.pid)));
+      writeFileSync(stalePath, record(dead, null));
+      expect(readPidFile(stalePath).kind).toBe("stale");
+
+      const replacement = spawnSleep();
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        // Only alpha is signalled. While it stops, a new bridge writes beta's record.
+        process.kill(pid, "SIGKILL");
+        writeFileSync(stalePath, replacementBytes);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([alpha.pid]);
+      expect(pidState(alpha.pid)).toBe("gone");
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(readFileSync(stalePath, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Stale pid file not removed; pid file ${stalePath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a signal that fails with ESRCH keeps a record replaced in the signal window and names it",
+    async () => {
+      const planned = spawnSleep();
+      const replacement = spawnSleep();
+      const path = join(runDir, "bridge-alpha.pid");
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      writeFileSync(path, record(planned.pid, tokenOf(planned.pid)));
+
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+        // A new record lands before the failed signal is classified.
+        writeFileSync(path, replacementBytes);
+        throw Object.assign(new Error("kill ESRCH"), { code: "ESRCH" });
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(signals).toEqual([planned.pid]);
+      // The ESRCH branch never waits for the exit; collect the child so the
+      // liveness probe cannot see an unreaped one.
+      await planned.exited;
+      expect(pidState(planned.pid)).toBe("gone");
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(readFileSync(path, "utf8")).toBe(replacementBytes);
+      expect(lines).toContain(
+        `Recorded bridge process (pid ${planned.pid}) is gone; pid file ${path} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a duplicate record whose bytes changed after the first record stopped the process is kept and named",
+    async () => {
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(firstPath, record(child.pid, token));
+      writeFileSync(secondPath, record(child.pid, token));
+      const plannedSecond = bridgePidFiles().find((entry) => entry.path === secondPath);
+      expect(plannedSecond?.state.kind).toBe("running");
+
+      const replacement = spawnSleep();
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      const signals: number[] = [];
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      // The second record's re-read sees the snapshot taken before the first
+      // record stopped the process; the file itself has already changed.
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        if (readPath === secondPath) {
+          writeFileSync(secondPath, replacementBytes);
+          return plannedSecond!;
+        }
+        return snapshotPidRecord(readPath);
+      });
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+        restore();
+      }
+
+      expect(signals).toEqual([child.pid]);
+      expect(readFileSync(secondPath, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(lines).toContain(
+        `Pid file not removed; pid file ${secondPath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
     },
     TIMEOUT,
   );

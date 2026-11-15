@@ -403,42 +403,6 @@ describe("mail relay stop keeps a record replaced before removal", () => {
   );
 
   test(
-    "an invalid record replaced by a live relay before its removal is kept and named",
-    async () => {
-      const replacement = spawnChild();
-      const replacementBytes = record(replacement.pid, childToken(replacement.pid));
-      writeFileSync(relayPid, "");
-
-      let reads = 0;
-      const previousReader = setRelayStopRecordReader(() => {
-        const snapshot = snapshotPidRecord(relayPid);
-        reads++;
-        if (reads === 1) writeFileSync(relayPid, replacementBytes);
-        return snapshot;
-      });
-      const signals: number[] = [];
-      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
-      const { logs, restore } = captureLogs();
-      try {
-        await runMail({ action: "relay", agent: "stop" });
-      } finally {
-        restore();
-        setRelayStopSignal(previousSignal);
-        setRelayStopRecordReader(previousReader);
-      }
-
-      expect(reads).toBe(1);
-      expect(signals).toEqual([]);
-      expect(logs.join("\n")).toContain(
-        `Mail relay pid file ${relayPid} was invalid; pid file ${relayPid} now belongs to a different process (pid ${replacement.pid}) and was kept. This command signalled no process, and the relay's state is unknown.`,
-      );
-      expect(readFileSync(relayPid, "utf8")).toBe(replacementBytes);
-      expect(pidState(replacement.pid)).toBe("alive");
-    },
-    CASE_TIMEOUT_MS,
-  );
-
-  test(
     "a stale record left unreadable at the final check fails the stop",
     async () => {
       const child = spawnChild();
@@ -457,38 +421,6 @@ describe("mail relay stop keeps a record replaced before removal", () => {
       try {
         await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
           `Mail relay pid file ${relayPid} was stale and could not be read at the final check`,
-        );
-      } finally {
-        setRelayStopRecordReader(previousReader);
-      }
-
-      expect(reads).toBe(1);
-      expect(existsSync(relayPid)).toBe(true);
-      expect(statSync(relayPid).isDirectory()).toBe(true);
-      expect(pidState(child.pid)).toBe("alive");
-    },
-    CASE_TIMEOUT_MS,
-  );
-
-  test(
-    "an invalid record left unreadable at the final check fails the stop",
-    async () => {
-      const child = spawnChild();
-      writeFileSync(relayPid, "not a pid record\n");
-      const invalid = snapshotPidRecord(relayPid);
-      expect(invalid.state.kind).toBe("invalid");
-      // The classification read returns the invalid snapshot; the re-read in
-      // `reportBadRecord` then finds a directory at the path.
-      leaveUnreadableRecord();
-
-      let reads = 0;
-      const previousReader = setRelayStopRecordReader(() => {
-        reads++;
-        return invalid;
-      });
-      try {
-        await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} was invalid and could not be read at the final check`,
         );
       } finally {
         setRelayStopRecordReader(previousReader);

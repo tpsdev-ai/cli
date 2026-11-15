@@ -255,37 +255,49 @@ describe("tps bridge status with a bad or unverified record", () => {
 
 describe("mail relay stop with a bad record", () => {
   test(
-    "an invalid pid file is removed and reported, and no process is signalled",
+    "an invalid pid file exits non-zero, is kept, and no process is signalled",
     () => {
       const child = spawnChild();
       writeFileSync(relayPid, "not-a-pid\n");
 
       const result = runCli(["mail", "relay", "stop"]);
 
-      expect(result.status).toBe(0);
-      expect(result.stdout).toContain(relayPid);
-      expect(result.stdout).toMatch(/was invalid and was removed/);
-      expect(result.stdout).toMatch(/signalled no process/i);
-      expect(result.stdout).toMatch(/state is unknown/i);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(relayPid);
+      expect(result.stderr).toMatch(/is invalid/);
+      expect(result.stderr).toMatch(/Check whether a relay is running/);
+      expect(result.stderr).toContain("by hand only if none is");
       expect(result.stdout).not.toMatch(/not running/i);
-      expect(existsSync(relayPid)).toBe(false);
+      expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,
   );
 
   test(
-    "an invalid pid file sends no signal when stop runs in this process",
+    "an invalid pid file sends no signal and keeps the record when stop runs in this process",
     async () => {
       const child = spawnChild();
       writeFileSync(relayPid, "not-a-pid\n");
 
-      const { signals, out } = await stopInProcess();
+      const signals: number[] = [];
+      const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
+      let message = "";
+      try {
+        await runMail({ action: "relay", agent: "stop" }).catch((error) => {
+          message = (error as Error).message;
+        });
+      } finally {
+        setRelayStopSignal(previousSignal);
+      }
 
       expect(signals).toEqual([]);
-      expect(out).toMatch(/was invalid and was removed/);
-      expect(out).not.toMatch(/not running/i);
-      expect(existsSync(relayPid)).toBe(false);
+      expect(message).toContain(relayPid);
+      expect(message).toMatch(/is invalid/);
+      expect(message).toMatch(/Check whether a relay is running/);
+      expect(message).toContain("by hand only if none is");
+      expect(message).not.toMatch(/not running/i);
+      expect(existsSync(relayPid)).toBe(true);
       expect(pidState(child.pid)).toBe("alive");
     },
     TIMEOUT,
@@ -316,7 +328,8 @@ describe("mail relay stop with a bad record", () => {
     "a record whose removal fails says so and leaves the relay state unknown",
     async () => {
       const child = spawnChild();
-      writeFileSync(relayPid, "not-a-pid\n");
+      writeFileSync(relayPid, staleRecord(child));
+      expect(readPidFile(relayPid).kind).toBe("stale");
       const previousRemoval = setRelayPidRemoval(() => {
         throw Object.assign(new Error("EISDIR"), { code: "EISDIR" });
       });
@@ -332,7 +345,7 @@ describe("mail relay stop with a bad record", () => {
       }
 
       expect(message).toContain(relayPid);
-      expect(message).toMatch(/was invalid/);
+      expect(message).toMatch(/was stale/);
       expect(message).toMatch(/could not be removed/);
       expect(message).toContain("EISDIR");
       expect(message).toMatch(/signalled no process/i);
