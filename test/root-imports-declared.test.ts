@@ -50,11 +50,34 @@ function reportEntry(specifier: string) {
 }
 
 /**
- * `source` parsed with a ParenthesizedExpression around each identifier
- * read as a callee, a member-access object, an assignment's left side or a call
- * argument, then printed by TypeScript's printer. Property names, binding names
- * and import specifiers are not wrapped. An already parenthesised expression is
- * wrapped again instead of being skipped.
+ * Whether an Identifier child of `parent` sits in an expression position.
+ */
+function isExpressionIdentifier(parent: ts.Node, node: ts.Identifier): boolean {
+	// A property name after a dot, and the `meta`/`target` of a meta property.
+	if (ts.isPropertyAccessExpression(parent)) return parent.expression === node;
+	if (ts.isQualifiedName(parent) || ts.isMetaProperty(parent)) return false;
+	// A label, which is a name rather than an expression.
+	if (ts.isLabeledStatement(parent) || ts.isBreakStatement(parent) || ts.isContinueStatement(parent)) {
+		return false;
+	}
+	// A declaration or binding name, or the `as` name of an import, export or
+	// binding specifier. Anything else under a declaration is an expression.
+	if (ts.isDeclaration(parent)) {
+		const named = parent as { name?: ts.Node; propertyName?: ts.Node };
+		return named.name !== node && named.propertyName !== node;
+	}
+	return true;
+}
+
+/**
+ * `source` parsed with a ParenthesizedExpression around every Identifier in an
+ * expression position, then printed by TypeScript's printer. The walk visits
+ * every node with ts.visitEachChild; the only Identifiers left unwrapped are
+ * the ones that are not expressions: a declaration or binding name, a property
+ * name after a dot or in a meta property, a property-assignment, method or
+ * shorthand property name, an import or export specifier, a qualified name, a
+ * label, and a type node. An already parenthesised expression is wrapped again
+ * instead of being skipped.
  */
 function withParenthesisedExpressions(source: string): { printed: string; wrapped: number } {
 	const sourceFile = ts.createSourceFile(
@@ -66,52 +89,33 @@ function withParenthesisedExpressions(source: string): { printed: string; wrappe
 	);
 	let wrapped = 0;
 	const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
-		const wrap = (node: ts.Expression): ts.Expression => {
-			const visited = ts.visitNode(node, visit) as ts.Expression;
-			if (!ts.isIdentifier(visited)) return visited;
-			wrapped += 1;
-			return ts.factory.createParenthesizedExpression(visited);
+		const visitChild = (parent: ts.Node, child: ts.Node, inType: boolean): ts.Node => {
+			if (!inType && ts.isIdentifier(child) && isExpressionIdentifier(parent, child)) {
+				wrapped += 1;
+				return context.factory.createParenthesizedExpression(child);
+			}
+			return visit(child, inType);
 		};
-		const visit = (node: ts.Node): ts.Node => {
-			if (ts.isCallExpression(node)) {
-				return ts.factory.updateCallExpression(
-					node,
-					wrap(node.expression),
-					node.typeArguments,
-					node.arguments.map((argument) => wrap(argument)),
-				);
-			}
-			if (ts.isPropertyAccessExpression(node)) {
-				return ts.factory.updatePropertyAccessExpression(
-					node,
-					wrap(node.expression),
-					node.name,
-				);
-			}
-			if (ts.isElementAccessExpression(node)) {
-				return ts.factory.updateElementAccessExpression(
-					node,
-					wrap(node.expression),
-					node.argumentExpression,
-				);
-			}
-			if (ts.isParenthesizedExpression(node)) {
-				return ts.factory.updateParenthesizedExpression(node, wrap(node.expression));
-			}
-			if (ts.isBinaryExpression(node) && node.operatorToken.kind === ts.SyntaxKind.EqualsToken) {
-				return ts.factory.updateBinaryExpression(
-					node,
-					wrap(node.left),
-					node.operatorToken,
-					node.right,
-				);
-			}
-			return ts.visitEachChild(node, visit, context);
+		const visit = (node: ts.Node, inType: boolean): ts.Node => {
+			const childrenInType = inType || ts.isTypeNode(node);
+			return ts.visitEachChild(node, (child) => visitChild(node, child, childrenInType), context);
 		};
-		return (root) => ts.visitNode(root, visit) as ts.SourceFile;
+		return (root) => ts.visitNode(root, (node) => visit(node, false)) as ts.SourceFile;
 	};
 	const transformed = ts.transform(sourceFile, [transformer]).transformed[0];
 	return { printed: ts.createPrinter().printFile(transformed), wrapped };
+}
+
+/** Diagnostic messages from reparsing `source` as the fixture script kind. */
+function parseDiagnostics(source: string): string[] {
+	const { diagnostics } = ts.transpileModule(source, {
+		fileName: "fixture.ts",
+		reportDiagnostics: true,
+		compilerOptions: { target: ts.ScriptTarget.Latest, module: ts.ModuleKind.ESNext },
+	});
+	return (diagnostics ?? []).map((diagnostic) =>
+		ts.flattenDiagnosticMessageText(diagnostic.messageText, " "),
+	);
 }
 
 describe("root imports are declared", () => {
@@ -455,19 +459,37 @@ describe("root imports are declared", () => {
 			});
 		}
 
-		it("reports the same specifiers with each callee, member-access object, assignment left and call argument identifier parenthesised", () => {
+		it("reports the same specifiers with every expression-position identifier parenthesised, and both forms parse cleanly", () => {
 			for (const fixture of LOADER_FIXTURES) {
+				expect({ fixture: fixture.name, diagnostics: parseDiagnostics(fixture.source) }).toEqual({
+					fixture: fixture.name,
+					diagnostics: [],
+				});
 				const variant = withParenthesisedExpressions(fixture.source);
 				// A fixture that wrapped nothing would make this case vacuous.
 				expect({ fixture: fixture.name, wrapped: variant.wrapped > 0 }).toEqual({
 					fixture: fixture.name,
 					wrapped: true,
 				});
+				expect({ fixture: fixture.name, diagnostics: parseDiagnostics(variant.printed) }).toEqual({
+					fixture: fixture.name,
+					diagnostics: [],
+				});
 				expect({ fixture: fixture.name, reported: undeclaredIn(variant.printed) }).toEqual({
 					fixture: fixture.name,
 					reported: fixture.specifiers.map(reportEntry),
 				});
 			}
+		});
+
+		it("generates a variant that wraps an assignment's right-hand side and a void operand", () => {
+			const assigned = withParenthesisedExpressions(
+				'r = createRequire(import.meta.url);\nr("x");\n',
+			);
+			expect(assigned.printed).toContain("(createRequire)(");
+			expect(assigned.printed).toContain("(r)(");
+			const voided = withParenthesisedExpressions("void pkg;\n");
+			expect(voided.printed).toContain("void (pkg)");
 		});
 
 		it("does not report a module.require call in a comment, a string or a template literal", () => {
