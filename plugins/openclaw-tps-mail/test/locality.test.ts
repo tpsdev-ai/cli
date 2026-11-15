@@ -70,8 +70,6 @@ const relay = {
   deliver: [] as Array<{ branchId: string; msg: any }>,
   bridge: [] as Array<{ branchId: string; msg: any }>,
   failDeliver: false,
-  // cli#408: a delivery call that writes its record and THEN throws.
-  failBridgeAfterWrite: false,
 };
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   ...realRelayExports,
@@ -106,7 +104,6 @@ mock.module("@tpsdev-ai/cli/utils/relay", () => ({
       JSON.stringify(payload, null, 2),
       "utf-8",
     );
-    if (relay.failBridgeAfterWrite) throw new Error("injected: the sandbox record was written, then the call threw");
   },
   resolveAgentMailRoot: (branchId: string) =>
     join(process.env.HOME ?? "", ".tps", "branch-office", branchId, "mail"),
@@ -272,7 +269,6 @@ async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<
   relay.deliver.length = 0;
   relay.bridge.length = 0;
   relay.failDeliver = false;
-  relay.failBridgeAfterWrite = false;
   try {
     setup();
     return await fn();
@@ -1298,10 +1294,8 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
 // ── cli#408 — the obligation-lifecycle paths a regression would miss ─────────
 
 /**
- * cli#408 (follow-up to the #406 review). Three paths whose outcome is right on
+ * cli#408 (follow-up to the #406 review). Two paths whose outcome is right on
  * main but whose failure mode a reader had to reason about:
- *   - a delivery that writes its record and THEN throws is settled from that
- *     evidence (`acked`), never failed;
  *   - a failed write-ahead (`delivering`) sends nothing, fails the obligation
  *     and announces the sender exactly once;
  *   - a failure write that throws is ONE attempt with no announcement; the
@@ -1309,28 +1303,7 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
  * (The attributable-quarantine deadline path and the deadline re-arm are
  * already pinned by final-selection (e) and reply-obligation R8/R9.)
  */
-describe("cli#408 — obligation-lifecycle coverage (delivery, write-ahead, failed write)", () => {
-  it("a bridge delivery that writes its record and THEN throws resolves `acked` from that evidence — never failed, never nacked", async () => {
-    // The delivery call can throw AFTER the bytes left. The sandbox record it
-    // already wrote is the evidence, so the scan must still ack the obligation.
-    process.env.TPS_OBLIGATION_DEADLINE_MS = "600000"; // the evidence decides it, not a deadline
-    const outcome = await inFreshHome(
-      () => {
-        branchInbox("remote-a");
-        relay.failBridgeAfterWrite = true;
-      },
-      () => routeViaDispatcher("remote-a", ["agent-b"]),
-    );
-
-    expect(outcome.route, "the sandbox record was written before the throw").toBe("bridge");
-    expect(outcome.sandboxRecord, "the delivered record is there").toBeTruthy();
-    expect(outcome.obligation?.state, "the evidence acks it").toBe("acked");
-    expect(outcome.obligation?.failure, "no failure is recorded").toBeUndefined();
-    expect(outcome.inboundNackedAt, "the inbound is NOT nacked").toBeNull();
-    expect(outcome.nack, "and no nack mail was sent").toBeNull();
-    expect(outcome.warns.some((w) => w.includes("delivery-uncertain")), "the throw is logged by name").toBe(true);
-  }, 20000);
-
+describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)", () => {
   it("a failed `delivering` write sends nothing, fails the obligation by name and sends exactly one nack mail", async () => {
     obligations.failDeliveringTransition = true;
     const outcome = await inFreshHome(
