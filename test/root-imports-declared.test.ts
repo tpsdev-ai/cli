@@ -326,22 +326,14 @@ describe("root imports are declared", () => {
 			expect(
 				undeclaredIn(
 					[
-						// A plain call keeps the file past the prefilter, so this fixture pins
-						// the element-access parse rather than the prefilter.
-						'const t = module.require("undeclared-module-require-trigger");',
 						'const a = module["require"]("undeclared-module-require-computed");',
 						'const b = process.mainModule["require"]("undeclared-main-module-require-computed");',
 						'const c = process["mainModule"]["require"]("undeclared-both-computed");',
-						"void t; void a; void b; void c;",
+						"void a; void b; void c;",
 						"",
 					].join("\n"),
 				),
 			).toEqual([
-				{
-					file: "fixture.ts",
-					specifier: "undeclared-module-require-trigger",
-					packageName: "undeclared-module-require-trigger",
-				},
 				{
 					file: "fixture.ts",
 					specifier: "undeclared-module-require-computed",
@@ -376,6 +368,95 @@ describe("root imports are declared", () => {
 					file: "fixture.ts",
 					specifier: "undeclared-create-require-parenthesised",
 					packageName: "undeclared-create-require-parenthesised",
+				},
+			]);
+		});
+
+		it("reports a dot-access loader name written with unicode escapes", () => {
+			expect(
+				undeclaredIn('const pkg = module.r\\u0065quire("undeclared-escaped-dot-name");\nvoid pkg;\n'),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-escaped-dot-name",
+					packageName: "undeclared-escaped-dot-name",
+				},
+			]);
+		});
+
+		it("reports a string-literal loader key written with unicode escapes", () => {
+			expect(
+				undeclaredIn(
+					'const pkg = module["r\\u0065quire"]("undeclared-escaped-key-name");\nvoid pkg;\n',
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-escaped-key-name",
+					packageName: "undeclared-escaped-key-name",
+				},
+			]);
+		});
+
+		it("reports a loader bound to a createRequire name written with unicode escapes", () => {
+			expect(
+				undeclaredIn(
+					[
+						"const load = creat\\u0065Require(import.meta.url);",
+						'const pkg = load("undeclared-escaped-bind-name");',
+						"void pkg;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-escaped-bind-name",
+					packageName: "undeclared-escaped-bind-name",
+				},
+			]);
+		});
+
+		it("reports a parenthesised loader callee", () => {
+			expect(
+				undeclaredIn('const pkg = (module.require)("undeclared-parenthesised-callee");\nvoid pkg;\n'),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-parenthesised-callee",
+					packageName: "undeclared-parenthesised-callee",
+				},
+			]);
+		});
+
+		it("reports a parenthesised bound loader", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						"const load = createRequire(import.meta.url);",
+						'const pkg = (load)("undeclared-parenthesised-bound");',
+						"void pkg;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-parenthesised-bound",
+					packageName: "undeclared-parenthesised-bound",
+				},
+			]);
+		});
+
+		it("reports a parenthesised member-access object", () => {
+			expect(
+				undeclaredIn('const pkg = (module).require("undeclared-parenthesised-object");\nvoid pkg;\n'),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-parenthesised-object",
+					packageName: "undeclared-parenthesised-object",
 				},
 			]);
 		});

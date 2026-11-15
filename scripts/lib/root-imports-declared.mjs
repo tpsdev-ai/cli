@@ -3,13 +3,25 @@
  *
  * Reports bare specifiers that root test and script files import or load by
  * value and that the root package.json does not declare in dependencies or
- * devDependencies. Imports are read with Bun's own scanner, not a regex. A
- * package loaded through a `createRequire(...)` result, `module.require` or
- * `process.mainModule.require` is reported from a TypeScript parse of the same
- * source when its first argument is a literal string; a non-literal argument is
- * not read. `require` and `mainModule` may be written as a property access or as
- * an element access with a string-literal name (`module["require"]`), and a
- * `createRequire(...)` initializer may be parenthesised.
+ * devDependencies.
+ *
+ * The check recognises these forms:
+ *   - `import ... from "x"`, `export ... from "x"` and `import("x")` with a
+ *     literal specifier, read with Bun's own scanner;
+ *   - `require("x")`, read by the same scanner;
+ *   - `module.require("x")` and `process.mainModule.require("x")`, with each
+ *     property written as a dot access or as an element access with a
+ *     string-literal key (`module["require"]`);
+ *   - a name bound to a `createRequire(...)` result by a variable declaration
+ *     or a direct assignment, and a direct `createRequire(...)("x")` call.
+ *
+ * Parentheses are allowed around a callee and around a member-access object:
+ * `(module.require)("x")`, `(module).require("x")` and `(r)("x")` for a bound
+ * loader are read as the forms above. An argument is read only when it is a
+ * literal string (or a template literal with no substitutions); any other form
+ * is not checked, for example a dynamic key, `module.createRequire`, a loader
+ * reached through another expression or invoked with `.call`/`.apply`, or a
+ * non-literal argument.
  *
  * A specifier with a `file:` or `data:` scheme is skipped before a package name
  * is read: Bun resolves those without a package.
@@ -23,20 +35,11 @@
  * importing `react`: Bun's scanner adds the JSX runtime (`react/jsx-runtime`
  * or `react/jsx-dev-runtime`) and `react` as requires.
  *
- * NOT covered: a type-only import (`import type { X } from "pkg"`,
+ * Not read: a type-only import (`import type { X } from "pkg"`,
  * `export type { X } from "pkg"`, or an import of `type` names only), which
  * Bun's TypeScript loader removes before the scan; `require.resolve("pkg")`;
- * a dynamic import whose specifier is not a literal string
- * (`await import(name)`); a non-literal first argument to any module loader
- * form (`r(name)`, `module.require(name)`, `process.mainModule.require(name)`);
- * a `createRequire` result that is not held in a variable declaration or a
- * direct assignment, that is renamed on import (`import { createRequire as
- * cr }`), that is reached through another expression
- * (`require("node:module").createRequire(...)`), or that is invoked with
- * `.call`/`.apply`; a `module` or `process.mainModule` reached through another
- * binding (`const m = module; m.require("x")`); packages imported only from
- * outside test/ and scripts/, and whether a declared range resolves for a
- * published consumer.
+ * packages imported only from outside test/ and scripts/, and whether a declared
+ * range resolves for a published consumer.
  * `listSourceFiles` lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files, skips
  * `node_modules`, and does not descend into a directory reached through a
  * symlink, so JavaScript inside shell scripts or built in template strings, and
@@ -117,35 +120,42 @@ function isCreateRequireCall(node) {
 }
 
 /**
+ * A node with any parentheses around it removed: a callee or a member-access
+ * object the walk reads.
+ */
+function unwrap(node) {
+	return ts.skipParentheses(node);
+}
+
+/**
  * The name of an access written `.name` or `["name"]`, or null when `node` is
  * neither or its element argument is not a string literal.
  */
 function accessName(node) {
-	if (ts.isPropertyAccessExpression(node)) return node.name.text;
-	if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)) {
-		return node.argumentExpression.text;
+	const access = unwrap(node);
+	if (ts.isPropertyAccessExpression(access)) return access.name.text;
+	if (ts.isElementAccessExpression(access) && ts.isStringLiteral(access.argumentExpression)) {
+		return access.argumentExpression.text;
 	}
 	return null;
 }
 
 /** A call written `process.mainModule.require(...)`, however each access is spelled. */
 function isProcessMainModuleRequire(node) {
-	if (accessName(node) !== "require") return false;
-	const target = node.expression;
-	return (
-		accessName(target) === "mainModule" &&
-		ts.isIdentifier(target.expression) &&
-		target.expression.text === "process"
-	);
+	const access = unwrap(node);
+	if (accessName(access) !== "require") return false;
+	const target = unwrap(access.expression);
+	if (accessName(target) !== "mainModule") return false;
+	const root = unwrap(target.expression);
+	return ts.isIdentifier(root) && root.text === "process";
 }
 
 /** A call written `module.require(...)`, however each access is spelled. */
 function isModuleRequire(node) {
-	return (
-		accessName(node) === "require" &&
-		ts.isIdentifier(node.expression) &&
-		node.expression.text === "module"
-	);
+	const access = unwrap(node);
+	if (accessName(access) !== "require") return false;
+	const object = unwrap(access.expression);
+	return ts.isIdentifier(object) && object.text === "module";
 }
 
 function literalArgument(node) {
@@ -167,9 +177,6 @@ function literalArgument(node) {
  * @returns {string[]}
  */
 export function scanLoaderImports(file, source) {
-	// A prefilter only: it must match every form the parse below recognises, so
-	// it matches any `require` token rather than an exact spelling.
-	if (!/createRequire|\brequire\b/.test(source)) return [];
 	const sourceFile = ts.createSourceFile(
 		file,
 		source,
@@ -203,12 +210,12 @@ export function scanLoaderImports(file, source) {
 	const found = [];
 	const collect = (node) => {
 		if (ts.isCallExpression(node)) {
-			const { expression } = node;
+			const callee = unwrap(node.expression);
 			const isLoader =
-				isCreateRequireCall(ts.skipParentheses(expression)) ||
-				(ts.isIdentifier(expression) && bound.has(expression.text)) ||
-				isModuleRequire(expression) ||
-				isProcessMainModuleRequire(expression);
+				isCreateRequireCall(callee) ||
+				(ts.isIdentifier(callee) && bound.has(callee.text)) ||
+				isModuleRequire(callee) ||
+				isProcessMainModuleRequire(callee);
 			if (isLoader) {
 				const specifier = literalArgument(node);
 				if (specifier !== null) found.push(specifier);
