@@ -644,16 +644,28 @@ chmod +x "$fake_npm"
 # reads run under the tool's NPM_TIMEOUT_SECONDS, and `dist-tag add` runs under a
 # shorter deadline this wrapper enforces with the same supervisor. A slow read
 # therefore cannot consume the write's budget before the case reaches the PUT.
+# It forwards only the subcommands run_npm issues and refuses every other before npm runs (BF).
 put_deadline_npm="$work/npm-put-deadline"
 cat >"$put_deadline_npm" <<'PUT_NPM'
 #!/bin/bash
 set -uo pipefail
-case "${1:-} ${2:-}" in
-  "dist-tag add")
-    exec node "${REAL_NPM_SUPERVISOR:?}" "${NPM_PUT_DEADLINE_SECONDS:?}" 2 -- "${REAL_NPM_BIN:?}" "$@"
+sub="${1:-}"
+case "$sub" in
+  view)
+    exec "${REAL_NPM_BIN:?}" "$@"
+    ;;
+  dist-tag)
+    if [ "${2:-}" = "add" ]; then
+      exec node "${REAL_NPM_SUPERVISOR:?}" "${NPM_PUT_DEADLINE_SECONDS:?}" 2 -- "${REAL_NPM_BIN:?}" "$@"
+    fi
+    printf 'npm-put-deadline: refused subcommand: dist-tag %s\n' "${2:-<none>}" >&2
+    exit 90
+    ;;
+  *)
+    printf 'npm-put-deadline: refused subcommand: %s\n' "${sub:-<none>}" >&2
+    exit 90
     ;;
 esac
-exec "${REAL_NPM_BIN:?}" "$@"
 PUT_NPM
 chmod +x "$put_deadline_npm"
 
@@ -2641,6 +2653,58 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$bd/npm-superv
   fi
 else
   bad "BD mutation: mid-call FIFO swap hang caught" "could not build the mutant supervisor"
+fi
+
+# ── BF. the fixture's npm wrapper refuses a subcommand the tool never issues ──
+# The dep-age guard classifies literal npm lines and cannot see a command
+# forwarded through NPM_BIN, so a wrapper that passed any subcommand on would
+# give a fixture an install the tree guard never saw. The wrapper forwards the
+# subcommands scripts/promote-latest.sh issues through run_npm (`view` and
+# `dist-tag add`) and refuses every other before npm is invoked.
+bf_stub="$work/refusal-probe-npm"
+cat >"$bf_stub" <<'BF_STUB'
+#!/bin/bash
+printf 'argv:%s\n' "$*" >>"${BF_STUB_LOG:?}"
+exit 0
+BF_STUB
+chmod +x "$bf_stub"
+
+# <wrapper> <record file> <subcommand...> -> BF_RC, BF_ERR
+run_refusal_probe() {
+  local w="$1" log="$2"
+  shift 2
+  : >"$log"
+  BF_RC=0
+  BF_ERR="$(BF_STUB_LOG="$log" REAL_NPM_BIN="$bf_stub" "$w" "$@" 2>&1)" || BF_RC=$?
+}
+
+bf_log="$work/bf-records"
+for bf_sub in install ci; do
+  run_refusal_probe "$put_deadline_npm" "$bf_log" "$bf_sub"
+  if [ "$BF_RC" -ne 0 ]; then ok "BF wrapper refuses $bf_sub: non-zero exit" "rc $BF_RC"; else bad "BF wrapper refuses $bf_sub: non-zero exit" "exited 0"; fi
+  assert_contains "BF wrapper refuses $bf_sub: names the subcommand" "$BF_ERR" "refused subcommand: $bf_sub"
+  assert_eq "BF wrapper refuses $bf_sub: the stub recorded nothing" 0 "$(wc -l <"$bf_log" | tr -d ' ')"
+done
+# The allowed subcommands still reach the real client: a wrapper that refused
+# those too would break every timing case above.
+run_refusal_probe "$put_deadline_npm" "$bf_log" view '@tpsdev-ai/cli' version
+assert_eq "BF an allowed read is forwarded" "argv:view @tpsdev-ai/cli version" "$(cat "$bf_log")"
+NPM_PUT_DEADLINE_SECONDS=5 REAL_NPM_SUPERVISOR="$here/npm-supervisor.mjs" \
+  run_refusal_probe "$put_deadline_npm" "$bf_log" dist-tag add '@tpsdev-ai/cli@0.5.4' latest --registry http://127.0.0.1:1
+assert_eq "BF an allowed tag write is forwarded" "argv:dist-tag add @tpsdev-ai/cli@0.5.4 latest --registry http://127.0.0.1:1" "$(cat "$bf_log")"
+
+# BF mutation: forward every subcommand again; BF must catch it.
+bf_mut="$work/npm-put-deadline-forward-all"
+if awk '{ print } /^set -uo pipefail$/ { print "exec \"${REAL_NPM_BIN:?}\" \"$@\"" }' "$put_deadline_npm" >"$bf_mut"; then
+  chmod +x "$bf_mut"
+  run_refusal_probe "$bf_mut" "$bf_log" install --ignore-scripts
+  if [ "$BF_RC" -eq 0 ] && [ -s "$bf_log" ]; then
+    ok "BF mutation: forward-all wrapper caught" "mutant exited 0, stub saw [$(cat "$bf_log")]"
+  else
+    bad "BF mutation: forward-all wrapper caught" "mutant rc $BF_RC, stub log [$(cat "$bf_log")]"
+  fi
+else
+  bad "BF mutation: forward-all wrapper caught" "could not build the mutant wrapper"
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
