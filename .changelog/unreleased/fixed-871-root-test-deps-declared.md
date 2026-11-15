@@ -5,7 +5,10 @@
   `.jsx`, `.mjs` or `.cjs` file under `test/` or `scripts/` imports an
   undeclared package by a literal specifier, or loads one by a literal argument
   through a `createRequire(...)` result held in a variable or called directly,
-  `module.require` or `process.mainModule.require`.
+  `module.require` or `process.mainModule.require`. `require` and `mainModule`
+  may be written as a property access or as an element access with a
+  string-literal name (`module["require"]`), and a `createRequire(...)`
+  initializer may be parenthesised.
 
   These forms are not checked with a non-literal argument. A type-only import
   (`import type`) is removed before the scan and is not checked. A

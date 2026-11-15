@@ -286,6 +286,100 @@ describe("root imports are declared", () => {
 			]);
 		});
 
+		it("reports loader member access split by whitespace or a comment", () => {
+			expect(
+				undeclaredIn(
+					[
+						'const a = module . require("undeclared-module-require-spaced");',
+						'const b = module /* c */ . require("undeclared-module-require-comment");',
+						'const c = process.mainModule . require("undeclared-main-module-require-spaced");',
+						'const d = process.mainModule /* c */ .require("undeclared-main-module-require-comment");',
+						"void a; void b; void c; void d;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-module-require-spaced",
+					packageName: "undeclared-module-require-spaced",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-module-require-comment",
+					packageName: "undeclared-module-require-comment",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-main-module-require-spaced",
+					packageName: "undeclared-main-module-require-spaced",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-main-module-require-comment",
+					packageName: "undeclared-main-module-require-comment",
+				},
+			]);
+		});
+
+		it("reports a literal argument through computed member access", () => {
+			expect(
+				undeclaredIn(
+					[
+						// A plain call keeps the file past the prefilter, so this fixture pins
+						// the element-access parse rather than the prefilter.
+						'const t = module.require("undeclared-module-require-trigger");',
+						'const a = module["require"]("undeclared-module-require-computed");',
+						'const b = process.mainModule["require"]("undeclared-main-module-require-computed");',
+						'const c = process["mainModule"]["require"]("undeclared-both-computed");',
+						"void t; void a; void b; void c;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-module-require-trigger",
+					packageName: "undeclared-module-require-trigger",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-module-require-computed",
+					packageName: "undeclared-module-require-computed",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-main-module-require-computed",
+					packageName: "undeclared-main-module-require-computed",
+				},
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-both-computed",
+					packageName: "undeclared-both-computed",
+				},
+			]);
+		});
+
+		it("reports a literal argument to a function bound from a parenthesised createRequire", () => {
+			expect(
+				undeclaredIn(
+					[
+						'import { createRequire } from "node:module";',
+						"const load = (createRequire(import.meta.url));",
+						'const pkg = load("undeclared-create-require-parenthesised");',
+						"void pkg;",
+						"",
+					].join("\n"),
+				),
+			).toEqual([
+				{
+					file: "fixture.ts",
+					specifier: "undeclared-create-require-parenthesised",
+					packageName: "undeclared-create-require-parenthesised",
+				},
+			]);
+		});
+
 		it("does not report a module.require call in a comment, a string or a template literal", () => {
 			expect(
 				undeclaredIn(

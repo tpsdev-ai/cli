@@ -7,7 +7,9 @@
  * package loaded through a `createRequire(...)` result, `module.require` or
  * `process.mainModule.require` is reported from a TypeScript parse of the same
  * source when its first argument is a literal string; a non-literal argument is
- * not read.
+ * not read. `require` and `mainModule` may be written as a property access or as
+ * an element access with a string-literal name (`module["require"]`), and a
+ * `createRequire(...)` initializer may be parenthesised.
  *
  * A specifier with a `file:` or `data:` scheme is skipped before a package name
  * is read: Bun resolves those without a package.
@@ -114,23 +116,33 @@ function isCreateRequireCall(node) {
 	);
 }
 
-/** A call written `process.mainModule.require(...)`. */
+/**
+ * The name of an access written `.name` or `["name"]`, or null when `node` is
+ * neither or its element argument is not a string literal.
+ */
+function accessName(node) {
+	if (ts.isPropertyAccessExpression(node)) return node.name.text;
+	if (ts.isElementAccessExpression(node) && ts.isStringLiteral(node.argumentExpression)) {
+		return node.argumentExpression.text;
+	}
+	return null;
+}
+
+/** A call written `process.mainModule.require(...)`, however each access is spelled. */
 function isProcessMainModuleRequire(node) {
-	if (!ts.isPropertyAccessExpression(node) || node.name.text !== "require") return false;
+	if (accessName(node) !== "require") return false;
 	const target = node.expression;
 	return (
-		ts.isPropertyAccessExpression(target) &&
-		target.name.text === "mainModule" &&
+		accessName(target) === "mainModule" &&
 		ts.isIdentifier(target.expression) &&
 		target.expression.text === "process"
 	);
 }
 
-/** A call written `module.require(...)`. */
+/** A call written `module.require(...)`, however each access is spelled. */
 function isModuleRequire(node) {
 	return (
-		ts.isPropertyAccessExpression(node) &&
-		node.name.text === "require" &&
+		accessName(node) === "require" &&
 		ts.isIdentifier(node.expression) &&
 		node.expression.text === "module"
 	);
@@ -155,7 +167,9 @@ function literalArgument(node) {
  * @returns {string[]}
  */
 export function scanLoaderImports(file, source) {
-	if (!/createRequire|module\.require|mainModule\.require/.test(source)) return [];
+	// A prefilter only: it must match every form the parse below recognises, so
+	// it matches any `require` token rather than an exact spelling.
+	if (!/createRequire|\brequire\b/.test(source)) return [];
 	const sourceFile = ts.createSourceFile(
 		file,
 		source,
@@ -170,7 +184,7 @@ export function scanLoaderImports(file, source) {
 		if (
 			ts.isVariableDeclaration(node) &&
 			node.initializer !== undefined &&
-			isCreateRequireCall(node.initializer) &&
+			isCreateRequireCall(ts.skipParentheses(node.initializer)) &&
 			ts.isIdentifier(node.name)
 		) {
 			bound.add(node.name.text);
@@ -178,7 +192,7 @@ export function scanLoaderImports(file, source) {
 		if (
 			ts.isBinaryExpression(node) &&
 			node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
-			isCreateRequireCall(node.right) &&
+			isCreateRequireCall(ts.skipParentheses(node.right)) &&
 			ts.isIdentifier(node.left)
 		) {
 			bound.add(node.left.text);
@@ -191,7 +205,7 @@ export function scanLoaderImports(file, source) {
 		if (ts.isCallExpression(node)) {
 			const { expression } = node;
 			const isLoader =
-				isCreateRequireCall(expression) ||
+				isCreateRequireCall(ts.skipParentheses(expression)) ||
 				(ts.isIdentifier(expression) && bound.has(expression.text)) ||
 				isModuleRequire(expression) ||
 				isProcessMainModuleRequire(expression);
