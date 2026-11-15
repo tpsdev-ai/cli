@@ -288,7 +288,7 @@ describe("outbox", () => {
     expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(false);
   });
 
-  test("a file with an mtime more than OUTBOX_FUTURE_SKEW_MS in the future is treated as old and quarantined", () => {
+  test("a file with an mtime at least OUTBOX_FUTURE_SKEW_MS in the future is treated as old and quarantined", () => {
     const newDir = join(root, ".tps", "outbox", "new");
     const sentDir = join(root, ".tps", "outbox", "sent");
     mkdirSync(newDir, { recursive: true });
@@ -298,7 +298,7 @@ describe("outbox", () => {
     utimesSync(join(newDir, name), future, future);
     const errors = spyOn(console, "error").mockImplementation(() => {});
     try {
-      // A writer cannot hold a file young with an mtime more than OUTBOX_FUTURE_SKEW_MS ahead.
+      // A writer cannot hold a file young with an mtime at least OUTBOX_FUTURE_SKEW_MS ahead.
       const result = drainOutboxWithStats(false);
       expect(result.skippedYoung).toBe(0);
       expect(result.messages).toEqual([]);
@@ -308,6 +308,41 @@ describe("outbox", () => {
     expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(true);
     expect(existsSync(join(newDir, name))).toBe(false);
   });
+
+  // Both ends of the young window, pinned with a fake clock: the mtime is set
+  // from a fixed `now` and Date.now returns that same value, so the age the
+  // drain computes is exact and no test sleeps. The window is open at both
+  // ends: an mtime 1 s or more in the future is quarantined, and an age of at
+  // least the grace is quarantined.
+  for (const { label, offsetMs, young } of [
+    { label: `exactly OUTBOX_FUTURE_SKEW_MS (${OUTBOX_FUTURE_SKEW_MS}ms) in the future`, offsetMs: OUTBOX_FUTURE_SKEW_MS, young: false },
+    { label: `just inside OUTBOX_FUTURE_SKEW_MS (${OUTBOX_FUTURE_SKEW_MS - 1}ms in the future)`, offsetMs: OUTBOX_FUTURE_SKEW_MS - 1, young: true },
+    { label: `exactly OUTBOX_PARTIAL_GRACE_MS (${OUTBOX_PARTIAL_GRACE_MS}ms old)`, offsetMs: -OUTBOX_PARTIAL_GRACE_MS, young: false },
+    { label: `just inside OUTBOX_PARTIAL_GRACE_MS (${OUTBOX_PARTIAL_GRACE_MS - 1}ms old)`, offsetMs: -(OUTBOX_PARTIAL_GRACE_MS - 1), young: true },
+  ]) {
+    test(`an mtime ${label} is ${young ? "left in place" : "quarantined"}`, () => {
+      const newDir = join(root, ".tps", "outbox", "new");
+      const sentDir = join(root, ".tps", "outbox", "sent");
+      mkdirSync(newDir, { recursive: true });
+      const name = "2026-05-16-boundary.json";
+      const file = join(newDir, name);
+      writeFileSync(file, "{", "utf-8");
+      const now = 1_700_000_000_000;
+      const clock = spyOn(Date, "now").mockReturnValue(now);
+      utimesSync(file, new Date(now + offsetMs), new Date(now + offsetMs));
+      const errors = spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const result = drainOutboxWithStats(false);
+        expect(result.messages).toEqual([]);
+        expect(result.skippedYoung).toBe(young ? 1 : 0);
+      } finally {
+        errors.mockRestore();
+        clock.mockRestore();
+      }
+      expect(existsSync(file)).toBe(young);
+      expect(existsSync(join(sentDir, `.malformed-${name}`))).toBe(!young);
+    });
+  }
 
   test("a real timer runs the retry once after the delay, and cancel() suppresses it", async () => {
     const scheduler = new OutboxYoungRetryScheduler(undefined, undefined, 20);
