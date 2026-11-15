@@ -202,7 +202,12 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     ).rejects.toBe(value);
   });
 
-  test.each([undefined, 0])("preserves thrown %p before the cleanup failure", async (value) => {
+  test.each([
+    [undefined, undefined],
+    [0, undefined],
+    [undefined, "heartbeat also failed"],
+    [0, "heartbeat also failed"],
+  ])("preserves thrown %p before the cleanup failure with label %p", async (value, failureLabel) => {
     const cleanup = new Error("cleanup failed");
     let reported: unknown;
     try {
@@ -213,6 +218,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
         async () => {
           throw cleanup;
         },
+        failureLabel,
       );
     } catch (error) {
       reported = error;
@@ -220,6 +226,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     expect(reported).toBeInstanceOf(AggregateError);
     const aggregate = reported as AggregateError;
     expect(aggregate.message.split("\n")[0]).toBe(String(value));
+    expect(aggregate.message).toBe(`${String(value)}\n${failureLabel ?? "cleanup also failed"}: ${cleanup.message}`);
     expect(aggregate.errors).toHaveLength(2);
     expect(aggregate.errors[0]).toBe(value);
     expect(aggregate.errors[1]).toBe(cleanup);
@@ -489,7 +496,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       chmodSync(join(stubs, "npm"), 0o755);
       const home = join(root, "home");
       mkdirSync(home);
-      const env = { PATH: `${stubs}:/usr/local/bin:/usr/bin:/bin`, HOME: home };
+      const env = { PATH: `${stubs}:${process.env.PATH ?? ""}`, HOME: home };
       const throwaway = join(root, "throwaway");
       const binDir = installOpenClaw(throwaway, { repo, pathEnv: stubs, env });
       expect(binDir).toBe(join(throwaway, "openclaw", "node_modules", ".bin"));

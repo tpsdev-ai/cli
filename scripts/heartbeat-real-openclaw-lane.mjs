@@ -375,7 +375,7 @@ function formatThrownValue(value) {
 /**
  * Run `action`, then `cleanup`; preserve thrown values, action first.
  */
-export async function finishWithCleanup(action, cleanup) {
+export async function finishWithCleanup(action, cleanup, failureLabel = "cleanup also failed") {
   let actionFailed = false;
   let failure;
   try {
@@ -388,7 +388,7 @@ export async function finishWithCleanup(action, cleanup) {
     await cleanup();
   } catch (error) {
     if (!actionFailed) throw error;
-    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\ncleanup also failed: ${formatThrownValue(error)}`);
+    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\n${failureLabel}: ${formatThrownValue(error)}`);
   }
   if (actionFailed) throw failure;
 }
@@ -458,6 +458,7 @@ export async function runLiveCase(root, binDir, options = {}) {
             async () => assertGatewayAnswersAfterHeartbeat(testCase, port, binDir, logPath, options),
           ),
         async () => assertLiveHeartbeatResult(result, testCase),
+        "heartbeat also failed",
       );
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
