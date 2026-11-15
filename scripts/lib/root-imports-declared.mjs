@@ -120,7 +120,8 @@ function unwrap(node) {
 
 /**
  * The name an identifier reads, with any parentheses around it removed, or null
- * when the node is not an identifier. Every name this module compares goes
+ * when the node is not an identifier. The createRequire name, the module and
+ * process roots, a bound loader name and an assignment's left side are read
  * through here, so a parenthesised expression is read like the bare one.
  * A binding name (`const r = ...`) is an identifier too; a binding pattern is
  * not, and returns null.
