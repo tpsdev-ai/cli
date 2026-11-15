@@ -43,8 +43,11 @@ if (!npmAvailable) {
     "dep-age hermetic npm lane: skipped — npm is not on PATH (the Docker Integration image ships no npm)",
   );
 }
-if (npmAvailable && process.env.TPS_TEST_REQUIRE_NPM === "1" && Bun.which("tar") === null) {
-  throw new Error("the Unit & Integration lane requires tar on PATH to unpack the bundle fixtures");
+if (process.env.TPS_TEST_REQUIRE_NPM === "1") {
+  if (!npmAvailable) throw new Error("the Unit & Integration lane requires npm on PATH");
+  if (Bun.which("tar") === null) {
+    throw new Error("the Unit & Integration lane requires tar on PATH to unpack the bundle fixtures");
+  }
 }
 
 /** The npm and Arborist actually used, from npm's own install. */
@@ -313,7 +316,7 @@ function entry(project: Project, path: string): Record<string, unknown> {
   return value;
 }
 
-describe("the release-age gate and a real npm installer on the same lock", () => {
+describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on the same lock", () => {
   it.each([
     {
       label: "name",
@@ -549,7 +552,6 @@ describe("the release-age gate and a real npm installer on the same lock", () =>
       const registry = startRegistry([{ ...depVersionless, time: { "1.0.0": OLD } }]);
       try {
         const project = await lockProject(root, registry, { dependencies: { "dep-versionless": "^1.0.0" } });
-        // npm always records a version; delete both fields to exercise the gate's refusal.
         const locked = project.lock.packages?.["node_modules/dep-versionless"];
         if (locked === undefined) throw new Error("no dep-versionless entry in the lock");
         delete locked.version;
