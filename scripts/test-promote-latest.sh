@@ -2685,8 +2685,8 @@ for bf_sub in install ci; do
   assert_contains "BF wrapper refuses $bf_sub: names the subcommand" "$BF_ERR" "refused subcommand: $bf_sub"
   assert_eq "BF wrapper refuses $bf_sub: the stub recorded nothing" 0 "$(wc -l <"$bf_log" | tr -d ' ')"
 done
-# The allowed subcommands still reach the real client: a wrapper that refused
-# those too would break every timing case above.
+# The allowed subcommands still reach the client they name: a wrapper that
+# refused those too would break the timing cases above.
 run_refusal_probe "$put_deadline_npm" "$bf_log" view '@tpsdev-ai/cli' version
 assert_eq "BF an allowed read is forwarded" "argv:view @tpsdev-ai/cli version" "$(cat "$bf_log")"
 NPM_PUT_DEADLINE_SECONDS=5 REAL_NPM_SUPERVISOR="$here/npm-supervisor.mjs" \
