@@ -1,0 +1,1 @@
+- **Relay cleanup retains its connection record path** Relay cleanup uses the captured path and connection ID, and a connection refreshes a record only while it still owns it.
