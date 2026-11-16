@@ -326,6 +326,31 @@ describe("root imports are declared", () => {
 		// reports. The generated-parentheses case below runs over this whole set.
 		const LOADER_FIXTURES: { name: string; source: string; specifiers: string[] }[] = [
 			{
+				name: "a loader bound by an object binding-pattern shorthand default",
+				source: 'const { load = createRequire(import.meta.url) } = {}; load("undeclared-a");',
+				specifiers: ["undeclared-a"],
+			},
+			{
+				name: "a loader bound by a renamed object binding-pattern default",
+				source: 'const { load: l = createRequire(import.meta.url) } = {}; l("undeclared-b");',
+				specifiers: ["undeclared-b"],
+			},
+			{
+				name: "a loader bound by an object assignment-pattern shorthand default",
+				source: 'let load; ({ load = createRequire(import.meta.url) } = {}); load("undeclared-c");',
+				specifiers: ["undeclared-c"],
+			},
+			{
+				name: "a loader bound by a renamed object assignment-pattern default",
+				source: 'let l; ({ load: l = createRequire(import.meta.url) } = {}); l("undeclared-d");',
+				specifiers: ["undeclared-d"],
+			},
+			{
+				name: "a loader bound by an array assignment-pattern default",
+				source: 'let load; [load = createRequire(import.meta.url)] = []; load("undeclared-e");',
+				specifiers: ["undeclared-e"],
+			},
+			{
 				name: "as assertions around loader expressions",
 				source: [
 					'const load = createRequire(import.meta.url) as (id: string) => unknown; load("u-as-assertion");',

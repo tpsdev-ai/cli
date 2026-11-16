@@ -20,8 +20,8 @@
  * expressions are skipped around callees, initializers, assignment operands,
  * member-access objects, literal keys and literal arguments.
  * Local declarations are treated as shadowing `module` and `process`, including
- * a `var` re-declaration of the CommonJS wrapper parameter and an ambient
- * `declare const module`, which do not shadow it at runtime.
+ * `var module`, `declare const module`, `declare const process` and
+ * `import process from "node:process"`, even when they bind the runtime receiver.
  * An argument is read only when it is a literal string (or a template literal
  * with no substitutions); any other form
  * is not checked, for example a dynamic key, `module.createRequire`, a loader
@@ -45,7 +45,7 @@
  * Bun's TypeScript loader removes before the scan; `require.resolve("pkg")`;
  * packages imported only from outside test/ and scripts/, and whether a declared
  * range resolves for a published consumer.
- * Not checked: assignments to undeclared names; aliased `createRequire` imports.
+ * Not checked: assignments to undeclared names; aliased `createRequire` imports; local `createRequire` shadowing (a parameter or declaration with that name is treated as the `node:module` factory).
  * `listSourceFiles` lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files, skips
  * `node_modules`, and does not descend into a directory reached through a
  * symlink, so JavaScript inside shell scripts or built in template strings, and
@@ -253,6 +253,22 @@ export function scanLoaderImports(file, source) {
 			isCreateRequireCall(unwrap(node.initializer))
 		) {
 			bound.add(declared);
+		}
+		if (
+			ts.isBindingElement(node) &&
+			node.initializer !== undefined &&
+			isCreateRequireCall(unwrap(node.initializer))
+		) {
+			const binding = symbolAt(node.name);
+			if (binding !== undefined) bound.add(binding);
+		}
+		if (
+			ts.isShorthandPropertyAssignment(node) &&
+			node.objectAssignmentInitializer !== undefined &&
+			isCreateRequireCall(unwrap(node.objectAssignmentInitializer))
+		) {
+			const assigned = checker.getShorthandAssignmentValueSymbol(node);
+			if (assigned !== undefined) bound.add(assigned);
 		}
 		if (
 			ts.isBinaryExpression(node) &&
