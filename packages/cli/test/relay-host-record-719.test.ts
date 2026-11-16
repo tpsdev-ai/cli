@@ -453,7 +453,7 @@ test.each(["live", "unverifiable", "stop"])("inbound persistence under contentio
 test("an inbound refresh whose self token cannot be read keeps retrying and reports the transition once", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-self-token-779-"));
   const savedEnv = savedRelayEnv();
-  const ownToken = processStartToken(process.pid);
+  const ownToken = processStartToken(process.pid) ?? "test:self";
   let token: string | null = ownToken;
   let stop: (() => Promise<void>) | undefined;
   let handler: Parameters<TransportChannel["onMessage"]>[0] | undefined;
@@ -476,6 +476,7 @@ test("an inbound refresh whose self token cannot be read keeps retrying and repo
     expect(handler).toBeDefined();
     await Bun.sleep(20);
     const path = hostStatePath(branch);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), startToken: ownToken }));
     const before = JSON.parse(readFileSync(path, "utf8"));
     token = null;
     diagnostic.mockClear();
