@@ -319,6 +319,48 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
   }
 }
 
+/** The exact name updateExistingRecord writes beside a record it replaces. */
+const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+const SWEEP_INTERVAL = 10 * 60 * 1000;
+const lastAckScratchSweep = new Map<string, number>();
+export const mailAckScratchTestHooks: { now?: () => number } = {};
+
+/**
+ * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
+ * lock, and removes it before releasing that lock. So any such name found in
+ * `dir` by code that holds the same lock is a leftover from a writer that died
+ * between creating the scratch and renaming it. Remove it, and report each
+ * attempt; a name that is not this exact shape is never touched.
+ *
+ * Sweep at most once per directory per process every ten minutes, so a bulk
+ * drain does not list the directory on every ack. A leftover has no live
+ * writer, so collecting it on a later pass is enough.
+ */
+function removeLeftoverAckScratch(dir: string): void {
+  dir = resolve(dir);
+  const now = (mailAckScratchTestHooks.now ?? Date.now)();
+  const lastSweep = lastAckScratchSweep.get(dir);
+  if (lastSweep !== undefined && now - lastSweep < SWEEP_INTERVAL) return;
+  lastAckScratchSweep.set(dir, now);
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    if (!ACK_SCRATCH_RE.test(name)) continue;
+    const scratchPath = join(dir, name);
+    try {
+      rmSync(scratchPath, { force: true });
+      console.warn(`[mail] removed leftover ack scratch ${scratchPath}`);
+    } catch (err: any) {
+      console.warn(`[mail] could not remove leftover ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);
+    }
+  }
+}
+
 export function updateExistingRecord<T extends object>(
   path: string,
   mutate: (record: T) => T | null,
@@ -346,6 +388,7 @@ export function updateExistingRecord<T extends object>(
     if (options.nonBlocking) return { status: "busy" };
     throw Object.assign(new Error(`mail lock contention timeout for ${path}`), { path: mailLockPath(root) });
   }
+  removeLeftoverAckScratch(dirname(path));
   const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
@@ -383,7 +426,11 @@ export function updateExistingRecord<T extends object>(
     throw err;
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch {} }
-    try { rmSync(scratchPath, { force: true }); } catch {}
+    try {
+      rmSync(scratchPath, { force: true });
+    } catch (err: any) {
+      console.warn(`[mail] could not remove ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);
+    }
     relayLock?.release();
     lock.release();
   }
