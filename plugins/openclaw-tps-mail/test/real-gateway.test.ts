@@ -23,10 +23,11 @@
  */
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -48,6 +49,7 @@ type Report = {
   replyTo?: string;
   replyHeaders?: Record<string, string> | null;
   curFiles: string[];
+  curEntries: CurEntry[];
   curRecord: { id?: string; ackedAt?: unknown } | null;
   obligationRecord: { state?: string } | null;
   inboundNewFiles: string[];
@@ -57,6 +59,34 @@ type Report = {
   logs: string[];
   logTail?: string[];
 };
+
+type CurEntry = { name: string; size: number };
+
+/** Every cur/ entry the driver saw, with its size: names, never just a count. */
+function describeCurEntries(entries: CurEntry[]): string {
+  if (entries.length === 0) return "no entries";
+  return entries.map((entry) => `${entry.name} (${entry.size} bytes)`).join(", ");
+}
+
+/**
+ * Exactly one INBOUND MESSAGE in cur/, counted by the mailbox's own name rule.
+ *
+ * The ack path replaces the cur/ record atomically: updateExistingRecord writes
+ * a hidden `.ack-<uuid>.tmp` scratch in the SAME directory, fsyncs it and
+ * renames it over the record. A listing taken during that window sees the
+ * record and the transient scratch; the scratch is not a mail message (its
+ * name starts with a dot), so it is reported but not counted. A second
+ * inbound message file still fails.
+ */
+function expectOneInbound(entries: CurEntry[], inboundId: string): void {
+  const messages = entries.filter((entry) => isMailboxMessageFile(entry.name));
+  if (messages.length !== 1) {
+    throw new Error(
+      `expected 1 inbound message in cur/, found ${messages.length}; cur/ entries: ${describeCurEntries(entries)}`,
+    );
+  }
+  expect(messages[0]?.name).toContain(inboundId);
+}
 
 function runDriver(): { status: number | null; stdout: string; stderr: string; report: Report | null; root: string } {
   const root = mkdtempSync(join(tmpdir(), "tps-real-gateway-"));
@@ -100,8 +130,7 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       expect(r.replyFrom).toBe("agent-a");
       expect(r.replyTo).toBe("agent-b");
       expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
-      expect(r.curFiles).toHaveLength(1);
-      expect(r.curFiles[0]).toContain(r.inboundId!);
+      expectOneInbound(r.curEntries, r.inboundId!);
       expect(r.replyCountAfterAck).toBe(1);
       expect(r.replyCountAfterStop).toBe(1);
       expect(r.inboundNewFiles).toEqual([]);
@@ -116,4 +145,41 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 130_000);
+});
+
+describe("cli#1020 — the cur/ assertion reports what it found", () => {
+  function entriesIn(dir: string): CurEntry[] {
+    return readdirSync(dir).map((name) => ({ name, size: statSync(join(dir, name)).size }));
+  }
+
+  it("names every entry when cur/ holds two inbound messages", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-cur-entries-"));
+    try {
+      writeFileSync(join(dir, "2026-01-01T00-00-00-000Z-msg-one.json"), "{\"id\":\"msg-one\"}");
+      writeFileSync(join(dir, "2026-01-01T00-00-00-001Z-msg-two.json"), "{\"id\":\"msg-two\"}");
+      const entries = entriesIn(dir);
+      let message = "";
+      try {
+        expectOneInbound(entries, "msg-one");
+      } catch (err) {
+        message = String((err as Error).message);
+      }
+      expect(message).toContain("found 2");
+      expect(message).toContain("msg-one.json");
+      expect(message).toContain("msg-two.json");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports, but does not count, the ack stamp's transient scratch", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-cur-scratch-"));
+    try {
+      writeFileSync(join(dir, "2026-01-01T00-00-00-000Z-msg-one.json"), "{\"id\":\"msg-one\"}");
+      writeFileSync(join(dir, ".ack-3f2b.tmp"), "{}");
+      expectOneInbound(entriesIn(dir), "msg-one");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });

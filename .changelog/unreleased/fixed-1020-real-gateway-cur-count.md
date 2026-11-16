@@ -1,0 +1,1 @@
+- **The real-gateway cur/ check counts inbound messages and names every entry it finds.** A listing taken during the ack's atomic record replace can see its transient hidden scratch file; the test now reports every name and size and counts inbound messages.

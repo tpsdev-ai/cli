@@ -15,7 +15,8 @@
  *      one signed mail into the agent's tmp/ then renames it into new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
  *      the ack, re-reads the reply count after the ack and again after the
- *      gateway stops, reads the cur/ record and the obligation record, then
+ *      gateway stops, reads every cur/ entry (name and size), the cur/ record
+ *      and the obligation record, then
  *      writes a JSON report for the Bun test that spawned it.
  *
  * Every HTTP target the driver creates is 127.0.0.1, and every model and
@@ -28,7 +29,7 @@ import { spawn } from "node:child_process";
 import { createHash, createPrivateKey, createPublicKey } from "node:crypto";
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
@@ -73,6 +74,7 @@ const report = {
   replyBody: null,
   replyHeaders: null,
   curFiles: [],
+  curEntries: [],
   curRecord: null,
   obligationRecord: null,
   inboundNewFiles: [],
@@ -389,8 +391,19 @@ try {
     report.replyHeaders = reply.headers ?? null;
   }
 
-  await until(() => readdirSync(join(MAIL, "agent-a", "cur")).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
-  report.curFiles = readdirSync(join(MAIL, "agent-a", "cur"));
+  const curDir = join(MAIL, "agent-a", "cur");
+  await until(() => readdirSync(curDir).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
+  // Snapshot every directory entry with its size: a name alone cannot answer
+  // what an unexpected entry is. A name that vanishes between the listing and
+  // the stat is still recorded (size -1) — that is the fact worth reporting.
+  report.curEntries = readdirSync(curDir).map((name) => {
+    try {
+      return { name, size: statSync(join(curDir, name)).size };
+    } catch {
+      return { name, size: -1 };
+    }
+  });
+  report.curFiles = report.curEntries.map((entry) => entry.name);
 
   try {
     await until(
@@ -426,8 +439,10 @@ try {
   if (stopped) {
     report.replyCountAfterStop = replyFilesOnDisk().length;
     report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
-    if (report.curFiles.length > 0) {
-      report.curRecord = readJson(join(MAIL, "agent-a", "cur", report.curFiles[0]), "cur record");
+    const inboundCur = report.curFiles.find((name) => report.inboundId && name.includes(report.inboundId));
+    const curRecordName = inboundCur ?? report.curFiles[0];
+    if (curRecordName) {
+      report.curRecord = readJson(join(MAIL, "agent-a", "cur", curRecordName), "cur record");
     }
     if (report.inboundId) {
       report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
