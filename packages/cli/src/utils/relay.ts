@@ -16,7 +16,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type HostStateReadHooks, type HostStateRefreshOutcome, type ServiceHealth } from "./connection-state.js";
+import { claimHostStateAt, clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type HostStateReadHooks, type HostStateRefreshOutcome, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1438,6 +1438,34 @@ function hostStateRefreshReporter(recordPath: string): (outcome: HostStateRefres
   };
 }
 
+/** Report a reconnect's claim outcome when it left the record alone: one line
+ *  per reconnect, naming the record path and the reason, never its contents. */
+function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshOutcome) => void {
+  return (outcome) => {
+    let reason: string;
+    switch (outcome.kind) {
+      case "written":
+      case "stopped":
+      case "absent":
+        // `claimHostStateAt` writes an absent record, so there is nothing to report.
+        return;
+      case "other":
+        reason = "the record belongs to another connection";
+        break;
+      case "unverifiable":
+        reason = "this process's start token could not be read";
+        break;
+      case "invalid":
+        reason = "the record is not a valid host state record";
+        break;
+      case "unreadable":
+        reason = outcome.reason;
+        break;
+    }
+    console.error(`[relay] Host state record ${recordPath} not claimed on reconnect: ${reason}, so it was left as it is; the connection continues`);
+  };
+}
+
 async function probeServiceHealth(): Promise<ServiceHealth[]> {
   const services = listServices();
   const results: ServiceHealth[] = [];
@@ -1461,8 +1489,13 @@ export async function connectAndKeepAlive(
   const recordPath = hostStatePath(branchId);
   const connectionId = randomUUID();
   const reportRefresh = hostStateRefreshReporter(recordPath);
+  const reportClaimSkip = hostStateClaimReporter(recordPath);
   let stopped = false;
   let reconnectCount = 0;
+  // Set once this connection's initial claim has returned, whether it wrote or
+  // the stop gate skipped it. A live connection's first claim replaces whatever
+  // record is there; every later claim runs the ownership rule.
+  let claimedRecord = false;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
   let pendingChannelClose: Promise<void> | null = null;
@@ -1596,10 +1629,19 @@ export async function connectAndKeepAlive(
           startToken: processStartToken(process.pid),
         };
         // stop() sets stopped before clearing; both gates are checked under the lock.
-        // The initial establishment write is the only write that may claim the
-        // record path; every later write is ownership-checked against it, so a
-        // connection whose record was replaced leaves the replacement intact.
-        const claim = () => writeHostStateAt(recordPath, state, () => !stopped);
+        // The initial claim of a live connection replaces whatever record is
+        // there. A later claim (a reconnect) re-establishes the record only when
+        // it is absent or this connection's own, so a connection whose record
+        // was replaced leaves the replacement intact. `claimedRecord` tells the
+        // two apart.
+        const claim = () => {
+          if (!claimedRecord) {
+            writeHostStateAt(recordPath, state, () => !stopped);
+            claimedRecord = true;
+            return;
+          }
+          reportClaimSkip(claimHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks));
+        };
         const persist = () => {
           const outcome = refreshOwnedHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks);
           reportRefresh(outcome);

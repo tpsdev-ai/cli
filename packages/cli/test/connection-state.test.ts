@@ -7,6 +7,7 @@ import {
   writeHostState,
   clearHostState,
   clearHostStateAt,
+  claimHostStateAt,
   refreshOwnedHostStateAt,
   hostStatePath,
   hostStateLockRoot,
@@ -136,6 +137,54 @@ describe("connection-state", () => {
     mkdirSync(path, { recursive: true });
     refreshOwnedHostStateAt(path, completeState(), "conn-a");
     expect(statSync(path).isDirectory()).toBe(true);
+  });
+
+  test("claimHostStateAt writes an absent record", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-absent-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a" }, "conn-a");
+    expect(outcome).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.connectionId).toBe("conn-a");
+  });
+
+  test("claimHostStateAt writes the record it owns", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-own-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a" });
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "ack" }, "conn-a");
+    expect(outcome).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("ack");
+  });
+
+  test("claimHostStateAt leaves another connection's record untouched", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-other-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a");
+    expect(outcome).toEqual({ kind: "other" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test("claimHostStateAt reports unverifiable and leaves the record when this process's token cannot be read", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-unverifiable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => null },
+    );
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
   });
 
   test("refreshOwnedHostStateAt writes the record it owns", () => {

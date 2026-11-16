@@ -556,7 +556,7 @@ test.each([false, true])("an inbound write stops retrying for another connection
     // Restore our record; a pending retry would write the inbound update here.
     writeFileSync(path, original);
     await Bun.sleep(300);
-    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(before);
+    expect(readFileSync(path)).toEqual(original);
   } finally {
     token = ownToken;
     await stop?.();
@@ -720,3 +720,90 @@ for (const kind of ["refresh", "inbound"] as const) {
     }
   }, 30_000);
 }
+
+test("a reconnect leaves another connection's host record in place and that connection's refresh still writes", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-claim-1023-"));
+  const savedEnv = savedRelayEnv();
+  const stops: Array<() => Promise<void>> = [];
+  type ChannelState = {
+    attached: boolean;
+    detached: boolean;
+    alive: boolean;
+    handler?: Parameters<TransportChannel["onMessage"]>[0];
+  };
+  const channels: ChannelState[] = [];
+  let attempts = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    attempts++;
+    const state: ChannelState = { attached: false, detached: false, alive: true };
+    channels.push(state);
+    return {
+      async send() {},
+      onMessage(callback) { state.attached = true; state.handler = callback; },
+      offMessage() { state.detached = true; },
+      async close() { state.alive = false; },
+      isAlive() { return state.alive; },
+      peerFingerprint() { return "remote"; },
+    };
+  });
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    const record = () => JSON.parse(readFileSync(path, "utf8"));
+    const start = async () => {
+      stops.push(await connectAndKeepAlive(branch));
+      for (let i = 0; i < 400 && !channels.at(-1)?.attached; i++) await Bun.sleep(5);
+      expect(channels.at(-1)?.attached).toBe(true);
+      return channels.at(-1)!;
+    };
+    const a = await start();
+    for (let i = 0; i < 400 && !existsSync(path); i++) await Bun.sleep(5);
+    const aId = record().connectionId;
+    expect(aId).toEqual(expect.any(String));
+    const b = await start();
+    for (let i = 0; i < 400 && record().connectionId === aId; i++) await Bun.sleep(5);
+    const bId = record().connectionId;
+    expect(bId).not.toBe(aId);
+    // Let B's own post-connect writes settle so the bytes below are its record at rest.
+    for (let i = 0; i < 400; i++) {
+      const state = record();
+      if (state.connectionId === bId && Array.isArray(state.services)) break;
+      await Bun.sleep(5);
+    }
+    const bBytes = readFileSync(path);
+
+    // A's channel drops. A's reconnect claim must leave B's record alone.
+    a.alive = false;
+    for (let i = 0; attempts < 3 && i < 1500; i++) await Bun.sleep(10);
+    expect(attempts).toBe(3);
+    for (let i = 0; i < 400 && !channels[2]!.attached; i++) await Bun.sleep(5);
+    expect(channels[2]!.attached).toBe(true);
+    expect(record().connectionId).toBe(bId);
+    expect(readFileSync(path)).toEqual(bBytes);
+
+    // A's stop removes only a record A owns: B's record survives.
+    await stops[0]!();
+    expect(record().connectionId).toBe(bId);
+    expect(readFileSync(path)).toEqual(bBytes);
+
+    // B's refresh still finds its own record and writes it.
+    const before = record();
+    b.handler!({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
+    for (let i = 0; i < 400; i++) {
+      if (record().messagesReceived === before.messagesReceived + 1) break;
+      await Bun.sleep(5);
+    }
+    const after = record();
+    expect(after.connectionId).toBe(bId);
+    expect(after.messagesReceived).toBe(before.messagesReceived + 1);
+  } finally {
+    try {
+      for (const stop of stops) await stop();
+      for (let i = 0; i < 400 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+    } finally {
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);

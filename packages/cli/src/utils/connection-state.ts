@@ -293,6 +293,26 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
   }, timeoutMs);
 }
 
+/**
+ * Claim a record for a connection that has established before. Under the
+ * record lock the record is read and written when the optional `shouldWrite`
+ * gate holds and the record is absent or owned by this connection; another
+ * connection's record, and an invalid, unreadable or unverifiable one, are
+ * left as they are. The absent case differs from a refresh: a reconnect may
+ * re-establish a record that was removed, but never replace one another
+ * connection owns.
+ */
+export function claimHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS, hooks?: HostStateReadHooks): HostStateRefreshOutcome {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withHostStateRecordLock(path, "write the host state record", (): HostStateRefreshOutcome => {
+    if (shouldWrite !== undefined && !shouldWrite()) return { kind: "stopped" };
+    const ownership = hostRecordOwnership(path, state.branch, connectionId, hooks?.startToken);
+    if (ownership.kind !== "absent" && ownership.kind !== "owned") return ownership;
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
+    return { kind: "written" };
+  }, timeoutMs);
+}
+
 /** "same" for the same PID, and the same start token when one is present;
  *  "unverifiable" when the record carries a token this process cannot read. */
 function selfIdentity(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): "same" | "other" | "unverifiable" {

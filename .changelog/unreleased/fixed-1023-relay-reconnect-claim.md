@@ -1,0 +1,1 @@
+- **A relay reconnect no longer takes over another connection's host state record.** The first claim of a connection still writes the record; a later claim writes only when the record is absent or carries this connection's own id, leaves another connection's record or an invalid, unreadable or unverifiable one as it is, and reports the skipped claim in one diagnostic line.
