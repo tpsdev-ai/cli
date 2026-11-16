@@ -13,7 +13,8 @@
  *     property written as a dot access or as an element access with a
  *     string-literal key (`module["require"]`);
  *   - a name bound to a `createRequire(...)` result by a variable declaration
- *     or a direct assignment, and a direct `createRequire(...)("x")` call.
+ *     or a direct assignment to a resolved binding, and a direct
+ *     `createRequire(...)("x")` call.
  *
  * Parentheses are allowed around a callee and around a member-access object:
  * `(module.require)("x")`, `(module).require("x")` and `(r)("x")` for a bound
@@ -21,7 +22,7 @@
  * literal string (or a template literal with no substitutions); any other form
  * is not checked, for example a dynamic key, `module.createRequire`, a loader
  * reached through another expression or invoked with `.call`/`.apply`, or a
- * non-literal argument.
+ * non-literal argument. Reassignments away from a loader are not tracked.
  *
  * A specifier with a `file:` or `data:` scheme is skipped before a package name
  * is read: Bun resolves those without a package.
@@ -118,14 +119,7 @@ function unwrap(node) {
 	return ts.skipParentheses(node);
 }
 
-/**
- * The name an identifier reads, with any parentheses around it removed, or null
- * when the node is not an identifier. The createRequire name, the module and
- * process roots, a bound loader name and an assignment's left side are read
- * through here, so a parenthesised expression is read like the bare one.
- * A binding name (`const r = ...`) is an identifier too; a binding pattern is
- * not, and returns null.
- */
+/** An identifier's name after unwrapping parentheses, or null. */
 function identifierText(node) {
 	const expression = unwrap(node);
 	return ts.isIdentifier(expression) ? expression.text : null;
@@ -191,13 +185,20 @@ export function scanLoaderImports(file, source) {
 		true,
 		scriptKindFor(file),
 	);
-	// Names holding a `createRequire(...)` result. This is not scope-aware: the
-	// name is treated as a loader for the whole file.
+	const options = { noResolve: true, noLib: true, allowJs: true, types: [] };
+	const host = ts.createCompilerHost(options);
+	host.getSourceFile = (name) => (name === file ? sourceFile : undefined);
+	const checker = ts.createProgram([file], options, host).getTypeChecker();
+	const symbolAt = (node) => {
+		const identifier = unwrap(node);
+		return ts.isIdentifier(identifier) ? checker.getSymbolAtLocation(identifier) : undefined;
+	};
+	// Match the loader's binding symbol so intervening declarations shadow it.
 	const bound = new Set();
 	const bind = (node) => {
-		const declared = ts.isVariableDeclaration(node) ? identifierText(node.name) : null;
+		const declared = ts.isVariableDeclaration(node) ? symbolAt(node.name) : undefined;
 		if (
-			declared !== null &&
+			declared !== undefined &&
 			node.initializer !== undefined &&
 			isCreateRequireCall(ts.skipParentheses(node.initializer))
 		) {
@@ -208,8 +209,8 @@ export function scanLoaderImports(file, source) {
 			node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
 			isCreateRequireCall(ts.skipParentheses(node.right))
 		) {
-			const assigned = identifierText(node.left);
-			if (assigned !== null) bound.add(assigned);
+			const assigned = symbolAt(node.left);
+			if (assigned !== undefined) bound.add(assigned);
 		}
 		ts.forEachChild(node, bind);
 	};
@@ -218,10 +219,10 @@ export function scanLoaderImports(file, source) {
 	const collect = (node) => {
 		if (ts.isCallExpression(node)) {
 			const callee = unwrap(node.expression);
-			const calleeName = identifierText(callee);
+			const calleeSymbol = symbolAt(callee);
 			const isLoader =
 				isCreateRequireCall(callee) ||
-				(calleeName !== null && bound.has(calleeName)) ||
+				(calleeSymbol !== undefined && bound.has(calleeSymbol)) ||
 				isModuleRequire(callee) ||
 				isProcessMainModuleRequire(callee);
 			if (isLoader) {

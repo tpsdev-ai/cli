@@ -459,6 +459,80 @@ describe("root imports are declared", () => {
 			});
 		}
 
+		const SHADOW_FIXTURES = [
+			{
+				name: "a parameter",
+				body: 'function render(load) { return load("display-label"); }',
+			},
+			{
+				name: "a nested const",
+				body: '{ const load = (label) => label; load("display-label"); }',
+			},
+			{
+				name: "a catch binding",
+				body: 'try {} catch (load) { load("display-label"); }',
+			},
+			{
+				name: "an inner function declaration",
+				body: 'function render() { load("display-label"); function load(label) { return label; } }',
+			},
+			{
+				name: "a hoisted var",
+				body: 'function render() { load("display-label"); var load = (label) => label; }',
+			},
+			{
+				name: "a nested let",
+				body: '{ let load = (label) => label; load("display-label"); }',
+			},
+			{
+				name: "a class declaration",
+				body: 'function render() { class load {} load("display-label"); }',
+			},
+			{
+				name: "an enclosing import",
+				body: 'import { load } from "node:module"; function render() { load("display-label"); }',
+				binding: 'function setup() { const load = createRequire(import.meta.url); }',
+			},
+		];
+
+		for (const fixture of SHADOW_FIXTURES) {
+			it(`does not report a loader name shadowed by ${fixture.name}`, () => {
+				expect(
+					undeclaredIn(
+						[
+							'import { createRequire } from "node:module";',
+							fixture.binding ?? "const load = createRequire(import.meta.url);",
+							fixture.body,
+						].join("\n"),
+					),
+				).toEqual([]);
+			});
+		}
+
+		it("reports an outer loader used in a nested scope without shadowing", () => {
+			expect(
+				undeclaredIn(
+					[
+						"const load = createRequire(import.meta.url);",
+						'function render() { return (load)("undeclared-nested-loader"); }',
+					].join("\n"),
+				),
+			).toEqual([reportEntry("undeclared-nested-loader")]);
+		});
+
+		it("binds an assignment to its resolved symbol", () => {
+			expect(
+				undeclaredIn(
+					[
+						"let load;",
+						"function setup() { (load) = createRequire(import.meta.url); }",
+						'function render(load) { return load("display-label"); }',
+						'load("undeclared-assigned-outer-loader");',
+					].join("\n"),
+				),
+			).toEqual([reportEntry("undeclared-assigned-outer-loader")]);
+		});
+
 		it("reports the same specifiers with every expression-position identifier parenthesised, and both forms parse cleanly", () => {
 			for (const fixture of LOADER_FIXTURES) {
 				expect({ fixture: fixture.name, diagnostics: parseDiagnostics(fixture.source) }).toEqual({
