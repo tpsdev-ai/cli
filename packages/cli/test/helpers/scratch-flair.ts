@@ -1,14 +1,13 @@
 /** Scratch Harper serving @tpsdev-ai/flair 0.58.0 for the real-Flair lane. */
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "../../src/utils/flair-client.js";
 import { generateKeyPair } from "../../src/utils/identity.js";
+import { bindErrorIn, withPortsRetry } from "./port.js";
 
 /** The published Flair the scratch instance runs. */
 export const FLAIR_PACKAGE = "@tpsdev-ai/flair";
@@ -68,24 +67,6 @@ export interface FlairTarget {
   baseUrl: string;
   opsUrl: string;
   admin: string;
-}
-
-/** Ask the OS for `count` distinct free loopback TCP ports. */
-async function freePorts(count: number): Promise<number[]> {
-  const servers: ReturnType<typeof createServer>[] = [];
-  try {
-    for (let index = 0; index < count; index++) {
-      const server = createServer();
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(0, "127.0.0.1", resolve);
-      });
-      servers.push(server);
-    }
-    return servers.map((server) => (server.address() as AddressInfo).port);
-  } finally {
-    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-  }
 }
 
 /** The environment the scratch Harper and its installer run under. */
@@ -265,18 +246,36 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
     throw new Error(`scratch Flair install is incomplete: ${flairDir} or ${harperBin} is missing`);
   }
 
-  const [httpPort, opsPort] = await freePorts(2);
-  const env = scratchEnv(root, home, models, httpPort, opsPort);
-  await execFileAsync(NODE_BIN, [harperBin, "install"], { cwd: flairDir, env, signal, timeout: 120_000 });
+  await execFileAsync(NODE_BIN, [harperBin, "install"], {
+    cwd: flairDir,
+    env: scratchEnv(root, home, models, 0, 0),
+    signal,
+    timeout: 120_000,
+  });
 
-  const proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
-  instance.proc = proc;
-  let log = "";
-  proc.once("error", (error) => { log += String(error); });
-  proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
-  proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
+  // The ports are chosen and handed to the child, which binds them; a taken
+  // port is retried with a new pair rather than assumed free at bind time.
+  const { ports, result } = await withPortsRetry(2, async ([httpPort, opsPort]) => {
+    const proc = spawn(NODE_BIN, [harperBin, "run", "."], {
+      cwd: flairDir,
+      env: scratchEnv(root, home, models, httpPort!, opsPort!),
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    instance.proc = proc;
+    let log = "";
+    proc.once("error", (error) => { log += String(error); });
+    proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
+    proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
 
-  return { home, httpPort, opsPort, log: () => log };
+    const up = await waitForOk(`http://127.0.0.1:${httpPort}/Health`, Date.now() + BOOT_TIMEOUT_MS, signal);
+    if (!up) {
+      try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+      throw bindErrorIn(log) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${log.slice(-2000)}`);
+    }
+    return { log: () => log };
+  });
+
+  return { home, httpPort: ports[0]!, opsPort: ports[1]!, log: result.log };
 }
 
 export async function initializeScratchFlair(

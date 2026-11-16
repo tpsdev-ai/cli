@@ -16,6 +16,7 @@ import { fingerprint, generateKeyPair, saveKeyPair, type TpsKeyPair } from "../s
 import { NoiseIkTransport, type TransportChannel } from "../src/utils/noise-ik-transport.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
+import { bindErrorIn, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -25,22 +26,6 @@ let pidFile: string;
 let savedEnv: Record<string, string | undefined>;
 const started: { pid: number; startToken: string }[] = [];
 const children: ChildProcess[] = [];
-
-async function freePort(): Promise<number> {
-  const net = await import("node:net");
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
-}
 
 function startToken(pid: number): string {
   const token = processStartToken(pid);
@@ -88,11 +73,14 @@ async function waitForPidGone(pid: number): Promise<void> {
 async function connectToBranch(
   port: number,
   branchKp: TpsKeyPair,
-  hostKp: TpsKeyPair
+  hostKp: TpsKeyPair,
+  failure?: () => Error | undefined,
 ): Promise<TransportChannel> {
   const deadline = Date.now() + WAIT_MS;
   let last: Error | undefined;
   while (Date.now() < deadline) {
+    const failed = failure?.();
+    if (failed) throw failed;
     const transport = new NoiseIkTransport(hostKp);
     try {
       return await transport.connect({
@@ -207,30 +195,35 @@ afterEach(async () => {
 
 describe("branch init single-daemon guard after a real join (cli#731)", () => {
   test("a live record present at spawn refuses the init and leaves the record in place", async () => {
-    const port = await freePort();
     const branchKp = generateKeyPair();
     const hostKp = generateKeyPair();
     saveKeyPair(branchKp, process.env.TPS_IDENTITY_DIR!, "branch");
 
-    const init = spawn(
-      "node",
-      [TPS_BIN, "branch", "init", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
-      { env: launcherEnv(), stdio: ["ignore", "pipe", "pipe"] }
-    );
-    children.push(init);
-    started.push({ pid: init.pid!, startToken: startToken(init.pid!) });
+    let init!: ChildProcess;
     let stdout = "";
     let stderr = "";
-    init.stdout?.on("data", (chunk) => {
-      stdout += String(chunk);
-    });
-    init.stderr?.on("data", (chunk) => {
-      stderr += String(chunk);
-    });
+    const { result: channel } = await withPortRetry(async (port) => {
+      if (init && init.exitCode === null && init.signalCode === null) init.kill("SIGKILL");
+      init = spawn(
+        "node",
+        [TPS_BIN, "branch", "init", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
+        { env: launcherEnv(), stdio: ["ignore", "pipe", "pipe"] }
+      );
+      children.push(init);
+      started.push({ pid: init.pid!, startToken: startToken(init.pid!) });
+      stdout = "";
+      stderr = "";
+      init.stdout?.on("data", (chunk) => {
+        stdout += String(chunk);
+      });
+      init.stderr?.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
 
-    // The early recorded-process check has already run once the launcher is
-    // listening; the record below is placed after it, while the join waits.
-    const channel = await connectToBranch(port, branchKp, hostKp);
+      // The early recorded-process check has already run once the launcher is
+      // listening; the record below is placed after it, while the join waits.
+      return await connectToBranch(port, branchKp, hostKp, () => bindErrorIn(stdout + stderr));
+    });
 
     const live = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
     children.push(live);

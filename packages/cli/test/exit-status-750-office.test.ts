@@ -3,28 +3,15 @@
 // command against a local Noise_IK listener so the join itself succeeds.
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fingerprint, generateKeyPair, registerBranch, saveToVault } from "../src/utils/identity.js";
 import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
+import { boundPort } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const AGENT = "agent-a";
 const VAULT_KEY = "exit-status-750-test-pass";
-
-function freePort(): Promise<number> {
-  return new Promise((resolvePromise, reject) => {
-    const server = net.createServer();
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") return reject(new Error("no address"));
-      const port = address.port;
-      server.close(() => resolvePromise(port));
-    });
-    server.once("error", reject);
-  });
-}
 
 let home: string;
 let fakeBin: string;
@@ -92,8 +79,8 @@ esac
   process.env.TPS_REGISTRY_DIR = registryDir;
   registerBranch(AGENT, branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
 
-  const port = await freePort();
-  server = await new NoiseIkTransport(hostKp, hostKp).listen(port);
+  server = await new NoiseIkTransport(hostKp, hostKp).listen(0);
+  const port = boundPort(server);
   const token = [
     "tps://join?",
     "host=127.0.0.1",

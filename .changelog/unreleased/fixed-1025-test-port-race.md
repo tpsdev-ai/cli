@@ -1,0 +1,1 @@
+- **A bind error rejects the listen call instead of escaping as an uncaught event, and tests share one port helper.** Listeners bound over an HTTP server route a failed bind into the promise the caller awaits, so a taken port no longer kills the process before its cleanup.

@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import net from "node:net";
 import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
@@ -11,27 +10,20 @@ import { branchStatePath, writeBranchState } from "../src/utils/connection-state
 import { QUIET_NONO_CHECK_FLAG } from "../src/utils/nono.js";
 import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { MSG_HEARTBEAT } from "../src/utils/wire-mail.js";
+import { bindErrorIn, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 
-async function freePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
-}
-
-async function connectHost(port: number, host: TpsKeyPair, branch: TpsKeyPair): Promise<TransportChannel> {
+async function connectHost(
+  port: number,
+  host: TpsKeyPair,
+  branch: TpsKeyPair,
+  failure?: () => Error | undefined,
+): Promise<TransportChannel> {
   const deadline = Date.now() + 8000;
   for (;;) {
+    const failed = failure?.();
+    if (failed) throw failed;
     try {
       return await new NoiseIkTransport(host).connect({
         host: "127.0.0.1",
@@ -65,6 +57,25 @@ describe("branch daemon state-write failure", () => {
   let child: ChildProcess | undefined;
   let channel: TransportChannel | undefined;
   let savedEnv: Record<string, string | undefined>;
+
+  /** Start the daemon and connect a host, retrying a port the daemon could not bind. */
+  async function startDaemonAndConnect(
+    host: TpsKeyPair,
+    branch: TpsKeyPair,
+  ): Promise<{ channel: TransportChannel; stderr: () => string }> {
+    const { result } = await withPortRetry(async (port) => {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+      const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
+      delete env.TPS_BRANCH_DAEMON;
+      child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
+      let stderr = "";
+      child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+      const channel = await connectHost(port, host, branch, () => bindErrorIn(stderr));
+      return { channel, stderr: () => stderr };
+    });
+    return result;
+  }
 
   beforeEach(() => {
     savedEnv = {};
@@ -110,9 +121,6 @@ describe("branch daemon state-write failure", () => {
     // A regular file in the connections directory's place makes the record
     // write fail for every uid, including root in CI.
     writeFileSync(join(process.env.TPS_ROOT!, "connections"), "not a directory");
-    const port = await freePort();
-    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
-
     // The daemon runs under the same runtime as this test, so the failure
     // message is the one this process sees for the same construction.
     let writeFailure: string | undefined;
@@ -123,13 +131,8 @@ describe("branch daemon state-write failure", () => {
     }
     expect(writeFailure).toBeDefined();
 
-    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
-    delete env.TPS_BRANCH_DAEMON;
-    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
-
-    channel = await connectHost(port, host, branch);
+    const { channel: started, stderr } = await startDaemonAndConnect(host, branch);
+    channel = started;
     expect(channel.isAlive()).toBe(true);
     const echo = await exchange(channel, { type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} }, MSG_HEARTBEAT);
     expect(echo.seq).toBe(7);
@@ -142,7 +145,7 @@ describe("branch daemon state-write failure", () => {
     const prefix = line.match(/^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\] /);
     expect(prefix).not.toBeNull();
     expect(line.slice(prefix![0].length)).toBe(`WARN: Branch state write failed at ${branchStatePath()}: ${writeFailure}`);
-    expect(stderr).toBe("");
+    expect(stderr()).toBe("");
   }, 30_000);
 
   test("a state and log write failure is counted and reported in the next appended log line", async () => {
@@ -154,16 +157,8 @@ describe("branch daemon state-write failure", () => {
       join(process.env.TPS_IDENTITY_DIR!, "host.json"),
       JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
     );
-    const port = await freePort();
-    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
-
-    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
-    delete env.TPS_BRANCH_DAEMON;
-    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
-    let stderr = "";
-    child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
-
-    channel = await connectHost(port, host, branch);
+    const { channel: started, stderr } = await startDaemonAndConnect(host, branch);
+    channel = started;
     expect(channel.isAlive()).toBe(true);
 
     // The daemon is connected with a working log and state path; break both
@@ -182,7 +177,7 @@ describe("branch daemon state-write failure", () => {
     }
     expect(child.exitCode).toBeNull();
     expect(child.signalCode).toBeNull();
-    expect(stderr).toBe("");
+    expect(stderr()).toBe("");
 
     // Each broken heartbeat fails two appends: the state-write warning and the
     // outbox-drained line, so the two heartbeats lost four lines. Wait for the
@@ -207,16 +202,10 @@ describe("branch daemon state-write failure", () => {
       join(process.env.TPS_IDENTITY_DIR!, "host.json"),
       JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
     );
-    const port = await freePort();
-    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
-
     // The daemon runs the built CLI (dist/bin/tps.js) under this test's
     // runtime, Bun.
-    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
-    delete env.TPS_BRANCH_DAEMON;
-    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
-
-    channel = await connectHost(port, host, branch);
+    const { channel: started } = await startDaemonAndConnect(host, branch);
+    channel = started;
     expect(channel.isAlive()).toBe(true);
 
     // The daemon is connected with a working log and state path; break both
@@ -255,18 +244,12 @@ describe("branch daemon state-write failure", () => {
       join(process.env.TPS_IDENTITY_DIR!, "host.json"),
       JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
     );
-    const port = await freePort();
-    writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
-
-    const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
-    delete env.TPS_BRANCH_DAEMON;
-    child = spawn(process.execPath, [TPS_BIN, "branch", "start", QUIET_NONO_CHECK_FLAG], { env, stdio: ["ignore", "ignore", "pipe"] });
+    const { channel: started } = await startDaemonAndConnect(host, branch);
+    channel = started;
+    expect(channel.isAlive()).toBe(true);
     // Leave the read end open and never drain it: a stderr write from log
     // handling would fill the pipe and stall a blocking writer.
-    child.stderr!.pause();
-
-    channel = await connectHost(port, host, branch);
-    expect(channel.isAlive()).toBe(true);
+    child!.stderr!.pause();
 
     // Break the state and log paths after connect. A regular file in the
     // connections directory's place and a directory in the log file's place

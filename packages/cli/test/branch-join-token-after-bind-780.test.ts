@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { bindErrorIn, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TRANSPORTS = ["tcp", "ws"] as const;
@@ -54,12 +55,6 @@ async function closeServer(server: net.Server): Promise<void> {
   await new Promise<void>((resolveClose, rejectClose) => {
     server.close((error) => (error ? rejectClose(error) : resolveClose()));
   });
-}
-
-async function freePort(): Promise<number> {
-  const { server, port } = await holdPort();
-  await closeServer(server);
-  return port;
 }
 
 function spawnInit(port: number, transport: (typeof TRANSPORTS)[number]): ChildProcess {
@@ -135,6 +130,12 @@ function waitForToken(child: ChildProcess): Promise<number> {
     }, WAIT_MS);
     const onData = (chunk: Buffer) => {
       output += String(chunk);
+      const failed = bindErrorIn(output);
+      if (failed) {
+        clearTimeout(timer);
+        rejectToken(failed);
+        return;
+      }
       const listening = /Listening on 0\.0\.0\.0:(\d+)/.exec(output);
       if (listening && output.includes("tps://join?")) {
         clearTimeout(timer);
@@ -179,14 +180,17 @@ describe("branch init join token after bind (cli#780)", () => {
     }, 60_000);
 
     test(`${transport}: the token appears once the printed port accepts a connection`, async () => {
-      const port = await freePort();
-      const child = spawnInit(port, transport);
+      const { port } = await withPortRetry(async (port) => {
+        const child = spawnInit(port, transport);
 
-      const printedPort = await waitForToken(child);
-      expect(printedPort).toBe(port);
+        const printedPort = await waitForToken(child);
+        expect(printedPort).toBe(port);
 
-      // The token has just been read from stdout: connect once, with no retry.
-      expect(await connectOnce(printedPort, 5_000)).toBe(true);
+        // The token has just been read from stdout: connect once, with no retry.
+        expect(await connectOnce(printedPort, 5_000)).toBe(true);
+        return printedPort;
+      });
+      expect(port).toBeGreaterThan(0);
     }, 60_000);
   }
 });

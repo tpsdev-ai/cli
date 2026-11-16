@@ -32,6 +32,27 @@ function toBuffer(data: WebSocket.RawData): Buffer {
   return Buffer.from(data as any);
 }
 
+/**
+ * Bind the HTTP server and settle once it accepts connections. A
+ * WebSocketServer built over the server re-emits the server's `error`, so a
+ * failed bind (EADDRINUSE) reaches this promise as its rejection; without a
+ * listener that second emission is an uncaught `error` event that kills the
+ * process before the caller can see the rejection. The WebSocketServer
+ * listener is removed once listening, so a later socket error is not reported
+ * as a listen failure.
+ */
+function listenOn(httpServer: HttpServer, wss: WebSocketServer, port: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    const onError = (error: Error) => reject(error);
+    wss.on("error", onError);
+    httpServer.once("error", reject);
+    httpServer.listen(port, "0.0.0.0", () => {
+      wss.off("error", onError);
+      resolve();
+    });
+  });
+}
+
 function waitForMessage(ws: WebSocket, timeoutMs: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const cleanup = () => {
@@ -268,10 +289,7 @@ export class WsNoiseTransport implements WireTransport {
       }
     });
 
-    await new Promise<void>((resolve, reject) => {
-      httpServer.listen(port, "0.0.0.0", () => resolve());
-      httpServer.once("error", reject);
-    });
+    await listenOn(httpServer, wss, port);
 
     return wrapper;
   }
@@ -367,7 +385,7 @@ export async function listenForJoinWs(
   branchKeyPair: TpsKeyPair,
   port: number,
   timeoutMs: number = 120_000,
-  onListening?: () => void
+  onListening?: (port: number) => void
 ): Promise<{
   channel: TransportChannel;
   server: TransportServer;
@@ -385,21 +403,19 @@ export async function listenForJoinWs(
     secretKey: Buffer.from(branchKeyPair.encryption.privateKey),
   };
 
-  await new Promise<void>((resolve, reject) => {
-    // The WebSocketServer re-emits the HTTP server's listen error; without a
-    // listener that second emission would crash before the bind rejection
-    // reaches the caller.
-    wss.once("error", () => {});
-    httpServer.once("error", reject);
-    httpServer.listen(port, "0.0.0.0", () => resolve());
-  });
+  await listenOn(httpServer, wss, port);
+  const boundPort = () => {
+    const address = httpServer.address();
+    return !address || typeof address === "string" ? 0 : address.port;
+  };
   // Bound: report it before waiting for the join, so a caller never advertises a
   // port that is not accepting connections.
-  onListening?.();
+  onListening?.(boundPort());
 
   // Wrap as a TransportServer (for close(); onConnection not used in join mode)
   const serverWrapper: TransportServer = {
     onConnection: () => {},
+    port: boundPort,
     // Settles with a peer connected, and at once when already closed: terminate
     // the accepted sockets, then force-stop the HTTP server rather than wait on
     // them.
@@ -531,10 +547,7 @@ export async function listenForHostWs(
     }
   });
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(port, "0.0.0.0", () => resolve());
-  });
+  await listenOn(httpServer, wss, port);
 
   return {
     onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },

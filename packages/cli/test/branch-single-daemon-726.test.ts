@@ -6,6 +6,7 @@ import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
+import { bindErrorIn, waitForListening as waitForPortListening, withPortRetry } from "./helpers/port.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -17,22 +18,6 @@ let logFile: string;
 let savedEnv: Record<string, string | undefined>;
 const daemons: number[] = [];
 const children: ChildProcess[] = [];
-
-async function freePort(): Promise<number> {
-  const net = await import("node:net");
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
-}
 
 function prepareBranch(port: number): void {
   const branch = generateKeyPair();
@@ -49,6 +34,44 @@ function startToken(pid: number): string {
   const token = processStartToken(pid);
   if (token === null) throw new Error(`no start token for pid ${pid}`);
   return token;
+}
+
+/** The launcher's log, which the daemon writes its own output to. */
+function daemonLog(): string {
+  try {
+    return readFileSync(logFile, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+/** Launch a real daemon and wait until it accepts connections on its port. */
+async function startDaemonOnFreePort(): Promise<{ running: { pid: number; startToken: string }; output: string }> {
+  const { result } = await withPortRetry(async (port) => {
+    prepareBranch(port);
+    const started = spawnSync("node", [TPS_BIN, "branch", "start"], {
+      env: launcherEnv(),
+      encoding: "utf8",
+      timeout: 20_000,
+    });
+    expect(started.status).toBe(0);
+    const running = await waitForRunningRecord();
+    await waitForPortListening(port, { timeoutMs: 8_000, failure: () => bindErrorIn(daemonLog()) });
+    if (pidState(running.pid) !== "alive") throw new Error(`daemon ${running.pid} exited after start`);
+    return { running, output: started.stdout ?? "" };
+  });
+  return result;
+}
+
+async function startSpawnedDaemon(): Promise<{ daemon: ChildProcess; port: number }> {
+  const { port, result: daemon } = await withPortRetry(async (port) => {
+    prepareBranch(port);
+    const child = spawnDaemon();
+    await waitForLogStarted();
+    await waitForPortListening(port, { timeoutMs: 8_000, failure: () => bindErrorIn(daemonLog()) });
+    return child;
+  });
+  return { daemon, port };
 }
 
 async function waitForLogStarted(): Promise<void> {
@@ -118,28 +141,6 @@ function launcherEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-async function waitForListening(port: number): Promise<void> {
-  const net = await import("node:net");
-  const deadline = Date.now() + WAIT_MS;
-  for (;;) {
-    const connected = await new Promise<boolean>((resolveConnect) => {
-      const socket = net.connect({ host: "127.0.0.1", port });
-      const finish = (value: boolean) => {
-        socket.destroy();
-        resolveConnect(value);
-      };
-      socket.once("connect", () => finish(true));
-      socket.once("error", () => finish(false));
-    });
-    if (connected) {
-      await new Promise((resolveWait) => setTimeout(resolveWait, 100));
-      return;
-    }
-    if (Date.now() >= deadline) throw new Error(`daemon did not listen on 127.0.0.1:${port}`);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
-  }
-}
-
 function reapedPid(): number {
   const child = spawnSync("true", []);
   if (child.pid === undefined) throw new Error("could not spawn a helper process");
@@ -188,15 +189,7 @@ afterEach(async () => {
 
 describe("branch start single-daemon guard (cli#726)", () => {
   test("a second start is refused while the recorded process runs and spawns nothing", async () => {
-    const port = await freePort();
-    prepareBranch(port);
-    const first = spawnSync("node", [TPS_BIN, "branch", "start"], {
-      env: launcherEnv(),
-      encoding: "utf8",
-      timeout: 20_000,
-    });
-    expect(first.status).toBe(0);
-    const running = await waitForRunningRecord();
+    const { running } = await startDaemonOnFreePort();
     daemons.push(running.pid);
     const recordBefore = readFileSync(pidFile, "utf8");
 
@@ -221,21 +214,13 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("a stale record is replaced on a successful launch", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const stalePid = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stalePid, null));
 
-    const started = spawnSync("node", [TPS_BIN, "branch", "start"], {
-      env: launcherEnv(),
-      encoding: "utf8",
-      timeout: 20_000,
-    });
-
-    expect(started.status).toBe(0);
-    expect(started.stdout).toContain("Branch daemon spawned");
-    const running = await waitForRunningRecord();
+    const { running, output } = await startDaemonOnFreePort();
     daemons.push(running.pid);
+    expect(output).toContain("Branch daemon spawned");
     expect(running.pid).not.toBe(stalePid);
 
     process.kill(running.pid, "SIGTERM");
@@ -243,8 +228,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("an unverified live record is refused with the stop remedy", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const live = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
     children.push(live);
     expect(live.pid).toBeDefined();
@@ -266,8 +250,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("an invalid record is refused naming the path and reason", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     writeFileSync(pidFile, "not a pid\n");
 
     const refused = spawnSync("node", [TPS_BIN, "branch", "start"], {
@@ -283,8 +266,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("an unreadable record is refused naming the path and reason", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     mkdirSync(pidFile, { recursive: true });
 
     const refused = spawnSync("node", [TPS_BIN, "branch", "start"], {
@@ -300,11 +282,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("a daemon leaves a replacement record in place on shutdown", async () => {
-    const port = await freePort();
-    prepareBranch(port);
-    const daemon = spawnDaemon();
-    await waitForLogStarted();
-    await waitForListening(port);
+    const { daemon } = await startSpawnedDaemon();
     expect(daemon.pid).toBeDefined();
 
     const newer = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
@@ -326,11 +304,7 @@ describe("branch start single-daemon guard (cli#726)", () => {
   }, 30_000);
 
   test("a daemon removes its own record on shutdown", async () => {
-    const port = await freePort();
-    prepareBranch(port);
-    const daemon = spawnDaemon();
-    await waitForLogStarted();
-    await waitForListening(port);
+    const { daemon } = await startSpawnedDaemon();
     expect(daemon.pid).toBeDefined();
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
