@@ -39,10 +39,25 @@ interface DaemonExit {
   signal: NodeJS.Signals | null;
 }
 
-/** Exit status, and the last STDERR_TAIL_BYTES of stderr, per spawned daemon. */
-const daemonExits = new Map<number, DaemonExit>();
-const daemonStderrTails = new Map<number, string>();
-const daemonClosing = new Map<number, Promise<DaemonExit>>();
+/** One child's exit status and the last STDERR_TAIL_BYTES of its stderr. */
+interface DaemonExitState {
+  status: DaemonExit | null;
+  stderr: Buffer;
+}
+
+/** Exit state lives on the child, so a later child that reuses a numeric pid has none. */
+interface DaemonTracker {
+  pid: number;
+  state: DaemonExitState;
+  exited: Promise<DaemonExit>;
+}
+
+type TrackedChild = ChildProcess & { tracker: DaemonTracker };
+
+/** Report timers still pending, so a test can prove a losing one was cleared. */
+const reportTimers = new Set<NodeJS.Timeout>();
+/** How many report deadlines fired, so a test can prove a cancelled timer never ran. */
+let reportTimerFires = 0;
 
 async function freePort(): Promise<number> {
   const net = await import("node:net");
@@ -118,45 +133,66 @@ async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_M
   }
 }
 
+/** Resolve with `promise`, or null when `timeoutMs` passes first; a winning promise cancels the timer. */
+function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolveWait) => {
+    const timer = setTimeout(() => {
+      reportTimerFires += 1;
+      reportTimers.delete(timer);
+      resolveWait(null);
+    }, timeoutMs);
+    reportTimers.add(timer);
+    promise.then((value) => {
+      clearTimeout(timer);
+      reportTimers.delete(timer);
+      resolveWait(value);
+    });
+  });
+}
+
 /** The daemon's exit status and stderr tail, for a wait that lost its daemon. */
-async function daemonExitReport(pid: number | undefined): Promise<string> {
-  if (pid === undefined) return "daemon pid unknown";
-  const closing = daemonClosing.get(pid);
-  const recorded =
-    daemonExits.get(pid) ??
-    (closing === undefined
-      ? null
-      : await Promise.race([
-          closing,
-          new Promise<null>((resolveWait) => setTimeout(() => resolveWait(null), EXIT_REPORT_MS)),
-        ]));
+async function daemonExitReport(daemon: DaemonTracker | undefined): Promise<string> {
+  if (daemon === undefined) return "daemon pid unknown";
+  const recorded = daemon.state.status ?? (await settleWithin(daemon.exited, EXIT_REPORT_MS));
   const status =
     recorded === null
       ? "exit status not captured"
       : recorded.signal !== null
         ? `killed by ${recorded.signal}`
         : `exit code ${String(recorded.code)}`;
-  const tail = (daemonStderrTails.get(pid) ?? "").trim();
-  return `daemon ${pid} ${status}; stderr tail: ${tail === "" ? "(empty)" : tail}`;
+  const tail = daemon.state.stderr.toString("utf8").trim();
+  return `daemon ${daemon.pid} ${status}; stderr tail: ${tail === "" ? "(empty)" : tail}`;
+}
+
+/** The pause file a wait accepts: the daemon's own exact name, or any for a phase without one. */
+function pauseFile(phase: string, pid: number | undefined): string | undefined {
+  const entries = readdirSync(pauseDir);
+  if (pid === undefined) return entries.find((entry) => entry.startsWith(`ready-${phase}-`));
+  const name = `ready-${phase}-${pid}`;
+  return entries.includes(name) ? name : undefined;
 }
 
 /**
- * Wait for `phase`'s pause file. With the daemon's pid, the file waited for is
- * that process's own, so a daemon that has exited can never write it: the wait
- * then fails at once, naming the exit status and the stderr tail, instead of
+ * Wait for `phase`'s pause file. With the daemon's tracker, the file waited for
+ * is that child's own exact name, so a sibling pid that shares a prefix cannot
+ * satisfy it, and a daemon that has exited can never write it: the wait then
+ * fails at once, naming the exit status and the stderr tail, instead of
  * waiting out the timeout for a file that can no longer appear.
  */
-async function waitForReady(phase: string, daemonPid?: number): Promise<string> {
-  const prefix = daemonPid === undefined ? `ready-${phase}-` : `ready-${phase}-${daemonPid}`;
+async function waitForReady(phase: string, daemon?: DaemonTracker): Promise<string> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
-    const name = readdirSync(pauseDir).find((entry) => entry.startsWith(prefix));
+    const name = pauseFile(phase, daemon?.pid);
     if (name !== undefined) return join(pauseDir, name);
-    if (daemonPid !== undefined && (daemonExits.has(daemonPid) || pidExited(daemonPid))) {
-      throw new Error(`pause ${phase} never appeared: ${await daemonExitReport(daemonPid)}; ${daemonState(daemonPid)}`);
+    if (daemon !== undefined && (daemon.state.status !== null || pidExited(daemon.pid))) {
+      // A daemon may write its file and then exit; check once more before
+      // reporting the pause as never written.
+      const late = pauseFile(phase, daemon.pid);
+      if (late !== undefined) return join(pauseDir, late);
+      throw new Error(`pause ${phase} never appeared: ${await daemonExitReport(daemon)}; ${daemonState(daemon.pid)}`);
     }
     if (Date.now() >= deadline) {
-      throw new Error(`timed out waiting for pause ${phase}; ${daemonState(daemonPid)}`);
+      throw new Error(`timed out waiting for pause ${phase}; ${daemonState(daemon?.pid)}`);
     }
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
   }
@@ -289,34 +325,38 @@ async function waitForPidGone(pid: number): Promise<void> {
   await waitFor(() => (pidExited(pid) ? true : null), `pid ${pid} to exit`);
 }
 
-function spawnDaemon(phase: string): ChildProcess {
+/** Track one child: exit status on both `exit` and `close`, and a byte-bounded stderr tail. */
+function trackDaemon(child: ChildProcess, pid = child.pid): TrackedChild {
+  if (pid === undefined) throw new Error("spawned child has no pid");
+  const state: DaemonExitState = { status: null, stderr: Buffer.alloc(0) };
+  let resolveExited!: (exit: DaemonExit) => void;
+  const exited = new Promise<DaemonExit>((resolveWait) => {
+    resolveExited = resolveWait;
+  });
+  const record = (code: number | null, signal: NodeJS.Signals | null): void => {
+    if (state.status !== null) return;
+    state.status = { code, signal };
+    resolveExited(state.status);
+  };
+  // "exit" fires when the process ends; "close" waits for piped stdio to
+  // drain, which a grandchild inheriting stderr can hold open indefinitely.
+  child.once("exit", record);
+  child.once("close", record);
+  child.stderr?.on("data", (chunk: Buffer) => {
+    const tail = Buffer.concat([state.stderr, chunk]);
+    state.stderr = tail.length > STDERR_TAIL_BYTES ? tail.subarray(tail.length - STDERR_TAIL_BYTES) : tail;
+  });
+  const tracked = child as TrackedChild;
+  tracked.tracker = { pid, state, exited };
+  return tracked;
+}
+
+function spawnDaemon(phase: string): TrackedChild {
   const env = pauseEnv(phase);
   env.TPS_BRANCH_NO_DAEMON = "1";
   delete env.TPS_BRANCH_DAEMON;
-  const child = spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  const child = trackDaemon(spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] }));
   children.push(child);
-  const pid = child.pid;
-  if (pid !== undefined) {
-    let tail = "";
-    daemonStderrTails.set(pid, tail);
-    child.stderr?.setEncoding("utf8");
-    child.stderr?.on("data", (chunk: string) => {
-      tail = (tail + chunk).slice(-STDERR_TAIL_BYTES);
-      daemonStderrTails.set(pid, tail);
-    });
-    // "close" fires after the piped stderr drains, so the tail above is
-    // complete when this resolves.
-    daemonClosing.set(
-      pid,
-      new Promise<DaemonExit>((resolveExit) => {
-        child.once("close", (code, signal) => {
-          const exit = { code, signal };
-          daemonExits.set(pid, exit);
-          resolveExit(exit);
-        });
-      }),
-    );
-  }
   return child;
 }
 
@@ -377,7 +417,7 @@ async function stopWhileDaemonPausesInShutdown(
     stderr += String(chunk);
   });
   const exited = waitForExit(stop);
-  await waitForReady("shutdown-before-unlink", daemon.pid);
+  await waitForReady("shutdown-before-unlink", daemon.tracker);
   return { daemon, exited, stdout: () => stdout, stderr: () => stderr };
 }
 
@@ -610,6 +650,8 @@ afterEach(async () => {
   }
   try {
     await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    for (const timer of reportTimers) clearTimeout(timer);
+    reportTimers.clear();
     rmSync(root, { recursive: true, force: true });
     for (const [key, value] of Object.entries(savedEnv)) {
       if (value === undefined) delete process.env[key];
@@ -679,7 +721,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const phase = "startup-before-listener";
     const daemon = spawnDaemon(phase);
     daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-    await waitForReady(phase, daemon.pid);
+    await waitForReady(phase, daemon.tracker);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -699,7 +741,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const phase = "listening-before-steady-state";
     const daemon = spawnDaemon(phase);
     daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-    await waitForReady(phase, daemon.pid);
+    await waitForReady(phase, daemon.tracker);
     await waitForListening(port);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
@@ -721,7 +763,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const phase = "listening-before-steady-state";
     const daemon = spawnDaemon(phase);
     const started = Date.now();
-    const failure = await waitForReady(phase, daemon.pid).then(
+    const failure = await waitForReady(phase, daemon.tracker).then(
       () => null,
       (error: Error) => error,
     );
@@ -731,6 +773,128 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(failure!.message).toContain("branch.conf.json not found");
     expect(Date.now() - started).toBeLessThan(10_000);
   }, 40_000);
+
+  test("a pause file whose pid merely shares a prefix is not accepted", async () => {
+    const phase = "exact-pause-name";
+    const daemon = trackDaemon(
+      spawn("node", ["-e", "setTimeout(() => process.exit(1), 100)"], { stdio: ["ignore", "ignore", "pipe"] }),
+    );
+    children.push(daemon);
+    expect(daemon.pid).toBeDefined();
+    writeFileSync(join(pauseDir, `ready-${phase}-${daemon.pid}0`), "");
+
+    const failure = await waitForReady(phase, daemon.tracker).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain(`pause ${phase} never appeared`);
+    expect(failure!.message).toContain("exit code 1");
+  }, 20_000);
+
+  test("a stale exit record for a reused pid does not reject a live daemon", async () => {
+    const phase = "reused-pid";
+    // The dead child is tracked under the live child's numeric pid, as a reused
+    // OS pid would be: the dead child's record must stay on its own tracker,
+    // not on the number, or the live wait rejects before its pause file appears.
+    const live = trackDaemon(
+      spawn("node", ["-e", "setTimeout(() => {}, 30_000)"], { stdio: ["ignore", "ignore", "pipe"] }),
+    );
+    children.push(live);
+    const pid = live.pid!;
+    const dead = trackDaemon(
+      spawn("node", ["-e", "process.exit(7)"], { stdio: ["ignore", "ignore", "pipe"] }),
+      pid,
+    );
+    children.push(dead);
+    expect(await dead.tracker.exited).toEqual({ code: 7, signal: null });
+
+    const name = `ready-${phase}-${pid}`;
+    const appear = new Promise<void>((resolveAppear) => {
+      setTimeout(() => {
+        writeFileSync(join(pauseDir, name), "");
+        resolveAppear();
+      }, 100);
+    });
+    expect(await waitForReady(phase, live.tracker)).toBe(join(pauseDir, name));
+    await appear;
+  }, 20_000);
+
+  test("an exit with stderr still held open reports the exit code", async () => {
+    const phase = "held-stderr";
+    const grandchildFile = join(root, "grandchild.pid");
+    // The detached grandchild inherits stderr, so the parent's piped stderr
+    // never drains: only the "exit" event carries the status.
+    const script = `
+      import { spawn } from "node:child_process";
+      import { writeFileSync } from "node:fs";
+      const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], {
+        detached: true,
+        stdio: ["ignore", "ignore", "inherit"],
+      });
+      writeFileSync(${JSON.stringify(grandchildFile)}, String(grandchild.pid));
+      process.exit(3);
+    `;
+    const daemon = trackDaemon(
+      spawn("node", ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "pipe"] }),
+    );
+    children.push(daemon);
+    let grandchildPid = 0;
+    try {
+      grandchildPid = await waitFor(
+        () => {
+          try {
+            return Number(readFileSync(grandchildFile, "utf8"));
+          } catch {
+            return null;
+          }
+        },
+        "detached grandchild pid",
+      );
+
+      const failure = await waitForReady(phase, daemon.tracker).then(
+        () => null,
+        (error: Error) => error,
+      );
+      expect(failure).not.toBeNull();
+      expect(failure!.message).toContain("exit code 3");
+    } finally {
+      if (grandchildPid > 0) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
+  }, 20_000);
+
+  test("a multi-byte stderr flood keeps the tail within 4096 bytes", async () => {
+    const script = 'process.stderr.write("€".repeat(5000)); process.exit(4);';
+    const daemon = trackDaemon(spawn("node", ["-e", script], { stdio: ["ignore", "ignore", "pipe"] }));
+    children.push(daemon);
+
+    expect(await waitForExit(daemon)).toEqual({ code: 4, signal: null });
+    expect(daemon.tracker.state.stderr.length).toBeLessThanOrEqual(STDERR_TAIL_BYTES);
+    expect(daemon.tracker.state.stderr.toString("utf8")).toContain("€");
+  }, 20_000);
+
+  test("a report that settles inside the deadline cancels its timer", async () => {
+    const state: DaemonExitState = { status: null, stderr: Buffer.alloc(0) };
+    let resolveExited!: (exit: DaemonExit) => void;
+    const exited = new Promise<DaemonExit>((resolveWait) => {
+      resolveExited = resolveWait;
+    });
+    const firedBefore = reportTimerFires;
+    const report = daemonExitReport({ pid: 4321, state, exited });
+    resolveExited({ code: 0, signal: null });
+
+    expect(await report).toContain("exit code 0");
+    expect(reportTimers.size).toBe(0);
+    // The losing deadline must not fire after the exit has already landed.
+    await new Promise((resolveWait) => setTimeout(resolveWait, EXIT_REPORT_MS + 50));
+    expect(reportTimerFires).toBe(firedBefore);
+  }, 20_000);
 
   test("a second signal during shutdown does not run the shutdown path twice", async () => {
     const port = await freePort();
@@ -745,7 +909,7 @@ describe("branch pid record ownership (cli#730)", () => {
 
     const exited = waitForExit(daemon);
     daemon.kill("SIGTERM");
-    await waitForReady(phase, daemon.pid);
+    await waitForReady(phase, daemon.tracker);
     daemon.kill("SIGINT");
     await new Promise((resolveWait) => setTimeout(resolveWait, 100));
     expect(stoppedCount()).toBe(1);
@@ -916,7 +1080,7 @@ describe("branch pid record ownership (cli#730)", () => {
     // The daemon installs its shutdown handlers before it opens the listener,
     // so a SIGTERM sent now reaches its shutdown path (cli#744).
     daemon.kill("SIGTERM");
-    await waitForReady(phase, daemon.pid);
+    await waitForReady(phase, daemon.tracker);
 
     const probe = acquireMailLockSync(branchPidLockRoot(pidFile), { timeoutMs: 0 });
     if (probe !== null) probe.release();
