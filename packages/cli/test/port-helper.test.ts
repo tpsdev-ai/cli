@@ -24,19 +24,18 @@ describe("port helper retry classification (cli#1025)", () => {
     expect(error).toBe(failure);
   });
 
-  test("EADDRINUSE retries and exhaustion reports the last error", async () => {
+  test("exhaustion with the default attempt count makes five attempts and reports the last error", async () => {
+    const failures: Error[] = [];
     let attempts = 0;
-    const error = await withPortRetry(
-      async () => {
-        attempts += 1;
-        throw coded("EADDRINUSE", `attempt ${attempts}`);
-      },
-      { attempts: 3 },
-    ).catch((caught: unknown) => caught);
+    const error = await withPortRetry(async () => {
+      attempts += 1;
+      const failure = coded("EADDRINUSE", `attempt ${attempts}`);
+      failures.push(failure);
+      throw failure;
+    }).catch((caught: unknown) => caught);
 
-    expect(attempts).toBe(3);
-    expect(error).toBeInstanceOf(Error);
-    expect((error as Error).message).toBe("attempt 3");
+    expect(attempts).toBe(5);
+    expect(error).toBe(failures[4]);
   });
 
   test("the default attempt count is bounded", () => {

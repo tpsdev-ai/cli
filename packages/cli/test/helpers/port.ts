@@ -4,9 +4,10 @@
  * A test that asks the OS for a free port (bind 0, read the port, close) and
  * then binds that port later leaves a gap: anything can take the port in
  * between. A test that starts a listener in-process therefore binds port 0 and
- * reads back the port it reports; a start that binds ports from config (a
- * child process) goes through `withPortsRetry`, which tries again with a new
- * port when the child reports EADDRINUSE.
+ * reads back the port it reports. A start that needs a preselected port for a
+ * child process goes through `withPortsRetry`, which tries again with a new
+ * port when the child reports EADDRINUSE; a child that accepts port 0 through
+ * its own config needs neither.
  */
 import net from "node:net";
 import type { AddressInfo } from "node:net";
@@ -90,8 +91,9 @@ export interface PortRetryOptions {
  * again. The #889 shape — the ports are never assumed to still be free at bind
  * time; the retry is what covers the gap between choosing and binding.
  *
- * `start` must reject with the bind failure (an error naming EADDRINUSE); any
- * other failure propagates at once.
+ * `start` must reject with the bind failure (an error naming EADDRINUSE). With
+ * the default predicate any other failure propagates at once; a caller can
+ * pass `retryOn` to retry a different failure (the heartbeat test does).
  */
 export async function withPortsRetry<T>(
   count: number,

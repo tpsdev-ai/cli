@@ -53,7 +53,6 @@ async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer:
   }
 }
 
-/** Selects a port using a temporary loopback socket. */
 /** Counts visible JSON filenames in a HOME's outbox/new. */
 function outboxRows(home: string): number {
   try {

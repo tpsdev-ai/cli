@@ -223,6 +223,47 @@ export class ScratchFlairBindError extends Error {
   override name = "ScratchFlairBindError";
 }
 
+/** What `bootOnRetriedPorts` needs from a scratch child. */
+export interface ScratchBoot {
+  /** How long one attempt may take to answer on both ports. */
+  timeoutMs: number;
+  /** Start the child on `httpPort` and `opsPort`. */
+  spawn: (httpPort: number, opsPort: number) => { proc: ChildProcess; log: () => string };
+  /** Poll `url` until it answers, or the deadline passes. */
+  ready: (url: string, deadline: number) => Promise<boolean>;
+  /** Stop a failed attempt's child before the next pair is tried. */
+  stop: (proc: ChildProcess) => void;
+}
+
+/**
+ * Start the scratch child on a picked port pair, and start it again on a new
+ * pair when a port was taken. HTTP readiness and operations readiness are both
+ * checked inside one attempt, so an operations port lost to another process
+ * restarts the child instead of failing the lane.
+ */
+export async function bootOnRetriedPorts(
+  boot: ScratchBoot,
+): Promise<{ httpPort: number; opsPort: number; log: () => string }> {
+  const { ports, result } = await withPortsRetry(2, async ([httpPort, opsPort]) => {
+    const child = boot.spawn(httpPort!, opsPort!);
+    const deadline = Date.now() + boot.timeoutMs;
+    const httpUp = await boot.ready(`http://127.0.0.1:${httpPort}/Health`, deadline);
+    if (!httpUp) {
+      boot.stop(child.proc);
+      throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${child.log().slice(-2000)}`);
+    }
+    // The operations port is bound by the same child; a lost one is the same
+    // retryable bind failure as a lost HTTP port.
+    const opsUp = await boot.ready(`http://127.0.0.1:${opsPort}/health`, deadline);
+    if (!opsUp) {
+      boot.stop(child.proc);
+      throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${child.log().slice(-2000)}`);
+    }
+    return child;
+  });
+  return { httpPort: ports[0]!, opsPort: ports[1]!, log: result.log };
+}
+
 async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
   const { root } = instance;
   const home = join(root, "home");
@@ -255,35 +296,28 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
 
   // The ports are chosen and handed to the child, which binds them; a taken
   // port is retried with a new pair rather than assumed free at bind time.
-  const { ports, result } = await withPortsRetry(2, async ([httpPort, opsPort]) => {
-    const proc = spawn(NODE_BIN, [harperBin, "run", "."], {
-      cwd: flairDir,
-      env: scratchEnv(root, home, models, httpPort!, opsPort!),
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    instance.proc = proc;
-    let log = "";
-    proc.once("error", (error) => { log += String(error); });
-    proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
-    proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
-
-    const deadline = Date.now() + BOOT_TIMEOUT_MS;
-    const up = await waitForOk(`http://127.0.0.1:${httpPort}/Health`, deadline, signal);
-    if (!up) {
+  const { httpPort, opsPort, log } = await bootOnRetriedPorts({
+    timeoutMs: BOOT_TIMEOUT_MS,
+    spawn: (httpPort, opsPort) => {
+      const proc = spawn(NODE_BIN, [harperBin, "run", "."], {
+        cwd: flairDir,
+        env: scratchEnv(root, home, models, httpPort, opsPort),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      instance.proc = proc;
+      let log = "";
+      proc.once("error", (error) => { log += String(error); });
+      proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
+      proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
+      return { proc, log: () => log };
+    },
+    ready: (url, deadline) => waitForOk(url, deadline, signal),
+    stop: (proc) => {
       try { proc.kill("SIGKILL"); } catch { /* already gone */ }
-      throw bindErrorIn(log) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${log.slice(-2000)}`);
-    }
-    // The operations port is bound by the same child; a lost one is the same
-    // retryable bind failure as a lost HTTP port.
-    const opsUp = await waitForOk(`http://127.0.0.1:${opsPort}/health`, deadline, signal);
-    if (!opsUp) {
-      try { proc.kill("SIGKILL"); } catch { /* already gone */ }
-      throw bindErrorIn(log) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${log.slice(-2000)}`);
-    }
-    return { log: () => log };
+    },
   });
 
-  return { home, httpPort: ports[0]!, opsPort: ports[1]!, log: result.log };
+  return { home, httpPort, opsPort, log };
 }
 
 export async function initializeScratchFlair(

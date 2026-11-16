@@ -457,15 +457,22 @@ export async function listenForJoinWs(
     }
   });
 
-  await listenOn(httpServer, port, {
-    also: wss,
-    onError: (error) => {
-      swarn("[join] listener error after bind:", error.message);
-      if (timeout) clearTimeout(timeout);
-      rejectJoin(error);
-      void serverWrapper?.close().catch(() => {});
-    },
-  });
+  try {
+    await listenOn(httpServer, port, {
+      also: wss,
+      onError: (error) => {
+        swarn("[join] listener error after bind:", error.message);
+        if (timeout) clearTimeout(timeout);
+        rejectJoin(error);
+        void serverWrapper?.close().catch(() => {});
+      },
+    });
+  } catch (error) {
+    // No join can complete after a rejected bind: stop the join timer rather
+    // than leave it armed for the caller's wait.
+    if (timeout) clearTimeout(timeout);
+    throw error;
+  }
   const boundPort = () => {
     const address = httpServer.address();
     return !address || typeof address === "string" ? 0 : address.port;

@@ -6,9 +6,11 @@
  * listener for the second emission it is an uncaught `error` event that kills
  * the process before the caller can see the rejection. `listenOn` attaches
  * listeners to both emitters for the duration of the bind, rejects the promise
- * with the bind failure, and then replaces them with one handler that routes
- * every later error to the caller's failure path: the error is handled, never
- * dropped because the promise has settled and never left without a listener.
+ * with the bind failure, and once listening replaces them with one handler:
+ * the first error after the bind runs the caller's failure path once, and
+ * later emissions are consumed without running it again (`failedAfterBind`),
+ * because a server and the WebSocketServer over it report one underlying
+ * error twice.
  */
 export type ErrorListener = (error: Error) => void;
 
@@ -27,7 +29,7 @@ export interface ListenOnOptions {
   host?: string;
   /** A second emitter that re-emits `server`'s errors, such as a WebSocketServer. */
   also?: ListenEmitter;
-  /** The listener's failure path for an error after a successful bind. */
+  /** The listener's failure path, run once for the first error after a successful bind. */
   onError: ErrorListener;
 }
 

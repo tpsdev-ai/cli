@@ -1,10 +1,15 @@
 /**
  * cli#1025 — no test may choose a port by binding port 0, closing that
  * listener, and using the number for a bind later: another process can take
- * the port in between. This scan follows a server through `listen(0)` →
- * `address().port` → `close` → a later `listen` of that port, by the shape of
- * the code rather than a helper's name or type annotation, so a renamed or
- * untyped copy and an inline anonymous block are found too.
+ * the port in between. This scan follows these forms, by the shape of the code
+ * rather than a helper's name or type annotation, so a renamed or untyped copy
+ * and an inline anonymous block are found too:
+ *
+ * - `listen(0)` → `address().port` → `close` → that port in a later `listen`
+ *   (directly, through a variable, or through a helper's return value);
+ * - a function that binds 0, reads the port, closes the server and hands the
+ *   port out, by `return` or as a Promise resolver's argument, whether or not
+ *   anything in the file consumes it.
  */
 import { describe, expect, test } from "bun:test";
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -146,7 +151,16 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
         analysis.addressNameSource.set(node.name.text, fromAddress);
       } else {
         const fromPort = directPortReceiver(initializer);
-        if (fromPort !== undefined) analysis.portNameSource.set(node.name.text, fromPort);
+        if (fromPort !== undefined) {
+          analysis.portNameSource.set(node.name.text, fromPort);
+        } else if (
+          ts.isPropertyAccessExpression(initializer) &&
+          initializer.name.text === "port" &&
+          ts.isIdentifier(initializer.expression)
+        ) {
+          const fromAddressName = analysis.addressNameSource.get(initializer.expression.text);
+          if (fromAddressName !== undefined) analysis.portNameSource.set(node.name.text, fromAddressName);
+        }
       }
     }
     if (ts.isVariableDeclaration(node) && ts.isObjectBindingPattern(node.name) && node.initializer) {
@@ -163,22 +177,14 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
 
     if (ts.isReturnStatement(node) && node.expression) {
       const owner = enclosingFunctionName(node, source);
-      const value = unwrap(node.expression);
-      if (
-        (ts.isIdentifier(value) && analysis.portNameSource.has(value.text)) ||
-        directPortReceiver(value) !== undefined ||
-        (ts.isPropertyAccessExpression(value) &&
-          ts.isIdentifier(value.expression) &&
-          analysis.addressNameSource.has(value.expression.text) &&
-          value.name.text === "port")
-      ) {
-        const source =
-          ts.isIdentifier(value)
-            ? analysis.portNameSource.get(value.text)
-            : directPortReceiver(value) ??
-              analysis.addressNameSource.get((value as ts.PropertyAccessExpression).expression.getText(source));
-        if (source !== undefined) analysis.functionSource.set(owner, source);
-      }
+      const origin = portReceiverOf(node.expression, analysis);
+      if (origin !== undefined) analysis.functionSource.set(owner, origin);
+    }
+    // A Promise resolver's argument hands the port out as a return does.
+    if (ts.isCallExpression(node) && callName(node) === "resolve" && node.arguments.length === 1) {
+      const owner = enclosingFunctionName(node, source);
+      const origin = portReceiverOf(node.arguments[0]!, analysis);
+      if (origin !== undefined) analysis.functionSource.set(owner, origin);
     }
     ts.forEachChild(node, visit);
   };
@@ -203,9 +209,11 @@ function portReceiverOf(expression: ts.Expression, analysis: Analysis): string |
 
 /**
  * Every pick-then-bind port helper in `source`: a server binds port 0, its
- * port is read from `address()`, the server is closed, and that port is used
- * by a later `listen` — whatever the function or variable is called, and with
- * no type annotation required.
+ * port is read from `address()`, the server is closed, and the port is either
+ * used by a later `listen` in the same file or handed out by a returning or
+ * resolving helper — whatever the function or variable is called, with no type
+ * annotation required. The forms it follows are listed at the top of this
+ * file; it is not a claim to parse every way a port can travel.
  */
 export function analyzeSource(source: string, name: string): PortFinding[] {
   const file = ts.createSourceFile(name, source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
@@ -244,6 +252,16 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
           }
         }
       }
+      if (ts.isCallExpression(node) && callName(node) === "resolve" && node.arguments.length === 1) {
+        const owner = enclosingFunctionName(node, file);
+        if (!analysis.functionSource.has(owner)) {
+          const from = portReceiverOf(node.arguments[0]!, analysis);
+          if (from !== undefined) {
+            analysis.functionSource.set(owner, from);
+            changed = true;
+          }
+        }
+      }
       ts.forEachChild(node, visit);
     };
     visit(file);
@@ -269,6 +287,22 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
         }
       }
       break;
+    }
+  }
+
+  // A function that binds 0, reads the port, closes the server and hands the
+  // port out — by `return` or as a Promise resolver's argument — is the
+  // pick-then-bind helper on its own, whatever consumes the number.
+  for (const [owner, receiver] of analysis.functionSource) {
+    if (!analysis.address.has(receiver)) continue;
+    if ((analysis.close.get(receiver) ?? []).length === 0) continue;
+    for (const offset of analysis.bindZero.get(receiver) ?? []) {
+      if (enclosingFunctionName(nodeAt(file, offset), file) !== owner) continue;
+      const line = file.getLineAndCharacterOfPosition(offset).line + 1;
+      const finding = { file: name, name: owner, line };
+      if (!findings.some((seen) => seen.file === finding.file && seen.name === finding.name && seen.line === finding.line)) {
+        findings.push(finding);
+      }
     }
   }
   return findings;
@@ -346,6 +380,42 @@ const INLINE_ANONYMOUS = `
     boot();
   }`;
 
+const CALLBACK_PICK_PORT = `
+  import net from "node:net";
+  async function pickPort(): Promise<number> {
+    return new Promise<number>((resolve) => {
+      const server = net.createServer();
+      server.listen(0, "127.0.0.1", () => {
+        const port = server.address().port;
+        server.close(() => resolve(port));
+      });
+    });
+  }
+  const later = net.createServer();
+  later.listen(await pickPort());`;
+
+const CALLBACK_PICK_PORT_UNCONSUMED = `
+  import net from "node:net";
+  async function pickPort(): Promise<number> {
+    return new Promise<number>((resolve) => {
+      const server = net.createServer();
+      server.listen(0, "127.0.0.1", () => {
+        const port = server.address().port;
+        server.close(() => resolve(port));
+      });
+    });
+  }`;
+
+const RETURN_ADDRESS_PORT = `
+  import net from "node:net";
+  function pickPort() {
+    const server = net.createServer();
+    server.listen(0, "127.0.0.1", () => {});
+    const address = server.address() as net.AddressInfo;
+    server.close();
+    return address.port;
+  }`;
+
 describe("port helper guard (cli#1025)", () => {
   test("no cli test file picks a port and binds it later", () => {
     const offenders = testTreeSources(join(CLI_ROOT, "test"))
@@ -368,6 +438,24 @@ describe("port helper guard (cli#1025)", () => {
   test("reports an inline anonymous block", () => {
     expect(analyzeSource(INLINE_ANONYMOUS, "inline.test.ts")).toEqual([
       { file: "inline.test.ts", name: "boot", line: 6 },
+    ]);
+  });
+
+  test("reports a pickPort that hands the port out through a Promise resolver", () => {
+    expect(analyzeSource(CALLBACK_PICK_PORT, "callback-pick-port.test.ts")).toEqual([
+      { file: "callback-pick-port.test.ts", name: "pickPort", line: 6 },
+    ]);
+  });
+
+  test("reports a Promise-resolving helper with no consumer in the file", () => {
+    expect(analyzeSource(CALLBACK_PICK_PORT_UNCONSUMED, "callback-unconsumed.test.ts")).toEqual([
+      { file: "callback-unconsumed.test.ts", name: "pickPort", line: 6 },
+    ]);
+  });
+
+  test("reports a helper that returns address.port without crashing", () => {
+    expect(analyzeSource(RETURN_ADDRESS_PORT, "return-address-port.test.ts")).toEqual([
+      { file: "return-address-port.test.ts", name: "pickPort", line: 5 },
     ]);
   });
 
