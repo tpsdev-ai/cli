@@ -162,9 +162,9 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-other-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
     const raw = readFileSync(path);
-    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a");
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:b" });
     expect(outcome).toEqual({ kind: "other" });
     expect(readFileSync(path)).toEqual(raw);
   });
@@ -184,6 +184,59 @@ describe("connection-state", () => {
       { startToken: () => null },
     );
     expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test.each([
+    { name: "a reused pid", pid: process.pid },
+    { name: "a pid that is gone", pid: 2147483646 },
+  ])("claimHostStateAt reclaims another connection's record when its process is gone ($name)", ({ pid }) => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-gone-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid, startToken: "proc:stale-owner" });
+    const aState = { ...completeState(), connectionId: "conn-a", startToken: "proc:current-owner", lastHeartbeatAck: "ack" };
+    const outcome = claimHostStateAt(path, aState, "conn-a", undefined, 0, { startToken: () => "proc:current-owner" });
+    expect(outcome).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.connectionId).toBe("conn-a");
+    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a", undefined, 0, { startToken: () => "proc:current-owner" });
+    expect(refreshed).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
+  });
+
+  test("claimHostStateAt skips another connection's record with no startToken while its pid is running", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-notoken-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => "proc:current-owner" },
+    );
+    expect(outcome).not.toEqual({ kind: "written" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test("claimHostStateAt skips another connection's record when the start token cannot be read", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-token-throws-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:other" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => { throw new Error("token read failed"); } },
+    );
+    expect(outcome).not.toEqual({ kind: "written" });
     expect(readFileSync(path)).toEqual(raw);
   });
 

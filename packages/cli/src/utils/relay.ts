@@ -1453,7 +1453,7 @@ function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshO
         reason = "the record belongs to another connection";
         break;
       case "unverifiable":
-        reason = "this process's start token could not be read";
+        reason = "ownership could not be verified";
         break;
       case "invalid":
         reason = "the record is not a valid host state record";
@@ -1648,9 +1648,10 @@ export async function connectAndKeepAlive(
           return outcome;
         };
         const refresh = hostStateRefresher(recordPath, persist);
-        // The claim stays outside the refresher so a refusal still reconnects,
-        // after one line naming the record path and reason; so does the
-        // post-send update.
+        // The claim stays outside the refresher so a write that throws still
+        // reconnects, after one line naming the record path and reason; so does
+        // the post-send update. A skipped claim logs one line and leaves the
+        // record to its owner: the channel stays up and serving.
         const connectWrite = (write: () => void) => {
           try {
             write();
