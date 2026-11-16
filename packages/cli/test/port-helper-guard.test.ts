@@ -63,18 +63,59 @@ function unwrap(expression: ts.Expression): ts.Expression {
   return current;
 }
 
-function callName(call: ts.CallExpression): string | undefined {
-  const callee = unwrap(call.expression);
-  if (ts.isIdentifier(callee)) return callee.text;
-  if (ts.isPropertyAccessExpression(callee)) return callee.name.text;
+const sourceAliases = new WeakMap<ts.SourceFile, Map<ts.Symbol, ts.Symbol>>();
+const sourceCheckers = new WeakMap<ts.SourceFile, ts.TypeChecker>();
+
+function bindingKey(identifier: ts.Identifier): string {
+  const checker = sourceCheckers.get(identifier.getSourceFile());
+  const symbol = ts.isShorthandPropertyAssignment(identifier.parent)
+    ? checker?.getShorthandAssignmentValueSymbol(identifier.parent)
+    : checker?.getSymbolAtLocation(identifier);
+  const binding = symbol && (sourceAliases.get(identifier.getSourceFile())?.get(symbol) ?? symbol);
+  const declaration = binding?.valueDeclaration ?? binding?.declarations?.[0];
+  return declaration ? `${binding!.name}@${declaration.getStart()}` : identifier.text;
+}
+
+function receiverKey(expression: ts.Expression): string {
+  const value = unwrap(expression);
+  if (ts.isIdentifier(value)) return bindingKey(value);
+  if (ts.isPropertyAccessExpression(value)) return `${receiverKey(value.expression)}.${value.name.text}`;
+  return value.getText();
+}
+
+function functionKey(node: ts.Node): string | undefined {
+  if ((ts.isFunctionDeclaration(node) || ts.isFunctionExpression(node) || ts.isMethodDeclaration(node)) && node.name && ts.isIdentifier(node.name)) {
+    return bindingKey(node.name);
+  }
+  const parent = node.parent;
+  if ((ts.isVariableDeclaration(parent) || ts.isPropertyAssignment(parent)) && ts.isIdentifier(parent.name)) {
+    return bindingKey(parent.name);
+  }
   return undefined;
 }
 
-/** The text of the receiver of `receiver.method(...)`, if it has that shape. */
+function enclosingFunctionKey(node: ts.Node): string {
+  for (let current = node.parent; current; current = current.parent) {
+    if (ts.isFunctionLike(current)) {
+      const key = functionKey(current);
+      if (key) return key;
+    }
+  }
+  return "<anonymous>";
+}
+
+function callName(call: ts.CallExpression): string | undefined {
+  const callee = unwrap(call.expression);
+  if (ts.isIdentifier(callee)) return bindingKey(callee);
+  if (ts.isPropertyAccessExpression(callee)) return bindingKey(callee.name);
+  return undefined;
+}
+
+/** The binding key of the receiver of `receiver.method(...)`, if it has that shape. */
 function receiverText(call: ts.CallExpression, method: string): string | undefined {
   if (!ts.isPropertyAccessExpression(call.expression)) return undefined;
   if (call.expression.name.text !== method) return undefined;
-  return call.expression.expression.getText();
+  return receiverKey(call.expression.expression);
 }
 
 /** The receiver of `<receiver>.address()`, if `expression` is that call. */
@@ -125,9 +166,9 @@ function enclosingFunctionName(node: ts.Node, _source: ts.SourceFile): string {
   return "<anonymous>";
 }
 
-/** Every name a binding pattern introduces. */
+/** The binding keys a pattern introduces. */
 function bindingNames(name: ts.BindingName): string[] {
-  if (ts.isIdentifier(name)) return [name.text];
+  if (ts.isIdentifier(name)) return [bindingKey(name)];
   const names: string[] = [];
   for (const element of name.elements) {
     if (ts.isBindingElement(element)) names.push(...bindingNames(element.name));
@@ -153,7 +194,7 @@ function isPromiseExecutor(node: ts.FunctionLikeDeclaration): boolean {
 function promiseResolverCall(call: ts.CallExpression): boolean {
   const callee = unwrap(call.expression);
   if (!ts.isIdentifier(callee)) return false;
-  const name = callee.text;
+  const name = bindingKey(callee);
   for (let current: ts.Node | undefined = call.parent; current; current = current.parent) {
     if (ts.isFunctionLike(current)) {
       if (isPromiseExecutor(current)) {
@@ -178,7 +219,7 @@ function portBundleReceiver(expression: ts.Expression, analysis: Analysis): stri
       const from = portReceiverOf(property.initializer, analysis) ?? directPortReceiver(property.initializer);
       if (from !== undefined) return from;
     } else if (ts.isShorthandPropertyAssignment(property)) {
-      const from = analysis.portNameSource.get(property.name.text);
+      const from = analysis.portNameSource.get(bindingKey(property.name));
       if (from !== undefined) return from;
     }
   }
@@ -223,7 +264,7 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
       const closeReceiver = receiverText(node, "close");
       if (closeReceiver !== undefined) {
         record(analysis.close, closeReceiver, node.getStart(source));
-        const owner = enclosingFunctionName(node, source);
+        const owner = enclosingFunctionKey(node);
         const owners = analysis.closeOwners.get(closeReceiver) ?? new Set<string>();
         owners.add(owner);
         analysis.closeOwners.set(closeReceiver, owners);
@@ -232,10 +273,10 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
         for (let current: ts.Node | undefined = node.parent; current; current = current.parent) {
           if (!ts.isFunctionLike(current)) continue;
           const index = current.parameters.findIndex(
-            (parameter) => ts.isIdentifier(parameter.name) && parameter.name.text === closeReceiver,
+            (parameter) => ts.isIdentifier(parameter.name) && bindingKey(parameter.name) === closeReceiver,
           );
           if (index >= 0) {
-            const name = functionName(current);
+            const name = functionKey(current);
             if (name !== undefined) analysis.closers.set(name, index);
             break;
           }
@@ -246,9 +287,9 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
       if (closesThroughCall !== undefined && node.arguments.length > closesThroughCall) {
         const argument = unwrap(node.arguments[closesThroughCall]!);
         if (ts.isIdentifier(argument)) {
-          const receiver = analysis.serverAlias.get(argument.text) ?? argument.text;
+          const receiver = analysis.serverAlias.get(bindingKey(argument)) ?? bindingKey(argument);
           record(analysis.close, receiver, node.getStart(source));
-          const owner = enclosingFunctionName(node, source);
+          const owner = enclosingFunctionKey(node);
           const owners = analysis.closeOwners.get(receiver) ?? new Set<string>();
           owners.add(owner);
           analysis.closeOwners.set(receiver, owners);
@@ -262,18 +303,18 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
       const initializer = unwrap(node.initializer);
       const fromAddress = addressReceiver(initializer);
       if (fromAddress !== undefined) {
-        analysis.addressNameSource.set(node.name.text, fromAddress);
+        analysis.addressNameSource.set(bindingKey(node.name), fromAddress);
       } else {
         const fromPort = directPortReceiver(initializer);
         if (fromPort !== undefined) {
-          analysis.portNameSource.set(node.name.text, fromPort);
+          analysis.portNameSource.set(bindingKey(node.name), fromPort);
         } else if (
           ts.isPropertyAccessExpression(initializer) &&
           initializer.name.text === "port" &&
           ts.isIdentifier(initializer.expression)
         ) {
-          const fromAddressName = analysis.addressNameSource.get(initializer.expression.text);
-          if (fromAddressName !== undefined) analysis.portNameSource.set(node.name.text, fromAddressName);
+          const fromAddressName = analysis.addressNameSource.get(bindingKey(initializer.expression));
+          if (fromAddressName !== undefined) analysis.portNameSource.set(bindingKey(node.name), fromAddressName);
         }
       }
     }
@@ -283,7 +324,7 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
         for (const element of node.name.elements) {
           const property = element.propertyName ?? element.name;
           if (ts.isIdentifier(property) && property.text === "port" && ts.isIdentifier(element.name)) {
-            analysis.portNameSource.set(element.name.text, fromAddress);
+            analysis.portNameSource.set(bindingKey(element.name), fromAddress);
           }
         }
       }
@@ -294,14 +335,14 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
         for (const element of node.name.elements) {
           const property = element.propertyName ?? element.name;
           if (!ts.isIdentifier(property) || !ts.isIdentifier(element.name)) continue;
-          if (property.text === "port") analysis.portNameSource.set(element.name.text, bundle);
-          if (property.text === "server") analysis.serverAlias.set(element.name.text, bundle);
+          if (property.text === "port") analysis.portNameSource.set(bindingKey(element.name), bundle);
+          if (property.text === "server") analysis.serverAlias.set(bindingKey(element.name), bundle);
         }
       }
     }
 
     if (ts.isReturnStatement(node) && node.expression) {
-      const owner = enclosingFunctionName(node, source);
+      const owner = enclosingFunctionKey(node);
       const value = unwrap(node.expression);
       const promiseExpression =
         ts.isNewExpression(value) && ts.isIdentifier(value.expression) && value.expression.text === "Promise";
@@ -314,7 +355,7 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
     // call is matched to the executor's first parameter, not to the name
     // `resolve`. A bundle keeps its server open, so it is tracked separately.
     if (ts.isCallExpression(node) && promiseResolverCall(node) && node.arguments.length === 1) {
-      const owner = enclosingFunctionName(node, source);
+      const owner = enclosingFunctionKey(node);
       const bundle = portBundleReceiver(node.arguments[0]!, analysis);
       if (bundle !== undefined) {
         analysis.functionBundleSource.set(owner, bundle);
@@ -331,7 +372,7 @@ function collect(root: ts.Node, source: ts.SourceFile, analysis: Analysis): void
 /** True when `expression` holds the port of a server in `analysis`. */
 function portReceiverOf(expression: ts.Expression, analysis: Analysis): string | undefined {
   const value = unwrap(expression);
-  if (ts.isIdentifier(value)) return analysis.portNameSource.get(value.text);
+  if (ts.isIdentifier(value)) return analysis.portNameSource.get(bindingKey(value));
   if (ts.isCallExpression(value)) {
     const name = callName(value);
     if (name !== undefined) return analysis.functionSource.get(name);
@@ -339,7 +380,7 @@ function portReceiverOf(expression: ts.Expression, analysis: Analysis): string |
   const direct = directPortReceiver(value);
   if (direct !== undefined) return direct;
   if (ts.isPropertyAccessExpression(value) && ts.isIdentifier(value.expression) && value.name.text === "port") {
-    return analysis.addressNameSource.get(value.expression.text);
+    return analysis.addressNameSource.get(bindingKey(value.expression));
   }
   return undefined;
 }
@@ -369,6 +410,39 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
     functionBundleSource: new Map(),
     bindArguments: [],
   };
+  const host = ts.createCompilerHost({ noLib: true, noResolve: true });
+  host.getSourceFile = (fileName) => fileName === name ? file : undefined;
+  const program = ts.createProgram([name], { noLib: true, noResolve: true }, host);
+  const checker = program.getTypeChecker();
+  sourceCheckers.set(file, checker);
+  const aliases = new Map<ts.Symbol, ts.Symbol>();
+  sourceAliases.set(file, aliases);
+  const elements = new Map<ts.Symbol, ts.Symbol>();
+  const scanPushes = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "push") {
+      const array = checker.getSymbolAtLocation(node.expression.expression);
+      const first = node.arguments[0];
+      const element = first && checker.getSymbolAtLocation(first);
+      if (array && element) elements.set(array, element);
+    }
+    ts.forEachChild(node, scanPushes);
+  };
+  scanPushes(file);
+  // Array callbacks read and close elements pushed into that array.
+  const scanMaps = (node: ts.Node) => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && node.expression.name.text === "map") {
+      const array = checker.getSymbolAtLocation(node.expression.expression);
+      const element = array && elements.get(array);
+      const callback = node.arguments[0];
+      if (element && callback && (ts.isArrowFunction(callback) || ts.isFunctionExpression(callback))) {
+        const first = callback.parameters[0];
+        const parameter = first && checker.getSymbolAtLocation(first.name);
+        if (parameter) aliases.set(parameter, element);
+      }
+    }
+    ts.forEachChild(node, scanMaps);
+  };
+  scanMaps(file);
   collect(file, file, analysis);
 
   // Propagate `const picked = pickPort()` and function returns a bounded number
@@ -377,10 +451,10 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
     let changed = false;
     const visit = (node: ts.Node) => {
       if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
-        if (!analysis.portNameSource.has(node.name.text)) {
+        if (!analysis.portNameSource.has(bindingKey(node.name))) {
           const from = portReceiverOf(node.initializer, analysis);
           if (from !== undefined) {
-            analysis.portNameSource.set(node.name.text, from);
+            analysis.portNameSource.set(bindingKey(node.name), from);
             changed = true;
           }
         }
@@ -393,12 +467,12 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
           for (const element of node.name.elements) {
             const property = element.propertyName ?? element.name;
             if (!ts.isIdentifier(property) || !ts.isIdentifier(element.name)) continue;
-            if (property.text === "port" && !analysis.portNameSource.has(element.name.text)) {
-              analysis.portNameSource.set(element.name.text, bundle);
+            if (property.text === "port" && !analysis.portNameSource.has(bindingKey(element.name))) {
+              analysis.portNameSource.set(bindingKey(element.name), bundle);
               changed = true;
             }
-            if (property.text === "server" && !analysis.serverAlias.has(element.name.text)) {
-              analysis.serverAlias.set(element.name.text, bundle);
+            if (property.text === "server" && !analysis.serverAlias.has(bindingKey(element.name))) {
+              analysis.serverAlias.set(bindingKey(element.name), bundle);
               changed = true;
             }
           }
@@ -410,10 +484,10 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
         if (index !== undefined && node.arguments.length > index) {
           const argument = unwrap(node.arguments[index]!);
           if (ts.isIdentifier(argument)) {
-            const receiver = analysis.serverAlias.get(argument.text) ?? argument.text;
+            const receiver = analysis.serverAlias.get(bindingKey(argument)) ?? bindingKey(argument);
             const owners = analysis.closeOwners.get(receiver) ?? new Set<string>();
-            if (!owners.has(enclosingFunctionName(node, file))) {
-              owners.add(enclosingFunctionName(node, file));
+            if (!owners.has(enclosingFunctionKey(node))) {
+              owners.add(enclosingFunctionKey(node));
               analysis.closeOwners.set(receiver, owners);
               const offsets = analysis.close.get(receiver) ?? [];
               offsets.push(node.getStart(file));
@@ -424,7 +498,7 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
         }
       }
       if (ts.isReturnStatement(node) && node.expression) {
-        const owner = enclosingFunctionName(node, file);
+        const owner = enclosingFunctionKey(node);
         const value = unwrap(node.expression);
         const promiseExpression =
           ts.isNewExpression(value) && ts.isIdentifier(value.expression) && value.expression.text === "Promise";
@@ -440,7 +514,7 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
         }
       }
       if (ts.isCallExpression(node) && promiseResolverCall(node) && node.arguments.length === 1) {
-        const owner = enclosingFunctionName(node, file);
+        const owner = enclosingFunctionKey(node);
         const bundle = portBundleReceiver(node.arguments[0]!, analysis);
         if (bundle !== undefined) {
           if (!analysis.functionBundleSource.has(owner)) {
@@ -466,13 +540,12 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
     if (!analysis.address.has(receiver)) continue;
     const closeOffsets = analysis.close.get(receiver) ?? [];
     if (closeOffsets.length === 0) continue;
-    const lastClose = Math.max(...closeOffsets);
     for (const bind of analysis.bindArguments) {
-      if (bind.offset <= lastClose) continue;
       // The bind argument must name a port taken from THIS server.
       const portSource = portReceiverOf(bind.expression, analysis);
       if (portSource !== receiver) continue;
       for (const offset of bindOffsets) {
+        if (!closeOffsets.some((close) => offset < close && close < bind.offset)) continue;
         const line = file.getLineAndCharacterOfPosition(offset).line + 1;
         const finding = { file: name, name: enclosingFunctionName(nodeAt(file, offset), file), line };
         if (!findings.some((seen) => seen.file === finding.file && seen.name === finding.name && seen.line === finding.line)) {
@@ -493,7 +566,7 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
     if (!(analysis.closeOwners.get(receiver) ?? new Set<string>()).has(owner)) continue;
     for (const offset of analysis.bindZero.get(receiver) ?? []) {
       const line = file.getLineAndCharacterOfPosition(offset).line + 1;
-      const finding = { file: name, name: owner, line };
+      const finding = { file: name, name: owner.replace(/@\d+$/, ""), line };
       if (!findings.some((seen) => seen.file === finding.file && seen.name === finding.name && seen.line === finding.line)) {
         findings.push(finding);
       }
@@ -704,6 +777,70 @@ describe("port helper guard (cli#1025)", () => {
         });
       }`;
     expect(analyzeSource(holds, "holds.test.ts")).toEqual([]);
+  });
+
+  test("keeps unrelated port and server bindings separate", () => {
+    const source = `
+      function probePort() {
+        const probe = net.createServer();
+        probe.listen(0);
+        const port = probe.address().port;
+        probe.close();
+      }
+      function configuredPort() {
+        const port = 45000;
+        later.listen(port);
+      }`;
+    expect(analyzeSource(source, "separate-bindings.test.ts")).toEqual([]);
+    const separateServers = `
+      function probePort() {
+        const probe = net.createServer();
+        probe.listen(0);
+        const port = probe.address().port;
+        probe.close();
+      }
+      function configuredPort() {
+        const probe = net.createServer();
+        probe.listen(45000);
+        const port = probe.address().port;
+        probe.close();
+        return port;
+      }`;
+    expect(analyzeSource(separateServers, "separate-servers.test.ts")).toEqual([]);
+    const shadowed = `
+      function start() {
+        const probe = net.createServer();
+        probe.listen(0);
+        const port = probe.address().port;
+        probe.close();
+        {
+          const port = 45000;
+          later.listen(port);
+        }
+        later.listen(port);
+      }`;
+    expect(analyzeSource(shadowed, "shadowed-bindings.test.ts")).toEqual([
+      { file: "shadowed-bindings.test.ts", name: "start", line: 4 },
+    ]);
+  });
+
+  test("reports a rebind before repeated cleanup", () => {
+    const source = `
+      function start() {
+        const probe = net.createServer();
+        probe.listen(0);
+        const port = probe.address().port;
+        try {
+          probe.close();
+          later.listen(port);
+        } finally {
+          probe.close();
+        }
+      }`;
+    expect(analyzeSource(source, "repeated-cleanup.test.ts")).toEqual([
+      { file: "repeated-cleanup.test.ts", name: "start", line: 4 },
+    ]);
+    expect(analyzeSource(source.replace("probe.close();", ""), "late-cleanup.test.ts")).toEqual([]);
   });
 
   test("replays every port helper this diff removed, with and without a consumer", () => {

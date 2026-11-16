@@ -84,7 +84,7 @@ export interface PortRetryOptions {
   /** Which failures are retried; address-in-use only, unless a caller says otherwise. */
   retryOn?: (error: unknown) => boolean;
   /** A port the first attempt starts on, so a case can make that attempt lose
-   *  the port on purpose and show the second attempt succeeding. */
+   *  the port on purpose and show a later attempt succeeding. */
   firstPort?: number;
 }
 
@@ -197,24 +197,28 @@ export async function waitForListening(
   for (;;) {
     const failure = options.failure?.();
     if (failure) throw failure;
-    const connected = await new Promise<boolean>((resolve) => {
+    const connected = await new Promise<boolean>((resolve, reject) => {
       const socket = net.connect({ host: "127.0.0.1", port });
-      const finish = (value: boolean) => {
+      let settled = false;
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      const finish = (value: boolean, error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(deadlineTimer);
+        clearTimeout(settleTimer);
         socket.destroy();
-        resolve(value);
+        if (error) reject(error);
+        else resolve(value);
       };
+      const deadlineTimer = setTimeout(
+        () => finish(false, new Error(`nothing is listening on 127.0.0.1:${port} after ${timeoutMs}ms`)),
+        Math.max(0, deadline - Date.now()),
+      );
       socket.once("connect", () => {
         if (settleMs === 0) return finish(true);
-        const timer = setTimeout(() => finish(true), settleMs);
-        socket.once("close", () => {
-          clearTimeout(timer);
-          finish(false);
-        });
-        socket.once("error", () => {
-          clearTimeout(timer);
-          finish(false);
-        });
+        settleTimer = setTimeout(() => finish(true), settleMs);
       });
+      socket.once("close", () => finish(false));
       socket.once("error", () => finish(false));
     });
     if (connected) return;

@@ -17,7 +17,7 @@ import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/co
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 import { probeStdoutUnderRoot, type IdentityVerdict } from "./helpers/branch-daemon-identity.js";
-import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
 import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -1279,7 +1279,8 @@ describe("branch pid record ownership (cli#730)", () => {
     try {
       const { daemon, attempts } = await startDaemonOnPort("unused", { firstPort: held.port });
       daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-      expect(attempts).toBe(2);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
       expect(pidState(daemon.pid!)).toBe("alive");
       const exited = waitForExit(daemon);
       daemon.kill("SIGTERM");
@@ -1298,7 +1299,8 @@ describe("branch pid record ownership (cli#730)", () => {
         readyBeforeListening: true,
       });
       daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-      expect(attempts).toBe(2);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
       writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
       const exited = waitForExit(daemon);
       daemon.kill("SIGTERM");

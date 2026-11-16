@@ -106,24 +106,28 @@ describe("branch daemon SIGTERM with a host connected", () => {
         join(process.env.TPS_IDENTITY_DIR!, "host.json"),
         JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") })
       );
-      let stderr = "";
+      let output = { stderr: "" };
       let exited!: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
       const { result: channel } = await withPortRetry(async (port) => {
-        if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        if (child) {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          await exited;
+        }
+        const captured = { stderr: "" };
+        output = captured;
         writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
 
         const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
         delete env.TPS_BRANCH_DAEMON;
         child = spawn(runtime, [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
-        stderr = "";
         child.stderr?.on("data", (chunk) => {
-          stderr += String(chunk);
+          captured.stderr += String(chunk);
         });
         exited = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
-          child!.once("exit", (code, signal) => resolve({ code, signal }));
+          child!.once("close", (code, signal) => resolve({ code, signal }));
         });
 
-        return await connectHost(port, host, branch, () => bindErrorIn(stderr));
+        return await connectHost(port, host, branch, () => bindErrorIn(captured.stderr));
       });
       cleanups.push(() => {
         void channel.close();
@@ -143,7 +147,7 @@ describe("branch daemon SIGTERM with a host connected", () => {
           ? readFileSync(join(process.env.TPS_ROOT!, "branch.log"), "utf8")
           : "(no branch.log)";
         throw new Error(
-          `the daemon did not exit within ${EXIT_BOUND_MS}ms of SIGTERM with a host connected; stderr=${stderr}; log=${log}`
+          `the daemon did not exit within ${EXIT_BOUND_MS}ms of SIGTERM with a host connected; stderr=${output.stderr}; log=${log}`
         );
       }
       const elapsed = Date.now() - started;

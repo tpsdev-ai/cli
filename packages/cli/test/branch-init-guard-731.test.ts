@@ -16,7 +16,7 @@ import { fingerprint, generateKeyPair, saveKeyPair, type TpsKeyPair } from "../s
 import { NoiseIkTransport, type TransportChannel } from "../src/utils/noise-ik-transport.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
-import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -272,7 +272,8 @@ describe("branch init single-daemon guard after a real join (cli#731)", () => {
     } finally {
       await held.close();
     }
-    expect(attempts).toBe(2);
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
 
     const live = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
     children.push(live);

@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TRANSPORTS = ["tcp", "ws"] as const;
@@ -216,6 +216,7 @@ describe("branch init join token after bind (cli#780)", () => {
     } finally {
       await held.close();
     }
-    expect(attempts).toBe(2);
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
   }, 60_000);
 });

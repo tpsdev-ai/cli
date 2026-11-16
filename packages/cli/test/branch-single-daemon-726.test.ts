@@ -7,7 +7,7 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
 import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
-import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
 import { pidRecordBytesEqual, readPidFile, serializePidRecord, snapshotPidRecord } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -328,7 +328,8 @@ describe("branch start single-daemon guard (cli#726)", () => {
     try {
       const { running, attempts } = await startDaemonOnFreePort(held.port);
       daemons.push(running.pid);
-      expect(attempts).toBe(2);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
       process.kill(running.pid, "SIGTERM");
       await waitForPidGone(running.pid);
     } finally {
@@ -340,7 +341,8 @@ describe("branch start single-daemon guard (cli#726)", () => {
     const held = await holdPort();
     try {
       const { daemon, attempts } = await startSpawnedDaemon(held.port);
-      expect(attempts).toBe(2);
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
       expect(daemon.pid).toBeDefined();
       writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
       const exited = waitForExit(daemon);

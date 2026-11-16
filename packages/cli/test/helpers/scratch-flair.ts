@@ -247,19 +247,27 @@ export async function bootOnRetriedPorts(
   const { ports, result } = await withPortsRetry(2, async ([httpPort, opsPort]) => {
     const child = boot.spawn(httpPort!, opsPort!);
     const deadline = Date.now() + boot.timeoutMs;
-    const httpUp = await boot.ready(`http://127.0.0.1:${httpPort}/Health`, deadline);
-    if (!httpUp) {
+    try {
+      const httpUp = await boot.ready(`http://127.0.0.1:${httpPort}/Health`, deadline);
+      if (!httpUp) {
+        throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${child.log().slice(-2000)}`);
+      }
+      // The operations port is bound by the same child; a lost one is the same
+      // retryable bind failure as a lost HTTP port.
+      const opsUp = await boot.ready(`http://127.0.0.1:${opsPort}/health`, deadline);
+      if (!opsUp) {
+        throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${child.log().slice(-2000)}`);
+      }
+      const bindFailure = bindErrorIn(child.log());
+      if (bindFailure) throw bindFailure;
+      if (child.proc.exitCode !== null || child.proc.signalCode !== null) {
+        throw new Error(`scratch Flair exited before readiness: ${child.log().slice(-2000)}`);
+      }
+      return child;
+    } catch (error) {
       boot.stop(child.proc);
-      throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${child.log().slice(-2000)}`);
+      throw error;
     }
-    // The operations port is bound by the same child; a lost one is the same
-    // retryable bind failure as a lost HTTP port.
-    const opsUp = await boot.ready(`http://127.0.0.1:${opsPort}/health`, deadline);
-    if (!opsUp) {
-      boot.stop(child.proc);
-      throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${child.log().slice(-2000)}`);
-    }
-    return child;
   });
   return { httpPort: ports[0]!, opsPort: ports[1]!, log: result.log };
 }
