@@ -327,9 +327,15 @@ const lastAckScratchSweep = new Map<string, number>();
 export const mailAckScratchTestHooks: { now?: () => number } = {};
 
 /**
- * Sweep under the mailbox lock at most once per directory per process every
- * ten minutes, avoiding a directory scan on each ack during a bulk drain.
- * A leftover has no active writer, so collecting it on a later pass is enough.
+ * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
+ * lock, and removes it before releasing that lock. So any such name found in
+ * `dir` by code that holds the same lock is a leftover from a writer that died
+ * between creating the scratch and renaming it. Remove it, and report each
+ * attempt; a name that is not this exact shape is never touched.
+ *
+ * Sweep at most once per directory per process every ten minutes, so a bulk
+ * drain does not list the directory on every ack. A leftover has no live
+ * writer, so collecting it on a later pass is enough.
  */
 function removeLeftoverAckScratch(dir: string): void {
   dir = resolve(dir);
