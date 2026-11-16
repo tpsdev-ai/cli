@@ -1,5 +1,6 @@
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
+import { listenOn } from "../utils/listen-on.js";
 
 const DEFAULT_RESPONSES = [
   "I'll check my mail now.",
@@ -22,7 +23,7 @@ function loadScript(scriptPath?: string): string[] {
   return DEFAULT_RESPONSES;
 }
 
-export function startMockLLM(port = 11434, scriptPath?: string): ReturnType<typeof createServer> {
+export async function startMockLLM(port = 11434, scriptPath?: string): Promise<Server> {
   const responses = loadScript(scriptPath);
   let index = 0;
 
@@ -61,9 +62,14 @@ export function startMockLLM(port = 11434, scriptPath?: string): ReturnType<type
   });
 
   // SECURITY: bind to loopback only, never 0.0.0.0
-  server.listen(port, "127.0.0.1", () => {
-    console.log(`Mock LLM listening on http://127.0.0.1:${port}/v1`);
+  await listenOn(server, port, {
+    host: "127.0.0.1",
+    onError: (error) => {
+      console.error(`Mock LLM listener failed: ${error.message}`);
+      server.close();
+    },
   });
+  console.log(`Mock LLM listening on http://127.0.0.1:${port}/v1`);
 
   return server;
 }
@@ -72,5 +78,8 @@ export function startMockLLM(port = 11434, scriptPath?: string): ReturnType<type
 if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("mock-llm.ts")) {
   const port = Number(process.env.MOCK_LLM_PORT || 11434);
   const script = process.env.MOCK_LLM_SCRIPT;
-  startMockLLM(port, script);
+  startMockLLM(port, script).catch((error: unknown) => {
+    console.error(`Mock LLM failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
 }

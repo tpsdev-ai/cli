@@ -1,22 +1,12 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch, fingerprint } from "../src/utils/identity.js";
 import { listenForJoin, NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
 import { runBranch } from "../src/commands/branch.js";
-import { withPortRetry } from "./helpers/port.js";
-
-/** Wait (bounded) for a join listener to report the port it bound. */
-async function waitForBoundPort(port: () => number): Promise<number> {
-  const deadline = Date.now() + 5_000;
-  while (port() === 0) {
-    if (Date.now() >= deadline) throw new Error("join listener did not report its bound port");
-    await Bun.sleep(5);
-  }
-  return port();
-}
+import { waitForBoundPort } from "./helpers/port.js";
 
 describe("branch join handshake", () => {
   let tmpDir: string;
@@ -96,48 +86,47 @@ describe("branch join handshake", () => {
     process.env.TPS_REGISTRY_DIR = hostRegistryDir;
     registerBranch("branch-run", branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
 
-    const { port } = await withPortRetry(async (port) => {
-      // run branch in background
-      process.env.TPS_IDENTITY_DIR = branchIdentityDir;
-      const runP = runBranch({ action: "init", port, host: "127.0.0.1", transport: "tcp" });
-      // A taken port rejects runP before it can accept the join; surface that
-      // rejection so withPortRetry tries a new port instead of connecting.
-      const early = await Promise.race([
-        runP.then(() => null, (error: unknown) => error),
-        Bun.sleep(200).then(() => null),
-      ]);
-      if (early) throw early;
-
-      const hostTransport = new NoiseIkTransport(hostKp);
-      const ch = await hostTransport.connect({
-        host: "127.0.0.1",
-        port,
-        branchId: "branch-run",
-        hostPublicKey: branchKp.encryption.publicKey,
-      });
-
-      await ch.send({
-        type: MSG_JOIN_COMPLETE,
-        seq: 1,
-        ts: new Date().toISOString(),
-        body: {
-          hostPubkey: Buffer.from(hostKp.encryption.publicKey).toString("base64url"),
-          hostFingerprint: fingerprint(hostKp.encryption.publicKey),
-          hostId: "host",
-        },
-      });
-
-      await runP;
-
-      const hostFile = join(branchIdentityDir, "host.json");
-      expect(existsSync(hostFile)).toBe(true);
-      const saved = JSON.parse(readFileSync(hostFile, "utf-8"));
-      expect(saved.hostId).toBe("host");
-      expect(saved.fingerprint).toBe(fingerprint(hostKp.encryption.publicKey));
-
-      await ch.close();
-      return port;
+    // run branch in background; the in-process listener binds 0 itself and
+    // writes the port it got, so nothing picks a port and binds it later.
+    process.env.TPS_IDENTITY_DIR = branchIdentityDir;
+    const runP = runBranch({ action: "init", port: 0, host: "127.0.0.1", transport: "tcp" });
+    const confFile = join(tmpDir, "branch.conf.json");
+    const port = await waitForBoundPort(() => {
+      try {
+        return Number(JSON.parse(readFileSync(confFile, "utf-8")).port) || 0;
+      } catch {
+        return 0;
+      }
     });
+
+    const hostTransport = new NoiseIkTransport(hostKp);
+    const ch = await hostTransport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "branch-run",
+      hostPublicKey: branchKp.encryption.publicKey,
+    });
+
+    await ch.send({
+      type: MSG_JOIN_COMPLETE,
+      seq: 1,
+      ts: new Date().toISOString(),
+      body: {
+        hostPubkey: Buffer.from(hostKp.encryption.publicKey).toString("base64url"),
+        hostFingerprint: fingerprint(hostKp.encryption.publicKey),
+        hostId: "host",
+      },
+    });
+
+    await runP;
+
+    const hostFile = join(branchIdentityDir, "host.json");
+    expect(existsSync(hostFile)).toBe(true);
+    const saved = JSON.parse(readFileSync(hostFile, "utf-8"));
+    expect(saved.hostId).toBe("host");
+    expect(saved.fingerprint).toBe(fingerprint(hostKp.encryption.publicKey));
+
+    await ch.close();
     expect(port).toBeGreaterThan(0);
   });
 });

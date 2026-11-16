@@ -14,6 +14,7 @@ import {
 } from "./transport.js";
 import { decodeWireMessage, encodeWireMessage } from "./wire-frame.js";
 import { fingerprint, loadHostIdentity, lookupBranch, type TpsKeyPair } from "./identity.js";
+import { listenOn } from "./listen-on.js";
 import { JoinCompleteBodySchema, MSG_JOIN_COMPLETE } from "./wire-mail.js";
 import { handleGithubWebhook } from "./github-webhook.js";
 import snooplogg from "snooplogg";
@@ -30,27 +31,6 @@ function toBuffer(data: WebSocket.RawData): Buffer {
   if (Array.isArray(data)) return Buffer.concat(data.map((d) => Buffer.from(d)));
   if (data instanceof ArrayBuffer) return Buffer.from(data);
   return Buffer.from(data as any);
-}
-
-/**
- * Bind the HTTP server and settle once it accepts connections. A
- * WebSocketServer built over the server re-emits the server's `error`, so a
- * failed bind (EADDRINUSE) reaches this promise as its rejection; without a
- * listener that second emission is an uncaught `error` event that kills the
- * process before the caller can see the rejection. The WebSocketServer
- * listener is removed once listening, so a later socket error is not reported
- * as a listen failure.
- */
-function listenOn(httpServer: HttpServer, wss: WebSocketServer, port: number): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const onError = (error: Error) => reject(error);
-    wss.on("error", onError);
-    httpServer.once("error", reject);
-    httpServer.listen(port, "0.0.0.0", () => {
-      wss.off("error", onError);
-      resolve();
-    });
-  });
 }
 
 function waitForMessage(ws: WebSocket, timeoutMs: number): Promise<Buffer> {
@@ -289,7 +269,13 @@ export class WsNoiseTransport implements WireTransport {
       }
     });
 
-    await listenOn(httpServer, wss, port);
+    await listenOn(httpServer, port, {
+      also: wss,
+      onError: (error) => {
+        swarn("[listen] server error after bind:", error.message);
+        void wrapper.close().catch(() => {});
+      },
+    });
 
     return wrapper;
   }
@@ -403,7 +389,83 @@ export async function listenForJoinWs(
     secretKey: Buffer.from(branchKeyPair.encryption.privateKey),
   };
 
-  await listenOn(httpServer, wss, port);
+  let serverWrapper: TransportServer | null = null;
+
+  // A deferred join: the listener's failure path rejects it when an error
+  // arrives after the bind, and the timeout rejects it while waiting.
+  type JoinResult = {
+    channel: TransportChannel;
+    hostPubkey: Uint8Array;
+    hostFingerprint: string;
+    hostId: string;
+  };
+  let resolveJoin!: (value: JoinResult) => void;
+  let rejectJoin!: (error: Error) => void;
+  const joined = new Promise<JoinResult>((resolve, reject) => {
+    resolveJoin = resolve;
+    rejectJoin = reject;
+  });
+  // The caller awaits this promise after the listener is up; mark it handled
+  // until then so a bind-time rejection is never reported as unhandled.
+  joined.catch(() => {});
+
+  const timeout =
+    timeoutMs > 0
+      ? setTimeout(() => rejectJoin(new Error("JOIN_COMPLETE timeout")), timeoutMs)
+      : null;
+
+  wss.once("connection", async (ws) => {
+    try {
+      const responder = new Noise("IK", false, branchStatic);
+      responder.initialise(PROLOGUE);
+
+      const msg1 = await waitForMessage(ws, HANDSHAKE_TIMEOUT_MS);
+      responder.recv(msg1);
+
+      const msg2 = Buffer.from(responder.send());
+      ws.send(msg2);
+
+      const channel = new WsNoiseChannel(
+        ws,
+        new Cipher(responder.tx),
+        new Cipher(responder.rx),
+        fingerprint(Buffer.from(responder.rs))
+      );
+
+      const handler = (msg: TpsMessage) => {
+        if (msg.type !== MSG_JOIN_COMPLETE) return;
+        const parsed = JoinCompleteBodySchema.safeParse(msg.body);
+        if (!parsed.success) return;
+
+        const hostPub = new Uint8Array(Buffer.from(parsed.data.hostPubkey, "base64url"));
+        const fp = fingerprint(hostPub);
+        const claimed = parsed.data.hostFingerprint.replace(/^sha256:/, "");
+        if (fp !== claimed) {
+          channel.offMessage(handler);
+          rejectJoin(new Error("Host fingerprint mismatch in JOIN_COMPLETE"));
+          return;
+        }
+        if (timeout) clearTimeout(timeout);
+        channel.offMessage(handler);
+        resolveJoin({ channel, hostPubkey: hostPub, hostFingerprint: fp, hostId: parsed.data.hostId });
+      };
+
+      channel.onMessage(handler);
+    } catch (e) {
+      ws.close(1011, "handshake failed");
+      rejectJoin(e instanceof Error ? e : new Error(String(e)));
+    }
+  });
+
+  await listenOn(httpServer, port, {
+    also: wss,
+    onError: (error) => {
+      swarn("[join] listener error after bind:", error.message);
+      if (timeout) clearTimeout(timeout);
+      rejectJoin(error);
+      void serverWrapper?.close().catch(() => {});
+    },
+  });
   const boundPort = () => {
     const address = httpServer.address();
     return !address || typeof address === "string" ? 0 : address.port;
@@ -413,7 +475,7 @@ export async function listenForJoinWs(
   onListening?.(boundPort());
 
   // Wrap as a TransportServer (for close(); onConnection not used in join mode)
-  const serverWrapper: TransportServer = {
+  serverWrapper = {
     onConnection: () => {},
     port: boundPort,
     // Settles with a peer connected, and at once when already closed: terminate
@@ -428,61 +490,6 @@ export async function listenForJoinWs(
         server: httpServer,
       }),
   };
-
-  const joined = new Promise<{
-    channel: TransportChannel;
-    hostPubkey: Uint8Array;
-    hostFingerprint: string;
-    hostId: string;
-  }>((resolve, reject) => {
-    const timeout =
-      timeoutMs > 0
-        ? setTimeout(() => reject(new Error("JOIN_COMPLETE timeout")), timeoutMs)
-        : null;
-
-    wss.once("connection", async (ws) => {
-      try {
-        const responder = new Noise("IK", false, branchStatic);
-        responder.initialise(PROLOGUE);
-
-        const msg1 = await waitForMessage(ws, HANDSHAKE_TIMEOUT_MS);
-        responder.recv(msg1);
-
-        const msg2 = Buffer.from(responder.send());
-        ws.send(msg2);
-
-        const channel = new WsNoiseChannel(
-          ws,
-          new Cipher(responder.tx),
-          new Cipher(responder.rx),
-          fingerprint(Buffer.from(responder.rs))
-        );
-
-        const handler = (msg: TpsMessage) => {
-          if (msg.type !== MSG_JOIN_COMPLETE) return;
-          const parsed = JoinCompleteBodySchema.safeParse(msg.body);
-          if (!parsed.success) return;
-
-          const hostPub = new Uint8Array(Buffer.from(parsed.data.hostPubkey, "base64url"));
-          const fp = fingerprint(hostPub);
-          const claimed = parsed.data.hostFingerprint.replace(/^sha256:/, "");
-          if (fp !== claimed) {
-            channel.offMessage(handler);
-            reject(new Error("Host fingerprint mismatch in JOIN_COMPLETE"));
-            return;
-          }
-          if (timeout) clearTimeout(timeout);
-          channel.offMessage(handler);
-          resolve({ channel, hostPubkey: hostPub, hostFingerprint: fp, hostId: parsed.data.hostId });
-        };
-
-        channel.onMessage(handler);
-      } catch (e) {
-        ws.close(1011, "handshake failed");
-        reject(e);
-      }
-    });
-  });
 
   const result = await joined;
   return { ...result, server: serverWrapper };
@@ -517,6 +524,15 @@ export async function listenForHostWs(
 
   let connectionCallback: ((channel: TransportChannel) => void) | null = null;
 
+  const close = () =>
+    closeListener({
+      terminate: () => {
+        for (const client of wss.clients) client.terminate();
+        wss.close();
+      },
+      server: httpServer,
+    });
+
   wss.on("connection", async (ws) => {
     try {
       const responder = new Noise("IK", false, branchStatic);
@@ -547,7 +563,13 @@ export async function listenForHostWs(
     }
   });
 
-  await listenOn(httpServer, wss, port);
+  await listenOn(httpServer, port, {
+    also: wss,
+    onError: (error) => {
+      swarn("[host] listener error after bind:", error.message);
+      void close().catch(() => {});
+    },
+  });
 
   return {
     onConnection: (cb: (channel: TransportChannel) => void) => { connectionCallback = cb; },
@@ -565,13 +587,6 @@ export async function listenForHostWs(
     // and force-stop the server first; bun's `closeAllConnections()` stops it,
     // so the `close` callback that follows reports ERR_SERVER_NOT_RUNNING,
     // which here means "closed".
-    close: () =>
-      closeListener({
-        terminate: () => {
-          for (const client of wss.clients) client.terminate();
-          wss.close();
-        },
-        server: httpServer,
-      }),
+    close,
   };
 }

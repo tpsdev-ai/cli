@@ -267,10 +267,18 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
     proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
     proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
 
-    const up = await waitForOk(`http://127.0.0.1:${httpPort}/Health`, Date.now() + BOOT_TIMEOUT_MS, signal);
+    const deadline = Date.now() + BOOT_TIMEOUT_MS;
+    const up = await waitForOk(`http://127.0.0.1:${httpPort}/Health`, deadline, signal);
     if (!up) {
       try { proc.kill("SIGKILL"); } catch { /* already gone */ }
       throw bindErrorIn(log) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${log.slice(-2000)}`);
+    }
+    // The operations port is bound by the same child; a lost one is the same
+    // retryable bind failure as a lost HTTP port.
+    const opsUp = await waitForOk(`http://127.0.0.1:${opsPort}/health`, deadline, signal);
+    if (!opsUp) {
+      try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+      throw bindErrorIn(log) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${log.slice(-2000)}`);
     }
     return { log: () => log };
   });

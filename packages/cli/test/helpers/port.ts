@@ -3,31 +3,31 @@
  *
  * A test that asks the OS for a free port (bind 0, read the port, close) and
  * then binds that port later leaves a gap: anything can take the port in
- * between. Every listener this repo starts IN-PROCESS therefore binds port 0
- * itself and reports the port it got; a listener a CHILD process binds from
- * config is started through `withPortRetry`, which tries again with a new port
- * when the child reports EADDRINUSE.
+ * between. A test that starts a listener in-process therefore binds port 0 and
+ * reads back the port it reports; a start that binds ports from config (a
+ * child process) goes through `withPortsRetry`, which tries again with a new
+ * port when the child reports EADDRINUSE.
  */
 import net from "node:net";
 import type { AddressInfo } from "node:net";
 
-/** How many starts `withPortRetry` attempts before it gives up with the last error. */
+/** How many starts `withPortsRetry` attempts before it gives up with the last error. */
 export const PORT_ATTEMPTS = 5;
 
 /** True when `error` reports that the address was already in use. */
 export function isAddressInUse(error: unknown): boolean {
-  const code = (error as { code?: unknown } | null)?.code;
-  if (code === "EADDRINUSE") return true;
-  const text = error instanceof Error ? error.message : typeof error === "string" ? error : "";
-  return /EADDRINUSE|Is port \d+ in use\?|address already in use/i.test(text);
+  return (error as { code?: unknown } | null)?.code === "EADDRINUSE";
 }
+
+/** Address-in-use text a child writes to its output. */
+const ADDRESS_IN_USE_TEXT = /EADDRINUSE|Is port \d+ in use\?|address already in use/i;
 
 /**
  * The bind failure a child reported in its output, as an error that
- * `withPortRetry` will retry on; undefined while the output names none.
+ * `withPortsRetry` will retry on; undefined while the output names none.
  */
 export function bindErrorIn(output: string): (Error & { code: string }) | undefined {
-  if (!isAddressInUse(output)) return undefined;
+  if (!ADDRESS_IN_USE_TEXT.test(output)) return undefined;
   return Object.assign(new Error(output), { code: "EADDRINUSE" });
 }
 
@@ -61,6 +61,20 @@ export function listeningPort(server: net.Server): number {
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("server is not bound to a TCP port");
   return (address as AddressInfo).port;
+}
+
+/**
+ * Wait (bounded) until `read` reports a non-zero port, then return it. For a
+ * listener started in-process with port 0, which reports the port it got.
+ */
+export async function waitForBoundPort(read: () => number, timeoutMs = 5_000): Promise<number> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const port = read();
+    if (port > 0) return port;
+    if (Date.now() >= deadline) throw new Error("listener did not report its bound port");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
 }
 
 export interface PortRetryOptions {
