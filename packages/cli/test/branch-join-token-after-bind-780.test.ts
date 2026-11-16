@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { bindErrorIn, holdPort as holdOccupiedPort, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TRANSPORTS = ["tcp", "ws"] as const;
@@ -32,29 +32,6 @@ function launcherEnv(): NodeJS.ProcessEnv {
   delete env.TPS_IDENTITY_DIR;
   delete env.TPS_REGISTRY_DIR;
   return env;
-}
-
-/** Listen on an ephemeral port and keep the listener open. */
-function holdPort(): Promise<{ server: net.Server; port: number }> {
-  return new Promise((resolvePort, rejectPort) => {
-    const server = net.createServer();
-    server.once("error", rejectPort);
-    server.listen(0, "0.0.0.0", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        rejectPort(new Error("no address"));
-        return;
-      }
-      resolvePort({ server, port: address.port });
-    });
-  });
-}
-
-async function closeServer(server: net.Server): Promise<void> {
-  await new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => (error ? rejectClose(error) : resolveClose()));
-  });
 }
 
 function spawnInit(port: number, transport: (typeof TRANSPORTS)[number]): ChildProcess {
@@ -181,7 +158,7 @@ afterEach(async () => {
 describe("branch init join token after bind (cli#780)", () => {
   for (const transport of TRANSPORTS) {
     test(`${transport}: a bound port exits non-zero, names it, and prints no token`, async () => {
-      const { server, port } = await holdPort();
+      const { port, close } = await holdPort();
       try {
         const child = spawnInit(port, transport);
         const { code, output } = await collect(child);
@@ -192,7 +169,7 @@ describe("branch init join token after bind (cli#780)", () => {
         expect(output).not.toContain("Join token");
         expect(output).not.toContain(`Listening on 0.0.0.0:${port}`);
       } finally {
-        await closeServer(server);
+        await close();
       }
     }, 60_000);
 
@@ -217,7 +194,7 @@ describe("branch init join token after bind (cli#780)", () => {
   }
 
   test("tcp: a taken first port is retried and the token appears on a free one", async () => {
-    const held = await holdOccupiedPort();
+    const held = await holdPort();
     let attempts = 0;
     try {
       const { port } = await withPortRetry(async (port) => {

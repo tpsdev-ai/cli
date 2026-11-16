@@ -171,9 +171,10 @@ export async function startServiceProxies(
         },
       });
       servers.push(server);
+      const address = server.address();
       handles.push({
         name: serviceName,
-        port: svc.localPort,
+        port: !address || typeof address === "string" ? 0 : address.port,
         close: () => server.close(),
       });
     }

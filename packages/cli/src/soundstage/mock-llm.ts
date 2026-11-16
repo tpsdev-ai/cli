@@ -69,7 +69,9 @@ export async function startMockLLM(port = 11434, scriptPath?: string): Promise<S
       server.close();
     },
   });
-  console.log(`Mock LLM listening on http://127.0.0.1:${port}/v1`);
+  const address = server.address();
+  const boundPort = !address || typeof address === "string" ? 0 : address.port;
+  console.log(`Mock LLM listening on http://127.0.0.1:${boundPort}/v1`);
 
   return server;
 }

@@ -123,33 +123,53 @@ export async function withPortsRetry<T>(
   throw lastError;
 }
 
-/** Hold a loopback port open for the life of a case. Like a real listener, it
- *  keeps accepted sockets open; `close` destroys them and the server. */
+/** Hold a port for the life of a case, so that binding it on the wildcard
+ *  address or on loopback fails with EADDRINUSE. On darwin a listener on
+ *  0.0.0.0 does not stop a bind to 127.0.0.1 on the same port, or the
+ *  reverse, so the holder binds both; where the wildcard listener already
+ *  blocks loopback (Linux), the loopback bind fails with EADDRINUSE and is
+ *  skipped. Like a real listener, it keeps accepted sockets open; `close`
+ *  destroys them and the servers. */
 export async function holdPort(): Promise<{ port: number; close: () => Promise<void> }> {
   const sockets = new Set<net.Socket>();
-  const server = net.createServer((socket) => {
-    sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
-    socket.on("error", () => {});
-  });
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => resolve());
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    throw new Error("no address");
-  }
-  return {
-    port: address.port,
-    close: () =>
-      new Promise<void>((resolve, reject) => {
-        for (const socket of sockets) socket.destroy();
-        sockets.clear();
-        server.close((error) => (error ? reject(error) : resolve()));
-      }),
+  const servers: net.Server[] = [];
+  const bind = async (port: number, host: string): Promise<net.Server> => {
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => resolve());
+    });
+    servers.push(server);
+    return server;
   };
+  const close = async (): Promise<void> => {
+    for (const socket of sockets) socket.destroy();
+    sockets.clear();
+    await Promise.all(
+      servers.splice(0).map(
+        (server) =>
+          new Promise<void>((resolve, reject) => {
+            server.close((error) => (error ? reject(error) : resolve()));
+          }),
+      ),
+    );
+  };
+  try {
+    const port = listeningPort(await bind(0, "0.0.0.0"));
+    try {
+      await bind(port, "127.0.0.1");
+    } catch (error) {
+      if (!isAddressInUse(error)) throw error;
+    }
+    return { port, close };
+  } catch (error) {
+    await close();
+    throw error;
+  }
 }
 
 /** `withPortsRetry` for the common one-port case. */

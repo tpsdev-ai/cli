@@ -1,5 +1,4 @@
 import { expect, test } from "bun:test";
-import net from "node:net";
 import * as http from "node:http";
 import { createServer, type Server } from "node:http";
 import { Writable } from "node:stream";
@@ -14,28 +13,10 @@ import { listenForHostWs, listenForJoinWs, WsNoiseTransport } from "../src/utils
 import { startServiceProxies } from "../src/utils/service-proxy-branch.js";
 import { OpenClawAdapter } from "../src/bridge/openclaw-adapter.js";
 import { startMockLLM } from "../src/soundstage/mock-llm.js";
-import { boundPort } from "./helpers/port.js";
+import { boundPort, holdPort, listeningPort } from "./helpers/port.js";
 import { createPatchShared } from "./helpers/patch-shared.js";
 
 const patchShared = createPatchShared();
-
-/** Bind a listener so the port is genuinely taken, and return it with its port. */
-async function occupyPort(): Promise<{ port: number; close: () => Promise<void> }> {
-  const server = net.createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "0.0.0.0", () => resolve());
-  });
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("no address");
-  return {
-    port: address.port,
-    close: () =>
-      new Promise<void>((resolve) => {
-        server.close(() => resolve());
-      }),
-  };
-}
 
 /** Record the HTTP servers that bind a port until `restore` is called. */
 function watchBinds(): { servers: Server[]; restore: () => void } {
@@ -134,7 +115,7 @@ async function until(predicate: () => boolean, timeoutMs = 2_000): Promise<void>
 }
 
 test("a bind failure rejects listenForHostWs and raises no uncaught error", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const uncaught: string[] = [];
   const onUncaught = (error: unknown) => {
     uncaught.push(error instanceof Error ? error.message : String(error));
@@ -167,7 +148,7 @@ test("a bind failure rejects listenForHostWs and raises no uncaught error", asyn
 });
 
 test("a bind failure rejects WsNoiseTransport.listen and raises no uncaught error", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const host = generateKeyPair();
   const uncaught = trackUncaught();
   let outcome: "resolved" | { rejection: unknown } = "resolved";
@@ -190,7 +171,7 @@ test("a bind failure rejects WsNoiseTransport.listen and raises no uncaught erro
 });
 
 test("a bind failure rejects startServiceProxies and raises no uncaught error", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const uncaught: string[] = [];
   const onUncaught = (error: unknown) => {
     uncaught.push(error instanceof Error ? error.message : String(error));
@@ -222,7 +203,7 @@ test("a bind failure rejects startServiceProxies and raises no uncaught error", 
 });
 
 test("a bind failure rejects OpenClawAdapter.start and raises no uncaught error", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const uncaught: string[] = [];
   const onUncaught = (error: unknown) => {
     uncaught.push(error instanceof Error ? error.message : String(error));
@@ -250,7 +231,7 @@ test("a bind failure rejects OpenClawAdapter.start and raises no uncaught error"
 });
 
 test("a bind failure rejects startMockLLM and raises no uncaught error", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const uncaught: string[] = [];
   const onUncaught = (error: unknown) => {
     uncaught.push(error instanceof Error ? error.message : String(error));
@@ -397,7 +378,7 @@ test("a post-bind error rejects the pending join and clears its timer", async ()
 }, 10_000);
 
 test("a bind failure rejects listenForJoinWs and clears its join timer", async () => {
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   const branch = generateKeyPair();
   const timers = watchTimers(120_000);
   const uncaught = trackUncaught();
@@ -506,7 +487,7 @@ test("service proxies roll back over a real transport channel", async () => {
   let watch: ReturnType<typeof watchBinds> | undefined;
   let client: WsNoiseTransport | undefined;
   let proxies: Awaited<ReturnType<typeof startServiceProxies>> | undefined;
-  const occupied = await occupyPort();
+  const occupied = await holdPort();
   try {
     listener = await hostTransport.listen(0);
     watch = watchBinds();
@@ -531,6 +512,7 @@ test("service proxies roll back over a real transport channel", async () => {
     expect(proxies.handles).toHaveLength(1);
     const firstProxy = watch.servers[0]!;
     await until(() => firstProxy.listening);
+    expect(proxies.handles[0]!.port).toBe(listeningPort(firstProxy));
 
     // A later proxy's port is taken: the start rejects, and the proxies it had
     // already bound are removed.
