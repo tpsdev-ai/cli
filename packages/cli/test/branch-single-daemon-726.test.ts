@@ -4,10 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
-import { bindErrorIn, holdPort, waitForListening as waitForPortListening, withPortRetry } from "./helpers/port.js";
-import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
+import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
+import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { pidRecordBytesEqual, readPidFile, serializePidRecord, snapshotPidRecord } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 10_000;
@@ -19,7 +20,7 @@ let savedEnv: Record<string, string | undefined>;
 const daemons: number[] = [];
 const children: ChildProcess[] = [];
 
-function prepareBranch(port: number): void {
+function prepareBranch(port: number): { branch: TpsKeyPair; host: TpsKeyPair } {
   const branch = generateKeyPair();
   const host = generateKeyPair();
   saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
@@ -28,6 +29,7 @@ function prepareBranch(port: number): void {
     JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
   );
   writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+  return { branch, host };
 }
 
 function startToken(pid: number): string {
@@ -54,7 +56,54 @@ function logSince(offset: number): string {
   }
 }
 
-/** Launch a real daemon and wait until it accepts connections on its port. */
+/** Wait until only the daemon answers a bounded Noise handshake under the
+ *  branch key it was started with; a foreign listener that holds the port
+ *  cannot answer it. The attempt's failure predicate is checked before every
+ *  wait and before any deadline throw. */
+async function waitForDaemonReady(
+  port: number,
+  branch: TpsKeyPair,
+  host: TpsKeyPair,
+  failure?: () => Error | undefined,
+): Promise<void> {
+  const deadline = Date.now() + WAIT_MS;
+  for (;;) {
+    const failed = failure?.();
+    if (failed) throw failed;
+    const transport = new NoiseIkTransport(host);
+    const pending = transport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "agent-a",
+      hostPublicKey: branch.encryption.publicKey,
+    });
+    pending.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const channel = await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("connect attempt did not settle")), 500);
+        }),
+      ]);
+      await channel.close();
+      return;
+    } catch {
+      transport.close();
+      void pending.then((channel) => channel.close()).catch(() => {});
+    } finally {
+      clearTimeout(timer);
+    }
+    if (Date.now() >= deadline) {
+      const failed = failure?.();
+      if (failed) throw failed;
+      throw new Error(`daemon did not answer a Noise handshake on 127.0.0.1:${port}`);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+  }
+}
+
+/** Launch a real daemon and wait until it answers a Noise handshake on its port. */
 async function startDaemonOnFreePort(
   firstPort?: number,
 ): Promise<{ running: { pid: number; startToken: string }; output: string; attempts: number }> {
@@ -62,10 +111,8 @@ async function startDaemonOnFreePort(
   const { result } = await withPortRetry(
     async (port) => {
       attempts += 1;
-      prepareBranch(port);
-      // A failed attempt leaves its record and config behind; neither may name
-      // this attempt's daemon or block its bind.
-      rmSync(pidFile, { force: true });
+      const { branch, host } = prepareBranch(port);
+      const before = snapshotPidRecord(pidFile);
       const offset = logSize();
       const started = spawnSync("node", [TPS_BIN, "branch", "start"], {
         env: launcherEnv(),
@@ -76,18 +123,27 @@ async function startDaemonOnFreePort(
       const failure = (): Error | undefined => bindErrorIn(logSince(offset) + (started.stderr ?? ""));
       try {
         const running = await waitForRunningRecord(failure);
-        await waitForPortListening(port, { timeoutMs: 8_000, failure, settleMs: 150 });
+        await waitForDaemonReady(port, branch, host, failure);
         if (pidState(running.pid) !== "alive") throw new Error(`daemon ${running.pid} exited after start`);
         return { running, output: started.stdout ?? "" };
       } catch (error) {
-        const state = readPidFile(pidFile);
+        // Keep what the caller set up: remove only a record this attempt
+        // wrote, and only after that attempt's process has stopped.
+        const written = snapshotPidRecord(pidFile);
+        const state = written.state;
+        let stopped = state.kind === "stale";
         if (state.kind === "running") {
           try {
             process.kill(state.pid, "SIGKILL");
+            await waitForPidGone(state.pid);
+            stopped = true;
           } catch {
-            /* already gone */
+            /* not confirmed stopped: leave the record */
           }
-          await waitForPidGone(state.pid).catch(() => {});
+        }
+        if (stopped && !pidRecordBytesEqual(written.raw, before.raw)) {
+          const after = snapshotPidRecord(pidFile);
+          if (pidRecordBytesEqual(after.raw, written.raw)) rmSync(pidFile, { force: true });
         }
         throw error;
       }
@@ -104,7 +160,7 @@ async function startSpawnedDaemon(
   const { port, result: daemon } = await withPortRetry(
     async (port) => {
       attempts += 1;
-      prepareBranch(port);
+      const { branch, host } = prepareBranch(port);
       rmSync(pidFile, { force: true });
       const offset = logSize();
       let stderr = "";
@@ -112,7 +168,7 @@ async function startSpawnedDaemon(
       const child = spawnDaemon((text) => {
         stderr += text;
       });
-      child.once("exit", (code, signal) => {
+      child.once("close", (code, signal) => {
         exited = { code, signal };
       });
       const failure = (): Error | undefined => {
@@ -126,7 +182,7 @@ async function startSpawnedDaemon(
       };
       try {
         await waitForLogStarted(offset, failure);
-        await waitForPortListening(port, { timeoutMs: 8_000, failure, settleMs: 150 });
+        await waitForDaemonReady(port, branch, host, failure);
         return child;
       } catch (error) {
         try {
@@ -280,6 +336,22 @@ describe("branch start single-daemon guard (cli#726)", () => {
     }
   }, 30_000);
 
+  test("a direct-spawn daemon retries onto a free port after its first port is taken", async () => {
+    const held = await holdPort();
+    try {
+      const { daemon, attempts } = await startSpawnedDaemon(held.port);
+      expect(attempts).toBe(2);
+      expect(daemon.pid).toBeDefined();
+      writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+      const exited = waitForExit(daemon);
+      daemon.kill("SIGTERM");
+      expect(await exited).toEqual({ code: 0, signal: null });
+      expect(existsSync(pidFile)).toBe(false);
+    } finally {
+      await held.close();
+    }
+  }, 40_000);
+
   test("a second start is refused while the recorded process runs and spawns nothing", async () => {
     const { running } = await startDaemonOnFreePort();
     daemons.push(running.pid);
@@ -309,6 +381,8 @@ describe("branch start single-daemon guard (cli#726)", () => {
     prepareBranch(0);
     const stalePid = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stalePid, null));
+    // The record is stale, not absent: the first launch must replace it.
+    expect(readPidFile(pidFile).kind).toBe("stale");
 
     const { running, output } = await startDaemonOnFreePort();
     daemons.push(running.pid);

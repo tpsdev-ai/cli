@@ -154,9 +154,14 @@ function waitForToken(child: ChildProcess): Promise<number> {
     // attempt rejects at once instead of waiting out the deadline.
     child.stdout?.on("data", onData);
     child.stderr?.on("data", onData);
-    child.once("exit", (code) => {
+    // Classify the drained output when the child closes: "exit" can fire
+    // before a piped stderr has drained, so a bind error can be missed.
+    child.once("close", (code) => {
       clearTimeout(timer);
-      rejectToken(new Error(`branch init exited (code ${code}) before printing a join token: ${output}`));
+      rejectToken(
+        bindErrorIn(output) ??
+          new Error(`branch init exited (code ${code}) before printing a join token: ${output}`),
+      );
     });
   });
 }

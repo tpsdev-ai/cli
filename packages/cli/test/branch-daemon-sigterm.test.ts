@@ -25,16 +25,33 @@ async function connectHost(
   for (;;) {
     const failed = failure?.();
     if (failed) throw failed;
+    const transport = new NoiseIkTransport(host);
+    const pending = transport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "agent-a",
+      hostPublicKey: branch.encryption.publicKey,
+    });
+    pending.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await new NoiseIkTransport(host).connect({
-        host: "127.0.0.1",
-        port,
-        branchId: "agent-a",
-        hostPublicKey: branch.encryption.publicKey,
-      });
+      return await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("connect attempt did not settle")), 500);
+        }),
+      ]);
     } catch (error) {
-      if (Date.now() >= deadline) throw error;
+      transport.close();
+      void pending.then((channel) => channel.close()).catch(() => {});
+      if (Date.now() >= deadline) {
+        const failed = failure?.();
+        if (failed) throw failed;
+        throw error;
+      }
       await new Promise((resolve) => setTimeout(resolve, 50));
+    } finally {
+      clearTimeout(timer);
     }
   }
 }

@@ -372,16 +372,18 @@ test("a post-bind error rejects the pending join and clears its timer", async ()
   });
   let rejection: unknown;
   let text = "";
+  let server: Server | undefined;
   try {
     joined.catch(() => {});
     await until(() => bound);
-    const server = watch.servers[0]!;
+    server = watch.servers[0]!;
     server.emit("error", new Error("post-bind"));
     rejection = await joined.then(() => undefined, (error: unknown) => error);
     await until(() => !server.listening);
   } finally {
     watch.restore();
     timers.stop();
+    if (server?.listening) await new Promise<void>((resolveClose) => server!.close(() => resolveClose()));
     text = warnings.text();
     warnings.stop();
     uncaught.stop();
@@ -469,13 +471,15 @@ test("a post-bind error runs OpenClawAdapter.start's failure path", async () => 
 test("a post-bind error runs startMockLLM's failure path", async () => {
   const consoleErrors = captureConsoleError();
   const uncaught = trackUncaught();
+  let server: Server | undefined;
   try {
-    const server = await startMockLLM(0);
+    server = await startMockLLM(0);
     server.emit("error", new Error("post-bind"));
-    await until(() => !server.listening);
+    await until(() => !server!.listening);
   } finally {
     consoleErrors.stop();
     uncaught.stop();
+    if (server?.listening) await new Promise<void>((resolveClose) => server!.close(() => resolveClose()));
   }
 
   expect(uncaught.errors).toEqual([]);

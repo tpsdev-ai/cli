@@ -94,8 +94,8 @@ async function connectToBranch(
     pending.catch(() => {});
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      // A port held by another listener accepts and drops the socket; bound
-      // each attempt so the bind-error check is reached without the noise
+      // A port held by another listener cannot answer the Noise handshake;
+      // bound each attempt so the bind-error check is reached without the
       // handshake's own timeout.
       return await Promise.race([
         pending,
@@ -240,7 +240,7 @@ describe("branch init single-daemon guard after a real join (cli#731)", () => {
         );
         children.push(init);
         started.push({ pid: init.pid!, startToken: startToken(init.pid!) });
-        init.once("exit", (code, signal) => {
+        init.once("close", (code, signal) => {
           exit = { code, signal };
         });
         init.stdout?.on("data", (chunk) => {

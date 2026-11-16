@@ -123,9 +123,15 @@ export async function withPortsRetry<T>(
   throw lastError;
 }
 
-/** Hold a loopback port open for the life of a case. A connection is dropped. */
+/** Hold a loopback port open for the life of a case. Like a real listener, it
+ *  keeps accepted sockets open; `close` destroys them and the server. */
 export async function holdPort(): Promise<{ port: number; close: () => Promise<void> }> {
-  const server = net.createServer((socket) => socket.destroy());
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
+    socket.on("error", () => {});
+  });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, "127.0.0.1", () => resolve());
@@ -139,6 +145,8 @@ export async function holdPort(): Promise<{ port: number; close: () => Promise<v
     port: address.port,
     close: () =>
       new Promise<void>((resolve, reject) => {
+        for (const socket of sockets) socket.destroy();
+        sockets.clear();
         server.close((error) => (error ? reject(error) : resolve()));
       }),
   };
@@ -177,8 +185,6 @@ export async function waitForListening(
       };
       socket.once("connect", () => {
         if (settleMs === 0) return finish(true);
-        // A port held by another listener accepts and closes at once; the
-        // real listener keeps the connection open, so only that counts.
         const timer = setTimeout(() => finish(true), settleMs);
         socket.once("close", () => {
           clearTimeout(timer);

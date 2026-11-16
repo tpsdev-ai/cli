@@ -11,13 +11,14 @@ import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
 import { hostStatePath, writeHostState } from "../src/utils/connection-state.js";
 import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 import { probeStdoutUnderRoot, type IdentityVerdict } from "./helpers/branch-daemon-identity.js";
 import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
+import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -50,7 +51,7 @@ function logSince(offset: number): string {
   }
 }
 
-function prepareBranch(port: number): void {
+function prepareBranch(port: number): { branch: TpsKeyPair; host: TpsKeyPair } {
   const branch = generateKeyPair();
   const host = generateKeyPair();
   saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
@@ -59,6 +60,7 @@ function prepareBranch(port: number): void {
     JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
   );
   writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+  return { branch, host };
 }
 
 function startToken(pid: number): string {
@@ -108,16 +110,24 @@ async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_M
   }
 }
 
-async function waitForReady(phase: string, daemonPid?: number): Promise<string> {
+async function waitForReady(
+  phase: string,
+  daemonPid?: number,
+  failure?: () => Error | undefined,
+): Promise<string> {
   try {
     return await waitFor(
       () => {
+        const failed = failure?.();
+        if (failed) throw failed;
         const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
         return name === undefined ? null : join(pauseDir, name);
       },
       `pause ${phase}`,
     );
   } catch (error) {
+    const failed = failure?.();
+    if (failed !== undefined) throw failed;
     throw new Error(`${(error as Error).message}; ${daemonState(daemonPid)}`);
   }
 }
@@ -177,37 +187,50 @@ async function waitForLogStarted(offset = 0, failure?: () => Error | undefined):
   );
 }
 
-async function waitForListening(port: number, failure?: () => Error | undefined, settleMs = 0): Promise<void> {
-  const net = await import("node:net");
+/** Wait until only the daemon answers a bounded Noise handshake under the
+ *  branch key it was started with; a foreign listener that holds the port
+ *  cannot answer it. The attempt's failure predicate is checked before every
+ *  wait and before any deadline throw. */
+async function waitForDaemonReady(
+  port: number,
+  branch: TpsKeyPair,
+  host: TpsKeyPair,
+  failure?: () => Error | undefined,
+): Promise<void> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
     const failed = failure?.();
     if (failed) throw failed;
-    const connected = await new Promise<boolean>((resolveConnect) => {
-      const socket = net.connect({ host: "127.0.0.1", port });
-      const finish = (value: boolean) => {
-        socket.destroy();
-        resolveConnect(value);
-      };
-      socket.once("connect", () => {
-        if (settleMs === 0) return finish(true);
-        // A port held by another listener accepts and closes at once; the
-        // real listener keeps the connection open, so only that counts.
-        const timer = setTimeout(() => finish(true), settleMs);
-        socket.once("close", () => {
-          clearTimeout(timer);
-          finish(false);
-        });
-        socket.once("error", () => {
-          clearTimeout(timer);
-          finish(false);
-        });
-      });
-      socket.once("error", () => finish(false));
+    const transport = new NoiseIkTransport(host);
+    const pending = transport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "agent-a",
+      hostPublicKey: branch.encryption.publicKey,
     });
-    if (connected) return;
-    if (Date.now() >= deadline) throw new Error(`daemon did not listen on 127.0.0.1:${port}`);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    pending.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const channel = await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("connect attempt did not settle")), 500);
+        }),
+      ]);
+      await channel.close();
+      return;
+    } catch {
+      transport.close();
+      void pending.then((channel) => channel.close()).catch(() => {});
+    } finally {
+      clearTimeout(timer);
+    }
+    if (Date.now() >= deadline) {
+      const failed = failure?.();
+      if (failed) throw failed;
+      throw new Error(`daemon did not answer a Noise handshake on 127.0.0.1:${port}`);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
 }
 
@@ -279,14 +302,14 @@ function spawnDaemon(phase: string, onStderr: (text: string) => void = () => {})
 /** One daemon start on `port`: only this attempt's log lines and stderr are
  *  read, and a failed child is killed before the caller retries. */
 async function startDaemonAttempt(port: number, phase: string, readyBeforeListening: boolean): Promise<ChildProcess> {
-  prepareBranch(port);
+  const { branch, host } = prepareBranch(port);
   const offset = logSize();
   let stderr = "";
   let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   const daemon = spawnDaemon(phase, (text) => {
     stderr += text;
   });
-  daemon.once("exit", (code, signal) => {
+  daemon.once("close", (code, signal) => {
     exited = { code, signal };
   });
   const failure = (): Error | undefined => {
@@ -300,8 +323,8 @@ async function startDaemonAttempt(port: number, phase: string, readyBeforeListen
   };
   try {
     await waitForLogStarted(offset, failure);
-    if (readyBeforeListening) await waitForReady(phase, daemon.pid);
-    await waitForListening(port, failure, 150);
+    if (readyBeforeListening) await waitForReady(phase, daemon.pid, failure);
+    await waitForDaemonReady(port, branch, host, failure);
     return daemon;
   } catch (error) {
     try {
@@ -1261,6 +1284,28 @@ describe("branch pid record ownership (cli#730)", () => {
       const exited = waitForExit(daemon);
       daemon.kill("SIGTERM");
       expect(await exited).toEqual({ code: 0, signal: null });
+    } finally {
+      await held.close();
+    }
+  }, 40_000);
+
+  test("a paused start retries onto a free port after its first port is taken", async () => {
+    const held = await holdPort();
+    const phase = "listening-before-steady-state";
+    try {
+      const { daemon, attempts } = await startDaemonOnPort(phase, {
+        firstPort: held.port,
+        readyBeforeListening: true,
+      });
+      daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
+      expect(attempts).toBe(2);
+      writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+      const exited = waitForExit(daemon);
+      daemon.kill("SIGTERM");
+      expect(await exited).toEqual({ code: 0, signal: null });
+      expect(stoppedCount()).toBe(1);
+      expect(readPidFile(pidFile).kind).toBe("missing");
+      expect(pidExited(daemon.pid!)).toBe(true);
     } finally {
       await held.close();
     }
