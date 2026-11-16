@@ -27,7 +27,6 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -50,6 +49,7 @@ type Report = {
   replyHeaders?: Record<string, string> | null;
   curFiles: string[];
   curEntries: CurEntry[];
+  curEntriesSettled: CurEntry[];
   curRecord: { id?: string; ackedAt?: unknown } | null;
   obligationRecord: { state?: string } | null;
   inboundNewFiles: string[];
@@ -69,23 +69,18 @@ function describeCurEntries(entries: CurEntry[]): string {
 }
 
 /**
- * Exactly one INBOUND MESSAGE in cur/, counted by the mailbox's own name rule.
- *
- * The ack path replaces the cur/ record atomically: updateExistingRecord writes
- * a hidden `.ack-<uuid>.tmp` scratch in the SAME directory, fsyncs it and
- * renames it over the record. A listing taken during that window sees the
- * record and the transient scratch; the scratch is not a mail message (its
- * name starts with a dot), so it is reported but not counted. A second
- * inbound message file still fails.
+ * Exactly one entry in cur/, counted with NO name filter, after the gateway has
+ * stopped. No writer is left, so an extra entry cannot be excused as transient:
+ * a leaked `.ack-<uuid>.tmp` scratch fails like any other entry. On a count
+ * mismatch the message names every entry with its size.
  */
-function expectOneInbound(entries: CurEntry[], inboundId: string): void {
-  const messages = entries.filter((entry) => isMailboxMessageFile(entry.name));
-  if (messages.length !== 1) {
+function expectOneSettledCurEntry(entries: CurEntry[], inboundId: string): void {
+  if (entries.length !== 1) {
     throw new Error(
-      `expected 1 inbound message in cur/, found ${messages.length}; cur/ entries: ${describeCurEntries(entries)}`,
+      `expected exactly 1 entry in settled cur/, found ${entries.length}; cur/ entries: ${describeCurEntries(entries)}`,
     );
   }
-  expect(messages[0]?.name).toContain(inboundId);
+  expect(entries[0]?.name).toContain(inboundId);
 }
 
 function runDriver(): { status: number | null; stdout: string; stderr: string; report: Report | null; root: string } {
@@ -130,7 +125,7 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       expect(r.replyFrom).toBe("agent-a");
       expect(r.replyTo).toBe("agent-b");
       expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
-      expectOneInbound(r.curEntries, r.inboundId!);
+      expectOneSettledCurEntry(r.curEntriesSettled, r.inboundId!);
       expect(r.replyCountAfterAck).toBe(1);
       expect(r.replyCountAfterStop).toBe(1);
       expect(r.inboundNewFiles).toEqual([]);
@@ -152,7 +147,7 @@ describe("cli#1020 — the cur/ assertion reports what it found", () => {
     return readdirSync(dir).map((name) => ({ name, size: statSync(join(dir, name)).size }));
   }
 
-  it("names every entry when cur/ holds two inbound messages", () => {
+  it("names every entry when the settled cur/ holds two inbound messages", () => {
     const dir = mkdtempSync(join(tmpdir(), "tps-cur-entries-"));
     try {
       writeFileSync(join(dir, "2026-01-01T00-00-00-000Z-msg-one.json"), "{\"id\":\"msg-one\"}");
@@ -160,7 +155,7 @@ describe("cli#1020 — the cur/ assertion reports what it found", () => {
       const entries = entriesIn(dir);
       let message = "";
       try {
-        expectOneInbound(entries, "msg-one");
+        expectOneSettledCurEntry(entries, "msg-one");
       } catch (err) {
         message = String((err as Error).message);
       }
@@ -172,12 +167,21 @@ describe("cli#1020 — the cur/ assertion reports what it found", () => {
     }
   });
 
-  it("reports, but does not count, the ack stamp's transient scratch", () => {
-    const dir = mkdtempSync(join(tmpdir(), "tps-cur-scratch-"));
+  it("fails the settled assertion on a leaked ack scratch beside the record", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-cur-leak-"));
     try {
       writeFileSync(join(dir, "2026-01-01T00-00-00-000Z-msg-one.json"), "{\"id\":\"msg-one\"}");
-      writeFileSync(join(dir, ".ack-3f2b.tmp"), "{}");
-      expectOneInbound(entriesIn(dir), "msg-one");
+      writeFileSync(join(dir, ".ack-7c1a9d2e-4b3f-4a51-9c8e-1f2d3e4a5b6c.tmp"), "{}");
+      const entries = entriesIn(dir);
+      let message = "";
+      try {
+        expectOneSettledCurEntry(entries, "msg-one");
+      } catch (err) {
+        message = String((err as Error).message);
+      }
+      expect(message).toContain("found 2");
+      expect(message).toContain("msg-one.json");
+      expect(message).toContain(".ack-7c1a9d2e-4b3f-4a51-9c8e-1f2d3e4a5b6c.tmp");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

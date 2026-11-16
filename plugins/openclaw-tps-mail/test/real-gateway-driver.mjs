@@ -15,9 +15,9 @@
  *      one signed mail into the agent's tmp/ then renames it into new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
  *      the ack, re-reads the reply count after the ack and again after the
- *      gateway stops, reads every cur/ entry (name and size), the cur/ record
- *      and the obligation record, then
- *      writes a JSON report for the Bun test that spawned it.
+ *      gateway stops, reads every cur/ entry (name and size) mid-ack and again
+ *      once the gateway has stopped, the cur/ record and the obligation record,
+ *      then writes a JSON report for the Bun test that spawned it.
  *
  * Every HTTP target the driver creates is 127.0.0.1, and every model and
  * Flair answer is generated here. The driver does not block or observe any
@@ -75,6 +75,7 @@ const report = {
   replyHeaders: null,
   curFiles: [],
   curEntries: [],
+  curEntriesSettled: [],
   curRecord: null,
   obligationRecord: null,
   inboundNewFiles: [],
@@ -393,9 +394,11 @@ try {
 
   const curDir = join(MAIL, "agent-a", "cur");
   await until(() => readdirSync(curDir).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
-  // Snapshot every directory entry with its size: a name alone cannot answer
-  // what an unexpected entry is. A name that vanishes between the listing and
-  // the stat is still recorded (size -1) — that is the fact worth reporting.
+  // DIAGNOSTIC ONLY, taken MID-ACK: the ack's atomic record replace may be in
+  // flight, so this listing can hold its transient hidden scratch beside the
+  // record. Only curEntriesSettled, read after the gateway stops, is asserted on.
+  // A name that vanishes between the listing and the stat is still recorded
+  // (size -1) — that is the fact worth reporting.
   report.curEntries = readdirSync(curDir).map((name) => {
     try {
       return { name, size: statSync(join(curDir, name)).size };
@@ -439,10 +442,20 @@ try {
   if (stopped) {
     report.replyCountAfterStop = replyFilesOnDisk().length;
     report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
-    const inboundCur = report.curFiles.find((name) => report.inboundId && name.includes(report.inboundId));
-    const curRecordName = inboundCur ?? report.curFiles[0];
+    // The gateway has stopped, so no writer is left. List cur/ afresh, with
+    // names and sizes, and read the record from THIS listing.
+    const settledCurDir = join(MAIL, "agent-a", "cur");
+    report.curEntriesSettled = readdirSync(settledCurDir).map((name) => {
+      try {
+        return { name, size: statSync(join(settledCurDir, name)).size };
+      } catch {
+        return { name, size: -1 };
+      }
+    });
+    const inboundCur = report.curEntriesSettled.find((entry) => report.inboundId && entry.name.includes(report.inboundId));
+    const curRecordName = inboundCur?.name ?? report.curEntriesSettled[0]?.name;
     if (curRecordName) {
-      report.curRecord = readJson(join(MAIL, "agent-a", "cur", curRecordName), "cur record");
+      report.curRecord = readJson(join(settledCurDir, curRecordName), "cur record");
     }
     if (report.inboundId) {
       report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
