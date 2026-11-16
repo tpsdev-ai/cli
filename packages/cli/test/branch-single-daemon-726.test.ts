@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
 import { writeBranchConf } from "../src/commands/branch.js";
-import { bindErrorIn, waitForListening as waitForPortListening, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, waitForListening as waitForPortListening, withPortRetry } from "./helpers/port.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
@@ -36,50 +36,121 @@ function startToken(pid: number): string {
   return token;
 }
 
-/** The launcher's log, which the daemon writes its own output to. */
-function daemonLog(): string {
+/** The log's size before an attempt, so only that attempt's lines are read. */
+function logSize(): number {
   try {
-    return readFileSync(logFile, "utf8");
+    return statSync(logFile).size;
+  } catch {
+    return 0;
+  }
+}
+
+/** The log written since `offset`. */
+function logSince(offset: number): string {
+  try {
+    return readFileSync(logFile).subarray(offset).toString("utf8");
   } catch {
     return "";
   }
 }
 
 /** Launch a real daemon and wait until it accepts connections on its port. */
-async function startDaemonOnFreePort(): Promise<{ running: { pid: number; startToken: string }; output: string }> {
-  const { result } = await withPortRetry(async (port) => {
-    prepareBranch(port);
-    const started = spawnSync("node", [TPS_BIN, "branch", "start"], {
-      env: launcherEnv(),
-      encoding: "utf8",
-      timeout: 20_000,
-    });
-    expect(started.status).toBe(0);
-    const running = await waitForRunningRecord();
-    await waitForPortListening(port, { timeoutMs: 8_000, failure: () => bindErrorIn(daemonLog()) });
-    if (pidState(running.pid) !== "alive") throw new Error(`daemon ${running.pid} exited after start`);
-    return { running, output: started.stdout ?? "" };
-  });
-  return result;
+async function startDaemonOnFreePort(
+  firstPort?: number,
+): Promise<{ running: { pid: number; startToken: string }; output: string; attempts: number }> {
+  let attempts = 0;
+  const { result } = await withPortRetry(
+    async (port) => {
+      attempts += 1;
+      prepareBranch(port);
+      // A failed attempt leaves its record and config behind; neither may name
+      // this attempt's daemon or block its bind.
+      rmSync(pidFile, { force: true });
+      const offset = logSize();
+      const started = spawnSync("node", [TPS_BIN, "branch", "start"], {
+        env: launcherEnv(),
+        encoding: "utf8",
+        timeout: 20_000,
+      });
+      expect(started.status).toBe(0);
+      const failure = (): Error | undefined => bindErrorIn(logSince(offset) + (started.stderr ?? ""));
+      try {
+        const running = await waitForRunningRecord(failure);
+        await waitForPortListening(port, { timeoutMs: 8_000, failure, settleMs: 150 });
+        if (pidState(running.pid) !== "alive") throw new Error(`daemon ${running.pid} exited after start`);
+        return { running, output: started.stdout ?? "" };
+      } catch (error) {
+        const state = readPidFile(pidFile);
+        if (state.kind === "running") {
+          try {
+            process.kill(state.pid, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+          await waitForPidGone(state.pid).catch(() => {});
+        }
+        throw error;
+      }
+    },
+    { firstPort },
+  );
+  return { ...result, attempts };
 }
 
-async function startSpawnedDaemon(): Promise<{ daemon: ChildProcess; port: number }> {
-  const { port, result: daemon } = await withPortRetry(async (port) => {
-    prepareBranch(port);
-    const child = spawnDaemon();
-    await waitForLogStarted();
-    await waitForPortListening(port, { timeoutMs: 8_000, failure: () => bindErrorIn(daemonLog()) });
-    return child;
-  });
-  return { daemon, port };
+async function startSpawnedDaemon(
+  firstPort?: number,
+): Promise<{ daemon: ChildProcess; port: number; attempts: number }> {
+  let attempts = 0;
+  const { port, result: daemon } = await withPortRetry(
+    async (port) => {
+      attempts += 1;
+      prepareBranch(port);
+      rmSync(pidFile, { force: true });
+      const offset = logSize();
+      let stderr = "";
+      let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+      const child = spawnDaemon((text) => {
+        stderr += text;
+      });
+      child.once("exit", (code, signal) => {
+        exited = { code, signal };
+      });
+      const failure = (): Error | undefined => {
+        const output = logSince(offset) + stderr;
+        const bind = bindErrorIn(output);
+        if (bind) return bind;
+        if (exited !== null && exited.code !== 0) {
+          return new Error(`daemon exited (code ${exited.code}) before listening: ${output}`);
+        }
+        return undefined;
+      };
+      try {
+        await waitForLogStarted(offset, failure);
+        await waitForPortListening(port, { timeoutMs: 8_000, failure, settleMs: 150 });
+        return child;
+      } catch (error) {
+        try {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        } catch {
+          /* already gone */
+        }
+        await waitForExit(child).catch(() => {});
+        throw error;
+      }
+    },
+    { firstPort },
+  );
+  return { daemon, port, attempts };
 }
 
-async function waitForLogStarted(): Promise<void> {
+async function waitForLogStarted(offset = 0, failure?: () => Error | undefined): Promise<void> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
+    const failed = failure?.();
+    if (failed) throw failed;
     let text = "";
     try {
-      text = readFileSync(logFile, "utf8");
+      text = logSince(offset);
     } catch {
       /* not created yet */
     }
@@ -89,9 +160,13 @@ async function waitForLogStarted(): Promise<void> {
   }
 }
 
-async function waitForRunningRecord(): Promise<{ pid: number; startToken: string }> {
+async function waitForRunningRecord(
+  failure?: () => Error | undefined,
+): Promise<{ pid: number; startToken: string }> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
+    const failed = failure?.();
+    if (failed) throw failed;
     const state = readPidFile(pidFile);
     if (state.kind === "running") return { pid: state.pid, startToken: state.startToken };
     if (Date.now() >= deadline) throw new Error(`pid file did not name a running process; last state=${JSON.stringify(state)}`);
@@ -100,6 +175,9 @@ async function waitForRunningRecord(): Promise<{ pid: number; startToken: string
 }
 
 async function waitForExit(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
   return new Promise((resolveExit) => {
     child.once("exit", (code, signal) => resolveExit({ code, signal }));
   });
@@ -123,10 +201,11 @@ async function waitForPidGone(pid: number): Promise<void> {
   }
 }
 
-function spawnDaemon(): ChildProcess {
+function spawnDaemon(onStderr: (text: string) => void = () => {}): ChildProcess {
   const env: NodeJS.ProcessEnv = { ...process.env, TPS_BRANCH_NO_DAEMON: "1" };
   delete env.TPS_BRANCH_DAEMON;
   const child = spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  child.stderr?.on("data", (chunk) => onStderr(String(chunk)));
   children.push(child);
   return child;
 }
@@ -188,6 +267,19 @@ afterEach(async () => {
 });
 
 describe("branch start single-daemon guard (cli#726)", () => {
+  test("a daemon start retries onto a free port after its first port is taken", async () => {
+    const held = await holdPort();
+    try {
+      const { running, attempts } = await startDaemonOnFreePort(held.port);
+      daemons.push(running.pid);
+      expect(attempts).toBe(2);
+      process.kill(running.pid, "SIGTERM");
+      await waitForPidGone(running.pid);
+    } finally {
+      await held.close();
+    }
+  }, 30_000);
+
   test("a second start is refused while the recorded process runs and spawns nothing", async () => {
     const { running } = await startDaemonOnFreePort();
     daemons.push(running.pid);

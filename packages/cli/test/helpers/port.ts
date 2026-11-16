@@ -83,6 +83,9 @@ export interface PortRetryOptions {
   attempts?: number;
   /** Which failures are retried; address-in-use only, unless a caller says otherwise. */
   retryOn?: (error: unknown) => boolean;
+  /** A port the first attempt starts on, so a case can make that attempt lose
+   *  the port on purpose and show the second attempt succeeding. */
+  firstPort?: number;
 }
 
 /**
@@ -105,6 +108,7 @@ export async function withPortsRetry<T>(
   let lastError: unknown;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     const ports: number[] = [];
+    if (attempt === 0 && options.firstPort !== undefined) ports.push(options.firstPort);
     while (ports.length < count) {
       const port = await pickPort();
       if (!ports.includes(port)) ports.push(port);
@@ -117,6 +121,27 @@ export async function withPortsRetry<T>(
     }
   }
   throw lastError;
+}
+
+/** Hold a loopback port open for the life of a case. A connection is dropped. */
+export async function holdPort(): Promise<{ port: number; close: () => Promise<void> }> {
+  const server = net.createServer((socket) => socket.destroy());
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    throw new Error("no address");
+  }
+  return {
+    port: address.port,
+    close: () =>
+      new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      }),
+  };
 }
 
 /** `withPortsRetry` for the common one-port case. */
@@ -136,9 +161,10 @@ export async function withPortRetry<T>(
  */
 export async function waitForListening(
   port: number,
-  options: { timeoutMs?: number; failure?: () => unknown } = {},
+  options: { timeoutMs?: number; failure?: () => unknown; settleMs?: number } = {},
 ): Promise<void> {
   const timeoutMs = options.timeoutMs ?? 10_000;
+  const settleMs = options.settleMs ?? 0;
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const failure = options.failure?.();
@@ -149,7 +175,20 @@ export async function waitForListening(
         socket.destroy();
         resolve(value);
       };
-      socket.once("connect", () => finish(true));
+      socket.once("connect", () => {
+        if (settleMs === 0) return finish(true);
+        // A port held by another listener accepts and closes at once; the
+        // real listener keeps the connection open, so only that counts.
+        const timer = setTimeout(() => finish(true), settleMs);
+        socket.once("close", () => {
+          clearTimeout(timer);
+          finish(false);
+        });
+        socket.once("error", () => {
+          clearTimeout(timer);
+          finish(false);
+        });
+      });
       socket.once("error", () => finish(false));
     });
     if (connected) return;

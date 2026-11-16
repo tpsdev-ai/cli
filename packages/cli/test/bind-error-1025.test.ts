@@ -166,6 +166,29 @@ test("a bind failure rejects listenForHostWs and raises no uncaught error", asyn
   expect((rejection as NodeJS.ErrnoException).code).toBe("EADDRINUSE");
 });
 
+test("a bind failure rejects WsNoiseTransport.listen and raises no uncaught error", async () => {
+  const occupied = await occupyPort();
+  const host = generateKeyPair();
+  const uncaught = trackUncaught();
+  let outcome: "resolved" | { rejection: unknown } = "resolved";
+  try {
+    outcome = await new WsNoiseTransport(host, host).listen(occupied.port).then(
+      () => "resolved" as const,
+      (rejection: unknown) => ({ rejection }),
+    );
+    await Bun.sleep(50);
+  } finally {
+    uncaught.stop();
+    await occupied.close();
+  }
+
+  expect(uncaught.errors).toEqual([]);
+  expect(outcome).not.toBe("resolved");
+  const rejection = (outcome as { rejection: unknown }).rejection;
+  expect(rejection).toBeInstanceOf(Error);
+  expect((rejection as NodeJS.ErrnoException).code).toBe("EADDRINUSE");
+});
+
 test("a bind failure rejects startServiceProxies and raises no uncaught error", async () => {
   const occupied = await occupyPort();
   const uncaught: string[] = [];
@@ -375,6 +398,7 @@ test("a bind failure rejects listenForJoinWs and clears its join timer", async (
   const occupied = await occupyPort();
   const branch = generateKeyPair();
   const timers = watchTimers(120_000);
+  const uncaught = trackUncaught();
   let rejection: unknown;
   try {
     rejection = await listenForJoinWs(branch, occupied.port).then(
@@ -383,9 +407,11 @@ test("a bind failure rejects listenForJoinWs and clears its join timer", async (
     );
   } finally {
     timers.stop();
+    uncaught.stop();
   }
   await occupied.close();
 
+  expect(uncaught.errors).toEqual([]);
   expect(rejection).toBeInstanceOf(Error);
   expect((rejection as NodeJS.ErrnoException).code).toBe("EADDRINUSE");
   expect(timers.live.size).toBe(0);

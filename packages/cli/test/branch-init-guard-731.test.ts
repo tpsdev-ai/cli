@@ -16,7 +16,7 @@ import { fingerprint, generateKeyPair, saveKeyPair, type TpsKeyPair } from "../s
 import { NoiseIkTransport, type TransportChannel } from "../src/utils/noise-ik-transport.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
-import { bindErrorIn, withPortRetry } from "./helpers/port.js";
+import { bindErrorIn, holdPort, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -42,6 +42,9 @@ function launcherEnv(): NodeJS.ProcessEnv {
 }
 
 async function waitForExit(child: ChildProcess, timeoutMs = WAIT_MS): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return { code: child.exitCode, signal: child.signalCode };
+  }
   return new Promise((resolveExit, rejectExit) => {
     const timer = setTimeout(() => rejectExit(new Error("launcher did not exit within the bound")), timeoutMs);
     child.once("exit", (code, signal) => {
@@ -82,16 +85,30 @@ async function connectToBranch(
     const failed = failure?.();
     if (failed) throw failed;
     const transport = new NoiseIkTransport(hostKp);
+    const pending = transport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "branch-a",
+      hostPublicKey: branchKp.encryption.publicKey,
+    });
+    pending.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
-      return await transport.connect({
-        host: "127.0.0.1",
-        port,
-        branchId: "branch-a",
-        hostPublicKey: branchKp.encryption.publicKey,
-      });
+      // A port held by another listener accepts and drops the socket; bound
+      // each attempt so the bind-error check is reached without the noise
+      // handshake's own timeout.
+      return await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("connect attempt did not settle")), 500);
+        }),
+      ]);
     } catch (error) {
       last = error as Error;
+      transport.close();
       await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw new Error(`the branch launcher did not accept a join connection: ${last?.message ?? "unknown"}`);
@@ -200,30 +217,62 @@ describe("branch init single-daemon guard after a real join (cli#731)", () => {
     saveKeyPair(branchKp, process.env.TPS_IDENTITY_DIR!, "branch");
 
     let init!: ChildProcess;
-    let stdout = "";
-    let stderr = "";
-    const { result: channel } = await withPortRetry(async (port) => {
-      if (init && init.exitCode === null && init.signalCode === null) init.kill("SIGKILL");
-      init = spawn(
-        "node",
-        [TPS_BIN, "branch", "init", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
-        { env: launcherEnv(), stdio: ["ignore", "pipe", "pipe"] }
-      );
-      children.push(init);
-      started.push({ pid: init.pid!, startToken: startToken(init.pid!) });
-      stdout = "";
-      stderr = "";
-      init.stdout?.on("data", (chunk) => {
-        stdout += String(chunk);
-      });
-      init.stderr?.on("data", (chunk) => {
-        stderr += String(chunk);
-      });
+    let attempts = 0;
+    let output = { stdout: "", stderr: "" };
+    const held = await holdPort();
+    let channel: TransportChannel;
+    try {
+      ({ result: channel } = await withPortRetry(async (port) => {
+        attempts += 1;
+        if (init && init.exitCode === null && init.signalCode === null) {
+          init.kill("SIGKILL");
+          await waitForExit(init).catch(() => {});
+        }
+        // A failed attempt writes branch.conf.json before it binds; leave
+        // nothing behind that would refuse the next attempt.
+        rmSync(join(root, ".tps", "branch.conf.json"), { force: true });
+        const captured = { stdout: "", stderr: "" };
+        let exit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+        init = spawn(
+          "node",
+          [TPS_BIN, "branch", "init", "--listen", String(port), "--host", "127.0.0.1", "--transport", "tcp"],
+          { env: launcherEnv(), stdio: ["ignore", "pipe", "pipe"] }
+        );
+        children.push(init);
+        started.push({ pid: init.pid!, startToken: startToken(init.pid!) });
+        init.once("exit", (code, signal) => {
+          exit = { code, signal };
+        });
+        init.stdout?.on("data", (chunk) => {
+          captured.stdout += String(chunk);
+        });
+        init.stderr?.on("data", (chunk) => {
+          captured.stderr += String(chunk);
+        });
 
-      // The early recorded-process check has already run once the launcher is
-      // listening; the record below is placed after it, while the join waits.
-      return await connectToBranch(port, branchKp, hostKp, () => bindErrorIn(stdout + stderr));
-    });
+        try {
+          // The early recorded-process check has already run once the launcher is
+          // listening; the record below is placed after it, while the join waits.
+          const joined = await connectToBranch(port, branchKp, hostKp, () => {
+            const bind = bindErrorIn(captured.stdout + captured.stderr);
+            if (bind) return bind;
+            if (exit !== null) {
+              return new Error(`branch init exited (code ${exit.code}) before the join: ${captured.stderr}`);
+            }
+            return undefined;
+          });
+          output = captured;
+          return joined;
+        } catch (error) {
+          if (init.exitCode === null && init.signalCode === null) init.kill("SIGKILL");
+          await waitForExit(init).catch(() => {});
+          throw error;
+        }
+      }, { firstPort: held.port }));
+    } finally {
+      await held.close();
+    }
+    expect(attempts).toBe(2);
 
     const live = spawn("sleep", ["60"], { stdio: ["ignore", "ignore", "ignore"] });
     children.push(live);
@@ -248,15 +297,15 @@ describe("branch init single-daemon guard after a real join (cli#731)", () => {
 
     // The join completed and the launcher reached its spawn point, so the
     // refusal below comes from the guard after the join.
-    expect(stdout).toContain("Joined to host 'host-a'");
-    expect(stdout).toContain("Starting branch daemon...");
+    expect(output.stdout).toContain("Joined to host 'host-a'");
+    expect(output.stdout).toContain("Starting branch daemon...");
     expect(exit.code).not.toBe(0);
-    expect(stderr).toContain(`Recorded process (pid ${live.pid}, start token matches) is still running; refusing to spawn`);
-    expect(stderr).toContain(pidFile);
-    expect(stderr).toContain(
+    expect(output.stderr).toContain(`Recorded process (pid ${live.pid}, start token matches) is still running; refusing to spawn`);
+    expect(output.stderr).toContain(pidFile);
+    expect(output.stderr).toContain(
       `If pid ${live.pid} is the branch daemon, stop it with "tps branch stop"; otherwise remove ${pidFile} only after confirming no branch daemon is running.`
     );
-    expect(stdout).not.toContain("Branch daemon spawned");
+    expect(output.stdout).not.toContain("Branch daemon spawned");
     expect(branchStartPids()).toEqual([]);
 
     expect(readFileSync(pidFile, "utf8")).toBe(recordBytes);
