@@ -24,10 +24,10 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const OPENCLAW_VERSION = "2026.5.7";
@@ -101,18 +101,25 @@ export function assertOpenClawVersion(stdout) {
   assert.equal(found, OPENCLAW_VERSION, `expected OpenClaw ${OPENCLAW_VERSION}, found: ${found}`);
 }
 
-/** True when `name` is an executable file in one of the PATH entries. */
-function executableOnPath(name, pathEnv) {
-  for (const dir of pathEnv.split(delimiter)) {
-    if (dir === "") continue;
-    try {
-      accessSync(join(dir, name), constants.X_OK);
-      return true;
-    } catch {
-      // Not in this directory, or not executable.
-    }
-  }
-  return false;
+/**
+ * The tracked-lock helper selects `sfw` itself with `command -v sfw` from its
+ * working directory. Ask the same shell the same question in the same
+ * directory, with the same environment, so a relative PATH entry or an `sfw`
+ * that is not an executable regular file resolves the way the helper resolves
+ * it instead of the way the lane's own working directory would.
+ */
+function trackedLockInstaller(repo, env) {
+  // env carries the PATH the helper gets, which need not contain bash itself.
+  const bash = spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8", timeout: 10_000 });
+  const bashBin = bash.status === 0 ? bash.stdout.trim() : "";
+  if (!bashBin) return "npm";
+  const probe = spawnSync(bashBin, ["-c", "command -v sfw"], {
+    cwd: repo,
+    env,
+    stdio: "ignore",
+    timeout: 10_000,
+  });
+  return probe.status === 0 ? "sfw" : "npm";
 }
 
 /**
@@ -122,7 +129,8 @@ function executableOnPath(name, pathEnv) {
 export function installOpenClaw(root, options = {}) {
   const { spawn: spawnInstall = spawnSync, env = process.env, pathEnv = env.PATH ?? "", repo = REPO } = options;
   const prefix = join(root, "openclaw");
-  const via = executableOnPath("sfw", pathEnv) ? "sfw" : "npm";
+  const installEnv = { ...env, PATH: pathEnv };
+  const via = trackedLockInstaller(repo, installEnv);
   console.error(`[lane] installing openclaw@${OPENCLAW_VERSION} from the committed fixture into ${prefix}`);
   const result = spawnInstall(
     "bash",
@@ -136,7 +144,7 @@ export function installOpenClaw(root, options = {}) {
       "--no-audit",
       "--no-fund",
     ],
-    { cwd: repo, env, stdio: "inherit", timeout: 600_000 },
+    { cwd: repo, env: installEnv, stdio: "inherit", timeout: 600_000 },
   );
   assert.equal(result.status, 0, `tracked-lock install of openclaw@${OPENCLAW_VERSION} failed (status ${result.status})`);
   return join(prefix, "node_modules", ".bin");

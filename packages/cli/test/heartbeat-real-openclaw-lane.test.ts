@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { chmodSync, closeSync, cpSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -421,18 +421,50 @@ describe("the temp tree removal failure is attached after the lane failure", () 
 
 type InstallCall = { command: string; args: string[]; options: { cwd?: string } };
 
+const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
+const FIXTURE = "test/fixtures/heartbeat-openclaw";
+const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
+
 function recordingSpawn() {
   const calls: InstallCall[] = [];
   const spawnInstall = (command: string, args: string[], options: InstallCall["options"]) => {
     calls.push({ command, args, options });
+    // Simulate the helper's install: the bin the caller will use must exist.
+    const prefix = args[args.indexOf(FIXTURE) + 1];
+    mkdirSync(join(prefix, "node_modules", ".bin"), { recursive: true });
+    writeFileSync(join(prefix, "node_modules", ".bin", "openclaw"), "");
     return { status: 0, stdout: "", stderr: "" };
   };
   return { calls, spawnInstall };
 }
 
-const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
-const FIXTURE = "test/fixtures/heartbeat-openclaw";
-const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
+/** An npm stub that records its argv and creates the bin under --prefix. */
+function npmStub(dir: string, recordPath: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "npm"),
+    `#!/bin/sh
+printf '%s\\n' "$@" > ${JSON.stringify(recordPath)}
+prefix=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--prefix" ]; then prefix="$arg"; fi
+  prev="$arg"
+done
+mkdir -p "$prefix/node_modules/.bin"
+: > "$prefix/node_modules/.bin/openclaw"
+`,
+  );
+  chmodSync(join(dir, "npm"), 0o755);
+}
+
+/** The inherited PATH with directories holding an sfw removed. */
+function pathWithoutSfw(): string {
+  return (process.env.PATH ?? "")
+    .split(":")
+    .filter((dir) => dir !== "" && !existsSync(join(dir, "sfw")))
+    .join(":");
+}
 
 describe("the local fallback installs from the committed fixture lock", () => {
   test("runs the tracked-lock helper on the committed fixture instead of npm install", () => {
@@ -446,6 +478,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       expect(call.args).toEqual([HELPER, "--via", "npm", FIXTURE, join(root, "openclaw"), ...CI_ARGS]);
       expect(call.options.cwd).toBe(REPO);
       expect(binDir).toBe(join(root, "openclaw", "node_modules", ".bin"));
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -496,9 +529,9 @@ describe("the local fallback installs from the committed fixture lock", () => {
       chmodSync(join(stubs, "npm"), 0o755);
       const home = join(root, "home");
       mkdirSync(home);
-      const env = { PATH: `${stubs}:${process.env.PATH ?? ""}`, HOME: home };
+      const env = { PATH: `${stubs}:${pathWithoutSfw()}`, HOME: home };
       const throwaway = join(root, "throwaway");
-      const binDir = installOpenClaw(throwaway, { repo, pathEnv: stubs, env });
+      const binDir = installOpenClaw(throwaway, { repo, env });
       expect(binDir).toBe(join(throwaway, "openclaw", "node_modules", ".bin"));
       const argv = readFileSync(recordPath, "utf-8").trim().split("\n");
       expect(argv[0]).toBe("ci");
@@ -507,6 +540,54 @@ describe("the local fallback installs from the committed fixture lock", () => {
       expect(argv.some((arg) => arg.startsWith("--registry="))).toBe(true);
       const lock = readFileSync(join(repo, "test", "fixtures", "heartbeat-openclaw", "package-lock.json"), "utf-8");
       expect(readFileSync(join(throwaway, "openclaw", "package-lock.json"), "utf-8")).toBe(lock);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a relative PATH entry resolves from the helper's working directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-relative-"));
+    const previousCwd = process.cwd();
+    try {
+      const repo = fixtureRepo(root);
+      const laneCwd = join(root, "lane-cwd");
+      const relBin = join(laneCwd, "relbin");
+      mkdirSync(relBin, { recursive: true });
+      writeFileSync(join(relBin, "sfw"), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(relBin, "sfw"), 0o755);
+      const npmDir = join(root, "npm-bin");
+      const recordPath = join(root, "npm-args.txt");
+      npmStub(npmDir, recordPath);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `relbin:${npmDir}:${pathWithoutSfw()}`;
+      process.chdir(laneCwd);
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      expect(readFileSync(recordPath, "utf-8")).toContain("ci");
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("an sfw PATH entry that is a directory is not an installer", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-dir-sfw-"));
+    try {
+      const repo = fixtureRepo(root);
+      const dirEntry = join(root, "dir-entry");
+      mkdirSync(join(dirEntry, "sfw"), { recursive: true });
+      const npmDir = join(root, "npm-bin");
+      const recordPath = join(root, "npm-args.txt");
+      npmStub(npmDir, recordPath);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `${dirEntry}:${npmDir}:${pathWithoutSfw()}`;
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      expect(readFileSync(recordPath, "utf-8")).toContain("ci");
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
