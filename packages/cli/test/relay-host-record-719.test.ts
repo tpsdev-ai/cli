@@ -921,3 +921,59 @@ test("a refused reconnect claim reports one line and the channel keeps handling 
     await connections.stop();
   }
 }, 30_000);
+
+test("a first successful connect after a failed attempt claims the record of another live connection", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-first-claim-1023-"));
+  const savedEnv = savedRelayEnv();
+  const stops: Array<() => Promise<void>> = [];
+  const channels: RelayChannelState[] = [];
+  let attempts = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    attempts++;
+    // A connects first (attempt 1). B's first attempt (2) fails; its retry (3) succeeds.
+    if (attempts === 2) throw new Error("connection refused");
+    const state: RelayChannelState = { attached: false, detached: false, alive: true };
+    channels.push(state);
+    return {
+      async send() {},
+      onMessage(callback) { state.attached = true; state.handler = callback; },
+      offMessage() { state.detached = true; },
+      async close() { state.alive = false; },
+      isAlive() { return state.alive; },
+      peerFingerprint() { return "remote"; },
+    };
+  });
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    const record = (): HostConnectionState => JSON.parse(readFileSync(path, "utf8")) as HostConnectionState;
+    const start = async (channel: number) => {
+      stops.push(await connectAndKeepAlive(branch));
+      for (let i = 0; i < 800 && !channels[channel]?.attached; i++) await Bun.sleep(10);
+      expect(channels[channel]?.attached).toBe(true);
+    };
+
+    await start(0);
+    for (let i = 0; i < 400 && record().connectionId === undefined; i++) await Bun.sleep(5);
+    const aId = record().connectionId;
+    expect(aId).toEqual(expect.any(String));
+
+    await start(1);
+    expect(attempts).toBe(3);
+    for (let i = 0; i < 400 && record().connectionId === aId; i++) await Bun.sleep(5);
+    const bRecord = record();
+    expect(bRecord.connectionId).not.toBe(aId);
+    expect(bRecord.pid).toBe(process.pid);
+    expect(bRecord.reconnectCount).toBe(1);
+    expect(bRecord.startToken).toBe(processStartToken(process.pid));
+  } finally {
+    try {
+      for (const stop of stops) await stop();
+      for (let i = 0; i < 400 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+    } finally {
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);

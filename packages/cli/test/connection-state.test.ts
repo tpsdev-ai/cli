@@ -18,6 +18,7 @@ import {
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
+import { processStartToken } from "@tpsdev-ai/agent";
 
 /** Read a connection record the way an operator would, so the assertions below
  *  pin the writer's output rather than a reader in the module under test. */
@@ -187,19 +188,50 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
-  test.each([
-    { name: "a simulated reused pid", pid: process.pid },
-    { name: "a pid that is gone", pid: 2147483646 },
-  ])("claimHostStateAt reclaims another connection's record when its process is gone ($name)", ({ pid }) => {
-    home = mkdtempSync(join(tmpdir(), "conn-state-claim-gone-"));
+  /** A pid this test spawned, still running until its stdin closes, with the
+   *  start token it carries while alive; awaited to exit before it is used. */
+  async function exitedChildPid(): Promise<{ pid: number; token: string }> {
+    const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    const token = processStartToken(child.pid);
+    expect(token).not.toBeNull();
+    child.stdin.end();
+    await child.exited;
+    return { pid: child.pid, token: String(token) };
+  }
+
+  test.each(["null", "captured"])("claimHostStateAt reclaims a gone owner's record whose startToken is %s (real pid probe)", async (recordedToken) => {
+    const child = await exitedChildPid();
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-gone-pid-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", pid, startToken: "proc:stale-owner" });
-    const aState = { ...completeState(), connectionId: "conn-a", startToken: "proc:current-owner", lastHeartbeatAck: "ack" };
-    const outcome = claimHostStateAt(path, aState, "conn-a", undefined, 0, { startToken: () => "proc:current-owner" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: child.pid, startToken: recordedToken === "null" ? null : child.token });
+    const live = processStartToken(process.pid);
+    expect(live).not.toBeNull();
+    const aState = { ...completeState(), connectionId: "conn-a", startToken: live, lastHeartbeatAck: "ack" };
+    const outcome = claimHostStateAt(path, aState, "conn-a");
     expect(outcome).toEqual({ kind: "written" });
     expect(readRecord<HostConnectionState>(path)?.connectionId).toBe("conn-a");
-    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a", undefined, 0, { startToken: () => "proc:current-owner" });
+    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a");
+    expect(refreshed).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
+  });
+
+  test("claimHostStateAt reclaims a live pid whose recorded start token differs (real pid probe)", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-reuse-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    const live = processStartToken(process.pid);
+    expect(live).not.toBeNull();
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: `${String(live)}-stale` });
+    const aState = { ...completeState(), connectionId: "conn-a", startToken: live, lastHeartbeatAck: "ack" };
+    const outcome = claimHostStateAt(path, aState, "conn-a");
+    expect(outcome).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.connectionId).toBe("conn-a");
+    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a");
     expect(refreshed).toEqual({ kind: "written" });
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
   });
