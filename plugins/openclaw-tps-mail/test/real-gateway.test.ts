@@ -26,8 +26,9 @@ import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
+import { decideSettledRead } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -114,6 +115,30 @@ function expectOneSettledCurEntry(entries: CurEntry[], inboundId: string): void 
   expect(entries[0]?.name).toContain(inboundId);
 }
 
+function expectGatewayReport(r: Report): void {
+  expectAckLanded(r);
+  expectOneSettledCurEntry(r.curEntriesSettled, r.inboundId!);
+  expect(r.openclawVersion).toBe("2026.8.1");
+  expect(r.dispatchStarts).toBe(1);
+  expect(r.modelTurnTexts).toEqual(["PROGRESS: drafting the answer", "FINAL: the task is complete"]);
+  expect(r.replyCount).toBe(1);
+  expect(r.replyBody).toBe("FINAL: the task is complete");
+  expect(r.replyFrom).toBe("agent-a");
+  expect(r.replyTo).toBe("agent-b");
+  expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
+  expectOneInbound(r.curEntries, r.inboundId!);
+  expect(r.replyCountAfterAck).toBe(1);
+  expect(r.replyCountAfterStop).toBe(1);
+  expect(r.inboundNewFiles).toEqual([]);
+  expect(r.readErrors).toEqual([]);
+  expect(typeof r.curRecord?.ackedAt).toBe("string");
+  expect(r.obligationRecord?.state).toBe("acked");
+  expect(r.ackLines).toHaveLength(1);
+  expect(r.ackLines[0]).toContain(r.inboundId!);
+  expect(r.ackLines[0]).toContain("receipt found");
+  expect(r.unexpected).toEqual([]);
+}
+
 function runDriver(): { status: number | null; stdout: string; stderr: string; report: Report | null; root: string } {
   const root = mkdtempSync(join(tmpdir(), "tps-real-gateway-"));
   const specFile = join(root, "spec.json");
@@ -148,27 +173,7 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       if (r.error) {
         throw new Error(`${r.error}\n${(r.logs ?? []).join("\n")}\n${(r.logTail ?? []).join("\n")}`);
       }
-      expect(r.openclawVersion).toBe("2026.8.1");
-      expect(r.dispatchStarts).toBe(1);
-      expect(r.modelTurnTexts).toEqual(["PROGRESS: drafting the answer", "FINAL: the task is complete"]);
-      expect(r.replyCount).toBe(1);
-      expect(r.replyBody).toBe("FINAL: the task is complete");
-      expect(r.replyFrom).toBe("agent-a");
-      expect(r.replyTo).toBe("agent-b");
-      expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
-      expectAckLanded(r);
-      expectOneInbound(r.curEntries, r.inboundId!);
-      expectOneSettledCurEntry(r.curEntriesSettled, r.inboundId!);
-      expect(r.replyCountAfterAck).toBe(1);
-      expect(r.replyCountAfterStop).toBe(1);
-      expect(r.inboundNewFiles).toEqual([]);
-      expect(r.readErrors).toEqual([]);
-      expect(typeof r.curRecord?.ackedAt).toBe("string");
-      expect(r.obligationRecord?.state).toBe("acked");
-      expect(r.ackLines).toHaveLength(1);
-      expect(r.ackLines[0]).toContain(r.inboundId!);
-      expect(r.ackLines[0]).toContain("receipt found");
-      expect(r.unexpected).toEqual([]);
+      expectGatewayReport(r);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -222,25 +227,109 @@ describe("cli#1020 — the cur/ assertion reports what it found", () => {
 });
 
 describe("cli#1020 — a timed-out ack is judged on its own assertion", () => {
-  it("fails on the ack timeout and never reaches the settled count", () => {
-    const report: Pick<Report, "ackTimedOut" | "curEntriesSettled"> = {
-      ackTimedOut: true,
-      curEntriesSettled: [
-        { name: "2026-01-01T00-00-00-000Z-msg-one.json", size: 10 },
-        { name: "2026-01-01T00-00-00-001Z-msg-two.json", size: 10 },
-      ],
+  function ackedReport(): Report {
+    const entries = [{ name: "2026-01-01T00-00-00-000Z-msg-one.json", size: 10 }];
+    return {
+      status: "ok",
+      node: process.version,
+      openclawVersion: "2026.8.1",
+      modelCalls: 2,
+      modelTurnTexts: ["PROGRESS: drafting the answer", "FINAL: the task is complete"],
+      unexpected: [],
+      dispatchStarts: 1,
+      replyCount: 1,
+      replyCountAfterAck: 1,
+      replyCountAfterStop: 1,
+      replyBody: "FINAL: the task is complete",
+      replyFrom: "agent-a",
+      replyTo: "agent-b",
+      replyHeaders: { "X-TPS-InReplyTo": "msg-one" },
+      curFiles: entries.map((entry) => entry.name),
+      curEntries: entries,
+      curEntriesSettled: entries,
+      curRecord: { id: "msg-one", ackedAt: "2026-01-01T00:00:00.000Z" },
+      obligationRecord: { state: "acked" },
+      inboundNewFiles: [],
+      readErrors: [],
+      inboundId: "msg-one",
+      ackTimedOut: false,
+      ackLines: ["acked msg-one: receipt found"],
+      logs: [],
     };
-    let settledCountJudged = false;
+  }
+
+  it("accepts an acked settled report", () => {
+    expectGatewayReport(ackedReport());
+  });
+
+  it("fails on the ack timeout before judging the settled count", () => {
+    const report = ackedReport();
+    report.ackTimedOut = true;
+    report.curEntriesSettled = [
+      ...report.curEntriesSettled,
+      { name: "2026-01-01T00-00-00-001Z-msg-two.json", size: 10 },
+    ];
     let message = "";
     try {
-      expectAckLanded(report);
-      settledCountJudged = true;
-      expectOneSettledCurEntry(report.curEntriesSettled, "msg-one");
+      expectGatewayReport(report);
     } catch (err) {
       message = String((err as Error).message);
     }
-    expect(settledCountJudged).toBe(false);
     expect(message).toContain("ack never landed");
     expect(message).not.toContain("found 2");
+  });
+});
+
+describe("cli#1020 — the driver's settled read decision", () => {
+  it("reads after the gateway stops and the ack lands", () => {
+    expect(decideSettledRead({ stopped: true, ackTimedOut: false })).toEqual({ read: true, readError: null });
+  });
+
+  it("skips the read and names the ack timeout", () => {
+    expect(decideSettledRead({ stopped: true, ackTimedOut: true })).toEqual({
+      read: false,
+      readError: "ack never landed before its deadline; settled state not read",
+    });
+  });
+
+  it("skips the read and names an unstopped gateway", () => {
+    for (const ackTimedOut of [false, true]) {
+      expect(decideSettledRead({ stopped: false, ackTimedOut })).toEqual({
+        read: false,
+        readError: "gateway did not stop within the deadline; settled state not read",
+      });
+    }
+  });
+
+  it("imports the driver under Bun and node without running it", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-driver-import-"));
+    try {
+      const untouched = join(root, "untouched");
+      const specFile = join(root, "spec.json");
+      writeFileSync(specFile, JSON.stringify({ root: untouched, pluginDir: PLUGIN_DIR }));
+      const probe = `process.argv[2] = ${JSON.stringify(specFile)};
+        await import(${JSON.stringify(pathToFileURL(DRIVER).href)});
+        process.stdout.write("imported");`;
+      for (const runtime of [process.execPath, process.env.TPS_LANE_NODE || "node"]) {
+        const importHome = mkdtempSync(join(tmpdir(), "tps-driver-import-home-"));
+        try {
+          const result = spawnSync(runtime, ["--input-type=module", "-e", probe], {
+            encoding: "utf8",
+            timeout: 5_000,
+            env: { PATH: process.env.PATH ?? "", HOME: importHome, TMPDIR: importHome },
+          });
+          expect(result.error).toBeUndefined();
+          expect(result.stderr).toBe("");
+          expect(result.status).toBe(0);
+          expect(result.stdout).toBe("imported");
+          expect(existsSync(untouched)).toBe(false);
+          expect(readdirSync(root)).toEqual(["spec.json"]);
+        } finally {
+          rmSync(importHome, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

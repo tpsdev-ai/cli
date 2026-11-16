@@ -33,463 +33,472 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-const spec = JSON.parse(readFileSync(process.argv[2], "utf8"));
-const ROOT = resolve(spec.root);
-const HOME = join(ROOT, "home");
-const MAIL = join(ROOT, "mail");
-const WORKSPACE = join(HOME, "workspace");
-const LOG = join(ROOT, "openclaw.log");
-const REPORT = join(ROOT, "report.json");
-const PLUGIN = resolve(spec.pluginDir);
-const OPENCLAW = join(PLUGIN, "node_modules", "openclaw", "openclaw.mjs");
-
-// ── named deadlines ─────────────────────────────────────────────────────────
-const GATEWAY_BOOT_DEADLINE_MS = 30_000;
-const REPLY_DEADLINE_MS = 45_000;
-const ACK_DEADLINE_MS = 15_000;
-const CUR_MOVE_DEADLINE_MS = 5_000;
-const STOP_DEADLINE_MS = 5_000;
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function until(predicate, deadlineMs, label) {
-  const end = Date.now() + deadlineMs;
-  while (Date.now() < end) {
-    if (predicate()) return true;
-    await sleep(25);
-  }
-  throw new Error(`timed out after ${deadlineMs}ms waiting for ${label}`);
-}
-
-const report = {
-  status: "error",
-  node: process.version,
-  openclawVersion: null,
-  modelCalls: 0,
-  modelTurnTexts: [],
-  unexpected: [],
-  dispatchStarts: 0,
-  replyCount: 0,
-  replyCountAfterAck: 0,
-  replyCountAfterStop: 0,
-  replyBody: null,
-  replyHeaders: null,
-  curFiles: [],
-  curEntries: [],
-  curEntriesSettled: [],
-  curRecord: null,
-  obligationRecord: null,
-  inboundNewFiles: [],
-  readErrors: [],
-  inboundId: null,
-  ackTimedOut: false,
-  ackLines: [],
-  logs: [],
-};
-
-function writeReport() {
-  writeFileSync(REPORT, JSON.stringify(report, null, 2), "utf8");
-}
-
-function readJson(path, label) {
-  try {
-    return JSON.parse(readFileSync(path, "utf8"));
-  } catch (err) {
-    report.readErrors.push(`${label} (${path}): ${err?.message ?? String(err)}`);
-    return null;
-  }
-}
-
-function replyFilesOnDisk() {
-  return readdirSync(join(MAIL, "agent-b", "new")).filter((f) => f.endsWith(".json"));
-}
-
-// ── prerequisites: node must satisfy the pinned OpenClaw's engines ─────────
-const openclawPkg = JSON.parse(readFileSync(join(PLUGIN, "node_modules", "openclaw", "package.json"), "utf8"));
-report.openclawVersion = openclawPkg.version;
-function satisfies(version, range) {
-  const v = version.replace(/^v/, "").split(".").map(Number);
-  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
-  return range.split("||").some((clause) =>
-    clause
-      .trim()
-      .split(/\s+/)
-      .every((c) => {
-        const m = /^(>=|<=|>|<|=)?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(c);
-        if (!m) throw new Error(`unparsed engines clause "${c}"`);
-        const d = cmp(v, [Number(m[2]), Number(m[3] ?? 0), Number(m[4] ?? 0)]);
-        return m[1] === ">=" ? d >= 0 : m[1] === ">" ? d > 0 : m[1] === "<=" ? d <= 0 : m[1] === "<" ? d < 0 : d === 0;
-      }),
-  );
-}
-const engines = openclawPkg.engines?.node ?? "";
-if (engines && !satisfies(process.version, engines)) {
-  report.error = `node ${process.version} does not satisfy openclaw ${openclawPkg.version} engines "${engines}"`;
-  writeReport();
-  console.error(`real-gateway-driver: ${report.error}`);
-  process.exit(3);
-}
-
-// ── test agents: keys and signed mail ──────────────────────────────────────
-const seedA = Buffer.alloc(32, 0x11);
-const seedB = Buffer.alloc(32, 0x22);
-const publicKey = (seed) => {
-  const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
-  const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
-  const spki = createPublicKey(key).export({ type: "spki", format: "der" });
-  return spki.subarray(spki.length - 32).toString("hex");
-};
-const pubA = publicKey(seedA);
-const pubB = publicKey(seedB);
-
-for (const dir of [
-  HOME,
-  MAIL,
-  WORKSPACE,
-  join(HOME, ".openclaw"),
-  join(HOME, ".flair", "keys"),
-  join(MAIL, "agent-a", "new"),
-  join(MAIL, "agent-a", "tmp"),
-  join(MAIL, "agent-b", "new"),
-  join(ROOT, "tmp"),
-]) {
-  mkdirSync(dir, { recursive: true });
-}
-writeFileSync(join(HOME, ".flair", "keys", "agent-a.key"), seedA);
-writeFileSync(join(HOME, ".flair", "keys", "agent-b.key"), seedB);
-
-// ── model stub (OpenAI Responses) ──────────────────────────────────────────
-const requests = [];
-let modelCalls = 0;
-const model = createServer((req, res) => {
-  let body = "";
-  req.on("data", (c) => (body += c));
-  req.on("end", () => {
-    let parsed = null;
-    try {
-      parsed = JSON.parse(body);
-    } catch {}
-    requests.push({ method: req.method, url: req.url });
-    if (req.method !== "POST" || req.url !== "/v1/responses") {
-      report.unexpected.push({ method: req.method, url: req.url });
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end("{}");
-      return;
-    }
-    modelCalls += 1;
-    const input = Array.isArray(parsed?.input) ? parsed.input : [];
-    const sawToolOutput = input.some((item) => item?.type === "function_call_output");
-    const messages = sawToolOutput
-      ? [{ id: "msg_2", text: "FINAL: the task is complete", phase: "final_answer" }]
-      : [{ id: "msg_1", text: "PROGRESS: drafting the answer", phase: "final_answer" }];
-    report.modelTurnTexts.push(...messages.map((item) => item.text));
-
-    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-    const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
-    const responseBase = { id: "resp_1", object: "response", created_at: Math.floor(Date.now() / 1000), model: "stub-model" };
-    send({ type: "response.created", response: { ...responseBase, status: "in_progress", output: [] } });
-    let index = 0;
-    const output = [];
-    const sendMessage = (it) => {
-      const item = {
-        type: "message",
-        id: it.id,
-        status: "completed",
-        role: "assistant",
-        content: [{ type: "output_text", text: it.text, annotations: [] }],
-        phase: it.phase,
-      };
-      send({
-        type: "response.output_item.added",
-        output_index: index,
-        item: { type: "message", id: it.id, status: "in_progress", role: "assistant", content: [], phase: it.phase },
-      });
-      send({
-        type: "response.content_part.added",
-        item_id: it.id,
-        output_index: index,
-        content_index: 0,
-        part: { type: "output_text", text: "", annotations: [] },
-      });
-      send({ type: "response.output_text.delta", item_id: it.id, output_index: index, content_index: 0, delta: it.text });
-      send({ type: "response.output_text.done", item_id: it.id, output_index: index, content_index: 0, text: it.text });
-      send({
-        type: "response.content_part.done",
-        item_id: it.id,
-        output_index: index,
-        content_index: 0,
-        part: { type: "output_text", text: it.text, annotations: [] },
-      });
-      send({ type: "response.output_item.done", output_index: index, item });
-      output.push(item);
-      index += 1;
-    };
-    for (const it of messages) sendMessage(it);
-    if (!sawToolOutput) {
-      const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "session_status", arguments: "{}", status: "completed" };
-      send({ type: "response.output_item.added", output_index: index, item: { ...call, status: "in_progress", arguments: "" } });
-      send({ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: index, delta: "{}" });
-      send({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: index, arguments: "{}" });
-      send({ type: "response.output_item.done", output_index: index, item: call });
-      output.push(call);
-    }
-    send({
-      type: "response.completed",
-      response: {
-        ...responseBase,
-        status: "completed",
-        output,
-        output_text: messages[0].text,
-        usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-      },
-    });
-    res.end();
-  });
-});
-await new Promise((r) => model.listen(0, "127.0.0.1", r));
-const modelPort = model.address().port;
-report.modelPort = modelPort;
-
-// ── Flair stub ──────────────────────────────────────────────────────────────
-const flair = createServer((req, res) => {
-  const m = /^\/Agent\/([^/]+)$/.exec(req.url ?? "");
-  if (req.method === "GET" && m) {
-    const id = decodeURIComponent(m[1]);
-    const pk = id === "agent-a" ? pubA : id === "agent-b" ? pubB : null;
-    if (pk) {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id, name: id, publicKey: pk }));
-      return;
-    }
-  }
-  report.unexpected.push({ method: req.method, url: req.url });
-  res.writeHead(404, { "content-type": "application/json" });
-  res.end("{}");
-});
-await new Promise((r) => flair.listen(0, "127.0.0.1", r));
-const flairPort = flair.address().port;
-report.flairPort = flairPort;
-
-// A free loopback port for the gateway: bind, read, close. The window is only
-// used to choose the port; the gateway binds it when it starts.
-const gatewayProbe = createServer(() => {});
-await new Promise((r) => gatewayProbe.listen(0, "127.0.0.1", r));
-const gatewayPort = gatewayProbe.address().port;
-await new Promise((r) => gatewayProbe.close(r));
-
-// ── gateway config ────────────────────────────────────────────────────────
-const config = {
-  logging: { file: LOG },
-  gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
-  agents: {
-    defaults: {
-      workspace: WORKSPACE,
-      model: { primary: "stub/stub-model" },
-    },
-    entries: { "agent-a": { workspace: WORKSPACE } },
-  },
-  models: {
-    providers: {
-      stub: {
-        baseUrl: `http://127.0.0.1:${modelPort}/v1`,
-        apiKey: "stub-key",
-        api: "openai-responses",
-        models: [{ id: "stub-model", name: "Stub", contextWindow: 200000, maxTokens: 8192 }],
-      },
-    },
-  },
-  plugins: {
-    allow: ["openclaw-tps-mail"],
-    load: { paths: [PLUGIN] },
-    entries: { "openclaw-tps-mail": { enabled: true, config: { mailDir: MAIL } } },
-  },
-  channels: {
-    "tps-mail": { enabled: true, accounts: { default: { mailDir: MAIL } } },
-  },
-  bindings: [{ agentId: "agent-a", match: { channel: "tps-mail", accountId: "default" } }],
-};
-writeFileSync(join(HOME, ".openclaw", "openclaw.json"), JSON.stringify(config, null, 2));
-
-const env = {
-  PATH: process.env.PATH ?? "",
-  HOME,
-  TMPDIR: join(ROOT, "tmp"),
-  FLAIR_URL: `http://127.0.0.1:${flairPort}`,
-  OPENCLAW_STATE_DIR: join(HOME, ".openclaw"),
-  OPENCLAW_CONFIG_PATH: join(HOME, ".openclaw", "openclaw.json"),
-  OPENCLAW_TEST_FAST: "0",
-};
-
-let child;
-let stopped = false;
-let logs = "";
-try {
-  child = spawn(
-    process.execPath,
-    [OPENCLAW, "gateway", "run", "--port", String(gatewayPort), "--auth", "none", "--allow-unconfigured", "--verbose"],
-    { env, cwd: HOME, stdio: ["ignore", "pipe", "pipe"] },
-  );
-  const onData = (chunk) => {
-    logs += String(chunk);
+export function decideSettledRead({ stopped, ackTimedOut }) {
+  if (stopped && !ackTimedOut) return { read: true, readError: null };
+  return {
+    read: false,
+    readError: !stopped
+      ? "gateway did not stop within the deadline; settled state not read"
+      : "ack never landed before its deadline; settled state not read",
   };
-  child.stdout.on("data", onData);
-  child.stderr.on("data", onData);
+}
 
-  await until(
-    () => logs.includes("watching 1 agent inbox"),
-    GATEWAY_BOOT_DEADLINE_MS,
-    "gateway boot",
-  );
+if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main();
 
-  // ── one signed mail ─────────────────────────────────────────────────────
-  const { signEnvelope } = await import(
-    pathToFileURL(join(PLUGIN, "node_modules", "@tpsdev-ai", "agent", "dist", "index.js")).href
-  );
-  const noblePath = createRequire(join(PLUGIN, "package.json")).resolve("@noble/ed25519");
-  const { hashes } = await import(pathToFileURL(noblePath).href);
-  hashes.sha512 = (message) => new Uint8Array(createHash("sha512").update(message).digest());
+async function main() {
+  const spec = JSON.parse(readFileSync(process.argv[2], "utf8"));
+  const ROOT = resolve(spec.root);
+  const HOME = join(ROOT, "home");
+  const MAIL = join(ROOT, "mail");
+  const WORKSPACE = join(HOME, "workspace");
+  const LOG = join(ROOT, "openclaw.log");
+  const REPORT = join(ROOT, "report.json");
+  const PLUGIN = resolve(spec.pluginDir);
+  const OPENCLAW = join(PLUGIN, "node_modules", "openclaw", "openclaw.mjs");
 
-  const inboundId = `msg-${Date.now()}`;
-  const timestamp = new Date().toISOString();
-  const envelope = signEnvelope(
-    {
-      v: 1,
-      from: "agent-b",
-      to: "agent-a",
-      body: "please handle this",
-      messageId: inboundId,
-      timestamp,
-      delegationChain: [
-        { agent: "system", kind: "human", timestamp, rationale: "originates", signature: null },
-        { agent: "agent-b", kind: "agent", timestamp, rationale: "agent agent-b dispatches", signature: null },
-      ],
-    },
-    { "agent-b": seedB },
-  );
-  report.inboundId = inboundId;
-  // Stage in the maildir's tmp/ and rename into new/: the plugin reads new/
-  // synchronously at start, and rename(2) within one filesystem is atomic, so it
-  // never sees a half-written record.
-  const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`;
-  const inboundTmp = join(MAIL, "agent-a", "tmp", inboundName);
-  writeFileSync(
-    inboundTmp,
-    JSON.stringify({ id: inboundId, from: "agent-b", to: "agent-a", body: JSON.stringify(envelope), timestamp, read: false }, null, 2),
-  );
-  renameSync(inboundTmp, join(MAIL, "agent-a", "new", inboundName));
+  // ── named deadlines ─────────────────────────────────────────────────────────
+  const GATEWAY_BOOT_DEADLINE_MS = 30_000;
+  const REPLY_DEADLINE_MS = 45_000;
+  const ACK_DEADLINE_MS = 15_000;
+  const CUR_MOVE_DEADLINE_MS = 5_000;
+  const STOP_DEADLINE_MS = 5_000;
 
-  await until(
-    () => readdirSync(join(MAIL, "agent-b", "new")).some((f) => f.endsWith(".json")),
-    REPLY_DEADLINE_MS,
-    "reply mail",
-  );
-  const replyFiles = readdirSync(join(MAIL, "agent-b", "new")).filter((f) => f.endsWith(".json"));
-  report.replyCount = replyFiles.length;
-  if (replyFiles.length > 0) {
-    const reply = JSON.parse(readFileSync(join(MAIL, "agent-b", "new", replyFiles[0]), "utf8"));
-    report.replyBody = JSON.parse(reply.body).body;
-    report.replyFrom = reply.from;
-    report.replyTo = reply.to;
-    report.replyHeaders = reply.headers ?? null;
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  async function until(predicate, deadlineMs, label) {
+    const end = Date.now() + deadlineMs;
+    while (Date.now() < end) {
+      if (predicate()) return true;
+      await sleep(25);
+    }
+    throw new Error(`timed out after ${deadlineMs}ms waiting for ${label}`);
   }
 
-  const curDir = join(MAIL, "agent-a", "cur");
-  await until(() => readdirSync(curDir).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
-  // DIAGNOSTIC ONLY, taken MID-ACK: the ack's atomic record replace may be in
-  // flight, so this listing can hold its transient hidden scratch beside the
-  // record. Only curEntriesSettled, read after the gateway stops, is asserted on.
-  // A name that vanishes between the listing and the stat is still recorded
-  // (size -1) — that is the fact worth reporting.
-  report.curEntries = readdirSync(curDir).map((name) => {
+  const report = {
+    status: "error",
+    node: process.version,
+    openclawVersion: null,
+    modelCalls: 0,
+    modelTurnTexts: [],
+    unexpected: [],
+    dispatchStarts: 0,
+    replyCount: 0,
+    replyCountAfterAck: 0,
+    replyCountAfterStop: 0,
+    replyBody: null,
+    replyHeaders: null,
+    curFiles: [],
+    curEntries: [],
+    curEntriesSettled: [],
+    curRecord: null,
+    obligationRecord: null,
+    inboundNewFiles: [],
+    readErrors: [],
+    inboundId: null,
+    ackTimedOut: false,
+    ackLines: [],
+    logs: [],
+  };
+
+  function writeReport() {
+    writeFileSync(REPORT, JSON.stringify(report, null, 2), "utf8");
+  }
+
+  function readJson(path, label) {
     try {
-      return { name, size: statSync(join(curDir, name)).size };
-    } catch {
-      return { name, size: -1 };
+      return JSON.parse(readFileSync(path, "utf8"));
+    } catch (err) {
+      report.readErrors.push(`${label} (${path}): ${err?.message ?? String(err)}`);
+      return null;
     }
-  });
-  report.curFiles = report.curEntries.map((entry) => entry.name);
+  }
 
-  try {
-    await until(
-      () => existsSync(LOG) && readFileSync(LOG, "utf8").includes("receipt found"),
-      ACK_DEADLINE_MS,
-      "ack log line",
+  function replyFilesOnDisk() {
+    return readdirSync(join(MAIL, "agent-b", "new")).filter((f) => f.endsWith(".json"));
+  }
+
+  // ── prerequisites: node must satisfy the pinned OpenClaw's engines ─────────
+  const openclawPkg = JSON.parse(readFileSync(join(PLUGIN, "node_modules", "openclaw", "package.json"), "utf8"));
+  report.openclawVersion = openclawPkg.version;
+  function satisfies(version, range) {
+    const v = version.replace(/^v/, "").split(".").map(Number);
+    const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+    return range.split("||").some((clause) =>
+      clause
+        .trim()
+        .split(/\s+/)
+        .every((c) => {
+          const m = /^(>=|<=|>|<|=)?(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(c);
+          if (!m) throw new Error(`unparsed engines clause "${c}"`);
+          const d = cmp(v, [Number(m[2]), Number(m[3] ?? 0), Number(m[4] ?? 0)]);
+          return m[1] === ">=" ? d >= 0 : m[1] === ">" ? d > 0 : m[1] === "<=" ? d <= 0 : m[1] === "<" ? d < 0 : d === 0;
+        }),
     );
-  } catch {
-    // A missing ack is an ASSERTION in the Bun test, not a driver failure: the
-    // report still carries the reply and the log so the failing line is named.
-    report.ackTimedOut = true;
   }
-  // B2: a second reply may land after the reply wait; count again once the ack
-  // has (or has not) arrived.
-  report.replyCountAfterAck = replyFilesOnDisk().length;
-  report.modelCalls = modelCalls;
-  report.status = "ok";
-} catch (err) {
-  report.error = err?.message ?? String(err);
-} finally {
-  if (child && child.exitCode === null) {
-    child.kill("SIGTERM");
-    await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
-    if (child.exitCode === null) {
-      child.kill("SIGKILL");
-      await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
-    }
+  const engines = openclawPkg.engines?.node ?? "";
+  if (engines && !satisfies(process.version, engines)) {
+    report.error = `node ${process.version} does not satisfy openclaw ${openclawPkg.version} engines "${engines}"`;
+    writeReport();
+    console.error(`real-gateway-driver: ${report.error}`);
+    process.exit(3);
   }
-  stopped = !child || child.exitCode !== null;
-  // B2: read the settled state only after the gateway has stopped — a second
-  // reply or a late stamp from a still-running gateway would race this read.
-  // A timed-out ack never reached the settled state either: listing cur/ then
-  // would judge the ack on a listing it never finished, so the settled listing
-  // (and the cur record read from it) is not taken and the report says why.
-  if (!stopped) report.readErrors.push("gateway did not stop within the deadline; settled state not read");
-  else if (report.ackTimedOut) report.readErrors.push("ack never landed before its deadline; settled state not read");
-  if (stopped && !report.ackTimedOut) {
-    report.replyCountAfterStop = replyFilesOnDisk().length;
-    report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
-    // The gateway has stopped, so no writer is left. List cur/ afresh, with
-    // names and sizes, and read the record from THIS listing.
-    const settledCurDir = join(MAIL, "agent-a", "cur");
-    report.curEntriesSettled = readdirSync(settledCurDir).map((name) => {
+
+  // ── test agents: keys and signed mail ──────────────────────────────────────
+  const seedA = Buffer.alloc(32, 0x11);
+  const seedB = Buffer.alloc(32, 0x22);
+  const publicKey = (seed) => {
+    const der = Buffer.concat([Buffer.from("302e020100300506032b657004220420", "hex"), seed]);
+    const key = createPrivateKey({ key: der, format: "der", type: "pkcs8" });
+    const spki = createPublicKey(key).export({ type: "spki", format: "der" });
+    return spki.subarray(spki.length - 32).toString("hex");
+  };
+  const pubA = publicKey(seedA);
+  const pubB = publicKey(seedB);
+
+  for (const dir of [
+    HOME,
+    MAIL,
+    WORKSPACE,
+    join(HOME, ".openclaw"),
+    join(HOME, ".flair", "keys"),
+    join(MAIL, "agent-a", "new"),
+    join(MAIL, "agent-a", "tmp"),
+    join(MAIL, "agent-b", "new"),
+    join(ROOT, "tmp"),
+  ]) {
+    mkdirSync(dir, { recursive: true });
+  }
+  writeFileSync(join(HOME, ".flair", "keys", "agent-a.key"), seedA);
+  writeFileSync(join(HOME, ".flair", "keys", "agent-b.key"), seedB);
+
+  // ── model stub (OpenAI Responses) ──────────────────────────────────────────
+  const requests = [];
+  let modelCalls = 0;
+  const model = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      let parsed = null;
       try {
-        return { name, size: statSync(join(settledCurDir, name)).size };
+        parsed = JSON.parse(body);
+      } catch {}
+      requests.push({ method: req.method, url: req.url });
+      if (req.method !== "POST" || req.url !== "/v1/responses") {
+        report.unexpected.push({ method: req.method, url: req.url });
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end("{}");
+        return;
+      }
+      modelCalls += 1;
+      const input = Array.isArray(parsed?.input) ? parsed.input : [];
+      const sawToolOutput = input.some((item) => item?.type === "function_call_output");
+      const messages = sawToolOutput
+        ? [{ id: "msg_2", text: "FINAL: the task is complete", phase: "final_answer" }]
+        : [{ id: "msg_1", text: "PROGRESS: drafting the answer", phase: "final_answer" }];
+      report.modelTurnTexts.push(...messages.map((item) => item.text));
+
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      const send = (o) => res.write(`data: ${JSON.stringify(o)}\n\n`);
+      const responseBase = { id: "resp_1", object: "response", created_at: Math.floor(Date.now() / 1000), model: "stub-model" };
+      send({ type: "response.created", response: { ...responseBase, status: "in_progress", output: [] } });
+      let index = 0;
+      const output = [];
+      const sendMessage = (it) => {
+        const item = {
+          type: "message",
+          id: it.id,
+          status: "completed",
+          role: "assistant",
+          content: [{ type: "output_text", text: it.text, annotations: [] }],
+          phase: it.phase,
+        };
+        send({
+          type: "response.output_item.added",
+          output_index: index,
+          item: { type: "message", id: it.id, status: "in_progress", role: "assistant", content: [], phase: it.phase },
+        });
+        send({
+          type: "response.content_part.added",
+          item_id: it.id,
+          output_index: index,
+          content_index: 0,
+          part: { type: "output_text", text: "", annotations: [] },
+        });
+        send({ type: "response.output_text.delta", item_id: it.id, output_index: index, content_index: 0, delta: it.text });
+        send({ type: "response.output_text.done", item_id: it.id, output_index: index, content_index: 0, text: it.text });
+        send({
+          type: "response.content_part.done",
+          item_id: it.id,
+          output_index: index,
+          content_index: 0,
+          part: { type: "output_text", text: it.text, annotations: [] },
+        });
+        send({ type: "response.output_item.done", output_index: index, item });
+        output.push(item);
+        index += 1;
+      };
+      for (const it of messages) sendMessage(it);
+      if (!sawToolOutput) {
+        const call = { type: "function_call", id: "fc_1", call_id: "call_1", name: "session_status", arguments: "{}", status: "completed" };
+        send({ type: "response.output_item.added", output_index: index, item: { ...call, status: "in_progress", arguments: "" } });
+        send({ type: "response.function_call_arguments.delta", item_id: "fc_1", output_index: index, delta: "{}" });
+        send({ type: "response.function_call_arguments.done", item_id: "fc_1", output_index: index, arguments: "{}" });
+        send({ type: "response.output_item.done", output_index: index, item: call });
+        output.push(call);
+      }
+      send({
+        type: "response.completed",
+        response: {
+          ...responseBase,
+          status: "completed",
+          output,
+          output_text: messages[0].text,
+          usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
+        },
+      });
+      res.end();
+    });
+  });
+  await new Promise((r) => model.listen(0, "127.0.0.1", r));
+  const modelPort = model.address().port;
+  report.modelPort = modelPort;
+
+  // ── Flair stub ──────────────────────────────────────────────────────────────
+  const flair = createServer((req, res) => {
+    const m = /^\/Agent\/([^/]+)$/.exec(req.url ?? "");
+    if (req.method === "GET" && m) {
+      const id = decodeURIComponent(m[1]);
+      const pk = id === "agent-a" ? pubA : id === "agent-b" ? pubB : null;
+      if (pk) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ id, name: id, publicKey: pk }));
+        return;
+      }
+    }
+    report.unexpected.push({ method: req.method, url: req.url });
+    res.writeHead(404, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((r) => flair.listen(0, "127.0.0.1", r));
+  const flairPort = flair.address().port;
+  report.flairPort = flairPort;
+
+  // A free loopback port for the gateway: bind, read, close. The window is only
+  // used to choose the port; the gateway binds it when it starts.
+  const gatewayProbe = createServer(() => {});
+  await new Promise((r) => gatewayProbe.listen(0, "127.0.0.1", r));
+  const gatewayPort = gatewayProbe.address().port;
+  await new Promise((r) => gatewayProbe.close(r));
+
+  // ── gateway config ────────────────────────────────────────────────────────
+  const config = {
+    logging: { file: LOG },
+    gateway: { mode: "local", bind: "loopback", auth: { mode: "none" } },
+    agents: {
+      defaults: {
+        workspace: WORKSPACE,
+        model: { primary: "stub/stub-model" },
+      },
+      entries: { "agent-a": { workspace: WORKSPACE } },
+    },
+    models: {
+      providers: {
+        stub: {
+          baseUrl: `http://127.0.0.1:${modelPort}/v1`,
+          apiKey: "stub-key",
+          api: "openai-responses",
+          models: [{ id: "stub-model", name: "Stub", contextWindow: 200000, maxTokens: 8192 }],
+        },
+      },
+    },
+    plugins: {
+      allow: ["openclaw-tps-mail"],
+      load: { paths: [PLUGIN] },
+      entries: { "openclaw-tps-mail": { enabled: true, config: { mailDir: MAIL } } },
+    },
+    channels: {
+      "tps-mail": { enabled: true, accounts: { default: { mailDir: MAIL } } },
+    },
+    bindings: [{ agentId: "agent-a", match: { channel: "tps-mail", accountId: "default" } }],
+  };
+  writeFileSync(join(HOME, ".openclaw", "openclaw.json"), JSON.stringify(config, null, 2));
+
+  const env = {
+    PATH: process.env.PATH ?? "",
+    HOME,
+    TMPDIR: join(ROOT, "tmp"),
+    FLAIR_URL: `http://127.0.0.1:${flairPort}`,
+    OPENCLAW_STATE_DIR: join(HOME, ".openclaw"),
+    OPENCLAW_CONFIG_PATH: join(HOME, ".openclaw", "openclaw.json"),
+    OPENCLAW_TEST_FAST: "0",
+  };
+
+  let child;
+  let stopped = false;
+  let logs = "";
+  try {
+    child = spawn(
+      process.execPath,
+      [OPENCLAW, "gateway", "run", "--port", String(gatewayPort), "--auth", "none", "--allow-unconfigured", "--verbose"],
+      { env, cwd: HOME, stdio: ["ignore", "pipe", "pipe"] },
+    );
+    const onData = (chunk) => {
+      logs += String(chunk);
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+
+    await until(
+      () => logs.includes("watching 1 agent inbox"),
+      GATEWAY_BOOT_DEADLINE_MS,
+      "gateway boot",
+    );
+
+    // ── one signed mail ─────────────────────────────────────────────────────
+    const { signEnvelope } = await import(
+      pathToFileURL(join(PLUGIN, "node_modules", "@tpsdev-ai", "agent", "dist", "index.js")).href
+    );
+    const noblePath = createRequire(join(PLUGIN, "package.json")).resolve("@noble/ed25519");
+    const { hashes } = await import(pathToFileURL(noblePath).href);
+    hashes.sha512 = (message) => new Uint8Array(createHash("sha512").update(message).digest());
+
+    const inboundId = `msg-${Date.now()}`;
+    const timestamp = new Date().toISOString();
+    const envelope = signEnvelope(
+      {
+        v: 1,
+        from: "agent-b",
+        to: "agent-a",
+        body: "please handle this",
+        messageId: inboundId,
+        timestamp,
+        delegationChain: [
+          { agent: "system", kind: "human", timestamp, rationale: "originates", signature: null },
+          { agent: "agent-b", kind: "agent", timestamp, rationale: "agent agent-b dispatches", signature: null },
+        ],
+      },
+      { "agent-b": seedB },
+    );
+    report.inboundId = inboundId;
+    // Stage in the maildir's tmp/ and rename into new/: the plugin reads new/
+    // synchronously at start, and rename(2) within one filesystem is atomic, so it
+    // never sees a half-written record.
+    const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`;
+    const inboundTmp = join(MAIL, "agent-a", "tmp", inboundName);
+    writeFileSync(
+      inboundTmp,
+      JSON.stringify({ id: inboundId, from: "agent-b", to: "agent-a", body: JSON.stringify(envelope), timestamp, read: false }, null, 2),
+    );
+    renameSync(inboundTmp, join(MAIL, "agent-a", "new", inboundName));
+
+    await until(
+      () => readdirSync(join(MAIL, "agent-b", "new")).some((f) => f.endsWith(".json")),
+      REPLY_DEADLINE_MS,
+      "reply mail",
+    );
+    const replyFiles = readdirSync(join(MAIL, "agent-b", "new")).filter((f) => f.endsWith(".json"));
+    report.replyCount = replyFiles.length;
+    if (replyFiles.length > 0) {
+      const reply = JSON.parse(readFileSync(join(MAIL, "agent-b", "new", replyFiles[0]), "utf8"));
+      report.replyBody = JSON.parse(reply.body).body;
+      report.replyFrom = reply.from;
+      report.replyTo = reply.to;
+      report.replyHeaders = reply.headers ?? null;
+    }
+
+    const curDir = join(MAIL, "agent-a", "cur");
+    await until(() => readdirSync(curDir).length > 0, CUR_MOVE_DEADLINE_MS, "cur/ move");
+    report.curEntries = readdirSync(curDir).map((name) => {
+      try {
+        return { name, size: statSync(join(curDir, name)).size };
       } catch {
         return { name, size: -1 };
       }
     });
-    const inboundCur = report.curEntriesSettled.find((entry) => report.inboundId && entry.name.includes(report.inboundId));
-    const curRecordName = inboundCur?.name ?? report.curEntriesSettled[0]?.name;
-    if (curRecordName) {
-      report.curRecord = readJson(join(settledCurDir, curRecordName), "cur record");
+    report.curFiles = report.curEntries.map((entry) => entry.name);
+
+    try {
+      await until(
+        () => existsSync(LOG) && readFileSync(LOG, "utf8").includes("receipt found"),
+        ACK_DEADLINE_MS,
+        "ack log line",
+      );
+    } catch {
+      // A missing ack is an ASSERTION in the Bun test, not a driver failure: the
+      // report still carries the reply and the log so the failing line is named.
+      report.ackTimedOut = true;
     }
-    if (report.inboundId) {
-      report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
+    // B2: a second reply may land after the reply wait; count again once the ack
+    // has (or has not) arrived.
+    report.replyCountAfterAck = replyFilesOnDisk().length;
+    report.modelCalls = modelCalls;
+    report.status = "ok";
+  } catch (err) {
+    report.error = err?.message ?? String(err);
+  } finally {
+    if (child && child.exitCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+        await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
+      }
     }
+    stopped = !child || child.exitCode !== null;
+    // B2: read the settled state only after the gateway has stopped — a second
+    // reply or a late stamp from a still-running gateway would race this read.
+    // A timed-out ack never reached the settled state either: listing cur/ then
+    // would judge the ack on a listing it never finished, so the settled listing
+    // (and the cur record read from it) is not taken and the report says why.
+    const settledRead = decideSettledRead({ stopped, ackTimedOut: report.ackTimedOut });
+    if (settledRead.readError) report.readErrors.push(settledRead.readError);
+    if (settledRead.read) {
+      report.replyCountAfterStop = replyFilesOnDisk().length;
+      report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
+      // The gateway has stopped, so no writer is left. List cur/ afresh, with
+      // names and sizes, and read the record from THIS listing.
+      const settledCurDir = join(MAIL, "agent-a", "cur");
+      report.curEntriesSettled = readdirSync(settledCurDir).map((name) => {
+        try {
+          return { name, size: statSync(join(settledCurDir, name)).size };
+        } catch {
+          return { name, size: -1 };
+        }
+      });
+      const inboundCur = report.curEntriesSettled.find((entry) => report.inboundId && entry.name.includes(report.inboundId));
+      const curRecordName = inboundCur?.name ?? report.curEntriesSettled[0]?.name;
+      if (curRecordName) {
+        report.curRecord = readJson(join(settledCurDir, curRecordName), "cur record");
+      }
+      if (report.inboundId) {
+        report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
+      }
+    }
+    await new Promise((r) => model.close(r));
+    await new Promise((r) => flair.close(r));
+    let logMessages = [];
+    try {
+      if (existsSync(LOG)) {
+        logMessages = readFileSync(LOG, "utf8")
+          .split("\n")
+          .filter(Boolean)
+          .map((line) => {
+            try {
+              const record = JSON.parse(line);
+              return typeof record["1"] === "string" ? record["1"] : String(record.message ?? "");
+            } catch {
+              return line;
+            }
+          })
+          .filter(Boolean);
+      }
+    } catch {}
+    report.logs = logs.split("\n").slice(-40);
+    report.logTail = logMessages.slice(-120);
+    const dispatchFromStdout = (logs.match(/message dispatch started: channel=tps-mail/g) ?? []).length;
+    const dispatchFromLogFile = logMessages.filter((message) => message.includes("message dispatch started: channel=tps-mail")).length;
+    report.dispatchStarts = Math.max(dispatchFromStdout, dispatchFromLogFile);
+    report.ackLines = logMessages.filter((message) => message.includes("acked "));
+    writeReport();
   }
-  await new Promise((r) => model.close(r));
-  await new Promise((r) => flair.close(r));
-  let logMessages = [];
-  try {
-    if (existsSync(LOG)) {
-      logMessages = readFileSync(LOG, "utf8")
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => {
-          try {
-            const record = JSON.parse(line);
-            return typeof record["1"] === "string" ? record["1"] : String(record.message ?? "");
-          } catch {
-            return line;
-          }
-        })
-        .filter(Boolean);
-    }
-  } catch {}
-  report.logs = logs.split("\n").slice(-40);
-  report.logTail = logMessages.slice(-120);
-  const dispatchFromStdout = (logs.match(/message dispatch started: channel=tps-mail/g) ?? []).length;
-  const dispatchFromLogFile = logMessages.filter((message) => message.includes("message dispatch started: channel=tps-mail")).length;
-  report.dispatchStarts = Math.max(dispatchFromStdout, dispatchFromLogFile);
-  report.ackLines = logMessages.filter((message) => message.includes("acked "));
-  writeReport();
+  process.exit(0);
 }
-process.exit(0);
