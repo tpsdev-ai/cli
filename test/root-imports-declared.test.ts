@@ -390,8 +390,11 @@ describe("root imports are declared", () => {
 					'(module as any)[("require" as string)]("u-as-member" as string);',
 					'(module.require as any)("u-as-callee");',
 					'const other = (createRequire as any)(import.meta.url); (other as any)("u-as-bound-callee");',
+					'const { destructured = createRequire(import.meta.url) as any } = {}; destructured("u-as-destructuring-default");',
+					'let shorthand; ({ shorthand = createRequire(import.meta.url) as any } = {}); shorthand("u-as-shorthand-default");',
+					'function withParam(paramLoad = createRequire(import.meta.url) as any) { return paramLoad("u-as-parameter-default"); }',
 				].join("\n"),
-				specifiers: ["u-as-assertion", ...[0, 1, 2, 3].map((index) => `u-as-assignment-${index}`), "u-as-member", "u-as-callee", "u-as-bound-callee"],
+				specifiers: ["u-as-assertion", ...[0, 1, 2, 3].map((index) => `u-as-assignment-${index}`), "u-as-member", "u-as-callee", "u-as-bound-callee", "u-as-destructuring-default", "u-as-shorthand-default", "u-as-parameter-default"],
 			},
 			{
 				name: "a satisfies expression around a loader initializer",
