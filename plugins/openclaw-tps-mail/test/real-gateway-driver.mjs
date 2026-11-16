@@ -14,8 +14,10 @@
  *      channel config the plugin's README documents (no streaming), and writes
  *      one signed mail into the agent's tmp/ then renames it into new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
- *      the ack,
- *      then writes a JSON report for the Bun test that spawned it.
+ *      the ack; lists cur/ mid-ack as a diagnostic; stops the gateway and, only
+ *      if the ack was observed, reads the settled state (reply count, new/ and
+ *      cur/ listings, the cur/ and obligation records); then writes a JSON
+ *      report for the Bun test that spawned it.
  *
  * Every HTTP target the driver creates is 127.0.0.1, and every model and
  * Flair answer is generated here. The driver does not block or observe any
@@ -466,6 +468,9 @@ async function main() {
       }
     }
     stopped = !child || child.exitCode !== null;
+    // Read the settled state only after the gateway has stopped (a second reply
+    // or a late stamp from a running gateway would race the read) and only after
+    // an observed ack (without one, cur/ was never settled by the ack).
     const settledRead = decideSettledRead({ stopped, ...report });
     if (settledRead.readError) report.readErrors.push(settledRead.readError);
     if (settledRead.read) {
