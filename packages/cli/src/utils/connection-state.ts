@@ -29,6 +29,7 @@ export interface HostConnectionState {
   /** Process start token; absent from records written before it was captured. */
   startToken?: string | null;
   services?: ServiceHealth[];
+  connectionId?: string;
 }
 
 export interface BranchConnectionState {
@@ -71,8 +72,7 @@ export interface ConnectionTempSweep {
  * never followed. An entry that could not be inspected or removed is reported
  * in `left`; an entry already gone is in neither list.
  */
-export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
-  const dir = connectionsDir();
+export function sweepStaleConnectionTemps(now = Date.now(), dir = connectionsDir()): ConnectionTempSweep {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -168,7 +168,7 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * then rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
-  sweepStaleConnectionTemps();
+  sweepStaleConnectionTemps(Date.now(), dirname(filePath));
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
   // A regular record's observed permission bits are preserved; a symlinked
   // record is treated as absent, as before (the rename replaces the link with a
@@ -243,8 +243,11 @@ export function withHostStateRecordLock<T>(path: string, action: string, fn: () 
 }
 
 export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(state.branch);
+  writeHostStateAt(hostStatePath(state.branch), state, shouldWrite, timeoutMs);
+}
+
+export function writeHostStateAt(path: string, state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "write the host state record", () => {
     // Checked inside the lock: a caller that has begun stop() sets its
     // flag before it takes the lock to clear, so a write it starts afterwards
@@ -254,11 +257,50 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
   }, timeoutMs);
 }
 
-/** True for the same PID, and the same start token when one is present. */
-function recordNamesOwnProcess(state: HostConnectionState): boolean {
-  if (state.pid !== process.pid) return false;
-  if (state.startToken === undefined || state.startToken === null) return true;
-  return state.startToken === processStartToken(process.pid);
+/** IN-PROCESS test seam only: no command, flag or environment variable reaches
+ *  it. Production callers use the default start-token reader. */
+export interface HostStateReadHooks {
+  startToken?: (pid: number) => string | null;
+}
+
+/** What a refresh did under the record lock. `unverifiable` means the record
+ *  carries a start token and this process's token could not be read, so
+ *  ownership is neither confirmed nor denied; nothing is written. */
+export type HostStateRefreshOutcome =
+  | { kind: "written" }
+  | { kind: "stopped" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "unverifiable" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Refresh a record this connection still owns. Under the record lock the
+ * record is read and written when the optional `shouldWrite` gate holds and
+ * ownership matches: an absent record or one owned by another connection is
+ * left alone (never recreated or replaced), and an invalid, unreadable or
+ * unverifiable record is left as it is. Returns what happened.
+ */
+export function refreshOwnedHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS, hooks?: HostStateReadHooks): HostStateRefreshOutcome {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withHostStateRecordLock(path, "write the host state record", (): HostStateRefreshOutcome => {
+    if (shouldWrite !== undefined && !shouldWrite()) return { kind: "stopped" };
+    const ownership = hostRecordOwnership(path, state.branch, connectionId, hooks?.startToken);
+    if (ownership.kind !== "owned") return ownership;
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
+    return { kind: "written" };
+  }, timeoutMs);
+}
+
+/** "same" for the same PID, and the same start token when one is present;
+ *  "unverifiable" when the record carries a token this process cannot read. */
+function selfIdentity(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): "same" | "other" | "unverifiable" {
+  if (state.pid !== process.pid) return "other";
+  if (state.startToken === undefined || state.startToken === null) return "same";
+  const ownToken = readStartToken(process.pid);
+  if (ownToken === null) return "unverifiable";
+  return state.startToken === ownToken ? "same" : "other";
 }
 
 type HostRecordRead =
@@ -304,6 +346,7 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
     || typeof state.messagesReceived !== "number"
     || !isPidRecordPid(state.pid)
     || !isPidRecordStartToken(state.startToken)
+    || (state.connectionId !== undefined && (typeof state.connectionId !== "string" || state.connectionId.length === 0))
     || (state.services !== undefined && (!Array.isArray(state.services) || !state.services.every((service: unknown) => {
       if (typeof service !== "object" || service === null || Array.isArray(service)) return false;
       const health = service as Record<string, unknown>;
@@ -316,19 +359,52 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
-/** Records classified as unreadable or invalid by the locked read are kept and reported. */
+type HostRecordOwnership =
+  | { kind: "owned" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "unverifiable" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Read the record first; return absent, invalid or unreadable before checking
+ * ownership. A supplied connection id must match before process identity is
+ * checked. Removal and the owned write both use this rule.
+ */
+function hostRecordOwnership(path: string, branch: string, connectionId?: string, readStartToken?: (pid: number) => string | null): HostRecordOwnership {
+  const current = readHostRecord(path, branch);
+  if (current.kind === "absent") return { kind: "absent" };
+  if (current.kind === "invalid") return { kind: "invalid" };
+  if (current.kind === "unreadable") return { kind: "unreadable", reason: current.reason };
+  if (connectionId !== undefined && current.state.connectionId !== connectionId) return { kind: "other" };
+  const identity = selfIdentity(current.state, readStartToken);
+  if (identity === "unverifiable") return { kind: "unverifiable" };
+  if (identity === "other") return { kind: "other" };
+  return { kind: "owned" };
+}
+
 export function clearHostState(branch: string): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(branch);
+  clearHostStateAt(hostStatePath(branch), branch);
+}
+
+/** Records classified as unreadable, invalid or unverifiable by the locked
+ *  read are kept and reported. */
+export function clearHostStateAt(path: string, branch: string, connectionId?: string, hooks?: HostStateReadHooks): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "remove the host state record", () => {
-    const current = readHostRecord(path, branch);
-    if (current.kind === "absent") return;
-    if (current.kind !== "record") {
+    const ownership = hostRecordOwnership(path, branch, connectionId, hooks?.startToken);
+    if (ownership.kind === "absent" || ownership.kind === "other") return;
+    if (ownership.kind !== "owned") {
+      const reason = ownership.kind === "invalid"
+        ? "is not a valid host state record"
+        : ownership.kind === "unverifiable"
+          ? "this process's start token could not be read"
+          : ownership.reason;
       throw new Error(
-        `Host state record ${path} is present but ${current.kind === "invalid" ? "is not a valid host state record" : current.reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+        `Host state record ${path} is present but ${reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
       );
     }
-    if (!recordNamesOwnProcess(current.state)) return;
     try {
       rmSync(path, { force: true });
     } catch (error) {
