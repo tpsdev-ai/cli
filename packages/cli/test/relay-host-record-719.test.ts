@@ -514,9 +514,11 @@ test("an inbound refresh whose self token cannot be read keeps retrying and repo
   }
 }, 30_000);
 
-test("an inbound write stops retrying once the record belongs to another connection", async () => {
+test.each([false, true])("an inbound write stops retrying for another connection with unreadable self token %j", async (unreadableToken) => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-inbound-other-779-"));
   const savedEnv = savedRelayEnv();
+  const ownToken = processStartToken(process.pid) ?? "test:self";
+  let token: string | null = ownToken;
   let stop: (() => Promise<void>) | undefined;
   let handler: Parameters<TransportChannel["onMessage"]>[0] | undefined;
   let alive = true;
@@ -533,25 +535,29 @@ test("an inbound write stops retrying once the record belongs to another connect
   const diagnostic = spyOn(console, "error").mockImplementation(() => {});
   try {
     const branch = await prepareBranch(root);
-    stop = await connectAndKeepAlive(branch);
+    stop = await connectAndKeepAlive(branch, { testHooks: { startToken: () => token } });
     for (let i = 0; !handler && i < 200; i++) await Bun.sleep(5);
     expect(handler).toBeDefined();
     await Bun.sleep(20);
     const path = hostStatePath(branch);
     const before = JSON.parse(readFileSync(path, "utf8"));
     const original = readFileSync(path);
+    token = unreadableToken ? null : ownToken;
     diagnostic.mockClear();
     // Replace the record before the scheduled inbound write runs: the write
     // sees another connection's id and ends its retries.
     handler!({ type: MSG_HEARTBEAT, seq: 0, ts: new Date().toISOString(), body: {} });
-    writeFileSync(path, JSON.stringify({ ...before, connectionId: "other-conn" }));
+    writeFileSync(path, JSON.stringify({ ...before, connectionId: "other-conn", startToken: ownToken }));
     await Bun.sleep(20);
     expect(diagnostic.mock.calls.filter(([line]) => String(line).includes("not refreshed"))).toHaveLength(0);
+    expect(readFileSync(path)).toEqual(Buffer.from(JSON.stringify({ ...before, connectionId: "other-conn", startToken: ownToken })));
+    token = ownToken;
     // Restore our record; a pending retry would write the inbound update here.
     writeFileSync(path, original);
     await Bun.sleep(300);
     expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(before);
   } finally {
+    token = ownToken;
     await stop?.();
     for (let i = 0; handler && !detached && i < 200; i++) await Bun.sleep(10);
     connect.mockRestore();

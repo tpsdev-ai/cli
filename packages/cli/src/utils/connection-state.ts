@@ -368,19 +368,19 @@ type HostRecordOwnership =
   | { kind: "unreadable"; reason: string };
 
 /**
- * The one ownership rule: the record at `path` is owned when it is a valid
- * record whose branch, process identity and, when given, connection id match
- * this process. Removal and the owned write both decide on this result.
+ * Read the record first; return absent, invalid or unreadable before checking
+ * ownership. A supplied connection id must match before process identity is
+ * checked. Removal and the owned write both use this rule.
  */
 function hostRecordOwnership(path: string, branch: string, connectionId?: string, readStartToken?: (pid: number) => string | null): HostRecordOwnership {
   const current = readHostRecord(path, branch);
   if (current.kind === "absent") return { kind: "absent" };
   if (current.kind === "invalid") return { kind: "invalid" };
   if (current.kind === "unreadable") return { kind: "unreadable", reason: current.reason };
+  if (connectionId !== undefined && current.state.connectionId !== connectionId) return { kind: "other" };
   const identity = selfIdentity(current.state, readStartToken);
   if (identity === "unverifiable") return { kind: "unverifiable" };
   if (identity === "other") return { kind: "other" };
-  if (connectionId !== undefined && current.state.connectionId !== connectionId) return { kind: "other" };
   return { kind: "owned" };
 }
 
