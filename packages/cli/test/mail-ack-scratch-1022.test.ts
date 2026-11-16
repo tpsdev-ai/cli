@@ -1,3 +1,5 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
@@ -70,7 +72,7 @@ test("a failed ack scratch removal is reported once with its path and code", () 
   expect(reports[0]).toContain("EBUSY");
 });
 
-test("the next ack in the directory removes and reports a leftover scratch", () => {
+test("the first ack in the directory removes and reports leftover scratch", () => {
   const inbox = mail.getInbox(agent);
   const leftover = join(inbox.cur, scratchName());
   fs.writeFileSync(leftover, "{ partial");
@@ -94,7 +96,7 @@ test("the next ack in the directory removes and reports a leftover scratch", () 
   }
 });
 
-test("a record and non-scratch dotfiles in the directory are never removed", () => {
+test("the sweep preserves records and non-scratch dotfiles", () => {
   const inbox = mail.getInbox(agent);
   const record = join(inbox.cur, "other.json");
   fs.writeFileSync(record, JSON.stringify({ id: "other-id", body: "keep", read: false }));
@@ -120,6 +122,141 @@ test("a record and non-scratch dotfiles in the directory are never removed", () 
   expect(fs.readFileSync(suffixed, "utf8")).toBe("{ not a scratch");
   expect(fs.existsSync(leftover)).toBe(false);
 });
+
+test("acks share a directory sweep until the interval expires", () => {
+  let now = 0;
+  const restoreClock = patchShared(mail.mailAckScratchTestHooks, "now", () => now);
+  try {
+    const cur = mail.getInbox(agent).cur;
+    const warn = spyOn(console, "warn").mockImplementation(() => {});
+    mail.ackMessageAtPath(target);
+    const leftover = join(cur, scratchName());
+    fs.writeFileSync(leftover, "partial");
+    const ack = (path: string) => {
+      fs.writeFileSync(path, JSON.stringify({ id: "bounded", body: "hello", read: false }));
+      expect(mail.ackMessageAtPath(path).read).toBe(true);
+    };
+    for (let i = 0; i < 10; i++) ack(join(cur, `record-${i}.json`));
+    now = 10 * 60 * 1000 - 1;
+    ack(target);
+    expect(fs.existsSync(leftover)).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+    const otherDir = join(root, "other", "cur");
+    fs.mkdirSync(otherDir, { recursive: true });
+    const otherLeftover = join(otherDir, scratchName());
+    fs.writeFileSync(otherLeftover, "partial");
+    ack(join(otherDir, "record.json"));
+    expect(fs.existsSync(otherLeftover)).toBe(false);
+    expect(fs.existsSync(leftover)).toBe(true);
+    now++;
+    ack(target);
+    expect(fs.existsSync(leftover)).toBe(false);
+    expect(warn.mock.calls.filter(([line]) => String(line).includes(leftover))).toHaveLength(1);
+  } finally {
+    restoreClock();
+  }
+});
+
+test("a failed leftover sweep warns with path and code without failing the ack", () => {
+  const leftover = join(mail.getInbox(agent).cur, scratchName());
+  fs.writeFileSync(leftover, "partial");
+  const warn = spyOn(console, "warn").mockImplementation(() => {});
+  const remove = fs.rmSync;
+  spyOn(fs, "rmSync").mockImplementation(((...args: Parameters<typeof remove>) => {
+    if (args[0] === leftover) throw Object.assign(new Error("removal refused"), { code: "EBUSY" });
+    return remove(...args);
+  }) as typeof remove);
+  const ack = mail.ackMessageAtPath(target);
+  expect(ack.read).toBe(true);
+  expect(ack.ackedAt).toBeDefined();
+  expect(fs.existsSync(target)).toBe(false);
+  expect(fs.existsSync(leftover)).toBe(true);
+  expect(warn).toHaveBeenCalledTimes(1);
+  expect(warn.mock.calls[0][0]).toContain(leftover);
+  expect(warn.mock.calls[0][0]).toContain("EBUSY");
+});
+
+test("distinct records ack across processes without sweeping a live scratch", async () => {
+  const iterations = 25;
+  const cur = mail.getInbox(agent).cur;
+  for (let i = 0; i < iterations; i++) {
+    for (const role of ["a", "b"]) {
+      fs.writeFileSync(join(cur, `${role}-${i}.json`), JSON.stringify({ id: `${role}-${i}`, body: "hello", read: false }));
+    }
+  }
+  const worker = join(root, "distinct-worker.ts");
+  fs.writeFileSync(worker, `
+    import * as fs from "node:fs";
+    import { join } from "node:path";
+    import { spyOn } from "bun:test";
+    ${WORKER_OWNER_WATCH_SCRIPT}
+    const [role, root, cur, source, count] = process.argv.slice(2);
+    process.env.TPS_MAIL_DIR = root;
+    const signal = (name) => fs.writeFileSync(join(root, name), "ready");
+    ${ownerAwareGateWaitScript()}
+    const mail = await import(source);
+    let iteration = 0;
+    mail.mailAckScratchTestHooks.now = () => iteration * 10 * 60 * 1000;
+    const warnings = [];
+    console.warn = (...args) => warnings.push(args.join(" "));
+    const sync = fs.fsyncSync;
+    if (role === "a") spyOn(fs, "fsyncSync").mockImplementation((fd) => {
+      sync(fd);
+      signal("live-" + iteration);
+      wait("release-" + iteration);
+    });
+    else {
+      const stat = fs.lstatSync;
+      spyOn(fs, "lstatSync").mockImplementation((...args) => {
+        const result = stat(...args);
+        if (String(args[0]).endsWith("/.mail-lock")) signal("contended-" + iteration);
+        return result;
+      });
+    }
+    const results = [];
+    signal(role + "-ready");
+    for (; iteration < Number(count); iteration++) {
+      wait(role + "-go-" + iteration);
+      results.push(mail.ackMessageAtPath(join(cur, role + "-" + iteration + ".json")));
+      signal(role + "-done-" + iteration);
+    }
+    fs.writeFileSync(join(root, role + "-results.json"), JSON.stringify({results, warnings}));
+    process.exit(0);
+  `);
+  const source = new URL("../src/utils/mail.ts", import.meta.url).href;
+  const children: ReturnType<typeof Bun.spawn>[] = [];
+  const signal = (name: string) => fs.writeFileSync(join(root, name), "ready");
+  const wait = (name: string) => waitFor(() => fs.existsSync(join(root, name)));
+  try {
+    for (const role of ["a", "b"]) children.push(spawnWatchedWorker(worker, [role, root, cur, source, String(iterations)]));
+    for (const role of ["a", "b"]) await wait(`${role}-ready`);
+    for (let i = 0; i < iterations; i++) {
+      signal(`a-go-${i}`);
+      await wait(`live-${i}`);
+      expect(fs.readdirSync(cur).filter(isScratchName)).toHaveLength(1);
+      signal(`b-go-${i}`);
+      await wait(`contended-${i}`);
+      expect(fs.readdirSync(cur).filter(isScratchName)).toHaveLength(1);
+      signal(`release-${i}`);
+      for (const role of ["a", "b"]) await wait(`${role}-done-${i}`);
+    }
+    for (const child of children) expect(await waitForChildExit(child, 10_000)).toBe(0);
+    for (const role of ["a", "b"]) {
+      const { results, warnings } = JSON.parse(fs.readFileSync(join(root, `${role}-results.json`), "utf8"));
+      expect(warnings).toEqual([]);
+      expect(results).toHaveLength(iterations);
+      for (let i = 0; i < iterations; i++) {
+        expect(results[i].id).toBe(`${role}-${i}`);
+        expect(results[i].read).toBe(true);
+        expect(results[i].ackedAt).toBeDefined();
+        expect(fs.existsSync(join(cur, `${role}-${i}.json`))).toBe(false);
+      }
+    }
+    expect(fs.readdirSync(cur).filter(isScratchName)).toEqual([]);
+  } finally {
+    await Promise.all(children.map((child) => stopChild(child)));
+  }
+}, 30_000);
 
 test("concurrent acks of one record produce one ack and no leftover scratch", async () => {
   const worker = join(root, "ack-worker.ts");
