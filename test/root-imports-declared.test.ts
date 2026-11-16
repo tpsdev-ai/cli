@@ -326,6 +326,39 @@ describe("root imports are declared", () => {
 		// reports. The generated-parentheses case below runs over this whole set.
 		const LOADER_FIXTURES: { name: string; source: string; specifiers: string[] }[] = [
 			{
+				name: "as assertions around loader expressions",
+				source: [
+					'const load = createRequire(import.meta.url) as (id: string) => unknown; load("u-as-assertion");',
+					...["=", "??=", "||=", "&&="].map((operator, index) =>
+						`let assigned${index}; assigned${index} ${operator} createRequire(import.meta.url) as any; assigned${index}("u-as-assignment-${index}");`,
+					),
+					'(module as any)[("require" as string)]("u-as-member" as string);',
+					'(module.require as any)("u-as-callee");',
+					'const other = (createRequire as any)(import.meta.url); (other as any)("u-as-bound-callee");',
+				].join("\n"),
+				specifiers: ["u-as-assertion", ...[0, 1, 2, 3].map((index) => `u-as-assignment-${index}`), "u-as-member", "u-as-callee", "u-as-bound-callee"],
+			},
+			{
+				name: "a satisfies expression around a loader initializer",
+				source: 'const load = createRequire(import.meta.url) satisfies unknown; load("u-satisfies");',
+				specifiers: ["u-satisfies"],
+			},
+			{
+				name: "a non-null expression around a loader initializer",
+				source: 'const load = createRequire(import.meta.url)!; load("u-nonnull");',
+				specifiers: ["u-nonnull"],
+			},
+			{
+				name: "nested as assertions around a direct loader callee",
+				source: '(createRequire(import.meta.url) as unknown as (id: string) => unknown)("u-direct-as");',
+				specifiers: ["u-direct-as"],
+			},
+			{
+				name: "an angle-bracket type assertion around a loader initializer",
+				source: 'const load = <any>createRequire(import.meta.url); load("u-type-assertion");',
+				specifiers: ["u-type-assertion"],
+			},
+			{
 				name: "a literal argument to a function bound from createRequire",
 				source: [
 					'import { createRequire } from "node:module";',
@@ -620,6 +653,13 @@ describe("root imports are declared", () => {
 			expect(undeclaredIn('load = createRequire(__filename); load("undeclared-global");', "fixture.cjs")).toEqual([]);
 		});
 
+		it("treats var re-declarations and ambient module declarations as shadowing", () => {
+			for (const file of ["fixture.cjs", "fixture.js"]) {
+				expect(undeclaredIn('var module;\nmodule.require("undeclared-var-module");', file)).toEqual([]);
+			}
+			expect(undeclaredIn('declare const module: any;\nmodule.require("undeclared-ambient-module");')).toEqual([]);
+		});
+
 		it("leaves an aliased createRequire import unchecked", () => {
 			expect(undeclaredIn('import { createRequire as cr } from "node:module"; const load = cr(import.meta.url); load("undeclared-alias");')).toEqual([]);
 		});
@@ -693,6 +733,7 @@ describe("root imports are declared", () => {
 		});
 
 		it("reports the same specifiers with expression-position identifiers and literals parenthesised, and both forms parse cleanly", () => {
+			// This covers parenthesisation only; assertion forms are pinned by the per-form fixtures.
 			for (const fixture of LOADER_FIXTURES) {
 				expect({ fixture: fixture.name, diagnostics: parseDiagnostics(fixture.source) }).toEqual({
 					fixture: fixture.name,

@@ -16,8 +16,12 @@
  *     or an `=`, `??=`, `||=` or `&&=` assignment to a resolved binding;
  *   - a direct `createRequire(...)("x")` call.
  *
- * Parentheses are allowed around callees, member-access objects, literal keys
- * and literal arguments. Local declarations shadow `module` and `process`.
+ * Parentheses, `as` and angle-bracket type assertions, `satisfies` and non-null
+ * expressions are skipped around callees, initializers, assignment operands,
+ * member-access objects, literal keys and literal arguments.
+ * Local declarations are treated as shadowing `module` and `process`, including
+ * a `var` re-declaration of the CommonJS wrapper parameter and an ambient
+ * `declare const module`, which do not shadow it at runtime.
  * An argument is read only when it is a literal string (or a template literal
  * with no substitutions); any other form
  * is not checked, for example a dynamic key, `module.createRequire`, a loader
@@ -113,13 +117,22 @@ function scriptKindFor(file) {
 }
 
 /**
- * A node with parentheses removed.
+ * A node with parentheses and TypeScript assertion wrappers removed.
  */
 function unwrap(node) {
-	return ts.skipParentheses(node);
+	while (
+		ts.isParenthesizedExpression(node) ||
+		ts.isAsExpression(node) ||
+		ts.isSatisfiesExpression(node) ||
+		ts.isNonNullExpression(node) ||
+		ts.isTypeAssertionExpression(node)
+	) {
+		node = node.expression;
+	}
+	return node;
 }
 
-/** An identifier's name after unwrapping parentheses, or null. */
+/** An identifier's name after unwrapping, or null. */
 function identifierText(node) {
 	const expression = unwrap(node);
 	return ts.isIdentifier(expression) ? expression.text : null;
@@ -237,7 +250,7 @@ export function scanLoaderImports(file, source) {
 		if (
 			declared !== undefined &&
 			node.initializer !== undefined &&
-			isCreateRequireCall(ts.skipParentheses(node.initializer))
+			isCreateRequireCall(unwrap(node.initializer))
 		) {
 			bound.add(declared);
 		}
@@ -249,7 +262,7 @@ export function scanLoaderImports(file, source) {
 				ts.SyntaxKind.BarBarEqualsToken,
 				ts.SyntaxKind.AmpersandAmpersandEqualsToken,
 			].includes(node.operatorToken.kind) &&
-			isCreateRequireCall(ts.skipParentheses(node.right))
+			isCreateRequireCall(unwrap(node.right))
 		) {
 			const assigned = symbolAt(node.left);
 			if (assigned !== undefined) bound.add(assigned);
