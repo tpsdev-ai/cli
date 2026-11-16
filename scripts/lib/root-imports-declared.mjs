@@ -9,17 +9,20 @@
  *   - `import ... from "x"`, `export ... from "x"` and `import("x")` with a
  *     literal specifier, read with Bun's own scanner;
  *   - `require("x")`, read by the same scanner;
- *   - `module.require("x")` and `process.mainModule.require("x")`, with each
- *     property written as a dot access or as an element access with a
- *     string or no-substitution-template key (`module["require"]`);
- *   - a name bound to a `createRequire(...)` result by a variable declaration
- *     or an `=`, `??=`, `||=` or `&&=` assignment to a resolved binding;
+ *   - `module.require("x")`, `process.mainModule.require("x")` and
+ *     `require.main.require("x")`, with each property written as a dot access
+ *     or as an element access with a string or no-substitution-template key
+ *     (`module["require"]`);
+ *   - a name bound to a `createRequire(...)` result by a variable declaration,
+ *     parameter default, binding-pattern default, shorthand object-assignment
+ *     default or an `=`, `??=`, `||=` or `&&=` assignment to a resolved binding;
  *   - a direct `createRequire(...)("x")` call.
  *
  * Parentheses, `as` and angle-bracket type assertions, `satisfies` and non-null
  * expressions are skipped around callees, initializers, assignment operands,
  * member-access objects, literal keys and literal arguments.
- * Local declarations are treated as shadowing `module` and `process`, including
+ * Local declarations are treated as shadowing `module`, `process` and the
+ * `require` receiver in `require.main.require`, including
  * `var module`, `declare const module`, `declare const process` and
  * `import process from "node:process"`, even when they bind the runtime receiver.
  * An argument is read only when it is a literal string (or a template literal
@@ -189,6 +192,18 @@ function isProcessMainModuleRequire(node, symbolAt) {
 	);
 }
 
+/** A call written `require.main.require(...)` with an unshadowed receiver. */
+function isRequireMainRequire(node, symbolAt) {
+	const access = unwrap(node);
+	if (accessName(access) !== "require") return false;
+	const target = unwrap(access.expression);
+	if (accessName(target) !== "main") return false;
+	return (
+		identifierText(target.expression) === "require" &&
+		!hasLocalBinding(symbolAt(target.expression))
+	);
+}
+
 /** A call written `module.require(...)` with an unshadowed receiver. */
 function isModuleRequire(node, symbolAt) {
 	const access = unwrap(node);
@@ -205,9 +220,10 @@ function literalArgument(node) {
 
 /**
  * Specifiers loaded through a module loader that Bun's scanner does not report:
- * a variable holding a `createRequire(...)` result (or a direct
- * `createRequire(...)(...)` call), `module.require` and
- * `process.mainModule.require`. Only a literal first argument is returned.
+ * a binding holding a `createRequire(...)` result (including parameter and
+ * binding-pattern defaults), a direct `createRequire(...)(...)` call,
+ * `module.require`, `process.mainModule.require` and `require.main.require`.
+ * Only a literal first argument is returned.
  * Comments and strings are not matched: this is a parse, not a text scan.
  * @param {string} file
  * @param {string} source
@@ -263,6 +279,14 @@ export function scanLoaderImports(file, source) {
 			if (binding !== undefined) bound.add(binding);
 		}
 		if (
+			ts.isParameter(node) &&
+			node.initializer !== undefined &&
+			isCreateRequireCall(unwrap(node.initializer))
+		) {
+			const binding = symbolAt(node.name);
+			if (binding !== undefined) bound.add(binding);
+		}
+		if (
 			ts.isShorthandPropertyAssignment(node) &&
 			node.objectAssignmentInitializer !== undefined &&
 			isCreateRequireCall(unwrap(node.objectAssignmentInitializer))
@@ -295,7 +319,8 @@ export function scanLoaderImports(file, source) {
 				isCreateRequireCall(callee) ||
 				(calleeSymbol !== undefined && bound.has(calleeSymbol)) ||
 				isModuleRequire(callee, symbolAt) ||
-				isProcessMainModuleRequire(callee, symbolAt);
+				isProcessMainModuleRequire(callee, symbolAt) ||
+				isRequireMainRequire(callee, symbolAt);
 			if (isLoader) {
 				const specifier = literalArgument(node);
 				if (specifier !== null) found.push(specifier);

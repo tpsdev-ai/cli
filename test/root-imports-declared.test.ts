@@ -326,6 +326,36 @@ describe("root imports are declared", () => {
 		// reports. The generated-parentheses case below runs over this whole set.
 		const LOADER_FIXTURES: { name: string; source: string; specifiers: string[] }[] = [
 			{
+				name: "a loader bound by a function parameter default",
+				source: 'function f(load = createRequire(import.meta.url)) { return load("undeclared-param-function"); }',
+				specifiers: ["undeclared-param-function"],
+			},
+			{
+				name: "a loader bound by an arrow parameter default",
+				source: 'const f = (load = createRequire(import.meta.url)) => load("undeclared-param-arrow");',
+				specifiers: ["undeclared-param-arrow"],
+			},
+			{
+				name: "a loader bound by a method parameter default",
+				source: 'class Reader { read(load = createRequire(import.meta.url)) { return load("undeclared-param-method"); } }',
+				specifiers: ["undeclared-param-method"],
+			},
+			{
+				name: "a literal argument to require.main.require",
+				source: 'require.main.require("undeclared-require-main");',
+				specifiers: ["undeclared-require-main"],
+			},
+			{
+				name: "a literal argument to optional require.main.require",
+				source: 'require.main?.require("undeclared-require-main-optional");',
+				specifiers: ["undeclared-require-main-optional"],
+			},
+			{
+				name: "a literal argument to require.main.require through computed member access",
+				source: 'require["main"][`require`]("undeclared-require-main-computed");',
+				specifiers: ["undeclared-require-main-computed"],
+			},
+			{
 				name: "a loader bound by an object binding-pattern shorthand default",
 				source: 'const { load = createRequire(import.meta.url) } = {}; load("undeclared-a");',
 				specifiers: ["undeclared-a"],
@@ -648,8 +678,8 @@ describe("root imports are declared", () => {
 			});
 		}
 
-		for (const receiver of ["module", "process"]) {
-			const call = receiver === "module" ? 'module.require("display-label")' : 'process.mainModule.require("display-label")';
+		for (const receiver of ["module", "process", "require"]) {
+			const call = receiver === "module" ? 'module.require("display-label")' : receiver === "process" ? 'process.mainModule.require("display-label")' : 'require.main.require("display-label")';
 			for (const declaration of [
 				`function render(${receiver}) { return ${call}; }`,
 				`{ const ${receiver} = {}; ${call}; }`,
@@ -677,6 +707,31 @@ describe("root imports are declared", () => {
 		it("leaves assignment to an undeclared name unchecked in a cjs script", () => {
 			expect(undeclaredIn('load = createRequire(__filename); load("undeclared-global");', "fixture.cjs")).toEqual([]);
 		});
+
+		it("reports a loader bound by a cjs parameter default using __filename", () => {
+			expect(undeclaredIn('function f(load = createRequire(__filename)) { return load("undeclared-param-cjs"); }', "fixture.cjs")).toEqual([
+				{ file: "fixture.cjs", specifier: "undeclared-param-cjs", packageName: "undeclared-param-cjs" },
+			]);
+		});
+
+		it("does not report a parameter default from a different factory", () => {
+			expect(undeclaredIn('const load = createRequire(import.meta.url); function f(load = makeLoader()) { return load("display-label"); }')).toEqual([]);
+		});
+
+		for (const file of ["fixture.cjs", "fixture.js"]) {
+			it(`reports require.main.require spellings beside CommonJS exports in ${file}`, () => {
+				expect(undeclaredIn('require.main.require("u-main"); require.main?.require("u-main-optional"); require["main"].require("u-main-computed"); module.exports = {};', file).map((entry) => entry.specifier)).toEqual(["u-main", "u-main-optional", "u-main-computed"]);
+			});
+
+			it(`does not report require.main.require with a local require in ${file}`, () => {
+				for (const source of [
+					'const require = customLoader; require.main.require("display-label");',
+					'function f(require) { require.main?.require("display-label"); require["main"].require("display-label"); }',
+				]) {
+					expect(undeclaredIn(source, file)).toEqual([]);
+				}
+			});
+		}
 
 		it("treats var re-declarations and ambient module declarations as shadowing", () => {
 			for (const file of ["fixture.cjs", "fixture.js"]) {
