@@ -11,7 +11,8 @@ import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/
 import { mailLockPath } from "../src/utils/mail-lock.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 import { connectAndKeepAlive } from "../src/utils/relay.js";
-import type { TransportChannel } from "../src/utils/transport.js";
+import type { HostConnectionState } from "../src/utils/connection-state.js";
+import type { TransportChannel, TpsMessage } from "../src/utils/transport.js";
 import { MSG_HEARTBEAT } from "../src/utils/wire-mail.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 
@@ -805,5 +806,118 @@ test("a reconnect leaves another connection's host record in place and that conn
       restoreRelayEnv(savedEnv);
       rmSync(root, { recursive: true, force: true });
     }
+  }
+}, 30_000);
+
+
+type RelayChannelState = {
+  attached: boolean;
+  detached: boolean;
+  alive: boolean;
+  handler?: Parameters<TransportChannel["onMessage"]>[0];
+};
+
+/** Two connections for one branch in this process over the stubbed transport;
+ *  `start` takes the read hooks for the connection it starts. */
+async function twoRelayConnections(root: string) {
+  const savedEnv = savedRelayEnv();
+  const stops: Array<() => Promise<void>> = [];
+  const channels: RelayChannelState[] = [];
+  const received: TpsMessage[] = [];
+  let attempts = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => {
+    attempts++;
+    const state: RelayChannelState = { attached: false, detached: false, alive: true };
+    channels.push(state);
+    return {
+      async send() {},
+      onMessage(callback) { state.attached = true; state.handler = callback; },
+      offMessage() { state.detached = true; },
+      async close() { state.alive = false; },
+      isAlive() { return state.alive; },
+      peerFingerprint() { return "remote"; },
+    };
+  });
+  const branch = await prepareBranch(root);
+  const path = hostStatePath(branch);
+  const record = (): HostConnectionState => JSON.parse(readFileSync(path, "utf8")) as HostConnectionState;
+  const start = async (connectionHooks?: { startToken: (pid: number) => string | null }): Promise<string> => {
+    stops.push(await connectAndKeepAlive(branch, { testHooks: connectionHooks, onMessage: (msg) => received.push(msg) }));
+    for (let i = 0; i < 400 && !channels.at(-1)?.attached; i++) await Bun.sleep(5);
+    expect(channels.at(-1)?.attached).toBe(true);
+    for (let i = 0; i < 400 && record().connectionId === undefined; i++) await Bun.sleep(5);
+    return String(record().connectionId);
+  };
+  const stop = async (): Promise<void> => {
+    try {
+      for (const stopConnection of stops) await stopConnection();
+      for (let i = 0; i < 400 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+    } finally {
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+  return { branch, path, record, channels, received, attempts: () => attempts, start, stop };
+}
+
+test("a relay reconnect claims a gone owner's host record", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-gone-1023-"));
+  // The record's owner is not running under its token: a live pid with a
+  // different start token from the same source is pid reuse.
+  const connections = await twoRelayConnections(root);
+  try {
+    const aId = await connections.start({ startToken: () => "proc:simulated-reuse" });
+    const bId = await connections.start();
+    expect(bId).not.toBe(aId);
+    const bBytes = readFileSync(connections.path);
+
+    connections.channels[0]!.alive = false;
+    for (let i = 0; connections.attempts() < 3 && i < 1500; i++) await Bun.sleep(10);
+    expect(connections.attempts()).toBe(3);
+    for (let i = 0; i < 400 && !connections.channels[2]?.attached; i++) await Bun.sleep(5);
+    expect(connections.channels[2]?.attached).toBe(true);
+    for (let i = 0; i < 400 && connections.record().connectionId !== aId; i++) await Bun.sleep(5);
+
+    expect(connections.record().connectionId).toBe(aId);
+    expect(connections.record().reconnectCount).toBe(1);
+    expect(readFileSync(connections.path).equals(bBytes)).toBe(false);
+  } finally {
+    await connections.stop();
+  }
+}, 30_000);
+
+test("a refused reconnect claim reports one line and the channel keeps handling messages", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-refused-1023-"));
+  const connections = await twoRelayConnections(root);
+  const errors = spyOn(console, "error");
+  try {
+    const aId = await connections.start({ startToken: () => String(JSON.parse(readFileSync(connections.path, "utf8")).startToken) });
+    const bId = await connections.start();
+    expect(bId).not.toBe(aId);
+    const bBytes = readFileSync(connections.path);
+
+    connections.channels[0]!.alive = false;
+    for (let i = 0; connections.attempts() < 3 && i < 1500; i++) await Bun.sleep(10);
+    expect(connections.attempts()).toBe(3);
+    for (let i = 0; i < 400 && !connections.channels[2]?.attached; i++) await Bun.sleep(5);
+    expect(connections.channels[2]?.attached).toBe(true);
+
+    const claimLines = errors.mock.calls
+      .map((call) => String(call[0]))
+      .filter((line) => line.includes("not claimed on reconnect"));
+    expect(claimLines).toEqual([
+      `[relay] Host state record ${connections.path} not claimed on reconnect: the record belongs to another connection, so it was left as it is; the connection continues`,
+    ]);
+    expect(readFileSync(connections.path)).toEqual(bBytes);
+
+    const before = connections.received.length;
+    connections.channels[2]!.handler!({ type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} });
+    for (let i = 0; i < 200 && connections.received.length === before; i++) await Bun.sleep(5);
+    expect(connections.received.length).toBe(before + 1);
+    expect(connections.channels[2]!.alive).toBe(true);
+  } finally {
+    errors.mockRestore();
+    await connections.stop();
   }
 }, 30_000);

@@ -188,7 +188,7 @@ describe("connection-state", () => {
   });
 
   test.each([
-    { name: "a reused pid", pid: process.pid },
+    { name: "a simulated reused pid", pid: process.pid },
     { name: "a pid that is gone", pid: 2147483646 },
   ])("claimHostStateAt reclaims another connection's record when its process is gone ($name)", ({ pid }) => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-gone-"));
@@ -218,7 +218,7 @@ describe("connection-state", () => {
       0,
       { startToken: () => "proc:current-owner" },
     );
-    expect(outcome).not.toEqual({ kind: "written" });
+    expect(outcome).toEqual({ kind: "unverifiable" });
     expect(readFileSync(path)).toEqual(raw);
   });
 
@@ -236,9 +236,90 @@ describe("connection-state", () => {
       0,
       { startToken: () => { throw new Error("token read failed"); } },
     );
-    expect(outcome).not.toEqual({ kind: "written" });
+    expect(outcome).toEqual({ kind: "unverifiable" });
     expect(readFileSync(path)).toEqual(raw);
   });
+
+  test("claimHostStateAt skips another connection's record when the start tokens come from different sources", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-source-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "ps:4242" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => "proc:4242" },
+    );
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test("claimHostStateAt reports an invalid record and leaves it as it is", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-invalid-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    mkdirSync(join(home, ".tps", "connections"), { recursive: true });
+    writeFileSync(path, "{ not json");
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a");
+    expect(outcome).toEqual({ kind: "invalid" });
+    expect(readFileSync(path, "utf8")).toBe("{ not json");
+  });
+
+  test("claimHostStateAt reports an unreadable record and leaves it as it is", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-unreadable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    mkdirSync(path, { recursive: true });
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a");
+    expect(outcome).toEqual({ kind: "unreadable", reason: "is not a regular file" });
+    expect(statSync(path).isDirectory()).toBe(true);
+  });
+
+  test("claimHostStateAt refuses while another process holds the record lock", async () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-locked-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
+    const raw = readFileSync(path);
+    const lockRoot = hostStateLockRoot(path);
+    // A separate process takes the real record lock and holds it; the claim is
+    // then a genuine contender, not a nested acquisition in this process.
+    const script = [
+      `const { acquireMailLockSync } = await import(process.env.TPS_LOCK_MODULE);`,
+      `const lock = acquireMailLockSync(process.env.TPS_LOCK_ROOT, { timeoutMs: 5000 });`,
+      `if (!lock) process.exit(2);`,
+      `process.stdout.write("locked\\n");`,
+      `await new Promise((resolve) => { process.stdin.on("data", () => {}); process.stdin.on("end", resolve); process.stdin.resume(); });`,
+      `lock.release();`,
+    ].join("\n");
+    const holder = Bun.spawn([process.execPath, "-e", script], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, TPS_LOCK_MODULE: new URL("../../agent/src/lib/mail-lock.ts", import.meta.url).href, TPS_LOCK_ROOT: lockRoot },
+    });
+    try {
+      const decoder = new TextDecoder();
+      let seen = "";
+      let errText = "";
+      void (async () => { for await (const chunk of holder.stdout) seen += decoder.decode(chunk); })();
+      void (async () => { for await (const chunk of holder.stderr) errText += decoder.decode(chunk); })();
+      const deadline = Date.now() + 15_000;
+      while (!seen.includes("locked") && holder.exitCode === null && Date.now() < deadline) await Bun.sleep(10);
+      expect({ seen, errText, exitCode: holder.exitCode }).toMatchObject({ seen: expect.stringContaining("locked") });
+      expect(() => claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:b" })).toThrow(
+        `Host state record lock ${mailLockPath(lockRoot)} could not be acquired within 0 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRoot} and retry.`,
+      );
+      expect(readFileSync(path)).toEqual(raw);
+    } finally {
+      holder.stdin.end();
+      await holder.exited;
+    }
+  }, 20_000);
 
   test("refreshOwnedHostStateAt writes the record it owns", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-owned-write-"));

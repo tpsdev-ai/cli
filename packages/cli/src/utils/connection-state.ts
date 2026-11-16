@@ -296,11 +296,12 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
 /**
  * Claim a record for a connection that has established before. Under the
  * record lock the record is read and written when the optional `shouldWrite`
- * gate holds and the record is absent, owned by this connection, or owned by
- * another connection whose recorded process is gone. A live owner's record,
- * and an invalid, unreadable or unverifiable one, are left as they are. The
- * absent case differs from a refresh: a reconnect may re-establish a record
- * that was removed, but never replace one another connection owns.
+ * gate holds and the record is absent, owned by this connection, or belongs to
+ * a connection whose recorded process is not running or is running with a
+ * start token different from the recorded one (pid reuse); a record whose
+ * token was altered is indistinguishable from pid reuse. An invalid, unreadable
+ * or unverifiable record is left as it is. The absent case differs from a
+ * refresh: a reconnect may re-establish a record that was removed.
  */
 export function claimHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS, hooks?: HostStateReadHooks): HostStateRefreshOutcome {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -415,8 +416,9 @@ function tokenSource(token: string): string {
 /**
  * Whether the process that wrote a record is still the one running under its
  * pid. "gone": the pid is gone, or a live pid carries a different start token
- * than the record from the same source (pid reuse). "unknown": the record has
- * no token, the token cannot be read, or the sources differ; unknown never
+ * than the record from the same source (pid reuse); a record whose token was
+ * altered is indistinguishable from pid reuse. "unknown": the record has no
+ * token, the token cannot be read, or the sources differ; unknown never
  * licenses a write.
  */
 function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
@@ -446,8 +448,9 @@ type HostRecordClaim =
 /**
  * Ownership for a reconnect claim: the rule in `hostRecordOwnership`, plus a
  * record owned by another connection is claimable when its recorded process is
- * gone. The read and the liveness check run under the caller's record lock, so
- * the evidence and the write share one hold.
+ * not running or is running with a start token different from the recorded one
+ * (pid reuse). The read and the liveness check run under the caller's record
+ * lock, so the evidence and the write share one hold.
  */
 function claimableHostRecordOwnership(path: string, branch: string, connectionId: string, readStartToken?: (pid: number) => string | null): HostRecordClaim {
   const current = readHostRecord(path, branch);

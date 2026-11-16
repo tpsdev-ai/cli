@@ -1438,8 +1438,8 @@ function hostStateRefreshReporter(recordPath: string): (outcome: HostStateRefres
   };
 }
 
-/** Report a reconnect's claim outcome when it left the record alone: one line
- *  per reconnect, naming the record path and the reason, never its contents. */
+/** Report a reconnect claim's ownership or readability refusal: one line
+ *  naming the record path and the reason, never its contents. */
 function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshOutcome) => void {
   return (outcome) => {
     let reason: string;
@@ -1630,10 +1630,11 @@ export async function connectAndKeepAlive(
         };
         // stop() sets stopped before clearing; both gates are checked under the lock.
         // The initial claim of a live connection replaces whatever record is
-        // there. A later claim (a reconnect) re-establishes the record only when
-        // it is absent or this connection's own, so a connection whose record
-        // was replaced leaves the replacement intact. `claimedRecord` tells the
-        // two apart.
+        // there. A later claim (a reconnect) writes when the record is absent or
+        // this connection's own, or when its recorded process is not running or
+        // runs with a start token different from the recorded one (pid reuse); a
+        // record whose token was altered is indistinguishable from pid reuse.
+        // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {
             writeHostStateAt(recordPath, state, () => !stopped);
@@ -1650,8 +1651,9 @@ export async function connectAndKeepAlive(
         const refresh = hostStateRefresher(recordPath, persist);
         // The claim stays outside the refresher so a write that throws still
         // reconnects, after one line naming the record path and reason; so does
-        // the post-send update. A skipped claim logs one line and leaves the
-        // record to its owner: the channel stays up and serving.
+        // the post-send update. A claim refused for ownership or readability
+        // logs one line and leaves the record as it is; a `stopped` outcome is
+        // silent. The channel stays up and serving.
         const connectWrite = (write: () => void) => {
           try {
             write();
