@@ -70,12 +70,14 @@ const relay = {
   deliver: [] as Array<{ branchId: string; msg: any }>,
   bridge: [] as Array<{ branchId: string; msg: any }>,
   failDeliver: false,
+  throwAfterDeliver: false,
 };
 mock.module("@tpsdev-ai/cli/utils/relay", () => ({
   ...realRelayExports,
   deliverToRemoteBranch: async (branchId: string, msg: any) => {
     if (relay.failDeliver) throw new Error("relay down");
     relay.deliver.push({ branchId, msg });
+    if (relay.throwAfterDeliver) throw new Error("relay threw after send");
   },
   // Mirrors the REAL deliverToSandbox (packages/cli/src/utils/relay.ts): it
   // writes the reduced record into the branch mail root's new/, carrying the
@@ -129,6 +131,9 @@ const obligations = {
   failPostedTransition: false,
   failAckTransition: false,
   failReceiptScan: false,
+  // cli#408: the write-ahead (`delivering`) and the failure write themselves.
+  failDeliveringTransition: false,
+  failFailedTransition: false,
   // cli#389 round 13, item 3: make a transition to `failed` be REFUSED (a null
   // return, not a throw) — the shape a record that is gone or already terminal
   // produces — so a test can prove the verb stamps nothing and mails nothing.
@@ -144,6 +149,12 @@ mock.module("../src/obligations.js", () => ({
     }
     if (obligations.failAckTransition && next === "acked") {
       throw new Error("injected: the ack transition threw");
+    }
+    if (obligations.failDeliveringTransition && next === "delivering") {
+      throw new Error("injected: the delivering transition threw");
+    }
+    if (obligations.failFailedTransition && next === "failed") {
+      throw new Error("injected: the failed transition threw");
     }
     if (obligations.refuseFailedTransition && next === "failed") {
       return null; // refused, not thrown — obligations.ts returns null for that
@@ -223,7 +234,7 @@ async function waitFor(pred: () => boolean, ms = 3000): Promise<void> {
  * bare `channelRuntime` is enough: the cur/ sweep skips a nacked record and the
  * obligation loop skips terminal ones, so nothing dispatches.
  */
-async function restartAccount(agentId: string): Promise<void> {
+async function restartAccount(agentId: string, settled?: () => boolean): Promise<void> {
   const cfg = {
     channels: { "tps-mail": { accounts: { default: { mailDir, enabled: true } } } },
     bindings: [{ agentId, match: { channel: "tps-mail", accountId: "default" } }],
@@ -236,6 +247,15 @@ async function restartAccount(agentId: string): Promise<void> {
     channelRuntime: {},
     abortSignal: abort.signal,
   });
+  if (settled) {
+    try {
+      await waitFor(settled, 3000);
+    } finally {
+      abort.abort();
+      await p.catch(() => {});
+    }
+    return;
+  }
   await new Promise((r) => setTimeout(r, 300)); // let the startup sweeps run
   abort.abort();
   try {
@@ -260,6 +280,7 @@ async function inFreshHome<T>(setup: () => void, fn: () => Promise<T>): Promise<
   relay.deliver.length = 0;
   relay.bridge.length = 0;
   relay.failDeliver = false;
+  relay.throwAfterDeliver = false;
   try {
     setup();
     return await fn();
@@ -297,6 +318,8 @@ beforeEach(() => {
   obligations.failPostedTransition = false;
   obligations.failAckTransition = false;
   obligations.failReceiptScan = false;
+  obligations.failDeliveringTransition = false;
+  obligations.failFailedTransition = false;
   obligations.refuseFailedTransition = false;
 });
 
@@ -1278,6 +1301,108 @@ describe("cli#389 round 8 — the commit is persisted, and the deadline never na
     expect(outcome.nack, "no nack mail").toBeNull();
     expect(typeof outcome.obligation?.deadlineAt, "the deadline decides it").toBe("string");
   }, 20000);
+});
+
+// ── cli#408 — the obligation-lifecycle paths a regression would miss ─────────
+
+/**
+ * cli#408 (follow-up to the #406 review). Two paths whose outcome is right on
+ * main but whose failure mode a reader had to reason about:
+ *   - a failed write-ahead (`delivering`) sends nothing, fails the obligation
+ *     and announces the sender exactly once;
+ *   - a failure write that throws is ONE attempt with no announcement; the
+ *     record resolves on the next start.
+ */
+describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)", () => {
+  it("a wire send recorded before the delivery call throws resolves unconfirmed with no nack", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "400";
+    const outcome = await inFreshHome(
+      () => {
+        galEntry("rockit", "tps-rockit");
+        remoteBranch("tps-rockit");
+        relay.throwAfterDeliver = true;
+      },
+      () => routeViaDispatcher("rockit", ["anvil"]),
+    );
+
+    expect(outcome.obligation?.state, "no verdict from the send-then-throw").toBe("unconfirmed");
+    expect(relay.deliver.length, "the wire send was recorded before the throw").toBe(1);
+    expect(relay.deliver[0]!.branchId).toBe("tps-rockit");
+    expect(JSON.parse(relay.deliver[0]!.msg.body).body).toBe("final verdict");
+    expect(outcome.route).toBe("remote-branch");
+    expect(outcome.obligation?.failure).toBe("yielded-without-resumption");
+    expect(outcome.inboundNackedAt).toBeNull();
+    expect(outcome.nack, "no nack mail after the recorded send").toBeNull();
+  }, 20000);
+
+  it("a failed `delivering` write sends nothing, fails the obligation by name and sends exactly one nack mail", async () => {
+    obligations.failDeliveringTransition = true;
+    const outcome = await inFreshHome(
+      () => maildirFor("sender-a"),
+      async () => {
+        const o = await routeViaDispatcher("sender-a", ["agent-b"]);
+        const senderNew = join(mailDir, "sender-a", "new");
+        const mails = readdirSafe(senderNew).filter((f) => f.endsWith(".json"));
+        const nacks = scanFor([senderNew], (r) => typeof r?.headers?.["X-TPS-Nack"] === "string");
+        return { ...o, mailCount: mails.length, nackCount: nacks.length };
+      },
+    );
+
+    // Nothing was sent: the only mail in the sender's box is the nack.
+    expect(relay.deliver.length + relay.bridge.length, "no wire or bridge send").toBe(0);
+    expect(outcome.mailCount, "exactly one mail: the nack").toBe(1);
+    expect(outcome.nackCount, "and it is a nack").toBe(1);
+
+    // The pre-call failure is named on the record and announced once.
+    expect(outcome.obligation?.state, "the obligation fails").toBe("failed");
+    expect(outcome.obligation?.failure, "the write failure is named").toBe("delivering-write-failed");
+    expect(outcome.inboundNackedAt, "the inbound IS nacked").toBeTruthy();
+    expect(String(outcome.inboundNackReason)).toContain("delivering-write-failed");
+    expect(outcome.warns.some((w) => w.includes("obligation-write-failed")), "logged by name").toBe(true);
+  }, 20000);
+
+  it("a failure write that throws is ONE attempt with no announcement; the next start resolves the record", async () => {
+    const out = await inFreshHome(
+      () => maildirFor("sender-a"),
+      async () => {
+        // Nothing is delivered (the write-ahead fails), and the failure write
+        // fails too: nothing can be recorded in this process.
+        obligations.failDeliveringTransition = true;
+        obligations.failFailedTransition = true;
+        const o = await routeViaDispatcher("sender-a", ["agent-b"]);
+        const senderNew = join(mailDir, "sender-a", "new");
+        const nacks = () => scanFor([senderNew], (r) => typeof r?.headers?.["X-TPS-Nack"] === "string").length;
+        const firstNackCount = nacks();
+        const firstState = o.obligation?.state;
+        const firstWriteFailedWarns = o.warns.filter((w) => w.includes("could not record the failure")).length;
+
+        // The store can be written again on the next start: recovery settles it.
+        obligations.failFailedTransition = false;
+        process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
+        // The launcher's own key dir is not this fixture's: point the restart's
+        // nack signer at the key the turn used.
+        const origKeys = process.env.TPS_TEST_KEYS_DIR;
+        process.env.TPS_TEST_KEYS_DIR = join(root, "keys");
+        try {
+          const obligationPath = join(mailDir, "agent-b", ".obligations", `${o.inboundId}.json`);
+          await restartAccount("agent-b", () => readJsonSafe(obligationPath)?.state === "failed" && nacks() > 0);
+          return { o, firstNackCount, firstState, firstWriteFailedWarns, rec: readJsonSafe(obligationPath), settledNackCount: nacks() };
+        } finally {
+          if (origKeys === undefined) delete process.env.TPS_TEST_KEYS_DIR;
+          else process.env.TPS_TEST_KEYS_DIR = origKeys;
+        }
+      },
+    );
+
+    // The turn: one attempt, logged once, nothing recorded, no mail sent.
+    expect(out.firstState, "the record stays unresolved").toBe("pending");
+    expect(out.firstNackCount, "no nack is sent for a failure that was not recorded").toBe(0);
+    expect(out.firstWriteFailedWarns, "one attempt, logged once").toBe(1);
+
+    // The next start can record it, and only then is the sender told.
+    expect(out.rec?.state, "the restart settles the record").toBe("failed");
+    expect(out.settledNackCount, "the sender is told exactly once, by the restart").toBe(1);
+  }, 25000);
 });
 
 // ── cli#429: a reply threads on the SIGNED inbound id, INSIDE the signature ──

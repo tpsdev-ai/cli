@@ -46,6 +46,7 @@ describe("the live case reports a failed heartbeat after the gateway exit", () =
     const message = stdout.slice(begin + marker.length, end);
     const gatewayAt = message.indexOf("gateway exited with code 0 during the heartbeat");
     const heartbeatAt = message.indexOf("live gateway: heartbeat exit status must be 0");
+    expect(message).toContain("\nheartbeat also failed: live gateway: heartbeat exit status must be 0");
     expect(gatewayAt).toBeGreaterThanOrEqual(0);
     expect(heartbeatAt).toBeGreaterThan(gatewayAt);
     expect(message).toContain("status=1");

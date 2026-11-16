@@ -32,14 +32,16 @@ function signalGroup(pid, signal) {
 
 /** Field 3 (state) and field 5 (process group) of a Linux `/proc/<pid>/stat`
  *  line. Field 2 (comm) may contain spaces and parentheses, so both follow the
- *  space after the last `)`. Null when the pid has no entry; other read errors
- *  are rethrown. */
-function procStat(pid) {
+ *  space after the last `)`. Null when the pid has no entry; a pid that exits
+ *  between the open and the read fails with ESRCH and is just as gone. Other
+ *  read errors are rethrown. The reader is injectable so a test can drive both
+ *  cases without a real /proc. */
+export function procStat(pid, readStat = readFileSync) {
   let stat;
   try {
-    stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
+    stat = readStat(`/proc/${pid}/stat`, "utf-8");
   } catch (error) {
-    if (error.code === "ENOENT") return null;
+    if (error.code === "ENOENT" || error.code === "ESRCH") return null;
     throw error;
   }
   const fields = stat.slice(stat.lastIndexOf(")") + 1).trim().split(/\s+/);
