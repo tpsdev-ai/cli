@@ -2009,8 +2009,8 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$ax/npm-superv
     *KILL*) bad "AX mutation: missing grace KILL caught" "AL's KILL assertion stayed green" ;;
     *) ok "AX mutation: missing grace KILL caught" "AL red: supervisor log contains no KILL attempt" ;;
   esac
-  ax_elapsed="$(awk '$1 == "start" {start=$2; signalled=0} $0 == "TERM" {signalled=1} $1 == "end" && signalled {printf "%.2f", ($2-start)/1000}' "$d/supervisor.log")"
-  if [ -n "$ax_elapsed" ] && node -e 'const n=Number(process.argv[1]); process.exit(n >= 2.5 && n < 8 ? 0 : 1)' "$ax_elapsed"; then
+  ax_elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
+  if [ -z "$ax_elapsed" ]; then bad "AX mutation: elapsed bounds stay green" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"; elif node -e 'const n=Number(process.argv[1]); process.exit(n >= 2.5 && n < 8 ? 0 : 1)' "$ax_elapsed"; then
     ok "AX mutation: elapsed bounds stay green" "${ax_elapsed}s"
   else
     bad "AX mutation: elapsed bounds stay green" "${ax_elapsed}s — expected [2.5, 8)"
