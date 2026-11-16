@@ -126,3 +126,26 @@ test("a failed listing warns with the directory and code, and the next ack retri
   expect(fs.existsSync(leftover)).toBe(false);
   expect(lines.filter((line) => line.includes("removed leftover ack scratch"))).toHaveLength(1);
 });
+
+test("a bare relative record path removes old scratch and leaves recent scratch", () => {
+  const cwd = process.cwd();
+  const mailbox = mail.getInbox("bare-path").root;
+  const old = join(mailbox, scratchName());
+  const fresh = join(mailbox, scratchName());
+  fs.writeFileSync(old, "{ old");
+  makeOld(old);
+  fs.writeFileSync(fresh, "{ fresh");
+  plantRecord(join(mailbox, "record.json"), "record-id");
+  const { lines } = collectWarnings();
+
+  try {
+    process.chdir(mailbox);
+    expect(mail.ackMessageAtPath("record.json").read).toBe(true);
+    expect(fs.existsSync(old)).toBe(false);
+    expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
+    expect(lines.filter((line) => line.includes("removed leftover ack scratch") && line.includes(old))).toHaveLength(1);
+    expect(lines.filter((line) => line.includes("left recent ack scratch") && line.includes(fresh))).toHaveLength(1);
+  } finally {
+    process.chdir(cwd);
+  }
+});

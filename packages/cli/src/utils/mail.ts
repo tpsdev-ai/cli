@@ -324,9 +324,8 @@ const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[
 
 const SWEEP_INTERVAL = 10 * 60 * 1000;
 /**
- * Collect a scratch only once it is older than this. An ack creates, writes and
- * renames its scratch inside one lock hold, which lasts milliseconds, so a
- * minute-old scratch cannot belong to an ack that is still running.
+ * Require at least a minute of age as an additional cleanup precaution.
+ * Age alone does not establish that a writer has stopped.
  */
 const ACK_SCRATCH_MIN_AGE_MS = 60 * 1000;
 const lastAckScratchSweep = new Map<string, number>();
@@ -334,21 +333,18 @@ export const mailAckScratchTestHooks: { now?: () => number } = {};
 
 /**
  * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
- * lock, and removes it before releasing that lock. So an old such name found in
- * `dir` while holding the same lock is a leftover from a writer that died
- * between creating the scratch and renaming it. Collect it and report the
- * attempt; a name that is not this exact shape is never touched. A scratch
- * younger than ACK_SCRATCH_MIN_AGE_MS is left for a later pass.
+ * lock, and removes it before releasing that lock. The sweep considers names
+ * of that exact shape and leaves scratch younger than ACK_SCRATCH_MIN_AGE_MS.
  *
- * The lock guards the mailbox root, so this only lists a directory that
- * resolves to a child of that root. A cur/ that is a symlink to another
- * mailbox's cur/ shares its scratch files but not its lock; the other
- * mailbox's live scratch is left alone there.
+ * The lock guards the mailbox root and its direct children, so the directory
+ * must resolve to the locked root or a direct child of it. A cur/ that is a
+ * symlink to another mailbox's cur/ shares its scratch files but not its lock;
+ * the other mailbox's live scratch is left alone there.
  *
  * Sweep at most once per directory per process every ten minutes, so a bulk
- * drain does not list the directory on every ack. A leftover has no live
- * writer, so collecting it on a later pass is enough. A failed listing records
- * no sweep time, so the next ack retries it.
+ * drain does not list the directory on every ack. Collecting eligible scratch
+ * on a later pass is enough. A failed listing records no sweep time, so the
+ * next ack retries it.
  */
 function removeLeftoverAckScratch(root: string, dir: string): void {
   dir = resolve(dir);
@@ -364,7 +360,7 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
     console.warn(`[mail] could not resolve ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
     return;
   }
-  if (dirname(listedDir) !== guardedRoot) {
+  if (listedDir !== guardedRoot && dirname(listedDir) !== guardedRoot) {
     lastAckScratchSweep.set(dir, now);
     console.warn(`[mail] left ack scratch in ${dir}: not a directory in the mailbox this lock guards`);
     return;
