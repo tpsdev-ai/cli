@@ -32,24 +32,6 @@ const NODE = Bun.which("node");
 /** A publish time well past the gate's 7-day threshold. */
 const OLD = "2026-01-01T00:00:00.000Z";
 
-const npmAvailable = (() => {
-  if (Bun.which("npm") === null) return false;
-  const probe = Bun.spawnSync(["npm", "--version"], { stdout: "pipe", stderr: "pipe" });
-  return probe.exitCode === 0;
-})();
-
-if (!npmAvailable) {
-  console.log(
-    "dep-age hermetic npm lane: skipped — npm is not on PATH (the Docker Integration image ships no npm)",
-  );
-}
-if (process.env.TPS_TEST_REQUIRE_NPM === "1") {
-  if (!npmAvailable) throw new Error("the Unit & Integration lane requires npm on PATH");
-  if (Bun.which("tar") === null) {
-    throw new Error("the Unit & Integration lane requires tar on PATH to unpack the bundle fixtures");
-  }
-}
-
 /** The npm and Arborist actually used, from npm's own install. */
 function npmToolchain(): { npm: string; arborist: string } {
   const npmBin = Bun.which("npm");
@@ -58,25 +40,64 @@ function npmToolchain(): { npm: string; arborist: string } {
   if (version.exitCode !== 0) {
     throw new Error(`npm --version exited ${version.exitCode}: ${version.stderr.toString().trim()}`);
   }
-  const npmDir = dirname(dirname(realpathSync(npmBin)));
-  const arboristPath = join(npmDir, "node_modules", "@npmcli", "arborist", "package.json");
-  let arborist: string;
+  const failures: string[] = [];
+  const readArborist = (npmDir: string): string => {
+    const arboristPath = join(npmDir, "node_modules", "@npmcli", "arborist", "package.json");
+    try {
+      return JSON.parse(readFileSync(arboristPath, "utf8")).version;
+    } catch (err) {
+      throw new Error(
+        `cannot read npm's bundled Arborist at ${arboristPath}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
   try {
-    arborist = JSON.parse(readFileSync(arboristPath, "utf8")).version;
+    return {
+      npm: version.stdout.toString().trim(),
+      arborist: readArborist(dirname(dirname(realpathSync(npmBin)))),
+    };
   } catch (err) {
-    throw new Error(
-      `test setup cannot read npm's bundled Arborist at ${arboristPath}: ${err instanceof Error ? err.message : String(err)}`,
+    failures.push(err instanceof Error ? err.message : String(err));
+  }
+  // PATH may name a version-manager shim rather than npm's own entry point.
+  const globalRoot = Bun.spawnSync(["npm", "root", "-g"], { stdout: "pipe", stderr: "pipe" });
+  if (globalRoot.exitCode === 0 && globalRoot.stdout.toString().trim() !== "") {
+    try {
+      return {
+        npm: version.stdout.toString().trim(),
+        arborist: readArborist(join(globalRoot.stdout.toString().trim(), "npm")),
+      };
+    } catch (err) {
+      failures.push(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    failures.push(
+      `npm root -g exited ${globalRoot.exitCode}: ${globalRoot.stderr.toString().trim() || "no global root returned"}`,
     );
   }
-  return { npm: version.stdout.toString().trim(), arborist };
+  throw new Error(`test setup cannot resolve npm's package root: ${failures.join("; ")}`);
 }
 
-const TOOLCHAIN = npmAvailable ? npmToolchain() : null;
+const TOOLCHAIN = (() => {
+  try {
+    return npmToolchain();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    if (process.env.TPS_TEST_REQUIRE_NPM === "1") {
+      throw new Error(`the Unit & Integration lane requires npm on PATH and its bundled Arborist: ${reason}`);
+    }
+    console.log(`dep-age hermetic npm lane: skipped — ${reason}`);
+    return null;
+  }
+})();
+if (process.env.TPS_TEST_REQUIRE_NPM === "1" && Bun.which("tar") === null) {
+  throw new Error("the Unit & Integration lane requires tar on PATH to unpack the bundle fixtures");
+}
 if (TOOLCHAIN !== null) {
   console.log(`dep-age hermetic npm lane: npm ${TOOLCHAIN.npm}, @npmcli/arborist ${TOOLCHAIN.arborist}`);
 }
 
-const SCRATCH = npmAvailable ? mkdtempSync(join(tmpdir(), "dep-age-hermetic-")) : "";
+const SCRATCH = TOOLCHAIN !== null ? mkdtempSync(join(tmpdir(), "dep-age-hermetic-")) : "";
 const liveRegistries: LocalRegistry[] = [];
 
 afterAll(() => {
@@ -316,7 +337,7 @@ function entry(project: Project, path: string): Record<string, unknown> {
   return value;
 }
 
-describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on the same lock", () => {
+describe.skipIf(TOOLCHAIN === null)("the release-age gate and a real npm installer on the same lock", () => {
   it.each([
     {
       label: "name",
@@ -344,11 +365,11 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
           const install = await installProject(root, registry, project);
           expect(install.status).not.toBe(0);
           expect(install.requests).toContain(`GET ${requested}`);
-          expect(registry.unexpected).toEqual([`GET ${requested}`]);
 
           const gate = await gateOn(root, registry, project);
           expect(gate.status).toBe(2);
           expect(gate.output).toContain(message);
+          expect(registry.unexpected).toEqual([`GET ${requested}`]);
         } finally {
           stopRegistry(registry);
         }
@@ -375,13 +396,13 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect(install.status).toBe(0);
         expect(install.requests).toEqual(["GET /dep-a/-/dep-a-1.0.0.tgz"]);
-        registry.assertNoUnexpected();
         const installed = JSON.parse(readFileSync(join(project.dir, "node_modules", "dep-alias", "package.json"), "utf8"));
         expect(installed.name).toBe("dep-a");
 
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(0);
         expect(gate.stdout).toContain("All 1 external resolved versions are at least 7 days old.");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -404,11 +425,11 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect(install.status).toBe(0);
         expect(install.requests).toEqual(["GET /dep-b", "GET /dep-b/-/dep-b-1.0.0.tgz"]);
-        registry.assertNoUnexpected();
 
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(0);
         expect(gate.stdout).toContain("All 1 external resolved versions are at least 7 days old.");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -444,7 +465,6 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect({ status: install.status, stderr: install.stderr }).toMatchObject({ status: 0 });
         expect(install.requests).toEqual(["GET /pkg-parent/-/pkg-parent-1.0.0.tgz"]);
-        registry.assertNoUnexpected();
         const installed = JSON.parse(
           readFileSync(join(project.dir, "node_modules", "pkg-parent", "node_modules", "bundled-dep", "package.json"), "utf8"),
         );
@@ -453,6 +473,7 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(0);
         expect(gate.stdout).toContain("All 1 external resolved versions are at least 7 days old.");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -499,7 +520,6 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
           "GET /bundled-dep",
           "GET /bundled-dep/-/bundled-dep-1.0.0.tgz",
         ]);
-        registry.assertNoUnexpected();
         const installed = JSON.parse(
           readFileSync(
             join(project.dir, "node_modules", "pkg-parent", "node_modules", "bundled-dep", "package.json"),
@@ -511,6 +531,7 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(0);
         expect(gate.stdout).toContain("All 2 external resolved versions are at least 7 days old.");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -533,12 +554,12 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect(install.status).toBe(0);
         expect(install.requests).toEqual(["GET /dep-young", "GET /dep-young/-/dep-young-1.0.0.tgz"]);
-        registry.assertNoUnexpected();
 
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(1);
         expect(gate.stderr).toContain("External packages younger than the 7-day release-age gate:");
         expect(gate.stderr).toContain("package-lock.json: dep-young@1.0.0");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -562,7 +583,6 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect(install.status).not.toBe(0);
         expect(install.stderr).toContain("Invalid: lock file's dep-versionless@ does not satisfy dep-versionless@1.0.0");
-        registry.assertNoUnexpected();
         expect(install.requests).toEqual(["GET /dep-versionless"]);
 
         const gate = await gateOn(root, registry, project);
@@ -570,6 +590,7 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         expect(gate.output).toContain(
           "package-lock.json: entry node_modules/dep-versionless: entry with no `resolved` URL has no version",
         );
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
@@ -591,11 +612,11 @@ describe.skipIf(!npmAvailable)("the release-age gate and a real npm installer on
         const install = await installProject(root, registry, project);
         expect(install.status).toBe(0);
         expect(install.requests).toEqual(["GET /dep-silent/-/dep-silent-1.0.0.tgz"]);
-        registry.assertNoUnexpected();
 
         const gate = await gateOn(root, registry, project);
         expect(gate.status).toBe(2);
         expect(gate.stderr).toContain("dep-silent@1.0.0: no publish time in the registry response");
+        registry.assertNoUnexpected();
       } finally {
         stopRegistry(registry);
       }
