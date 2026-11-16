@@ -33,7 +33,13 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function decideSettledRead({ stopped, ackLanded, ackTimedOut, error }) {
+export function decideSettledRead({ stopped, stoppedGracefully = true, ackLanded, ackTimedOut, error }) {
+  if (stopped && !stoppedGracefully) {
+    return {
+      read: false,
+      readError: "gateway did not stop gracefully (it was killed after the stop deadline); settled state not read",
+    };
+  }
   if (stopped && ackLanded) return { read: true, readError: null };
   return {
     read: false,
@@ -42,6 +48,39 @@ export function decideSettledRead({ stopped, ackLanded, ackTimedOut, error }) {
       : ackTimedOut
         ? "ack wait timed out; settled state not read"
         : `ack never awaited (the run failed before it${error ? `: ${error}` : ""}); settled state not read`,
+  };
+}
+
+function waitForExit(child, deadlineMs) {
+  return Promise.race([
+    new Promise((resolve) => child.once("exit", resolve)),
+    new Promise((resolve) => setTimeout(resolve, deadlineMs)),
+  ]);
+}
+
+/**
+ * Stop a gateway child: SIGTERM, then SIGKILL after the budget. Signal death
+ * leaves `exitCode` null, so a process that ended on SIGKILL is still stopped
+ * (dead, no writer left) but not stopped GRACEFULLY.
+ */
+export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
+  if (child) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await waitForExit(child, deadlineMs);
+    }
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await waitForExit(child, deadlineMs);
+    }
+  }
+  const exitCode = child?.exitCode ?? null;
+  const signalCode = child?.signalCode ?? null;
+  return {
+    stopped: !child || exitCode !== null || signalCode !== null,
+    stoppedGracefully: !child || exitCode !== null,
+    exitCode,
+    signalCode,
   };
 }
 
@@ -125,6 +164,11 @@ async function main() {
     inboundNewFiles: [],
     readErrors: [],
     inboundId: null,
+    inboundName: null,
+    settledRead: false,
+    stopped: false,
+    stoppedGracefully: false,
+    stopSignal: null,
     ackLanded: false,
     ackTimedOut: false,
     ackLines: [],
@@ -356,7 +400,6 @@ async function main() {
   };
 
   let child;
-  let stopped = false;
   let logs = "";
   try {
     child = spawn(
@@ -406,6 +449,7 @@ async function main() {
     // synchronously at start, and rename(2) within one filesystem is atomic, so it
     // never sees a half-written record.
     const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`;
+    report.inboundName = inboundName;
     const inboundTmp = join(MAIL, "agent-a", "tmp", inboundName);
     writeFileSync(
       inboundTmp,
@@ -459,19 +503,21 @@ async function main() {
   } catch (err) {
     report.error = err?.message ?? String(err);
   } finally {
-    if (child && child.exitCode === null) {
-      child.kill("SIGTERM");
-      await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
-      if (child.exitCode === null) {
-        child.kill("SIGKILL");
-        await Promise.race([new Promise((r) => child.once("exit", r)), sleep(STOP_DEADLINE_MS)]);
-      }
-    }
-    stopped = !child || child.exitCode !== null;
+    const stop = await stopGateway(child, { deadlineMs: STOP_DEADLINE_MS });
+    report.stopped = stop.stopped;
+    report.stoppedGracefully = stop.stoppedGracefully;
+    report.stopSignal = stop.signalCode;
     // Read the settled state only after the gateway has stopped (a second reply
     // or a late stamp from a running gateway would race the read) and only after
-    // an observed ack (without one, cur/ was never settled by the ack).
-    const settledRead = decideSettledRead({ stopped, ...report });
+    // an observed ack (without one, cur/ was never settled by the ack). A
+    // gateway killed after the stop budget is dead but did not stop gracefully,
+    // so the settled state is not judged.
+    const settledRead = decideSettledRead({
+      ...report,
+      stopped: stop.stopped,
+      stoppedGracefully: stop.stoppedGracefully,
+    });
+    report.settledRead = settledRead.read;
     if (settledRead.readError) report.readErrors.push(settledRead.readError);
     if (settledRead.read) {
       readSettledState(report, {
