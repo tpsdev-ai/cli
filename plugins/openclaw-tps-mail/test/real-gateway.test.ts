@@ -27,6 +27,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, w
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -55,6 +56,7 @@ type Report = {
   inboundNewFiles: string[];
   readErrors: string[];
   inboundId: string | null;
+  ackTimedOut: boolean;
   ackLines: string[];
   logs: string[];
   logTail?: string[];
@@ -66,6 +68,35 @@ type CurEntry = { name: string; size: number };
 function describeCurEntries(entries: CurEntry[]): string {
   if (entries.length === 0) return "no entries";
   return entries.map((entry) => `${entry.name} (${entry.size} bytes)`).join(", ");
+}
+
+/**
+ * The ack must have landed before any settled state is judged: a timed-out ack
+ * never finished, so the driver leaves the settled listing and the cur record
+ * unread, and this fails first, naming the ack.
+ */
+function expectAckLanded(report: Pick<Report, "ackTimedOut">): void {
+  if (report.ackTimedOut) {
+    throw new Error(
+      "the ack never landed within its deadline: the settled cur/ state was not read, so its count is not judged",
+    );
+  }
+}
+
+/**
+ * Exactly one INBOUND MESSAGE in the MID-ACK diagnostic listing, counted by the
+ * mailbox's own name rule. That listing is taken while the ack's atomic record
+ * replace may be in flight, so its transient `.ack-*.tmp` scratch is reported
+ * but not counted. A second inbound message still fails.
+ */
+function expectOneInbound(entries: CurEntry[], inboundId: string): void {
+  const messages = entries.filter((entry) => isMailboxMessageFile(entry.name));
+  if (messages.length !== 1) {
+    throw new Error(
+      `expected 1 inbound message in cur/, found ${messages.length}; cur/ entries: ${describeCurEntries(entries)}`,
+    );
+  }
+  expect(messages[0]?.name).toContain(inboundId);
 }
 
 /**
@@ -125,6 +156,8 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
       expect(r.replyFrom).toBe("agent-a");
       expect(r.replyTo).toBe("agent-b");
       expect(r.replyHeaders?.["X-TPS-InReplyTo"]).toBe(r.inboundId);
+      expectAckLanded(r);
+      expectOneInbound(r.curEntries, r.inboundId!);
       expectOneSettledCurEntry(r.curEntriesSettled, r.inboundId!);
       expect(r.replyCountAfterAck).toBe(1);
       expect(r.replyCountAfterStop).toBe(1);
@@ -185,5 +218,29 @@ describe("cli#1020 — the cur/ assertion reports what it found", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("cli#1020 — a timed-out ack is judged on its own assertion", () => {
+  it("fails on the ack timeout and never reaches the settled count", () => {
+    const report: Pick<Report, "ackTimedOut" | "curEntriesSettled"> = {
+      ackTimedOut: true,
+      curEntriesSettled: [
+        { name: "2026-01-01T00-00-00-000Z-msg-one.json", size: 10 },
+        { name: "2026-01-01T00-00-00-001Z-msg-two.json", size: 10 },
+      ],
+    };
+    let settledCountJudged = false;
+    let message = "";
+    try {
+      expectAckLanded(report);
+      settledCountJudged = true;
+      expectOneSettledCurEntry(report.curEntriesSettled, "msg-one");
+    } catch (err) {
+      message = String((err as Error).message);
+    }
+    expect(settledCountJudged).toBe(false);
+    expect(message).toContain("ack never landed");
+    expect(message).not.toContain("found 2");
   });
 });

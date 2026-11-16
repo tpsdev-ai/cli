@@ -438,8 +438,12 @@ try {
   stopped = !child || child.exitCode !== null;
   // B2: read the settled state only after the gateway has stopped — a second
   // reply or a late stamp from a still-running gateway would race this read.
+  // A timed-out ack never reached the settled state either: listing cur/ then
+  // would judge the ack on a listing it never finished, so the settled listing
+  // (and the cur record read from it) is not taken and the report says why.
   if (!stopped) report.readErrors.push("gateway did not stop within the deadline; settled state not read");
-  if (stopped) {
+  else if (report.ackTimedOut) report.readErrors.push("ack never landed before its deadline; settled state not read");
+  if (stopped && !report.ackTimedOut) {
     report.replyCountAfterStop = replyFilesOnDisk().length;
     report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
     // The gateway has stopped, so no writer is left. List cur/ afresh, with
