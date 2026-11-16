@@ -7,7 +7,7 @@ import { expect, test } from "bun:test";
 import type { ChildProcess } from "node:child_process";
 import { bootOnRetriedPorts } from "./helpers/scratch-flair.js";
 
-/** A stand-in child that records the signal it was stopped with. */
+/** A stand-in child that records its own pid when it is stopped; the signal is ignored. */
 function fakeChild(pid: number, killed: number[]): ChildProcess {
   return {
     pid,

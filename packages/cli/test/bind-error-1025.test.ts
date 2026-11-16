@@ -96,8 +96,19 @@ function watchTimers(delayMs: number): { live: Set<unknown>; stop: () => void } 
   const realSetTimeout = timers.setTimeout;
   const realClearTimeout = timers.clearTimeout;
   const restoreSet = patchShared(timers, "setTimeout", (handler: TimerHandler, ms?: number, ...args: unknown[]) => {
-    const handle = realSetTimeout(handler, ms, ...args);
-    if (ms === delayMs) live.add(handle);
+    const tracked = ms === delayMs && typeof handler === "function";
+    let handle: unknown;
+    handle = realSetTimeout(
+      tracked
+        ? (...timerArgs: unknown[]) => {
+            live.delete(handle);
+            (handler as (...callbackArgs: unknown[]) => void)(...timerArgs);
+          }
+        : handler,
+      ms,
+      ...args,
+    );
+    if (tracked) live.add(handle);
     return handle;
   });
   const restoreClear = patchShared(timers, "clearTimeout", (handle?: unknown) => {
@@ -284,6 +295,7 @@ test("a post-bind error runs listenForHostWs's failure path", async () => {
   const uncaught = trackUncaught();
   const watch = watchBinds();
   let listener: Awaited<ReturnType<typeof listenForHostWs>> | undefined;
+  let text = "";
   try {
     listener = await listenForHostWs(branch, host.encryption.publicKey, 0, () => {});
     const server = watch.servers[0]!;
@@ -291,11 +303,11 @@ test("a post-bind error runs listenForHostWs's failure path", async () => {
     await until(() => !server.listening);
   } finally {
     watch.restore();
+    text = warnings.text();
+    warnings.stop();
+    uncaught.stop();
+    await listener?.close();
   }
-  const text = warnings.text();
-  warnings.stop();
-  uncaught.stop();
-  await listener?.close();
 
   expect(uncaught.errors).toEqual([]);
   expect(text).toContain("[host] listener error after bind: post-bind");
@@ -307,6 +319,7 @@ test("a post-bind error runs WsNoiseTransport.listen's failure path", async () =
   const uncaught = trackUncaught();
   const watch = watchBinds();
   let listener: Awaited<ReturnType<WsNoiseTransport["listen"]>> | undefined;
+  let text = "";
   try {
     listener = await new WsNoiseTransport(host, host).listen(0);
     const server = watch.servers[0]!;
@@ -314,11 +327,11 @@ test("a post-bind error runs WsNoiseTransport.listen's failure path", async () =
     await until(() => !server.listening);
   } finally {
     watch.restore();
+    text = warnings.text();
+    warnings.stop();
+    uncaught.stop();
+    await listener?.close();
   }
-  const text = warnings.text();
-  warnings.stop();
-  uncaught.stop();
-  await listener?.close();
 
   expect(uncaught.errors).toEqual([]);
   expect(text).toContain("[listen] server error after bind: post-bind");
@@ -335,6 +348,7 @@ test("a post-bind error rejects the pending join and clears its timer", async ()
     bound = true;
   });
   let rejection: unknown;
+  let text = "";
   try {
     joined.catch(() => {});
     await until(() => bound);
@@ -345,10 +359,10 @@ test("a post-bind error rejects the pending join and clears its timer", async ()
   } finally {
     watch.restore();
     timers.stop();
+    text = warnings.text();
+    warnings.stop();
+    uncaught.stop();
   }
-  const text = warnings.text();
-  warnings.stop();
-  uncaught.stop();
 
   expect(uncaught.errors).toEqual([]);
   expect(rejection).toBeInstanceOf(Error);
@@ -382,6 +396,7 @@ test("a post-bind error runs startServiceProxies's failure path", async () => {
   const uncaught = trackUncaught();
   const watch = watchBinds();
   let proxies: Awaited<ReturnType<typeof startServiceProxies>> | undefined;
+  let lines: string[] = [];
   try {
     const channel = {
       onMessage: () => {},
@@ -395,11 +410,11 @@ test("a post-bind error runs startServiceProxies's failure path", async () => {
     await until(() => !server.listening);
   } finally {
     watch.restore();
+    lines = consoleErrors.lines();
+    consoleErrors.stop();
+    uncaught.stop();
+    proxies?.close();
   }
-  const lines = consoleErrors.lines();
-  consoleErrors.stop();
-  uncaught.stop();
-  proxies?.close();
 
   expect(uncaught.errors).toEqual([]);
   expect(lines).toContain("Service proxy 'service-a' listener failed: post-bind");
@@ -417,9 +432,9 @@ test("a post-bind error runs OpenClawAdapter.start's failure path", async () => 
     await until(() => !server.listening);
   } finally {
     watch.restore();
+    uncaught.stop();
+    await adapter.stop();
   }
-  uncaught.stop();
-  await adapter.stop();
 
   expect(uncaught.errors).toEqual([]);
   expect(logs.some((line) => line.includes("[openclaw] listener failed: post-bind"))).toBe(true);
