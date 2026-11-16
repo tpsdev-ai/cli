@@ -337,12 +337,12 @@ export const mailAckScratchTestHooks: { now?: () => number } = {};
  * of that exact shape and leaves scratch younger than ACK_SCRATCH_MIN_AGE_MS.
  *
  * The lock guards the mailbox root and its direct children, so the directory
- * must resolve to the locked root or a direct child of it. A cur/ that is a
- * symlink to another mailbox's cur/ shares its scratch files but not its lock;
+ * must resolve to a direct child of the locked root. A cur/ symlink to
+ * another mailbox's cur/ shares its scratch files but not its lock;
  * the other mailbox's live scratch is left alone there.
  *
- * Sweep at most once per directory per process every ten minutes, so a bulk
- * drain does not list the directory on every ack. Collecting eligible scratch
+ * After a successful listing, wait ten minutes before sweeping the directory
+ * again, so a bulk drain avoids repeated listings. Collecting eligible scratch
  * on a later pass is enough. A failed listing records no sweep time, so the
  * next ack retries it.
  */
@@ -360,7 +360,7 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
     console.warn(`[mail] could not resolve ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
     return;
   }
-  if (listedDir !== guardedRoot && dirname(listedDir) !== guardedRoot) {
+  if (dirname(listedDir) !== guardedRoot) {
     lastAckScratchSweep.set(dir, now);
     console.warn(`[mail] left ack scratch in ${dir}: not a directory in the mailbox this lock guards`);
     return;
@@ -413,6 +413,7 @@ export function updateExistingRecord<T extends object>(
     withholdPlacement?: boolean;
   } = {},
 ): UpdateExistingResult<T> {
+  path = resolve(path);
   const root = dirname(dirname(path));
   let lock: MailLock | null;
   try {

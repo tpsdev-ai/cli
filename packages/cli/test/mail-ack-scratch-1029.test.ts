@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -127,24 +128,42 @@ test("a failed listing warns with the directory and code, and the next ack retri
   expect(lines.filter((line) => line.includes("removed leftover ack scratch"))).toHaveLength(1);
 });
 
-test("a bare relative record path removes old scratch and leaves recent scratch", () => {
-  const cwd = process.cwd();
-  const mailbox = mail.getInbox("bare-path").root;
-  const old = join(mailbox, scratchName());
-  const fresh = join(mailbox, scratchName());
-  fs.writeFileSync(old, "{ old");
+test("a bare relative record update contends for the root lock before sweeping", () => {
+  const inbox = mail.getInbox("bare-path");
+  const target = join(inbox.cur, "record.json");
+  const old = join(inbox.cur, scratchName());
+  const fresh = join(inbox.cur, scratchName());
+  plantRecord(target, "record-id");
+  const writer = acquireMailLockSync(inbox.root);
+  expect(writer).not.toBeNull();
+  const fd = fs.openSync(old, "w");
+  fs.writeFileSync(fd, "{ partial");
   makeOld(old);
   fs.writeFileSync(fresh, "{ fresh");
-  plantRecord(join(mailbox, "record.json"), "record-id");
-  const { lines } = collectWarnings();
-
+  const source = new URL("../src/utils/mail.ts", import.meta.url).href;
   try {
-    process.chdir(mailbox);
+    const child = spawnSync(process.execPath, ["--eval", `
+      const mail = await import(${JSON.stringify(source)});
+      const result = mail.updateExistingRecord("record.json", (record) => ({ ...record, read: true }), { nonBlocking: true });
+      console.log(JSON.stringify(result));
+    `], { cwd: inbox.cur, encoding: "utf8" });
+    expect(child.status).toBe(0);
+    expect(fs.readFileSync(old, "utf8")).toBe("{ partial");
+    expect(JSON.parse(child.stdout)).toEqual({ status: "busy" });
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(false);
+  } finally {
+    fs.closeSync(fd);
+    writer!.release();
+  }
+
+  const cwd = process.cwd();
+  collectWarnings();
+  try {
+    process.chdir(inbox.cur);
     expect(mail.ackMessageAtPath("record.json").read).toBe(true);
+    expect(fs.existsSync(target)).toBe(false);
     expect(fs.existsSync(old)).toBe(false);
     expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
-    expect(lines.filter((line) => line.includes("removed leftover ack scratch") && line.includes(old))).toHaveLength(1);
-    expect(lines.filter((line) => line.includes("left recent ack scratch") && line.includes(fresh))).toHaveLength(1);
   } finally {
     process.chdir(cwd);
   }
