@@ -23,12 +23,12 @@
  */
 import { describe, expect, it } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { decideSettledRead } from "./real-gateway-driver.mjs";
+import { decideSettledRead, readSettledState } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -57,6 +57,7 @@ type Report = {
   inboundNewFiles: string[];
   readErrors: string[];
   inboundId: string | null;
+  ackLanded: boolean;
   ackTimedOut: boolean;
   ackLines: string[];
   logs: string[];
@@ -252,6 +253,7 @@ describe("cli#1020 — a timed-out ack is judged on its own assertion", () => {
       inboundNewFiles: [],
       readErrors: [],
       inboundId: "msg-one",
+      ackLanded: true,
       ackTimedOut: false,
       ackLines: ["acked msg-one: receipt found"],
       logs: [],
@@ -282,22 +284,73 @@ describe("cli#1020 — a timed-out ack is judged on its own assertion", () => {
 
 describe("cli#1020 — the driver's settled read decision", () => {
   it("reads after the gateway stops and the ack lands", () => {
-    expect(decideSettledRead({ stopped: true, ackTimedOut: false })).toEqual({ read: true, readError: null });
+    expect(decideSettledRead({ stopped: true, ackLanded: true, ackTimedOut: false })).toEqual({ read: true, readError: null });
   });
 
   it("skips the read and names the ack timeout", () => {
-    expect(decideSettledRead({ stopped: true, ackTimedOut: true })).toEqual({
+    expect(decideSettledRead({ stopped: true, ackLanded: false, ackTimedOut: true })).toEqual({
       read: false,
-      readError: "ack never landed before its deadline; settled state not read",
+      readError: "ack wait timed out; settled state not read",
     });
   });
 
   it("skips the read and names an unstopped gateway", () => {
-    for (const ackTimedOut of [false, true]) {
-      expect(decideSettledRead({ stopped: false, ackTimedOut })).toEqual({
+    for (const ackLanded of [false, true]) {
+      expect(decideSettledRead({ stopped: false, ackLanded })).toEqual({
         read: false,
         readError: "gateway did not stop within the deadline; settled state not read",
       });
+    }
+  });
+
+  it("skips the read when stopped before the ack was awaited", () => {
+    for (const error of [undefined, "gateway boot failed"]) {
+      expect(decideSettledRead({ stopped: true, ackLanded: false, ackTimedOut: false, error })).toEqual({
+        read: false,
+        readError: error
+          ? "ack never awaited (the run failed before it: gateway boot failed); settled state not read"
+          : "ack never awaited (the run failed before it); settled state not read",
+      });
+    }
+  });
+
+  it("records settled listing failures and continues to the obligation read", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-settled-read-"));
+    try {
+      writeFileSync(join(root, "msg-one.json"), JSON.stringify({ state: "acked" }));
+      const report = { readErrors: [] as string[], inboundId: "msg-one", obligationRecord: null };
+      expect(() => readSettledState(report, {
+        replyDir: join(root, "missing-replies"),
+        newDir: join(root, "missing-new"),
+        curDir: join(root, "missing-cur"),
+        obligationsDir: root,
+      })).not.toThrow();
+      expect(report.readErrors).toHaveLength(3);
+      expect(report.readErrors[0]).toContain("reply listing");
+      expect(report.readErrors[1]).toContain("new listing");
+      expect(report.readErrors[2]).toContain("cur listing");
+      expect(report.obligationRecord).toEqual({ state: "acked" });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("records malformed settled records", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-settled-record-"));
+    try {
+      const curDir = join(root, "cur");
+      mkdirSync(curDir);
+      writeFileSync(join(curDir, "msg-one.json"), "{");
+      writeFileSync(join(root, "msg-one.json"), "{");
+      const report = { readErrors: [] as string[], inboundId: "msg-one", curRecord: null, obligationRecord: null };
+      expect(() => readSettledState(report, { replyDir: root, newDir: root, curDir, obligationsDir: root })).not.toThrow();
+      expect(report.readErrors).toHaveLength(2);
+      expect(report.readErrors[0]).toContain("cur record");
+      expect(report.readErrors[1]).toContain("obligation record");
+      expect(report.curRecord).toBeNull();
+      expect(report.obligationRecord).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   });
 

@@ -14,9 +14,7 @@
  *      channel config the plugin's README documents (no streaming), and writes
  *      one signed mail into the agent's tmp/ then renames it into new/;
  *   4. waits (every wait has a named deadline) for the reply, the cur/ move and
- *      the ack, re-reads the reply count after the ack and again after the
- *      gateway stops, reads every cur/ entry (name and size) mid-ack and again
- *      once the gateway has stopped, the cur/ record and the obligation record,
+ *      the ack,
  *      then writes a JSON report for the Bun test that spawned it.
  *
  * Every HTTP target the driver creates is 127.0.0.1, and every model and
@@ -33,14 +31,45 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function decideSettledRead({ stopped, ackTimedOut }) {
-  if (stopped && !ackTimedOut) return { read: true, readError: null };
+export function decideSettledRead({ stopped, ackLanded, ackTimedOut, error }) {
+  if (stopped && ackLanded) return { read: true, readError: null };
   return {
     read: false,
     readError: !stopped
       ? "gateway did not stop within the deadline; settled state not read"
-      : "ack never landed before its deadline; settled state not read",
+      : ackTimedOut
+        ? "ack wait timed out; settled state not read"
+        : `ack never awaited (the run failed before it${error ? `: ${error}` : ""}); settled state not read`,
   };
+}
+
+export function readSettledState(report, { replyDir, newDir, curDir, obligationsDir }) {
+  const read = (label, path, action, fallback = null) => {
+    try {
+      return action();
+    } catch (err) {
+      report.readErrors.push(`${label} (${path}): ${err?.message ?? String(err)}`);
+      return fallback;
+    }
+  };
+  report.replyCountAfterStop = read("reply listing", replyDir,
+    () => readdirSync(replyDir).filter((name) => name.endsWith(".json")).length, 0);
+  report.inboundNewFiles = read("new listing", newDir,
+    () => readdirSync(newDir).filter((name) => name.endsWith(".json")), []);
+  report.curEntriesSettled = read("cur listing", curDir, () => readdirSync(curDir).map((name) => ({
+    name,
+    size: read("cur entry size", join(curDir, name), () => statSync(join(curDir, name)).size, -1),
+  })), []);
+  const inboundCur = report.curEntriesSettled.find((entry) => report.inboundId && entry.name.includes(report.inboundId));
+  const curRecordName = inboundCur?.name ?? report.curEntriesSettled[0]?.name;
+  if (curRecordName) {
+    const path = join(curDir, curRecordName);
+    report.curRecord = read("cur record", path, () => JSON.parse(readFileSync(path, "utf8")));
+  }
+  if (report.inboundId) {
+    const path = join(obligationsDir, `${report.inboundId}.json`);
+    report.obligationRecord = read("obligation record", path, () => JSON.parse(readFileSync(path, "utf8")));
+  }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main();
@@ -94,6 +123,7 @@ async function main() {
     inboundNewFiles: [],
     readErrors: [],
     inboundId: null,
+    ackLanded: false,
     ackTimedOut: false,
     ackLines: [],
     logs: [],
@@ -101,15 +131,6 @@ async function main() {
 
   function writeReport() {
     writeFileSync(REPORT, JSON.stringify(report, null, 2), "utf8");
-  }
-
-  function readJson(path, label) {
-    try {
-      return JSON.parse(readFileSync(path, "utf8"));
-    } catch (err) {
-      report.readErrors.push(`${label} (${path}): ${err?.message ?? String(err)}`);
-      return null;
-    }
   }
 
   function replyFilesOnDisk() {
@@ -422,6 +443,7 @@ async function main() {
         ACK_DEADLINE_MS,
         "ack log line",
       );
+      report.ackLanded = true;
     } catch {
       // A missing ack is an ASSERTION in the Bun test, not a driver failure: the
       // report still carries the reply and the log so the failing line is named.
@@ -444,34 +466,15 @@ async function main() {
       }
     }
     stopped = !child || child.exitCode !== null;
-    // B2: read the settled state only after the gateway has stopped — a second
-    // reply or a late stamp from a still-running gateway would race this read.
-    // A timed-out ack never reached the settled state either: listing cur/ then
-    // would judge the ack on a listing it never finished, so the settled listing
-    // (and the cur record read from it) is not taken and the report says why.
-    const settledRead = decideSettledRead({ stopped, ackTimedOut: report.ackTimedOut });
+    const settledRead = decideSettledRead({ stopped, ...report });
     if (settledRead.readError) report.readErrors.push(settledRead.readError);
     if (settledRead.read) {
-      report.replyCountAfterStop = replyFilesOnDisk().length;
-      report.inboundNewFiles = readdirSync(join(MAIL, "agent-a", "new")).filter((f) => f.endsWith(".json"));
-      // The gateway has stopped, so no writer is left. List cur/ afresh, with
-      // names and sizes, and read the record from THIS listing.
-      const settledCurDir = join(MAIL, "agent-a", "cur");
-      report.curEntriesSettled = readdirSync(settledCurDir).map((name) => {
-        try {
-          return { name, size: statSync(join(settledCurDir, name)).size };
-        } catch {
-          return { name, size: -1 };
-        }
+      readSettledState(report, {
+        replyDir: join(MAIL, "agent-b", "new"),
+        newDir: join(MAIL, "agent-a", "new"),
+        curDir: join(MAIL, "agent-a", "cur"),
+        obligationsDir: join(MAIL, "agent-a", ".obligations"),
       });
-      const inboundCur = report.curEntriesSettled.find((entry) => report.inboundId && entry.name.includes(report.inboundId));
-      const curRecordName = inboundCur?.name ?? report.curEntriesSettled[0]?.name;
-      if (curRecordName) {
-        report.curRecord = readJson(join(settledCurDir, curRecordName), "cur record");
-      }
-      if (report.inboundId) {
-        report.obligationRecord = readJson(join(MAIL, "agent-a", ".obligations", `${report.inboundId}.json`), "obligation record");
-      }
     }
     await new Promise((r) => model.close(r));
     await new Promise((r) => flair.close(r));
@@ -491,7 +494,9 @@ async function main() {
           })
           .filter(Boolean);
       }
-    } catch {}
+    } catch (err) {
+      report.readErrors.push(`gateway log (${LOG}): ${err?.message ?? String(err)}`);
+    }
     report.logs = logs.split("\n").slice(-40);
     report.logTail = logMessages.slice(-120);
     const dispatchFromStdout = (logs.match(/message dispatch started: channel=tps-mail/g) ?? []).length;
