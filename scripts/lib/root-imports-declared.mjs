@@ -201,8 +201,9 @@ function literalArgument(node) {
  * @returns {string[]}
  */
 export function scanLoaderImports(file, source) {
+	const normalizedFile = file.replaceAll("\\", "/");
 	const sourceFile = ts.createSourceFile(
-		file,
+		normalizedFile,
 		source,
 		ts.ScriptTarget.Latest,
 		true,
@@ -211,20 +212,20 @@ export function scanLoaderImports(file, source) {
 	const options = { noResolve: true, noLib: true, allowJs: true, types: [] };
 	// Binding needs this source only; resolution must not probe the host filesystem.
 	const host = {
-		getSourceFile: (name) => (name === file ? sourceFile : undefined),
+		getSourceFile: (name) => (name === normalizedFile ? sourceFile : undefined),
 		getDefaultLibFileName: () => "",
 		writeFile: () => {},
 		getCurrentDirectory: () => "",
 		getCanonicalFileName: (name) => name,
 		useCaseSensitiveFileNames: () => true,
 		getNewLine: () => "\n",
-		fileExists: (name) => name === file,
+		fileExists: (name) => name === normalizedFile,
 		directoryExists: () => false,
-		readFile: (name) => (name === file ? source : undefined),
+		readFile: (name) => (name === normalizedFile ? source : undefined),
 		realpath: (name) => name,
 		getDirectories: () => [],
 	};
-	const checker = ts.createProgram([file], options, host).getTypeChecker();
+	const checker = ts.createProgram([normalizedFile], options, host).getTypeChecker();
 	const symbolAt = (node) => {
 		const identifier = unwrap(node);
 		return ts.isIdentifier(identifier) ? checker.getSymbolAtLocation(identifier) : undefined;

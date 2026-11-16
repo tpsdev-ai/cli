@@ -305,6 +305,23 @@ describe("root imports are declared", () => {
 	});
 
 	describe("module loader forms", () => {
+		it("reports a bound loader in a file name containing a backslash", () => {
+			const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
+			const file = "sub\\fixture.ts";
+			try {
+				mkdirSync(join(dir, "sub"));
+				writeFileSync(
+					join(dir, file),
+					'const load = createRequire(import.meta.url); load("undeclared-backslash");',
+				);
+				expect(findUndeclaredImports(dir, [file], { devDependencies: {} })).toEqual([
+					{ file, specifier: "undeclared-backslash", packageName: "undeclared-backslash" },
+				]);
+			} finally {
+				rmSync(dir, { recursive: true, force: true });
+			}
+		});
+
 		// Every loader form that must report a specifier, with the specifiers it
 		// reports. The generated-parentheses case below runs over this whole set.
 		const LOADER_FIXTURES: { name: string; source: string; specifiers: string[] }[] = [
