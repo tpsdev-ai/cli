@@ -11,15 +11,15 @@
  *   - `require("x")`, read by the same scanner;
  *   - `module.require("x")` and `process.mainModule.require("x")`, with each
  *     property written as a dot access or as an element access with a
- *     string-literal key (`module["require"]`);
+ *     string or no-substitution-template key (`module["require"]`);
  *   - a name bound to a `createRequire(...)` result by a variable declaration
- *     or a direct assignment to a resolved binding, and a direct
- *     `createRequire(...)("x")` call.
+ *     or an `=`, `??=`, `||=` or `&&=` assignment to a resolved binding;
+ *   - a direct `createRequire(...)("x")` call.
  *
- * Parentheses are allowed around a callee and around a member-access object:
- * `(module.require)("x")`, `(module).require("x")` and `(r)("x")` for a bound
- * loader are read as the forms above. An argument is read only when it is a
- * literal string (or a template literal with no substitutions); any other form
+ * Parentheses are allowed around callees, member-access objects, literal keys
+ * and literal arguments. Local declarations shadow `module` and `process`.
+ * An argument is read only when it is a literal string (or a template literal
+ * with no substitutions); any other form
  * is not checked, for example a dynamic key, `module.createRequire`, a loader
  * reached through another expression or invoked with `.call`/`.apply`, or a
  * non-literal argument. Reassignments away from a loader are not tracked.
@@ -41,6 +41,7 @@
  * Bun's TypeScript loader removes before the scan; `require.resolve("pkg")`;
  * packages imported only from outside test/ and scripts/, and whether a declared
  * range resolves for a published consumer.
+ * Not checked: assignments to undeclared names; aliased `createRequire` imports.
  * `listSourceFiles` lists only .ts, .tsx, .js, .jsx, .mjs and .cjs files, skips
  * `node_modules`, and does not descend into a directory reached through a
  * symlink, so JavaScript inside shell scripts or built in template strings, and
@@ -112,8 +113,7 @@ function scriptKindFor(file) {
 }
 
 /**
- * A node with any parentheses around it removed: a callee or a member-access
- * object the walk reads.
+ * A node with parentheses removed.
  */
 function unwrap(node) {
 	return ts.skipParentheses(node);
@@ -130,41 +130,45 @@ function isCreateRequireCall(node) {
 	return ts.isCallExpression(node) && identifierText(node.expression) === "createRequire";
 }
 
-/**
- * The name of an access written `.name` or `["name"]`, or null when `node` is
- * neither or its element argument is not a string literal.
- */
+function stringLiteralText(node) {
+	if (node === undefined) return null;
+	const expression = unwrap(node);
+	return ts.isStringLiteral(expression) || ts.isNoSubstitutionTemplateLiteral(expression)
+		? expression.text
+		: null;
+}
+
+/** The name of a dot access or literal-key element access, or null. */
 function accessName(node) {
 	const access = unwrap(node);
 	if (ts.isPropertyAccessExpression(access)) return access.name.text;
-	if (ts.isElementAccessExpression(access) && ts.isStringLiteral(access.argumentExpression)) {
-		return access.argumentExpression.text;
-	}
-	return null;
+	return ts.isElementAccessExpression(access) ? stringLiteralText(access.argumentExpression) : null;
 }
 
-/** A call written `process.mainModule.require(...)`, however each access is spelled. */
-function isProcessMainModuleRequire(node) {
+/** A call written `process.mainModule.require(...)` with an unshadowed receiver. */
+function isProcessMainModuleRequire(node, symbolAt) {
 	const access = unwrap(node);
 	if (accessName(access) !== "require") return false;
 	const target = unwrap(access.expression);
 	if (accessName(target) !== "mainModule") return false;
-	return identifierText(target.expression) === "process";
+	return (
+		identifierText(target.expression) === "process" &&
+		!symbolAt(target.expression)?.declarations?.length
+	);
 }
 
-/** A call written `module.require(...)`, however each access is spelled. */
-function isModuleRequire(node) {
+/** A call written `module.require(...)` with an unshadowed receiver. */
+function isModuleRequire(node, symbolAt) {
 	const access = unwrap(node);
 	if (accessName(access) !== "require") return false;
-	return identifierText(access.expression) === "module";
+	return (
+		identifierText(access.expression) === "module" &&
+		!symbolAt(access.expression)?.declarations?.length
+	);
 }
 
 function literalArgument(node) {
-	const [first] = node.arguments;
-	if (first === undefined) return null;
-	return ts.isStringLiteral(first) || ts.isNoSubstitutionTemplateLiteral(first)
-		? first.text
-		: null;
+	return stringLiteralText(node.arguments[0]);
 }
 
 /**
@@ -186,8 +190,21 @@ export function scanLoaderImports(file, source) {
 		scriptKindFor(file),
 	);
 	const options = { noResolve: true, noLib: true, allowJs: true, types: [] };
-	const host = ts.createCompilerHost(options);
-	host.getSourceFile = (name) => (name === file ? sourceFile : undefined);
+	// Binding needs this source only; resolution must not probe the host filesystem.
+	const host = {
+		getSourceFile: (name) => (name === file ? sourceFile : undefined),
+		getDefaultLibFileName: () => "",
+		writeFile: () => {},
+		getCurrentDirectory: () => "",
+		getCanonicalFileName: (name) => name,
+		useCaseSensitiveFileNames: () => true,
+		getNewLine: () => "\n",
+		fileExists: (name) => name === file,
+		directoryExists: () => false,
+		readFile: (name) => (name === file ? source : undefined),
+		realpath: (name) => name,
+		getDirectories: () => [],
+	};
 	const checker = ts.createProgram([file], options, host).getTypeChecker();
 	const symbolAt = (node) => {
 		const identifier = unwrap(node);
@@ -206,7 +223,12 @@ export function scanLoaderImports(file, source) {
 		}
 		if (
 			ts.isBinaryExpression(node) &&
-			node.operatorToken.kind === ts.SyntaxKind.EqualsToken &&
+			[
+				ts.SyntaxKind.EqualsToken,
+				ts.SyntaxKind.QuestionQuestionEqualsToken,
+				ts.SyntaxKind.BarBarEqualsToken,
+				ts.SyntaxKind.AmpersandAmpersandEqualsToken,
+			].includes(node.operatorToken.kind) &&
 			isCreateRequireCall(ts.skipParentheses(node.right))
 		) {
 			const assigned = symbolAt(node.left);
@@ -223,8 +245,8 @@ export function scanLoaderImports(file, source) {
 			const isLoader =
 				isCreateRequireCall(callee) ||
 				(calleeSymbol !== undefined && bound.has(calleeSymbol)) ||
-				isModuleRequire(callee) ||
-				isProcessMainModuleRequire(callee);
+				isModuleRequire(callee, symbolAt) ||
+				isProcessMainModuleRequire(callee, symbolAt);
 			if (isLoader) {
 				const specifier = literalArgument(node);
 				if (specifier !== null) found.push(specifier);

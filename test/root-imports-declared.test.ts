@@ -8,7 +8,7 @@
  * cover.
  */
 
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { builtinModules } from "node:module";
 import { tmpdir } from "node:os";
@@ -34,11 +34,11 @@ function rootManifest(): RootManifest {
 }
 
 /** The undeclared packages reported for one fixture body in a throwaway directory. */
-function undeclaredIn(body: string) {
+function undeclaredIn(body: string, file = "fixture.ts") {
 	const dir = mkdtempSync(join(tmpdir(), "root-imports-"));
 	try {
-		writeFileSync(join(dir, "fixture.ts"), body);
-		return findUndeclaredImports(dir, ["fixture.ts"], { devDependencies: {} });
+		writeFileSync(join(dir, file), body);
+		return findUndeclaredImports(dir, [file], { devDependencies: {} });
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
@@ -50,9 +50,14 @@ function reportEntry(specifier: string) {
 }
 
 /**
- * Whether an Identifier child of `parent` sits in an expression position.
+ * Whether an identifier or literal child of `parent` sits in an expression position.
  */
-function isExpressionIdentifier(parent: ts.Node, node: ts.Identifier): boolean {
+function isExpressionLeaf(parent: ts.Node, node: ts.Node): boolean {
+	if (
+		ts.isImportDeclaration(parent) ||
+		ts.isExportDeclaration(parent) ||
+		ts.isExternalModuleReference(parent)
+	) return false;
 	// A property name after a dot, and the `meta`/`target` of a meta property.
 	if (ts.isPropertyAccessExpression(parent)) return parent.expression === node;
 	if (ts.isQualifiedName(parent) || ts.isMetaProperty(parent)) return false;
@@ -70,14 +75,14 @@ function isExpressionIdentifier(parent: ts.Node, node: ts.Identifier): boolean {
 }
 
 /**
- * `source` parsed with a ParenthesizedExpression around every Identifier in an
- * expression position, then printed by TypeScript's printer. The walk visits
- * every node with ts.visitEachChild; the only Identifiers left unwrapped are
+ * `source` parsed with parentheses around identifiers and string/template
+ * literals in expression positions, then printed by TypeScript. The walk visits
+ * every node with ts.visitEachChild; the leaves left unwrapped are
  * the ones that are not expressions: a declaration or binding name, a property
  * name after a dot or in a meta property, a property-assignment, method or
  * shorthand property name, an import or export specifier, a qualified name, a
- * label, and a type node. An already parenthesised expression is wrapped again
- * instead of being skipped.
+ * label, module specifier, and a type node. An already parenthesised expression
+ * is wrapped again instead of being skipped.
  */
 function withParenthesisedExpressions(source: string): { printed: string; wrapped: number } {
 	const sourceFile = ts.createSourceFile(
@@ -90,7 +95,11 @@ function withParenthesisedExpressions(source: string): { printed: string; wrappe
 	let wrapped = 0;
 	const transformer: ts.TransformerFactory<ts.SourceFile> = (context) => {
 		const visitChild = (parent: ts.Node, child: ts.Node, inType: boolean): ts.Node => {
-			if (!inType && ts.isIdentifier(child) && isExpressionIdentifier(parent, child)) {
+			if (
+				!inType &&
+				(ts.isIdentifier(child) || ts.isStringLiteral(child) || ts.isNoSubstitutionTemplateLiteral(child)) &&
+				isExpressionLeaf(parent, child)
+			) {
 				wrapped += 1;
 				return context.factory.createParenthesizedExpression(child);
 			}
@@ -451,6 +460,61 @@ describe("root imports are declared", () => {
 				].join("\n"),
 				specifiers: ["undeclared-parenthesised-assignment"],
 			},
+			{
+				name: "a parenthesised module.require argument",
+				source: 'module.require(("undeclared-paren-arg-module"))',
+				specifiers: ["undeclared-paren-arg-module"],
+			},
+			{
+				name: "a parenthesised bound-loader argument",
+				source: 'const load = createRequire(import.meta.url); load(("undeclared-paren-arg-bound"))',
+				specifiers: ["undeclared-paren-arg-bound"],
+			},
+			{
+				name: "a parenthesised template argument",
+				source: 'module.require((`undeclared-paren-template`))',
+				specifiers: ["undeclared-paren-template"],
+			},
+			{
+				name: "a doubly parenthesised argument",
+				source: 'module.require((("undeclared-double-paren")))',
+				specifiers: ["undeclared-double-paren"],
+			},
+			{
+				name: "a parenthesised require key",
+				source: 'module[("require")]("undeclared-paren-key")',
+				specifiers: ["undeclared-paren-key"],
+			},
+			{
+				name: "a parenthesised mainModule key",
+				source: 'process[("mainModule")].require("undeclared-paren-main")',
+				specifiers: ["undeclared-paren-main"],
+			},
+			{
+				name: "a template require key",
+				source: 'module[`require`]("undeclared-template-key")',
+				specifiers: ["undeclared-template-key"],
+			},
+			{
+				name: "a template mainModule key",
+				source: 'process[`mainModule`].require("undeclared-proc-template")',
+				specifiers: ["undeclared-proc-template"],
+			},
+			{
+				name: "a loader bound by ??=",
+				source: 'let load; load ??= createRequire(import.meta.url); load("undeclared-nullish")',
+				specifiers: ["undeclared-nullish"],
+			},
+			{
+				name: "a loader bound by ||=",
+				source: 'let load; load ||= createRequire(import.meta.url); load("undeclared-or")',
+				specifiers: ["undeclared-or"],
+			},
+			{
+				name: "a loader bound by &&=",
+				source: 'let load; load &&= createRequire(import.meta.url); load("undeclared-and")',
+				specifiers: ["undeclared-and"],
+			},
 		];
 
 		for (const fixture of LOADER_FIXTURES) {
@@ -509,6 +573,51 @@ describe("root imports are declared", () => {
 			});
 		}
 
+		for (const receiver of ["module", "process"]) {
+			const call = receiver === "module" ? 'module.require("display-label")' : 'process.mainModule.require("display-label")';
+			for (const declaration of [
+				`function render(${receiver}) { return ${call}; }`,
+				`{ const ${receiver} = {}; ${call}; }`,
+				`{ let ${receiver}; ${call}; }`,
+				`function render() { ${call}; var ${receiver}; }`,
+				`function ${receiver}() {} ${call};`,
+				`class ${receiver} {} ${call};`,
+				`import { ${receiver} } from "node:module"; ${call};`,
+			]) {
+				it(`does not report a locally declared receiver: ${declaration}`, () => {
+					expect(undeclaredIn(declaration)).toEqual([]);
+				});
+			}
+		}
+
+		it("leaves assignment to an undeclared name unchecked in a cjs script", () => {
+			expect(undeclaredIn('load = createRequire(__filename); load("undeclared-global");', "fixture.cjs")).toEqual([]);
+		});
+
+		it("leaves an aliased createRequire import unchecked", () => {
+			expect(undeclaredIn('import { createRequire as cr } from "node:module"; const load = cr(import.meta.url); load("undeclared-alias");')).toEqual([]);
+		});
+
+		it("reports unshadowed receivers in a cjs script", () => {
+			expect(undeclaredIn('module.require("undeclared-cjs-module"); process.mainModule.require("undeclared-cjs-process");', "fixture.cjs").map((entry) => entry.specifier)).toEqual(["undeclared-cjs-module", "undeclared-cjs-process"]);
+		});
+
+		it("scans the real tree without ts.sys filesystem calls", () => {
+			const calls: string[] = [];
+			const methods = ["fileExists", "directoryExists", "readFile", "realpath", "getDirectories", "readDirectory", "getCurrentDirectory"] as const;
+			const spies = methods.map((method) => spyOn(ts.sys, method).mockImplementation(() => {
+				calls.push(method);
+				throw new Error(`unexpected ts.sys.${method}`);
+			}));
+			try {
+				const files = SCANNED_DIRS.flatMap((dir) => listSourceFiles(ROOT, dir));
+				expect(findUndeclaredImports(ROOT, files, rootManifest())).toEqual([]);
+				expect(calls).toEqual([]);
+			} finally {
+				for (const spy of spies) spy.mockRestore();
+			}
+		});
+
 		it("reports an outer loader used in a nested scope without shadowing", () => {
 			expect(
 				undeclaredIn(
@@ -533,7 +642,7 @@ describe("root imports are declared", () => {
 			).toEqual([reportEntry("undeclared-assigned-outer-loader")]);
 		});
 
-		it("reports the same specifiers with every expression-position identifier parenthesised, and both forms parse cleanly", () => {
+		it("reports the same specifiers with expression-position identifiers and literals parenthesised, and both forms parse cleanly", () => {
 			for (const fixture of LOADER_FIXTURES) {
 				expect({ fixture: fixture.name, diagnostics: parseDiagnostics(fixture.source) }).toEqual({
 					fixture: fixture.name,
@@ -564,6 +673,14 @@ describe("root imports are declared", () => {
 			expect(assigned.printed).toContain("(r)(");
 			const voided = withParenthesisedExpressions("void pkg;\n");
 			expect(voided.printed).toContain("void (pkg)");
+		});
+
+		it("generates parenthesised string and template keys and arguments", () => {
+			const variant = withParenthesisedExpressions('module["require"]("x"); process[`mainModule`].require(`y`);');
+			expect(variant.printed).toContain('[("require")](("x"))');
+			expect(variant.printed).toContain('[(`mainModule`)]');
+			expect(variant.printed).toContain('((`y`))');
+			expect(parseDiagnostics(variant.printed)).toEqual([]);
 		});
 
 		it("does not report a module.require call in a comment, a string or a template literal", () => {
