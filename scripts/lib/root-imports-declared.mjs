@@ -145,6 +145,25 @@ function accessName(node) {
 	return ts.isElementAccessExpression(access) ? stringLiteralText(access.argumentExpression) : null;
 }
 
+function hasLocalBinding(symbol) {
+	return symbol?.declarations?.some(
+		(declaration) =>
+			ts.isParameter(declaration) ||
+			ts.isVariableDeclaration(declaration) ||
+			ts.isBindingElement(declaration) ||
+			ts.isFunctionDeclaration(declaration) ||
+			ts.isFunctionExpression(declaration) ||
+			ts.isClassDeclaration(declaration) ||
+			ts.isClassExpression(declaration) ||
+			ts.isImportClause(declaration) ||
+			ts.isImportSpecifier(declaration) ||
+			ts.isNamespaceImport(declaration) ||
+			ts.isImportEqualsDeclaration(declaration) ||
+			ts.isEnumDeclaration(declaration) ||
+			ts.isModuleDeclaration(declaration),
+	) ?? false;
+}
+
 /** A call written `process.mainModule.require(...)` with an unshadowed receiver. */
 function isProcessMainModuleRequire(node, symbolAt) {
 	const access = unwrap(node);
@@ -153,7 +172,7 @@ function isProcessMainModuleRequire(node, symbolAt) {
 	if (accessName(target) !== "mainModule") return false;
 	return (
 		identifierText(target.expression) === "process" &&
-		!symbolAt(target.expression)?.declarations?.length
+		!hasLocalBinding(symbolAt(target.expression))
 	);
 }
 
@@ -163,7 +182,7 @@ function isModuleRequire(node, symbolAt) {
 	if (accessName(access) !== "require") return false;
 	return (
 		identifierText(access.expression) === "module" &&
-		!symbolAt(access.expression)?.declarations?.length
+		!hasLocalBinding(symbolAt(access.expression))
 	);
 }
 

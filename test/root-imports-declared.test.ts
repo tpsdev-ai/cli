@@ -583,6 +583,15 @@ describe("root imports are declared", () => {
 				`function ${receiver}() {} ${call};`,
 				`class ${receiver} {} ${call};`,
 				`import { ${receiver} } from "node:module"; ${call};`,
+				`const { ${receiver} } = {}; ${call};`,
+				`try {} catch (${receiver}) { ${call}; }`,
+				`import ${receiver} from "node:module"; ${call};`,
+				`import * as ${receiver} from "node:module"; ${call};`,
+				`import ${receiver} = require("node:module"); ${call};`,
+				`enum ${receiver} {} ${call};`,
+				`namespace ${receiver} { export const x = 1; } ${call};`,
+				`const render = function ${receiver}() { ${call}; };`,
+				`const render = class ${receiver} { render() { ${call}; } };`,
 			]) {
 				it(`does not report a locally declared receiver: ${declaration}`, () => {
 					expect(undeclaredIn(declaration)).toEqual([]);
@@ -601,6 +610,30 @@ describe("root imports are declared", () => {
 		it("reports unshadowed receivers in a cjs script", () => {
 			expect(undeclaredIn('module.require("undeclared-cjs-module"); process.mainModule.require("undeclared-cjs-process");', "fixture.cjs").map((entry) => entry.specifier)).toEqual(["undeclared-cjs-module", "undeclared-cjs-process"]);
 		});
+
+		for (const fixture of [
+			{
+				file: "b.cjs",
+				source: 'module.require("u-cjs-exports");\nmodule.exports = {};',
+				specifier: "u-cjs-exports",
+			},
+			{
+				file: "fixture.js",
+				source: 'module.require("undeclared-js-module");\nmodule.exports = {};',
+				specifier: "undeclared-js-module",
+			},
+			{
+				file: "exports.js",
+				source: 'module.require("undeclared-js-exports");\nexports.x = 1;',
+				specifier: "undeclared-js-exports",
+			},
+		]) {
+			it(`reports module.require beside CommonJS exports in ${fixture.file}`, () => {
+				expect(undeclaredIn(fixture.source, fixture.file)).toEqual([
+					{ file: fixture.file, specifier: fixture.specifier, packageName: fixture.specifier },
+				]);
+			});
+		}
 
 		it("scans the real tree without ts.sys filesystem calls", () => {
 			const calls: string[] = [];
