@@ -1,0 +1,1 @@
+- **A pid-claim test whose daemon dies before its pause point fails at once and prints the exit status.** The pause wait stopped for the daemon's own pid and carries the exit code or signal and the last 4 KB of the daemon's stderr, instead of waiting out the 20 s timeout for a file that process can no longer write.
