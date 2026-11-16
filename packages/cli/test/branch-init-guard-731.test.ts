@@ -75,6 +75,8 @@ async function waitForPidGone(pid: number): Promise<void> {
         if (stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z") return;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
+        throw error;
       }
     }
     if (Date.now() >= deadline) throw new Error(`pid ${pid} was still alive after the wait bound`);
