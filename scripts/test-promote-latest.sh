@@ -846,6 +846,20 @@ if (which === 'kill_unchecked') {
   process.exit(0);
 }
 
+if (which === 'no_grace_kill') {
+  const old = `  graceTimer = setTimeout(() => {
+    graceDone = true;
+    if (!gone()) send('SIGKILL');`;
+  const neu = `  graceTimer = setTimeout(() => {
+    graceDone = true;`;
+  if (s.split(old).length !== 2) {
+    console.error('supervisor grace KILL mutation target not found');
+    process.exit(3);
+  }
+  fs.writeFileSync(dst, s.replace(old, neu));
+  process.exit(0);
+}
+
 if (which === 'count_sleeps') {
   const start = 'deadlineTimer = setTimeout(() => {';
   const end = '}, Math.round(deadlineSeconds * 1000));';
@@ -1979,6 +1993,31 @@ if node -e 'const fs=require("node:fs"); const [src,dst]=process.argv.slice(1); 
   TOOL=""
 else
   bad "AW mutation: no-grace KILL caught" "could not build the mutant supervisor"
+fi
+
+# ── AX. mutation: removing the grace KILL must turn AL's KILL assertion red ──
+ax="$work/mut-no-grace-kill"
+mkdir -p "$ax"
+cp "$tool" "$ax/promote-latest.sh"
+if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$ax/npm-supervisor.mjs" no_grace_kill; then
+  d="$(new_fixture mut-no-grace-kill)"
+  write_state "$d/state.json" "0.5.4" "0.5.3"
+  node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-linux-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
+  NPM_TIMEOUT_SECONDS=1 TOOL="$ax/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  assert_eq "AX mutation: exit" 7 "$RC"
+  case "$(cat "$d/supervisor.log" 2>/dev/null)" in
+    *KILL*) bad "AX mutation: missing grace KILL caught" "AL's KILL assertion stayed green" ;;
+    *) ok "AX mutation: missing grace KILL caught" "AL red: supervisor log contains no KILL attempt" ;;
+  esac
+  ax_elapsed="$(awk '$1 == "start" {start=$2; signalled=0} $0 == "TERM" {signalled=1} $1 == "end" && signalled {printf "%.2f", ($2-start)/1000}' "$d/supervisor.log")"
+  if [ -n "$ax_elapsed" ] && node -e 'const n=Number(process.argv[1]); process.exit(n >= 2.5 && n < 8 ? 0 : 1)' "$ax_elapsed"; then
+    ok "AX mutation: elapsed bounds stay green" "${ax_elapsed}s"
+  else
+    bad "AX mutation: elapsed bounds stay green" "${ax_elapsed}s — expected [2.5, 8)"
+  fi
+  TOOL=""
+else
+  bad "AX mutation: missing grace KILL caught" "could not build the mutant supervisor"
 fi
 
 # ── M1. mutation: break the existence check; fixture A must catch it ──────────
