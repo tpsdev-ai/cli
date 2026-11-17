@@ -334,12 +334,12 @@ export const mailAckScratchTestHooks: { now?: () => number } = {};
 /**
  * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
  * lock, and removes it before releasing that lock. The sweep considers names
- * of that exact shape and leaves scratch younger than ACK_SCRATCH_MIN_AGE_MS.
+ * of that exact shape and removes regular files at least ACK_SCRATCH_MIN_AGE_MS old.
  *
- * The lock guards the mailbox root and its direct children, so the directory
- * must resolve to a direct child of the locked root. A cur/ symlink to
- * another mailbox's cur/ shares its scratch files but not its lock;
- * the other mailbox's live scratch is left alone there.
+ * Before listing, check that the directory's real path is a direct child of
+ * the locked root: a cur/ symlink can share another mailbox's scratch
+ * without sharing its lock.
+ * A directory replaced or retargeted during the sweep is not detected.
  *
  * After a successful listing, wait ten minutes before sweeping the directory
  * again, so a bulk drain avoids repeated listings. Collecting eligible scratch
@@ -378,7 +378,12 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
     const scratchPath = join(dir, name);
     let mtimeMs: number;
     try {
-      mtimeMs = statSync(scratchPath).mtimeMs;
+      const entry = lstatSync(scratchPath);
+      if (!entry.isFile()) {
+        console.warn(`[mail] left non-regular ack scratch ${scratchPath}`);
+        continue;
+      }
+      mtimeMs = entry.mtimeMs;
     } catch (err: any) {
       if (err?.code === "ENOENT") continue;
       console.warn(`[mail] could not inspect leftover ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);

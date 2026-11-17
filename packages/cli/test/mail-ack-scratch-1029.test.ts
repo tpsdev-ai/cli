@@ -62,8 +62,8 @@ test("the sweep leaves a live writer's scratch reached through a leaf cur symlin
   const live = join(inboxA.cur, scratchName());
   const fd = fs.openSync(live, "w");
   fs.writeFileSync(fd, "{ partial");
-  // Held long enough to outlive the sweep's minimum age: only the lock a
-  // writer holds, not the file's age, says whether the scratch is live.
+  // Age cannot prove a writer has stopped; this test protects a scratch
+  // that belongs to the current lock holder.
   makeOld(live);
   const { lines } = collectWarnings();
   try {
@@ -93,6 +93,34 @@ test("the sweep leaves a scratch younger than the minimum age and removes an old
   expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
   expect(fs.existsSync(old)).toBe(false);
   expect(lines.filter((line) => line.includes(fresh))).toHaveLength(1);
+});
+
+test("the sweep leaves a fresh symlink to an old file and removes an old regular scratch", () => {
+  const cur = mail.getInbox("mailbox-a").cur;
+  const target = join(cur, "record.json");
+  plantRecord(target, "record-id");
+  const oldTarget = join(root, "old-target");
+  fs.writeFileSync(oldTarget, "{ keep target");
+  makeOld(oldTarget);
+  const targetBefore = fs.lstatSync(oldTarget);
+  const link = join(cur, scratchName());
+  fs.symlinkSync(oldTarget, link);
+  const old = join(cur, scratchName());
+  fs.writeFileSync(old, "{ old");
+  makeOld(old);
+
+  const { lines } = collectWarnings();
+  expect(mail.ackMessageAtPath(target).read).toBe(true);
+
+  expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
+  expect(fs.readlinkSync(link)).toBe(oldTarget);
+  expect(fs.readFileSync(oldTarget, "utf8")).toBe("{ keep target");
+  const targetAfter = fs.lstatSync(oldTarget);
+  expect(targetAfter.ino).toBe(targetBefore.ino);
+  expect(targetAfter.mtimeMs).toBe(targetBefore.mtimeMs);
+  expect(targetAfter.ctimeMs).toBe(targetBefore.ctimeMs);
+  expect(fs.existsSync(old)).toBe(false);
+  expect(lines.filter((line) => line.includes(link) && line.includes("left non-regular ack scratch"))).toHaveLength(1);
 });
 
 test("a failed listing warns with the directory and code, and the next ack retries", () => {
