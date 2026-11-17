@@ -276,8 +276,12 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
-  test("claimHostStateAt skips another connection's record when the start token cannot be read", () => {
-    home = mkdtempSync(join(tmpdir(), "conn-state-claim-token-throws-"));
+  // processStartToken returns null when it cannot read a token; a throwing reader is the other failure shape.
+  test.each([
+    ["returns null", (): string | null => null],
+    ["throws", (): string | null => { throw new Error("token read failed"); }],
+  ])("claimHostStateAt skips another connection's record when the start token reader %s", (_label, startToken) => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-token-unreadable-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
     writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:other" });
@@ -288,7 +292,7 @@ describe("connection-state", () => {
       "conn-a",
       undefined,
       0,
-      { startToken: () => { throw new Error("token read failed"); } },
+      { startToken },
     );
     expect(outcome).toEqual({ kind: "unverifiable" });
     expect(readFileSync(path)).toEqual(raw);
