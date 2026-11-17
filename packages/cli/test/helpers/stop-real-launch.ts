@@ -33,16 +33,43 @@ function parseReleasedPid(output: string): number | null {
   return match ? Number(match[1]) : null;
 }
 
+export interface GroupMemberIo {
+  platform: NodeJS.Platform;
+  readdir: (path: string) => string[];
+  readFile: (path: string) => string;
+  execPs: () => string;
+}
+
+const defaultGroupMemberIo: GroupMemberIo = {
+  platform: process.platform,
+  readdir: (path) => readdirSync(path),
+  readFile: (path) => readFileSync(path, "utf8"),
+  execPs: () => execFileSync("ps", ["-axo", "pid=,pgid=,stat="], {
+    encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
+  }),
+};
+
+export function parsePsGroupMembers(output: string, pgid: number): number[] | null {
+  const members: number[] = [];
+  for (const line of output.trim().split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
+    if (!match) return null;
+    // macOS pidState lacks /proc, so exclude ps's exited state before probing.
+    if (Number(match[2]) === pgid && !match[3].startsWith("Z")) members.push(Number(match[1]));
+  }
+  return members;
+}
+
 /** Null keeps the kill probe when membership cannot be read. */
-export function listGroupMembers(pgid: number): number[] | null {
+export function listGroupMembers(pgid: number, io: GroupMemberIo = defaultGroupMemberIo): number[] | null {
   try {
-    if (process.platform === "linux") {
+    if (io.platform === "linux") {
       const members: number[] = [];
-      for (const entry of readdirSync("/proc")) {
+      for (const entry of io.readdir("/proc")) {
         if (!/^\d+$/.test(entry)) continue;
         let stat: string;
         try {
-          stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+          stat = io.readFile(`/proc/${entry}/stat`);
         } catch (error) {
           // A process can disappear during the scan; other errors leave membership unknown.
           if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
@@ -57,19 +84,9 @@ export function listGroupMembers(pgid: number): number[] | null {
       }
       return members;
     }
-    if (process.platform === "darwin") {
+    if (io.platform === "darwin") {
       // Explicit PGID matching avoids ps selection flags' session/terminal semantics.
-      const output = execFileSync("ps", ["-axo", "pid=,pgid=,stat="], {
-        encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
-      });
-      const members: number[] = [];
-      for (const line of output.trim().split("\n")) {
-        const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
-        if (!match) return null;
-        // macOS pidState lacks /proc, so exclude ps's exited state before probing.
-        if (Number(match[2]) === pgid && !match[3].startsWith("Z")) members.push(Number(match[1]));
-      }
-      return members;
+      return parsePsGroupMembers(io.execPs(), pgid);
     }
   } catch {
     /* fall back to the group probe */
