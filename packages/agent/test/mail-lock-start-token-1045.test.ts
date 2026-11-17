@@ -36,7 +36,7 @@ import {
 
 const MAIL_LOCK_MODULE = fileURLToPath(new URL("../src/lib/mail-lock.ts", import.meta.url));
 
-/** Program text a child runs first: import the lock module. Children run with PS_START_TOKENS_BUN_ARGS. */
+/** Program text a child runs first: import the lock module. Children default to PS_START_TOKENS_BUN_ARGS. */
 const CHILD_PRELUDE = `
   import { acquireMailLock, acquireMailLockSync, processStartToken } from ${JSON.stringify(MAIL_LOCK_MODULE)};
 `;
@@ -221,9 +221,9 @@ describe("a mail lock naming a live pid with a different ps: token", () => {
     const { child, pid, token } = await liveChild();
     try {
       expect(token).toStartWith("ps:");
-      // The text an unpinned writer in another zone would have recorded for this
-      // same live process. The zone matches neither UTC nor any host's local
-      // time, so it differs from the real `ps:` token in value only.
+      // The text an unpinned writer in an intentionally non-UTC zone would have
+      // recorded for this same live process; it differs from the pinned UTC `ps:`
+      // token (asserted below).
       const legacy = `ps:${unpinnedLstart(pid, ODD_ZONE_ENV)}`;
       expect(legacy).not.toBe(token);
       const owner = { pid, startToken: legacy, nonce: "planted" };
