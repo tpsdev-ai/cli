@@ -279,6 +279,12 @@ export function createObligation(
   });
 }
 
+/** Test hook before the transition acquires its store lock. */
+let beforeTransitionForTests: ((inboundId: string) => void) | undefined;
+export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTests): void {
+  beforeTransitionForTests = hook;
+}
+
 /**
  * One-way transition. A late event after a TERMINAL state (acked/unconfirmed/
  * failed) is a NO-OP, logged — never a state resurrection. Transitions do not
@@ -292,10 +298,8 @@ export function createObligation(
  * needs to act on "this transition did not happen" (markDelivering, before a
  * delivery call) may never be handed the old record as though it were the result.
  *
- * `expect.from` (cli#1006 r2) makes the write a compare-and-set: the transition
- * lands only while the record is still in that prior state. A caller that
- * decided on a snapshot taken before an await passes the state it saw, so a
- * transition that landed meanwhile is refused rather than overwritten.
+ * `expect.from` refuses a transition when the record's STATE moved since the
+ * caller's re-read. A concurrent same-state update is not detected.
  */
 export function transitionObligation(
   mailDir: string,
@@ -306,6 +310,7 @@ export function transitionObligation(
   log?: ObligationLog,
   expect?: { from: ObligationState },
 ): ObligationRecord | null {
+  beforeTransitionForTests?.(inboundId);
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
     if (!current) return null;

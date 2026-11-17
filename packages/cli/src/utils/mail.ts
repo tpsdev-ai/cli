@@ -593,8 +593,19 @@ function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT") {
-      // Distinguish "no obligation" from a path that exists but cannot be read
-      // (a dangling symlink, for one): only a genuinely absent path may archive.
+      // A child's ENOENT can hide an inaccessible store (e.g. a dangling
+      // symlink). Check the store itself before treating the child as absent.
+      try {
+        const store = lstatSync(join(inboxRoot, ".obligations"));
+        if (!store.isDirectory()) {
+          warnObligationArchiveRead(path, "INVALID_STORE");
+          return true;
+        }
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
       try {
         lstatSync(path);
       } catch (inner) {

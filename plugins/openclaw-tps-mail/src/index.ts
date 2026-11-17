@@ -1464,19 +1464,26 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 }
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
-function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
+function armDeadline(
+  ctx: YieldContext,
+  obligationId: string,
+  deadlineAt?: string | null,
+  patch: Partial<ObligationRecord> = {},
+): void {
   if (!isLiveContext(ctx)) return;
-  const result = readObligationForCleanup(ctx, obligationId);
-  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
-  const rec = result.record;
-  const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
-  // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
-  // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
-  // their state and only gain `deadlineAt`. The deadline must be able to tell
-  // "committed, no evidence yet" from "never delivered" — that is the whole
-  // difference between `unconfirmed` and `failed`.
-  const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
-  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
+  let updated: ObligationRecord | null = null;
+  // Arming must preserve committed delivery state: the deadline distinguishes
+  // `unconfirmed` from `failed`. Re-read once if the state moves before writing.
+  for (let attempt = 0; attempt < 2 && !updated; attempt++) {
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+    const rec = result.record;
+    const at = (attempt === 0 ? deadlineAt : rec.deadlineAt) ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
+    updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, { from: rec.state });
+  }
+  if (!updated) return;
+  const at = updated.deadlineAt!;
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearAccountTimer(prev.accountId, prev.timer);
@@ -1495,6 +1502,8 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
   const rec = result.record;
   const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
   if (!isLiveContext(ctx)) return;
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur === "error") return;
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
   // record once it had stayed malformed for at least the partial-write grace, or was
@@ -1514,11 +1523,8 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
     receipt: receipt.status === "found" ? "found" : "none",
     verdict,
     reason,
-    // cli#1006: a deadline re-armed while the cur/ entry was gone has no
-    // inbound to re-verify. The only mail settlement may send is a nack to the
-    // recorded sender; delivery retries follow the existing at-least-once
-    // contract.
-    missingCur: rec.missingCurReason === MISSING_CUR_REASON,
+    // A restored inbound must pass the normal gate; the marker is historical.
+    missingCur: cur === "missing",
   });
 }
 
@@ -1597,12 +1603,37 @@ function scanObligationReceipt(
   );
 }
 
+const warnedObligationCurLookups = new Set<string>();
+
+/** The missing-file allowance requires a clean lookup at the decision point. */
+function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing" | "present" | "error" {
+  const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
+  let error: string | undefined;
+  const found = findCurPath(ctx.mailDir, ctx.agent, ctx.inboundId, (path, code) => {
+    if (code === "ENOENT" && path === curDir) return;
+    error ??= code ?? "INVALID_JSON";
+  });
+  if (error !== undefined) {
+    const key = resolve(curDir, ctx.inboundId);
+    if (!warnedObligationCurLookups.has(key)) {
+      warnedObligationCurLookups.add(key);
+      ctx.log?.warn?.(`tps-mail: obligation-cur-lookup-failed: obligation ${obligationId} for inbound ${ctx.inboundId}: the cur/ lookup failed (${error}); leaving the obligation untouched`);
+    }
+    return "error";
+  }
+  if (found !== null) {
+    ctx.curPath = found;
+    return "present";
+  }
+  return "missing";
+}
+
 /**
  * cli#1006 — recovery for an open obligation whose inbound cur/ entry is GONE.
  *
  * The obligation record is the durable truth; cur/ only corroborates it. With no
  * record to verify there is nothing to dispatch, so this path settles from the
- * record: a receipt if one exists, otherwise the deadline verdict (re-arm while
+ * record: a verified receipt if one exists, otherwise the deadline verdict (re-arm while
  * the deadline is ahead; at/after it, the deadline's own terminal outcome).
  * The only mail settlement may send is a nack to the recorded sender; delivery
  * retries follow the existing at-least-once contract. The internal-inbound gate
@@ -1621,6 +1652,12 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
 
   const receipt = await scanObligationReceipt(ctx, current.obligationId, current, current.replyId);
   if (!isLiveContext(ctx)) return;
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur === "error") return;
+  if (cur === "present") {
+    await reconcileObligation(ctx, current);
+    return;
+  }
   if (receipt.status === "found") {
     await settleObligation(ctx, current.obligationId, {
       receipt: "found",
@@ -1630,43 +1667,16 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     return;
   }
 
-  const parsedDeadline = current.deadlineAt === null ? NaN : Date.parse(current.deadlineAt);
+  // Decide from the post-scan state. The store guard refuses a STATE change
+  // after the re-read; a concurrent same-state update is not detected.
+  const fresh = readObligationForCleanup(ctx, current.obligationId);
+  if (fresh.status !== "found" || TERMINAL_STATES.has(fresh.record.state)) return;
+  const parsedDeadline = fresh.record.deadlineAt === null ? NaN : Date.parse(fresh.record.deadlineAt);
   if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
     const at = Number.isFinite(parsedDeadline)
-      ? current.deadlineAt!
+      ? fresh.record.deadlineAt!
       : new Date(Date.now() + obligationDeadlineMs()).toISOString();
-    const next: ObligationState = current.state === "pending" || current.state === "yielded" ? "yielded" : current.state;
-    // cli#1006 r2: `current` is a snapshot taken BEFORE the awaited receipt
-    // scan. A transition that landed during it (e.g. `posted`) must not be
-    // overwritten with a stale state. Re-read after the await and decide from
-    // the fresh record; the write below is also a compare-and-set on the state
-    // we snapshotted, so a transition that lands between the re-read and the
-    // write is refused too. A record that moved is left alone, and its own
-    // deadline is re-armed from the fresh record so it settles by its state.
-    const fresh = readObligationForCleanup(ctx, current.obligationId);
-    if (fresh.status !== "found" || fresh.record.state !== current.state) {
-      if (fresh.status === "found" && !TERMINAL_STATES.has(fresh.record.state)) {
-        armDeadline(ctx, current.obligationId, fresh.record.deadlineAt);
-      }
-      return;
-    }
-    const updated = transitionObligation(
-      ctx.mailDir,
-      ctx.agent,
-      ctx.inboundId,
-      next,
-      { deadlineAt: at, missingCurReason: MISSING_CUR_REASON },
-      ctx.log,
-      { from: current.state },
-    );
-    if (!updated) {
-      const after = readObligationForCleanup(ctx, current.obligationId);
-      if (after.status === "found" && !TERMINAL_STATES.has(after.record.state)) {
-        armDeadline(ctx, current.obligationId, after.record.deadlineAt);
-      }
-      return;
-    }
-    armDeadline(ctx, current.obligationId, at);
+    armDeadline(ctx, current.obligationId, at, { missingCurReason: MISSING_CUR_REASON });
     return;
   }
 

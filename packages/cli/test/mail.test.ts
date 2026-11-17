@@ -1,6 +1,6 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
 import { createPatchShared } from "./helpers/patch-shared.js";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, utimesSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, utimesSync, existsSync, symlinkSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { checkMessages, getInbox, inboxExists, listMessages, sendMessage, ackMessage, countInboxMessages, promote } from "../src/utils/mail.js";
@@ -615,5 +615,67 @@ describe("mail command", () => {
     const msgs = JSON.parse(checked.stdout);
     expect(msgs.length).toBe(1);
     expect(msgs[0].body).toBe("branch mail");
+  });
+});
+
+
+describe("r3 obligation archiver filesystem seam", () => {
+  let root: string;
+  let previousMailDir: string | undefined;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "archiver-seam-"));
+    previousMailDir = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = root;
+  });
+  afterEach(() => {
+    if (previousMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+    else process.env.TPS_MAIL_DIR = previousMailDir;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function agedCur(id: string): string {
+    const inbox = getInbox("seam-agent");
+    const file = join(inbox.cur, `${id}.json`);
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    writeFileSync(file, JSON.stringify({ id, from: "seam-sender", to: "seam-agent", body: "x", timestamp: old.toISOString() }));
+    utimesSync(file, old, old);
+    return file;
+  }
+
+  test("r3 dangling obligation store keeps cur and logs per path", async () => {
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const file = agedCur("dangling-store");
+    const inbox = getInbox("seam-agent");
+    symlinkSync(join(root, "absent-store"), join(inbox.root, ".obligations"));
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30)).toBe(0);
+      expect(archiveOldCur("seam-agent", 30)).toBe(0);
+      expect(existsSync(file)).toBe(true);
+      expect(warnings).toHaveLength(1);
+    } finally { restore(); }
+  });
+
+  test("r3 real plugin writer and CLI archiver agree on open and terminal records", async () => {
+    const { createObligation, transitionObligation } = await import("../../../plugins/openclaw-tps-mail/src/obligations.js");
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const message = sendMessage("seam-agent", "x", "seam-sender");
+    const id = message.id;
+    const file = join(getInbox("seam-agent").cur, `${id}.json`);
+    renameSync(message.filePath, file);
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(file, old, old);
+    expect(createObligation(root, "seam-agent", () => ({
+      obligationId: "ob-seam", inboundId: id, inboundTimestamp: new Date().toISOString(),
+      from: "seam-sender", to: "seam-agent", accountId: "default", state: "yielded", deadlineAt: null, attempts: 1,
+    })).created).toBe(true);
+    expect(archiveOldCur("seam-agent", 30)).toBe(0);
+    expect(existsSync(file)).toBe(true);
+    expect(transitionObligation(root, "seam-agent", id, "acked")?.state).toBe("acked");
+    expect(archiveOldCur("seam-agent", 30)).toBe(1);
+    expect(existsSync(file)).toBe(false);
+    const archive = join(getInbox("seam-agent").root, "archive");
+    expect(readdirSync(archive).flatMap((month) => readdirSync(join(archive, month)))).toContain(`${id}.json`);
   });
 });
