@@ -15,10 +15,7 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
-
-/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
- *  reused live pid can be staged only where start tokens come from /proc. */
-const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+import { PROC_START_TOKENS_NODE_ARGS, forcePsStartTokens, stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
@@ -214,9 +211,10 @@ afterEach(() => {
 });
 
 describe("relay stop identity", () => {
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "a mismatched token gets no signal, the stale file is removed, and the stop succeeds",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       // A token from the child's own source whose value cannot be current
       // stands for a pid that has since been reused: the recorded identity is
@@ -392,13 +390,15 @@ describe("relay stop identity", () => {
     TIMEOUT,
   );
 
-  // The macOS ps token resolves to one second. A token for the same live pid
-  // that differs only in its seconds field does not prove a different identity:
-  // a recorded `ps:` token may predate the TZ/locale pin (cli#1045), so the
-  // record is unverified (never signalled), not stale.
-  test.skipIf(!PS_START_TOKENS)(
+  // A ps token resolves to one second (the `ps` fallback is forced, so this runs
+  // where /proc exists too). A token for the same live pid that differs only in
+  // its seconds field does not prove a different identity: a recorded `ps:`
+  // token may predate the TZ/locale pin (cli#1045), so the record is unverified
+  // (never signalled), not stale.
+  test(
     "two ps tokens that differ only in the seconds field classify unverified, not stale",
     () => {
+      forcePsStartTokens();
       const child = spawnChild();
       const real = childToken(child.pid);
       const shifted = psTokenWithDifferentSeconds(real);
@@ -492,9 +492,10 @@ describe("relay start and status classification", () => {
     TIMEOUT,
   );
 
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "relay status on a stale record reports it, removes nothing and exits 0",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
       const { logs, restore } = captureLogs();
@@ -627,9 +628,10 @@ describe("json pid interpretation", () => {
 });
 
 describe("bridge stop identity", () => {
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "a mismatched token gets no signal and the stale file is removed",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(bridgePid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
       expect(readPidFile(bridgePid).kind).toBe("stale");
@@ -1175,12 +1177,13 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     TIMEOUT,
   );
 
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "relay stop with a stale mismatched token exits 0 and removes the file",
     () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
-      const result = spawnSync("node", [TPS_BIN, "mail", "relay", "stop"], {
+      const result = spawnSync("node", [...PROC_START_TOKENS_NODE_ARGS, TPS_BIN, "mail", "relay", "stop"], {
         env: { ...process.env, HOME: home },
         encoding: "utf8",
         timeout: TIMEOUT,
@@ -1194,12 +1197,13 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     TIMEOUT,
   );
 
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "bridge stop with a stale mismatched token exits 0 and removes the file",
     () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(bridgePid, relayRecord(child.pid, foreignStartToken(childToken(child.pid))));
-      const result = spawnSync("node", [TPS_BIN, "bridge", "stop"], {
+      const result = spawnSync("node", [...PROC_START_TOKENS_NODE_ARGS, TPS_BIN, "bridge", "stop"], {
         env: { ...process.env, HOME: home },
         encoding: "utf8",
         timeout: TIMEOUT,

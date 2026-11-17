@@ -16,10 +16,7 @@ import { pidPath as branchPidPath } from "../src/commands/branch.js";
 import { linuxProcessExited, runOffice, setOfficeKillSignal, setProcStatReader } from "../src/commands/office.js";
 import { hostStatePath, writeBranchState, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
-
-/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
- *  reused live pid can be staged only where start tokens come from /proc. */
-const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
 
 const TIMEOUT = 30_000;
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -333,9 +330,10 @@ describe("office kill identity", () => {
     TIMEOUT,
   );
 
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "office kill attempts stale-record removal without signalling the live pids",
     async () => {
+      stageProcStartTokens();
       const host = spawnChild();
       const branch = spawnChild();
       const hostPath = hostStatePath("host-a");

@@ -49,7 +49,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
+import { classifyOwnerToken, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 
 export const LAUNCH_SNAPSHOT_PREFIX = "config-";
 /** A snapshot in the making, renamed to `config-*` once its owner record is written. */
@@ -141,16 +141,12 @@ function parseLaunchSnapshotOwner(fd: number): LaunchSnapshotOwner | null {
   return { pid, startToken };
 }
 
-function tokenSource(token: string): string {
-  const colon = token.indexOf(":");
-  return colon === -1 ? token : token.slice(0, colon);
-}
-
 /**
- * "dead" — pid gone, or pid alive under a different readable start token from
- * the same source. While the pid is alive, a token from another source, or
- * either token unavailable (the recorded token, or the current one), is
- * "unverifiable": it is kept, never treated as dead. A pid that the probe
+ * "dead" — pid gone, or pid alive under a different readable `proc:` start
+ * token. While the pid is alive, classifyOwnerToken decides when both tokens
+ * are readable: a differing `ps:` token (cli#1045) or a token from another
+ * source is "unverifiable". Either token unavailable (the recorded token, or
+ * the current one) is "unverifiable" too: it is kept, never treated as dead. A pid that the probe
  * (default: pidState) classifies as "invalid" is "unreadable", like an owner record that cannot be
  * read.
  */
@@ -164,8 +160,7 @@ function ownerState(
   if (owner.startToken === null) return "unverifiable";
   const current = processStartToken(owner.pid);
   if (current === null) return "unverifiable";
-  if (tokenSource(current) !== tokenSource(owner.startToken)) return "unverifiable";
-  return current === owner.startToken ? "alive" : "dead";
+  return classifyOwnerToken(current, owner.startToken);
 }
 
 /** The entry's recorded owner is dead, or it has no readable owner record and is at least `graceMs` old. */

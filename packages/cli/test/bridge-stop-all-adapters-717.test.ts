@@ -14,10 +14,7 @@ import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile, snapshotPidRecord } from "../src/utils/pid-file.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
-
-/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
- *  reused live pid can be staged only where start tokens come from /proc. */
-const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
 
 const TIMEOUT = 30_000;
 const START_TIMEOUT = 10_000;
@@ -439,9 +436,10 @@ describe("bridge stop re-read exit status (cli#970)", () => {
     TIMEOUT,
   );
 
-  test.skipIf(PS_START_TOKENS)(
+  test(
     "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
     async () => {
+      stageProcStartTokens();
       const child = spawnSleep();
       const plannedToken = tokenOf(child.pid);
       const path = join(runDir, "bridge-alpha.pid");
