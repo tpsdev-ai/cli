@@ -1620,13 +1620,26 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     });
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
     try {
-      expect(injected).toBe(true);
+      // The hook fires from the recovery's own write, whose timing depends on
+      // the host; wait for it instead of assuming it landed inside start()'s poll.
+      expect(await pollUntil(() => injected, 15000), "recovery reached its guarded write").toBe(true);
       expect(obligationFile(AGENT, inboundId)?.state).toBe("posted");
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
       expect(obligationFile(AGENT, inboundId)?.missingCurReason).toBe(REASON);
       expect(await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 7000)).toBe(true);
     } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
-  }, 20000);
+  }, 40000);
+
+  it("r4 the state guard refuses a write decided on a snapshot that moved", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-expect-guard";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: 60000 });
+    const snapshot = obligationFile(AGENT, inboundId)?.state;
+    expect(transitionObligation(tempMailDir, AGENT, inboundId, "delivering", {})?.state).toBe("delivering");
+    // Same target state as the record's, so only the prior-state guard can refuse.
+    expect(transitionObligation(tempMailDir, AGENT, inboundId, "delivering", {}, undefined, { from: snapshot })).toBeNull();
+    expect(obligationFile(AGENT, inboundId)?.state).toBe("delivering");
+  });
 
   it("does not overwrite a posted transition that lands during the receipt scan", async () => {
     seedSigningKeys();
