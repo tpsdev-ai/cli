@@ -787,9 +787,9 @@ function isPostableFinalText(text: string): boolean {
 
 const OBLIGATION_DEFAULT_DEADLINE_MS = 60 * 60 * 1000;
 
-/** cli#1006: the named reason carried on an obligation record when recovery
- *  settled or re-armed it from the record because the inbound's cur/ entry was
- *  gone. A reason, never a verdict. */
+/** cli#1006: the named reason carried on an obligation record when restart
+ *  recovery or an in-process deadline settled or re-armed it from the record
+ *  because the inbound's cur/ entry was gone. A reason, never a verdict. */
 const MISSING_CUR_REASON = "cur-record-missing";
 
 /** The yield→deadline window. Test-only override via env; production is 60 min. */
@@ -1112,8 +1112,8 @@ async function settleObligation(
      *  the stamp. The nack MAIL is a separate question and is still owed unless
      *  the record itself says it was sent. */
     alreadyStamped?: boolean;
-    /** cli#1006: recovery is settling from the obligation RECORD because the
-     *  inbound's cur/ entry is GONE. The record is the durable truth and this
+    /** cli#1006: restart recovery or an in-process deadline is settling from
+     *  the obligation RECORD because the inbound's cur/ entry is GONE. The record is the durable truth and this
      *  path dispatches no agent reply, so the internal-inbound gate (which
      *  binds the dispatch path) does not apply. The only mail settlement may
      *  send is a nack to the recorded sender; delivery retries follow the

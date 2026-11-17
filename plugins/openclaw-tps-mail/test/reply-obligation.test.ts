@@ -1745,7 +1745,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     });
     expect(scanEntered, "the receipt scan is awaiting verification").toBe(true);
 
-    // The delivery path commits `posted` while recovery still holds the
+    // Simulate a delivery committing `posted` while recovery holds the
     // pre-scan snapshot.
     expect(transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId })?.state).toBe("posted");
     releaseScan();
