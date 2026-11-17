@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname } from "node:path";
+import { join, resolve, dirname, isAbsolute, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
@@ -685,6 +685,35 @@ describe("the local fallback installs from the committed fixture lock", () => {
       installOpenClaw(join(root, "run"), { repo: root, pathEnv: `${first}:${valid}`, spawn: spawnInstall });
       expect(calls).toHaveLength(1);
       expect(calls[0].command).toBe(bashBin);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty PATH searches no directory, even when the working directory holds bash", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-emptypath-"));
+    try {
+      symlinkSync(realBash(), join(root, "bash"));
+      const { calls, spawnInstall } = recordingSpawn();
+      expect(() => installOpenClaw(join(root, "run"), { repo: root, pathEnv: "", spawn: spawnInstall })).toThrow(
+        "no executable bash on the install PATH: PATH is empty",
+      );
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty PATH entry with a relative working directory selects an absolute bash", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-relcwd-"));
+    try {
+      const bashBin = join(root, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: relative(process.cwd(), root), pathEnv: `:${dirname(realBash())}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(isAbsolute(calls[0].command)).toBe(true);
+      expect(realpathSync(calls[0].command)).toBe(realpathSync(bashBin));
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

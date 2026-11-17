@@ -107,9 +107,13 @@ export function assertOpenClawVersion(stdout) {
  * that directory, and a match must be an executable regular file.
  */
 function resolveInstallBash(cwd, env) {
+  // bash searches no directories for an empty PATH; only an empty entry inside
+  // a PATH (a leading, trailing or doubled ':') means the working directory.
+  const pathValue = env.PATH ?? "";
+  if (pathValue === "") throw new Error("no executable bash on the install PATH: PATH is empty");
   const tried = [];
-  for (const entry of (env.PATH ?? "").split(delimiter)) {
-    const candidate = join(entry === "" ? cwd : resolve(cwd, entry), "bash");
+  for (const entry of pathValue.split(delimiter)) {
+    const candidate = join(resolve(cwd, entry), "bash");
     tried.push(candidate);
     try {
       if (!statSync(candidate).isFile()) continue;
