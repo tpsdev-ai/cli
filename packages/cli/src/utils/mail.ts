@@ -548,6 +548,59 @@ export function inboxFullMessage(recipient: string, count: number): string {
   );
 }
 
+/** Final obligation states (cli#1006): once one of these is on the record the
+ *  reply is no longer owed, so cur/ may age out. */
+const TERMINAL_OBLIGATION_STATES = new Set(["acked", "unconfirmed", "failed"]);
+
+/** Paths already warned about while checking obligations before archiving, so
+ *  a repeated mail check logs once per unreadable record rather than every run. */
+const warnedObligationArchiveReads = new Set<string>();
+
+function warnObligationArchiveRead(path: string, code: string | undefined): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} is unreadable (${code ?? "invalid"}); not archiving`);
+}
+
+/** True when the obligation for `messageId` is still live (or cannot be read).
+ *  Fail-closed: an unreadable or malformed record keeps the cur/ file, because
+ *  archiving on a read error could hide an open obligation (cli#1006). */
+function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
+  const path = join(inboxRoot, ".obligations", `${messageId}.json`);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // Distinguish "no obligation" from a path that exists but cannot be read
+      // (a dangling symlink, for one): only a genuinely absent path may archive.
+      try {
+        lstatSync(path);
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
+      warnObligationArchiveRead(path, code);
+      return true;
+    }
+    warnObligationArchiveRead(path, code);
+    return true;
+  }
+  try {
+    const record = JSON.parse(raw) as { state?: unknown };
+    if (!record || typeof record.state !== "string") {
+      warnObligationArchiveRead(path, "INVALID_RECORD");
+      return true;
+    }
+    return !TERMINAL_OBLIGATION_STATES.has(record.state);
+  } catch {
+    warnObligationArchiveRead(path, "INVALID_JSON");
+    return true;
+  }
+}
+
 /**
  * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
  *
@@ -578,6 +631,17 @@ export function archiveOldCur(agent: string, maxAgeDays = 30): number {
         // and ones manually touched. Most cur/ entries are written-once when
         // ack'd, so mtime ≈ when the agent processed them.
         if (st.mtimeMs > cutoffMs) continue;
+        // cli#1006: keep the record while its reply obligation is open. Reading
+        // the identity first also means an unreadable cur/ record is kept (its
+        // obligation cannot be checked), never archived on a read error.
+        let messageId: unknown;
+        try {
+          messageId = (JSON.parse(readFileSync(src, "utf-8")) as { id?: unknown }).id;
+        } catch {
+          continue;
+        }
+        if (typeof messageId !== "string" || messageId.length === 0) continue;
+        if (obligationHoldsCur(inbox.root, messageId)) continue;
         const ts = new Date(st.mtimeMs);
         const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
         mkdirSync(monthDir, { recursive: true });

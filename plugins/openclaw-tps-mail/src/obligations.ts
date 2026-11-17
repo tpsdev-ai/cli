@@ -129,6 +129,10 @@ export interface ObligationRecord {
    *  was proven not to have happened (`failed`), or WHY the obligation could
    *  not be resolved either way (`unconfirmed`). Never set on a live record. */
   failure?: string;
+  /** cli#1006: recovery settled or re-armed this obligation from its own record
+   *  because the inbound's cur/ entry was GONE. A reason, never a verdict: it
+   *  says why the record, not the maildir, decided. */
+  missingCurReason?: string;
   /** ISO time of the LAST state transition (create counts as the pending
    *  transition). The retention sweep ages a terminal record by THIS, falling
    *  back to `inboundTimestamp` for records written before this field existed —

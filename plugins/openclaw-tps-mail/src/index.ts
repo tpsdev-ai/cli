@@ -787,6 +787,11 @@ function isPostableFinalText(text: string): boolean {
 
 const OBLIGATION_DEFAULT_DEADLINE_MS = 60 * 60 * 1000;
 
+/** cli#1006: the named reason carried on an obligation record when recovery
+ *  settled or re-armed it from the record because the inbound's cur/ entry was
+ *  gone. A reason, never a verdict. */
+const MISSING_CUR_REASON = "cur-record-missing";
+
 /** The yield→deadline window. Test-only override via env; production is 60 min. */
 function obligationDeadlineMs(): number {
   const v = Number(process.env.TPS_OBLIGATION_DEADLINE_MS);
@@ -1004,14 +1009,20 @@ function stampTerminalCur(
 }
 
 
-function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
+function ackObligation(
+  ctx: YieldContext,
+  obligationId: string,
+  why: string,
+  patch: Partial<ObligationRecord> = {},
+  stampCur = true,
+): void {
   if (!isLiveContext(ctx)) return;
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
   // record (e.g. a deadline that already FAILED the obligation) refuses the
   // transition (obligations.ts: TERMINAL_STATES is final, never resurrected)
   // and must not get an ackedAt — otherwise a late final acks the inbound
   // while the obligation stays failed (cli#400).
-  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
+  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", patch, ctx.log);
   if (!updated || updated.state !== "acked") {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") return;
@@ -1021,7 +1032,8 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     );
     return;
   }
-  stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
+  // A missing cur/ entry has no record to stamp (cli#1006).
+  if (stampCur) stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
   releaseObligationState(obligationId);
 }
@@ -1100,9 +1112,17 @@ async function settleObligation(
      *  the stamp. The nack MAIL is a separate question and is still owed unless
      *  the record itself says it was sent. */
     alreadyStamped?: boolean;
+    /** cli#1006: recovery is settling from the obligation RECORD because the
+     *  inbound's cur/ entry is GONE. The record is the durable truth and this
+     *  path dispatches no agent reply, so the internal-inbound gate (which
+     *  binds the dispatch path) does not apply. The ONLY send this path can
+     *  make is the nack to the sender recorded at obligation creation. */
+    missingCur?: boolean;
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return "none";
+  if (!isLiveContext(ctx)) return "none";
+  if (!s.missingCur && !(await internalInbound(ctx))) return "none";
+  if (!isLiveContext(ctx)) return "none";
   const result = readObligationForCleanup(ctx, obligationId);
   if (result.status !== "found") return "none";
   const rec = result.record;
@@ -1113,7 +1133,13 @@ async function settleObligation(
     return "none";
   }
   if (s.receipt === "found" && !s.verdict) {
-    ackObligation(ctx, obligationId, s.reason);
+    ackObligation(
+      ctx,
+      obligationId,
+      s.reason,
+      s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {},
+      !s.missingCur,
+    );
     return "acked";
   }
   const committed = rec.state === "delivering" || rec.state === "posted";
@@ -1127,7 +1153,10 @@ async function settleObligation(
         ctx.agent,
         ctx.inboundId,
         "unconfirmed",
-        { failure: s.reason },
+        {
+          failure: s.reason,
+          ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+        },
         ctx.log,
       );
       if (appliedUnconfirmed === null) {
@@ -1172,7 +1201,11 @@ async function settleObligation(
       ctx.agent,
       ctx.inboundId,
       "failed",
-      { failure: failedOn, nackPending: true },
+      {
+        failure: failedOn,
+        nackPending: true,
+        ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+      },
       ctx.log,
     );
   } catch (err: any) {
@@ -1195,12 +1228,14 @@ async function settleObligation(
   // The failure is terminal: drop the context and its timer before the nack is
   // handed off (cli#403).
   releaseObligationState(obligationId);
-  if (!s.alreadyStamped) {
+  // A missing cur/ entry has no record to stamp; the obligation record carries
+  // the outcome (cli#1006).
+  if (!s.alreadyStamped && !s.missingCur) {
     stampTerminalCur(ctx, "nack", { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
-  const nackHandedOff = await deliverNack(ctx, failedOn);
+  const nackHandedOff = await deliverNack(ctx, failedOn, { allowMissingInbound: s.missingCur });
   if (!isLiveContext(ctx)) return "none";
   ctx.log?.warn?.(
     `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
@@ -1234,7 +1269,7 @@ async function settleObligation(
 async function deliverNack(
   ctx: YieldContext,
   reason: string,
-  opts: { timeoutMs?: number; ackTimeoutMs?: number } = {},
+  opts: { timeoutMs?: number; ackTimeoutMs?: number; allowMissingInbound?: boolean } = {},
 ): Promise<boolean> {
   if (!isLiveContext(ctx)) return false;
   let handedOff = false;
@@ -1291,6 +1326,7 @@ function retryOwedNackInBackground(
   log: any,
   incarnation: symbol,
   inboundEnvelopeId?: string,
+  allowMissingInbound = false,
 ): void {
   if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
@@ -1364,7 +1400,7 @@ function retryOwedNackInBackground(
     }
   });
   void Promise.race([
-    deliverNack(ctx, reason, { timeoutMs, ackTimeoutMs }).then(
+    deliverNack(ctx, reason, { timeoutMs, ackTimeoutMs, allowMissingInbound }).then(
       () => "done" as const,
       () => "done" as const,
     ),
@@ -1477,6 +1513,10 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
     receipt: receipt.status === "found" ? "found" : "none",
     verdict,
     reason,
+    // cli#1006: a deadline re-armed while the cur/ entry was gone has no
+    // inbound to re-verify; settling from the record still makes no reply
+    // dispatch and only the nack to the recorded sender.
+    missingCur: rec.missingCurReason === MISSING_CUR_REASON,
   });
 }
 
@@ -1556,6 +1596,69 @@ function scanObligationReceipt(
 }
 
 /**
+ * cli#1006 — recovery for an open obligation whose inbound cur/ entry is GONE.
+ *
+ * The obligation record is the durable truth; cur/ only corroborates it. With no
+ * record to verify there is nothing to dispatch, so this path settles from the
+ * record: a receipt if one exists, otherwise the deadline verdict (re-arm while
+ * the deadline is ahead; at/after it, the deadline's own terminal outcome).
+ * Settling can make exactly ONE send — the nack to the sender recorded at
+ * creation, through the durable nackOwed/markNackSent path — and the
+ * internal-inbound gate does not apply because no agent reply is dispatched.
+ * The missing cur/ entry is carried as the named `missingCurReason` field, not
+ * as a verdict.
+ */
+async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: string): Promise<void> {
+  if (!isLiveContext(ctx)) return;
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const current = result.record;
+  ctx.log?.warn?.(
+    `tps-mail: obligation-missing-cur: obligation ${current.obligationId} for inbound ${current.inboundId}: ` +
+      `the cur/ record is missing (${MISSING_CUR_REASON}); recovering from the obligation record`,
+  );
+
+  const receipt = await scanObligationReceipt(ctx, current.obligationId, current, current.replyId);
+  if (!isLiveContext(ctx)) return;
+  if (receipt.status === "found") {
+    await settleObligation(ctx, current.obligationId, {
+      receipt: "found",
+      reason: "recovered: receipt already posted",
+      missingCur: true,
+    });
+    return;
+  }
+
+  const parsedDeadline = current.deadlineAt === null ? NaN : Date.parse(current.deadlineAt);
+  if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
+    const at = Number.isFinite(parsedDeadline)
+      ? current.deadlineAt!
+      : new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    const next: ObligationState = current.state === "pending" || current.state === "yielded" ? "yielded" : current.state;
+    transitionObligation(
+      ctx.mailDir,
+      ctx.agent,
+      ctx.inboundId,
+      next,
+      { deadlineAt: at, missingCurReason: MISSING_CUR_REASON },
+      ctx.log,
+    );
+    armDeadline(ctx, current.obligationId, at);
+    return;
+  }
+
+  // The deadline has passed: apply the deadline's own terminal outcome.
+  const reason = "yielded-without-resumption";
+  const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
+  await settleObligation(ctx, current.obligationId, {
+    receipt: "none",
+    verdict,
+    reason,
+    missingCur: true,
+  });
+}
+
+/**
  * Derive an obligation's truth from the maildir/outbox: a nacked cur/ record is
  * a failure; a posted marker is an ack; otherwise the work is outstanding and
  * the deadline is (re-)armed. Used by restart recovery and by a re-dispatch of
@@ -1568,7 +1671,16 @@ async function reconcileObligation(
   ctx: YieldContext,
   rec: { obligationId: string; deadlineAt: string | null; inboundId: string; inboundEnvelopeId?: string; replyId?: string },
 ): Promise<void> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return;
+  if (!isLiveContext(ctx)) return;
+  // cli#1006: the record is the durable truth of the lifecycle; cur/
+  // corroborates it. When the cur/ entry is gone there is no inbound to
+  // re-verify and nothing to dispatch, so recovery settles or re-arms from the
+  // obligation record itself. The dispatch path keeps its gate below.
+  if (!ctx.curPath || !existsSync(ctx.curPath)) {
+    await reconcileMissingCurObligation(ctx, rec.obligationId);
+    return;
+  }
+  if (!(await internalInbound(ctx)) || !isLiveContext(ctx)) return;
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
@@ -1615,9 +1727,15 @@ async function reconcileObligation(
 async function sendNackMail(
   ctx: YieldContext,
   reason: string,
-  opts: { timeoutMs?: number; ackTimeoutMs?: number } = {},
+  opts: { timeoutMs?: number; ackTimeoutMs?: number; allowMissingInbound?: boolean } = {},
 ): Promise<boolean> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return false;
+  if (!isLiveContext(ctx)) return false;
+  // cli#1006: settling from the obligation record makes exactly ONE send — the
+  // nack to the sender recorded at creation — and dispatches no agent reply, so
+  // the internal-inbound gate (which binds the dispatch path) is bypassed only
+  // for that settle. Every other caller keeps it.
+  if (!opts.allowMissingInbound && !(await internalInbound(ctx))) return false;
+  if (!isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -2687,6 +2805,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             log,
             incarnation,
             rec.inboundEnvelopeId,
+            // cli#1006: a nack settled from a record whose cur/ entry was gone
+            // is still owed to the sender recorded at creation; retry it under
+            // the same settle-path rule as the initial send.
+            rec.missingCurReason === MISSING_CUR_REASON,
           );
         }
 

@@ -38,8 +38,8 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 // Import the plugin — default export gives us { register }.
-import pluginModule from "../src/index.js";
-import { createObligation, sweepTerminalObligations } from "../src/obligations.js";
+import pluginModule, { obligationStateForTests } from "../src/index.js";
+import { createObligation, sweepTerminalObligations, writeReceipt } from "../src/obligations.js";
 
 let capturedPlugin: any;
 let capturedSubscription: any;
@@ -1306,5 +1306,167 @@ describe("cli#389 round 11 — an owed nack is never swept", () => {
       await h.stop();
     });
   }
+
+// ── cli#1006: an open obligation whose cur/ record is gone ──────────────────
+
+describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ record", () => {
+  const AGENT = "agent-a";
+  const SENDER = "sender-a";
+  const REASON = "cur-record-missing";
+
+  function seedOrphan(
+    inboundId: string,
+    opts: {
+      obligationId?: string;
+      state?: "pending" | "yielded" | "delivering" | "posted";
+      deadlineInMs?: number;
+      envelopeId?: string;
+    } = {},
+  ): { obligationId: string; envelopeId: string } {
+    const envelopeId = opts.envelopeId ?? `env-${inboundId}`;
+    const obligationId = opts.obligationId ?? `ob-${inboundId}`;
+    const dir = resolve(tempMailDir, AGENT, ".obligations");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      resolve(dir, `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId,
+          inboundId,
+          inboundEnvelopeId: envelopeId,
+          inboundTimestamp: new Date().toISOString(),
+          from: SENDER,
+          to: AGENT,
+          accountId: "default",
+          state: opts.state ?? "yielded",
+          deadlineAt: new Date(Date.now() + (opts.deadlineInMs ?? -1000)).toISOString(),
+          attempts: 1,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    return { obligationId, envelopeId };
+  }
+
+  function seedSigningKeys(): void {
+    writeFileSync(join(tempKeysDir, `${AGENT}.key`), ANVIL_SEED);
+    writeFileSync(join(tempKeysDir, `${SENDER}.key`), FLINT_SEED);
+  }
+
+  it("with the deadline passed, settles from the record: terminal, named reason, one nack, no dispatch", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-orphan-past";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const warned: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warned });
+
+    const failed = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 3000);
+    expect(failed, "the obligation reaches a terminal state").toBe(true);
+    const rec = obligationFile(AGENT, inboundId);
+    expect(rec?.failure).toBe("yielded-without-resumption");
+    expect(rec?.missingCurReason, "the missing cur/ entry is a named reason on the record").toBe(REASON);
+    expect(rec?.nackPending, "the nack is handed over, not left owing").toBeFalsy();
+    expect(typeof rec?.nackSentAt).toBe("string");
+
+    const senderNew = resolve(tempMailDir, SENDER, "new");
+    expect(nackMailsIn(senderNew, "yielded-without-resumption").length, "exactly one nack to the recorded sender").toBe(1);
+    expect(nackMailsIn(senderNew).length).toBe(1);
+    expect(h.dispatchCount, "settling from the record dispatches nothing").toBe(0);
+    expect(warned.join("\n"), "one line names the obligation and the reason").toContain(obligationId);
+    expect(warned.join("\n")).toContain(REASON);
+    await h.stop();
+  }, 20000);
+
+  it("with the deadline still ahead, re-arms and does not settle early", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-orphan-future";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: 6000 });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+
+    const rec = obligationFile(AGENT, inboundId);
+    expect(rec?.state, "the obligation stays open").toBe("yielded");
+    expect(rec?.missingCurReason, "and the named reason is on the record").toBe(REASON);
+    const armed = obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId);
+    expect(armed, "the deadline is re-armed").toBe(true);
+    expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")).length, "nothing was sent early").toBe(0);
+    expect(h.dispatchCount).toBe(0);
+
+    // The re-armed deadline must itself settle from the record when it fires.
+    const settled = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 5000);
+    expect(settled, "the re-armed deadline settles it").toBe(true);
+    const senderNew = resolve(tempMailDir, SENDER, "new");
+    expect(nackMailsIn(senderNew, "yielded-without-resumption").length, "one nack at the deadline").toBe(1);
+    expect(h.dispatchCount).toBe(0);
+    await h.stop();
+  }, 20000);
+
+  it("re-sends a nack still owed by a settled record whose cur/ entry is gone", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-orphan-owed-nack";
+    seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const settled = JSON.parse(readFileSync(recordPath, "utf-8"));
+    writeFileSync(
+      recordPath,
+      JSON.stringify(
+        {
+          ...settled,
+          state: "failed",
+          failure: "yielded-without-resumption",
+          nackPending: true,
+          missingCurReason: REASON,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+
+    const senderNew = resolve(tempMailDir, SENDER, "new");
+    const arrived = await pollUntil(() => nackMailsIn(senderNew, "yielded-without-resumption").length === 1, 3000);
+    expect(arrived, "the owed nack is retried from the record").toBe(true);
+    expect(obligationFile(AGENT, inboundId)?.nackPending).toBeFalsy();
+    expect(typeof obligationFile(AGENT, inboundId)?.nackSentAt).toBe("string");
+    expect(nackMailsIn(senderNew).length).toBe(1);
+    expect(h.dispatchCount).toBe(0);
+    await h.stop();
+  }, 20000);
+
+  it("with a receipt present, settles from the receipt", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-orphan-receipt";
+    const { obligationId, envelopeId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const replyId = "reply-orphan-a";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const signedReply = signEnvelope(
+      { v: 1, from: AGENT, to: SENDER, body: "recovered reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+      { [AGENT]: ANVIL_SEED },
+    );
+    writeReceipt(tempMailDir, AGENT, {
+      replyId,
+      obligationId,
+      replyToId: envelopeId,
+      route: "local",
+      ts: now,
+      signedReply: JSON.stringify(signedReply),
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+
+    const acked = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "acked", 3000);
+    expect(acked, "the receipt settles it").toBe(true);
+    expect(obligationFile(AGENT, inboundId)?.missingCurReason).toBe(REASON);
+    expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")).length, "an ack sends no nack").toBe(0);
+    expect(h.dispatchCount).toBe(0);
+    await h.stop();
+  }, 20000);
+});
+
 
 });

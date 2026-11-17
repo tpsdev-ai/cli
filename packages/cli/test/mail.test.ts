@@ -1,11 +1,13 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { createPatchShared } from "./helpers/patch-shared.js";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, utimesSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { checkMessages, getInbox, inboxExists, listMessages, sendMessage, ackMessage, countInboxMessages, promote } from "../src/utils/mail.js";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
+const patchShared = createPatchShared();
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const KERN_SEED = Buffer.alloc(32, 0x02);
@@ -237,6 +239,50 @@ describe("mail utils", () => {
     // Archive structure: ~/.tps/mail/<agent>/archive/YYYY-MM/<file>.json
     const archiveRoot = join(inbox.root, "archive");
     expect(existsSync(archiveRoot)).toBe(true);
+  });
+
+
+  test("archiveOldCur keeps cur/ while its obligation is non-terminal, and fails closed on an unreadable one", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const aged = (name: string, id: string): string => {
+      const path = join(inbox.cur, name);
+      writeFileSync(path, JSON.stringify({ id, from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+      utimesSync(path, old, old);
+      return path;
+    };
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const obligation = (id: string, state: string): void => {
+      writeFileSync(join(obligationDir, `${id}.json`), JSON.stringify({ obligationId: `ob-${id}`, inboundId: id, state }));
+    };
+
+    const open = aged("open.json", "msg-open");
+    const closed = aged("closed.json", "msg-closed");
+    const unreadable = aged("unreadable.json", "msg-unreadable");
+    obligation("msg-open", "yielded");
+    obligation("msg-closed", "acked");
+    // A directory at the record path makes the read fail for every uid, root included.
+    mkdirSync(join(obligationDir, "msg-unreadable.json"));
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(1);
+      expect(existsSync(open), "a non-terminal obligation keeps its cur/ record").toBe(true);
+      expect(existsSync(closed), "a terminal obligation does not").toBe(false);
+      expect(existsSync(unreadable), "an unreadable obligation record fails closed").toBe(true);
+
+      const malformed = aged("malformed.json", "msg-malformed");
+      writeFileSync(join(obligationDir, "msg-malformed.json"), "{not json");
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(malformed), "a malformed obligation record fails closed").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-unreadable.json")).length, "an unreadable record is logged once").toBe(1);
+      expect(warnings.filter((line) => line.includes("msg-malformed.json")).length, "a malformed record is logged once").toBe(1);
+    } finally {
+      restoreWarn();
+    }
   });
 
   test("checkMessages opportunistically archives old cur entries", async () => {
