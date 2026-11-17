@@ -718,11 +718,13 @@ const REPLAY_DIR = join(TEST_ROOT, "fixtures", "port-helper-replay");
 const REPLAY: { entries: ReplayEntry[] } = JSON.parse(readFileSync(join(REPLAY_DIR, "manifest.json"), "utf8"));
 
 describe("port helper guard (cli#1025)", () => {
+  // Darwin alone takes ~1.8 s; Docker's full suite took 5.5 s at 886cfc8b.
+  // Allow 30 s (~5x that CI measurement) for suite load.
   test("no cli test file picks a port and binds it later", () => {
     const offenders = testTreeSources(join(CLI_ROOT, "test"))
       .flatMap((file) => analyzeSource(readFileSync(file, "utf8"), relative(CLI_ROOT, file)));
     expect(offenders).toEqual([]);
-  });
+  }, 30_000);
 
   test("reports a named, annotated pickPort copy", () => {
     expect(analyzeSource(NAMED_PICK_PORT, "pick-port.test.ts")).toEqual([
