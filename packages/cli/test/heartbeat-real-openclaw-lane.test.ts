@@ -4,7 +4,7 @@ import { EventEmitter, once } from "node:events";
 import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve, dirname, isAbsolute, relative } from "node:path";
+import { join, resolve, isAbsolute, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
@@ -466,12 +466,16 @@ mkdir -p "$prefix/node_modules/.bin"
   chmodSync(join(dir, "npm"), 0o755);
 }
 
-/** The inherited PATH with directories holding an sfw removed. */
-function pathWithoutSfw(): string {
-  return (process.env.PATH ?? "")
-    .split(":")
-    .filter((dir) => dir !== "" && !existsSync(join(dir, "sfw")))
-    .join(":");
+function helperTools(root: string): string {
+  const tools = join(root, "tools");
+  mkdirSync(tools);
+  for (const name of ["bash", "node", "git", "mktemp", "mkdir", "cp", "cmp", "rm", "rmdir"]) {
+    const found = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf-8" });
+    const tool = found.status === 0 ? found.stdout.trim() : "";
+    if (!tool.startsWith("/")) throw new Error(`no absolute ${name} on this host: ${JSON.stringify(tool)}`);
+    symlinkSync(tool, join(tools, name));
+  }
+  return tools;
 }
 
 describe("the local fallback installs from the committed fixture lock", () => {
@@ -479,12 +483,11 @@ describe("the local fallback installs from the committed fixture lock", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
     try {
       const { calls, spawnInstall } = recordingSpawn();
-      const bashDir = dirname(realBash());
-      const pathEnv = `${bashDir}:${pathWithoutSfw()}`;
+      const pathEnv = helperTools(root);
       const binDir = installOpenClaw(root, { spawn: spawnInstall, pathEnv, env: { PATH: pathEnv } });
       expect(calls).toHaveLength(1);
       const [call] = calls;
-      expect(call.command).toBe(realBash());
+      expect(call.command).toBe(join(pathEnv, "bash"));
       expect(call.args).toEqual([HELPER, "--via", "npm", FIXTURE, join(root, "openclaw"), ...CI_ARGS]);
       expect(call.options.cwd).toBe(REPO);
       expect(binDir).toBe(join(root, "openclaw", "node_modules", ".bin"));
@@ -497,12 +500,11 @@ describe("the local fallback installs from the committed fixture lock", () => {
   test("uses the sfw path when sfw is on PATH", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
     try {
-      const stubs = join(root, "stubs");
-      mkdirSync(stubs);
+      const stubs = helperTools(root);
       writeFileSync(join(stubs, "sfw"), "#!/bin/sh\n");
       chmodSync(join(stubs, "sfw"), 0o755);
       const { calls, spawnInstall } = recordingSpawn();
-      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: `${stubs}:${dirname(realBash())}:${pathWithoutSfw()}` });
+      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: stubs, env: { PATH: stubs } });
       expect(calls[0].args).toEqual([HELPER, "--via", "sfw", FIXTURE, join(root, "run", "openclaw"), ...CI_ARGS]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -532,14 +534,13 @@ describe("the local fallback installs from the committed fixture lock", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-helper-"));
     try {
       const repo = fixtureRepo(root);
-      const stubs = join(root, "stubs");
-      mkdirSync(stubs);
+      const stubs = helperTools(root);
       const recordPath = join(root, "npm-args.txt");
       writeFileSync(join(stubs, "npm"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(recordPath)}\n`);
       chmodSync(join(stubs, "npm"), 0o755);
       const home = join(root, "home");
       mkdirSync(home);
-      const env = { PATH: `${stubs}:${pathWithoutSfw()}`, HOME: home };
+      const env = { PATH: stubs, HOME: home };
       const throwaway = join(root, "throwaway");
       const binDir = installOpenClaw(throwaway, { repo, env });
       expect(binDir).toBe(join(throwaway, "openclaw", "node_modules", ".bin"));
@@ -565,12 +566,12 @@ describe("the local fallback installs from the committed fixture lock", () => {
       mkdirSync(relBin, { recursive: true });
       writeFileSync(join(relBin, "sfw"), "#!/bin/sh\nexit 0\n");
       chmodSync(join(relBin, "sfw"), 0o755);
-      const npmDir = join(root, "npm-bin");
+      const npmDir = helperTools(root);
       const recordPath = join(root, "npm-args.txt");
       npmStub(npmDir, recordPath);
       const home = join(root, "home");
       mkdirSync(home);
-      const pathEnv = `relbin:${npmDir}:${pathWithoutSfw()}`;
+      const pathEnv = `relbin:${npmDir}`;
       process.chdir(laneCwd);
       const throwaway = join(root, "throwaway");
       const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
@@ -599,14 +600,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       const sfwRecord = join(root, "sfw-args.txt");
       writeFileSync(join(relBin, "sfw"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(sfwRecord)}\n`);
       chmodSync(join(relBin, "sfw"), 0o755);
-      const tools = join(root, "tools");
-      mkdirSync(tools);
-      for (const name of ["node", "git", "mktemp", "mkdir", "cp", "cmp", "rm", "rmdir"]) {
-        const found = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf-8" });
-        const tool = found.status === 0 ? found.stdout.trim() : "";
-        if (!tool.startsWith("/")) throw new Error(`no absolute ${name} on this host: ${JSON.stringify(tool)}`);
-        symlinkSync(tool, join(tools, name));
-      }
+      const tools = helperTools(root);
       const home = join(root, "home");
       mkdirSync(home);
       const pathEnv = `relative-bin:${tools}`;
@@ -634,13 +628,14 @@ describe("the local fallback installs from the committed fixture lock", () => {
       const notExecutable = join(root, "bash");
       writeFileSync(notExecutable, "");
       const { calls, spawnInstall } = recordingSpawn();
+      const pathEnv = helperTools(root);
       let reported: unknown;
       try {
         installOpenClaw(join(root, "run"), {
           spawn: spawnInstall,
           bashPath: notExecutable,
-          pathEnv: pathWithoutSfw(),
-          env: { PATH: pathWithoutSfw() },
+          pathEnv,
+          env: { PATH: pathEnv },
         });
       } catch (error) {
         reported = error;
@@ -659,7 +654,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       const bashBin = join(root, "bash");
       symlinkSync(realBash(), bashBin);
       const { calls, spawnInstall } = recordingSpawn();
-      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `:${dirname(realBash())}`, spawn: spawnInstall });
+      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `:${helperTools(root)}`, spawn: spawnInstall });
       expect(calls).toHaveLength(1);
       expect(calls[0].command).toBe(bashBin);
     } finally {
@@ -710,7 +705,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       const bashBin = join(root, "bash");
       symlinkSync(realBash(), bashBin);
       const { calls, spawnInstall } = recordingSpawn();
-      installOpenClaw(join(root, "run"), { repo: relative(process.cwd(), root), pathEnv: `:${dirname(realBash())}`, spawn: spawnInstall });
+      installOpenClaw(join(root, "run"), { repo: relative(process.cwd(), root), pathEnv: `:${helperTools(root)}`, spawn: spawnInstall });
       expect(calls).toHaveLength(1);
       expect(isAbsolute(calls[0].command)).toBe(true);
       expect(realpathSync(calls[0].command)).toBe(realpathSync(bashBin));
@@ -789,12 +784,12 @@ describe("the local fallback installs from the committed fixture lock", () => {
       const repo = fixtureRepo(root);
       const dirEntry = join(root, "dir-entry");
       mkdirSync(join(dirEntry, "sfw"), { recursive: true });
-      const npmDir = join(root, "npm-bin");
+      const npmDir = helperTools(root);
       const recordPath = join(root, "npm-args.txt");
       npmStub(npmDir, recordPath);
       const home = join(root, "home");
       mkdirSync(home);
-      const pathEnv = `${dirEntry}:${npmDir}:${pathWithoutSfw()}`;
+      const pathEnv = `${dirEntry}:${npmDir}`;
       const throwaway = join(root, "throwaway");
       const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
       expect(readFileSync(recordPath, "utf-8")).toContain("ci");
