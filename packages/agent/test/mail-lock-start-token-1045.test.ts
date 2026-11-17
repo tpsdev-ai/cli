@@ -4,13 +4,15 @@
  *
  * Where /proc is unavailable (macOS), processStartToken reads `ps -o lstart=`,
  * whose text follows the reader's TZ and locale unless the call pins them. The
- * cross-environment tests below send processStartToken to that `ps` fallback
- * through `startTokenTestHooks` (in this process and in every child they
- * start), so they exercise it on Linux too, where `ps -o lstart=` also exists.
+ * cross-environment tests below send processStartToken to that `ps` fallback by
+ * making `/proc/<pid>/stat` reads fail as absent — with test-only substitution
+ * (test/helpers/start-token-source.mjs: a `node:fs` spy in this process, a
+ * `--preload` in every child) — so they exercise it on Linux too, where
+ * `ps -o lstart=` also exists. The production package has no hook for this.
  * The classifyOwnerToken and ownerState tests inject tokens and check the rule
  * identically on every platform.
  */
-import { afterEach, beforeEach, describe, expect, onTestFinished, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, execFileSync, spawn, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -18,21 +20,25 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import {
+  forcePsStartTokens,
+  PROC_START_TOKENS_PRELOAD,
+  PS_START_TOKENS_BUN_ARGS,
+  stageProcStartTokens,
+} from "../../../test/helpers/start-token-source-test.js";
+import {
   acquireMailLockSync,
   classifyOwnerToken,
   mailLockPath,
   ownerState,
   processIsGone,
   processStartToken,
-  startTokenTestHooks,
 } from "../src/lib/mail-lock.js";
 
 const MAIL_LOCK_MODULE = fileURLToPath(new URL("../src/lib/mail-lock.ts", import.meta.url));
 
-/** Program text a child runs first: import the lock module and force its `ps` fallback. */
+/** Program text a child runs first: import the lock module. Children run with PS_START_TOKENS_BUN_ARGS. */
 const CHILD_PRELUDE = `
-  import { acquireMailLock, acquireMailLockSync, processStartToken, startTokenTestHooks } from ${JSON.stringify(MAIL_LOCK_MODULE)};
-  startTokenTestHooks.readStat = () => null;
+  import { acquireMailLock, acquireMailLockSync, processStartToken } from ${JSON.stringify(MAIL_LOCK_MODULE)};
 `;
 
 /** Reader environments: a local zone (never UTC-equal), UTC, and UTC with another locale. */
@@ -43,18 +49,9 @@ const READER_ENVS = [PACIFIC_ENV, UTC_ENV, UTC_GERMAN_ENV];
 /** A POSIX zone at UTC+13:17, an offset no host's local time uses. */
 const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
 
-/** Send this process's processStartToken to the `ps` fallback for the rest of the test. */
-function forcePsTokens(): void {
-  const previous = startTokenTestHooks.readStat;
-  startTokenTestHooks.readStat = () => null;
-  onTestFinished(() => {
-    startTokenTestHooks.readStat = previous;
-  });
-}
-
-/** `pid`'s token, read through the real processStartToken (`ps` forced) in a child started with `env`. */
-function tokenReadUnder(pid: number, env: NodeJS.ProcessEnv): string | null {
-  const result = spawnSync(process.execPath, ["--eval", `${CHILD_PRELUDE}
+/** `pid`'s token, read through the real processStartToken in a child started with `env` and `preloadArgs`. */
+function tokenReadUnder(pid: number, env: NodeJS.ProcessEnv, preloadArgs: readonly string[] = PS_START_TOKENS_BUN_ARGS): string | null {
+  const result = spawnSync(process.execPath, [...preloadArgs, "--eval", `${CHILD_PRELUDE}
     process.stdout.write(JSON.stringify(processStartToken(${pid})));
   `], { env, encoding: "utf-8", timeout: 20_000 });
   if (result.status !== 0) throw new Error(`token reader exited ${result.status}: ${result.stderr}`);
@@ -88,23 +85,42 @@ function reapedPid(): number {
   return result.pid as number;
 }
 
-describe("startTokenTestHooks", () => {
-  test("a reader's fields give a proc: token, and a null reader sends the same pid to ps", () => {
-    const previous = startTokenTestHooks.readStat;
+describe("test-only start-token source (no production hook)", () => {
+  test("in this process, forcing ps gives a live pid a ps: token", async () => {
+    forcePsStartTokens();
+    const { child, pid, token } = await liveChild();
     try {
-      startTokenTestHooks.readStat = () => ["S", ...Array(18).fill("0"), "4242"];
-      expect(processStartToken(process.pid)).toBe("proc:4242");
-      startTokenTestHooks.readStat = () => null;
-      expect(processStartToken(process.pid)).toMatch(/^ps:\S/);
+      expect(token).toMatch(/^ps:\S/);
     } finally {
-      startTokenTestHooks.readStat = previous;
+      child.kill("SIGKILL");
     }
   });
+
+  test("in this process, staging proc gives a live pid a proc: token", async () => {
+    stageProcStartTokens();
+    const { child, pid, token } = await liveChild();
+    try {
+      expect(token).toMatch(/^proc:\d+$/);
+      expect(processStartToken(pid)).toBe(token);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  });
+
+  test("in a child, the ps preload gives a ps: token and the proc preload a proc: token", async () => {
+    const { child, pid } = await liveChild();
+    try {
+      expect(tokenReadUnder(pid, UTC_ENV)).toMatch(/^ps:\S/);
+      expect(tokenReadUnder(pid, UTC_ENV, ["--preload", PROC_START_TOKENS_PRELOAD])).toMatch(/^proc:\d+$/);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 30_000);
 });
 
 describe("processStartToken is the same whichever environment reads it", () => {
   test("one live pid read under different TZ and locale values yields one token", async () => {
-    forcePsTokens();
+    forcePsStartTokens();
     const { child, pid, token } = await liveChild();
     try {
       expect(token).toStartWith("ps:");
@@ -201,7 +217,7 @@ describe("a mail lock naming a live pid with a different ps: token", () => {
   });
 
   test("is kept, and the pid is not gone", async () => {
-    forcePsTokens();
+    forcePsStartTokens();
     const { child, pid, token } = await liveChild();
     try {
       expect(token).toStartWith("ps:");
@@ -239,7 +255,7 @@ describe("a live holder keeps the mail lock against a contender in another TZ", 
   });
 
   test("a contender started with TZ=UTC does not take a lock held by a live process started in America/Los_Angeles", async () => {
-    const holder = spawn(process.execPath, ["--eval", `${CHILD_PRELUDE}
+    const holder = spawn(process.execPath, [...PS_START_TOKENS_BUN_ARGS, "--eval", `${CHILD_PRELUDE}
       const lock = await acquireMailLock(${JSON.stringify(root)}, { timeoutMs: 5000 });
       if (!lock) { process.stdout.write("unavailable"); process.exit(2); }
       process.stdout.write("ready");
@@ -266,7 +282,7 @@ describe("a live holder keeps the mail lock against a contender in another TZ", 
       const owner = JSON.parse(readFileSync(join(mailLockPath(root), "owner.json"), "utf-8")) as { pid: unknown; startToken: unknown };
       expect(owner.startToken).toEqual(expect.stringMatching(/^ps:/));
 
-      const contender = spawnSync(process.execPath, ["--eval", `${CHILD_PRELUDE}
+      const contender = spawnSync(process.execPath, [...PS_START_TOKENS_BUN_ARGS, "--eval", `${CHILD_PRELUDE}
         const lock = acquireMailLockSync(${JSON.stringify(root)}, { timeoutMs: 500 });
         if (lock) { lock.release(); process.stdout.write("acquired"); }
         else process.stdout.write("refused");

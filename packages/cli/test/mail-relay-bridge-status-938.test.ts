@@ -13,7 +13,7 @@ import { runBridge } from "../src/commands/bridge.js";
 import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
 import { setRunDirReader, setStatusProbe } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
-import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;

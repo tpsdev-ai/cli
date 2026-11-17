@@ -16,7 +16,7 @@ import { pidPath as branchPidPath } from "../src/commands/branch.js";
 import { linuxProcessExited, runOffice, setOfficeKillSignal, setProcStatReader } from "../src/commands/office.js";
 import { hostStatePath, writeBranchState, writeHostState, type HostConnectionState } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TIMEOUT = 30_000;
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");

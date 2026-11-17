@@ -13,7 +13,7 @@ import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/co
 import { snapshotPidRecord } from "../src/utils/pid-file.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 let home: string;
 let relayPid: string;

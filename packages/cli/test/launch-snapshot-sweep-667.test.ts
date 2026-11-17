@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import { processStartToken } from "@tpsdev-ai/agent";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 import { createPrivateLaunchDir, launchDirLabel } from "../src/utils/launch-attestation.js";
 import {
   LAUNCH_SNAPSHOT_OWNER_FILE,

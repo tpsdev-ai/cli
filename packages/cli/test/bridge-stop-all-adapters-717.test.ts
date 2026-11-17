@@ -14,7 +14,7 @@ import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile, snapshotPidRecord } from "../src/utils/pid-file.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TIMEOUT = 30_000;
 const START_TIMEOUT = 10_000;

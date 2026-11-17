@@ -13,9 +13,11 @@
  * leave the pending directory behind.
  *
  * Each snapshot records its owning launcher: pid and, when one is readable, a
- * process start token. When the recorded and current tokens are both readable
- * from the same source and differ, the sweep treats the pid as reused and the
- * owner as gone; when they match, the snapshot is kept. The next launch attempts
+ * process start token. When the recorded and current tokens are both readable,
+ * the shared rule (classifyOwnerToken, cli#1045) decides: differing `proc:`
+ * tokens mean the pid was reused and the owner is gone; differing `ps:` tokens,
+ * or tokens from different sources, keep the snapshot; matching tokens keep it.
+ * The next launch attempts
  * to remove published and pending entries whose recorded owner is dead, and
  * entries with no readable owner record whose directory mtime is at least a
  * grace period old: one minute for a published entry, 24 hours for a pending

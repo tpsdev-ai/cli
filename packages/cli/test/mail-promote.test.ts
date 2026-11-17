@@ -17,7 +17,7 @@ import { processStartToken } from "../src/utils/mail-lock.js";
 import { spawnSync } from "node:child_process";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 afterEach(() => {
   mock.restore();

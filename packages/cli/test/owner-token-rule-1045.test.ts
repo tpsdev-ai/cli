@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { processStartToken } from "@tpsdev-ai/agent";
 import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
-import { forcePsStartTokens, stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { forcePsStartTokens, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 import { LAUNCH_SNAPSHOT_OWNER_FILE, LAUNCH_SNAPSHOT_PREFIX, sweepStaleLaunchSnapshots } from "../src/utils/launch-snapshots.js";
 import { MailLockOwnerError, tryAcquireMailLock } from "../src/utils/mail-lock.js";
 

@@ -7,7 +7,7 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBranch, setBranchStopSignal } from "../src/commands/branch.js";
 
 import { readPidFile } from "../src/utils/pid-file.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;

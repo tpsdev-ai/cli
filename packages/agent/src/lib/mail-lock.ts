@@ -71,17 +71,6 @@ function readProcStatFields(pid: number): string[] | null {
 }
 
 /**
- * Test seam for processStartToken (cli#1045), off by default. `readStat`, when
- * set, replaces the `/proc/<pid>/stat` reader processStartToken uses — the same
- * reader pidState's `readStat` parameter takes. A reader that returns null
- * sends processStartToken to the `ps` fallback, so a test can exercise that
- * path where /proc exists; one that returns fields stages a `proc:` token
- * where /proc is absent. It reaches every caller of processStartToken in the
- * process, and never changes pidState.
- */
-export const startTokenTestHooks: { readStat?: (pid: number) => string[] | null } = {};
-
-/**
  * A per-process identity token — its birth time — or null only when it cannot
  * be read at all.
  *
@@ -97,7 +86,7 @@ export const startTokenTestHooks: { readStat?: (pid: number) => string[] | null 
  * read a `ps:` mismatch as pid reuse.
  */
 export function processStartToken(pid: number): string | null {
-  const fields = (startTokenTestHooks.readStat ?? readProcStatFields)(pid);
+  const fields = readProcStatFields(pid);
   if (fields) {
     const token = fields[19];
     if (token) return `proc:${token}`;

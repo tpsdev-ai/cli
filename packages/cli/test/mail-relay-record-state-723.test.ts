@@ -11,7 +11,7 @@ import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { readPidFile } from "../src/utils/pid-file.js";
-import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;

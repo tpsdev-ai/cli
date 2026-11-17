@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
 import { snapshotPidRecord } from "../src/utils/pid-file.js";
-import { stageProcStartTokens } from "./helpers/stage-proc-start-tokens.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const CASE_TIMEOUT_MS = 20_000;
 const WAIT_DEADLINE_MS = 5_000;
