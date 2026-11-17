@@ -864,9 +864,14 @@ async function twoRelayConnections(root: string) {
 test("a relay reconnect claims a host record on a simulated token mismatch", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-gone-1023-"));
   // The stub simulates the token mismatch used to detect possible PID reuse.
+  // It keeps the live token's source prefix (proc: on Linux, ps: on darwin):
+  // a token from a different source is unverifiable, not a mismatch.
+  const live = processStartToken(process.pid);
+  expect(live).not.toBeNull();
+  const source = live!.slice(0, live!.indexOf(":"));
   const connections = await twoRelayConnections(root);
   try {
-    const aId = await connections.start({ startToken: () => "proc:simulated-reuse" });
+    const aId = await connections.start({ startToken: () => `${source}:simulated-reuse` });
     const bId = await connections.start();
     expect(bId).not.toBe(aId);
     const bBytes = readFileSync(connections.path);
