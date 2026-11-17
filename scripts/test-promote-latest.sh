@@ -2063,16 +2063,16 @@ d="$(new_fixture supervisor-format)"
 cat >"$d/ignore-term.mjs" <<'IGNORE_TERM'
 import fs from 'node:fs';
 process.on('SIGTERM', () => {});
-// Written only after the handler is installed: a TERM that arrives first ends the
-// process by default before this line, so no marker means this run never tested
-// a child that ignores TERM.
+// Written only after the handler is installed, so a marker proves the handler was
+// in place; without one, whether this run tested a child that ignores TERM is
+// unproven.
 fs.writeFileSync(process.argv[2], 'ready');
 setInterval(() => {}, 250);
 IGNORE_TERM
-# The supervisor sends TERM at its deadline whether or not the child has started, so
-# the producer rows count only for a run whose child confirmed its TERM handler
-# first; a start slower than the deadline retries with a longer one, and a child
-# that never confirms leaves only the failed fixture row.
+# At its deadline the supervisor sends TERM to a child still running, whether or not
+# it has installed its handler, so the producer rows count only for a run whose
+# child confirmed the handler; a start slower than the deadline retries with a
+# longer one, and a child that never confirms leaves only the failed fixture row.
 bg_supervise() { # <deadline> <child> <ready marker> <supervisor log> -> the supervisor's exit code
   PROMOTE_SUPERVISOR_LOG="$4" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$1" 0.5 -- "${NODE_BIN:-node}" "$2" "$3"
 }
@@ -2088,7 +2088,7 @@ bg_run() { # <fixture dir> -> BG rows; non-zero when no deadline saw the ready m
     fi
   done
   if [ "$bg_ready" = yes ]; then
-    ok "BG fixture: the child held TERM before it came" "deadline ${bg_deadline} s"
+    ok "BG fixture: the child confirmed its TERM handler" "deadline ${bg_deadline} s"
     assert_eq "BG producer log: the timed call ends" 124 "$bg_rc"
     known_lines="$(sed -E 's/[0-9]+/<ms>/' "$known_log")"
     producer_lines="$(sed -E 's/[0-9]+/<ms>/' "$d/supervisor.log" 2>/dev/null)"
@@ -2098,7 +2098,7 @@ bg_run() { # <fixture dir> -> BG rows; non-zero when no deadline saw the ready m
       bad "BG producer log: the same fields as the known log" "producer wrote [$(printf '%s' "$producer_lines" | tr '\n' ' ')]; the known log the parser reads is [$(printf '%s' "$known_lines" | tr '\n' ' ')]"
     fi
   else
-    bad "BG fixture: the child held TERM before it came" "no ready marker at deadlines 0.5, 2 and 8 s; no producer row was asserted"
+    bad "BG fixture: the child confirmed its TERM handler" "no ready marker at deadlines 0.5, 2 and 8 s; no producer row was asserted"
   fi
   [ "$bg_ready" = yes ]
 }
@@ -2130,7 +2130,7 @@ probe_bg_gate() { # <slow|never>
   tried="$(sed -n 's/^SUPERVISE //p' "$record" | tr '\n' ' ')"
   if [ "$kind" = slow ]; then
     if [ "$probe_rc" -eq 0 ] && [ "$tried" = "0.5 2 " ] &&
-      grep -qxF 'PASS BG fixture: the child held TERM before it came | deadline 2 s' "$record" &&
+      grep -qxF 'PASS BG fixture: the child confirmed its TERM handler | deadline 2 s' "$record" &&
       grep -qxF 'PASS BG producer log: the timed call ends | == 124' "$record" &&
       grep -qxF 'PASS BG producer log: the same fields as the known log | start <ms> / TERM / KILL / end <ms>' "$record" &&
       ! grep -q '^FAIL ' "$record"; then
@@ -2140,7 +2140,7 @@ probe_bg_gate() { # <slow|never>
     fi
   else
     if [ "$probe_rc" -ne 0 ] && [ "$tried" = "0.5 2 8 " ] &&
-      grep -q '^FAIL BG fixture: the child held TERM before it came | ' "$record" &&
+      grep -q '^FAIL BG fixture: the child confirmed its TERM handler | ' "$record" &&
       ! grep -q '^[A-Z]* BG producer log:' "$record"; then
       ok "BG gate probe: never ready runs no producer row" "tried [${tried% }], not ready, only the fixture row"
     else
