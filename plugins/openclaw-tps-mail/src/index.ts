@@ -951,6 +951,9 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
+/** Re-read a record whose state could not be established, and re-arm its
+ *  deadline while it is live. Also the recovery for a settlement write the
+ *  store refused on a LIVE record (cli#1006 r10). */
 function retryObligationRead(ctx: YieldContext, obligationId: string): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const timer = accountTimer(ctx, () => {
@@ -1164,10 +1167,17 @@ async function settleObligation(
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
         if (result.status === "unverified") return "none";
+        // cli#1006 r10: the helper above releases a terminal or gone record.
+        // A STILL-LIVE one (another writer moved it, e.g. to `posted`) needs
+        // the deadline this refusal left unarmed: re-read and re-arm, so the
+        // deadline rescans the evidence instead of reusing this decision.
         const cur = result.status === "found" ? result.record : null;
+        const live = cur !== null && !TERMINAL_STATES.has(cur.state);
         ctx.log?.warn?.(
-          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
+          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
+            (live ? "it keeps its state and its deadline is re-armed" : "it stays as it is"),
         );
+        if (live) retryObligationRead(ctx, obligationId);
         return "none";
       }
     } catch (err: any) {
@@ -1221,11 +1231,17 @@ async function settleObligation(
   if (appliedFailed === null) {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") return "none";
+    // cli#1006 r10: the helper above releases a terminal or gone record. A
+    // STILL-LIVE one (another writer moved it, e.g. to `posted`) keeps no timer
+    // here — the fired deadline is already disarmed — so re-read and re-arm it,
+    // and the deadline rescans the evidence instead of reusing this decision.
     const cur = result.status === "found" ? result.record : null;
+    const live = cur !== null && !TERMINAL_STATES.has(cur.state);
     ctx.log?.warn?.(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
-        `the inbound keeps no nack stamp and no nack mail is sent`,
+        (live ? "it keeps its state and its deadline is re-armed" : "the inbound keeps no nack stamp and no nack mail is sent"),
     );
+    if (live) retryObligationRead(ctx, obligationId);
     return "none";
   }
   // The failure is terminal: drop the context and its timer before the nack is
@@ -1610,6 +1626,11 @@ const warnedObligationCurLookups = new Set<string>();
 /** The missing-file allowance requires a clean lookup at the decision point. */
 function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing" | "present" | "error" {
   const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
+  // cli#1006 r10: the delivery that armed this obligation recorded the inbound's
+  // cur/ path, so a probe there proves PRESENCE without a directory scan, which
+  // a cur/ holding more names than the scan reads would refuse. A record at that
+  // path for a DIFFERENT id proves nothing, so the scan below decides.
+  if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return "present";
   let error: string | undefined;
   const found = findCurPath(ctx.mailDir, ctx.agent, ctx.inboundId, (path, code) => {
     if (code === "ENOENT" && path === curDir) return;
@@ -1886,11 +1907,21 @@ function installYieldSubscription(api: any): boolean {
   return true;
 }
 
-function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code?: string) => void): string | null {
+function findCurPath(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  onReadError?: (path: string, code?: string) => void,
+  /** cli#1006 r10: past the scan limit, keep reading for a MATCH only. Presence
+   *  can be proven that way; absence cannot, so an unmatched id still reports
+   *  SCAN_LIMIT. */
+  opts: { presenceBeyondLimit?: boolean } = {},
+): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
     const names = readdirSync(curDir);
-    if (onReadError && names.length > 4096) {
+    const beyondLimit = onReadError !== undefined && names.length > 4096;
+    if (beyondLimit && !opts.presenceBeyondLimit) {
       onReadError(curDir, "SCAN_LIMIT");
       return null;
     }
@@ -1898,7 +1929,9 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
-      const rec = readMailFile(p, onReadError);
+      // Past the limit a read error on an unrelated entry cannot establish
+      // absence, and a match settles the question: scan without reporting it.
+      const rec = readMailFile(p, beyondLimit ? undefined : onReadError);
       if (rec?.id !== inboundId) continue;
       if (!onReadError) return p;
       if (match) {
@@ -1907,7 +1940,10 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
       }
       match = p;
     }
-    if (!match) onReadError?.(curDir, "ENOENT");
+    if (!match) {
+      if (beyondLimit) onReadError?.(curDir, "SCAN_LIMIT");
+      else onReadError?.(curDir, "ENOENT");
+    }
     return match;
   } catch (err: any) {
     // cli#1006: readdir's ENOENT is a clean "nothing to scan" only when the
@@ -2909,13 +2945,22 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // path; an unreadable or malformed file, SCAN_LIMIT or
           // AMBIGUOUS_ID leaves the obligation untouched.
           let curLookupError: string | null = null;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
-            // Only the scan's clean signals — no matching entry, or the cur/
-            // directory itself absent — are a miss; a dangling cur/ symlink or
-            // a listed file that is gone is a read error.
-            if (code === "ENOENT" && path === curDir) return;
-            curLookupError ??= code ?? "INVALID_JSON";
-          });
+          const recCurPath = findCurPath(
+            account.mailDir,
+            agentId,
+            rec.inboundId,
+            (path, code) => {
+              // Only the scan's clean signals — no matching entry, or the cur/
+              // directory itself absent — are a miss; a dangling cur/ symlink or
+              // a listed file that is gone is a read error.
+              if (code === "ENOENT" && path === curDir) return;
+              curLookupError ??= code ?? "INVALID_JSON";
+            },
+            // cli#1006 r10: startup knows no cur/ path yet. Reading past the
+            // limit can still prove the entry is THERE; a miss still reports
+            // SCAN_LIMIT, because absence is not provable that way.
+            { presenceBeyondLimit: true },
+          );
           if (curLookupError) {
             log?.warn?.(
               `tps-mail: obligation-cur-lookup-failed: obligation ${rec.obligationId} for inbound ${rec.inboundId}: ` +

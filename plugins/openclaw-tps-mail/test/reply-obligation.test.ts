@@ -20,7 +20,7 @@ import { MailClient, mailboxReplayStore } from "@tpsdev-ai/agent";
  * cross-account rejection; plus the replayed-inbound no-second-obligation case.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -1357,6 +1357,23 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     writeFileSync(join(tempKeysDir, `${SENDER}.key`), FLINT_SEED);
   }
 
+  /**
+   * cli#1006 r10: push cur/ past the 4096-name scan limit with unrelated,
+   * well-formed entries. Each carries a terminal stamp, so startup's cur/
+   * sweep leaves it in place (an unacked one is re-dispatched or quarantined).
+   */
+  function exceedCurScanLimit(): void {
+    const dir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(dir, { recursive: true });
+    const ackedAt = new Date(0).toISOString();
+    for (let i = 0; i < 4100; i++) {
+      writeFileSync(
+        resolve(dir, `zz-other-${i}.json`),
+        JSON.stringify({ id: `other-${i}`, envelope: { messageId: `env-other-${i}` }, ackedAt }),
+      );
+    }
+  }
+
   it("with the deadline passed, settles from the record: terminal, named reason, one nack, no dispatch", async () => {
     seedSigningKeys();
     const inboundId = "msg-orphan-past";
@@ -1755,8 +1772,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
     try {
       expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
-      await sleep(200);
-      expect(obligationFile(AGENT, inboundId)?.state).toBe("posted");
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
+        "the guarded write was refused, and the live record settles from fresh evidence",
+      ).toBe(true);
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
       expect(warnings.join("\n")).toContain("refusing to record the failure");
@@ -1777,8 +1796,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
     try {
       expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
-      await sleep(200);
-      expect(obligationFile(AGENT, inboundId)?.state).toBe("posted");
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
+        "the guarded write was refused, and the live record settles from fresh evidence",
+      ).toBe(true);
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
     } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
   }, 40000);
@@ -2002,6 +2023,153 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
     await h.stop();
   }, 30000);
+
+  /** A verified cur/ entry plus an obligation record at `state` with `deadlineInMs`. */
+  function seedVerifiedCur(
+    inboundId: string,
+    state: "yielded" | "delivering",
+    deadlineInMs: number,
+  ): { obligationId: string; curPath: string } {
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state, deadlineInMs, envelopeId });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const curPath = resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`);
+    writeFileSync(
+      curPath,
+      JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false }),
+      "utf-8",
+    );
+    return { obligationId, curPath };
+  }
+
+  it("r10 a deadline settles a verified inbound while cur/ holds more names than a scan reads", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-deadline-scan-limit";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 8000);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery verified the cur/ entry and armed the deadline",
+      ).toBe(true);
+      exceedCurScanLimit();
+
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the deadline settles from the cur/ path it was armed with",
+      ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the entry is not missing").toBeUndefined();
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "no timer is left armed",
+      ).toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+      expect(h.dispatchCount, "the deadline dispatches nothing").toBe(0);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("r10 a stale curPath naming another id falls back to the scan", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-stale-cur-path";
+    const { obligationId, curPath } = seedVerifiedCur(inboundId, "yielded", 8000);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery armed the deadline with the verified cur/ path",
+      ).toBe(true);
+      // The record at the armed path is replaced by ANOTHER inbound, and this
+      // inbound's record now lives at a different name.
+      const moved = resolve(resolve(tempMailDir, AGENT, "cur"), `2026-05-26T00-00-01-${inboundId}.json`);
+      renameSync(curPath, moved);
+      writeFileSync(
+        curPath,
+        JSON.stringify({ id: "msg-other-inbound", from: SENDER, to: AGENT, body: "unrelated", timestamp: new Date().toISOString() }),
+        "utf-8",
+      );
+
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the scan finds the record at its new name",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "no timer is left armed",
+      ).toBe(false);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("r10 startup proves presence beyond the scan limit and arms the deadline", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-startup-scan-limit";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 60000);
+    exceedCurScanLimit();
+
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "the startup scan finds the entry past the limit and arms its deadline",
+      ).toBe(true);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(0);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the entry is not missing").toBeUndefined();
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("r10 startup past the scan limit still reports SCAN_LIMIT when no match proves absence", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-startup-scan-limit-absent";
+    seedOrphan(inboundId, { deadlineInMs: -1000 });
+    exceedCurScanLimit();
+
+    const before = obligationFile(AGENT, inboundId);
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 15000),
+        "the unmatched lookup past the limit is reported",
+      ).toBe(true);
+      expect(warnings.join("\n")).toContain("SCAN_LIMIT");
+      expect(obligationFile(AGENT, inboundId), "the obligation is untouched").toEqual(before);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  for (const state of ["yielded", "delivering"] as const) {
+    it(`r10 a refused settlement write on a live record re-arms it: ${state} -> posted reaches a terminal state`, async () => {
+      seedSigningKeys();
+      const inboundId = `msg-refused-${state}`;
+      const { obligationId } = seedOrphan(inboundId, { state, deadlineInMs: -1000 });
+      let injected = false;
+      setBeforeTransitionForTests((id) => {
+        if (id !== inboundId || injected) return;
+        injected = true;
+        setBeforeTransitionForTests(undefined);
+        transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "concurrent-reply" });
+      });
+      const warnings: string[] = [];
+      const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+      try {
+        expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
+        expect(
+          await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
+          "the re-armed deadline settles the live record from fresh evidence",
+        ).toBe(true);
+        expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
+        expect(
+          obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+          "no timer is left armed",
+        ).toBe(false);
+        expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "a committed record is not nacked").toHaveLength(0);
+        expect(warnings.join("\n")).toContain("refusing to record");
+      } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+    }, 40000);
+  }
 });
 
 
