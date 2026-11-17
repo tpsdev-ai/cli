@@ -14,6 +14,10 @@ import { snapshotPidRecord } from "../src/utils/pid-file.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 let home: string;
 let relayPid: string;
 let savedHome: string | undefined;
@@ -187,7 +191,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
     20_000,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
     async () => {
       const child = spawnChild();

@@ -12,6 +12,10 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
 
@@ -136,7 +140,7 @@ describe("mail relay status with a bad record", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a stale record with a live relay-shaped process is reported as unknown",
     () => {
       const child = spawnChild();
@@ -185,7 +189,7 @@ describe("tps bridge status with a bad or unverified record", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a stale bridge pid file is reported as unknown",
     () => {
       const child = spawnChild();
@@ -303,7 +307,7 @@ describe("mail relay stop with a bad record", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a stale record is removed and reported, and the live process is not signalled",
     async () => {
       const child = spawnChild();
@@ -324,7 +328,7 @@ describe("mail relay stop with a bad record", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a record whose removal fails says so and leaves the relay state unknown",
     async () => {
       const child = spawnChild();

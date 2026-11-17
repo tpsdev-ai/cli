@@ -16,6 +16,10 @@ import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands
 import { runBridge, setBridgeStopSignal } from "../src/commands/bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
 const PID_FILE_URL = new URL("../src/utils/pid-file.js", import.meta.url).href;
@@ -210,7 +214,7 @@ afterEach(() => {
 });
 
 describe("relay stop identity", () => {
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a mismatched token gets no signal, the stale file is removed, and the stop succeeds",
     async () => {
       const child = spawnChild();
@@ -388,17 +392,19 @@ describe("relay stop identity", () => {
     TIMEOUT,
   );
 
-  // The macOS ps token resolves to one second: a token for the same pid that
-  // differs only in its seconds field is a different identity.
-  test.skipIf(!(processStartToken(process.pid) ?? "").startsWith("ps:"))(
-    "two ps tokens that differ only in the seconds field classify stale",
+  // The macOS ps token resolves to one second. A token for the same live pid
+  // that differs only in its seconds field does not prove a different identity:
+  // a recorded `ps:` token may predate the TZ/locale pin (cli#1045), so the
+  // record is unverified (never signalled), not stale.
+  test.skipIf(!PS_START_TOKENS)(
+    "two ps tokens that differ only in the seconds field classify unverified, not stale",
     () => {
       const child = spawnChild();
       const real = childToken(child.pid);
       const shifted = psTokenWithDifferentSeconds(real);
       expect(shifted).not.toBe(real);
       writeFileSync(relayPid, relayRecord(child.pid, shifted));
-      expect(readPidFile(relayPid).kind).toBe("stale");
+      expect(readPidFile(relayPid).kind).toBe("unverified");
     },
     TIMEOUT,
   );
@@ -486,7 +492,7 @@ describe("relay start and status classification", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "relay status on a stale record reports it, removes nothing and exits 0",
     async () => {
       const child = spawnChild();
@@ -621,7 +627,7 @@ describe("json pid interpretation", () => {
 });
 
 describe("bridge stop identity", () => {
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a mismatched token gets no signal and the stale file is removed",
     async () => {
       const child = spawnChild();
@@ -1169,7 +1175,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "relay stop with a stale mismatched token exits 0 and removes the file",
     () => {
       const child = spawnChild();
@@ -1188,7 +1194,7 @@ describe("relay and bridge commands exit non-zero on a refusal", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "bridge stop with a stale mismatched token exits 0 and removes the file",
     () => {
       const child = spawnChild();

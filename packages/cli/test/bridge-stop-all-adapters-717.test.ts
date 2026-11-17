@@ -15,6 +15,10 @@ import { readPidFile, snapshotPidRecord } from "../src/utils/pid-file.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 const TIMEOUT = 30_000;
 const START_TIMEOUT = 10_000;
 /** Room the FIFO child's deadline leaves before the timeout of the test that
@@ -435,7 +439,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
     async () => {
       const child = spawnSleep();

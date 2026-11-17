@@ -14,6 +14,10 @@ import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
 import { setRunDirReader, setStatusProbe } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
 
@@ -273,7 +277,7 @@ describe("tps bridge status --json records", () => {
     TIMEOUT,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "records names the kind of a stale, unverified and unreadable record",
     () => {
       const staleChild = spawnChild();

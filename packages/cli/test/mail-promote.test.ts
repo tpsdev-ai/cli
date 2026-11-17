@@ -18,6 +18,10 @@ import { spawnSync } from "node:child_process";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 afterEach(() => {
   mock.restore();
 });
@@ -624,7 +628,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     expect(existsSync(join(inbox.root, ".mail-lock"))).toBe(true);
   });
 
-  test("a lock whose live owner's start token mismatches (same source) is broken (pid reuse)", async () => {
+  test.skipIf(PS_START_TOKENS)("a lock whose live owner's start token mismatches (same source) is broken (pid reuse)", async () => {
     const real = processStartToken(process.pid);
     expect(real).not.toBeNull();
     // Same source prefix, different value → provably a reused pid → broken.

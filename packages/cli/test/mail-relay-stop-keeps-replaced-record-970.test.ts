@@ -13,6 +13,10 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
 import { snapshotPidRecord } from "../src/utils/pid-file.js";
 
+/** cli#1045: a live pid whose recorded `ps:` start token differs is unverified, not stale, so a
+ *  reused live pid can be staged only where start tokens come from /proc. */
+const PS_START_TOKENS = (processStartToken(process.pid) ?? "").startsWith("ps:");
+
 const CASE_TIMEOUT_MS = 20_000;
 const WAIT_DEADLINE_MS = 5_000;
 
@@ -361,7 +365,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
     CASE_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a stale record replaced by a live relay before its removal is kept and named",
     async () => {
       const planned = spawnChild();
@@ -402,7 +406,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
     CASE_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "a stale record left unreadable at the final check fails the stop",
     async () => {
       const child = spawnChild();
@@ -434,7 +438,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
     CASE_TIMEOUT_MS,
   );
 
-  test(
+  test.skipIf(PS_START_TOKENS)(
     "an unchanged stale record is still removed",
     async () => {
       const child = spawnChild();
