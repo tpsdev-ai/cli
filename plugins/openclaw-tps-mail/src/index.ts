@@ -1768,8 +1768,9 @@ async function sendNackMail(
   // cli#1006: the only mail settlement may send is a nack to the recorded
   // sender; delivery retries follow the existing at-least-once contract. It
   // dispatches no agent reply, so the internal-inbound gate (which binds the
-  // dispatch path) is bypassed only for that settle. Every other caller keeps
-  // it.
+  // dispatch path) is bypassed only for two callers: the missing-cur settle,
+  // and the owed-nack retry for a record settled under that rule, after a clean
+  // lookup still finds cur/ absent. Every other caller keeps it.
   if (!opts.allowMissingInbound && !(await internalInbound(ctx))) return false;
   if (!isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);

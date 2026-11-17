@@ -1544,6 +1544,23 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     await h.stop();
   }, 20000);
 
+  it("r7 an owed nack without the missing-cur reason keeps the inbound gate", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-owed-nack-no-reason";
+    seedOrphan(inboundId);
+    transitionObligation(tempMailDir, AGENT, inboundId, "failed", {
+      nackPending: true, failure: "yielded-without-resumption",
+    });
+    // This record was settled without the missing-cur rule. cur/ is absent too,
+    // but absence alone does not hand it the retry's allowance.
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      await sleep(1000);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+      expect(obligationFile(AGENT, inboundId)?.nackPending).toBe(true);
+    } finally { await h.stop(); }
+  }, 20000);
+
   for (const fault of ["restored", "corrupt", "dangling"] as const) {
     it(`r3 deadline rechecks cur after re-arm: ${fault}`, async () => {
       seedSigningKeys();
