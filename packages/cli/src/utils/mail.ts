@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -455,18 +455,26 @@ export function updateExistingRecord<T extends object>(
   let replaced = false;
   let relayLock: MailLock | null = null;
   try {
-    // The lock is keyed on the lexical path, so prove the record's directory
-    // really sits under that root before writing scratch or mutating.
+    // The lock is keyed on the lexical path, so check that the record's
+    // directory is physically the one under that root before writing scratch
+    // or mutating. Compare identity, not spelling: on a case-insensitive
+    // volume two spellings of one directory resolve to different strings.
     let realRoot: string;
     let realRecordDir: string;
+    let rootIdentity: Stats;
+    let parentIdentity: Stats;
     try {
       realRoot = realpathSync(root);
       realRecordDir = realpathSync(recordDir);
+      rootIdentity = statSync(realRoot);
+      parentIdentity = statSync(dirname(realRecordDir));
     } catch (err: any) {
       if (err?.code === "ENOENT") return { status: "gone" };
       throw Object.assign(new Error(`cannot verify the mailbox root for ${path}: ${err?.message ?? String(err)}`), { path: recordDir });
     }
-    if (dirname(realRecordDir) !== realRoot) throw new MailRecordLockRootError(path, realRecordDir, realRoot);
+    if (parentIdentity.dev !== rootIdentity.dev || parentIdentity.ino !== rootIdentity.ino) {
+      throw new MailRecordLockRootError(path, realRecordDir, realRoot);
+    }
     removeLeftoverAckScratch(root, recordDir);
     statSync(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
