@@ -45,6 +45,11 @@ function isScratchName(name: string): boolean {
   return /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(name);
 }
 
+function makeOld(path: string, now = Date.now()): void {
+  const when = new Date(now - 24 * 60 * 60 * 1000);
+  fs.utimesSync(path, when, when);
+}
+
 test("a failed ack scratch removal is reported once with its path and code", () => {
   const warnings: string[] = [];
   const warn = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
@@ -76,8 +81,10 @@ test("the first ack in the directory removes and reports leftover scratch", () =
   const inbox = mail.getInbox(agent);
   const leftover = join(inbox.cur, scratchName());
   fs.writeFileSync(leftover, "{ partial");
+  makeOld(leftover);
   const other = join(inbox.cur, scratchName());
   fs.writeFileSync(other, "{ partial");
+  makeOld(other);
 
   const warnings: string[] = [];
   const warn = spyOn(console, "warn").mockImplementation((...args: unknown[]) => {
@@ -108,6 +115,7 @@ test("the sweep preserves records and non-scratch dotfiles", () => {
   fs.writeFileSync(suffixed, "{ not a scratch");
   const leftover = join(inbox.cur, scratchName());
   fs.writeFileSync(leftover, "{ partial");
+  makeOld(leftover);
 
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   try {
@@ -124,7 +132,8 @@ test("the sweep preserves records and non-scratch dotfiles", () => {
 });
 
 test("acks share a directory sweep until the interval expires", () => {
-  let now = 0;
+  const base = Date.parse("2026-01-01T00:00:00Z");
+  let now = base;
   const restoreClock = patchShared(mail.mailAckScratchTestHooks, "now", () => now);
   try {
     const cur = mail.getInbox(agent).cur;
@@ -132,12 +141,13 @@ test("acks share a directory sweep until the interval expires", () => {
     mail.ackMessageAtPath(target);
     const leftover = join(cur, scratchName());
     fs.writeFileSync(leftover, "partial");
+    makeOld(leftover, base);
     const ack = (path: string) => {
       fs.writeFileSync(path, JSON.stringify({ id: "bounded", body: "hello", read: false }));
       expect(mail.ackMessageAtPath(path).read).toBe(true);
     };
     for (let i = 0; i < 10; i++) ack(join(cur, `record-${i}.json`));
-    now = 10 * 60 * 1000 - 1;
+    now = base + 10 * 60 * 1000 - 1;
     ack(target);
     expect(fs.existsSync(leftover)).toBe(true);
     expect(warn).not.toHaveBeenCalled();
@@ -145,10 +155,11 @@ test("acks share a directory sweep until the interval expires", () => {
     fs.mkdirSync(otherDir, { recursive: true });
     const otherLeftover = join(otherDir, scratchName());
     fs.writeFileSync(otherLeftover, "partial");
+    makeOld(otherLeftover, base);
     ack(join(otherDir, "record.json"));
     expect(fs.existsSync(otherLeftover)).toBe(false);
     expect(fs.existsSync(leftover)).toBe(true);
-    now++;
+    now = base + 10 * 60 * 1000;
     ack(target);
     expect(fs.existsSync(leftover)).toBe(false);
     expect(warn.mock.calls.filter(([line]) => String(line).includes(leftover))).toHaveLength(1);
@@ -160,6 +171,7 @@ test("acks share a directory sweep until the interval expires", () => {
 test("a failed leftover sweep warns with path and code without failing the ack", () => {
   const leftover = join(mail.getInbox(agent).cur, scratchName());
   fs.writeFileSync(leftover, "partial");
+  makeOld(leftover);
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   const remove = fs.rmSync;
   spyOn(fs, "rmSync").mockImplementation(((...args: Parameters<typeof remove>) => {
