@@ -256,8 +256,9 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
-  /** A pid this test spawned, still running until its stdin closes, with the
-   *  start token it carries while alive; awaited to exit before it is used. */
+  /** A pid this test spawned and awaited to exit before it is used. With
+   *  captureToken, the token is read from the live child; otherwise it is a
+   *  fixed ps: token. */
   async function exitedChildPid(captureToken = true): Promise<{ pid: number; token: string }> {
     const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
       stdin: "pipe",

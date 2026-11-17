@@ -419,8 +419,8 @@ function tokenSource(token: string): string {
  * pid. "gone": the pid is gone, or a live pid carries a different `proc:`
  * token (pid reuse). A changed `proc:` record token is indistinguishable from
  * pid reuse. A live `ps:` mismatch is unknown because its text depends on the
- * reader's TZ and locale. Missing, unreadable or different-source tokens are
- * also unknown; unknown never licenses a write.
+ * reader's TZ and locale. For a live pid, missing, unreadable or
+ * different-source tokens are also unknown; unknown never licenses a write.
  */
 function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
   const pid = pidState(state.pid);
