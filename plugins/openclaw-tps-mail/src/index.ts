@@ -952,8 +952,8 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
 }
 
 /** Re-read a record whose state could not be established, and re-arm its
- *  deadline while it is live. Also the recovery for a settlement write the
- *  store refused on a LIVE record (cli#1006 r10). */
+ *  deadline while it is live. Also called when a settlement write was refused
+ *  on a LIVE record (cli#1006 r10). */
 function retryObligationRead(ctx: YieldContext, obligationId: string): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const timer = accountTimer(ctx, () => {
@@ -1167,15 +1167,17 @@ async function settleObligation(
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
         if (result.status === "unverified") return "none";
-        // cli#1006 r10: the helper above releases a terminal or gone record.
-        // A STILL-LIVE one (another writer moved it, e.g. to `posted`) needs
-        // the deadline this refusal left unarmed: re-read and re-arm, so the
-        // deadline rescans the evidence instead of reusing this decision.
+        // cli#1006 r10: readObligationForCleanup released a terminal or gone
+        // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
+        // needs its deadline re-armed — the fired one is already disarmed, and
+        // a past-deadline startup settlement never had one — so re-read and
+        // re-arm, and the deadline rescans the evidence instead of reusing this
+        // decision.
         const cur = result.status === "found" ? result.record : null;
         const live = cur !== null && !TERMINAL_STATES.has(cur.state);
         ctx.log?.warn?.(
           `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
-            (live ? "it keeps its state and its deadline is re-armed" : "it stays as it is"),
+            (live ? "it keeps its state and is left to its deadline" : "it stays as it is"),
         );
         if (live) retryObligationRead(ctx, obligationId);
         return "none";
@@ -1231,15 +1233,17 @@ async function settleObligation(
   if (appliedFailed === null) {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") return "none";
-    // cli#1006 r10: the helper above releases a terminal or gone record. A
-    // STILL-LIVE one (another writer moved it, e.g. to `posted`) keeps no timer
-    // here — the fired deadline is already disarmed — so re-read and re-arm it,
-    // and the deadline rescans the evidence instead of reusing this decision.
+    // cli#1006 r10: readObligationForCleanup released a terminal or gone
+    // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
+    // keeps no timer here — the fired deadline is already disarmed, and a
+    // past-deadline startup settlement never had one — so re-read and re-arm
+    // it, and the deadline rescans the evidence instead of reusing this
+    // decision.
     const cur = result.status === "found" ? result.record : null;
     const live = cur !== null && !TERMINAL_STATES.has(cur.state);
     ctx.log?.warn?.(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
-        (live ? "it keeps its state and its deadline is re-armed" : "the inbound keeps no nack stamp and no nack mail is sent"),
+        (live ? "it keeps its state and is left to its deadline" : "the inbound keeps no nack stamp and no nack mail is sent"),
     );
     if (live) retryObligationRead(ctx, obligationId);
     return "none";
@@ -1626,9 +1630,9 @@ const warnedObligationCurLookups = new Set<string>();
 /** The missing-file allowance requires a clean lookup at the decision point. */
 function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing" | "present" | "error" {
   const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
-  // cli#1006 r10: the delivery that armed this obligation recorded the inbound's
-  // cur/ path, so a probe there proves PRESENCE without a directory scan, which
-  // a cur/ holding more names than the scan reads would refuse. A record at that
+  // cli#1006 r10: the context carries the inbound's cur/ path when one is
+  // known, and a probe there proves PRESENCE without a directory scan, which a
+  // cur/ holding more names than the scan reads would refuse. A record at that
   // path for a DIFFERENT id proves nothing, so the scan below decides.
   if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return "present";
   let error: string | undefined;

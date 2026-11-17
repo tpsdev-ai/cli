@@ -1774,7 +1774,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
       expect(
         await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
-        "the guarded write was refused, and the live record settles from fresh evidence",
+        "the guarded write was refused; the re-armed record settles",
       ).toBe(true);
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
@@ -1798,7 +1798,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
       expect(
         await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
-        "the guarded write was refused, and the live record settles from fresh evidence",
+        "the guarded write was refused; the re-armed record settles",
       ).toBe(true);
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
     } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
@@ -2024,7 +2024,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     await h.stop();
   }, 30000);
 
-  /** A verified cur/ entry plus an obligation record at `state` with `deadlineInMs`. */
+  /** A signed cur/ entry (promoted by the launcher) plus an obligation record at `state`. */
   function seedVerifiedCur(
     inboundId: string,
     state: "yielded" | "delivering",
@@ -2102,7 +2102,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally { await h.stop(); }
   }, 40000);
 
-  it("r10 startup proves presence beyond the scan limit and arms the deadline", async () => {
+  it("r10 startup's cur/ scan finds a present entry past the scan limit", async () => {
     seedSigningKeys();
     const inboundId = "msg-startup-scan-limit";
     const { obligationId } = seedVerifiedCur(inboundId, "yielded", 60000);
@@ -2113,7 +2113,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     try {
       expect(
         await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
-        "the startup scan finds the entry past the limit and arms its deadline",
+        "the startup scan leaves the obligation recoverable and its deadline armed",
       ).toBe(true);
       expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(0);
       expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the entry is not missing").toBeUndefined();
