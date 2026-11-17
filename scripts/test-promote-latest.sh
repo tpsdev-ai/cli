@@ -2070,32 +2070,86 @@ fs.writeFileSync(process.argv[2], 'ready');
 setInterval(() => {}, 250);
 IGNORE_TERM
 # The supervisor sends TERM at its deadline whether or not the child has started, so
-# the KILL row below counts only for a run whose child confirmed its TERM handler
-# first; a start slower than the deadline retries with a longer one.
-bg_rc=0
-bg_ready=no
-for bg_deadline in 0.5 2 8; do
-  rm -f "$d/ready" "$d/supervisor.log"
-  bg_rc=0
-  PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$bg_deadline" 0.5 -- "${NODE_BIN:-node}" "$d/ignore-term.mjs" "$d/ready" >"$d/out.txt" 2>"$d/err.txt" || bg_rc=$?
-  if [ -f "$d/ready" ]; then
-    bg_ready=yes
-    break
+# the producer rows count only for a run whose child confirmed its TERM handler
+# first; a start slower than the deadline retries with a longer one, and a child
+# that never confirms leaves only the failed fixture row.
+bg_supervise() { # <deadline> <child> <ready marker> <supervisor log> -> the supervisor's exit code
+  PROMOTE_SUPERVISOR_LOG="$4" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$1" 0.5 -- "${NODE_BIN:-node}" "$2" "$3"
+}
+bg_run() { # <fixture dir> -> BG rows; non-zero when no deadline saw the ready marker
+  local d="$1" bg_deadline bg_rc=0 bg_ready=no known_lines producer_lines
+  for bg_deadline in 0.5 2 8; do
+    rm -f "$d/ready" "$d/supervisor.log"
+    bg_rc=0
+    bg_supervise "$bg_deadline" "$d/ignore-term.mjs" "$d/ready" "$d/supervisor.log" >"$d/out.txt" 2>"$d/err.txt" || bg_rc=$?
+    if [ -f "$d/ready" ]; then
+      bg_ready=yes
+      break
+    fi
+  done
+  if [ "$bg_ready" = yes ]; then
+    ok "BG fixture: the child held TERM before it came" "deadline ${bg_deadline} s"
+    assert_eq "BG producer log: the timed call ends" 124 "$bg_rc"
+    known_lines="$(sed -E 's/[0-9]+/<ms>/' "$known_log")"
+    producer_lines="$(sed -E 's/[0-9]+/<ms>/' "$d/supervisor.log" 2>/dev/null)"
+    if [ "$producer_lines" = "$known_lines" ]; then
+      ok "BG producer log: the same fields as the known log" "start <ms> / TERM / KILL / end <ms>"
+    else
+      bad "BG producer log: the same fields as the known log" "producer wrote [$(printf '%s' "$producer_lines" | tr '\n' ' ')]; the known log the parser reads is [$(printf '%s' "$known_lines" | tr '\n' ' ')]"
+    fi
+  else
+    bad "BG fixture: the child held TERM before it came" "no ready marker at deadlines 0.5, 2 and 8 s; no producer row was asserted"
   fi
-done
-if [ "$bg_ready" = yes ]; then
-  ok "BG fixture: the child held TERM before it came" "deadline ${bg_deadline} s"
-else
-  bad "BG fixture: the child held TERM before it came" "no ready marker at deadlines 0.5, 2 and 8 s; the rows below are not evidence"
-fi
-assert_eq "BG producer log: the timed call ends" 124 "$bg_rc"
-known_lines="$(sed -E 's/[0-9]+/<ms>/' "$known_log")"
-producer_lines="$(sed -E 's/[0-9]+/<ms>/' "$d/supervisor.log" 2>/dev/null)"
-if [ "$producer_lines" = "$known_lines" ]; then
-  ok "BG producer log: the same fields as the known log" "start <ms> / TERM / KILL / end <ms>"
-else
-  bad "BG producer log: the same fields as the known log" "producer wrote [$(printf '%s' "$producer_lines" | tr '\n' ' ')]; the known log the parser reads is [$(printf '%s' "$known_lines" | tr '\n' ' ')]"
-fi
+  [ "$bg_ready" = yes ]
+}
+bg_run "$d"
+
+# BG gate probes: bg_run with the supervisor call replaced by a fixture that writes
+# what a child would leave at each deadline, so neither probe waits on a deadline.
+# slow: no marker at 0.5 s, marker and a KILL log at 2 s -> retried once, gated rows pass.
+# never: no marker at any deadline -> all three tried, not ready, no producer row.
+probe_bg_gate() { # <slow|never>
+  local kind="$1" record="$work/bg-gate-$1.record" pd="$work/bg-gate-$1" probe_rc=0 tried
+  mkdir -p "$pd"
+  : >"$record"
+  (
+    bg_supervise() {
+      printf 'SUPERVISE %s\n' "$1" >>"$record"
+      if [ "$kind" = slow ] && [ "$1" != 0.5 ]; then
+        printf 'ready' >"$3"
+        printf 'start 1\nTERM\nKILL\nend 2\n' >"$4"
+      else
+        printf 'start 1\nTERM\nend 2\n' >"$4"
+      fi
+      return 124
+    }
+    ok() { printf 'PASS %s | %s\n' "$1" "$2" >>"$record"; }
+    bad() { printf 'FAIL %s | %s\n' "$1" "$2" >>"$record"; }
+    bg_run "$pd"
+  ) >"$pd/probe.out" 2>&1 || probe_rc=$?
+  tried="$(sed -n 's/^SUPERVISE //p' "$record" | tr '\n' ' ')"
+  if [ "$kind" = slow ]; then
+    if [ "$probe_rc" -eq 0 ] && [ "$tried" = "0.5 2 " ] &&
+      grep -qxF 'PASS BG fixture: the child held TERM before it came | deadline 2 s' "$record" &&
+      grep -qxF 'PASS BG producer log: the timed call ends | == 124' "$record" &&
+      grep -qxF 'PASS BG producer log: the same fields as the known log | start <ms> / TERM / KILL / end <ms>' "$record" &&
+      ! grep -q '^FAIL ' "$record"; then
+      ok "BG gate probe: a slow start retries at 2 s" "tried [${tried% }], ready, producer rows passed"
+    else
+      bad "BG gate probe: a slow start retries at 2 s" "rc $probe_rc, tried [${tried% }], record [$(grep -v '^SUPERVISE ' "$record" | tr '\n' ' ')]"
+    fi
+  else
+    if [ "$probe_rc" -ne 0 ] && [ "$tried" = "0.5 2 8 " ] &&
+      grep -q '^FAIL BG fixture: the child held TERM before it came | ' "$record" &&
+      ! grep -q '^[A-Z]* BG producer log:' "$record"; then
+      ok "BG gate probe: never ready runs no producer row" "tried [${tried% }], not ready, only the fixture row"
+    else
+      bad "BG gate probe: never ready runs no producer row" "rc $probe_rc, tried [${tried% }], record [$(grep -v '^SUPERVISE ' "$record" | tr '\n' ' ')]"
+    fi
+  fi
+}
+probe_bg_gate slow
+probe_bg_gate never
 
 # ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
 # The strict framing rejects the next call's start while the timed-out call is
