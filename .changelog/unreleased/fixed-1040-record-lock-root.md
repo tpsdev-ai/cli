@@ -1,0 +1,1 @@
+- **A mailbox record update proves the record belongs to the mailbox whose lock it holds.** `updateExistingRecord` resolves the record directory's real path under the lock and refuses with `MailRecordLockRootError` when its parent is not that lock's mailbox root, so an update through a symlinked `cur/` does not write another mailbox under a different lock.

@@ -319,6 +319,24 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
   }
 }
 
+/**
+ * An update takes the mailbox lock derived from the record path, so the record
+ * must really live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory
+ * symlinked to another mailbox would otherwise let a lock holder write a
+ * mailbox it does not lock, and two lock holders could update one physical
+ * record.
+ */
+export class MailRecordLockRootError extends Error {
+  constructor(
+    readonly recordPath: string,
+    readonly recordDir: string,
+    readonly lockRoot: string,
+  ) {
+    super(`refusing to update mail record ${recordPath}: its directory resolves to ${recordDir}, whose parent is not the locked mailbox root ${lockRoot}; update the record through the mailbox that physically contains it`);
+    this.name = "MailRecordLockRootError";
+  }
+}
+
 /** The exact name updateExistingRecord writes beside a record it replaces. */
 const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 
@@ -431,12 +449,25 @@ export function updateExistingRecord<T extends object>(
     if (options.nonBlocking) return { status: "busy" };
     throw Object.assign(new Error(`mail lock contention timeout for ${path}`), { path: mailLockPath(root) });
   }
-  removeLeftoverAckScratch(root, dirname(path));
-  const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+  const recordDir = dirname(path);
+  const scratchPath = join(recordDir, `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
   let relayLock: MailLock | null = null;
   try {
+    // The lock is keyed on the lexical path, so prove the record's directory
+    // really sits under that root before writing scratch or mutating.
+    let realRoot: string;
+    let realRecordDir: string;
+    try {
+      realRoot = realpathSync(root);
+      realRecordDir = realpathSync(recordDir);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { status: "gone" };
+      throw Object.assign(new Error(`cannot verify the mailbox root for ${path}: ${err?.message ?? String(err)}`), { path: recordDir });
+    }
+    if (dirname(realRecordDir) !== realRoot) throw new MailRecordLockRootError(path, realRecordDir, realRoot);
+    removeLeftoverAckScratch(root, recordDir);
     statSync(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
     if (options.reserveRelayMove) {
