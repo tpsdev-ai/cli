@@ -1,12 +1,10 @@
 /**
  * Teardown for a fixture that launched a real-nono session (cli#1037).
  *
- * The launcher and the released child are signalled with SIGTERM and then
- * SIGKILL. Liveness is the CLI's own classifier, `pidState`: a Linux process in
- * state Z has exited even when `kill(pid, 0)` still succeeds for it. In the
- * Docker lane the suite's PID 1 does not reap a child orphaned by an exiting
- * supervisor, so a bare `kill(pid, 0)` probe counted that zombie as a survivor
- * and failed a green case after both waits.
+ * Tracked targets receive SIGTERM; if any remains alive after the wait, all tracked targets receive SIGKILL.
+ * Liveness is the CLI's own classifier, `pidState`: a Linux process in
+ * state Z has exited even when `kill(pid, 0)` still succeeds for it.
+ * An orphaned child can remain unreaped as a zombie in the Docker lane, so a bare `kill(pid, 0)` probe can count it as a survivor and exhaust both waits.
  */
 import type { ChildProcess } from "node:child_process";
 import { pidState } from "@tpsdev-ai/agent";
@@ -89,7 +87,7 @@ export async function stopRealLaunch(
   return { stopped: false, survivors, waitedMs: Date.now() - started };
 }
 
-/** The teardown assertion's message: every survivor by role and pid, and how
+/** The teardown assertion's message: every survivor by role, pid and state, and how
  * long the stop waited before giving up. */
 export function formatStopFailure(report: StopReport): string {
   if (report.stopped) return "teardown confirmed the released child and launcher are gone";

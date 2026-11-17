@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { formatStopFailure, type StopReport } from "./helpers/stop-real-launch.js";
 
 describe("real-launch teardown reporting (cli#1037)", () => {
-  test("a survivor is named by role and pid, with the wait", () => {
+  test("survivors are named by role, pid and state, with the wait", () => {
     const report: StopReport = {
       stopped: false,
       waitedMs: 6_000,
@@ -12,8 +12,8 @@ describe("real-launch teardown reporting (cli#1037)", () => {
       ],
     };
     const message = formatStopFailure(report);
-    expect(message).toContain("released child pid 4242");
-    expect(message).toContain("launcher pid 4243");
+    expect(message).toContain("released child pid 4242 (alive)");
+    expect(message).toContain("launcher pid 4243 (alive)");
     expect(message).toContain("after 6000ms");
   });
 
@@ -23,7 +23,8 @@ describe("real-launch teardown reporting (cli#1037)", () => {
       waitedMs: 3_000,
       survivors: [{ role: "released child", pid: 7, state: "alive" }],
     });
-    expect(message).toContain("released child pid 7");
+    expect(message).toContain("released child pid 7 (alive)");
+    expect(message).toContain("after 3000ms");
     expect(message).not.toContain("launcher pid");
   });
 
