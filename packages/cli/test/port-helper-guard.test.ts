@@ -486,11 +486,12 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
           if (ts.isIdentifier(argument)) {
             const receiver = analysis.serverAlias.get(bindingKey(argument)) ?? bindingKey(argument);
             const owners = analysis.closeOwners.get(receiver) ?? new Set<string>();
-            if (!owners.has(enclosingFunctionKey(node))) {
-              owners.add(enclosingFunctionKey(node));
-              analysis.closeOwners.set(receiver, owners);
-              const offsets = analysis.close.get(receiver) ?? [];
-              offsets.push(node.getStart(file));
+            owners.add(enclosingFunctionKey(node));
+            analysis.closeOwners.set(receiver, owners);
+            const offsets = analysis.close.get(receiver) ?? [];
+            const offset = node.getStart(file);
+            if (!offsets.includes(offset)) {
+              offsets.push(offset);
               analysis.close.set(receiver, offsets);
               changed = true;
             }
@@ -841,6 +842,25 @@ describe("port helper guard (cli#1025)", () => {
       { file: "repeated-cleanup.test.ts", name: "start", line: 4 },
     ]);
     expect(analyzeSource(source.replace("probe.close();", ""), "late-cleanup.test.ts")).toEqual([]);
+  });
+
+  test("reports a rebind after repeated calls to a later close helper", () => {
+    const source = `
+      async function start() {
+        const probe = net.createServer();
+        probe.listen(45000);
+        await closeServer(probe);
+        probe.listen(0);
+        const port = probe.address().port;
+        await closeServer(probe);
+        later.listen(port);
+      }
+      async function closeServer(server) {
+        await new Promise((resolve) => server.close(resolve));
+      }`;
+    expect(analyzeSource(source, "later-close-helper.test.ts")).toEqual([
+      { file: "later-close-helper.test.ts", name: "start", line: 6 },
+    ]);
   });
 
   test("replays every port helper this diff removed, with and without a consumer", () => {
