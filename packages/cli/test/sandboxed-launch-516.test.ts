@@ -35,6 +35,7 @@ import {
 } from "../src/utils/nono.js";
 import { checkoutWorktree, onStart, onStop, WorktreeLifecycleError } from "../src/utils/agent-lifecycle.js";
 import { realNonoHomeBase, sandboxHomeBase, NONO_PROBE_DENIED_PREFIX } from "./helpers/launcher-grants.js";
+import { formatStopFailure, stopRealLaunch } from "./helpers/stop-real-launch.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The shipped CLI is a node script; the real-nono case must run it with node
@@ -43,37 +44,6 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
-async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): Promise<boolean> {
-  const releasedPid = /released under nono session \S+ \(child pid (\d+)\)/.exec(output)?.[1];
-  const targets = new Set<number>();
-  if (releasedPid) targets.add(Number(releasedPid));
-  else if (child.pid) targets.add(-child.pid);
-  if (child.pid) targets.add(child.pid);
-  const alive = (pid: number) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ESRCH";
-    }
-  };
-  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-    for (const pid of targets) {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        /* checked below */
-      }
-    }
-    const deadline = Date.now() + 3_000;
-    do {
-      if ([...targets].every((pid) => !alive(pid))) return true;
-      await new Promise((r) => setTimeout(r, 25));
-    } while (Date.now() < deadline);
-  }
-  return false;
-}
-
 const SANDBOX_REQUIRED = "--sandbox-required";
 const NONO_BIN_ENV = "NONO_BIN";
 const ACCEPTS_ONLY = "accepts only 'true' or 'false'";
@@ -1666,9 +1636,9 @@ realNonoSuite(
         expect(canRead(join(wsDefault, ".tps-agent.pid"))).toBe(false);
       } finally {
         // Signal and check the release PID and launcher, or the group without a release line.
-        const stopped = !child || await stopRealLaunch(child, out);
+        const stop = child ? await stopRealLaunch(child, out) : null;
         rmSync(sb.root, { recursive: true, force: true });
-        expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+        expect(stop?.stopped ?? true, stop ? formatStopFailure(stop) : "teardown: no launcher was spawned").toBe(true);
       }
     }, 60_000);
 
@@ -1727,9 +1697,9 @@ realNonoSuite(
         expect(checkedOut, `no checkout report; launcher output:\n${out}`).toBe(true);
       } finally {
         // Signal and check the release PID and launcher, or the group without a release line.
-        const stopped = !child || await stopRealLaunch(child, out);
+        const stop = child ? await stopRealLaunch(child, out) : null;
         rmSync(sb.root, { recursive: true, force: true });
-        expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+        expect(stop?.stopped ?? true, stop ? formatStopFailure(stop) : "teardown: no launcher was spawned").toBe(true);
       }
     }, 60_000);
     }
