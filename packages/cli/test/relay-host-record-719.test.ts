@@ -1120,6 +1120,53 @@ test("a reconnect claim refused as unreadable reports one line naming the path a
   }
 }, 30_000);
 
+test("a first claim replaces invalid JSON with this connection's record without a refusal line", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-first-claim-invalid-1023-"));
+  const savedEnv = savedRelayEnv();
+  const channel: RelayChannelState = { attached: false, detached: false, alive: true };
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(async () => ({
+    async send() {},
+    onMessage(callback) { channel.attached = true; channel.handler = callback; },
+    offMessage() { channel.detached = true; },
+    async close() { channel.alive = false; },
+    isAlive() { return channel.alive; },
+    peerFingerprint() { return "remote"; },
+  }));
+  const errors = spyOn(console, "error");
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    mkdirSync(join(root, ".tps", "connections"), { recursive: true });
+    writeFileSync(path, "{ not json");
+    expect(fs.statSync(path).isFile()).toBe(true);
+
+    stop = await connectAndKeepAlive(branch);
+    for (let i = 0; i < 400 && !channel.attached; i++) await Bun.sleep(5);
+    expect(channel.attached).toBe(true);
+    const record = JSON.parse(readFileSync(path, "utf8")) as HostConnectionState;
+    const startToken = processStartToken(process.pid);
+    expect(record.branch).toBe(branch);
+    expect(record.connectionId).toEqual(expect.any(String));
+    expect(record.connectionId!.length).toBeGreaterThan(0);
+    expect(record.pid).toBe(process.pid);
+    expect(record.startToken).toBe(startToken);
+    expect(record.reconnectCount).toBe(0);
+    expect(claimReporterLines(errors.mock.calls)).toEqual([]);
+    expect(startToken).not.toBeNull();
+  } finally {
+    try {
+      await stop?.();
+      for (let i = 0; i < 400 && channel.attached && !channel.detached; i++) await Bun.sleep(10);
+    } finally {
+      errors.mockRestore();
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+});
+
 test("a first successful connect after a failed attempt claims the record of another live connection", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-first-claim-1023-"));
   const savedEnv = savedRelayEnv();
