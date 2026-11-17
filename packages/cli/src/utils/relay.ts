@@ -1631,9 +1631,10 @@ export async function connectAndKeepAlive(
         // stop() sets stopped before clearing; both gates are checked under the lock.
         // The initial claim of a live connection replaces whatever record is
         // there. A later claim (a reconnect) writes when the record is absent or
-        // this connection's own, or when its recorded process is not running or
-        // runs with a start token different from the recorded one (pid reuse); a
-        // record whose token was altered is indistinguishable from pid reuse.
+        // is verified as owned by this connection, or when its recorded process
+        // is not running or runs with a start token different from the recorded
+        // one (pid reuse); a record whose token was altered is indistinguishable
+        // from pid reuse.
         // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {
@@ -1652,8 +1653,9 @@ export async function connectAndKeepAlive(
         // The claim stays outside the refresher so a write that throws still
         // reconnects, after one line naming the record path and reason; so does
         // the post-send update. A claim refused for ownership or readability
-        // logs one line and leaves the record as it is; a `stopped` outcome is
-        // silent. The channel stays up and serving.
+        // leaves the record as it is; the claim reporter emits one line, and a
+        // later refresh may report separately. A `stopped` outcome is silent.
+        // The channel stays up and serving.
         const connectWrite = (write: () => void) => {
           try {
             write();

@@ -263,9 +263,9 @@ export interface HostStateReadHooks {
   startToken?: (pid: number) => string | null;
 }
 
-/** What a refresh did under the record lock. `unverifiable` means ownership is
- *  neither confirmed nor denied (a token that cannot be read, or another
- *  owner's liveness that cannot be decided); nothing is written. */
+/** What a refresh or claim did under the record lock. `unverifiable` means
+ *  ownership is neither confirmed nor denied (a token that cannot be read, or
+ *  another owner's liveness that cannot be decided); nothing is written. */
 export type HostStateRefreshOutcome =
   | { kind: "written" }
   | { kind: "stopped" }
@@ -296,9 +296,9 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
 /**
  * Claim a record for a connection that has established before. Under the
  * record lock the record is read and written when the optional `shouldWrite`
- * gate holds and the record is absent, owned by this connection, or belongs to
- * a connection whose recorded process is not running or is running with a
- * start token different from the recorded one (pid reuse); a record whose
+ * gate holds and the record is absent, is verified as owned by this connection,
+ * or belongs to a connection whose recorded process is not running or is running
+ * with a start token different from the recorded one (pid reuse); a record whose
  * token was altered is indistinguishable from pid reuse. An invalid, unreadable
  * or unverifiable record is left as it is. The absent case differs from a
  * refresh: a reconnect may re-establish a record that was removed.

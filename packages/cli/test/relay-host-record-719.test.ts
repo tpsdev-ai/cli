@@ -861,10 +861,9 @@ async function twoRelayConnections(root: string) {
   return { branch, path, record, channels, received, attempts: () => attempts, start, stop };
 }
 
-test("a relay reconnect claims a gone owner's host record", async () => {
+test("a relay reconnect claims a host record on a simulated token mismatch", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-gone-1023-"));
-  // The record's owner is not running under its token: a live pid with a
-  // different start token from the same source is pid reuse.
+  // The stub simulates the token mismatch used to detect possible PID reuse.
   const connections = await twoRelayConnections(root);
   try {
     const aId = await connections.start({ startToken: () => "proc:simulated-reuse" });
@@ -887,7 +886,7 @@ test("a relay reconnect claims a gone owner's host record", async () => {
   }
 }, 30_000);
 
-test("a refused reconnect claim reports one line and the channel keeps handling messages", async () => {
+test("a refused reconnect claim's reporter emits one line and the channel keeps handling messages", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-refused-1023-"));
   const connections = await twoRelayConnections(root);
   const errors = spyOn(console, "error");
