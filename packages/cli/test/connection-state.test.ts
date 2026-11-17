@@ -170,6 +170,28 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
+  test("claimHostStateAt returns stopped and leaves the record as it is when the stop gate is closed", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-stopped-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
+    const raw = readFileSync(path);
+    const absentPath = hostStatePath("absent");
+    let checked = 0;
+    const gate = (recordPath: string) => (): boolean => {
+      checked++;
+      expect(existsSync(mailLockPath(hostStateLockRoot(recordPath)))).toBe(true);
+      return false;
+    };
+    const other = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", gate(path));
+    const absent = claimHostStateAt(absentPath, { ...completeState(), connectionId: "conn-a" }, "conn-a", gate(absentPath));
+    expect(other).toEqual({ kind: "stopped" });
+    expect(absent).toEqual({ kind: "stopped" });
+    expect(checked).toBe(2);
+    expect(readFileSync(path)).toEqual(raw);
+    expect(existsSync(absentPath)).toBe(false);
+  });
+
   test("claimHostStateAt reports unverifiable and leaves the record when this process's token cannot be read", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-unverifiable-"));
     process.env.HOME = home;

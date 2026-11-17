@@ -926,6 +926,174 @@ test("a refused reconnect claim's reporter emits one line and the channel keeps 
   }
 }, 30_000);
 
+/** The claim reporter's lines from the console.error spy's calls, in order. */
+const claimReporterLines = (calls: unknown[][]): string[] =>
+  calls.map((call) => String(call[0])).filter((line) => line.includes("not claimed on reconnect"));
+
+/** Wait for the claim reporter's first line; returns what it saw. */
+async function waitForClaimLine(calls: () => unknown[][]): Promise<string[]> {
+  let lines: string[] = [];
+  for (let i = 0; i < 1500 && lines.length === 0; i++) {
+    await Bun.sleep(10);
+    lines = claimReporterLines(calls());
+  }
+  return lines;
+}
+
+test("a reconnect claim skipped by the stop gate prints no claim line", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-stopped-1023-"));
+  const savedEnv = savedRelayEnv();
+  const stops: Array<() => Promise<void>> = [];
+  const channels: RelayChannelState[] = [];
+  const reconnectConnect = deferred<TransportChannel>();
+  const channelFor = (state: RelayChannelState): TransportChannel => ({
+    async send() {},
+    onMessage(callback) { state.attached = true; state.handler = callback; },
+    offMessage() { state.detached = true; },
+    async close() { state.alive = false; },
+    isAlive() { return state.alive; },
+    peerFingerprint() { return "remote"; },
+  });
+  let attempts = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(() => {
+    attempts++;
+    if (attempts === 3) return reconnectConnect.promise;
+    const state: RelayChannelState = { attached: false, detached: false, alive: true };
+    channels.push(state);
+    return Promise.resolve(channelFor(state));
+  });
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    const record = (): HostConnectionState => JSON.parse(readFileSync(path, "utf8")) as HostConnectionState;
+    const start = async (): Promise<void> => {
+      stops.push(await connectAndKeepAlive(branch));
+      for (let i = 0; i < 400 && !channels.at(-1)?.attached; i++) await Bun.sleep(5);
+      expect(channels.at(-1)?.attached).toBe(true);
+    };
+    await start();
+    for (let i = 0; i < 400 && record().connectionId === undefined; i++) await Bun.sleep(5);
+    const aId = record().connectionId;
+    await start();
+    for (let i = 0; i < 400 && record().connectionId === aId; i++) await Bun.sleep(5);
+    const bId = record().connectionId;
+    expect(bId).not.toBe(aId);
+    for (let i = 0; i < 400 && !Array.isArray(record().services); i++) await Bun.sleep(5);
+    const bBytes = readFileSync(path);
+
+    const errors = spyOn(console, "error");
+    try {
+      channels[0]!.alive = false;
+      for (let i = 0; attempts < 3 && i < 1500; i++) await Bun.sleep(10);
+      expect(attempts).toBe(3);
+      const reconnectState: RelayChannelState = { attached: false, detached: false, alive: true };
+      channels.push(reconnectState);
+      let stopA!: Promise<void>;
+      // A's claim runs in the microtask right after its connect resolves. The
+      // next microtask stops A, so the gate is closed when the claim takes the
+      // record lock: the race the gate exists for.
+      reconnectConnect.resolve(channelFor(reconnectState));
+      queueMicrotask(() => { stopA = stops[0]!(); });
+      await Bun.sleep(50);
+      expect(claimReporterLines(errors.mock.calls)).toEqual([]);
+      expect(record().connectionId).toBe(bId);
+      expect(readFileSync(path)).toEqual(bBytes);
+      await stopA;
+    } finally {
+      errors.mockRestore();
+    }
+  } finally {
+    try {
+      for (const stop of stops) await stop();
+      for (let i = 0; i < 400 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+    } finally {
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
+
+test("a reconnect claim whose ownership cannot be verified reports one line naming the path and reason", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-unverifiable-1023-"));
+  expect(processStartToken(process.pid)).not.toBeNull();
+  let readToken: (pid: number) => string | null = (pid) => processStartToken(pid);
+  const connections = await twoRelayConnections(root);
+  const errors = spyOn(console, "error");
+  try {
+    const aId = await connections.start({ startToken: (pid) => readToken(pid) });
+    for (let i = 0; i < 400 && !Array.isArray(connections.record().services); i++) await Bun.sleep(5);
+    const bytes = readFileSync(connections.path);
+    readToken = () => null;
+    connections.channels[0]!.alive = false;
+    for (let i = 0; connections.attempts() < 2 && i < 1500; i++) await Bun.sleep(10);
+    expect(connections.attempts()).toBe(2);
+    const lines = await waitForClaimLine(() => errors.mock.calls);
+    expect(lines).toEqual([
+      `[relay] Host state record ${connections.path} not claimed on reconnect: ownership could not be verified, so it was left as it is; the connection continues`,
+    ]);
+    expect(connections.record().connectionId).toBe(aId);
+    expect(readFileSync(connections.path)).toEqual(bytes);
+  } finally {
+    errors.mockRestore();
+    // stop() reports and keeps a record it cannot verify, so it rejects.
+    await connections.stop().catch((error: unknown) => {
+      expect(String(error)).toContain("cannot be verified");
+    });
+  }
+}, 30_000);
+
+test("a reconnect claim refused as invalid reports one line naming the path and reason", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-invalid-1023-"));
+  const connections = await twoRelayConnections(root);
+  const errors = spyOn(console, "error");
+  try {
+    await connections.start();
+    for (let i = 0; i < 400 && !Array.isArray(connections.record().services); i++) await Bun.sleep(5);
+    writeFileSync(connections.path, "{ not json");
+    connections.channels[0]!.alive = false;
+    for (let i = 0; connections.attempts() < 2 && i < 1500; i++) await Bun.sleep(10);
+    expect(connections.attempts()).toBe(2);
+    const lines = await waitForClaimLine(() => errors.mock.calls);
+    expect(lines).toEqual([
+      `[relay] Host state record ${connections.path} not claimed on reconnect: the record is not a valid host state record, so it was left as it is; the connection continues`,
+    ]);
+    expect(readFileSync(connections.path, "utf8")).toBe("{ not json");
+  } finally {
+    errors.mockRestore();
+    // stop() reports and keeps an invalid record, so it rejects.
+    await connections.stop().catch((error: unknown) => {
+      expect(String(error)).toContain("cannot be verified");
+    });
+  }
+}, 30_000);
+
+test("a reconnect claim refused as unreadable reports one line naming the path and reason", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-reconnect-unreadable-1023-"));
+  const connections = await twoRelayConnections(root);
+  const errors = spyOn(console, "error");
+  try {
+    await connections.start();
+    for (let i = 0; i < 400 && !Array.isArray(connections.record().services); i++) await Bun.sleep(5);
+    rmSync(connections.path, { force: true });
+    mkdirSync(connections.path, { recursive: true });
+    connections.channels[0]!.alive = false;
+    for (let i = 0; connections.attempts() < 2 && i < 1500; i++) await Bun.sleep(10);
+    expect(connections.attempts()).toBe(2);
+    const lines = await waitForClaimLine(() => errors.mock.calls);
+    expect(lines).toEqual([
+      `[relay] Host state record ${connections.path} not claimed on reconnect: is not a regular file, so it was left as it is; the connection continues`,
+    ]);
+    expect(readdirSync(connections.path)).toEqual([]);
+  } finally {
+    errors.mockRestore();
+    // stop() reports and keeps an unreadable record, so it rejects.
+    await connections.stop().catch((error: unknown) => {
+      expect(String(error)).toContain("cannot be verified");
+    });
+  }
+}, 30_000);
+
 test("a first successful connect after a failed attempt claims the record of another live connection", async () => {
   const root = mkdtempSync(join(tmpdir(), "tps-relay-first-claim-1023-"));
   const savedEnv = savedRelayEnv();
