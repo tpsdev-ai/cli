@@ -11,27 +11,13 @@ import { listenForHost, NoiseIkTransport } from "../src/utils/noise-ik-transport
 import { listenForJoinWs, WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
 import { encodeWireMessage } from "../src/utils/wire-frame.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
+import { boundPort } from "./helpers/port.js";
 
 const PROLOGUE = Buffer.from("tps-v1");
 const WS_PATH = "/tps/wire";
 
 const CLOSE_BOUND_MS = 3000;
 const REPEAT_BOUND_MS = 1000;
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolve(address.port));
-    });
-  });
-}
 
 /** Resolve `promise`, or reject with a named error if it does not settle in `ms`. */
 async function within<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
@@ -65,12 +51,13 @@ async function expectPortReusable(port: number): Promise<void> {
 }
 
 /** Wait until the listener accepts TCP connections (it is listening), bounded. */
-async function waitForPort(port: number): Promise<void> {
+async function waitForPort(port: number | (() => number)): Promise<void> {
   const deadline = Date.now() + 5000;
   for (;;) {
+    const target = typeof port === "function" ? port() : port;
     try {
       await new Promise<void>((resolve, reject) => {
-        const probe = net.createConnection({ host: "127.0.0.1", port });
+        const probe = net.createConnection({ host: "127.0.0.1", port: target });
         probe.once("connect", () => {
           probe.destroy();
           resolve();
@@ -118,8 +105,8 @@ describe("transport listener close()", () => {
   test("TCP branch listener (listenForHost) close settles with a peer, is idempotent, frees the port", async () => {
     const host = generateKeyPair();
     const branch = generateKeyPair();
-    const port = await freePort();
-    const server = await listenForHost(branch, host.encryption.publicKey, port, () => {});
+    const server = await listenForHost(branch, host.encryption.publicKey, 0, () => {});
+    const port = boundPort(server);
     cleanups.push(() => settle(server.close()));
 
     const client = new NoiseIkTransport(host);
@@ -141,8 +128,8 @@ describe("transport listener close()", () => {
     const host = generateKeyPair();
     const branch = generateKeyPair();
     registerBranch("branch-a", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-    const port = await freePort();
-    const server = await new NoiseIkTransport(branch, host).listen(port);
+    const server = await new NoiseIkTransport(branch, host).listen(0);
+    const port = boundPort(server);
     cleanups.push(() => settle(server.close()));
 
     const channel = await new NoiseIkTransport(branch).connect({
@@ -163,8 +150,8 @@ describe("transport listener close()", () => {
     const host = generateKeyPair();
     const branch = generateKeyPair();
     registerBranch("branch-b", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-    const port = await freePort();
-    const server = await new WsNoiseTransport(host, host).listen(port);
+    const server = await new WsNoiseTransport(host, host).listen(0);
+    const port = boundPort(server);
     cleanups.push(() => settle(server.close()));
 
     const channel = await new WsNoiseTransport(branch).connect({
@@ -184,8 +171,8 @@ describe("transport listener close()", () => {
   test("WS host listener close settles after a rejected handshake, is idempotent, frees the port", async () => {
     const host = generateKeyPair();
     const branch = generateKeyPair();
-    const port = await freePort();
-    const server = await new WsNoiseTransport(host, host).listen(port);
+    const server = await new WsNoiseTransport(host, host).listen(0);
+    const port = boundPort(server);
     cleanups.push(() => settle(server.close()));
 
     // Not registered: the listener rejects the handshake and closes the socket.
@@ -206,10 +193,10 @@ describe("transport listener close()", () => {
   test("join WS listener (listenForJoinWs) close settles with a peer, is idempotent, frees the port", async () => {
     const branch = generateKeyPair();
     const host = generateKeyPair();
-    const port = await freePort();
+    let port = 0;
     const joined = await (async () => {
-      const joining = listenForJoinWs(branch, port, 10_000);
-      await waitForPort(port);
+      const joining = listenForJoinWs(branch, 0, 10_000, (bound) => { port = bound; });
+      await waitForPort(() => port);
       const socket = await joinAsHost(port, branch, host);
       cleanups.push(() => {
         try {

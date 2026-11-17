@@ -1,14 +1,13 @@
 /** Scratch Harper serving @tpsdev-ai/flair 0.58.0 for the real-Flair lane. */
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { createServer } from "node:net";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { randomUUID } from "node:crypto";
 import { FlairClient } from "../../src/utils/flair-client.js";
 import { generateKeyPair } from "../../src/utils/identity.js";
+import { bindErrorIn, withPortsRetry } from "./port.js";
 
 /** The published Flair the scratch instance runs. */
 export const FLAIR_PACKAGE = "@tpsdev-ai/flair";
@@ -68,24 +67,6 @@ export interface FlairTarget {
   baseUrl: string;
   opsUrl: string;
   admin: string;
-}
-
-/** Ask the OS for `count` distinct free loopback TCP ports. */
-async function freePorts(count: number): Promise<number[]> {
-  const servers: ReturnType<typeof createServer>[] = [];
-  try {
-    for (let index = 0; index < count; index++) {
-      const server = createServer();
-      await new Promise<void>((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(0, "127.0.0.1", resolve);
-      });
-      servers.push(server);
-    }
-    return servers.map((server) => (server.address() as AddressInfo).port);
-  } finally {
-    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
-  }
 }
 
 /** The environment the scratch Harper and its installer run under. */
@@ -242,6 +223,55 @@ export class ScratchFlairBindError extends Error {
   override name = "ScratchFlairBindError";
 }
 
+/** What `bootOnRetriedPorts` needs from a scratch child. */
+export interface ScratchBoot {
+  /** How long one attempt may take to answer on both ports. */
+  timeoutMs: number;
+  /** Start the child on `httpPort` and `opsPort`. */
+  spawn: (httpPort: number, opsPort: number) => { proc: ChildProcess; log: () => string };
+  /** Poll `url` until it answers, or the deadline passes. */
+  ready: (url: string, deadline: number) => Promise<boolean>;
+  /** Stop a failed attempt's child before the next pair is tried. */
+  stop: (proc: ChildProcess) => void;
+}
+
+/**
+ * Start the scratch child on a picked port pair, and start it again on a new
+ * pair when a port was taken. HTTP readiness and operations readiness are both
+ * checked inside one attempt, so an operations port lost to another process
+ * restarts the child instead of failing the lane.
+ */
+export async function bootOnRetriedPorts(
+  boot: ScratchBoot,
+): Promise<{ httpPort: number; opsPort: number; log: () => string }> {
+  const { ports, result } = await withPortsRetry(2, async ([httpPort, opsPort]) => {
+    const child = boot.spawn(httpPort!, opsPort!);
+    const deadline = Date.now() + boot.timeoutMs;
+    try {
+      const httpUp = await boot.ready(`http://127.0.0.1:${httpPort}/Health`, deadline);
+      if (!httpUp) {
+        throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${httpPort}: ${child.log().slice(-2000)}`);
+      }
+      // The operations port is bound by the same child; a lost one is the same
+      // retryable bind failure as a lost HTTP port.
+      const opsUp = await boot.ready(`http://127.0.0.1:${opsPort}/health`, deadline);
+      if (!opsUp) {
+        throw bindErrorIn(child.log()) ?? new Error(`scratch Flair did not answer on 127.0.0.1:${opsPort}: ${child.log().slice(-2000)}`);
+      }
+      const bindFailure = bindErrorIn(child.log());
+      if (bindFailure) throw bindFailure;
+      if (child.proc.exitCode !== null || child.proc.signalCode !== null) {
+        throw new Error(`scratch Flair exited before readiness: ${child.log().slice(-2000)}`);
+      }
+      return child;
+    } catch (error) {
+      boot.stop(child.proc);
+      throw error;
+    }
+  });
+  return { httpPort: ports[0]!, opsPort: ports[1]!, log: result.log };
+}
+
 async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
   const { root } = instance;
   const home = join(root, "home");
@@ -265,18 +295,37 @@ async function bootScratchFlair(instance: ScratchProcess, signal: AbortSignal) {
     throw new Error(`scratch Flair install is incomplete: ${flairDir} or ${harperBin} is missing`);
   }
 
-  const [httpPort, opsPort] = await freePorts(2);
-  const env = scratchEnv(root, home, models, httpPort, opsPort);
-  await execFileAsync(NODE_BIN, [harperBin, "install"], { cwd: flairDir, env, signal, timeout: 120_000 });
+  await execFileAsync(NODE_BIN, [harperBin, "install"], {
+    cwd: flairDir,
+    env: scratchEnv(root, home, models, 0, 0),
+    signal,
+    timeout: 120_000,
+  });
 
-  const proc = spawn(NODE_BIN, [harperBin, "run", "."], { cwd: flairDir, env, stdio: ["ignore", "pipe", "pipe"] });
-  instance.proc = proc;
-  let log = "";
-  proc.once("error", (error) => { log += String(error); });
-  proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
-  proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
+  // The ports are chosen and handed to the child, which binds them; a taken
+  // port is retried with a new pair rather than assumed free at bind time.
+  const { httpPort, opsPort, log } = await bootOnRetriedPorts({
+    timeoutMs: BOOT_TIMEOUT_MS,
+    spawn: (httpPort, opsPort) => {
+      const proc = spawn(NODE_BIN, [harperBin, "run", "."], {
+        cwd: flairDir,
+        env: scratchEnv(root, home, models, httpPort, opsPort),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      instance.proc = proc;
+      let log = "";
+      proc.once("error", (error) => { log += String(error); });
+      proc.stdout?.on("data", (d: Buffer) => (log += d.toString()));
+      proc.stderr?.on("data", (d: Buffer) => (log += d.toString()));
+      return { proc, log: () => log };
+    },
+    ready: (url, deadline) => waitForOk(url, deadline, signal),
+    stop: (proc) => {
+      try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+    },
+  });
 
-  return { home, httpPort, opsPort, log: () => log };
+  return { home, httpPort, opsPort, log };
 }
 
 export async function initializeScratchFlair(

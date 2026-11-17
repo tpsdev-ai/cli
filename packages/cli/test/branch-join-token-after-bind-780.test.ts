@@ -13,6 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TRANSPORTS = ["tcp", "ws"] as const;
@@ -31,35 +32,6 @@ function launcherEnv(): NodeJS.ProcessEnv {
   delete env.TPS_IDENTITY_DIR;
   delete env.TPS_REGISTRY_DIR;
   return env;
-}
-
-/** Listen on an ephemeral port and keep the listener open. */
-function holdPort(): Promise<{ server: net.Server; port: number }> {
-  return new Promise((resolvePort, rejectPort) => {
-    const server = net.createServer();
-    server.once("error", rejectPort);
-    server.listen(0, "0.0.0.0", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close();
-        rejectPort(new Error("no address"));
-        return;
-      }
-      resolvePort({ server, port: address.port });
-    });
-  });
-}
-
-async function closeServer(server: net.Server): Promise<void> {
-  await new Promise<void>((resolveClose, rejectClose) => {
-    server.close((error) => (error ? rejectClose(error) : resolveClose()));
-  });
-}
-
-async function freePort(): Promise<number> {
-  const { server, port } = await holdPort();
-  await closeServer(server);
-  return port;
 }
 
 function spawnInit(port: number, transport: (typeof TRANSPORTS)[number]): ChildProcess {
@@ -126,6 +98,14 @@ function connectOnce(port: number, timeoutMs: number): Promise<boolean> {
   });
 }
 
+/** Kill a child and wait for it to be gone before the next attempt. */
+async function stopChild(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise<void>((resolveExit) => child.once("exit", () => resolveExit()));
+  child.kill("SIGKILL");
+  await exited;
+}
+
 /** Resolve with the printed port as soon as the join token appears. */
 function waitForToken(child: ChildProcess): Promise<number> {
   return new Promise((resolveToken, rejectToken) => {
@@ -135,15 +115,30 @@ function waitForToken(child: ChildProcess): Promise<number> {
     }, WAIT_MS);
     const onData = (chunk: Buffer) => {
       output += String(chunk);
+      const failed = bindErrorIn(output);
+      if (failed) {
+        clearTimeout(timer);
+        rejectToken(failed);
+        return;
+      }
       const listening = /Listening on 0\.0\.0\.0:(\d+)/.exec(output);
       if (listening && output.includes("tps://join?")) {
         clearTimeout(timer);
         resolveToken(Number(listening[1]));
       }
     };
+    // `branch init` writes a bind failure to stderr; read both streams so the
+    // attempt rejects at once instead of waiting out the deadline.
     child.stdout?.on("data", onData);
-    child.stderr?.on("data", (chunk) => {
-      output += String(chunk);
+    child.stderr?.on("data", onData);
+    // Classify the drained output when the child closes: "exit" can fire
+    // before a piped stderr has drained, so a bind error can be missed.
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      rejectToken(
+        bindErrorIn(output) ??
+          new Error(`branch init exited (code ${code}) before printing a join token: ${output}`),
+      );
     });
   });
 }
@@ -163,7 +158,7 @@ afterEach(async () => {
 describe("branch init join token after bind (cli#780)", () => {
   for (const transport of TRANSPORTS) {
     test(`${transport}: a bound port exits non-zero, names it, and prints no token`, async () => {
-      const { server, port } = await holdPort();
+      const { port, close } = await holdPort();
       try {
         const child = spawnInit(port, transport);
         const { code, output } = await collect(child);
@@ -174,19 +169,54 @@ describe("branch init join token after bind (cli#780)", () => {
         expect(output).not.toContain("Join token");
         expect(output).not.toContain(`Listening on 0.0.0.0:${port}`);
       } finally {
-        await closeServer(server);
+        await close();
       }
     }, 60_000);
 
     test(`${transport}: the token appears once the printed port accepts a connection`, async () => {
-      const port = await freePort();
-      const child = spawnInit(port, transport);
+      const { port } = await withPortRetry(async (port) => {
+        rmSync(join(root, ".tps", "branch.conf.json"), { force: true });
+        const child = spawnInit(port, transport);
+        try {
+          const printedPort = await waitForToken(child);
+          expect(printedPort).toBe(port);
 
-      const printedPort = await waitForToken(child);
-      expect(printedPort).toBe(port);
-
-      // The token has just been read from stdout: connect once, with no retry.
-      expect(await connectOnce(printedPort, 5_000)).toBe(true);
+          // The token has just been read from stdout: connect once, with no retry.
+          expect(await connectOnce(printedPort, 5_000)).toBe(true);
+          return printedPort;
+        } catch (error) {
+          await stopChild(child);
+          throw error;
+        }
+      });
+      expect(port).toBeGreaterThan(0);
     }, 60_000);
   }
+
+  test("tcp: a taken first port is retried and the token appears on a free one", async () => {
+    const held = await holdPort();
+    let attempts = 0;
+    try {
+      const { port } = await withPortRetry(async (port) => {
+        attempts += 1;
+        // A failed attempt leaves branch.conf.json behind; remove it so the
+        // next attempt reaches its listener instead of the already-exists guard.
+        rmSync(join(root, ".tps", "branch.conf.json"), { force: true });
+        const child = spawnInit(port, "tcp");
+        try {
+          const printedPort = await waitForToken(child);
+          expect(await connectOnce(printedPort, 5_000)).toBe(true);
+          return printedPort;
+        } catch (error) {
+          await stopChild(child);
+          throw error;
+        }
+      }, { firstPort: held.port });
+      expect(port).toBeGreaterThan(0);
+    } finally {
+      await held.close();
+    }
+    expect(attempts).toBeGreaterThanOrEqual(2);
+    expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
+  }, 60_000);
 });

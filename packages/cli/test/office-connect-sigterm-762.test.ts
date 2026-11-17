@@ -9,7 +9,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createConnectShutdown } from "../src/commands/office.js";
@@ -18,6 +17,7 @@ import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/
 import { QUIET_NONO_CHECK_FLAG, SANDBOX_REQUIRED_FLAG } from "../src/utils/nono.js";
 import type { TransportChannel, TransportServer } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
+import { boundPort } from "./helpers/port.js";
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -35,21 +35,6 @@ const TEST_TIMEOUT_MS = 45_000;
 const ENV_KEYS = ["HOME", "TMPDIR", "TPS_ROOT", "TPS_MAIL_DIR", "TPS_IDENTITY_DIR", "TPS_REGISTRY_DIR", "TPS_VAULT_KEY", "TPS_BRANCH_NO_DAEMON"];
 
 type Exit = { code: number | null; signal: NodeJS.Signals | null };
-
-async function freePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
-}
 
 /** Poll (bounded) until `ready()` holds; the failure names what was awaited. */
 async function waitFor(what: string, ready: () => boolean, ms: number): Promise<void> {
@@ -84,14 +69,15 @@ function restoreEnv(saved: Record<string, string | undefined>): void {
 }
 
 /** Register the branch and point its remote.json at `port`. */
-async function prepareBranch(root: string, port: number): Promise<void> {
+async function prepareBranch(root: string): Promise<void> {
   const keys = generateKeyPair();
   registerBranch(BRANCH, keys.signing.publicKey, undefined, keys.encryption.publicKey);
+  const host = await initHostIdentity();
+  server = await ws.listenForHostWs(keys, host.encryption.publicKey, 0, () => {});
+  const port = boundPort(server);
   const branchDir = join(root, ".tps", "branch-office", BRANCH);
   mkdirSync(branchDir, { recursive: true });
   writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "127.0.0.1", port, transport: "ws" }));
-  const host = await initHostIdentity();
-  server = await ws.listenForHostWs(keys, host.encryption.publicKey, port, () => {});
   server.onConnection((channel) => { connected = channel; });
 }
 
@@ -135,8 +121,7 @@ function recordPid(path: string): number | null {
 
 async function startConnect(): Promise<{ channel: TransportChannel; recordPath: string }> {
   const dir = root!;
-  const port = await freePort();
-  await prepareBranch(dir, port);
+  await prepareBranch(dir);
 
   const proc = spawn(
     process.execPath,

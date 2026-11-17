@@ -1,15 +1,19 @@
 import { describe, test, expect, afterEach } from "bun:test";
+import type { Server } from "node:http";
 import { startMockLLM } from "../src/soundstage/mock-llm.js";
+import { createPatchShared } from "./helpers/patch-shared.js";
+
+const patchShared = createPatchShared();
 
 describe("mock-llm", () => {
-  let server: ReturnType<typeof startMockLLM>;
+  let server: Server;
 
   afterEach(() => {
     if (server) server.close();
   });
 
   test("returns scripted responses in order", async () => {
-    server = startMockLLM(0); // random port
+    server = await startMockLLM(0); // random port
     const addr = server.address() as { port: number };
 
     const res1 = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
@@ -30,7 +34,7 @@ describe("mock-llm", () => {
   });
 
   test("does not echo user input", async () => {
-    server = startMockLLM(0);
+    server = await startMockLLM(0);
     const addr = server.address() as { port: number };
 
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
@@ -43,9 +47,23 @@ describe("mock-llm", () => {
   });
 
   test("health endpoint", async () => {
-    server = startMockLLM(0);
+    server = await startMockLLM(0);
     const addr = server.address() as { port: number };
     const res = await fetch(`http://127.0.0.1:${addr.port}/health`);
     expect(res.status).toBe(200);
+  });
+
+  test("logs the port it bound", async () => {
+    const logged: string[] = [];
+    const restore = patchShared(console, "log", (...args: unknown[]) => {
+      logged.push(args.map((arg) => String(arg)).join(" "));
+    });
+    try {
+      server = await startMockLLM(0);
+    } finally {
+      restore();
+    }
+    const addr = server.address() as { port: number };
+    expect(logged).toContain(`Mock LLM listening on http://127.0.0.1:${addr.port}/v1`);
   });
 });
