@@ -1175,3 +1175,72 @@ test("a first successful connect after a failed attempt claims the record of ano
     }
   }
 }, 30_000);
+
+
+test("a reconnect after a thrown first claim attempt preserves another live connection's record", async () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-relay-thrown-first-claim-1023-"));
+  const savedEnv = savedRelayEnv();
+  const channels: RelayChannelState[] = [];
+  const reconnectConnect = deferred<TransportChannel>();
+  const channelFor = (state: RelayChannelState): TransportChannel => ({
+    async send() {},
+    onMessage(callback) { state.attached = true; state.handler = callback; },
+    offMessage() { state.detached = true; },
+    async close() { state.alive = false; },
+    isAlive() { return state.alive; },
+    peerFingerprint() { return "remote"; },
+  });
+  let attempts = 0;
+  const connect = spyOn(ws.WsNoiseTransport.prototype, "connect").mockImplementation(() => {
+    attempts++;
+    const state: RelayChannelState = { attached: false, detached: false, alive: true };
+    channels.push(state);
+    return attempts === 1 ? Promise.resolve(channelFor(state)) : reconnectConnect.promise;
+  });
+  const errors = spyOn(console, "error");
+  let stop: (() => Promise<void>) | undefined;
+  try {
+    const branch = await prepareBranch(root);
+    const path = hostStatePath(branch);
+    // A directory makes the first atomic rename fail for every uid.
+    mkdirSync(path, { recursive: true });
+    stop = await connectAndKeepAlive(branch);
+    for (let i = 0; i < 400 && !errors.mock.calls.some((call) => String(call[0]).includes("connect write failed; reconnecting")); i++) await Bun.sleep(5);
+    const failures = errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("connect write failed; reconnecting"));
+    expect(failures).toHaveLength(1);
+    expect(failures[0]).toContain("rename");
+    expect(fs.statSync(path).isDirectory()).toBe(true);
+
+    rmSync(path, { recursive: true });
+    const startToken = processStartToken(process.pid);
+    const now = new Date().toISOString();
+    const other: HostConnectionState = {
+      branch, connectionId: "conn-b", pid: process.pid, startToken,
+      connectedAt: now, lastHeartbeatSent: now, lastHeartbeatAck: null,
+      reconnectCount: 0, bytesSent: 0, bytesReceived: 0, messagesSent: 0, messagesReceived: 0,
+    };
+    writeFileSync(path, JSON.stringify(other, null, 2));
+    const bytes = readFileSync(path);
+    for (let i = 0; attempts < 2 && i < 1000; i++) await Bun.sleep(10);
+    expect(attempts).toBe(2);
+    reconnectConnect.resolve(channelFor(channels[1]!));
+    for (let i = 0; i < 400 && !channels[1]?.attached; i++) await Bun.sleep(5);
+    expect(channels[1]?.attached).toBe(true);
+    expect(readFileSync(path)).toEqual(bytes);
+    expect(startToken).not.toBeNull();
+    expect(claimReporterLines(errors.mock.calls)).toEqual([
+      `[relay] Host state record ${path} not claimed on reconnect: the record belongs to another connection, so it was left as it is; the connection continues`,
+    ]);
+  } finally {
+    try {
+      if (channels[1]) reconnectConnect.resolve(channelFor(channels[1]));
+      await stop?.();
+      for (let i = 0; i < 400 && channels.some((channel) => channel.attached && !channel.detached); i++) await Bun.sleep(10);
+    } finally {
+      errors.mockRestore();
+      connect.mockRestore();
+      restoreRelayEnv(savedEnv);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+}, 30_000);
