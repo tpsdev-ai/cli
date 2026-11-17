@@ -1602,11 +1602,10 @@ function scanObligationReceipt(
  * record to verify there is nothing to dispatch, so this path settles from the
  * record: a receipt if one exists, otherwise the deadline verdict (re-arm while
  * the deadline is ahead; at/after it, the deadline's own terminal outcome).
- * Settling can make exactly ONE send — the nack to the sender recorded at
- * creation, through the durable nackOwed/markNackSent path — and the
- * internal-inbound gate does not apply because no agent reply is dispatched.
- * The missing cur/ entry is carried as the named `missingCurReason` field, not
- * as a verdict.
+ * The only mail settlement may send is a nack to the recorded sender; delivery
+ * retries follow the existing at-least-once contract. The internal-inbound gate
+ * does not apply because no agent reply is dispatched. The missing cur/ entry
+ * is carried as the named `missingCurReason` field, not as a verdict.
  */
 async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: string): Promise<void> {
   if (!isLiveContext(ctx)) return;
@@ -1635,14 +1634,37 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
       ? current.deadlineAt!
       : new Date(Date.now() + obligationDeadlineMs()).toISOString();
     const next: ObligationState = current.state === "pending" || current.state === "yielded" ? "yielded" : current.state;
-    transitionObligation(
+    // cli#1006 r2: `current` is a snapshot taken BEFORE the awaited receipt
+    // scan. A transition that landed during it (e.g. `posted`) must not be
+    // overwritten with a stale state. Re-read after the await and decide from
+    // the fresh record; the write below is also a compare-and-set on the state
+    // we snapshotted, so the window between the re-read and the write cannot
+    // overwrite a later transition either. A record that moved is left alone,
+    // and its own deadline is re-armed from the fresh record so it settles by
+    // its state.
+    const fresh = readObligationForCleanup(ctx, current.obligationId);
+    if (fresh.status !== "found" || fresh.record.state !== current.state) {
+      if (fresh.status === "found" && !TERMINAL_STATES.has(fresh.record.state)) {
+        armDeadline(ctx, current.obligationId, fresh.record.deadlineAt);
+      }
+      return;
+    }
+    const updated = transitionObligation(
       ctx.mailDir,
       ctx.agent,
       ctx.inboundId,
       next,
       { deadlineAt: at, missingCurReason: MISSING_CUR_REASON },
       ctx.log,
+      { from: current.state },
     );
+    if (!updated) {
+      const after = readObligationForCleanup(ctx, current.obligationId);
+      if (after.status === "found" && !TERMINAL_STATES.has(after.record.state)) {
+        armDeadline(ctx, current.obligationId, after.record.deadlineAt);
+      }
+      return;
+    }
     armDeadline(ctx, current.obligationId, at);
     return;
   }
@@ -1730,10 +1752,11 @@ async function sendNackMail(
   opts: { timeoutMs?: number; ackTimeoutMs?: number; allowMissingInbound?: boolean } = {},
 ): Promise<boolean> {
   if (!isLiveContext(ctx)) return false;
-  // cli#1006: settling from the obligation record makes exactly ONE send — the
-  // nack to the sender recorded at creation — and dispatches no agent reply, so
-  // the internal-inbound gate (which binds the dispatch path) is bypassed only
-  // for that settle. Every other caller keeps it.
+  // cli#1006: the only mail settlement may send is a nack to the recorded
+  // sender; delivery retries follow the existing at-least-once contract. It
+  // dispatches no agent reply, so the internal-inbound gate (which binds the
+  // dispatch path) is bypassed only for that settle. Every other caller keeps
+  // it.
   if (!opts.allowMissingInbound && !(await internalInbound(ctx))) return false;
   if (!isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
@@ -2794,6 +2817,18 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (!nackOwed(rec)) continue;
+          // cli#1006 r2: the missing-cur allowance is sound only while a CLEAN
+          // lookup confirms cur/ is still absent. A lookup that errors, or one
+          // that finds the file again, takes the normal gated path.
+          let curStillAbsent = false;
+          if (rec.missingCurReason === MISSING_CUR_REASON) {
+            let retryLookupError: string | null = null;
+            const found = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
+              if (code === "ENOENT" && path === curDir) return;
+              retryLookupError ??= code ?? "INVALID_JSON";
+            });
+            curStillAbsent = found === null && retryLookupError === null;
+          }
           retryOwedNackInBackground(
             account.mailDir,
             agentId,
@@ -2808,7 +2843,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // cli#1006: a nack settled from a record whose cur/ entry was gone
             // is still owed to the sender recorded at creation; retry it under
             // the same settle-path rule as the initial send.
-            rec.missingCurReason === MISSING_CUR_REASON,
+            curStillAbsent,
           );
         }
 
@@ -2839,7 +2874,25 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
+          // cli#1006 r2: a lookup that FAILED is not a MISSING cur/. Only a
+          // clean scan that finds no matching id may take the missing-cur
+          // path; an unreadable or malformed file, SCAN_LIMIT or
+          // AMBIGUOUS_ID leaves the obligation untouched.
+          let curLookupError: string | null = null;
+          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
+            // Only the scan's own clean "no match" (ENOENT ON the cur/ dir) is
+            // a miss; ENOENT from a listed file (a dangling symlink) is a read
+            // error.
+            if (code === "ENOENT" && path === curDir) return;
+            curLookupError ??= code ?? "INVALID_JSON";
+          });
+          if (curLookupError) {
+            log?.warn?.(
+              `tps-mail: obligation-cur-lookup-failed: obligation ${rec.obligationId} for inbound ${rec.inboundId}: ` +
+                `the cur/ lookup failed (${curLookupError}); leaving the obligation untouched`,
+            );
+            continue;
+          }
           const ctx = makeYieldCtx(
             account.mailDir,
             agentId,

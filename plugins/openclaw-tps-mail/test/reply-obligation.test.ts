@@ -1321,6 +1321,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       state?: "pending" | "yielded" | "delivering" | "posted";
       deadlineInMs?: number;
       envelopeId?: string;
+      missingCurReason?: string;
     } = {},
   ): { obligationId: string; envelopeId: string } {
     const envelopeId = opts.envelopeId ?? `env-${inboundId}`;
@@ -1341,6 +1342,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
           state: opts.state ?? "yielded",
           deadlineAt: new Date(Date.now() + (opts.deadlineInMs ?? -1000)).toISOString(),
           attempts: 1,
+          ...(opts.missingCurReason ? { missingCurReason: opts.missingCurReason } : {}),
         },
         null,
         2,
@@ -1466,6 +1468,141 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     expect(h.dispatchCount).toBe(0);
     await h.stop();
   }, 20000);
+
+  it("leaves the obligation untouched when its cur/ file is present but unreadable", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-cur-unreadable";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    // The cur/ record exists at the matching name but cannot be parsed. It is
+    // not a missing record, so the lookup must not take the missing-cur path.
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    writeFileSync(resolve(curDir, `${inboundId}.json`), "{not json", "utf-8");
+
+    const warned: string[] = [];
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      keepRawCur: `${inboundId}.json`,
+      warnCalls: warned,
+    });
+    await sleep(300);
+
+    const rec = obligationFile(AGENT, inboundId);
+    expect(rec?.state, "a failed lookup does not settle the record").toBe("yielded");
+    expect(rec?.missingCurReason, "and it is not marked as a missing cur/").toBeUndefined();
+    expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")).length, "no nack").toBe(0);
+
+    const lines = warned.filter((line) => line.includes("obligation-cur-lookup-failed"));
+    expect(lines.length, "one line names the failed lookup").toBe(1);
+    expect(lines[0]).toContain(obligationId);
+    expect(lines[0]).toContain(inboundId);
+    expect(lines[0]).toContain("INVALID_JSON");
+    await h.stop();
+  }, 20000);
+
+  it("withholds the missing-cur nack-retry allowance once the cur/ file is back", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-cur-restored";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    // The record still owes its nack and was settled while cur/ was gone.
+    const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const settled = JSON.parse(readFileSync(recordPath, "utf-8"));
+    writeFileSync(
+      recordPath,
+      JSON.stringify(
+        {
+          ...settled,
+          state: "failed",
+          failure: "yielded-without-resumption",
+          nackPending: true,
+          missingCurReason: REASON,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    // The cur/ record is BACK. It does not verify (its body is not a signed
+    // envelope), so the normal gated path must refuse to send; only the
+    // missing-cur allowance would bypass that gate.
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    writeFileSync(
+      resolve(curDir, `${inboundId}.json`),
+      JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: "not a signed envelope", timestamp: new Date().toISOString(), trust: "external" }),
+      "utf-8",
+    );
+
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json` });
+    await sleep(500);
+    expect(
+      nackMailsIn(resolve(tempMailDir, SENDER, "new")).length,
+      "a present cur/ record takes the normal path, which refuses here",
+    ).toBe(0);
+    expect(obligationFile(AGENT, inboundId)?.nackPending, "the debt stays on the record").toBe(true);
+    await h.stop();
+  }, 20000);
+
+  it("does not overwrite a posted transition that lands during the receipt scan", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-race-posted";
+    const { obligationId, envelopeId } = seedOrphan(inboundId, {
+      deadlineInMs: 8000,
+      state: "yielded",
+      missingCurReason: REASON,
+    });
+    // A receipt carrying a reply signed by the WRONG key keeps the scan pending
+    // (the verifier is gated below) and then reports no evidence.
+    const replyId = "reply-race-a";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const wrongKeyReply = signEnvelope(
+      { v: 1, from: AGENT, to: SENDER, body: "race reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+      { [AGENT]: FLINT_SEED },
+    );
+    writeReceipt(tempMailDir, AGENT, {
+      replyId,
+      obligationId,
+      replyToId: envelopeId,
+      route: "local",
+      ts: now,
+      signedReply: JSON.stringify(wrongKeyReply),
+    });
+
+    let releaseScan!: () => void;
+    const scanGate = new Promise<void>((r) => { releaseScan = r; });
+    let scanEntered = false;
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      beforeVerify: async (name) => {
+        if (name !== AGENT) return;
+        scanEntered = true;
+        await scanGate;
+      },
+    });
+    expect(scanEntered, "the receipt scan is awaiting verification").toBe(true);
+
+    // The delivery path commits `posted` while recovery still holds the
+    // pre-scan snapshot.
+    const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const snapshot = JSON.parse(readFileSync(recordPath, "utf-8"));
+    writeFileSync(recordPath, JSON.stringify({ ...snapshot, state: "posted", replyId }, null, 2), "utf-8");
+    releaseScan();
+
+    await sleep(300);
+    expect(obligationFile(AGENT, inboundId)?.state, "the fresh posted state is not overwritten").toBe("posted");
+
+    const settled = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 8000);
+    expect(settled, "a committed record settles unconfirmed at its deadline, not failed").toBe(true);
+    expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")).length, "an unconfirmed obligation sends no nack").toBe(0);
+    expect(h.dispatchCount).toBe(0);
+    await h.stop();
+  }, 30000);
 });
 
 

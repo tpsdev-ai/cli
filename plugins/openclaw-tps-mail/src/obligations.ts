@@ -291,6 +291,11 @@ export function createObligation(
  * 9, item 4). A refusal must be distinguishable from a landing: a caller that
  * needs to act on "this transition did not happen" (markDelivering, before a
  * delivery call) may never be handed the old record as though it were the result.
+ *
+ * `expect.from` (cli#1006 r2) makes the write a compare-and-set: the transition
+ * lands only while the record is still in that prior state. A caller that
+ * decided on a snapshot taken before an await passes the state it saw, so a
+ * transition that landed meanwhile is refused rather than overwritten.
  */
 export function transitionObligation(
   mailDir: string,
@@ -299,6 +304,7 @@ export function transitionObligation(
   next: ObligationState,
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
+  expect?: { from: ObligationState },
 ): ObligationRecord | null {
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
@@ -306,6 +312,12 @@ export function transitionObligation(
     if (TERMINAL_STATES.has(current.state)) {
       log?.info?.(
         `tps-mail: obligation ${current.obligationId} is ${current.state}; refusing the late transition to ${next}`,
+      );
+      return null;
+    }
+    if (expect !== undefined && current.state !== expect.from) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} moved from ${expect.from} to ${current.state}; refusing the stale transition to ${next}`,
       );
       return null;
     }

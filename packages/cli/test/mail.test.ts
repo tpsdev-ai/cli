@@ -285,6 +285,43 @@ describe("mail utils", () => {
     }
   });
 
+  test("archiveOldCur keeps a terminal record that is not for this cur/ file, and one with an unknown state", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const aged = (name: string, id: string): string => {
+      const path = join(inbox.cur, name);
+      writeFileSync(path, JSON.stringify({ id, from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+      utimesSync(path, old, old);
+      return path;
+    };
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+
+    const mismatched = aged("mismatched.json", "msg-mismatched");
+    writeFileSync(
+      join(obligationDir, "msg-mismatched.json"),
+      JSON.stringify({ obligationId: "ob-other", inboundId: "msg-other", state: "acked" }),
+    );
+    const unknown = aged("unknown-state.json", "msg-unknown-state");
+    writeFileSync(
+      join(obligationDir, "msg-unknown-state.json"),
+      JSON.stringify({ obligationId: "ob-unknown", inboundId: "msg-unknown-state", state: "someday" }),
+    );
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(mismatched), "a record naming another inbound keeps this cur/ file").toBe(true);
+      expect(existsSync(unknown), "an unrecognized state keeps this cur/ file").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-mismatched.json")).length, "the mismatch is logged once").toBe(1);
+      expect(warnings.filter((line) => line.includes("msg-unknown-state.json")).length, "the unknown state is logged once").toBe(1);
+    } finally {
+      restoreWarn();
+    }
+  });
+
   test("checkMessages opportunistically archives old cur entries", async () => {
     const { getInbox } = await import("../src/utils/mail.js");
     const inbox = getInbox("kern");

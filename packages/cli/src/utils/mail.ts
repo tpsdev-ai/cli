@@ -552,8 +552,19 @@ export function inboxFullMessage(recipient: string, count: number): string {
  *  reply is no longer owed, so cur/ may age out. */
 const TERMINAL_OBLIGATION_STATES = new Set(["acked", "unconfirmed", "failed"]);
 
-/** Paths already warned about while checking obligations before archiving, so
- *  a repeated mail check logs once per unreadable record rather than every run. */
+/** Every obligation state the store recognizes; anything else is not a record
+ *  this archiver may act on. */
+const KNOWN_OBLIGATION_STATES = new Set([
+  "pending",
+  "yielded",
+  "delivering",
+  "posted",
+  "acked",
+  "unconfirmed",
+  "failed",
+]);
+
+/** Paths already warned about in this process, so repeated checks in the same process log each unreadable obligation path once. */
 const warnedObligationArchiveReads = new Set<string>();
 
 function warnObligationArchiveRead(path: string, code: string | undefined): void {
@@ -562,9 +573,18 @@ function warnObligationArchiveRead(path: string, code: string | undefined): void
   console.warn(`[mail] keeping cur/ record: obligation ${path} is unreadable (${code ?? "invalid"}); not archiving`);
 }
 
-/** True when the obligation for `messageId` is still live (or cannot be read).
- *  Fail-closed: an unreadable or malformed record keeps the cur/ file, because
- *  archiving on a read error could hide an open obligation (cli#1006). */
+/** One line per path for a record that exists but does not describe THIS cur/
+ *  file, or whose state is not recognized. */
+function warnObligationArchiveMismatch(path: string, reason: string): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} ${reason}; not archiving`);
+}
+
+/** True when the obligation for `messageId` is still live (or cannot be read,
+ *  or does not belong to this cur/ file). Fail-closed: an unreadable or
+ *  malformed record keeps the cur/ file, because archiving on a read error
+ *  could hide an open obligation (cli#1006). */
 function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
   const path = join(inboxRoot, ".obligations", `${messageId}.json`);
   let raw: string;
@@ -589,9 +609,25 @@ function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
     return true;
   }
   try {
-    const record = JSON.parse(raw) as { state?: unknown };
+    const record = JSON.parse(raw) as { state?: unknown; inboundId?: unknown };
     if (!record || typeof record.state !== "string") {
       warnObligationArchiveRead(path, "INVALID_RECORD");
+      return true;
+    }
+    // cli#1006 r2: the record must be FOR THIS cur/ file. A record that names
+    // another inbound (or none) says nothing about this one; keeping the file
+    // is the fail-closed answer.
+    if (typeof record.inboundId !== "string" || record.inboundId.length === 0) {
+      warnObligationArchiveMismatch(path, "carries no inboundId");
+      return true;
+    }
+    if (record.inboundId !== messageId) {
+      warnObligationArchiveMismatch(path, `names inbound ${record.inboundId}, not this cur/ record`);
+      return true;
+    }
+    // An unrecognized state is not a terminal one: keep the file and say so.
+    if (!KNOWN_OBLIGATION_STATES.has(record.state)) {
+      warnObligationArchiveMismatch(path, `has an unrecognized state ${record.state}`);
       return true;
     }
     return !TERMINAL_OBLIGATION_STATES.has(record.state);
