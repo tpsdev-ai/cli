@@ -1,10 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   MailRecordLockRootError,
   getInbox,
+  sameDirectory,
   updateExistingRecord,
 } from "../src/utils/mail.js";
 import { acquireMailLockSync, mailLockPath } from "../src/utils/mail-lock.js";
@@ -32,7 +35,7 @@ function swapCase(segment: string): string {
   return segment.replace(/[a-zA-Z]/g, (letter) => (letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase()));
 }
 
-/** True when a different-case spelling of one directory names that same directory. */
+/** True when the filesystem treats a different-case spelling as a different path. */
 function caseSensitiveFs(): boolean {
   const probe = fs.mkdtempSync(join(tmpdir(), "record-lock-probe-"));
   try {
@@ -51,16 +54,18 @@ if (caseSensitive) {
   console.warn("[mail] different-letter-case alias test skipped: this filesystem is case-sensitive, so the alternate spelling does not resolve");
 }
 
-function symlinkedLayout(): { inboxA: ReturnType<typeof getInbox>; mailboxB: string; targetA: string; targetB: string } {
+function symlinkedLayout(subdir: "cur" | "new" | "dlq" = "cur"): { inboxA: ReturnType<typeof getInbox>; mailboxB: string; source: string; targetA: string; targetB: string } {
   const inboxA = getInbox("mailbox-a");
   const mailboxB = join(root, "mailbox-b");
   fs.mkdirSync(mailboxB, { recursive: true });
-  fs.symlinkSync(inboxA.cur, join(mailboxB, "cur"), "dir");
+  const source = subdir === "new" ? inboxA.fresh : subdir === "dlq" ? inboxA.dlq : inboxA.cur;
+  fs.symlinkSync(source, join(mailboxB, subdir), "dir");
   return {
     inboxA,
     mailboxB,
-    targetA: join(inboxA.cur, "record.json"),
-    targetB: join(mailboxB, "cur", "record.json"),
+    source,
+    targetA: join(source, "record.json"),
+    targetB: join(mailboxB, subdir, "record.json"),
   };
 }
 
@@ -74,25 +79,76 @@ function refusal(update: () => unknown): MailRecordLockRootError {
   throw new Error("expected the update to be refused");
 }
 
+test("sameDirectory compares device and inode, not path spelling", () => {
+  const stats = new Map<string, fs.Stats>([
+    ["/mail/a/cur", { dev: 7, ino: 42 } as fs.Stats],
+    ["/mail/a/CUR", { dev: 7, ino: 42 } as fs.Stats],
+    ["/mail/a/other", { dev: 7, ino: 43 } as fs.Stats],
+    ["/mail/b/cur", { dev: 8, ino: 42 } as fs.Stats],
+  ]);
+  const stat = (path: string) => stats.get(path)!;
+  expect(sameDirectory("/mail/a/cur", "/mail/a/CUR", stat)).toBe(true);
+  expect(sameDirectory("/mail/a/cur", "/mail/a/other", stat)).toBe(false);
+  expect(sameDirectory("/mail/a/cur", "/mail/b/cur", stat)).toBe(false);
+});
+
 test("an update through a symlinked cur/ is refused and leaves the record unchanged", () => {
-  const { inboxA, mailboxB, targetA, targetB } = symlinkedLayout();
+  const { inboxA, mailboxB, source, targetA, targetB } = symlinkedLayout();
+  plantRecord(targetB, "record-id");
+  const before = fs.readFileSync(targetA, "utf8");
+
+  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
+
+  const realRecordDir = fs.realpathSync(source);
+  const realRoot = fs.realpathSync(mailboxB);
+  expect(fs.readFileSync(targetA, "utf8")).toBe(before);
+  expect(err.message).toContain(targetB);
+  expect(err.message).toContain(realRecordDir);
+  expect(err.message).toContain(realRoot);
+  expect(err.message).toContain("mailbox that physically contains it");
+  expect(err.recordDir).toBe(realRecordDir);
+  expect(err.lockRoot).toBe(realRoot);
+  expect(fs.readdirSync(source).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("a refused alias update does not parse the target record first", () => {
+  const { targetB } = symlinkedLayout();
+  fs.writeFileSync(targetB, "{ this is not json");
+
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+
+  expect(err.name).toBe("MailRecordLockRootError");
+});
+
+test("an update through a symlinked new/ is refused", () => {
+  const { mailboxB, source, targetA, targetB } = symlinkedLayout("new");
   plantRecord(targetB, "record-id");
   const before = fs.readFileSync(targetA, "utf8");
 
   const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
 
   expect(fs.readFileSync(targetA, "utf8")).toBe(before);
-  expect(err.message).toContain(targetB);
-  expect(err.recordDir).toBe(fs.realpathSync(inboxA.cur));
+  expect(err.recordDir).toBe(fs.realpathSync(source));
   expect(err.lockRoot).toBe(fs.realpathSync(mailboxB));
-  expect(fs.readdirSync(inboxA.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("an update through a symlinked dlq/ is refused", () => {
+  const { mailboxB, source, targetA, targetB } = symlinkedLayout("dlq");
+  plantRecord(targetB, "record-id");
+  const before = fs.readFileSync(targetA, "utf8");
+
+  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
+
+  expect(fs.readFileSync(targetA, "utf8")).toBe(before);
+  expect(err.recordDir).toBe(fs.realpathSync(source));
+  expect(err.lockRoot).toBe(fs.realpathSync(mailboxB));
 });
 
 test("an alias update is refused while the owning mailbox's lock is held", () => {
-  const { inboxA, mailboxB, targetA, targetB } = symlinkedLayout();
+  const { inboxA, mailboxB, source, targetA, targetB } = symlinkedLayout();
   plantRecord(targetB, "record-id");
   const before = fs.readFileSync(targetA, "utf8");
-  const scratchesBefore = fs.readdirSync(inboxA.cur).filter((name) => name.startsWith(".ack-"));
+  const scratchesBefore = fs.readdirSync(source).filter((name) => name.startsWith(".ack-"));
 
   const lockA = acquireMailLockSync(inboxA.root);
   expect(lockA).not.toBeNull();
@@ -108,12 +164,12 @@ test("an alias update is refused while the owning mailbox's lock is held", () =>
         return { ...record, read: true };
       }),
     );
-    expect(err.recordDir).toBe(fs.realpathSync(inboxA.cur));
+    expect(err.recordDir).toBe(fs.realpathSync(source));
     expect(err.lockRoot).toBe(fs.realpathSync(mailboxB));
     expect(fs.existsSync(mailLockPath(mailboxB))).toBe(false);
     expect(mutated).toBe(false);
     expect(fs.readFileSync(targetA, "utf8")).toBe(before);
-    expect(fs.readdirSync(inboxA.cur).filter((name) => name.startsWith(".ack-"))).toEqual(scratchesBefore);
+    expect(fs.readdirSync(source).filter((name) => name.startsWith(".ack-"))).toEqual(scratchesBefore);
   } finally {
     lockA!.release();
   }
@@ -140,6 +196,17 @@ test.skipIf(caseSensitive)("an alias spelled with different letter case is not r
   expect(fs.readFileSync(recordPath, "utf8")).not.toBe(before);
   expect(JSON.parse(fs.readFileSync(recordPath, "utf8")).read).toBe(true);
   expect(fs.readdirSync(join(mailbox, "cur")).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+
+  // A second update runs through the BUILT module under node, the plugin's
+  // production runtime, whose realpathSync keeps the given letter case.
+  const distMail = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "src", "utils", "mail.js");
+  const script = [
+    `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
+    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }));`,
+    `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
+  ].join("\n");
+  const run = spawnSync("node", ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 30_000 });
+  expect(run.status, `node refused the alias update: ${run.stderr}${run.stdout}`).toBe(0);
 });
 
 test("a normal non-symlinked update still succeeds", () => {

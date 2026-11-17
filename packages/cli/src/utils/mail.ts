@@ -320,6 +320,17 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
 }
 
 /**
+ * Whether two paths name one physical directory, compared by device and inode.
+ * Different spellings of one directory (a symlink, or another letter case on a
+ * case-insensitive volume) still match when they reach the same directory.
+ */
+export function sameDirectory(a: string, b: string, stat: (path: string) => Stats = statSync): boolean {
+  const left = stat(a);
+  const right = stat(b);
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+/**
  * An update takes the mailbox lock derived from the record path, so the record
  * must really live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory
  * symlinked to another mailbox would otherwise let a lock holder write a
@@ -457,22 +468,19 @@ export function updateExistingRecord<T extends object>(
   try {
     // The lock is keyed on the lexical path, so check that the record's
     // directory is physically the one under that root before writing scratch
-    // or mutating. Compare identity, not spelling: on a case-insensitive
-    // volume two spellings of one directory resolve to different strings.
+    // or mutating. Compare identity, not spelling: node's realpathSync keeps
+    // the given letter case, so on a case-insensitive volume two spellings of
+    // one directory resolve to different strings (bun canonicalizes the case).
     let realRoot: string;
     let realRecordDir: string;
-    let rootIdentity: Stats;
-    let parentIdentity: Stats;
     try {
       realRoot = realpathSync(root);
       realRecordDir = realpathSync(recordDir);
-      rootIdentity = statSync(realRoot);
-      parentIdentity = statSync(dirname(realRecordDir));
     } catch (err: any) {
       if (err?.code === "ENOENT") return { status: "gone" };
       throw Object.assign(new Error(`cannot verify the mailbox root for ${path}: ${err?.message ?? String(err)}`), { path: recordDir });
     }
-    if (parentIdentity.dev !== rootIdentity.dev || parentIdentity.ino !== rootIdentity.ino) {
+    if (!sameDirectory(dirname(realRecordDir), realRoot)) {
       throw new MailRecordLockRootError(path, realRecordDir, realRoot);
     }
     removeLeftoverAckScratch(root, recordDir);
