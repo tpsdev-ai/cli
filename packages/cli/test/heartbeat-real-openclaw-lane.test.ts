@@ -1,10 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 
@@ -425,6 +425,14 @@ const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
 const FIXTURE = "test/fixtures/heartbeat-openclaw";
 const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
 
+/** The absolute bash the lane resolves, used to build a PATH that contains it. */
+function realBash(): string {
+  const found = spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" });
+  const bashBin = found.status === 0 ? found.stdout.trim() : "";
+  if (!bashBin.startsWith("/")) throw new Error(`no absolute bash on this host: ${JSON.stringify(bashBin)}`);
+  return bashBin;
+}
+
 function recordingSpawn() {
   const calls: InstallCall[] = [];
   const spawnInstall = (command: string, args: string[], options: InstallCall["options"]) => {
@@ -471,10 +479,12 @@ describe("the local fallback installs from the committed fixture lock", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
     try {
       const { calls, spawnInstall } = recordingSpawn();
-      const binDir = installOpenClaw(root, { spawn: spawnInstall, pathEnv: "", env: {} });
+      const bashDir = dirname(realBash());
+      const pathEnv = `${bashDir}:${pathWithoutSfw()}`;
+      const binDir = installOpenClaw(root, { spawn: spawnInstall, pathEnv, env: { PATH: pathEnv } });
       expect(calls).toHaveLength(1);
       const [call] = calls;
-      expect(call.command).toBe("bash");
+      expect(call.command).toBe(realBash());
       expect(call.args).toEqual([HELPER, "--via", "npm", FIXTURE, join(root, "openclaw"), ...CI_ARGS]);
       expect(call.options.cwd).toBe(REPO);
       expect(binDir).toBe(join(root, "openclaw", "node_modules", ".bin"));
@@ -492,7 +502,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
       writeFileSync(join(stubs, "sfw"), "#!/bin/sh\n");
       chmodSync(join(stubs, "sfw"), 0o755);
       const { calls, spawnInstall } = recordingSpawn();
-      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: stubs });
+      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: `${stubs}:${dirname(realBash())}:${pathWithoutSfw()}` });
       expect(calls[0].args).toEqual([HELPER, "--via", "sfw", FIXTURE, join(root, "run", "openclaw"), ...CI_ARGS]);
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -571,6 +581,77 @@ describe("the local fallback installs from the committed fixture lock", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 60_000);
+
+  test("a relative PATH entry for bash itself: the lane and the helper use the same bash and both see sfw", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-relative-bash-"));
+    const previousCwd = process.cwd();
+    const previousPath = process.env.PATH;
+    try {
+      const repo = fixtureRepo(root);
+      const relBin = join(repo, "relative-bin");
+      mkdirSync(relBin, { recursive: true });
+      const bashRecord = join(root, "bash-calls.txt");
+      writeFileSync(
+        join(relBin, "bash"),
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(bashRecord)}\nexec ${JSON.stringify(realBash())} "$@"\n`,
+      );
+      chmodSync(join(relBin, "bash"), 0o755);
+      const sfwRecord = join(root, "sfw-args.txt");
+      writeFileSync(join(relBin, "sfw"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(sfwRecord)}\n`);
+      chmodSync(join(relBin, "sfw"), 0o755);
+      const tools = join(root, "tools");
+      mkdirSync(tools);
+      for (const name of ["node", "git", "mktemp", "mkdir", "cp", "cmp", "rm", "rmdir"]) {
+        const found = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf-8" });
+        const tool = found.status === 0 ? found.stdout.trim() : "";
+        if (!tool.startsWith("/")) throw new Error(`no absolute ${name} on this host: ${JSON.stringify(tool)}`);
+        symlinkSync(tool, join(tools, name));
+      }
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `relative-bin:${tools}`;
+      const laneCwd = join(root, "lane-cwd");
+      mkdirSync(laneCwd);
+      process.env.PATH = pathEnv;
+      process.chdir(laneCwd);
+      const throwaway = join(root, "throwaway");
+      installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      const bashCalls = readFileSync(bashRecord, "utf-8").trim().split("\n");
+      expect(bashCalls.some((line) => line.includes("command -v sfw"))).toBe(true);
+      expect(bashCalls.some((line) => line.includes("--via sfw") && line.includes("npm-ci-tracked-lock.sh"))).toBe(true);
+      expect(readFileSync(sfwRecord, "utf-8")).toContain("ci");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a probe that cannot launch bash is a named error, not an npm fallback", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-probe-fail-"));
+    try {
+      const notExecutable = join(root, "bash");
+      writeFileSync(notExecutable, "");
+      const { calls, spawnInstall } = recordingSpawn();
+      let reported: unknown;
+      try {
+        installOpenClaw(join(root, "run"), {
+          spawn: spawnInstall,
+          bashPath: notExecutable,
+          pathEnv: pathWithoutSfw(),
+          env: { PATH: pathWithoutSfw() },
+        });
+      } catch (error) {
+        reported = error;
+      }
+      expect(reported).toBeInstanceOf(Error);
+      expect((reported as Error).message).toBe(`sfw probe cannot launch bash at ${notExecutable}: EACCES`);
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
   test("an sfw PATH entry that is a directory is not an installer", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-dir-sfw-"));
