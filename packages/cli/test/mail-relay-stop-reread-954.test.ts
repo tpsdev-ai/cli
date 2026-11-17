@@ -13,6 +13,7 @@ import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/co
 import { snapshotPidRecord } from "../src/utils/pid-file.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 let home: string;
 let relayPid: string;
@@ -190,6 +191,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
   test(
     "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, childToken(child.pid)));
       expect(readRelayPidFile().kind).toBe("running");

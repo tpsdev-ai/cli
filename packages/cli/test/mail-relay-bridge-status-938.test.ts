@@ -13,6 +13,7 @@ import { runBridge } from "../src/commands/bridge.js";
 import { runMail, setRelayStopSignal } from "../src/commands/mail.js";
 import { setRunDirReader, setStatusProbe } from "../src/utils/mail-bridge.js";
 import { readPidFile } from "../src/utils/pid-file.js";
+import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
@@ -54,8 +55,8 @@ function staleRecord(child: Bun.Subprocess): string {
 }
 
 /** Drive the shipped CLI the way a user does, with HOME pointing at this test. */
-function runCli(args: string[]): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync("node", [TPS_BIN, ...args], {
+function runCli(args: string[], nodeArgs: readonly string[] = []): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("node", [...nodeArgs, TPS_BIN, ...args], {
     env: { ...process.env, HOME: home },
     encoding: "utf8",
     timeout: TIMEOUT,
@@ -276,6 +277,7 @@ describe("tps bridge status --json records", () => {
   test(
     "records names the kind of a stale, unverified and unreadable record",
     () => {
+      stageProcStartTokens();
       const staleChild = spawnChild();
       const unverifiedChild = spawnChild();
       const stalePath = writeBridgeRecord("bridge-alpha.pid", staleRecord(staleChild));
@@ -283,7 +285,7 @@ describe("tps bridge status --json records", () => {
       const unreadablePath = join(runDir, "bridge-gamma.pid");
       symlinkSync(join(home, "missing-bridge-target"), unreadablePath);
 
-      const result = runCli(["bridge", "status", "--json"]);
+      const result = runCli(["bridge", "status", "--json"], PROC_START_TOKENS_NODE_ARGS);
 
       expect(result.status).toBe(0);
       const status = JSON.parse(result.stdout);
