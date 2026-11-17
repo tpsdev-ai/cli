@@ -1131,6 +1131,17 @@ signal_tool() { # <dir> <signal> — signal the tool itself, never the pty runne
   fi
   kill -"$sig" "$pid" 2>/dev/null
 }
+wait_add_entry() { # <package-short> <version|->
+  local pkg="$1" ver="$2" n=0
+  local entry="dist-tag add @tpsdev-ai/$pkg@"
+  [ "$ver" = "-" ] || entry="$entry$ver latest "
+  while [ "$n" -lt 800 ]; do
+    grep -qF "$entry" "$LOG" 2>/dev/null && return 0
+    sleep 0.05
+    n=$((n + 1))
+  done
+  return 1
+}
 run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [args...]
   local d="$1"
   local hold="$2"
@@ -1138,10 +1149,41 @@ run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [arg
   local sig="$4"
   shift 4
   start_held "$d" "$hold" "$holdver" "$@"
-  wait_count "$HCOUNTER" 1
+  # Preflight time is outside the hold wait; signal only after this add is held.
+  if ! wait_add_entry "$hold" "$holdver"; then
+    bad "interrupt: intended add entered" "no matching add before the timeout"
+    finish_held "$d"
+    return 1
+  fi
+  if ! wait_count "$HCOUNTER" 1; then
+    bad "interrupt: intended add held" "no hold marker before the timeout"
+    finish_held "$d"
+    return 1
+  fi
   signal_tool "$d" "$sig"
   finish_held "$d"
 }
+
+probe_interrupt_prerequisite() { # <entry|hold>
+  local phase="$1" record="$work/interrupt-prerequisite-$1" probe_rc=0
+  (
+    start_held() { :; }
+    wait_add_entry() { [ "$phase" = hold ]; }
+    wait_count() { return 1; }
+    bad() { printf 'FAILURE\n' >>"$record"; }
+    signal_tool() { printf 'SIGNAL\n' >>"$record"; }
+    finish_held() { :; }
+    run_interrupt "$work" cli-linux-arm64 0.5.3 TERM 0.5.4 --yes
+  ) >"$record" || probe_rc=$?
+  if [ "$probe_rc" -ne 0 ] && grep -q '^FAILURE$' "$record" && ! grep -q '^SIGNAL$' "$record"; then
+    ok "interrupt prerequisite: expired $phase wait prevents signal" "failure recorded, no signal"
+  else
+    bad "interrupt prerequisite: expired $phase wait prevents signal" "rc $probe_rc, record [$(cat "$record")]"
+  fi
+}
+probe_interrupt_prerequisite entry
+probe_interrupt_prerequisite hold
+
 adds_count() {
   local n
   n="$(grep -c '^dist-tag add ' "$LOG" 2>/dev/null)"
@@ -2796,13 +2838,47 @@ run_refusal_probe() {
 bf_log="$work/bf-records"
 # Read the guard's own install classifier instead of copying its verb list.
 guard_ts="$repo_root/test/helpers/npm-ci-workflow-guard.ts"
-install_verb_line="$(grep -m1 '^const INSTALL_VERB = ' "$guard_ts" 2>/dev/null)"
-install_verbs="$(printf '%s\n' "$install_verb_line" | sed -n 's/.*(?:\([a-z|]*\))(?!.*/\1/p' | tr '|' ' ')"
-if [ -z "$install_verbs" ]; then
-  bad "BF verb list: read from the guard" "no INSTALL_VERB verb group in test/helpers/npm-ci-workflow-guard.ts"
-else
+extract_install_verbs() { # <guard source>
+  node - "$1" <<'BF_VERBS'
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const declarations = source.match(/^const INSTALL_VERB\b.*$/gm) || [];
+const prefix = 'const INSTALL_VERB = /(?:^|[^A-Za-z0-9_-])(?:';
+const suffix = ')(?![A-Za-z0-9_-])/;';
+if (declarations.length !== 1) process.exit(1);
+const line = declarations[0];
+if (!line.startsWith(prefix) || !line.endsWith(suffix)) process.exit(1);
+const group = line.slice(prefix.length, -suffix.length);
+if (!/^[a-z]+(?:\|[a-z]+)*$/.test(group)) process.exit(1);
+const verbs = group.split('|');
+const distinct = new Set(verbs);
+if (distinct.size !== verbs.length || distinct.size < 6 ||
+    !['ci', 'install', 'i', 'add', 'exec', 'x'].every(verb => distinct.has(verb))) process.exit(1);
+console.log(verbs.join(' '));
+BF_VERBS
+}
+install_verbs=""
+if install_verbs="$(extract_install_verbs "$guard_ts")"; then
   ok "BF verb list: read from the guard" "$install_verbs"
+else
+  bad "BF verb list: read from the guard" "unrecognized or incomplete INSTALL_VERB declaration"
 fi
+
+bf_unrecognized="$work/bf-unrecognized.ts"
+cat >"$bf_unrecognized" <<'BF_UNRECOGNIZED'
+const INSTALL_VERB = new RegExp("(?:^|[^A-Za-z0-9_-])(?:ci|install|i|add|exec|x)(?![A-Za-z0-9_-])");
+BF_UNRECOGNIZED
+bf_split="$work/bf-split.ts"
+cat >"$bf_split" <<'BF_SPLIT'
+const INSTALL_VERB = /(?:^|[^A-Za-z0-9_-])(?:(?:ci|install|i|add)(?![A-Za-z0-9_-])|(?:exec|x)(?![A-Za-z0-9_-]))/;
+BF_SPLIT
+for bf_source in "$bf_unrecognized" "$bf_split"; do
+  if extract_install_verbs "$bf_source" >"$work/bf-extracted"; then
+    bad "BF mutation: rejects $(basename "$bf_source")" "extraction accepted [$(cat "$work/bf-extracted")]"
+  else
+    ok "BF mutation: rejects $(basename "$bf_source")" "extraction failed"
+  fi
+done
 for bf_sub in $install_verbs; do
   run_refusal_probe "$put_deadline_npm" "$bf_log" "$bf_sub"
   if [ "$BF_RC" -ne 0 ]; then ok "BF wrapper refuses $bf_sub: non-zero exit" "rc $BF_RC"; else bad "BF wrapper refuses $bf_sub: non-zero exit" "exited 0"; fi
