@@ -1169,7 +1169,7 @@ probe_interrupt_prerequisite() { # <entry|hold>
   (
     start_held() { :; }
     wait_add_entry() { [ "$phase" = hold ]; }
-    wait_count() { return 1; }
+    wait_count() { [ "$phase" = entry ]; }
     bad() { printf 'FAILURE\n' >>"$record"; }
     signal_tool() { printf 'SIGNAL\n' >>"$record"; }
     finish_held() { :; }
@@ -1183,6 +1183,21 @@ probe_interrupt_prerequisite() { # <entry|hold>
 }
 probe_interrupt_prerequisite entry
 probe_interrupt_prerequisite hold
+
+if (
+  LOG="$work/interrupt-entry-matcher.log"
+  printf '%s\n' 'dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.4 latest --registry fixture' >"$LOG"
+  polls=0
+  sleep() {
+    polls=$((polls + 1))
+    printf '%s\n' 'dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.3 latest --registry fixture' >>"$LOG"
+  }
+  wait_add_entry cli-linux-arm64 0.5.3 && [ "$polls" -eq 1 ]
+); then
+  ok "interrupt entry matcher: waits past unrelated add for rollback" "rollback add observed after one poll"
+else
+  bad "interrupt entry matcher: waits past unrelated add for rollback" "expected a match after one poll"
+fi
 
 adds_count() {
   local n
