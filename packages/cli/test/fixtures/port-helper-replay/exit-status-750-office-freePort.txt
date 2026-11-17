@@ -1,0 +1,12 @@
+function freePort(): Promise<number> {
+  return new Promise((resolvePromise, reject) => {
+    const server = net.createServer();
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") return reject(new Error("no address"));
+      const port = address.port;
+      server.close(() => resolvePromise(port));
+    });
+    server.once("error", reject);
+  });
+}

@@ -1,25 +1,12 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import net from "node:net";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { generateKeyPair, registerBranch, fingerprint } from "../src/utils/identity.js";
 import { listenForJoin, NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 import { MSG_JOIN_COMPLETE } from "../src/utils/wire-mail.js";
 import { runBranch } from "../src/commands/branch.js";
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const addr = s.address();
-      if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-      const p = addr.port;
-      s.close(() => resolve(p));
-    });
-    s.once("error", reject);
-  });
-}
+import { waitForBoundPort } from "./helpers/port.js";
 
 describe("branch join handshake", () => {
   let tmpDir: string;
@@ -51,8 +38,9 @@ describe("branch join handshake", () => {
     process.env.TPS_REGISTRY_DIR = hostRegistryDir;
     registerBranch("test-branch", branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
 
-    const port = await freePort();
-    const joinP = listenForJoin(branchKp, port, 10_000);
+    let bound = 0;
+    const joinP = listenForJoin(branchKp, 0, 10_000, (port) => { bound = port; });
+    const port = await waitForBoundPort(() => bound);
 
     const hostTransport = new NoiseIkTransport(hostKp);
     const ch = await hostTransport.connect({
@@ -98,13 +86,18 @@ describe("branch join handshake", () => {
     process.env.TPS_REGISTRY_DIR = hostRegistryDir;
     registerBranch("branch-run", branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
 
-    const port = await freePort();
-
-    // run branch in background
+    // run branch in background; the in-process listener binds 0 itself and
+    // writes the port it got, so nothing picks a port and binds it later.
     process.env.TPS_IDENTITY_DIR = branchIdentityDir;
-    const runP = runBranch({ action: "init", port, host: "127.0.0.1", transport: "tcp" });
-
-    await new Promise((r) => setTimeout(r, 200));
+    const runP = runBranch({ action: "init", port: 0, host: "127.0.0.1", transport: "tcp" });
+    const confFile = join(tmpDir, "branch.conf.json");
+    const port = await waitForBoundPort(() => {
+      try {
+        return Number(JSON.parse(readFileSync(confFile, "utf-8")).port) || 0;
+      } catch {
+        return 0;
+      }
+    });
 
     const hostTransport = new NoiseIkTransport(hostKp);
     const ch = await hostTransport.connect({
@@ -134,5 +127,6 @@ describe("branch join handshake", () => {
     expect(saved.fingerprint).toBe(fingerprint(hostKp.encryption.publicKey));
 
     await ch.close();
+    expect(port).toBeGreaterThan(0);
   });
 });

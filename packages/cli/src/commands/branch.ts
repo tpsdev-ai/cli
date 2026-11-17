@@ -461,19 +461,25 @@ async function runInit(args: BranchArgs): Promise<void> {
 
   const pubkeyB64 = Buffer.from(kp.encryption.publicKey).toString("base64url");
   const sigPubkeyB64 = Buffer.from(kp.signing.publicKey).toString("base64url");
-  const token = `tps://join?host=${encodeURIComponent(advertiseHost)}&port=${port}&transport=${transport}&pubkey=${pubkeyB64}&sigpubkey=${sigPubkeyB64}&fp=sha256:${kp.fingerprint}`;
+  const joinToken = (listeningPort: number) =>
+    `tps://join?host=${encodeURIComponent(advertiseHost)}&port=${listeningPort}&transport=${transport}&pubkey=${pubkeyB64}&sigpubkey=${sigPubkeyB64}&fp=sha256:${kp.fingerprint}`;
 
   console.log("Branch identity created.");
   console.log(`Fingerprint: sha256:${kp.fingerprint}`);
 
   // Announce the port and the token only once the join listener has bound
   // (cli#780): a bind failure must not advertise a listener that never existed.
+  // Port 0 asks the OS for one; the bound port is what the token, the config and
+  // the daemon must carry.
   let bound = false;
-  const announceListener = () => {
+  let boundPort = port;
+  const announceListener = (listeningPort: number) => {
     bound = true;
-    console.log(`Listening on 0.0.0.0:${port}`);
+    boundPort = listeningPort;
+    if (listeningPort !== port) writeBranchConf(listeningPort, advertiseHost, transport, undefined, args.agent);
+    console.log(`Listening on 0.0.0.0:${listeningPort}`);
     console.log("\nJoin token (run on host):");
-    console.log(`  tps office join <name> \"${token}\"`);
+    console.log(`  tps office join <name> \"${joinToken(listeningPort)}\"`);
     console.log("\nWaiting for host to connect... (Ctrl+C to cancel)");
   };
 
@@ -513,7 +519,7 @@ async function runInit(args: BranchArgs): Promise<void> {
   console.log("Starting branch daemon...");
   const daemonPid = spawnBranchDaemon();
 
-  console.log(`Branch daemon spawned (pid ${daemonPid}). Configured port: ${port}.`);
+  console.log(`Branch daemon spawned (pid ${daemonPid}). Configured port: ${boundPort}.`);
   console.log(`Log: ${logPath()}`);
 }
 
@@ -624,9 +630,13 @@ async function runStart(): Promise<void> {
       const services = parsed.success ? (parsed.data.services ?? []) : [];
       if (services.length > 0) {
         try { serviceProxies?.close(); } catch {}
-        serviceProxies = startServiceProxies(services, channel);
-        for (const h of serviceProxies.handles) {
-          logLine("PROXY", `Service '${h.name}' proxied on 127.0.0.1:${h.port}`);
+        try {
+          serviceProxies = await startServiceProxies(services, channel);
+          for (const h of serviceProxies.handles) {
+            logLine("PROXY", `Service '${h.name}' proxied on 127.0.0.1:${h.port}`);
+          }
+        } catch (error) {
+          logLine("WARN", `Service proxy listen failed: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
       return;

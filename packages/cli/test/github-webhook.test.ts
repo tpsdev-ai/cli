@@ -4,7 +4,6 @@ import { describe, test, expect, beforeEach, afterEach, spyOn, mock } from "bun:
 import * as fs from "node:fs";
 import { createHmac, createHash } from "node:crypto";
 import { mkdtempSync, rmSync, existsSync, readdirSync, readFileSync, mkdirSync, renameSync, utimesSync, writeFileSync } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -52,19 +51,6 @@ async function readLine(reader: ReadableStreamDefaultReader<Uint8Array>, buffer:
     if (part.done) return buffer.text;
     buffer.text += new TextDecoder().decode(part.value);
   }
-}
-
-/** Selects a port using a temporary loopback socket. */
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") return reject(new Error("no address"));
-      server.close(() => resolve(address.port));
-    });
-  });
 }
 
 /** Counts visible JSON filenames in a HOME's outbox/new. */
@@ -727,7 +713,9 @@ describe("handleGithubWebhook", () => {
       "x-hub-signature-256": `sha256=${createHmac("sha256", "testsecret").update(payload).digest("hex")}`,
     };
     const lock = join(childHome, ".tps", "outbox", "new", `.github-${createHash("sha256").update(delivery).digest("hex")}.lock`);
-    const port = await freePort();
+    // The listener child binds port 0 and prints the port it got, so no port is
+    // chosen in this process for the child to bind later.
+    let port = 0;
     const transportPath = new URL("../src/utils/ws-noise-transport.ts", import.meta.url).pathname;
     const identityPath = new URL("../src/utils/identity.ts", import.meta.url).pathname;
     const lockModulePath = new URL("../src/utils/mail-lock.ts", import.meta.url).pathname;
@@ -740,8 +728,8 @@ describe("handleGithubWebhook", () => {
       function pause(stage) { console.log(stage); readSync(0, Buffer.alloc(1), 0, 1, null); }
       mailLockTestHooks.beforeOwnerRead = () => { if (!heldBefore) { heldBefore = true; pause("before"); } };
       mailLockTestHooks.unverifiedOwner = () => { if (!heldUnverified) { heldUnverified = true; pause("unverified"); } };
-      await listenForHostWs(generateKeyPair(), generateKeyPair().encryption.publicKey, ${port}, () => {});
-      console.log("listening");
+      const server = await listenForHostWs(generateKeyPair(), generateKeyPair().encryption.publicKey, 0, () => {});
+      console.log("listening " + server.port?.());
     `], { env: { ...process.env, HOME: childHome }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const reader = listener.stdout.getReader();
     const buffer = { text: "" };
@@ -752,7 +740,10 @@ describe("handleGithubWebhook", () => {
     };
     const deliver = () => fetch(`http://127.0.0.1:${port}/github/webhook`, { method: "POST", headers, body: payload });
     try {
-      expect(await readLine(reader, buffer)).toBe("listening");
+      const ready = await readLine(reader, buffer);
+      const bound = /^listening (\d+)$/.exec(ready);
+      if (!bound) throw new Error(`unexpected listener output: ${ready}`);
+      port = Number(bound[1]);
       const reaped = Bun.spawn([process.execPath, "-e", ""], { stdout: "pipe", stderr: "pipe" });
       expect(await reaped.exited).toBe(0);
       mkdirSync(join(childHome, ".tps", "outbox", "new"), { recursive: true });
