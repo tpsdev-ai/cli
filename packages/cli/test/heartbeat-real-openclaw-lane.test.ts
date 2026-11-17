@@ -690,7 +690,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
     }
   });
 
-  test("an empty PATH searches no directory, even when the working directory holds bash", () => {
+  test("an empty install PATH is refused by name, even when the working directory holds bash", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-emptypath-"));
     try {
       symlinkSync(realBash(), join(root, "bash"));

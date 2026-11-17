@@ -107,8 +107,9 @@ export function assertOpenClawVersion(stdout) {
  * that directory, and a match must be an executable regular file.
  */
 function resolveInstallBash(cwd, env) {
-  // bash searches no directories for an empty PATH; only an empty entry inside
-  // a PATH (a leading, trailing or doubled ':') means the working directory.
+  // An empty PATH is refused rather than searched: bash and execvp would try the
+  // bare name against the working directory, and the lane does not pick a bash
+  // from there. An empty entry inside a PATH means the working directory.
   const pathValue = env.PATH ?? "";
   if (pathValue === "") throw new Error("no executable bash on the install PATH: PATH is empty");
   const tried = [];
