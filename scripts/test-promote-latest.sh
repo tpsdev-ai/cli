@@ -314,8 +314,8 @@ const requests = [];
 const applied = [];
 const disconnected = [];
 let eventOrder = 0;
-// The first held read's receipt and answer times, so a fixture can assert the
-// hold's own duration rather than the run's.
+// The first held read's receipt time and the time its delay ended (recorded just
+// before the response handler runs), so a fixture can assert the hold itself.
 let firstReadHold = null;
 function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied, disconnected, firstReadHold }, null, 2)); }
 function manifest(pkg, version) {
@@ -1864,9 +1864,9 @@ elif REGISTRY_FIRST_READ_DELAY_MS=2000 start_registry "$d" delayed-put; then
   # on its own, so a shorter hold fails here rather than passing as AN does.
   hold_ms="$(node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const h=s.firstReadHold; process.stdout.write(h && h.answered !== null ? String(h.answered - h.received) : "unknown");' "$d/registry.state" 2>/dev/null || printf 'unknown')"
   if node -e 'process.exit(/^[0-9]+$/.test(process.argv[1]) && Number(process.argv[1]) > 1000 ? 0 : 1)' "$hold_ms"; then
-    ok "AN2 slow read: the hold outlasted the PUT deadline" "the registry answered after ${hold_ms}ms, over the 1 s PUT deadline"
+    ok "AN2 slow read: the hold outlasted the PUT deadline" "the held read's delay ended after ${hold_ms}ms, over the 1 s PUT deadline"
   else
-    bad "AN2 slow read: the hold outlasted the PUT deadline" "the registry answered the held first read after ${hold_ms}ms; AN2 needs more than the 1 s PUT deadline before it judges the PUT"
+    bad "AN2 slow read: the hold outlasted the PUT deadline" "the held first read's delay ended after ${hold_ms}ms; AN2 needs more than the 1 s PUT deadline before it judges the PUT"
   fi
   assert_eq "AN2 slow read: exit" 7 "$RC"
   assert_eq "AN2 slow read: reached the held PUT" 1 "$(node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(String((s.requests||[]).some((r)=>r.method==="PUT") ? 1 : 0));' "$d/registry.state")"
@@ -2069,10 +2069,10 @@ process.on('SIGTERM', () => {});
 fs.writeFileSync(process.argv[2], 'ready');
 setInterval(() => {}, 250);
 IGNORE_TERM
-# At its deadline the supervisor sends TERM to a child still running, whether or not
-# it has installed its handler, so the producer rows count only for a run whose
-# child confirmed the handler; a start slower than the deadline retries with a
-# longer one, and a child that never confirms leaves only the failed fixture row.
+# At its deadline the supervisor attempts TERM while its child handle still reports
+# running, whether or not the child has installed its handler (the log records the
+# attempt), so the producer rows count only for a run whose child confirmed the
+# handler; a slower start retries with a longer deadline, and a child that never confirms leaves only the failed fixture row.
 bg_supervise() { # <deadline> <child> <ready marker> <supervisor log> -> the supervisor's exit code
   PROMOTE_SUPERVISOR_LOG="$4" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$1" 0.5 -- "${NODE_BIN:-node}" "$2" "$3"
 }
