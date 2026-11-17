@@ -333,7 +333,8 @@ export const mailAckScratchTestHooks: { now?: () => number } = {};
 
 /**
  * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
- * lock, and removes it before releasing that lock. The sweep considers names
+ * lock, and attempts to remove it before releasing that lock; a failed removal
+ * is reported and leaves the scratch behind. The sweep considers names
  * of that exact shape and removes regular files at least ACK_SCRATCH_MIN_AGE_MS old.
  *
  * Before listing, check that the directory's real path is a direct child of
