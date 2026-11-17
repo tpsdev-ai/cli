@@ -1034,6 +1034,14 @@ test("a reconnect claim whose ownership cannot be verified reports one line nami
     ]);
     expect(connections.record().connectionId).toBe(aId);
     expect(readFileSync(connections.path)).toEqual(bytes);
+
+    for (let i = 0; i < 400 && !connections.channels[1]?.attached; i++) await Bun.sleep(5);
+    expect(connections.channels[1]?.attached).toBe(true);
+    const before = connections.received.length;
+    connections.channels[1]!.handler!({ type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} });
+    for (let i = 0; i < 200 && connections.received.length === before; i++) await Bun.sleep(5);
+    expect(connections.received.length).toBe(before + 1);
+    expect(connections.channels[1]!.alive).toBe(true);
   } finally {
     errors.mockRestore();
     // stop() reports and keeps a record it cannot verify, so it rejects.
@@ -1059,6 +1067,14 @@ test("a reconnect claim refused as invalid reports one line naming the path and 
       `[relay] Host state record ${connections.path} not claimed on reconnect: the record is not a valid host state record, so it was left as it is; the connection continues`,
     ]);
     expect(readFileSync(connections.path, "utf8")).toBe("{ not json");
+
+    for (let i = 0; i < 400 && !connections.channels[1]?.attached; i++) await Bun.sleep(5);
+    expect(connections.channels[1]?.attached).toBe(true);
+    const before = connections.received.length;
+    connections.channels[1]!.handler!({ type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} });
+    for (let i = 0; i < 200 && connections.received.length === before; i++) await Bun.sleep(5);
+    expect(connections.received.length).toBe(before + 1);
+    expect(connections.channels[1]!.alive).toBe(true);
   } finally {
     errors.mockRestore();
     // stop() reports and keeps an invalid record, so it rejects.
@@ -1085,6 +1101,14 @@ test("a reconnect claim refused as unreadable reports one line naming the path a
       `[relay] Host state record ${connections.path} not claimed on reconnect: is not a regular file, so it was left as it is; the connection continues`,
     ]);
     expect(readdirSync(connections.path)).toEqual([]);
+
+    for (let i = 0; i < 400 && !connections.channels[1]?.attached; i++) await Bun.sleep(5);
+    expect(connections.channels[1]?.attached).toBe(true);
+    const before = connections.received.length;
+    connections.channels[1]!.handler!({ type: MSG_HEARTBEAT, seq: 7, ts: new Date().toISOString(), body: {} });
+    for (let i = 0; i < 200 && connections.received.length === before; i++) await Bun.sleep(5);
+    expect(connections.received.length).toBe(before + 1);
+    expect(connections.channels[1]!.alive).toBe(true);
   } finally {
     errors.mockRestore();
     // stop() reports and keeps an unreadable record, so it rejects.
