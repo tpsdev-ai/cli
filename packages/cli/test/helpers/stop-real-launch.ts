@@ -43,10 +43,6 @@ function groupAlive(pid: number): boolean {
   }
 }
 
-function alive(pid: number): boolean {
-  return pid < 0 ? groupAlive(pid) : pidState(pid) === "alive";
-}
-
 function signal(pid: number, signalName: NodeJS.Signals): void {
   try {
     process.kill(pid, signalName);
@@ -55,10 +51,23 @@ function signal(pid: number, signalName: NodeJS.Signals): void {
   }
 }
 
+interface StopOptions {
+  signalBudgetMs?: number;
+  pollMs?: number;
+  sendSignal?: (pid: number, signalName: NodeJS.Signals) => void;
+  readState?: typeof pidState;
+}
+
 export async function stopRealLaunch(
   child: Pick<ChildProcess, "pid">,
-  output: string
+  output: string,
+  options: StopOptions = {}
 ): Promise<StopReport> {
+  const signalBudgetMs = options.signalBudgetMs ?? SIGNAL_BUDGET_MS;
+  const pollMs = options.pollMs ?? POLL_MS;
+  const sendSignal = options.sendSignal ?? signal;
+  const readState = options.readState ?? pidState;
+  const alive = (pid: number): boolean => pid < 0 ? groupAlive(pid) : readState(pid) === "alive";
   const releasedPid = parseReleasedPid(output);
   const targets: { role: StopRole; pid: number }[] = [];
   if (releasedPid !== null) targets.push({ role: "released child", pid: releasedPid });
@@ -67,13 +76,13 @@ export async function stopRealLaunch(
 
   const started = Date.now();
   for (const signalName of ["SIGTERM", "SIGKILL"] as const) {
-    for (const target of targets) signal(target.pid, signalName);
-    const deadline = Date.now() + SIGNAL_BUDGET_MS;
+    for (const target of targets) sendSignal(target.pid, signalName);
+    const deadline = Date.now() + signalBudgetMs;
     do {
       if (targets.every((target) => !alive(target.pid))) {
         return { stopped: true, survivors: [], waitedMs: Date.now() - started };
       }
-      await new Promise((resolvePoll) => setTimeout(resolvePoll, POLL_MS));
+      await new Promise((resolvePoll) => setTimeout(resolvePoll, pollMs));
     } while (Date.now() < deadline);
   }
 
@@ -82,9 +91,9 @@ export async function stopRealLaunch(
     .map((target) => ({
       role: target.role,
       pid: target.pid < 0 ? -target.pid : target.pid,
-      state: target.pid < 0 ? "alive" : pidState(target.pid),
+      state: target.pid < 0 ? "alive" : readState(target.pid),
     }));
-  return { stopped: false, survivors, waitedMs: Date.now() - started };
+  return { stopped: survivors.length === 0, survivors, waitedMs: Date.now() - started };
 }
 
 /** The teardown assertion's message: every survivor by role, pid and state, and how
