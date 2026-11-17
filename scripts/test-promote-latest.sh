@@ -2061,11 +2061,33 @@ known_elapsed="$(node "$supervisor_log_parser" "$known_log" 2>"$work/known-parse
 assert_eq "BG known log: the parser reads the format" "2.50" "$known_elapsed"
 d="$(new_fixture supervisor-format)"
 cat >"$d/ignore-term.mjs" <<'IGNORE_TERM'
+import fs from 'node:fs';
 process.on('SIGTERM', () => {});
+// Written only after the handler is installed: a TERM that arrives first ends the
+// process by default before this line, so no marker means this run never tested
+// a child that ignores TERM.
+fs.writeFileSync(process.argv[2], 'ready');
 setInterval(() => {}, 250);
 IGNORE_TERM
-PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 0.5 0.5 -- "${NODE_BIN:-node}" "$d/ignore-term.mjs" >"$d/out.txt" 2>"$d/err.txt"
-bg_rc=$?
+# The supervisor sends TERM at its deadline whether or not the child has started, so
+# the KILL row below counts only for a run whose child confirmed its TERM handler
+# first; a start slower than the deadline retries with a longer one.
+bg_rc=0
+bg_ready=no
+for bg_deadline in 0.5 2 8; do
+  rm -f "$d/ready" "$d/supervisor.log"
+  bg_rc=0
+  PROMOTE_SUPERVISOR_LOG="$d/supervisor.log" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$bg_deadline" 0.5 -- "${NODE_BIN:-node}" "$d/ignore-term.mjs" "$d/ready" >"$d/out.txt" 2>"$d/err.txt" || bg_rc=$?
+  if [ -f "$d/ready" ]; then
+    bg_ready=yes
+    break
+  fi
+done
+if [ "$bg_ready" = yes ]; then
+  ok "BG fixture: the child held TERM before it came" "deadline ${bg_deadline} s"
+else
+  bad "BG fixture: the child held TERM before it came" "no ready marker at deadlines 0.5, 2 and 8 s; the rows below are not evidence"
+fi
 assert_eq "BG producer log: the timed call ends" 124 "$bg_rc"
 known_lines="$(sed -E 's/[0-9]+/<ms>/' "$known_log")"
 producer_lines="$(sed -E 's/[0-9]+/<ms>/' "$d/supervisor.log" 2>/dev/null)"
