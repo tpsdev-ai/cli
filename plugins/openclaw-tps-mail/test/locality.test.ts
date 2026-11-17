@@ -141,10 +141,9 @@ const obligations = {
   beforeScan: null as null | ((expectedReplyId: string | undefined) => void),
 };
 const realObligations = { ...obligationsModule };
-// cli#1006 r4: this mock is process-wide (bun's mock.module replaces the module
-// for every test file in the run), so the wrapper must be argument-faithful.
-// A fixed six-parameter wrapper dropped `expect`, which silently disabled the
-// obligation store's prior-state guard for the other files.
+// cli#1006 r4: bun's mock.module replacement is process-wide, so the wrapper is
+// what the other test files get too. A fixed six-parameter wrapper dropped
+// `expect` — the obligation store's prior-state guard — for those callers.
 const realTransition = realObligations.transitionObligation as (...args: any[]) => any;
 mock.module("../src/obligations.js", () => ({
   ...realObligations,
