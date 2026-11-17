@@ -1909,9 +1909,9 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
     if (!match) onReadError?.(curDir, "ENOENT");
     return match;
   } catch (err: any) {
-    // cli#1006: ENOENT here is a clean "no cur/ directory" only when the
-    // directory itself is absent. A dangling cur/ symlink also reads ENOENT
-    // but exists, so it is a lookup ERROR, not an absence.
+    // cli#1006: readdir's ENOENT is a clean "nothing to scan" only when the
+    // cur/ directory itself is absent. A dangling cur/ symlink also reads
+    // ENOENT but exists, so it is a lookup ERROR, not an absence.
     if (err?.code === "ENOENT" && !curDirAbsent(curDir)) {
       onReadError?.(curDir, "DANGLING_SYMLINK");
     } else {
@@ -2910,9 +2910,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // AMBIGUOUS_ID leaves the obligation untouched.
           let curLookupError: string | null = null;
           const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
-            // Only the scan's own clean "no cur/ directory" (ENOENT with the
-            // directory itself absent) is a miss; a dangling cur/ symlink or a
-            // listed file that is gone is a read error.
+            // Only the scan's clean signals — no matching entry, or the cur/
+            // directory itself absent — are a miss; a dangling cur/ symlink or
+            // a listed file that is gone is a read error.
             if (code === "ENOENT" && path === curDir) return;
             curLookupError ??= code ?? "INVALID_JSON";
           });
