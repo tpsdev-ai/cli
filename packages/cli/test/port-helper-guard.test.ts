@@ -553,7 +553,6 @@ export function analyzeSource(source: string, name: string): PortFinding[] {
           findings.push(finding);
         }
       }
-      break;
     }
   }
 
@@ -842,6 +841,21 @@ describe("port helper guard (cli#1025)", () => {
       { file: "repeated-cleanup.test.ts", name: "start", line: 4 },
     ]);
     expect(analyzeSource(source.replace("probe.close();", ""), "late-cleanup.test.ts")).toEqual([]);
+  });
+
+  test("reports a rebind after the close when an earlier bind of the same port precedes it", () => {
+    const source = `
+      function start() {
+        const probe = net.createServer();
+        probe.listen(0);
+        const port = probe.address().port;
+        contender.listen(port);
+        probe.close();
+        later.listen(port);
+      }`;
+    expect(analyzeSource(source, "earlier-bind.test.ts")).toEqual([
+      { file: "earlier-bind.test.ts", name: "start", line: 4 },
+    ]);
   });
 
   test("reports a rebind after repeated calls to a later close helper", () => {

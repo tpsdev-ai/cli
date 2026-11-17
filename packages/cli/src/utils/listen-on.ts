@@ -25,7 +25,7 @@ export interface Listenable extends ListenEmitter {
 }
 
 export interface ListenOnOptions {
-  /** Interface to bind; defaults to every interface. */
+  /** Interface to bind; defaults to "0.0.0.0" (every IPv4 interface). */
   host?: string;
   /** A second emitter that re-emits `server`'s errors, such as a WebSocketServer. */
   also?: ListenEmitter;
