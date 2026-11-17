@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -474,11 +474,35 @@ describe("validateSshReachable", () => {
   });
 
   test("reports full ssh command in error for debugging", () => {
+    // cli#1036: a real `ssh` to an unknown host waits on this host's resolver,
+    // for as long as the host takes: macOS looks a `.local` name up by multicast
+    // DNS (getaddrinfo measured 35 s on a darwin dev host, past bun's 5 s test
+    // limit), Linux runners fail it at once. The case is about the error message,
+    // so a stand-in `ssh` first on PATH fails the way an unresolvable host does:
+    // no resolver, no network, no ~/.ssh/config. It records its argv, so the
+    // case also proves the stand-in is what ran.
+    const fakeBin = join(TMP_HOME, "fake-bin");
+    const argvLog = join(fakeBin, "argv");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      join(fakeBin, "ssh"),
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argvLog)}\n` +
+        `echo "ssh: Could not resolve hostname $2: stand-in for an unresolvable host" >&2\nexit 255\n`
+    );
+    chmodSync(join(fakeBin, "ssh"), 0o755);
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${savedPath ?? ""}`;
+    let message = "";
     try {
       validateSshReachable("nonexistent-host.local");
     } catch (e: any) {
-      expect(e.message).toContain("ssh -- nonexistent-host.local exit 0");
-      expect(e.message).toContain("SSH reachability check failed");
+      message = e.message;
+    } finally {
+      if (savedPath === undefined) delete process.env.PATH;
+      else process.env.PATH = savedPath;
     }
+    expect(readFileSync(argvLog, "utf8")).toBe("--\nnonexistent-host.local\nexit\n0\n");
+    expect(message).toContain("ssh -- nonexistent-host.local exit 0");
+    expect(message).toContain("SSH reachability check failed");
   });
 });

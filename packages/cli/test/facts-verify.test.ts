@@ -21,6 +21,7 @@ import {
 } from "../src/utils/facts-verify.js";
 
 import { type ManifestEntry } from "../src/utils/facts-manifest.js";
+import { verifyBin } from "./helpers/verify-bin.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -185,7 +186,7 @@ describe("type coercion", () => {
     // `printf ""` outputs nothing
     const entry = makeEntry({
       type: "string",
-      verify: { command: "/usr/bin/test", args: ["-z", ""] },
+      verify: { command: verifyBin("test"), args: ["-z", ""] },
     });
     // test -z "" exits 0 with empty stdout
     const result = await runVerify(entry);
@@ -220,7 +221,7 @@ describe("runVerify — timeout", () => {
 describe("runVerify — nonzero exit", () => {
   test("false command returns nonzero_exit", async () => {
     const entry = makeEntry({
-      verify: { command: "/bin/false", args: [] },
+      verify: { command: verifyBin("false"), args: [] },
     });
     const result = await runVerify(entry);
     expect(result.ok).toBe(false);
