@@ -38,6 +38,7 @@ import {
   writeCache,
   setCachedValue,
 } from "../src/utils/facts-cache.js";
+import { verifyBin } from "./helpers/verify-bin.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -266,7 +267,7 @@ describe("get", () => {
     await runFacts({
       action: "register",
       name: "test.model",
-      command: "/bin/grep",
+      command: verifyBin("grep"),
       parsedArgs: ["MODEL=", fixture],
       type: "string",
       rationale: "Test model.",

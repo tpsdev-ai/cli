@@ -8,8 +8,10 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 import {
   runVerify,
@@ -21,6 +23,7 @@ import {
 } from "../src/utils/facts-verify.js";
 
 import { type ManifestEntry } from "../src/utils/facts-manifest.js";
+import { verifyBin } from "./helpers/verify-bin.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -185,11 +188,12 @@ describe("type coercion", () => {
     // `printf ""` outputs nothing
     const entry = makeEntry({
       type: "string",
-      verify: { command: "/usr/bin/test", args: ["-z", ""] },
+      verify: { command: verifyBin("test"), args: ["-z", ""] },
     });
     // test -z "" exits 0 with empty stdout
     const result = await runVerify(entry);
     // Empty stdout → invalid_type for string
+    expect(result.ok).toBe(false);
     if (!result.ok) {
       expect(result.reason).toBe("invalid_type");
     }
@@ -220,7 +224,7 @@ describe("runVerify — timeout", () => {
 describe("runVerify — nonzero exit", () => {
   test("false command returns nonzero_exit", async () => {
     const entry = makeEntry({
-      verify: { command: "/bin/false", args: [] },
+      verify: { command: verifyBin("false"), args: [] },
     });
     const result = await runVerify(entry);
     expect(result.ok).toBe(false);
@@ -327,6 +331,52 @@ describe("buildSpawnDescriptor", () => {
     const desc = buildSpawnDescriptor(entry);
     expect(desc.timeout_ms).toBe(10000);
   });
+});
+
+// ---------------------------------------------------------------------------
+// verifyBin (test helper, cli#1036)
+// ---------------------------------------------------------------------------
+
+describe("verifyBin", () => {
+  test("an absent name throws, naming the binary and the verify PATH", () => {
+    expect(() => verifyBin("tps-absent-bin-1036")).toThrow(
+      "tps-absent-bin-1036 is not on the facts verify PATH (/usr/bin:/bin) on this host"
+    );
+  });
+
+  test("a script only on the caller's PATH is not found: it searches the verify PATH alone", () => {
+    // Bun.which with no PATH option does not see a PATH set on process.env at
+    // runtime (measured on bun 1.3.10 and 1.4.4), so a script placed there could
+    // not catch a verifyBin that dropped its PATH. The caller's PATH is set where
+    // it counts instead: a child bun started with the script's directory first
+    // on PATH. The child also asks Bun.which with no PATH, which must FIND the
+    // script, so the throw is verifyBin keeping to /usr/bin:/bin, not a fixture
+    // nothing could see.
+    const dir = mkdtempSync(join(tmpdir(), "tps-verify-bin-"));
+    try {
+      const script = join(dir, "tps-absent-bin-1036");
+      writeFileSync(script, "#!/bin/sh\nexit 0\n");
+      chmodSync(script, 0o755);
+      const helper = fileURLToPath(new URL("./helpers/verify-bin.ts", import.meta.url));
+      const probe = `
+        const { verifyBin } = await import(${JSON.stringify(helper)});
+        let threw = null;
+        try { verifyBin("tps-absent-bin-1036"); } catch (e) { threw = e.message; }
+        console.log(JSON.stringify({ callerWhich: Bun.which("tps-absent-bin-1036"), threw }));
+      `;
+      const child = spawnSync(process.execPath, ["--eval", probe], {
+        encoding: "utf8",
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` },
+        timeout: 15_000,
+      });
+      expect(child.status, child.stderr).toBe(0);
+      const seen = JSON.parse(child.stdout.trim().split("\n").pop()!);
+      expect(seen.callerWhich && realpathSync(seen.callerWhich)).toBe(realpathSync(script));
+      expect(seen.threw).toBe("tps-absent-bin-1036 is not on the facts verify PATH (/usr/bin:/bin) on this host");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 });
 
 // ---------------------------------------------------------------------------
