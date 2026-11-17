@@ -425,7 +425,7 @@ const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
 const FIXTURE = "test/fixtures/heartbeat-openclaw";
 const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
 
-/** The absolute bash the lane resolves, used to build a PATH that contains it. */
+/** Host Bash used directly or as a wrapper target. */
 function realBash(): string {
   const found = spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" });
   const bashBin = found.status === 0 ? found.stdout.trim() : "";
@@ -628,7 +628,7 @@ describe("the local fallback installs from the committed fixture lock", () => {
     }
   }, 60_000);
 
-  test("a probe that cannot launch bash is a named error, not an npm fallback", () => {
+  test("an explicit non-executable bash override fails the probe with EACCES", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-install-probe-fail-"));
     try {
       const notExecutable = join(root, "bash");
@@ -648,6 +648,107 @@ describe("the local fallback installs from the committed fixture lock", () => {
       expect(reported).toBeInstanceOf(Error);
       expect((reported as Error).message).toBe(`sfw probe cannot launch bash at ${notExecutable}: EACCES`);
       expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty PATH entry selects bash from the helper working directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-empty-"));
+    try {
+      const bashBin = join(root, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `:${dirname(realBash())}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe(bashBin);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["directory", "non-executable file"])("skips a %s named bash before a valid executable", (kind) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-skip-"));
+    try {
+      const first = join(root, "first");
+      const valid = join(root, "valid");
+      mkdirSync(first);
+      mkdirSync(valid);
+      if (kind === "directory") mkdirSync(join(first, "bash"));
+      else {
+        writeFileSync(join(first, "bash"), "#!/bin/sh\nexit 0\n");
+        chmodSync(join(first, "bash"), 0o644);
+      }
+      const bashBin = join(valid, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `${first}:${valid}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe(bashBin);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a PATH without bash names the resolver refusal before installing", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-missing-"));
+    try {
+      const { calls, spawnInstall } = recordingSpawn();
+      expect(() => installOpenClaw(join(root, "run"), { pathEnv: root, spawn: spawnInstall })).toThrow(
+        `no executable bash on the install PATH: tried ${join(root, "bash")}`,
+      );
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["unexpected exit", "exit 23", "exited with status 23"],
+    ["signal", 'kill -TERM "$$"', "was killed by SIGTERM"],
+    ["ENOENT", null, "ENOENT"],
+  ])("a probe %s is a named failure before installing", (_kind, script, detail) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-probe-outcome-"));
+    try {
+      const bashBin = join(root, "bash");
+      if (script !== null) {
+        writeFileSync(bashBin, `#!/bin/sh\nexec ${JSON.stringify(realBash())} -c ${JSON.stringify(script)}\n`);
+        chmodSync(bashBin, 0o755);
+      }
+      const { calls, spawnInstall } = recordingSpawn();
+      const message = script === null
+        ? `sfw probe cannot launch bash at ${bashBin}: ${detail}`
+        : `sfw probe with bash at ${bashBin} ${detail}`;
+      expect(() => installOpenClaw(join(root, "run"), { bashPath: bashBin, spawn: spawnInstall })).toThrow(message);
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["error", { status: null, error: Object.assign(new Error("missing"), { code: "ENOENT" }) }],
+    ["signal", { status: null, signal: "SIGTERM" }],
+  ])("an install %s names bash and its outcome", (kind, outcome) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-outcome-"));
+    try {
+      const bashBin = realBash();
+      let installs = 0;
+      let reported: unknown;
+      try {
+        installOpenClaw(root, { bashPath: bashBin, pathEnv: root, spawn: () => {
+          installs++;
+          return outcome;
+        } });
+      } catch (error) {
+        reported = error;
+      }
+      expect(installs).toBe(1);
+      expect(reported).toBeInstanceOf(Error);
+      expect((reported as Error).message).toBe(kind === "error"
+        ? `tracked-lock install cannot launch bash at ${bashBin}: ENOENT`
+        : `tracked-lock install with bash at ${bashBin} was killed by SIGTERM`);
+      expect((reported as Error).message).not.toContain("status null");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
