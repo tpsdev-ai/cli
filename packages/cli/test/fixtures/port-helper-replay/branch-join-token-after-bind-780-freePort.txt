@@ -1,0 +1,27 @@
+function holdPort(): Promise<{ server: net.Server; port: number }> {
+  return new Promise((resolvePort, rejectPort) => {
+    const server = net.createServer();
+    server.once("error", rejectPort);
+    server.listen(0, "0.0.0.0", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        rejectPort(new Error("no address"));
+        return;
+      }
+      resolvePort({ server, port: address.port });
+    });
+  });
+}
+
+async function closeServer(server: net.Server): Promise<void> {
+  await new Promise<void>((resolveClose, rejectClose) => {
+    server.close((error) => (error ? rejectClose(error) : resolveClose()));
+  });
+}
+
+async function freePort(): Promise<number> {
+  const { server, port } = await holdPort();
+  await closeServer(server);
+  return port;
+}

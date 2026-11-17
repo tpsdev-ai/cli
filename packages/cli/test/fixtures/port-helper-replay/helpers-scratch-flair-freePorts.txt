@@ -1,0 +1,16 @@
+async function freePorts(count: number): Promise<number[]> {
+  const servers: ReturnType<typeof createServer>[] = [];
+  try {
+    for (let index = 0; index < count; index++) {
+      const server = createServer();
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      servers.push(server);
+    }
+    return servers.map((server) => (server.address() as AddressInfo).port);
+  } finally {
+    await Promise.all(servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
+  }
+}
