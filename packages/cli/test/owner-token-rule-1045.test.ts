@@ -1,12 +1,13 @@
 /**
- * cli#1045 — the cli's own owner classifiers use the agent package's one token
+ * cli#1045 — the cli owner classifiers changed here use the agent package's one token
  * rule (classifyOwnerToken): a live pid whose recorded `ps:` token differs is
  * unverifiable, never dead; a differing `proc:` token is still pid reuse.
  *
  * Covered: the outbox per-delivery lock (`tryAcquireMailLock`) and the launch
  * snapshot sweep (`sweepStaleLaunchSnapshots`). The `ps:` cases send
- * processStartToken to its `ps` fallback through the agent's start-token seam,
- * and the `proc:` cases stage `proc:` tokens through it, so both run the same on
+ * processStartToken to its `ps` fallback through a test-only `node:fs`
+ * substitution (test/helpers/start-token-source-test.ts), and the `proc:` cases
+ * stage `proc:` tokens through it, so both run the same on
  * Linux and macOS.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -20,7 +21,7 @@ import { forcePsStartTokens, stageProcStartTokens } from "../../../test/helpers/
 import { LAUNCH_SNAPSHOT_OWNER_FILE, LAUNCH_SNAPSHOT_PREFIX, sweepStaleLaunchSnapshots } from "../src/utils/launch-snapshots.js";
 import { MailLockOwnerError, tryAcquireMailLock } from "../src/utils/mail-lock.js";
 
-/** A POSIX zone at UTC+13:17, an offset no host's local time uses. */
+/** An intentionally non-UTC POSIX zone (UTC+13:17). */
 const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
 
 /**

@@ -46,7 +46,7 @@ const PACIFIC_ENV = { ...process.env, TZ: "America/Los_Angeles" };
 const UTC_ENV = { ...process.env, TZ: "UTC" };
 const UTC_GERMAN_ENV = { ...process.env, TZ: "UTC", LC_ALL: "de_DE.UTF-8" };
 const READER_ENVS = [PACIFIC_ENV, UTC_ENV, UTC_GERMAN_ENV];
-/** A POSIX zone at UTC+13:17, an offset no host's local time uses. */
+/** An intentionally non-UTC POSIX zone (UTC+13:17). */
 const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
 
 /** `pid`'s token, read through the real processStartToken in a child started with `env` and `preloadArgs`. */
