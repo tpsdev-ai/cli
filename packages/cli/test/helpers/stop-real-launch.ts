@@ -2,11 +2,12 @@
  * Teardown for a fixture that launched a real-nono session (cli#1037).
  *
  * Tracked targets receive SIGTERM; if any remains alive after the wait, all tracked targets receive SIGKILL.
- * Liveness is the CLI's own classifier, `pidState`: a Linux process in
+ * Positive-pid liveness uses the CLI's `pidState`: a Linux process in
  * state Z has exited even when `kill(pid, 0)` still succeeds for it.
  * An orphaned child can remain unreaped as a zombie in the Docker lane, so a bare `kill(pid, 0)` probe can count it as a survivor and exhaust both waits.
  */
-import type { ChildProcess } from "node:child_process";
+import { type ChildProcess, execFileSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
 import { pidState } from "@tpsdev-ai/agent";
 
 export type StopRole = "released child" | "launcher" | "launcher process group";
@@ -14,7 +15,7 @@ export type StopRole = "released child" | "launcher" | "launcher process group";
 export interface StopSurvivor {
   role: StopRole;
   pid: number;
-  /** `pidState`'s classification for a positive pid; "alive" for a group probe. */
+  /** "alive" for a surviving group; otherwise pidState's classification. */
   state: string;
 }
 
@@ -32,8 +33,50 @@ function parseReleasedPid(output: string): number | null {
   return match ? Number(match[1]) : null;
 }
 
-/** A process group is probed with `kill(-pgid, 0)`: it reports the group, not
- * one pid, so `pidState`'s single-pid classification does not apply. */
+/** Null keeps the kill probe when membership cannot be read. */
+export function listGroupMembers(pgid: number): number[] | null {
+  try {
+    if (process.platform === "linux") {
+      const members: number[] = [];
+      for (const entry of readdirSync("/proc")) {
+        if (!/^\d+$/.test(entry)) continue;
+        let stat: string;
+        try {
+          stat = readFileSync(`/proc/${entry}/stat`, "utf8");
+        } catch (error) {
+          // A process can disappear during the scan; other errors leave membership unknown.
+          if (["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) continue;
+          return null;
+        }
+        const end = stat.lastIndexOf(")");
+        if (end < 0) return null;
+        const fields = stat.slice(end + 2).trim().split(/\s+/);
+        const group = Number(fields[2]);
+        if (!Number.isSafeInteger(group) || group < 0) return null;
+        if (group === pgid) members.push(Number(entry));
+      }
+      return members;
+    }
+    if (process.platform === "darwin") {
+      // Explicit PGID matching avoids ps selection flags' session/terminal semantics.
+      const output = execFileSync("ps", ["-axo", "pid=,pgid=,stat="], {
+        encoding: "utf8", timeout: 2_000, stdio: ["ignore", "pipe", "ignore"],
+      });
+      const members: number[] = [];
+      for (const line of output.trim().split("\n")) {
+        const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*$/.exec(line);
+        if (!match) return null;
+        // macOS pidState lacks /proc, so exclude ps's exited state before probing.
+        if (Number(match[2]) === pgid && !match[3].startsWith("Z")) members.push(Number(match[1]));
+      }
+      return members;
+    }
+  } catch {
+    /* fall back to the group probe */
+  }
+  return null;
+}
+
 function groupAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -56,6 +99,7 @@ interface StopOptions {
   pollMs?: number;
   sendSignal?: (pid: number, signalName: NodeJS.Signals) => void;
   readState?: typeof pidState;
+  listGroupMembers?: typeof listGroupMembers;
 }
 
 export async function stopRealLaunch(
@@ -67,7 +111,13 @@ export async function stopRealLaunch(
   const pollMs = options.pollMs ?? POLL_MS;
   const sendSignal = options.sendSignal ?? signal;
   const readState = options.readState ?? pidState;
-  const alive = (pid: number): boolean => pid < 0 ? groupAlive(pid) : readState(pid) === "alive";
+  const membersOf = options.listGroupMembers ?? listGroupMembers;
+  const state = (pid: number): ReturnType<typeof pidState> => {
+    if (pid >= 0) return readState(pid);
+    const members = membersOf(-pid);
+    const alive = members === null ? groupAlive(pid) : members.some((member) => readState(member) === "alive");
+    return alive ? "alive" : "gone";
+  };
   const releasedPid = parseReleasedPid(output);
   const targets: { role: StopRole; pid: number }[] = [];
   if (releasedPid !== null) targets.push({ role: "released child", pid: releasedPid });
@@ -79,7 +129,7 @@ export async function stopRealLaunch(
     for (const target of targets) sendSignal(target.pid, signalName);
     const deadline = Date.now() + signalBudgetMs;
     do {
-      if (targets.every((target) => !alive(target.pid))) {
+      if (targets.every((target) => state(target.pid) !== "alive")) {
         return { stopped: true, survivors: [], waitedMs: Date.now() - started };
       }
       await new Promise((resolvePoll) => setTimeout(resolvePoll, pollMs));
@@ -87,12 +137,12 @@ export async function stopRealLaunch(
   }
 
   const survivors = targets
-    .filter((target) => alive(target.pid))
     .map((target) => ({
       role: target.role,
       pid: target.pid < 0 ? -target.pid : target.pid,
-      state: target.pid < 0 ? "alive" : readState(target.pid),
-    }));
+      state: state(target.pid),
+    }))
+    .filter((target) => target.state === "alive");
   return { stopped: survivors.length === 0, survivors, waitedMs: Date.now() - started };
 }
 

@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pidState } from "@tpsdev-ai/agent";
-import { formatStopFailure, stopRealLaunch, type StopReport } from "./helpers/stop-real-launch.js";
+import { formatStopFailure, listGroupMembers, stopRealLaunch, type StopReport } from "./helpers/stop-real-launch.js";
 
 describe("real-launch teardown reporting (cli#1037)", () => {
   test("survivors are named by role, pid and state, with the wait", () => {
@@ -67,6 +67,92 @@ async function waitUntil(check: () => boolean): Promise<void> {
 }
 
 describe("stopRealLaunch (cli#1037)", () => {
+  test("the final survivor entry uses one state observation", async () => {
+    let reads = 0;
+    const report = await stopRealLaunch({}, released(4242), {
+      signalBudgetMs: 0,
+      pollMs: 1,
+      sendSignal: () => {},
+      readState: () => ++reads <= 3 ? "alive" : "gone",
+    });
+    expect(reads).toBe(3);
+    expect(report.survivors).toEqual([{ role: "released child", pid: 4242, state: "alive" }]);
+    expect(report.stopped).toBe(false);
+    expect(report.stopped).toBe(report.survivors.length === 0);
+  });
+
+  test("a zombie-only group has stopped", async () => {
+    const launcher = await sleepingChild(true);
+    try {
+      expect(() => process.kill(-launcher.pid!, 0)).not.toThrow();
+      const report = await stopRealLaunch(launcher, "", {
+        signalBudgetMs: 0,
+        pollMs: 1,
+        sendSignal: () => {},
+        listGroupMembers: (pgid) => {
+          expect(pgid).toBe(launcher.pid);
+          return [launcher.pid!];
+        },
+        // pidState maps a Linux zombie to gone while the group kill probe still succeeds.
+        readState: () => "gone",
+      });
+      expect(report.survivors).toEqual([]);
+      expect(report.stopped).toBe(true);
+    } finally {
+      await killChild(launcher);
+    }
+  });
+
+  test("a group with a live member remains a survivor", async () => {
+    const report = await stopRealLaunch({ pid: 4242 }, "", {
+      signalBudgetMs: 0,
+      pollMs: 1,
+      sendSignal: () => {},
+      listGroupMembers: (pgid) => {
+        expect(pgid).toBe(4242);
+        return [4242, 4243];
+      },
+      readState: (pid) => pid === 4243 ? "alive" : "gone",
+    });
+    expect(report.survivors).toEqual([{ role: "launcher process group", pid: 4242, state: "alive" }]);
+    expect(report.stopped).toBe(false);
+  });
+
+  test("unreadable group membership retains the kill probe", async () => {
+    const launcher = await sleepingChild(true);
+    try {
+      const report = await stopRealLaunch(launcher, "", {
+        signalBudgetMs: 0,
+        pollMs: 1,
+        sendSignal: () => {},
+        listGroupMembers: () => null,
+        readState: () => "gone",
+      });
+      expect(report.survivors).toEqual([{ role: "launcher process group", pid: launcher.pid, state: "alive" }]);
+      expect(report.stopped).toBe(false);
+    } finally {
+      await killChild(launcher);
+    }
+  });
+
+  const psAvailable = process.platform !== "darwin" || spawnSync("ps", ["-axo", "pid=,pgid=,stat="], { stdio: "ignore" }).status === 0;
+  test.skipIf(!psAvailable)("the real group lister finds a detached launcher", async () => {
+    const launcher = await sleepingChild(true);
+    try {
+      expect(listGroupMembers(launcher.pid!)).toContain(launcher.pid!);
+      const report = await stopRealLaunch(launcher, "", {
+        signalBudgetMs: 0,
+        pollMs: 1,
+        sendSignal: () => {},
+        readState: () => "gone",
+      });
+      expect(report.survivors).toEqual([]);
+      expect(report.stopped).toBe(true);
+    } finally {
+      await killChild(launcher);
+    }
+  });
+
   test("the final check confirms a target gone after the in-loop checks", async () => {
     const child = await sleepingChild();
     let reads = 0;
@@ -181,6 +267,7 @@ describe("stopRealLaunch (cli#1037)", () => {
     const gate = join(root, "gate");
     writeFileSync(gate, "hold");
     const holder = spawn("sh", ["-c", 'while [ -e "$1" ]; do sleep 0.01; done & printf "%s\\n" "$!"; exec sleep 60', "sh", gate], {
+      detached: true,
       stdio: ["ignore", "pipe", "ignore"],
     });
     const launcher = await sleepingChild();
@@ -196,9 +283,13 @@ describe("stopRealLaunch (cli#1037)", () => {
       await waitUntil(() => readFileSync(`/proc/${zombiePid}/stat`, "utf8").split(") ")[1]?.startsWith("Z ") === true);
       expect(() => process.kill(zombiePid, 0)).not.toThrow();
       expect(pidState(zombiePid)).toBe("gone");
+      expect(listGroupMembers(holder.pid!)).toContain(zombiePid);
       const report = await stopRealLaunch(launcher, released(zombiePid), { signalBudgetMs: 10, pollMs: 1 });
       expect(report.stopped).toBe(true);
       expect(report.survivors).toEqual([]);
+      const groupReport = await stopRealLaunch(holder, "", { signalBudgetMs: 10, pollMs: 1 });
+      expect(groupReport.stopped).toBe(true);
+      expect(groupReport.survivors).toEqual([]);
     } finally {
       rmSync(root, { recursive: true, force: true });
       await Promise.all([killChild(holder), killChild(launcher)]);
