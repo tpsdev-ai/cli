@@ -951,9 +951,12 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
-/** Re-read a record whose state could not be established, and re-arm its
- *  deadline while it is live. Also called when a settlement write was refused
- *  on a LIVE record (cli#1006 r10). */
+/** SCHEDULE a retry that re-reads the record and re-arms its deadline while it
+ *  is live. Also called when a settlement write was refused on a LIVE record
+ *  (cli#1006 r10). The retry is scheduled, not guaranteed: it removes its own
+ *  timer before re-arming, and an arm refused twice or a store write that
+ *  throws on lock contention leaves the record without a timer. An arm failure
+ *  inside that retry is not re-tried by this change (a follow-up). */
 function retryObligationRead(ctx: YieldContext, obligationId: string): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const timer = accountTimer(ctx, () => {
@@ -1170,9 +1173,10 @@ async function settleObligation(
         // cli#1006 r10: readObligationForCleanup released a terminal or gone
         // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
         // needs its deadline re-armed — the fired one is already disarmed, and
-        // a past-deadline startup settlement never had one — so re-read and
-        // re-arm, and the deadline rescans the evidence instead of reusing this
-        // decision.
+        // a past-deadline startup settlement never had one — so schedule the
+        // retry that re-reads and re-arms it. When that re-arm lands, the
+        // deadline rescans the evidence instead of reusing this decision; an
+        // arm failure inside the retry is not re-tried here (a follow-up).
         const cur = result.status === "found" ? result.record : null;
         const live = cur !== null && !TERMINAL_STATES.has(cur.state);
         ctx.log?.warn?.(
@@ -1236,9 +1240,10 @@ async function settleObligation(
     // cli#1006 r10: readObligationForCleanup released a terminal or gone
     // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
     // keeps no timer here — the fired deadline is already disarmed, and a
-    // past-deadline startup settlement never had one — so re-read and re-arm
-    // it, and the deadline rescans the evidence instead of reusing this
-    // decision.
+    // past-deadline startup settlement never had one — so schedule the retry
+    // that re-reads and re-arms it. When that re-arm lands, the deadline
+    // rescans the evidence instead of reusing this decision; an arm failure
+    // inside the retry is not re-tried here (a follow-up).
     const cur = result.status === "found" ? result.record : null;
     const live = cur !== null && !TERMINAL_STATES.has(cur.state);
     ctx.log?.warn?.(

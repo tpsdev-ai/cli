@@ -1374,6 +1374,43 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }
 
+  /**
+   * cli#1006 r11: fill cur/ past the 4096-name scan limit with unrelated,
+   * terminal-stamped entries, then place `record` in a file that readdir lists
+   * at index >= 4096. The position is MEASURED: names are probed in batches and
+   * the first one past the boundary carries the record. Returns that file's name.
+   */
+  function placeCurPastScanBoundary(record: object): string {
+    const dir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(dir, { recursive: true });
+    const ackedAt = new Date(0).toISOString();
+    for (let i = 0; i < 4100; i++) {
+      writeFileSync(
+        resolve(dir, `zz-other-${i}.json`),
+        JSON.stringify({ id: `other-${i}`, envelope: { messageId: `env-other-${i}` }, ackedAt }),
+      );
+    }
+    for (let batch = 0; batch < 10; batch++) {
+      const probes: string[] = [];
+      for (let i = 0; i < 200; i++) {
+        const name = `zzz-probe-${batch}-${i}.json`;
+        writeFileSync(
+          resolve(dir, name),
+          JSON.stringify({ id: `probe-${batch}-${i}`, envelope: { messageId: `env-probe-${batch}-${i}` }, ackedAt }),
+        );
+        probes.push(name);
+      }
+      const order = readdirSync(dir);
+      const placed = probes.find((name) => order.indexOf(name) >= 4096);
+      if (placed) {
+        writeFileSync(resolve(dir, placed), JSON.stringify(record), "utf-8");
+        expect(order.indexOf(placed), "the record's file is past the first 4096 names in readdir order").toBeGreaterThanOrEqual(4096);
+        return placed;
+      }
+    }
+    throw new Error("could not place the record past the first 4096 names in readdirSync order on this filesystem");
+  }
+
   it("with the deadline passed, settles from the record: terminal, named reason, one nack, no dispatch", async () => {
     seedSigningKeys();
     const inboundId = "msg-orphan-past";
@@ -2120,6 +2157,33 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally { await h.stop(); }
   }, 40000);
 
+  it("r11 startup's cur/ scan finds its record beyond the scan boundary", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-startup-beyond-boundary";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: 60000, envelopeId });
+    placeCurPastScanBoundary({
+      id: inboundId,
+      from: SENDER,
+      to: AGENT,
+      body: signedBody,
+      timestamp: new Date().toISOString(),
+      read: false,
+    });
+
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "the startup scan finds the record past the boundary and arms its deadline",
+      ).toBe(true);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(0);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the entry is not missing").toBeUndefined();
+    } finally { await h.stop(); }
+  }, 60000);
+
   it("r10 startup past the scan limit still reports SCAN_LIMIT when no match proves absence", async () => {
     seedSigningKeys();
     const inboundId = "msg-startup-scan-limit-absent";
@@ -2170,6 +2234,59 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
     }, 40000);
   }
+
+  it("r11 a retry after a refused write rescans the receipts: one placed before it fires acks", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-retry-receipt";
+    const replyId = "reply-retry-receipt";
+    const { obligationId, envelopeId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    let injected = false;
+    let receiptWritten = false;
+    let stateWhenReceiptLanded: string | undefined;
+    const writeLateReceipt = (): void => {
+      const now = new Date().toISOString();
+      const chain: ChainEntry[] = [
+        { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+        { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+      ];
+      const signedReply = signEnvelope(
+        { v: 1, from: AGENT, to: SENDER, body: "late reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+        { [AGENT]: ANVIL_SEED },
+      );
+      stateWhenReceiptLanded = obligationFile(AGENT, inboundId)?.state;
+      writeReceipt(tempMailDir, AGENT, {
+        replyId,
+        obligationId,
+        replyToId: envelopeId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signedReply),
+      });
+      receiptWritten = true;
+    };
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeTransitionForTests(undefined);
+      transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId });
+      // The outer write is refused once this hook returns; the receipt lands
+      // 100 ms after that refusal, well inside the retry's one-second delay.
+      setTimeout(writeLateReceipt, 100);
+    });
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(await pollUntil(() => receiptWritten, 15000), "the receipt landed after the refusal").toBe(true);
+      expect(stateWhenReceiptLanded, "the refused record was still live when the receipt landed").toBe("posted");
+      expect(warnings.some((line) => line.includes("refusing to record")), "the guarded write was refused").toBe(true);
+
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "acked", 15000),
+        "the retry rescans the receipts and acks from the one that landed after the refusal",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "an ack sends no nack").toHaveLength(0);
+    } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+  }, 40000);
 });
 
 

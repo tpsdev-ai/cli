@@ -564,7 +564,9 @@ const KNOWN_OBLIGATION_STATES = new Set([
   "failed",
 ]);
 
-/** Paths already warned about in this process, so repeated checks in the same process log each unreadable obligation path once. */
+/** Paths already warned about in this process: at most one warning per path per
+ *  process, whatever the reason — a later reason for the same path is
+ *  suppressed. */
 const warnedObligationArchiveReads = new Set<string>();
 
 function warnObligationArchiveRead(path: string, code: string | undefined): void {
