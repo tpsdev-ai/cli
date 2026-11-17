@@ -243,7 +243,7 @@ export async function listenForJoin(
   branchKeyPair: TpsKeyPair,
   port: number,
   timeoutMs: number = 120_000,
-  onListening?: () => void
+  onListening?: (port: number) => void
 ): Promise<{
   channel: TransportChannel;
   server: TransportServer;
@@ -331,7 +331,7 @@ export async function listenForJoin(
   });
   // Bound: report it before waiting for the join, so a caller never advertises a
   // port that is not accepting connections.
-  onListening?.();
+  onListening?.(wrapper.port());
 
   const timeoutP =
     timeoutMs > 0

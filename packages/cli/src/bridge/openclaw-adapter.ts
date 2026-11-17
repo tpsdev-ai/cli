@@ -13,6 +13,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { BridgeAdapter, BridgeEnvelope } from "./adapter.js";
+import { listenOn } from "../utils/listen-on.js";
 import snooplogg from "snooplogg";
 const { log: slog } = snooplogg("tps:bridge:openclaw");
 
@@ -146,12 +147,14 @@ export class OpenClawAdapter implements BridgeAdapter {
       res.end(JSON.stringify({ error: "Not found" }));
     });
 
-    await new Promise<void>((resolve) => {
-      this.server!.listen(this.port, "127.0.0.1", () => {
-        this.log(`[openclaw] Listening on http://127.0.0.1:${this.port}`);
-        resolve();
-      });
+    await listenOn(this.server!, this.port, {
+      host: "127.0.0.1",
+      onError: (error) => {
+        this.log(`[openclaw] listener failed: ${error.message}`);
+        void this.stop();
+      },
     });
+    this.log(`[openclaw] Listening on http://127.0.0.1:${this.port}`);
   }
 
   async send(envelope: BridgeEnvelope): Promise<void> {

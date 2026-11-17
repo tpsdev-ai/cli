@@ -46,6 +46,7 @@ import { getInbox } from "../src/utils/mail.js";
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import { decodeWireMessage, encodeWireMessage } from "../src/utils/wire-frame.js";
 import { writeKeyFile } from "./helpers/stub-flair.js";
+import { listeningPort } from "./helpers/port.js";
 import { readSentEnvelope, SENT_ENVELOPE_TTL_MS, storeSentEnvelope } from "../src/utils/sent-envelope.js";
 import { signEnvelope, type ChainEntry, type Envelope, type FlairClient } from "@tpsdev-ai/agent";
 import * as ed from "@noble/ed25519";
@@ -97,22 +98,8 @@ let branch: BranchServer;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-async function freePort(): Promise<number> {
-  return new Promise((resolvePort, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const addr = s.address();
-      if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-      const p = addr.port;
-      s.close(() => resolvePort(p));
-    });
-    s.once("error", reject);
-  });
-}
-
 async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer> {
   branch = { deliveries: [], acceptErrors: [] };
-  port = await freePort();
   httpServer = createServer();
   connections = new Set();
   httpServer.on("connection", (socket) => {
@@ -176,7 +163,8 @@ async function startBranchServer(behavior: BranchBehavior): Promise<BranchServer
     });
   });
 
-  await new Promise<void>((done) => httpServer!.listen(port, "127.0.0.1", () => done()));
+  await new Promise<void>((done) => httpServer!.listen(0, "127.0.0.1", () => done()));
+  port = listeningPort(httpServer!);
   return branch;
 }
 

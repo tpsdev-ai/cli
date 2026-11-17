@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join, resolve, isAbsolute, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { withPortRetry } from "./helpers/port.js";
 
 const REPO = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 
@@ -69,15 +70,12 @@ function fakeConnect(event: string, value?: unknown) {
 }
 
 async function refusedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen(0, "127.0.0.1", () => resolveListen());
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("listener has no port");
-  await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-  return address.port;
+  // The port must refuse connections now: probe it after the listener closes,
+  // and choose another if something took it in between.
+  const { port } = await withPortRetry(async (port) => {
+    await assertPortClosed(port);
+  }, { retryOn: () => true });
+  return port;
 }
 
 describe("the dead-gateway precondition accepts only a refused connection", () => {

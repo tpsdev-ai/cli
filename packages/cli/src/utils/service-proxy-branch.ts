@@ -22,6 +22,7 @@ import { createServer, type Server } from "node:http";
 import type { TransportChannel, TpsMessage } from "./transport.js";
 import { MSG_SERVICE_REQUEST, MSG_SERVICE_RESPONSE } from "./wire-mail.js";
 import type { HttpRequestBody, HttpResponseBody } from "./wire-mail.js";
+import { listenOn } from "./listen-on.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_BODY_BYTES = 1024 * 1024; // 1MB
@@ -45,10 +46,10 @@ export interface ServiceProxySet {
  * @param services - list of services advertised by the host
  * @param channel - active tunnel channel
  */
-export function startServiceProxies(
+export async function startServiceProxies(
   services: Array<{ name: string; localPort: number; description?: string }>,
   channel: TransportChannel,
-): ServiceProxySet {
+): Promise<ServiceProxySet> {
   type PendingEntry = {
     resolve: (r: HttpResponseBody) => void;
     reject: (e: Error) => void;
@@ -73,95 +74,6 @@ export function startServiceProxies(
   const servers: Server[] = [];
   const handles: ServiceProxyHandle[] = [];
 
-  for (const svc of services) {
-    const serviceName = svc.name;
-
-    const server = createServer(async (req, res) => {
-      const reqId = randomUUID();
-
-      // Read and cap request body
-      const chunks: Buffer[] = [];
-      let totalBytes = 0;
-      for await (const chunk of req) {
-        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        totalBytes += buf.length;
-        if (totalBytes > MAX_BODY_BYTES) {
-          res.writeHead(413, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "request body too large" }));
-          return;
-        }
-        chunks.push(buf);
-      }
-      const bodyStr = Buffer.concat(chunks).toString("utf-8");
-      let path: string;
-      try {
-        path = decodeURIComponent(req.url ?? "/");
-      } catch {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "invalid proxy path encoding" }));
-        return;
-      }
-
-      // Validate path
-      if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "invalid proxy path" }));
-        return;
-      }
-
-      // Forward headers (flat string values only)
-      const headers = Object.fromEntries(
-        Object.entries(req.headers).flatMap(([k, v]) =>
-          typeof v === "string" ? [[k, v] as const] : [],
-        ),
-      );
-
-      const proxyReq: HttpRequestBody = {
-        reqId,
-        service: serviceName,
-        method: req.method ?? "GET",
-        path,
-        headers,
-        body: bodyStr || undefined,
-      };
-
-      try {
-        const response = await new Promise<HttpResponseBody>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            pending.delete(reqId);
-            reject(new Error("proxy timeout"));
-          }, DEFAULT_TIMEOUT_MS);
-
-          pending.set(reqId, { resolve, reject, timer });
-          void channel.send({
-            type: MSG_SERVICE_REQUEST,
-            seq: 0,
-            ts: new Date().toISOString(),
-            body: proxyReq,
-          }).catch((err) => {
-            clearTimeout(timer);
-            pending.delete(reqId);
-            reject(err instanceof Error ? err : new Error(String(err)));
-          });
-        });
-
-        res.writeHead(response.status, response.headers);
-        res.end(response.body ?? "");
-      } catch {
-        res.writeHead(502, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: `proxy error: ${serviceName}` }));
-      }
-    });
-
-    server.listen(svc.localPort, "127.0.0.1");
-    servers.push(server);
-    handles.push({
-      name: serviceName,
-      port: svc.localPort,
-      close: () => server.close(),
-    });
-  }
-
   const failAll = () => {
     for (const [reqId, entry] of pending) {
       clearTimeout(entry.timer);
@@ -169,6 +81,111 @@ export function startServiceProxies(
       pending.delete(reqId);
     }
   };
+
+  try {
+    for (const svc of services) {
+      const serviceName = svc.name;
+
+      const server = createServer(async (req, res) => {
+        const reqId = randomUUID();
+
+        // Read and cap request body
+        const chunks: Buffer[] = [];
+        let totalBytes = 0;
+        for await (const chunk of req) {
+          const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          totalBytes += buf.length;
+          if (totalBytes > MAX_BODY_BYTES) {
+            res.writeHead(413, { "content-type": "application/json" });
+            res.end(JSON.stringify({ error: "request body too large" }));
+            return;
+          }
+          chunks.push(buf);
+        }
+        const bodyStr = Buffer.concat(chunks).toString("utf-8");
+        let path: string;
+        try {
+          path = decodeURIComponent(req.url ?? "/");
+        } catch {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid proxy path encoding" }));
+          return;
+        }
+
+        // Validate path
+        if (!path.startsWith("/") || path.startsWith("//") || path.includes("..")) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "invalid proxy path" }));
+          return;
+        }
+
+        // Forward headers (flat string values only)
+        const headers = Object.fromEntries(
+          Object.entries(req.headers).flatMap(([k, v]) =>
+            typeof v === "string" ? [[k, v] as const] : [],
+          ),
+        );
+
+        const proxyReq: HttpRequestBody = {
+          reqId,
+          service: serviceName,
+          method: req.method ?? "GET",
+          path,
+          headers,
+          body: bodyStr || undefined,
+        };
+
+        try {
+          const response = await new Promise<HttpResponseBody>((resolve, reject) => {
+            const timer = setTimeout(() => {
+              pending.delete(reqId);
+              reject(new Error("proxy timeout"));
+            }, DEFAULT_TIMEOUT_MS);
+
+            pending.set(reqId, { resolve, reject, timer });
+            void channel.send({
+              type: MSG_SERVICE_REQUEST,
+              seq: 0,
+              ts: new Date().toISOString(),
+              body: proxyReq,
+            }).catch((err) => {
+              clearTimeout(timer);
+              pending.delete(reqId);
+              reject(err instanceof Error ? err : new Error(String(err)));
+            });
+          });
+
+          res.writeHead(response.status, response.headers);
+          res.end(response.body ?? "");
+        } catch {
+          res.writeHead(502, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: `proxy error: ${serviceName}` }));
+        }
+      });
+
+      await listenOn(server, svc.localPort, {
+        host: "127.0.0.1",
+        onError: (error) => {
+          console.error(`Service proxy '${serviceName}' listener failed: ${error.message}`);
+          server.close();
+        },
+      });
+      servers.push(server);
+      const address = server.address();
+      handles.push({
+        name: serviceName,
+        port: !address || typeof address === "string" ? 0 : address.port,
+        close: () => server.close(),
+      });
+    }
+  } catch (error) {
+    channel.offMessage(responseHandler);
+    failAll();
+    for (const server of servers) {
+      try { server.close(); } catch {}
+    }
+    throw error;
+  }
 
   const close = () => {
     channel.offMessage(responseHandler);
