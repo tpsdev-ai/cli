@@ -25,8 +25,9 @@ import { MailLockOwnerError, tryAcquireMailLock } from "../src/utils/mail-lock.j
 const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
 
 /**
- * The `ps:` text an unpinned writer in another zone would have recorded for this
- * live pid: it differs from the pinned token in value only.
+ * The `ps:` text an unpinned writer in an intentionally non-UTC zone would have
+ * recorded for this live pid; it differs from the pinned UTC token (each caller
+ * asserts this).
  */
 function legacyPsToken(pid: number): string {
   return `ps:${execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], { env: ODD_ZONE_ENV, encoding: "utf-8", timeout: 5_000 }).trim()}`;
