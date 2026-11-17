@@ -989,9 +989,11 @@ test("a reconnect claim skipped by the stop gate prints no claim line", async ()
       const reconnectState: RelayChannelState = { attached: false, detached: false, alive: true };
       channels.push(reconnectState);
       let stopA!: Promise<void>;
-      // A's claim runs in the microtask right after its connect resolves. The
-      // next microtask stops A, so the gate is closed when the claim takes the
-      // record lock: the race the gate exists for.
+      // Resolving A's reconnect and stopping A on the next microtask lets stop()
+      // run before A's connect path reaches its claim (the claim comes several
+      // promise steps later), so the stop gate is closed when the claim takes the
+      // record lock: the race the gate exists for. Deleting the gate line in
+      // claimHostStateAt turns this case red, which shows the claim did run.
       reconnectConnect.resolve(channelFor(reconnectState));
       queueMicrotask(() => { stopA = stops[0]!(); });
       await Bun.sleep(50);

@@ -174,7 +174,11 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-stopped-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
+    // A token from this process's real source that differs from its live token:
+    // with the gate removed, the claim reclaims it on every platform.
+    const live = processStartToken(process.pid);
+    expect(live).not.toBeNull();
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: `${live}-stale` });
     const raw = readFileSync(path);
     const absentPath = hostStatePath("absent");
     let checked = 0;
