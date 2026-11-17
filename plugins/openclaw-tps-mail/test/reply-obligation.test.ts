@@ -1381,6 +1381,88 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     await h.stop();
   }, 20000);
 
+  it("r8 a verified cur/ entry removed before the deadline: the deadline itself writes the reason", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-deadline-first-writer";
+    const obligationId = `ob-${inboundId}`;
+    const deadlineAt = new Date(Date.now() + 5000).toISOString();
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const dir = resolve(tempMailDir, AGENT, ".obligations");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      resolve(dir, `${inboundId}.json`),
+      JSON.stringify(
+        {
+          obligationId,
+          inboundId,
+          inboundEnvelopeId: envelopeId,
+          inboundTimestamp: new Date().toISOString(),
+          from: SENDER,
+          to: AGENT,
+          accountId: "default",
+          state: "yielded",
+          deadlineAt,
+          attempts: 1,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+    // A VERIFIED cur/ entry at start: the launcher's noInbound rewrite promotes
+    // it, and recovery verifies it before arming the deadline.
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const curPath = resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`);
+    writeFileSync(
+      curPath,
+      JSON.stringify(
+        {
+          id: inboundId,
+          from: SENDER,
+          to: AGENT,
+          body: signedBody,
+          timestamp: new Date().toISOString(),
+          read: false,
+        },
+        null,
+        2,
+      ),
+      "utf-8",
+    );
+
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery verified the cur/ entry and armed the deadline",
+      ).toBe(true);
+      expect(
+        obligationFile(AGENT, inboundId)?.missingCurReason,
+        "recovery with cur/ present writes no reason",
+      ).toBeUndefined();
+
+      // Remove the cur/ entry BEFORE the deadline fires: from here the deadline
+      // path is the first and only writer of the reason.
+      rmSync(curPath);
+
+      const failed = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 12000);
+      expect(failed, "the in-process deadline settles it").toBe(true);
+      const rec = obligationFile(AGENT, inboundId);
+      expect(rec?.failure).toBe("yielded-without-resumption");
+      expect(rec?.missingCurReason, "the deadline path records the reason").toBe(REASON);
+      expect(rec?.nackPending, "the nack is handed over, not left owing").toBeFalsy();
+      expect(typeof rec?.nackSentAt).toBe("string");
+
+      const senderNew = resolve(tempMailDir, SENDER, "new");
+      expect(nackMailsIn(senderNew, "yielded-without-resumption").length, "exactly one nack to the recorded sender").toBe(1);
+      expect(nackMailsIn(senderNew).length).toBe(1);
+      expect(h.dispatchCount, "the deadline dispatches nothing").toBe(0);
+    } finally { await h.stop(); }
+  }, 30000);
+
   it("with the deadline still ahead, re-arms and does not settle early", async () => {
     seedSigningKeys();
     const inboundId = "msg-orphan-future";
@@ -1719,6 +1801,32 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(warnings.join("\n")).toContain("DANGLING_SYMLINK");
     } finally { await h.stop(); }
   }, 20000);
+
+  it("r8 cur/ as a regular file reports ENOTDIR and leaves the obligation untouched", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-cur-notdir";
+    seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const before = obligationFile(AGENT, inboundId);
+    const agentDir = resolve(tempMailDir, AGENT);
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(resolve(agentDir, "cur"), "not a directory", "utf-8");
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 15000),
+        "the failed lookup is logged",
+      ).toBe(true);
+      await sleep(200);
+      expect(obligationFile(AGENT, inboundId), "the obligation is unchanged").toEqual(before);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "ENOTDIR is not a missing cur/").toBeUndefined();
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+      expect(h.dispatchCount).toBe(0);
+      const lines = warnings.filter((line) => line.includes("obligation-cur-lookup-failed"));
+      expect(lines, "one line names the failed lookup").toHaveLength(1);
+      expect(lines[0]).toContain("ENOTDIR");
+    } finally { await h.stop(); }
+  }, 30000);
 
   it("does not overwrite a posted transition that lands during the receipt scan", async () => {
     seedSigningKeys();

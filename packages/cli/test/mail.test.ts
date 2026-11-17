@@ -285,6 +285,25 @@ describe("mail utils", () => {
     }
   });
 
+  test("archiveOldCur keeps a cur/ entry whose own read fails, for every uid", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    mkdirSync(inbox.cur, { recursive: true });
+    // A DIRECTORY named like a cur/ record: readFileSync fails with EISDIR for
+    // root too, so this is not a permissions case.
+    const unreadable = join(inbox.cur, "msg-unreadable-cur.json");
+    mkdirSync(unreadable);
+    utimesSync(unreadable, old, old);
+
+    expect(archiveOldCur("agent-a", 30)).toBe(0);
+    expect(existsSync(unreadable), "an unreadable cur/ record is kept").toBe(true);
+    expect(
+      readdirSync(inbox.cur).filter((f) => f.endsWith(".json")),
+      "nothing was archived",
+    ).toEqual(["msg-unreadable-cur.json"]);
+  });
+
   test("archiveOldCur keeps a terminal record that is not for this cur/ file, and one with an unknown state", async () => {
     const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
     const inbox = getInbox("agent-a");

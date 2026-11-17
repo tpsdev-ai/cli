@@ -1769,8 +1769,8 @@ async function sendNackMail(
   // sender; delivery retries follow the existing at-least-once contract. It
   // dispatches no agent reply, so the internal-inbound gate (which binds the
   // dispatch path) is bypassed only for two callers: the missing-cur settle,
-  // and the owed-nack retry for a record settled under that rule, after a clean
-  // lookup still finds cur/ absent. Every other caller keeps it.
+  // and the owed-nack retry for a record carrying MISSING_CUR_REASON, after a
+  // clean lookup still finds cur/ absent. Every other caller keeps it.
   if (!opts.allowMissingInbound && !(await internalInbound(ctx))) return false;
   if (!isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
@@ -1922,8 +1922,7 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
   return null;
 }
 
-/** True when `dir` does not exist; a dangling symlink is not absent. A check
- *  that cannot tell reports "not absent", so it never licenses the allowance. */
+/** True when `dir` does not exist; a dangling symlink is not absent. */
 function curDirAbsent(dir: string): boolean {
   try {
     return lstatSync(dir, { throwIfNoEntry: false }) === undefined;
@@ -2871,9 +2870,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             log,
             incarnation,
             rec.inboundEnvelopeId,
-            // cli#1006: a nack settled from a record whose cur/ entry was gone
-            // is still owed to the sender recorded at creation; retry it under
-            // the same settle-path rule as the initial send.
+            // cli#1006: the owed-nack retry for a record carrying
+            // MISSING_CUR_REASON, after a clean lookup still finds cur/ absent,
+            // keeps the settle-path allowance. Every other record keeps the gate.
             curStillAbsent,
           );
         }
