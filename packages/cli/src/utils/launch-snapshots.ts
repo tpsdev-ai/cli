@@ -13,9 +13,11 @@
  * leave the pending directory behind.
  *
  * Each snapshot records its owning launcher: pid and, when one is readable, a
- * process start token. When the recorded and current tokens are both readable
- * from the same source and differ, the sweep treats the pid as reused and the
- * owner as gone; when they match, the snapshot is kept. The next launch attempts
+ * process start token. When the recorded and current tokens are both readable,
+ * the shared rule (classifyOwnerToken, cli#1045) decides: differing `proc:`
+ * tokens mean the pid was reused and the owner is gone; differing `ps:` tokens,
+ * or tokens from different sources, keep the snapshot; matching tokens keep it.
+ * The next launch attempts
  * to remove published and pending entries whose recorded owner is dead, and
  * entries with no readable owner record whose directory mtime is at least a
  * grace period old: one minute for a published entry, 24 hours for a pending
@@ -49,7 +51,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
+import { classifyOwnerToken, pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
 
 export const LAUNCH_SNAPSHOT_PREFIX = "config-";
 /** A snapshot in the making, renamed to `config-*` once its owner record is written. */
@@ -141,16 +143,12 @@ function parseLaunchSnapshotOwner(fd: number): LaunchSnapshotOwner | null {
   return { pid, startToken };
 }
 
-function tokenSource(token: string): string {
-  const colon = token.indexOf(":");
-  return colon === -1 ? token : token.slice(0, colon);
-}
-
 /**
- * "dead" — pid gone, or pid alive under a different readable start token from
- * the same source. While the pid is alive, a token from another source, or
- * either token unavailable (the recorded token, or the current one), is
- * "unverifiable": it is kept, never treated as dead. A pid that the probe
+ * "dead" — pid gone, or pid alive under a different readable `proc:` start
+ * token. While the pid is alive, classifyOwnerToken decides when both tokens
+ * are readable: a differing `ps:` token (cli#1045) or a token from another
+ * source is "unverifiable". Either token unavailable (the recorded token, or
+ * the current one) is "unverifiable" too: it is kept, never treated as dead. A pid that the probe
  * (default: pidState) classifies as "invalid" is "unreadable", like an owner record that cannot be
  * read.
  */
@@ -164,8 +162,7 @@ function ownerState(
   if (owner.startToken === null) return "unverifiable";
   const current = processStartToken(owner.pid);
   if (current === null) return "unverifiable";
-  if (tokenSource(current) !== tokenSource(owner.startToken)) return "unverifiable";
-  return current === owner.startToken ? "alive" : "dead";
+  return classifyOwnerToken(current, owner.startToken);
 }
 
 /** The entry's recorded owner is dead, or it has no readable owner record and is at least `graceMs` old. */

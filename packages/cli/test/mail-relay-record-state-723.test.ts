@@ -11,6 +11,7 @@ import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayPidRemoval, setRelayStopSignal } from "../src/commands/mail.js";
 import { readPidFile } from "../src/utils/pid-file.js";
+import { PROC_START_TOKENS_NODE_ARGS, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
@@ -52,8 +53,8 @@ function staleRecord(child: Bun.Subprocess): string {
 }
 
 /** Drive the shipped CLI the way a user does, with HOME pointing at this test. */
-function runCli(args: string[]): { status: number | null; stdout: string; stderr: string } {
-  const result = spawnSync("node", [TPS_BIN, ...args], {
+function runCli(args: string[], nodeArgs: readonly string[] = []): { status: number | null; stdout: string; stderr: string } {
+  const result = spawnSync("node", [...nodeArgs, TPS_BIN, ...args], {
     env: { ...process.env, HOME: home },
     encoding: "utf8",
     timeout: TIMEOUT,
@@ -139,12 +140,13 @@ describe("mail relay status with a bad record", () => {
   test(
     "a stale record with a live relay-shaped process is reported as unknown",
     () => {
+      stageProcStartTokens();
       const child = spawnChild();
       const contents = staleRecord(child);
       writeFileSync(relayPid, contents);
       expect(readPidFile(relayPid).kind).toBe("stale");
 
-      const result = runCli(["mail", "relay", "status"]);
+      const result = runCli(["mail", "relay", "status"], PROC_START_TOKENS_NODE_ARGS);
 
       expect(result.status).toBe(0);
       expect(result.stdout).toContain(relayPid);
@@ -188,11 +190,12 @@ describe("tps bridge status with a bad or unverified record", () => {
   test(
     "a stale bridge pid file is reported as unknown",
     () => {
+      stageProcStartTokens();
       const child = spawnChild();
       const bridgePid = writeBridgeRecord(staleRecord(child));
       expect(readPidFile(bridgePid).kind).toBe("stale");
 
-      const result = runCli(["bridge", "status"]);
+      const result = runCli(["bridge", "status"], PROC_START_TOKENS_NODE_ARGS);
 
       expect(result.status).toBe(0);
       expect(result.stdout).toMatch(/Bridge state unknown \(stale pid file /);
@@ -306,6 +309,7 @@ describe("mail relay stop with a bad record", () => {
   test(
     "a stale record is removed and reported, and the live process is not signalled",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, staleRecord(child));
       expect(readPidFile(relayPid).kind).toBe("stale");
@@ -327,6 +331,7 @@ describe("mail relay stop with a bad record", () => {
   test(
     "a record whose removal fails says so and leaves the relay state unknown",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, staleRecord(child));
       expect(readPidFile(relayPid).kind).toBe("stale");

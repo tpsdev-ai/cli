@@ -14,6 +14,7 @@ import { bridgePidFiles, bridgeStatus } from "../src/utils/mail-bridge.js";
 import { readPidFile, snapshotPidRecord } from "../src/utils/pid-file.js";
 import type { PidFileState } from "../src/utils/pid-file.js";
 import { patchShared } from "./helpers/patch-shared.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TIMEOUT = 30_000;
 const START_TIMEOUT = 10_000;
@@ -438,6 +439,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
   test(
     "a record rewritten to the same pid with a different start token exits non-zero, keeps the record, and sends no signal",
     async () => {
+      stageProcStartTokens();
       const child = spawnSleep();
       const plannedToken = tokenOf(child.pid);
       const path = join(runDir, "bridge-alpha.pid");
