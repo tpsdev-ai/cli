@@ -24,7 +24,7 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join, resolve } from "node:path";
@@ -101,31 +101,71 @@ export function assertOpenClawVersion(stdout) {
   assert.equal(found, OPENCLAW_VERSION, `expected OpenClaw ${OPENCLAW_VERSION}, found: ${found}`);
 }
 
-/** True when `name` is an executable file in one of the PATH entries. */
-function executableOnPath(name, pathEnv) {
-  for (const dir of pathEnv.split(delimiter)) {
-    if (dir === "") continue;
+/**
+ * Resolve the bash the install helper will run, with the helper's PATH lookup:
+ * relative entries are relative to its working directory, an empty entry means
+ * that directory, and a match must be an executable regular file.
+ */
+function resolveInstallBash(cwd, env) {
+  // An empty PATH is refused rather than searched: bash and execvp would try the
+  // bare name against the working directory, and the lane does not pick a bash
+  // from there. An empty entry inside a PATH means the working directory.
+  const pathValue = env.PATH ?? "";
+  if (pathValue === "") throw new Error("no executable bash on the install PATH: PATH is empty");
+  const tried = [];
+  for (const entry of pathValue.split(delimiter)) {
+    const candidate = join(resolve(cwd, entry), "bash");
+    tried.push(candidate);
     try {
-      accessSync(join(dir, name), constants.X_OK);
-      return true;
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
     } catch {
-      // Not in this directory, or not executable.
+      // Not an executable regular file in this PATH entry.
     }
   }
-  return false;
+  throw new Error(`no executable bash on the install PATH: tried ${tried.join(", ")}`);
+}
+
+/**
+ * Probe `command -v sfw` with the same bash the install uses, from the helper's
+ * working directory and with its install environment. A probe that cannot run
+ * is an error, not a missing installer.
+ */
+function trackedLockInstaller(repo, env, bashBin) {
+  const probe = spawnSync(bashBin, ["-c", "command -v sfw"], {
+    cwd: repo,
+    env,
+    stdio: "ignore",
+    timeout: 10_000,
+  });
+  if (probe.error) {
+    throw new Error(`sfw probe cannot launch bash at ${bashBin}: ${probe.error.code ?? probe.error.message}`);
+  }
+  if (probe.signal) {
+    throw new Error(`sfw probe with bash at ${bashBin} was killed by ${probe.signal}`);
+  }
+  if (probe.status === 1) return "npm";
+  if (probe.status !== 0) {
+    throw new Error(`sfw probe with bash at ${bashBin} exited with status ${probe.status}`);
+  }
+  return "sfw";
 }
 
 /**
  * Install the pinned OpenClaw from the committed fixture manifest and lockfile;
- * the tracked-lock helper is used with `sfw` when it is on PATH, else npm.
+ * the tracked-lock helper is used with `sfw` when the probe finds it and with
+ * npm when the probe reports it absent.
  */
 export function installOpenClaw(root, options = {}) {
-  const { spawn: spawnInstall = spawnSync, env = process.env, pathEnv = env.PATH ?? "", repo = REPO } = options;
+  const { spawn: spawnInstall = spawnSync, env = process.env, pathEnv = env.PATH ?? "", repo = REPO, bashPath } = options;
   const prefix = join(root, "openclaw");
-  const via = executableOnPath("sfw", pathEnv) ? "sfw" : "npm";
+  const installEnv = { ...env, PATH: pathEnv };
+  const bashBin = bashPath ?? resolveInstallBash(repo, installEnv);
+  const via = trackedLockInstaller(repo, installEnv, bashBin);
   console.error(`[lane] installing openclaw@${OPENCLAW_VERSION} from the committed fixture into ${prefix}`);
   const result = spawnInstall(
-    "bash",
+    bashBin,
     [
       join(repo, "scripts", "npm-ci-tracked-lock.sh"),
       "--via",
@@ -136,8 +176,14 @@ export function installOpenClaw(root, options = {}) {
       "--no-audit",
       "--no-fund",
     ],
-    { cwd: repo, env, stdio: "inherit", timeout: 600_000 },
+    { cwd: repo, env: installEnv, stdio: "inherit", timeout: 600_000 },
   );
+  if (result.error) {
+    throw new Error(`tracked-lock install cannot launch bash at ${bashBin}: ${result.error.code ?? result.error.message}`);
+  }
+  if (result.signal) {
+    throw new Error(`tracked-lock install with bash at ${bashBin} was killed by ${result.signal}`);
+  }
   assert.equal(result.status, 0, `tracked-lock install of openclaw@${OPENCLAW_VERSION} failed (status ${result.status})`);
   return join(prefix, "node_modules", ".bin");
 }
