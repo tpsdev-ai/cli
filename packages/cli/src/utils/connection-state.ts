@@ -453,7 +453,8 @@ type HostRecordClaim =
  * not running or carries a different `proc:` token (pid reuse). `ps:` mismatches
  * are unverifiable because their text depends on the reader's TZ and locale.
  * The read and the liveness check run under the caller's record
- * lock, so the evidence and the write share one hold.
+ * lock, so the evidence and the write share one hold. Cross-environment
+ * exclusivity of that lock depends on cli#1045.
  */
 function claimableHostRecordOwnership(path: string, branch: string, connectionId: string, readStartToken?: (pid: number) => string | null): HostRecordClaim {
   const current = readHostRecord(path, branch);

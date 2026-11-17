@@ -159,6 +159,51 @@ describe("connection-state", () => {
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("ack");
   });
 
+  test("claimHostStateAt holds the same real lock during record read, liveness probe and write", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-hold-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:stale" });
+    const lockDir = mailLockPath(hostStateLockRoot(path));
+    const read = fs.readFileSync;
+    const rename = fs.renameSync;
+    const stages: string[] = [];
+    let nonce: string | undefined;
+    const observeHold = (stage: string) => {
+      const owner = JSON.parse(read(join(lockDir, "owner.json"), "utf8"));
+      expect(owner.pid).toBe(process.pid);
+      expect(owner.nonce).toEqual(expect.any(String));
+      expect(owner.nonce.length).toBeGreaterThan(0);
+      if (nonce === undefined) nonce = owner.nonce;
+      expect(owner.nonce).toBe(nonce);
+      stages.push(stage);
+    };
+    const readSpy = spyOn(fs, "readFileSync").mockImplementation((file, ...args) => {
+      if (file === path) observeHold("read");
+      return read(file, ...args);
+    });
+    const renameSpy = spyOn(fs, "renameSync").mockImplementation((...args: Parameters<typeof rename>) => {
+      if (args[1] === path) observeHold("write");
+      return rename(...args);
+    });
+    try {
+      const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "ack" }, "conn-a", undefined, 0, {
+        startToken: (pid) => {
+          expect(pid).toBe(process.pid);
+          observeHold("liveness");
+          return "proc:live";
+        },
+      });
+      expect(outcome).toEqual({ kind: "written" });
+      expect(stages).toEqual(["read", "liveness", "write"]);
+      expect(existsSync(lockDir)).toBe(false);
+      expect(JSON.parse(read(path, "utf8"))).toMatchObject({ connectionId: "conn-a", lastHeartbeatAck: "ack" });
+    } finally {
+      readSpy.mockRestore();
+      renameSpy.mockRestore();
+    }
+  });
+
   test("claimHostStateAt leaves another connection's record untouched", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-other-"));
     process.env.HOME = home;
@@ -276,7 +321,7 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
-  test("claimHostStateAt preserves a live child's record across real ps: reads under different TZ values", async () => {
+  test("claimHostStateAt preserves a live child's legacy ps: record when the current reader uses another TZ", async () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-ps-env-"));
     process.env.HOME = home;
     const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
@@ -284,8 +329,10 @@ describe("connection-state", () => {
     });
     try {
       // Force the real reader's ps fallback on Linux too; ps itself is not mocked.
+      // Raw ps output models a legacy record across the cli#1045 producer change.
       const script = `
         import * as fs from "node:fs";
+        import { execFileSync } from "node:child_process";
         import { spyOn } from "bun:test";
         const read = fs.readFileSync;
         spyOn(fs, "readFileSync").mockImplementation((path, ...args) => {
@@ -293,11 +340,14 @@ describe("connection-state", () => {
           return read(path, ...args);
         });
         const { processStartToken } = await import(process.env.TPS_TOKEN_MODULE);
-        process.stdout.write(JSON.stringify(processStartToken(Number(process.env.TPS_OWNER_PID))));
+        const token = process.env.TPS_LEGACY_TOKEN === "1"
+          ? "ps:" + execFileSync("ps", ["-o", "lstart=", "-p", process.env.TPS_OWNER_PID], { encoding: "utf8" }).trim()
+          : processStartToken(Number(process.env.TPS_OWNER_PID));
+        process.stdout.write(JSON.stringify(token));
       `;
-      const readToken = async (TZ: string): Promise<string> => {
+      const readToken = async (TZ: string, legacy = false): Promise<string> => {
         const reader = Bun.spawn([process.execPath, "-e", script], {
-          env: { ...process.env, TZ, LC_ALL: "C", TPS_OWNER_PID: String(child.pid), TPS_TOKEN_MODULE: new URL("../../agent/src/lib/mail-lock.ts", import.meta.url).href },
+          env: { ...process.env, TZ, LC_ALL: "C", TPS_LEGACY_TOKEN: legacy ? "1" : "0", TPS_OWNER_PID: String(child.pid), TPS_TOKEN_MODULE: new URL("../../agent/src/lib/mail-lock.ts", import.meta.url).href },
           stdout: "pipe", stderr: "pipe",
         });
         const [out, err, code] = await Promise.all([new Response(reader.stdout).text(), new Response(reader.stderr).text(), reader.exited]);
@@ -306,7 +356,7 @@ describe("connection-state", () => {
         expect(token).toEqual(expect.stringContaining("ps:"));
         return token;
       };
-      const local = await readToken("Etc/GMT+8");
+      const local = await readToken("Etc/GMT+8", true);
       const utc = await readToken("UTC");
       expect(local).not.toBe(utc);
       expect(() => process.kill(child.pid, 0)).not.toThrow();
