@@ -1447,7 +1447,7 @@ function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshO
       case "written":
       case "stopped":
       case "absent":
-        // `claimHostStateAt` writes an absent record, so there is nothing to report.
+        // A successful claim of an absent record returns `written`.
         return;
       case "other":
         reason = "the record belongs to another connection";
@@ -1636,9 +1636,9 @@ export async function connectAndKeepAlive(
         // attempt check eligibility only while the stop gate is open, and
         // attempt the write when the record is absent or
         // is verified as owned by this connection, or when its recorded process
-        // is not running or runs with a start token different from the recorded
-        // one (pid reuse); a record whose token was altered is indistinguishable
-        // from pid reuse. Either write can fail on the filesystem.
+        // is not running or carries a different token from the same source
+        // (pid reuse); a record token altered within the same source is
+        // indistinguishable from pid reuse. Either write can fail on the filesystem.
         // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {
@@ -1659,7 +1659,7 @@ export async function connectAndKeepAlive(
         // the post-send update. A claim refused for ownership or readability
         // leaves the record as it is; the claim reporter emits one line, and a
         // later refresh may report separately. A `stopped` outcome is silent.
-        // The channel stays up and serving.
+        // An ownership or readability refusal leaves the channel up and serving.
         const connectWrite = (write: () => void) => {
           try {
             write();
