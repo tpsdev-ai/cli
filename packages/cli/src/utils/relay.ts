@@ -1636,9 +1636,9 @@ export async function connectAndKeepAlive(
         // attempt check eligibility only while the stop gate is open, and
         // attempt the write when the record is absent or
         // is verified as owned by this connection, or when its recorded process
-        // is not running or carries a different token from the same source
-        // (pid reuse); a record token altered within the same source is
-        // indistinguishable from pid reuse. Either write can fail on the filesystem.
+        // is not running or carries a different `proc:` token (pid reuse).
+        // `ps:` mismatches are unverifiable: their text depends on the reader's
+        // TZ and locale. Either write can fail on the filesystem.
         // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {

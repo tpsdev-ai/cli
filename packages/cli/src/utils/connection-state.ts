@@ -298,9 +298,9 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
  * record lock, while the optional `shouldWrite` gate holds, read the record and
  * attempt the write when it is absent, is verified as owned by this connection,
  * or belongs to a connection whose recorded process is not running or carries
- * a different token from the same source (pid reuse). A record token altered
- * within the same source is indistinguishable from pid reuse. Filesystem failure
- * can throw. An invalid, unreadable or unverifiable record is left as it is.
+ * a different `proc:` token (pid reuse). `ps:` mismatches are unverifiable:
+ * their text depends on the reader's TZ and locale. Filesystem failure can throw.
+ * An invalid, unreadable or unverifiable record is left as it is.
  * The absent case differs from a refresh: a reconnect may re-establish a record
  * that was removed.
  */
@@ -416,11 +416,11 @@ function tokenSource(token: string): string {
 
 /**
  * Whether the process that wrote a record is still the one running under its
- * pid. "gone": the pid is gone, or a live pid carries a different token from
- * the same source (pid reuse); a record token altered within the same source
- * is indistinguishable from pid reuse. For a live pid, "unknown": the record
- * has no token, the token cannot be read, or the sources differ; unknown never
- * licenses a write.
+ * pid. "gone": the pid is gone, or a live pid carries a different `proc:`
+ * token (pid reuse). A changed `proc:` record token is indistinguishable from
+ * pid reuse. A live `ps:` mismatch is unknown because its text depends on the
+ * reader's TZ and locale. Missing, unreadable or different-source tokens are
+ * also unknown; unknown never licenses a write.
  */
 function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
   const pid = pidState(state.pid);
@@ -435,7 +435,8 @@ function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number)
   }
   if (liveToken === null) return "unknown";
   if (tokenSource(liveToken) !== tokenSource(state.startToken)) return "unknown";
-  return liveToken === state.startToken ? "alive" : "gone";
+  if (liveToken === state.startToken) return "alive";
+  return tokenSource(liveToken) === "proc" ? "gone" : "unknown";
 }
 
 type HostRecordClaim =
@@ -449,7 +450,8 @@ type HostRecordClaim =
 /**
  * Ownership for a reconnect claim: the rule in `hostRecordOwnership`, plus a
  * record owned by another connection is claimable when its recorded process is
- * not running or carries a different token from the same source (pid reuse).
+ * not running or carries a different `proc:` token (pid reuse). `ps:` mismatches
+ * are unverifiable because their text depends on the reader's TZ and locale.
  * The read and the liveness check run under the caller's record
  * lock, so the evidence and the write share one hold.
  */

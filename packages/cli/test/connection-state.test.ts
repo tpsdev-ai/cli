@@ -174,11 +174,8 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-stopped-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    // A token from this process's real source that differs from its live token:
-    // with the gate removed, the claim reclaims it on every platform.
-    const live = processStartToken(process.pid);
-    expect(live).not.toBeNull();
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: `${live}-stale` });
+    // A simulated proc: mismatch makes the record reclaimable without the gate.
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:stale" });
     const raw = readFileSync(path);
     const absentPath = hostStatePath("absent");
     let checked = 0;
@@ -187,7 +184,7 @@ describe("connection-state", () => {
       expect(existsSync(mailLockPath(hostStateLockRoot(recordPath)))).toBe(true);
       return false;
     };
-    const other = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", gate(path));
+    const other = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", gate(path), 0, { startToken: () => "proc:live" });
     const absent = claimHostStateAt(absentPath, { ...completeState(), connectionId: "conn-a" }, "conn-a", gate(absentPath));
     expect(other).toEqual({ kind: "stopped" });
     expect(absent).toEqual({ kind: "stopped" });
@@ -216,27 +213,30 @@ describe("connection-state", () => {
 
   /** A pid this test spawned, still running until its stdin closes, with the
    *  start token it carries while alive; awaited to exit before it is used. */
-  async function exitedChildPid(): Promise<{ pid: number; token: string }> {
+  async function exitedChildPid(captureToken = true): Promise<{ pid: number; token: string }> {
     const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
       stdin: "pipe",
       stdout: "ignore",
       stderr: "ignore",
     });
-    const token = processStartToken(child.pid);
-    expect(token).not.toBeNull();
-    child.stdin.end();
-    await child.exited;
-    return { pid: child.pid, token: String(token) };
+    try {
+      const token = captureToken ? processStartToken(child.pid) : "ps:Tue Nov 17 02:39:30 2026";
+      expect(token).not.toBeNull();
+      return { pid: child.pid, token: String(token) };
+    } finally {
+      child.stdin.end();
+      await child.exited;
+    }
   }
 
-  test.each(["null", "captured"])("claimHostStateAt reclaims a gone owner's record whose startToken is %s (real pid probe)", async (recordedToken) => {
-    const child = await exitedChildPid();
+  test.each(["null", "captured", "ps"])("claimHostStateAt reclaims a gone owner's record whose startToken is %s (real pid probe)", async (recordedToken) => {
+    const child = await exitedChildPid(recordedToken !== "ps");
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-gone-pid-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", pid: child.pid, startToken: recordedToken === "null" ? null : child.token });
-    const live = processStartToken(process.pid);
-    expect(live).not.toBeNull();
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: child.pid, startToken: recordedToken === "null" ? null : recordedToken === "ps" ? "ps:Tue Nov 17 02:39:30 2026" : child.token });
+    const live = recordedToken === "ps" ? null : processStartToken(process.pid);
+    if (recordedToken !== "ps") expect(live).not.toBeNull();
     const aState = { ...completeState(), connectionId: "conn-a", startToken: live, lastHeartbeatAck: "ack" };
     const outcome = claimHostStateAt(path, aState, "conn-a");
     expect(outcome).toEqual({ kind: "written" });
@@ -246,21 +246,84 @@ describe("connection-state", () => {
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
   });
 
-  test("claimHostStateAt reclaims a live pid whose recorded start token differs (real pid probe)", () => {
+  test("claimHostStateAt reclaims a live pid with a simulated proc: token mismatch (real pid probe)", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-reuse-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    const live = processStartToken(process.pid);
-    expect(live).not.toBeNull();
-    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: `${String(live)}-stale` });
+    const live = "proc:live";
+    const hooks = { startToken: () => live };
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: "proc:stale" });
     const aState = { ...completeState(), connectionId: "conn-a", startToken: live, lastHeartbeatAck: "ack" };
-    const outcome = claimHostStateAt(path, aState, "conn-a");
+    const outcome = claimHostStateAt(path, aState, "conn-a", undefined, 0, hooks);
     expect(outcome).toEqual({ kind: "written" });
     expect(readRecord<HostConnectionState>(path)?.connectionId).toBe("conn-a");
-    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a");
+    const refreshed = refreshOwnedHostStateAt(path, { ...aState, lastHeartbeatAck: "next" }, "conn-a", undefined, 0, hooks);
     expect(refreshed).toEqual({ kind: "written" });
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
   });
+
+  test.each([
+    ["matching", "ps:Tue Nov 17 02:39:30 2026", "other"],
+    ["different", "ps:Tue Nov 17 10:39:30 2026", "unverifiable"],
+  ])("claimHostStateAt preserves a live owner's record with %s ps: tokens", (_label, live, kind) => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-ps-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "ps:Tue Nov 17 02:39:30 2026" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a" }, "conn-a", undefined, 0, { startToken: () => live });
+    expect(outcome).toEqual({ kind });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test("claimHostStateAt preserves a live child's record across real ps: reads under different TZ values", async () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-ps-env-"));
+    process.env.HOME = home;
+    const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
+      stdin: "pipe", stdout: "ignore", stderr: "ignore",
+    });
+    try {
+      // Force the real reader's ps fallback on Linux too; ps itself is not mocked.
+      const script = `
+        import * as fs from "node:fs";
+        import { spyOn } from "bun:test";
+        const read = fs.readFileSync;
+        spyOn(fs, "readFileSync").mockImplementation((path, ...args) => {
+          if (String(path) === "/proc/" + process.env.TPS_OWNER_PID + "/stat") throw new Error("proc unavailable");
+          return read(path, ...args);
+        });
+        const { processStartToken } = await import(process.env.TPS_TOKEN_MODULE);
+        process.stdout.write(JSON.stringify(processStartToken(Number(process.env.TPS_OWNER_PID))));
+      `;
+      const readToken = async (TZ: string): Promise<string> => {
+        const reader = Bun.spawn([process.execPath, "-e", script], {
+          env: { ...process.env, TZ, LC_ALL: "C", TPS_OWNER_PID: String(child.pid), TPS_TOKEN_MODULE: new URL("../../agent/src/lib/mail-lock.ts", import.meta.url).href },
+          stdout: "pipe", stderr: "pipe",
+        });
+        const [out, err, code] = await Promise.all([new Response(reader.stdout).text(), new Response(reader.stderr).text(), reader.exited]);
+        expect({ code, err }).toEqual({ code: 0, err: "" });
+        const token = JSON.parse(out);
+        expect(token).toEqual(expect.stringContaining("ps:"));
+        return token;
+      };
+      const local = await readToken("Etc/GMT+8");
+      const utc = await readToken("UTC");
+      expect(local).not.toBe(utc);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+      const path = hostStatePath("x");
+      writeHostState({ ...completeState(), connectionId: "conn-b", pid: child.pid, startToken: local });
+      const raw = readFileSync(path);
+      const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a" }, "conn-a", undefined, 0, {
+        startToken: (pid) => { expect(pid).toBe(child.pid); return utc; },
+      });
+      expect(outcome).toEqual({ kind: "unverifiable" });
+      expect(readFileSync(path)).toEqual(raw);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+    } finally {
+      child.stdin.end();
+      await child.exited;
+    }
+  }, 20_000);
 
   test("claimHostStateAt skips another connection's record with no startToken while its pid is running", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-notoken-"));
