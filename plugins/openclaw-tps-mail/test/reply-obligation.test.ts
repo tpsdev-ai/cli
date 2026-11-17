@@ -2287,6 +2287,110 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "an ack sends no nack").toHaveLength(0);
     } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
   }, 40000);
+
+  // ── cli#1006 r12 — a refused settlement write on a TERMINAL or GONE record ──
+  // The r10 cases above cover a record another writer left LIVE (re-armed). A
+  // refused settlement write also has two other outcomes: the record is
+  // TERMINAL, or it is GONE. Both are released from the in-process state, with
+  // no retry timer, and neither the other writer's terminal state nor the nack
+  // mail is touched.
+  //
+  // The retry's timer lives for one second, and the harness returns after its
+  // own startup wait: sample the armed deadlines WHILE startup runs, so a
+  // scheduled retry is seen even when it has fired by the time start resolves.
+  async function sampleArmedDeadlines(obligationId: string, untilInjected: () => boolean, ms = 1200): Promise<boolean[]> {
+    const seen: boolean[] = [];
+    await pollUntil(untilInjected, 15000);
+    const end = Date.now() + ms;
+    while (Date.now() < end) {
+      seen.push(obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId));
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    return seen;
+  }
+
+  const refusedSettlements = [
+    { from: "yielded", write: "failure", warning: "refusing to record the failure" },
+    { from: "delivering", write: "unconfirmed", warning: "refusing to record the unconfirmed outcome" },
+  ] as const;
+
+  for (const { from, write, warning } of refusedSettlements) {
+    for (const terminal of ["acked", "unconfirmed", "failed"] as const) {
+      it(`r12 a refused ${write} write on a record another writer made ${terminal} releases it and sends no nack`, async () => {
+        seedSigningKeys();
+        const inboundId = `msg-refused-terminal-${write}-${terminal}`;
+        const { obligationId } = seedOrphan(inboundId, { state: from, deadlineInMs: -1000 });
+        let injected = false;
+        let terminalRecord: any = null;
+        setBeforeTransitionForTests((id) => {
+          if (id !== inboundId || injected) return;
+          injected = true;
+          setBeforeTransitionForTests(undefined);
+          transitionObligation(tempMailDir, AGENT, inboundId, terminal, { replyId: "concurrent-writer" });
+          terminalRecord = obligationFile(AGENT, inboundId);
+        });
+        const warnings: string[] = [];
+        const hPromise = start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+        const sampled = sampleArmedDeadlines(obligationId, () => injected);
+        const h = await hPromise;
+        try {
+          expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
+          expect(terminalRecord?.state, "the concurrent writer made the record terminal").toBe(terminal);
+          expect(
+            await pollUntil(() => warnings.some((line) => line.includes(warning)), 15000),
+            "the guarded settlement write was refused",
+          ).toBe(true);
+          expect(obligationFile(AGENT, inboundId), "the terminal state written by the other writer is unchanged").toEqual(terminalRecord);
+          expect(
+            obligationStateForTests().contexts.some((c) => c.obligationId === obligationId),
+            "the refused obligation is released from the in-process map",
+          ).toBe(false);
+          expect((await sampled).includes(true), "no retry timer is armed").toBe(false);
+          expect(
+            obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+            "no retry timer is armed after startup",
+          ).toBe(false);
+          expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "a refused settlement sends no nack").toHaveLength(0);
+        } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+      }, 40000);
+    }
+
+    it(`r12 a refused ${write} write on a record DELETED before the re-read releases it and sends no nack`, async () => {
+      seedSigningKeys();
+      const inboundId = `msg-refused-gone-${write}`;
+      const { obligationId } = seedOrphan(inboundId, { state: from, deadlineInMs: -1000 });
+      let injected = false;
+      setBeforeTransitionForTests((id) => {
+        if (id !== inboundId || injected) return;
+        injected = true;
+        setBeforeTransitionForTests(undefined);
+        rmSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), { force: true });
+      });
+      const warnings: string[] = [];
+      const hPromise = start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+      const sampled = sampleArmedDeadlines(obligationId, () => injected);
+      const h = await hPromise;
+      try {
+        expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
+        expect(
+          await pollUntil(() => warnings.some((line) => line.includes(warning)), 15000),
+          "the guarded settlement write was refused",
+        ).toBe(true);
+        expect(warnings.join("\n"), "the refusal names the record as gone").toContain("obligation is gone");
+        expect(obligationFile(AGENT, inboundId), "the record stays deleted").toBeNull();
+        expect(
+          obligationStateForTests().contexts.some((c) => c.obligationId === obligationId),
+          "the gone obligation is released from the in-process map",
+        ).toBe(false);
+        expect((await sampled).includes(true), "no retry timer is armed").toBe(false);
+        expect(
+          obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+          "no retry timer is armed after startup",
+        ).toBe(false);
+        expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "a refused settlement sends no nack").toHaveLength(0);
+      } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+    }, 40000);
+  }
 });
 
 
