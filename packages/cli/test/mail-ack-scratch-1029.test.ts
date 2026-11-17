@@ -156,6 +156,26 @@ test("a failed listing warns with the directory and code, and the next ack retri
   expect(lines.filter((line) => line.includes("removed leftover ack scratch"))).toHaveLength(1);
 });
 
+test("the sweep refuses a directory that resolves to the locked root itself, including at the filesystem root", () => {
+  const inbox = mail.getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+  const leftover = join(inbox.cur, scratchName());
+  fs.writeFileSync(leftover, "{ partial");
+  makeOld(leftover);
+
+  // dirname("/") === "/", so a directory and root that both resolve to "/" must not pass the direct-child guard.
+  const realpath = fs.realpathSync;
+  const guarded = new Set([resolve(inbox.root), resolve(inbox.cur)]);
+  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) =>
+    guarded.has(resolve(String(args[0]))) ? "/" : realpath(...args)) as typeof realpath);
+
+  const { lines } = collectWarnings();
+  expect(mail.ackMessageAtPath(target).read).toBe(true);
+  expect(fs.readFileSync(leftover, "utf8")).toBe("{ partial");
+  expect(lines.filter((line) => line.includes("left ack scratch in") && line.includes(inbox.cur))).toHaveLength(1);
+});
+
 test("a bare relative record update contends for the root lock before sweeping", () => {
   const inbox = mail.getInbox("bare-path");
   const target = join(inbox.cur, "record.json");

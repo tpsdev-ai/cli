@@ -360,7 +360,7 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
     console.warn(`[mail] could not resolve ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
     return;
   }
-  if (dirname(listedDir) !== guardedRoot) {
+  if (listedDir === guardedRoot || dirname(listedDir) !== guardedRoot) {
     lastAckScratchSweep.set(dir, now);
     console.warn(`[mail] left ack scratch in ${dir}: not a directory in the mailbox this lock guards`);
     return;
