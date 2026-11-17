@@ -1115,8 +1115,9 @@ async function settleObligation(
     /** cli#1006: recovery is settling from the obligation RECORD because the
      *  inbound's cur/ entry is GONE. The record is the durable truth and this
      *  path dispatches no agent reply, so the internal-inbound gate (which
-     *  binds the dispatch path) does not apply. The ONLY send this path can
-     *  make is the nack to the sender recorded at obligation creation. */
+     *  binds the dispatch path) does not apply. The only mail settlement may
+     *  send is a nack to the recorded sender; delivery retries follow the
+     *  existing at-least-once contract. */
     missingCur?: boolean;
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
@@ -1514,8 +1515,9 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
     verdict,
     reason,
     // cli#1006: a deadline re-armed while the cur/ entry was gone has no
-    // inbound to re-verify; settling from the record still makes no reply
-    // dispatch and only the nack to the recorded sender.
+    // inbound to re-verify. The only mail settlement may send is a nack to the
+    // recorded sender; delivery retries follow the existing at-least-once
+    // contract.
     missingCur: rec.missingCurReason === MISSING_CUR_REASON,
   });
 }
@@ -1638,10 +1640,9 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     // scan. A transition that landed during it (e.g. `posted`) must not be
     // overwritten with a stale state. Re-read after the await and decide from
     // the fresh record; the write below is also a compare-and-set on the state
-    // we snapshotted, so the window between the re-read and the write cannot
-    // overwrite a later transition either. A record that moved is left alone,
-    // and its own deadline is re-armed from the fresh record so it settles by
-    // its state.
+    // we snapshotted, so a transition that lands between the re-read and the
+    // write is refused too. A record that moved is left alone, and its own
+    // deadline is re-armed from the fresh record so it settles by its state.
     const fresh = readObligationForCleanup(ctx, current.obligationId);
     if (fresh.status !== "found" || fresh.record.state !== current.state) {
       if (fresh.status === "found" && !TERMINAL_STATES.has(fresh.record.state)) {
