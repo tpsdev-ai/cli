@@ -52,7 +52,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
@@ -1159,6 +1159,7 @@ async function settleObligation(
           ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
         },
         ctx.log,
+        { from: rec.state },
       );
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
@@ -1208,6 +1209,7 @@ async function settleObligation(
         ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
       },
       ctx.log,
+      { from: rec.state },
     );
   } catch (err: any) {
     ctx.log?.warn?.(
@@ -1907,9 +1909,26 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
     if (!match) onReadError?.(curDir, "ENOENT");
     return match;
   } catch (err: any) {
-    onReadError?.(curDir, err?.code);
+    // cli#1006: ENOENT here is a clean "no cur/ directory" only when the
+    // directory itself is absent. A dangling cur/ symlink also reads ENOENT
+    // but exists, so it is a lookup ERROR, not an absence.
+    if (err?.code === "ENOENT" && !curDirAbsent(curDir)) {
+      onReadError?.(curDir, "DANGLING_SYMLINK");
+    } else {
+      onReadError?.(curDir, err?.code);
+    }
   }
   return null;
+}
+
+/** True when `dir` does not exist; a dangling symlink is not absent. A check
+ *  that cannot tell reports "not absent", so it never licenses the allowance. */
+function curDirAbsent(dir: string): boolean {
+  try {
+    return lstatSync(dir, { throwIfNoEntry: false }) === undefined;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Channel Plugin ──────────────────────────────────────────────────────────
@@ -2891,9 +2910,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // AMBIGUOUS_ID leaves the obligation untouched.
           let curLookupError: string | null = null;
           const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
-            // Only the scan's own clean "no match" (ENOENT ON the cur/ dir) is
-            // a miss; ENOENT from a listed file (a dangling symlink) is a read
-            // error.
+            // Only the scan's own clean "no cur/ directory" (ENOENT with the
+            // directory itself absent) is a miss; a dangling cur/ symlink or a
+            // listed file that is gone is a read error.
             if (code === "ENOENT" && path === curDir) return;
             curLookupError ??= code ?? "INVALID_JSON";
           });

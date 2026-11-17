@@ -1641,6 +1641,68 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     expect(obligationFile(AGENT, inboundId)?.state).toBe("delivering");
   });
 
+  it("r5 the deadline settlement refuses a state change after its re-read", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-settle-guard";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    let injected = false;
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeTransitionForTests(undefined);
+      transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "concurrent-reply" });
+    });
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
+      await sleep(200);
+      expect(obligationFile(AGENT, inboundId)?.state).toBe("posted");
+      expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+      expect(warnings.join("\n")).toContain("refusing to record the failure");
+    } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+  }, 40000);
+
+  it("r5 the unconfirmed settlement refuses a state change after its re-read", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-unconfirmed-guard";
+    seedOrphan(inboundId, { state: "delivering", deadlineInMs: -1000 });
+    let injected = false;
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeTransitionForTests(undefined);
+      transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "concurrent-reply" });
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(await pollUntil(() => injected, 15000), "settlement reached its guarded write").toBe(true);
+      await sleep(200);
+      expect(obligationFile(AGENT, inboundId)?.state).toBe("posted");
+      expect(obligationFile(AGENT, inboundId)?.replyId).toBe("concurrent-reply");
+    } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
+  }, 40000);
+
+  it("r5 a dangling cur/ directory is a lookup error: no settle, no nack, one log line", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-dangling-cur-dir";
+    seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const before = obligationFile(AGENT, inboundId);
+    const agentDir = resolve(tempMailDir, AGENT);
+    symlinkSync(resolve(agentDir, "absent-cur"), resolve(agentDir, "cur"));
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 15000), "the lookup failure is logged").toBe(true);
+      await sleep(200);
+      expect(obligationFile(AGENT, inboundId)).toEqual(before);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(1);
+      expect(warnings.join("\n")).toContain("DANGLING_SYMLINK");
+    } finally { await h.stop(); }
+  }, 20000);
+
   it("does not overwrite a posted transition that lands during the receipt scan", async () => {
     seedSigningKeys();
     const inboundId = "msg-race-posted";
