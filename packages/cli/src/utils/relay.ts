@@ -1493,9 +1493,10 @@ export async function connectAndKeepAlive(
   let stopped = false;
   let reconnectCount = 0;
   // Set once this connection's initial claim has returned, whether it wrote or
-  // the stop gate skipped it. A live connection's first claim attempts the
-  // write and replaces whatever record is there while the stop gate is open;
-  // every later claim runs the ownership rule.
+  // the stop gate skipped it. A live connection's first claim attempts a write
+  // without an ownership check while the stop gate is open; a later claim runs
+  // the ownership rule only while the stop gate is open. Writes can still fail
+  // on the filesystem (a directory at the record path, for one).
   let claimedRecord = false;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
@@ -1630,13 +1631,14 @@ export async function connectAndKeepAlive(
           startToken: processStartToken(process.pid),
         };
         // stop() sets stopped before clearing; both gates are checked under the lock.
-        // The initial claim of a live connection attempts the write and replaces
-        // whatever record is there while the stop gate is open. A later claim (a
-        // reconnect) writes when the record is absent or
+        // The initial claim of a live connection attempts a write without an
+        // ownership check while the stop gate is open. A later claim (a
+        // reconnect) checks eligibility only while the stop gate is open, and
+        // attempts the write when the record is absent or
         // is verified as owned by this connection, or when its recorded process
         // is not running or runs with a start token different from the recorded
         // one (pid reuse); a record whose token was altered is indistinguishable
-        // from pid reuse.
+        // from pid reuse. Either write can fail on the filesystem.
         // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {
