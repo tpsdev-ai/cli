@@ -1,11 +1,13 @@
 import { beforeEach, afterEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { createPatchShared } from "./helpers/patch-shared.js";
+import { mkdtempSync, rmSync, readdirSync, readFileSync, mkdirSync, writeFileSync, utimesSync, existsSync, symlinkSync, renameSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { checkMessages, getInbox, inboxExists, listMessages, sendMessage, ackMessage, countInboxMessages, promote } from "../src/utils/mail.js";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
+const patchShared = createPatchShared();
 
 const FLINT_SEED = Buffer.alloc(32, 0x01);
 const KERN_SEED = Buffer.alloc(32, 0x02);
@@ -237,6 +239,168 @@ describe("mail utils", () => {
     // Archive structure: ~/.tps/mail/<agent>/archive/YYYY-MM/<file>.json
     const archiveRoot = join(inbox.root, "archive");
     expect(existsSync(archiveRoot)).toBe(true);
+  });
+
+
+  test("archiveOldCur keeps cur/ while its obligation is non-terminal, and fails closed on an unreadable one", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const aged = (name: string, id: string): string => {
+      const path = join(inbox.cur, name);
+      writeFileSync(path, JSON.stringify({ id, from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+      utimesSync(path, old, old);
+      return path;
+    };
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const obligation = (id: string, state: string): void => {
+      writeFileSync(join(obligationDir, `${id}.json`), JSON.stringify({ obligationId: `ob-${id}`, inboundId: id, state }));
+    };
+
+    const open = aged("open.json", "msg-open");
+    const closed = aged("closed.json", "msg-closed");
+    const unreadable = aged("unreadable.json", "msg-unreadable");
+    obligation("msg-open", "yielded");
+    obligation("msg-closed", "acked");
+    // A directory at the record path makes the read fail for every uid, root included.
+    mkdirSync(join(obligationDir, "msg-unreadable.json"));
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(1);
+      expect(existsSync(open), "a non-terminal obligation keeps its cur/ record").toBe(true);
+      expect(existsSync(closed), "a terminal obligation does not").toBe(false);
+      expect(existsSync(unreadable), "an unreadable obligation record fails closed").toBe(true);
+
+      const malformed = aged("malformed.json", "msg-malformed");
+      writeFileSync(join(obligationDir, "msg-malformed.json"), "{not json");
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(malformed), "a malformed obligation record fails closed").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-unreadable.json")).length, "an unreadable record is logged once").toBe(1);
+      expect(warnings.filter((line) => line.includes("msg-malformed.json")).length, "a malformed record is logged once").toBe(1);
+    } finally {
+      restoreWarn();
+    }
+  });
+
+  test("archiveOldCur keeps a cur/ entry whose own read fails, for every uid", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    mkdirSync(inbox.cur, { recursive: true });
+    // A DIRECTORY named like a cur/ record: readFileSync fails with EISDIR for
+    // root too, so this is not a permissions case.
+    const unreadable = join(inbox.cur, "msg-unreadable-cur.json");
+    mkdirSync(unreadable);
+    utimesSync(unreadable, old, old);
+
+    expect(archiveOldCur("agent-a", 30)).toBe(0);
+    expect(existsSync(unreadable), "an unreadable cur/ record is kept").toBe(true);
+    expect(
+      readdirSync(inbox.cur).filter((f) => f.endsWith(".json")),
+      "nothing was archived",
+    ).toEqual(["msg-unreadable-cur.json"]);
+  });
+
+  test("archiveOldCur keeps a terminal record that is not for this cur/ file, and one with an unknown state", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const aged = (name: string, id: string): string => {
+      const path = join(inbox.cur, name);
+      writeFileSync(path, JSON.stringify({ id, from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+      utimesSync(path, old, old);
+      return path;
+    };
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+
+    const mismatched = aged("mismatched.json", "msg-mismatched");
+    writeFileSync(
+      join(obligationDir, "msg-mismatched.json"),
+      JSON.stringify({ obligationId: "ob-other", inboundId: "msg-other", state: "acked" }),
+    );
+    const unknown = aged("unknown-state.json", "msg-unknown-state");
+    writeFileSync(
+      join(obligationDir, "msg-unknown-state.json"),
+      JSON.stringify({ obligationId: "ob-unknown", inboundId: "msg-unknown-state", state: "someday" }),
+    );
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(mismatched), "a record naming another inbound keeps this cur/ file").toBe(true);
+      expect(existsSync(unknown), "an unrecognized state keeps this cur/ file").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-mismatched.json")).length, "the mismatch is logged once").toBe(1);
+      expect(warnings.filter((line) => line.includes("msg-unknown-state.json")).length, "the unknown state is logged once").toBe(1);
+    } finally {
+      restoreWarn();
+    }
+  });
+
+  test("archiveOldCur warns at most once per path across a mismatch and a later malformed record", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const cur = join(inbox.cur, "changed.json");
+    writeFileSync(cur, JSON.stringify({ id: "msg-changed", from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+    utimesSync(cur, old, old);
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const record = join(obligationDir, "msg-changed.json");
+    // First condition for the one retained cur/ path: a mismatch.
+    writeFileSync(record, JSON.stringify({ obligationId: "ob-other", inboundId: "msg-other", state: "acked" }));
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      // Same path, same process, second condition: the record is malformed.
+      writeFileSync(record, "{not json");
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(cur), "the cur/ record is retained through both calls").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-changed.json")).length, "only the first warning for the path appears").toBe(1);
+      expect(warnings.find((line) => line.includes("msg-changed.json")), "the first warning is the mismatch").toContain("names inbound msg-other");
+    } finally {
+      restoreWarn();
+    }
+  });
+
+  test("archiveOldCur keeps a cur/ entry whose obligation record has no inboundId, warning once per path", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    mkdirSync(inbox.cur, { recursive: true });
+    const cur = join(inbox.cur, "no-inbound-id.json");
+    writeFileSync(cur, JSON.stringify({ id: "msg-no-inbound-id", from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+    utimesSync(cur, old, old);
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    // The record cannot be tied to this cur/ entry, so its terminal state says
+    // nothing about this file: the fail-closed answer is to keep it.
+    writeFileSync(
+      join(obligationDir, "msg-no-inbound-id.json"),
+      JSON.stringify({ obligationId: "ob-no-inbound-id", state: "acked" }),
+    );
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30), "nothing is archived").toBe(0);
+      expect(existsSync(cur), "a record with no inboundId keeps the cur/ file").toBe(true);
+      expect(archiveOldCur("agent-a", 30), "a later call archives nothing either").toBe(0);
+      expect(existsSync(cur), "the file is still kept").toBe(true);
+      expect(
+        warnings.filter((line) => line.includes("msg-no-inbound-id.json")),
+        "the shared warning set reports the path once",
+      ).toHaveLength(1);
+      expect(warnings.find((line) => line.includes("msg-no-inbound-id.json"))).toContain("carries no inboundId");
+    } finally {
+      restoreWarn();
+    }
   });
 
   test("checkMessages opportunistically archives old cur entries", async () => {
@@ -532,5 +696,146 @@ describe("mail command", () => {
     const msgs = JSON.parse(checked.stdout);
     expect(msgs.length).toBe(1);
     expect(msgs[0].body).toBe("branch mail");
+  });
+});
+
+
+describe("r3 obligation archiver filesystem seam", () => {
+  let root: string;
+  let previousMailDir: string | undefined;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "archiver-seam-"));
+    previousMailDir = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = root;
+  });
+  afterEach(() => {
+    if (previousMailDir === undefined) delete process.env.TPS_MAIL_DIR;
+    else process.env.TPS_MAIL_DIR = previousMailDir;
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function agedCur(id: string): string {
+    const inbox = getInbox("seam-agent");
+    const file = join(inbox.cur, `${id}.json`);
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    writeFileSync(file, JSON.stringify({ id, from: "seam-sender", to: "seam-agent", body: "x", timestamp: old.toISOString() }));
+    utimesSync(file, old, old);
+    return file;
+  }
+
+  test("r3 dangling obligation store keeps cur and logs per path", async () => {
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const file = agedCur("dangling-store");
+    const inbox = getInbox("seam-agent");
+    symlinkSync(join(root, "absent-store"), join(inbox.root, ".obligations"));
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30)).toBe(0);
+      expect(archiveOldCur("seam-agent", 30)).toBe(0);
+      expect(existsSync(file)).toBe(true);
+      expect(warnings).toHaveLength(1);
+    } finally { restore(); }
+  });
+
+  test("r3 real plugin writer and CLI archiver agree on open and terminal records", async () => {
+    const { createObligation, transitionObligation } = await import("../../../plugins/openclaw-tps-mail/src/obligations.js");
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const message = sendMessage("seam-agent", "x", "seam-sender");
+    const id = message.id;
+    const file = join(getInbox("seam-agent").cur, `${id}.json`);
+    renameSync(message.filePath, file);
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    utimesSync(file, old, old);
+    expect(createObligation(root, "seam-agent", () => ({
+      obligationId: "ob-seam", inboundId: id, inboundTimestamp: new Date().toISOString(),
+      from: "seam-sender", to: "seam-agent", accountId: "default", state: "yielded", deadlineAt: null, attempts: 1,
+    })).created).toBe(true);
+    expect(archiveOldCur("seam-agent", 30)).toBe(0);
+    expect(existsSync(file)).toBe(true);
+    expect(transitionObligation(root, "seam-agent", id, "acked")?.state).toBe("acked");
+    expect(archiveOldCur("seam-agent", 30)).toBe(1);
+    expect(existsSync(file)).toBe(false);
+    const archive = join(getInbox("seam-agent").root, "archive");
+    expect(readdirSync(archive).flatMap((month) => readdirSync(join(archive, month)))).toContain(`${id}.json`);
+  });
+
+  test("r15 the archiver keeps every non-terminal state and archives every terminal one through the real writer", async () => {
+    const { createObligation, transitionObligation } = await import("../../../plugins/openclaw-tps-mail/src/obligations.js");
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const nonTerminal = ["pending", "yielded", "delivering", "posted"] as const;
+    const terminal = ["acked", "unconfirmed", "failed"] as const;
+    const files = new Map<string, string>();
+
+    const create = (id: string): void => {
+      const result = createObligation(root, "seam-agent", () => ({
+        obligationId: `ob-${id}`,
+        inboundId: id,
+        inboundTimestamp: new Date().toISOString(),
+        from: "seam-sender",
+        to: "seam-agent",
+        accountId: "default",
+        state: "pending",
+        deadlineAt: null,
+        attempts: 1,
+      }));
+      expect(result.created).toBe(true);
+    };
+    const transition = (id: string, next: "yielded" | "delivering" | "posted" | "acked" | "unconfirmed" | "failed"): void => {
+      expect(transitionObligation(root, "seam-agent", id, next)?.state).toBe(next);
+    };
+
+    for (const state of [...nonTerminal, ...terminal]) {
+      const id = `state-${state}`;
+      files.set(state, agedCur(id));
+      create(id);
+      if (state === "yielded" || state === "delivering" || state === "posted") transition(id, state);
+      if (state === "acked" || state === "unconfirmed") {
+        transition(id, "posted");
+        transition(id, state);
+      }
+      if (state === "failed") transition(id, "failed");
+    }
+
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30), "the three terminal records are archived").toBe(3);
+      for (const state of nonTerminal) {
+        expect(existsSync(files.get(state)!), `${state} keeps the cur/ record`).toBe(true);
+      }
+      for (const state of terminal) {
+        expect(existsSync(files.get(state)!), `${state} does not keep the cur/ record`).toBe(false);
+      }
+      expect(warnings, "every state is read without a warning").toHaveLength(0);
+    } finally { restore(); }
+  });
+
+  test("r15 obligationHoldsCur: an absent record archives the cur/ entry, a dangling record keeps it", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("seam-agent");
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const absent = agedCur("no-obligation-record");
+    const dangling = agedCur("dangling-obligation-record");
+    symlinkSync(join(root, "absent-record.json"), join(obligationDir, "dangling-obligation-record.json"));
+
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30), "only the entry with no record is archived").toBe(1);
+      expect(existsSync(absent), "a clean absent record archives the cur/ entry").toBe(false);
+      expect(existsSync(dangling), "a dangling record keeps the cur/ entry").toBe(true);
+      expect(warnings.filter((line) => line.includes("dangling-obligation-record.json"))).toHaveLength(1);
+      expect(
+        warnings.filter((line) => line.includes("no-obligation-record.json")),
+        "an absent record archives without a warning",
+      ).toHaveLength(0);
+      expect(archiveOldCur("seam-agent", 30), "a second call archives nothing").toBe(0);
+      expect(
+        warnings.filter((line) => line.includes("dangling-obligation-record.json")),
+        "the dangling record warns once per path",
+      ).toHaveLength(1);
+    } finally { restore(); }
   });
 });

@@ -596,6 +596,109 @@ export function inboxFullMessage(recipient: string, count: number): string {
   );
 }
 
+/** Final obligation states (cli#1006): once one of these is on the record the
+ *  reply is no longer owed, so cur/ may age out. */
+const TERMINAL_OBLIGATION_STATES = new Set(["acked", "unconfirmed", "failed"]);
+
+/** Every obligation state the store recognizes; anything else is not a record
+ *  this archiver may act on. */
+const KNOWN_OBLIGATION_STATES = new Set([
+  "pending",
+  "yielded",
+  "delivering",
+  "posted",
+  "acked",
+  "unconfirmed",
+  "failed",
+]);
+
+/** Paths already warned about in this process: at most one warning per path per
+ *  process, whatever the reason — a later reason for the same path is
+ *  suppressed. */
+const warnedObligationArchiveReads = new Set<string>();
+
+function warnObligationArchiveRead(path: string, code: string | undefined): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} is unreadable (${code ?? "invalid"}); not archiving`);
+}
+
+/** At most one warning per path across read and mismatch reasons: a record that
+ *  exists but does not describe THIS cur/ file, or whose state is not
+ *  recognized. */
+function warnObligationArchiveMismatch(path: string, reason: string): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} ${reason}; not archiving`);
+}
+
+/** True when the obligation for `messageId` is still live (or cannot be read,
+ *  or does not belong to this cur/ file). Fail-closed: an unreadable or
+ *  malformed record keeps the cur/ file, because archiving on a read error
+ *  could hide an open obligation (cli#1006). */
+function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
+  const path = join(inboxRoot, ".obligations", `${messageId}.json`);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // A child's ENOENT can hide an inaccessible store (e.g. a dangling
+      // symlink). Check the store itself before treating the child as absent.
+      try {
+        const store = lstatSync(join(inboxRoot, ".obligations"));
+        if (!store.isDirectory()) {
+          warnObligationArchiveRead(path, "INVALID_STORE");
+          return true;
+        }
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
+      try {
+        lstatSync(path);
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
+      warnObligationArchiveRead(path, code);
+      return true;
+    }
+    warnObligationArchiveRead(path, code);
+    return true;
+  }
+  try {
+    const record = JSON.parse(raw) as { state?: unknown; inboundId?: unknown };
+    if (!record || typeof record.state !== "string") {
+      warnObligationArchiveRead(path, "INVALID_RECORD");
+      return true;
+    }
+    // cli#1006 r2: the record must be FOR THIS cur/ file. A record that names
+    // another inbound (or none) says nothing about this one; keeping the file
+    // is the fail-closed answer.
+    if (typeof record.inboundId !== "string" || record.inboundId.length === 0) {
+      warnObligationArchiveMismatch(path, "carries no inboundId");
+      return true;
+    }
+    if (record.inboundId !== messageId) {
+      warnObligationArchiveMismatch(path, `names inbound ${record.inboundId}, not this cur/ record`);
+      return true;
+    }
+    // An unrecognized state is not a terminal one: keep the file and say so.
+    if (!KNOWN_OBLIGATION_STATES.has(record.state)) {
+      warnObligationArchiveMismatch(path, `has an unrecognized state ${record.state}`);
+      return true;
+    }
+    return !TERMINAL_OBLIGATION_STATES.has(record.state);
+  } catch {
+    warnObligationArchiveRead(path, "INVALID_JSON");
+    return true;
+  }
+}
+
 /**
  * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
  *
@@ -626,6 +729,17 @@ export function archiveOldCur(agent: string, maxAgeDays = 30): number {
         // and ones manually touched. Most cur/ entries are written-once when
         // ack'd, so mtime ≈ when the agent processed them.
         if (st.mtimeMs > cutoffMs) continue;
+        // cli#1006: keep the record while its reply obligation is open. Reading
+        // the identity first also means an unreadable cur/ record is kept (its
+        // obligation cannot be checked), never archived on a read error.
+        let messageId: unknown;
+        try {
+          messageId = (JSON.parse(readFileSync(src, "utf-8")) as { id?: unknown }).id;
+        } catch {
+          continue;
+        }
+        if (typeof messageId !== "string" || messageId.length === 0) continue;
+        if (obligationHoldsCur(inbox.root, messageId)) continue;
         const ts = new Date(st.mtimeMs);
         const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
         mkdirSync(monthDir, { recursive: true });
