@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -319,6 +319,36 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
   }
 }
 
+/**
+ * Whether two paths resolve to the same filesystem object (same device and
+ * inode); `updateExistingRecord` passes directories. Different spellings of one
+ * directory (a symlink, or another letter case on a case-insensitive volume)
+ * match when they resolve to the same directory; identities are compared exactly, as bigint.
+ */
+export function sameDirectory(a: string, b: string, stat: (path: string) => BigIntStats = (path) => statSync(path, { bigint: true })): boolean {
+  const left = stat(a);
+  const right = stat(b);
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+/**
+ * An update takes the mailbox lock derived from the record path, so the record
+ * must really live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory
+ * symlinked to another mailbox would otherwise let a lock holder write a
+ * mailbox it does not lock, and two lock holders could update one physical
+ * record.
+ */
+export class MailRecordLockRootError extends Error {
+  constructor(
+    readonly recordPath: string,
+    readonly recordDir: string,
+    readonly lockRoot: string,
+  ) {
+    super(`refusing to update mail record ${recordPath}: its directory resolves to ${recordDir}, whose parent is not the locked mailbox root ${lockRoot}; update the record through the mailbox that physically contains it`);
+    this.name = "MailRecordLockRootError";
+  }
+}
+
 /** The exact name updateExistingRecord writes beside a record it replaces. */
 const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 
@@ -431,12 +461,30 @@ export function updateExistingRecord<T extends object>(
     if (options.nonBlocking) return { status: "busy" };
     throw Object.assign(new Error(`mail lock contention timeout for ${path}`), { path: mailLockPath(root) });
   }
-  removeLeftoverAckScratch(root, dirname(path));
-  const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+  const recordDir = dirname(path);
+  const scratchPath = join(recordDir, `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
   let relayLock: MailLock | null = null;
   try {
+    // The lock is keyed on the lexical path, so check that the record's
+    // directory is physically the one under that root before writing scratch
+    // or mutating. Compare identity, not spelling: node's realpathSync keeps
+    // the given letter case, so on a case-insensitive volume two spellings of
+    // one directory resolve to different strings (bun canonicalizes the case).
+    let realRoot: string;
+    let realRecordDir: string;
+    try {
+      realRoot = realpathSync(root);
+      realRecordDir = realpathSync(recordDir);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { status: "gone" };
+      throw Object.assign(new Error(`cannot verify the mailbox root for ${path}: ${err?.message ?? String(err)}`), { path: recordDir });
+    }
+    if (!sameDirectory(dirname(realRecordDir), realRoot)) {
+      throw new MailRecordLockRootError(path, realRecordDir, realRoot);
+    }
+    removeLeftoverAckScratch(root, recordDir);
     statSync(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
     if (options.reserveRelayMove) {

@@ -49,13 +49,14 @@ function collectWarnings(): { lines: string[]; warn: ReturnType<typeof spyOn> } 
   return { lines, warn };
 }
 
-test("the sweep leaves a live writer's scratch reached through a leaf cur symlink", () => {
+test("an ack through a leaf cur symlink is refused and leaves the live scratch untouched", () => {
   const inboxA = mail.getInbox("mailbox-a");
   const mailboxB = join(root, "mailbox-b");
   fs.mkdirSync(mailboxB, { recursive: true });
   fs.symlinkSync(inboxA.cur, join(mailboxB, "cur"), "dir");
   const targetB = join(mailboxB, "cur", "record.json");
   plantRecord(targetB, "record-id");
+  const recordBefore = fs.readFileSync(targetB, "utf8");
 
   const lockA = acquireMailLockSync(inboxA.root);
   expect(lockA).not.toBeNull();
@@ -67,14 +68,15 @@ test("the sweep leaves a live writer's scratch reached through a leaf cur symlin
   makeOld(live);
   const { lines } = collectWarnings();
   try {
-    expect(mail.ackMessageAtPath(targetB).read).toBe(true);
+    expect(() => mail.ackMessageAtPath(targetB)).toThrow(mail.MailRecordLockRootError);
   } finally {
     lockA!.release();
     fs.closeSync(fd);
   }
 
   expect(fs.readFileSync(live, "utf8")).toBe("{ partial");
-  expect(lines.filter((line) => line.includes("left ack scratch"))).toHaveLength(1);
+  expect(fs.readFileSync(targetB, "utf8")).toBe(recordBefore);
+  expect(lines.filter((line) => line.includes("left ack scratch"))).toHaveLength(0);
 });
 
 test("the sweep leaves a scratch younger than the minimum age and removes an older one", () => {
