@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { decideSettledRead, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
+import { decideSettledRead, finalizeGatewayRun, readSettledState } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -523,6 +523,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
       ],
       { stdio: ["ignore", "pipe", "pipe"] },
     );
+    const root = mkdtempSync(join(tmpdir(), "tps-killed-gateway-"));
     try {
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("stub gateway never booted")), 5_000);
@@ -540,36 +541,54 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
         });
       });
 
-      const stop = await stopGateway(stub, { deadlineMs: 200 });
+      // The settled listing would succeed with a count of 0 here, so the report
+      // can only carry it if the function reads a state it was told not to.
+      const mailDir = join(root, "mail");
+      for (const dir of [
+        join(mailDir, "agent-a", "new"),
+        join(mailDir, "agent-a", "cur"),
+        join(mailDir, "agent-a", ".obligations"),
+        join(mailDir, "agent-b", "new"),
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const report = {
+        readErrors: [] as string[],
+        inboundId: "msg-one",
+        inboundName: "2026-01-01T00-00-00-000Z-msg-one.json",
+        settledRead: false,
+        stopped: false,
+        stoppedGracefully: false,
+        stopSignal: null as string | null,
+        ackLanded: true,
+        ackTimedOut: false,
+      };
+      const reportPath = join(root, "report.json");
+
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir,
+        reportPath,
+        stopDeadlineMs: 200,
+      });
       expect(stop.stopped).toBe(true);
       expect(stop.stoppedGracefully).toBe(false);
       expect(stop.signalCode).toBe("SIGKILL");
 
-      const read = decideSettledRead({
-        stopped: stop.stopped,
-        stoppedGracefully: stop.stoppedGracefully,
-        ackLanded: true,
-        ackTimedOut: false,
-      });
-      expect(read.read).toBe(false);
-      expect(read.readError).toContain("did not stop gracefully");
-
-      const report = ackedReport();
-      report.settledRead = false;
-      report.readErrors = [read.readError!];
-      let message = "";
-      try {
-        expectGatewayReport(report);
-      } catch (err) {
-        message = String((err as Error).message);
-      }
-      expect(message).toContain("did not stop gracefully");
-      expect(message).not.toContain("found 0");
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGKILL");
+      expect(written.settledRead).toBe(false);
+      expect(written.readErrors.join("; ")).toContain("did not stop gracefully");
+      expect(written.replyCountAfterStop).toBeUndefined();
     } finally {
       if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
       if (stub.exitCode === null && stub.signalCode === null) {
         await new Promise((resolve) => stub.once("exit", resolve));
       }
+      rmSync(root, { recursive: true, force: true });
     }
   }, 15_000);
 });
