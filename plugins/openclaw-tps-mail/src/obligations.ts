@@ -164,6 +164,12 @@ export interface ObligationRecord {
    *  (like `markNackSent` clears it on a hand-off), so it happens ONCE and the
    *  startup retry no longer fires for that record. */
   nackAbandonedAt?: string;
+  /** cli#1059: the store increments this under its lock on every write. A
+   *  decision write names the revision it decided on (with the state), so a
+   *  same-state update — e.g. one that extends `deadlineAt` — cannot be
+   *  overwritten by a decision made on an older snapshot. A record written
+   *  before this field existed reads as revision 0, and its first write sets 1. */
+  revision?: number;
 }
 
 export interface ObligationLog {
@@ -245,13 +251,18 @@ export function writeObligation(mailDir: string, agent: string, record: Obligati
   withObligationLock(mailDir, agent, () => writeObligationLocked(mailDir, agent, record));
 }
 
-function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord): void {
+function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord): ObligationRecord {
   const dir = obligationsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const target = resolve(dir, `${record.inboundId}.json`);
   const tmp = resolve(dir, `.${record.inboundId}.json.tmp`);
-  writeFileSync(tmp, JSON.stringify(record, null, 2), "utf-8");
+  // The lock is held here, so the revision this write replaces is the one the
+  // last write left. A record from before the field existed reads as 0.
+  const existing = readObligation(mailDir, agent, record.inboundId);
+  const written: ObligationRecord = { ...record, revision: (existing?.revision ?? 0) + 1 };
+  writeFileSync(tmp, JSON.stringify(written, null, 2), "utf-8");
   renameSync(tmp, target);
+  return written;
 }
 
 /**
@@ -275,8 +286,8 @@ export function createObligation(
       return { created: false, record: existing };
     }
     draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
-    writeObligationLocked(mailDir, agent, draft);
-    return { created: true, record: draft };
+    const written = writeObligationLocked(mailDir, agent, draft);
+    return { created: true, record: written };
   });
 }
 
@@ -300,7 +311,10 @@ export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTest
  * delivery call) may never be handed the old record as though it were the result.
  *
  * `expect.from` refuses a transition when the record's STATE moved since the
- * caller's re-read. A concurrent same-state update is not detected.
+ * caller's re-read; `expect.revision` additionally refuses a SAME-STATE update
+ * (e.g. a deadline extension) that landed since that read. A decision write
+ * passes both. A refused transition returns null and writes nothing, so the
+ * caller must re-read and re-evaluate.
  */
 export function transitionObligation(
   mailDir: string,
@@ -309,7 +323,7 @@ export function transitionObligation(
   next: ObligationState,
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
-  expect?: { from: ObligationState },
+  expect?: { from: ObligationState; revision?: number },
 ): ObligationRecord | null {
   beforeTransitionForTests?.(inboundId);
   return withObligationLock(mailDir, agent, () => {
@@ -327,9 +341,14 @@ export function transitionObligation(
       );
       return null;
     }
+    if (expect?.revision !== undefined && (current.revision ?? 0) !== expect.revision) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} moved from revision ${expect.revision} to ${current.revision ?? 0}; refusing the stale transition to ${next}`,
+      );
+      return null;
+    }
     const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
-    writeObligationLocked(mailDir, agent, updated);
-    return updated;
+    return writeObligationLocked(mailDir, agent, updated);
   });
 }
 

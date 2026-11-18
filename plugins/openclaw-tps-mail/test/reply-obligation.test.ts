@@ -38,7 +38,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 // Import the plugin — default export gives us { register }.
-import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests } from "../src/index.js";
 import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -3180,6 +3180,211 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       ).toHaveLength(1);
     } finally { await second.stop(); }
   }, 120000);
+
+  // ── cli#1059 — bounded in-process retry and revision-checked writes ────────
+
+  it("1059 a deadline lookup error retries in-process and settles once the fault clears", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-lookup-retry";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 500);
+    let faulty = true;
+    setObligationCurLookupFaultForTests((id) => (id === inboundId && faulty ? "EIO" : undefined));
+    const prevDelays = setObligationRetryDelaysForTests([300, 300, 300]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the deadline lookup error scheduled an in-process retry",
+      ).toBe(true);
+      faulty = false;
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "a later attempt settles the live record after the lookup recovers",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setObligationCurLookupFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 two refused re-arms continue to the next bounded attempt and then resolve", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-arm-retry";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
+    let refusals = 2;
+    setArmDeadlineFaultForTests((id) => id === inboundId && refusals-- > 0);
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 200]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "a later attempt arms the deadline",
+      ).toBe(true);
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the armed deadline resolves the obligation in this process",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 a lookup fault through all three attempts logs one exhaustion warning and writes nothing", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-retry-exhausted";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1200);
+    setObligationCurLookupFaultForTests((id) => (id === inboundId ? "EIO" : undefined));
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "the deadline is armed before the faulting deadline fires",
+      ).toBe(true);
+      const before = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
+        "the cap is reached with a named warning",
+      ).toBe(true);
+      expect(warnings.filter((line) => line.includes("obligation-retry-exhausted"))).toHaveLength(1);
+      expect(warnings.join("\n")).toContain("EIO");
+      await sleep(200);
+      const after = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      expect(after, "the record is byte-identical").toBe(before);
+      expect(obligationStateForTests().retries.some((r) => r.obligationId === obligationId), "no retry timer is left").toBe(false);
+      expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), "no deadline timer is left").toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "the cap sends no nack").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setObligationCurLookupFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 shutdown clears a pending retry and a restarted account is not touched by it", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-retry-shutdown";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 300);
+    setObligationCurLookupFaultForTests((id) => (id === inboundId ? "EIO" : undefined));
+    const prevDelays = setObligationRetryDelaysForTests([600, 600, 600]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "a retry is pending",
+      ).toBe(true);
+      await h.stop();
+      expect(obligationStateForTests().retries.some((r) => r.obligationId === obligationId), "shutdown clears the retry").toBe(false);
+
+      transitionObligation(tempMailDir, AGENT, inboundId, "unconfirmed", { failure: "restart-fixture" });
+      const before = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      const h2 = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+      await sleep(900);
+      const after = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      expect(after, "the old retry does not act after the restart").toBe(before);
+      await h2.stop();
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setObligationCurLookupFaultForTests(undefined);
+      try { await h.stop(); } catch { /* already stopped */ }
+    }
+  }, 40000);
+
+  it("1059 a record that settles while a retry waits cancels the retry with no write", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-retry-cancel";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 300);
+    setObligationCurLookupFaultForTests((id) => (id === inboundId ? "EIO" : undefined));
+    const prevDelays = setObligationRetryDelaysForTests([600, 600, 600]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "a retry is pending",
+      ).toBe(true);
+      transitionObligation(tempMailDir, AGENT, inboundId, "unconfirmed", { failure: "settled-concurrently" });
+      const before = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      await sleep(900);
+      const after = readFileSync(resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`), "utf-8");
+      expect(after, "the cancelled retry writes nothing").toBe(before);
+      expect(obligationStateForTests().retries.some((r) => r.obligationId === obligationId)).toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setObligationCurLookupFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 a same-state deadline extension refuses the stale settle write and sends no early nack", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-same-state";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    let injected = false;
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeTransitionForTests(undefined);
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", {
+        deadlineAt: new Date(Date.now() + 2500).toISOString(),
+      });
+    });
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 200]);
+    const warnings: string[] = [];
+    const hPromise = start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(await pollUntil(() => injected, 15000), "the settlement reached its guarded write").toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the stale settle write is refused").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no early nack is sent").toHaveLength(0);
+      const h = await hPromise;
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the fresh record is re-evaluated and settles at its extended deadline",
+      ).toBe(true);
+      expect(warnings.join("\n")).toContain("refusing to record the failure");
+      await h.stop();
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setBeforeTransitionForTests(undefined);
+    }
+  }, 40000);
+
+  it("1059 a record with no revision reads as 0 and its first write sets 1", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-legacy-revision";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: 60000 });
+    expect(obligationFile(AGENT, inboundId)?.revision).toBeUndefined();
+    const written = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-legacy" });
+    expect(written?.revision).toBe(1);
+    expect(obligationFile(AGENT, inboundId)?.revision).toBe(1);
+  });
+
+  it("1059 two writers on the same snapshot revision: exactly one wins", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-revision-race";
+    seedOrphan(inboundId, { state: "posted", deadlineInMs: 60000 });
+    const snapshot = obligationFile(AGENT, inboundId);
+    expect(snapshot?.revision).toBeUndefined();
+    const stale = snapshot?.revision ?? 0;
+    const first = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-first" }, undefined, {
+      from: "posted",
+      revision: stale,
+    });
+    const second = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-second" }, undefined, {
+      from: "posted",
+      revision: stale,
+    });
+    expect(first?.revision, "the first writer lands revision 1").toBe(1);
+    expect(second, "the second writer on the same revision is refused").toBeNull();
+    expect(obligationFile(AGENT, inboundId)?.replyId).toBe("reply-first");
+    expect(obligationFile(AGENT, inboundId)?.revision).toBe(1);
+  });
 });
 
 
