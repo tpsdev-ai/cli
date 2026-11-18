@@ -6,15 +6,17 @@
  * the reverse): the outbox per-delivery lock, pid files and the launch
  * snapshot sweep. The pid-file path is also driven through a CLI subprocess
  * with the test-only `ps` preload. A live owner whose tokens cannot be
- * compared is never treated as gone: it is reported, its record is kept, and
- * the outbox refusals say how to recover.
+ * compared is never treated as gone: its record is kept, and the lock,
+ * pid-file and teardown checks report it.
  */
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { processStartToken } from "@tpsdev-ai/agent";
+import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import {
   forcePsStartTokens,
@@ -23,7 +25,7 @@ import {
 } from "../../../test/helpers/start-token-source-test.js";
 import { releasedAgentIdentity, stopLaunchProcesses } from "../src/utils/launch-attestation.js";
 import { LAUNCH_SNAPSHOT_OWNER_FILE, LAUNCH_SNAPSHOT_PREFIX, sweepStaleLaunchSnapshots } from "../src/utils/launch-snapshots.js";
-import { MailLockOwnerError, tryAcquireMailLock } from "../src/utils/mail-lock.js";
+import { MailLockOwnerError, mailLockTestHooks, tryAcquireMailLock } from "../src/utils/mail-lock.js";
 import { OutboxLockError, queueOutboxMessage } from "../src/utils/outbox.js";
 import { readPidFile } from "../src/utils/pid-file.js";
 
@@ -123,6 +125,37 @@ describe("outbox per-delivery lock", () => {
     expect((thrown as Error).message).toContain(GUIDANCE);
     expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
   });
+
+  test("a reclaim that meets a live unverifiable owner reports the guidance and keeps the record", () => {
+    process.env.HOME = root;
+    const reaped = spawnSync(process.execPath, ["-e", ""]).pid as number;
+    expect(pidState(reaped)).toBe("gone");
+    const pid = livePid();
+    const owner = { pid, startToken: legacyPsToken(pid) };
+    const deliveryId = "b".repeat(64);
+    const lockDir = join(root, ".tps", "outbox", "new", `.github-${deliveryId}.lock`);
+    mkdirSync(lockDir, { recursive: true });
+    const ownerFile = join(lockDir, "owner.json");
+    const deadOwner = { pid: reaped, startToken: "proc:1" };
+    writeFileSync(ownerFile, JSON.stringify(deadOwner));
+    mkdirSync(`${lockDir}.reclaim`);
+    writeFileSync(join(`${lockDir}.reclaim`, "owner.json"), JSON.stringify(deadOwner));
+    const restore = patchShared(mailLockTestHooks, "beforeOwnerRead", (dir: string) => {
+      if (!dir.endsWith(".reclaim")) return;
+      writeFileSync(ownerFile, JSON.stringify(owner));
+    });
+    let thrown: unknown;
+    try {
+      queueOutboxMessage("agent-a", "body", "agent-a", deliveryId);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      restore();
+    }
+    expect(thrown).toBeInstanceOf(OutboxLockError);
+    expect((thrown as Error).message).toContain(GUIDANCE);
+    expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
+  });
 });
 
 describe("pid files", () => {
@@ -147,8 +180,22 @@ describe("pid files", () => {
     mkdirSync(join(root, ".tps"), { recursive: true });
     const pid = livePid();
     const legacy = legacyPsToken(pid);
-    expect(legacy).not.toBe(pinnedPsToken(pid));
+    const pinned = pinnedPsToken(pid);
+    expect(legacy).not.toBe(pinned);
     const path = join(root, ".tps", "relay.pid");
+
+    // Positive control: the preload really put this child on the ps: path. A
+    // /proc read would report the relay unverified against this ps: token.
+    writeFileSync(path, `${JSON.stringify({ pid, startToken: pinned })}\n`);
+    const status = spawnSync(
+      node,
+      [...PS_START_TOKENS_NODE_ARGS, TPS_BIN, "mail", "relay", "status"],
+      { env: { ...process.env, HOME: root }, encoding: "utf-8", timeout: 30_000 },
+    );
+    if (status.error) throw status.error;
+    expect(status.status).toBe(0);
+    expect(status.stdout).toContain(`Mail relay running: pid=${pid}`);
+
     const bytes = `${JSON.stringify({ pid, startToken: legacy })}\n`;
     writeFileSync(path, bytes);
 
@@ -190,6 +237,52 @@ describe("launch snapshot sweep", () => {
 });
 
 describe("released-agent identity", () => {
+  test("a live released agent recorded as a proc: token against its live ps: token is a survivor", async () => {
+    forcePsStartTokens();
+    const pid = livePid();
+    const live = processStartToken(pid);
+    expect(live).toMatch(/^ps:/);
+    const signalled: number[] = [];
+    try {
+      expect(releasedAgentIdentity({ pid, startToken: "proc:1" })).toBe("unknown");
+      const stop = await stopLaunchProcesses(
+        { supervisor: null, agent: { pid, startToken: "proc:1" } },
+        "SIGTERM",
+        { boundMs: 50, hooks: { startToken: () => live, onSignal: (signalledPid) => signalled.push(signalledPid) } },
+      );
+      expect(stop.stopped).toBe(false);
+      expect(stop.survivors).toEqual([pid]);
+      expect(signalled).toEqual([]);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      child?.kill("SIGKILL");
+      child = undefined;
+    }
+  });
+
+  test("a live released agent recorded as a ps: token against its live proc: token is a survivor", async () => {
+    stageProcStartTokens();
+    const pid = livePid();
+    const legacy = legacyPsToken(pid);
+    expect(processStartToken(pid)).toMatch(/^proc:/);
+    const signalled: number[] = [];
+    try {
+      expect(releasedAgentIdentity({ pid, startToken: legacy })).toBe("unknown");
+      const stop = await stopLaunchProcesses(
+        { supervisor: null, agent: { pid, startToken: legacy } },
+        "SIGTERM",
+        { boundMs: 50, hooks: { onSignal: (signalledPid) => signalled.push(signalledPid) } },
+      );
+      expect(stop.stopped).toBe(false);
+      expect(stop.survivors).toEqual([pid]);
+      expect(signalled).toEqual([]);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      child?.kill("SIGKILL");
+      child = undefined;
+    }
+  });
+
   test("a live released agent with a legacy ps: token is a survivor, not a stopped launch", async () => {
     const pid = livePid();
     const legacy = legacyPsToken(pid);
