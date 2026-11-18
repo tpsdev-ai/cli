@@ -19,7 +19,10 @@ let root: string;
 let priorMailDir: string | undefined;
 
 beforeEach(() => {
-  root = fs.mkdtempSync(join(tmpdir(), "ack-scratch-1029-"));
+  // Canonicalize the temp root: on a host whose tmpdir() goes through a
+  // symlink (macOS: /var -> /private/var), updateExistingRecord resolves the
+  // mailbox path and the spies below would compare against the other spelling.
+  root = fs.realpathSync(fs.mkdtempSync(join(tmpdir(), "ack-scratch-1029-")));
   priorMailDir = process.env.TPS_MAIL_DIR;
   process.env.TPS_MAIL_DIR = root;
 });
