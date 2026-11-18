@@ -320,9 +320,10 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
 }
 
 /**
- * Whether two paths name one physical directory, compared by device and inode.
- * Different spellings of one directory (a symlink, or another letter case on a
- * case-insensitive volume) still match when they reach the same directory.
+ * Whether two paths resolve to the same filesystem object (same device and
+ * inode); `updateExistingRecord` passes directories. Different spellings of one
+ * directory (a symlink, or another letter case on a case-insensitive volume)
+ * match when they resolve to the same directory.
  */
 export function sameDirectory(a: string, b: string, stat: (path: string) => Stats = statSync): boolean {
   const left = stat(a);

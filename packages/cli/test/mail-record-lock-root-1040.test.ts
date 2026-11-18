@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, expect, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -11,6 +11,10 @@ import {
   updateExistingRecord,
 } from "../src/utils/mail.js";
 import { acquireMailLockSync, mailLockPath } from "../src/utils/mail-lock.js";
+
+afterEach(() => {
+  mock.restore();
+});
 
 let root: string;
 let priorMailDir: string | undefined;
@@ -118,6 +122,42 @@ test("a refused alias update does not parse the target record first", () => {
   const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
 
   expect(err.name).toBe("MailRecordLockRootError");
+});
+
+test("a refused alias whose record path is a directory still throws the lock-root error", () => {
+  const { targetB } = symlinkedLayout();
+  // Reading a directory throws EISDIR, so a raw read placed above the check
+  // surfaces as EISDIR instead of the refusal.
+  fs.mkdirSync(targetB, { recursive: true });
+
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+
+  expect(err.name).toBe("MailRecordLockRootError");
+});
+
+test("a refused alias update never attempts to create an ack scratch path", () => {
+  const { source, targetB } = symlinkedLayout();
+  plantRecord(targetB, "record-id");
+
+  const scratchAttempts: string[] = [];
+  const record = (path: unknown) => {
+    if (String(path).includes(".ack-")) scratchAttempts.push(String(path));
+  };
+  const realWriteFileSync = fs.writeFileSync;
+  const realOpenSync = fs.openSync;
+  spyOn(fs, "writeFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    record(path);
+    return (realWriteFileSync as (...args: unknown[]) => void)(path, ...rest);
+  }) as typeof fs.writeFileSync);
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    record(path);
+    return (realOpenSync as (...args: unknown[]) => number)(path, ...rest);
+  }) as typeof fs.openSync);
+
+  refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+
+  expect(scratchAttempts).toEqual([]);
+  expect(fs.readdirSync(source).filter((name) => name.startsWith(".ack-"))).toEqual([]);
 });
 
 test("an update through a symlinked new/ is refused", () => {
