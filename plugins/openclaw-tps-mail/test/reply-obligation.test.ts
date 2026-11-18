@@ -2512,13 +2512,68 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
   }, 60000);
 
   /**
-   * Await the startup's cur/ sweep for this inbound: its completion includes any
-   * recovery it scheduled for the inbound. The helper FAILS when that completion
-   * never arrives, so a delayed bypass cannot pass by outliving the assertions.
+   * Await the account's bound-agent startup cur/ sweeps and their recoveries for
+   * this inbound. A timeout fails the caller's completion assertion, so a delayed
+   * bypass cannot pass by outliving the assertions.
    */
   async function waitForStartupSweep(inboundId: string, ms = 15000): Promise<boolean> {
     return awaitStartupCurSweepForTests("default", inboundId, ms);
   }
+
+  it("startup sweep wait retains the first bound agent's recovery after the second sweep starts", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-first-bound-agent";
+    const secondAgent = "agent-b";
+    const secondInbound = "msg-second-bound-agent";
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    writeFileSync(resolve(curDir, `${inboundId}.json`), JSON.stringify({
+      id: inboundId, from: SENDER, to: AGENT,
+      body: buildSignedBody(SENDER, AGENT, "payload", FLINT_SEED),
+      timestamp: new Date().toISOString(), read: false,
+    }));
+    const secondCurDir = resolve(tempMailDir, secondAgent, "cur");
+    mkdirSync(secondCurDir, { recursive: true });
+    writeFileSync(resolve(secondCurDir, `${secondInbound}.json`), JSON.stringify({
+      id: secondInbound, from: SENDER, to: secondAgent,
+      body: "unpromoted", timestamp: new Date().toISOString(), read: false,
+    }));
+
+    let releaseRecovery!: () => void;
+    const recoveryGate = new Promise<void>((r) => { releaseRecovery = r; });
+    let recoveryEntered = false;
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, {
+      noInbound: true,
+      localSender: true,
+      warnCalls: warnings,
+      bindings: [AGENT, secondAgent].map((agentId) => ({ agentId, match: { channel: "tps-mail", accountId: "default" } })),
+      beforeVerify: async () => { recoveryEntered = true; await recoveryGate; },
+    });
+    try {
+      expect(await pollUntil(() => recoveryEntered), "the first recovery is delayed").toBe(true);
+      expect(await pollUntil(() => warnings.some((line) => line.includes(`cur/ recovery refused ${secondInbound}`))),
+        "the second agent's sweep has scheduled recovery").toBe(true);
+      let resolved = false;
+      const waiting = waitForStartupSweep(inboundId).then((completed) => {
+        resolved = true;
+        return { completed, ackedAt: curRecordById(AGENT, inboundId)?.ackedAt };
+      });
+      await sleep(30);
+      expect(resolved, "the wait includes the delayed first recovery").toBe(false);
+      releaseRecovery();
+      expect(await pollUntil(() => h.dispatched !== null), "the first recovery dispatches").toBe(true);
+      await h.deliver("recovered reply", "final");
+      h.settle();
+      const result = await waiting;
+      expect(result.completed).toBe(true);
+      expect(result.ackedAt, "the recovery's ack is visible when the wait resolves").toBeString();
+    } finally {
+      releaseRecovery();
+      h.settle();
+      await h.stop();
+    }
+  }, 30000);
 
   it("r16 two matching cur/ entries report AMBIGUOUS_ID and the completed startup sweep leaves the obligation untouched", async () => {
     seedSigningKeys();
