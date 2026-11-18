@@ -113,6 +113,50 @@ export function readSettledState(report, { replyDir, newDir, curDir, obligations
   }
 }
 
+/**
+ * The report's final section: stop the gateway child, copy the stop result into
+ * the report, decide whether the settled state may be judged, read it when the
+ * decision allows, then write the report. `beforeWrite` is where the caller
+ * closes its stubs and gathers the log-derived fields; it runs after the
+ * settled read and before the write.
+ */
+export async function finalizeGatewayRun({
+  child,
+  report,
+  mailDir,
+  reportPath,
+  stopDeadlineMs = 5_000,
+  beforeWrite = null,
+}) {
+  const stop = await stopGateway(child, { deadlineMs: stopDeadlineMs });
+  report.stopped = stop.stopped;
+  report.stoppedGracefully = stop.stoppedGracefully;
+  report.stopSignal = stop.signalCode;
+  // Read the settled state only after the gateway has stopped (a second reply
+  // or a late stamp from a running gateway would race the read) and only after
+  // an observed ack (without one, cur/ was never settled by the ack). A
+  // gateway killed after the stop budget is dead but did not stop gracefully,
+  // so the settled state is not judged.
+  const settledRead = decideSettledRead({
+    ...report,
+    stopped: stop.stopped,
+    stoppedGracefully: stop.stoppedGracefully,
+  });
+  report.settledRead = settledRead.read;
+  if (settledRead.readError) report.readErrors.push(settledRead.readError);
+  if (settledRead.read) {
+    readSettledState(report, {
+      replyDir: join(mailDir, "agent-b", "new"),
+      newDir: join(mailDir, "agent-a", "new"),
+      curDir: join(mailDir, "agent-a", "cur"),
+      obligationsDir: join(mailDir, "agent-a", ".obligations"),
+    });
+  }
+  if (beforeWrite) await beforeWrite();
+  writeFileSync(reportPath, JSON.stringify(report, null, 2), "utf8");
+  return stop;
+}
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) await main();
 
 async function main() {
@@ -503,58 +547,42 @@ async function main() {
   } catch (err) {
     report.error = err?.message ?? String(err);
   } finally {
-    const stop = await stopGateway(child, { deadlineMs: STOP_DEADLINE_MS });
-    report.stopped = stop.stopped;
-    report.stoppedGracefully = stop.stoppedGracefully;
-    report.stopSignal = stop.signalCode;
-    // Read the settled state only after the gateway has stopped (a second reply
-    // or a late stamp from a running gateway would race the read) and only after
-    // an observed ack (without one, cur/ was never settled by the ack). A
-    // gateway killed after the stop budget is dead but did not stop gracefully,
-    // so the settled state is not judged.
-    const settledRead = decideSettledRead({
-      ...report,
-      stopped: stop.stopped,
-      stoppedGracefully: stop.stoppedGracefully,
+    await finalizeGatewayRun({
+      child,
+      report,
+      mailDir: MAIL,
+      reportPath: REPORT,
+      stopDeadlineMs: STOP_DEADLINE_MS,
+      beforeWrite: async () => {
+        await new Promise((r) => model.close(r));
+        await new Promise((r) => flair.close(r));
+        let logMessages = [];
+        try {
+          if (existsSync(LOG)) {
+            logMessages = readFileSync(LOG, "utf8")
+              .split("\n")
+              .filter(Boolean)
+              .map((line) => {
+                try {
+                  const record = JSON.parse(line);
+                  return typeof record["1"] === "string" ? record["1"] : String(record.message ?? "");
+                } catch {
+                  return line;
+                }
+              })
+              .filter(Boolean);
+          }
+        } catch (err) {
+          report.readErrors.push(`gateway log (${LOG}): ${err?.message ?? String(err)}`);
+        }
+        report.logs = logs.split("\n").slice(-40);
+        report.logTail = logMessages.slice(-120);
+        const dispatchFromStdout = (logs.match(/message dispatch started: channel=tps-mail/g) ?? []).length;
+        const dispatchFromLogFile = logMessages.filter((message) => message.includes("message dispatch started: channel=tps-mail")).length;
+        report.dispatchStarts = Math.max(dispatchFromStdout, dispatchFromLogFile);
+        report.ackLines = logMessages.filter((message) => message.includes("acked "));
+      },
     });
-    report.settledRead = settledRead.read;
-    if (settledRead.readError) report.readErrors.push(settledRead.readError);
-    if (settledRead.read) {
-      readSettledState(report, {
-        replyDir: join(MAIL, "agent-b", "new"),
-        newDir: join(MAIL, "agent-a", "new"),
-        curDir: join(MAIL, "agent-a", "cur"),
-        obligationsDir: join(MAIL, "agent-a", ".obligations"),
-      });
-    }
-    await new Promise((r) => model.close(r));
-    await new Promise((r) => flair.close(r));
-    let logMessages = [];
-    try {
-      if (existsSync(LOG)) {
-        logMessages = readFileSync(LOG, "utf8")
-          .split("\n")
-          .filter(Boolean)
-          .map((line) => {
-            try {
-              const record = JSON.parse(line);
-              return typeof record["1"] === "string" ? record["1"] : String(record.message ?? "");
-            } catch {
-              return line;
-            }
-          })
-          .filter(Boolean);
-      }
-    } catch (err) {
-      report.readErrors.push(`gateway log (${LOG}): ${err?.message ?? String(err)}`);
-    }
-    report.logs = logs.split("\n").slice(-40);
-    report.logTail = logMessages.slice(-120);
-    const dispatchFromStdout = (logs.match(/message dispatch started: channel=tps-mail/g) ?? []).length;
-    const dispatchFromLogFile = logMessages.filter((message) => message.includes("message dispatch started: channel=tps-mail")).length;
-    report.dispatchStarts = Math.max(dispatchFromStdout, dispatchFromLogFile);
-    report.ackLines = logMessages.filter((message) => message.includes("acked "));
-    writeReport();
   }
   process.exit(0);
 }
