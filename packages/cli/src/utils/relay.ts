@@ -16,7 +16,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type HostStateReadHooks, type HostStateRefreshOutcome, type ServiceHealth } from "./connection-state.js";
+import { claimHostStateAt, clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type HostStateReadHooks, type HostStateRefreshOutcome, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1438,6 +1438,34 @@ function hostStateRefreshReporter(recordPath: string): (outcome: HostStateRefres
   };
 }
 
+/** Report a reconnect claim's ownership or readability refusal: one line
+ *  naming the record path and the reason, never its contents. */
+function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshOutcome) => void {
+  return (outcome) => {
+    let reason: string;
+    switch (outcome.kind) {
+      case "written":
+      case "stopped":
+      case "absent":
+        // A successful claim of an absent record returns `written`.
+        return;
+      case "other":
+        reason = "the record belongs to another connection";
+        break;
+      case "unverifiable":
+        reason = "ownership could not be verified";
+        break;
+      case "invalid":
+        reason = "the record is not a valid host state record";
+        break;
+      case "unreadable":
+        reason = outcome.reason;
+        break;
+    }
+    console.error(`[relay] Host state record ${recordPath} not claimed on reconnect: ${reason}, so it was left as it is; the connection continues`);
+  };
+}
+
 async function probeServiceHealth(): Promise<ServiceHealth[]> {
   const services = listServices();
   const results: ServiceHealth[] = [];
@@ -1461,8 +1489,15 @@ export async function connectAndKeepAlive(
   const recordPath = hostStatePath(branchId);
   const connectionId = randomUUID();
   const reportRefresh = hostStateRefreshReporter(recordPath);
+  const reportClaimSkip = hostStateClaimReporter(recordPath);
   let stopped = false;
   let reconnectCount = 0;
+  // Set before this connection's first claim attempt, even if it throws.
+  // On its first claim attempt, a live connection attempts a write
+  // without an ownership check while the stop gate is open; a later claim runs
+  // the ownership rule only while the stop gate is open. Writes can still fail
+  // on the filesystem (a directory at the record path, for one).
+  let claimedRecord = false;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
   let pendingChannelClose: Promise<void> | null = null;
@@ -1596,19 +1631,35 @@ export async function connectAndKeepAlive(
           startToken: processStartToken(process.pid),
         };
         // stop() sets stopped before clearing; both gates are checked under the lock.
-        // The initial establishment write is the only write that may claim the
-        // record path; every later write is ownership-checked against it, so a
-        // connection whose record was replaced leaves the replacement intact.
-        const claim = () => writeHostStateAt(recordPath, state, () => !stopped);
+        // On its first claim attempt, a live connection attempts a write without an
+        // ownership check while the stop gate is open. Claims after that
+        // attempt check eligibility only while the stop gate is open, and
+        // attempt the write when the record is absent or
+        // is verified as owned by this connection, or when its recorded process
+        // is not running or carries a different `proc:` token (pid reuse).
+        // `ps:` mismatches are unverifiable: a record written before cli#1045 may
+        // hold local-time text. Either write can fail on the filesystem.
+        // `claimedRecord` tells the two apart.
+        const claim = () => {
+          if (!claimedRecord) {
+            claimedRecord = true;
+            writeHostStateAt(recordPath, state, () => !stopped);
+            return;
+          }
+          reportClaimSkip(claimHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks));
+        };
         const persist = () => {
           const outcome = refreshOwnedHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks);
           reportRefresh(outcome);
           return outcome;
         };
         const refresh = hostStateRefresher(recordPath, persist);
-        // The claim stays outside the refresher so a refusal still reconnects,
-        // after one line naming the record path and reason; so does the
-        // post-send update.
+        // The claim stays outside the refresher so a write that throws still
+        // reconnects, after one line naming the record path and reason; so does
+        // the post-send update. A claim refused for ownership or readability
+        // leaves the record as it is; the claim reporter emits one line, and a
+        // later refresh may report separately. A `stopped` outcome is silent.
+        // An ownership or readability refusal leaves the channel up and serving.
         const connectWrite = (write: () => void) => {
           try {
             write();
