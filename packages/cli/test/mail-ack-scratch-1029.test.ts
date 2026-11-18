@@ -6,9 +6,10 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import * as mail from "../src/utils/mail.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
+import { freshDistMail } from "./helpers/fresh-dist.js";
 
 afterEach(() => {
   mock.restore();
@@ -62,23 +63,6 @@ if (caseSensitive) {
   console.warn("[mail] different-letter-case alias sweep test skipped: this filesystem is case-sensitive, so the alternate spelling does not resolve");
 }
 
-/**
- * The node case imports the built module. Without a rebuild, a source mutation
- * is tested against stale bytes, so refuse to run it when dist is missing or
- * predates the source it was built from.
- */
-function freshDistMail(): string {
-  const testDir = dirname(fileURLToPath(import.meta.url));
-  const sourceMail = join(testDir, "..", "src", "utils", "mail.ts");
-  const distMail = join(testDir, "..", "dist", "src", "utils", "mail.js");
-  if (!fs.existsSync(distMail)) {
-    throw new Error(`node rerun needs a build: ${distMail} is missing; run bun run build in packages/cli`);
-  }
-  if (fs.statSync(distMail).mtimeMs < fs.statSync(sourceMail).mtimeMs) {
-    throw new Error(`node rerun would test stale code: ${distMail} is older than ${sourceMail}; rebuild with bun run build`);
-  }
-  return distMail;
-}
 
 function makeOld(path: string, ageMs = DAY_MS): void {
   const when = new Date(Date.now() - ageMs);
@@ -112,7 +96,7 @@ test("an ack through a leaf cur symlink is refused and leaves the live scratch u
   makeOld(live);
   const { lines } = collectWarnings();
   try {
-    expect(() => mail.ackMessageAtPath(targetB)).toThrow(mail.MailRecordLockRootError);
+    expect(() => mail.ackMessageAtPath(targetB, mailboxB)).toThrow(mail.MailRecordLockRootError);
   } finally {
     lockA!.release();
     fs.closeSync(fd);
@@ -124,7 +108,8 @@ test("an ack through a leaf cur symlink is refused and leaves the live scratch u
 });
 
 test("the sweep leaves a scratch younger than the minimum age and removes an older one", () => {
-  const cur = mail.getInbox("mailbox-a").cur;
+  const inbox = mail.getInbox("mailbox-a");
+  const cur = inbox.cur;
   const target = join(cur, "record.json");
   plantRecord(target, "record-id");
   const fresh = join(cur, scratchName());
@@ -134,7 +119,7 @@ test("the sweep leaves a scratch younger than the minimum age and removes an old
   makeOld(old);
 
   const { lines } = collectWarnings();
-  expect(mail.ackMessageAtPath(target).read).toBe(true);
+  expect(mail.ackMessageAtPath(target, inbox.root).read).toBe(true);
 
   expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
   expect(fs.existsSync(old)).toBe(false);
@@ -142,7 +127,8 @@ test("the sweep leaves a scratch younger than the minimum age and removes an old
 });
 
 test("the sweep leaves a fresh symlink to an old file and removes an old regular scratch", () => {
-  const cur = mail.getInbox("mailbox-a").cur;
+  const inbox = mail.getInbox("mailbox-a");
+  const cur = inbox.cur;
   const target = join(cur, "record.json");
   plantRecord(target, "record-id");
   const oldTarget = join(root, "old-target");
@@ -156,7 +142,7 @@ test("the sweep leaves a fresh symlink to an old file and removes an old regular
   makeOld(old);
 
   const { lines } = collectWarnings();
-  expect(mail.ackMessageAtPath(target).read).toBe(true);
+  expect(mail.ackMessageAtPath(target, inbox.root).read).toBe(true);
 
   expect(fs.lstatSync(link).isSymbolicLink()).toBe(true);
   expect(fs.readlinkSync(link)).toBe(oldTarget);
@@ -170,7 +156,8 @@ test("the sweep leaves a fresh symlink to an old file and removes an old regular
 });
 
 test("a failed listing warns with the directory and code, and the next ack retries", () => {
-  const cur = mail.getInbox("mailbox-a").cur;
+  const inbox = mail.getInbox("mailbox-a");
+  const cur = inbox.cur;
   const first = join(cur, "record-1.json");
   const second = join(cur, "record-2.json");
   plantRecord(first, "record-1");
@@ -187,7 +174,7 @@ test("a failed listing warns with the directory and code, and the next ack retri
   }) as typeof readdir);
 
   const { lines } = collectWarnings();
-  expect(mail.ackMessageAtPath(first).read).toBe(true);
+  expect(mail.ackMessageAtPath(first, inbox.root).read).toBe(true);
 
   const failures = lines.filter((line) => line.includes(cur) && line.includes("EACCES"));
   expect(failures).toHaveLength(1);
@@ -195,7 +182,7 @@ test("a failed listing warns with the directory and code, and the next ack retri
   const leftover = join(cur, scratchName());
   fs.writeFileSync(leftover, "{ partial");
   makeOld(leftover);
-  expect(mail.ackMessageAtPath(second).read).toBe(true);
+  expect(mail.ackMessageAtPath(second, inbox.root).read).toBe(true);
 
   expect(listings).toBeGreaterThanOrEqual(2);
   expect(fs.existsSync(leftover)).toBe(false);
@@ -225,7 +212,7 @@ test("the sweep refuses a directory that resolves to the locked root itself, inc
   }) as typeof realpath);
 
   const { lines } = collectWarnings();
-  expect(mail.ackMessageAtPath(target).read).toBe(true);
+  expect(mail.ackMessageAtPath(target, inbox.root).read).toBe(true);
   expect(fs.readFileSync(leftover, "utf8")).toBe("{ partial");
   expect(lines.filter((line) => line.includes("left ack scratch in") && line.includes(inbox.cur))).toHaveLength(1);
 });
@@ -246,7 +233,7 @@ test("a bare relative record update contends for the root lock before sweeping",
   try {
     const child = spawnSync(process.execPath, ["--eval", `
       const mail = await import(${JSON.stringify(source)});
-      const result = mail.updateExistingRecord("record.json", (record) => ({ ...record, read: true }), { nonBlocking: true });
+      const result = mail.updateExistingRecord("record.json", (record) => ({ ...record, read: true }), { mailboxRoot: ${JSON.stringify(inbox.root)}, nonBlocking: true });
       console.log(JSON.stringify(result));
     `], { cwd: inbox.cur, encoding: "utf8" });
     expect(child.status).toBe(0);
@@ -262,7 +249,7 @@ test("a bare relative record update contends for the root lock before sweeping",
   collectWarnings();
   try {
     process.chdir(inbox.cur);
-    expect(mail.ackMessageAtPath("record.json").read).toBe(true);
+    expect(mail.ackMessageAtPath("record.json", inbox.root).read).toBe(true);
     expect(fs.existsSync(target)).toBe(false);
     expect(fs.existsSync(old)).toBe(false);
     expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
@@ -272,7 +259,8 @@ test("a bare relative record update contends for the root lock before sweeping",
 });
 
 test("a refused sweep does not postpone the next sweep", () => {
-  const cur = mail.getInbox("mailbox-a").cur;
+  const inbox = mail.getInbox("mailbox-a");
+  const cur = inbox.cur;
   const target = join(cur, "record.json");
   plantRecord(target, "record-id");
   const aged = join(cur, scratchName());
@@ -300,17 +288,59 @@ test("a refused sweep does not postpone the next sweep", () => {
 
   const { lines } = collectWarnings();
   try {
-    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true })).status).toBe("updated");
+    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true }), { mailboxRoot: inbox.root }).status).toBe("updated");
     expect(refused).toBe(true);
     expect(fs.existsSync(aged)).toBe(true);
 
-    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true })).status).toBe("updated");
+    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true }), { mailboxRoot: inbox.root }).status).toBe("updated");
   } finally {
     restoreClock();
   }
 
   expect(fs.existsSync(aged)).toBe(false);
   expect(lines.filter((line) => line.includes("left ack scratch in") && line.includes(cur))).toHaveLength(1);
+  expect(lines.filter((line) => line.includes("removed leftover ack scratch") && line.includes(aged))).toHaveLength(1);
+});
+
+test("the sweep compares directories by identity, not by their path strings", () => {
+  const inbox = mail.getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+  const aged = join(inbox.cur, scratchName());
+  fs.writeFileSync(aged, "{ partial");
+  makeOld(aged);
+
+  // The sweep's two resolutions name different strings, and neither is a
+  // textual parent of the other. Only device and inode say the second is a
+  // directory directly under the first.
+  const realpath = fs.realpathSync;
+  let rootResolutions = 0;
+  let curResolutions = 0;
+  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
+    const path = resolve(String(args[0]));
+    if (path === resolve(inbox.root) && ++rootResolutions === 2) return "/virtual/mailbox";
+    if (path === resolve(inbox.cur) && ++curResolutions === 3) return "/virtual/alias";
+    return realpath(...args);
+  }) as typeof realpath);
+  const identities = new Map<string, fs.BigIntStats>([
+    ["/virtual/mailbox", { dev: 7n, ino: 1n } as fs.BigIntStats],
+    ["/virtual/alias", { dev: 7n, ino: 2n } as fs.BigIntStats],
+    ["/virtual", { dev: 7n, ino: 1n } as fs.BigIntStats],
+  ]);
+  const restoreStat = patchShared(mail.mailAckScratchTestHooks, "stat", (path: string) => {
+    const entry = identities.get(path);
+    if (!entry) throw Object.assign(new Error(path), { code: "ENOENT" });
+    return entry;
+  });
+
+  const { lines } = collectWarnings();
+  try {
+    expect(mail.ackMessageAtPath(target, inbox.root).read).toBe(true);
+  } finally {
+    restoreStat();
+  }
+
+  expect(fs.existsSync(aged)).toBe(false);
   expect(lines.filter((line) => line.includes("removed leftover ack scratch") && line.includes(aged))).toHaveLength(1);
 });
 
@@ -325,11 +355,11 @@ test.skipIf(caseSensitive)("the sweep recognises a different-case alias of the m
   fs.writeFileSync(aged, "{ partial");
   makeOld(aged);
 
-  const distMail = freshDistMail();
+  const distMail = freshDistMail(import.meta.url);
   const script = [
     `import * as fs from "node:fs";`,
     `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
-    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }));`,
+    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }), { mailboxRoot: ${JSON.stringify(inbox.root)} });`,
     `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
     `if (fs.existsSync(${JSON.stringify(aged)})) { console.error("aged scratch remains"); process.exit(3); }`,
   ].join("\n");

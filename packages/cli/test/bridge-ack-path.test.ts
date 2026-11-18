@@ -173,7 +173,7 @@ test("pending wrapper lifecycle fields cannot suppress first delivery", async ()
 test("acknowledgement by path does not create a missing record", () => {
   const missing = path("cur", "missing.json");
   expect(typeof mail.ackMessageAtPath).toBe("function");
-  expect(() => mail.ackMessageAtPath(missing)).toThrow();
+  expect(() => mail.ackMessageAtPath(missing, join(root, BRIDGE))).toThrow();
   expect(fs.existsSync(missing)).toBe(false);
 });
 
@@ -186,7 +186,7 @@ test("acknowledgement does not recreate a file removed after its read", () => {
     if (args[0] === target) fs.unlinkSync(target);
     return data;
   }));
-  expect(() => mail.ackMessageAtPath(target)).toThrow();
+  expect(() => mail.ackMessageAtPath(target, join(root, BRIDGE))).toThrow();
   expect(fs.existsSync(target)).toBe(false);
 });
 
@@ -248,7 +248,7 @@ for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "st
       return originalOperation(...args);
     }) as any);
     faults.push(fault);
-    expect(() => mail.ackMessageAtPath(target)).toThrow(`${operation} fault`);
+    expect(() => mail.ackMessageAtPath(target, join(root, BRIDGE))).toThrow(`${operation} fault`);
     expect(injected).toBe(true);
     expect(fs.readFileSync(target, "utf8")).toBe(original);
     expect(JSON.parse(fs.readFileSync(target, "utf8")).bridgeSentAt).toBe("sent");
@@ -269,7 +269,7 @@ test("ack holds the shared mail lock while checking for the existing record", ()
     }
     return stat(...args);
   }) as typeof stat));
-  expect(() => mail.ackMessageAtPath(target)).toThrow();
+  expect(() => mail.ackMessageAtPath(target, join(root, BRIDGE))).toThrow();
   expect(checked).toBe(true);
   expect(fs.existsSync(target)).toBe(false);
   expect(fs.readdirSync(path("cur", ""))).toEqual([]);
@@ -283,7 +283,7 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
   fs.writeFileSync(worker, `
     import { spyOn } from "bun:test";
     import * as fs from "node:fs";
-    import { join } from "node:path";
+    import { dirname, join } from "node:path";
     ${WORKER_OWNER_WATCH_SCRIPT}
     const [role, root, target, source] = process.argv.slice(2);
     const signal = (name) => fs.writeFileSync(join(root, name), "ready");
@@ -318,7 +318,7 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
       });
     }
     const { ackMessageAtPath } = await import(source);
-    try { ackMessageAtPath(target); signal(role + "-acked"); }
+    try { ackMessageAtPath(target, dirname(dirname(target))); signal(role + "-acked"); }
     catch (error) {
       if (role !== "second" || !String(error).includes("ENOENT")) throw error;
       signal("second-missing");

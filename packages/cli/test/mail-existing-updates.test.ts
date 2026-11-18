@@ -90,7 +90,7 @@ for (const change of ["ack", "body", "id", "lease", "receipt"]) {
     const checking = mail.checkMessages(agent);
     await waitFor(() => verifying);
     expect(fs.existsSync(join(mail.getInbox(agent).root, ".mail-lock"))).toBe(false);
-    if (change === "ack") mail.ackMessageAtPath(target);
+    if (change === "ack") mail.ackMessageAtPath(target, mail.getInbox(agent).root);
     else {
       const current = JSON.parse(fs.readFileSync(target, "utf8"));
       if (change === "body") current.body = "changed";
@@ -116,9 +116,9 @@ for (const operation of ["ack", "ack-id", "sent", "nack-transient", "nack-agent"
       if (args[0] === target) fs.unlinkSync(target);
       return result;
     }) as typeof read));
-    if (operation === "ack") expect(() => mail.ackMessageAtPath(target)).toThrow();
+    if (operation === "ack") expect(() => mail.ackMessageAtPath(target, mail.getInbox(agent).root)).toThrow();
     else if (operation === "ack-id") expect(() => mail.ackMessage(agent, "record-id")).toThrow();
-    else if (operation === "sent") expect(() => mail.setBridgeSentAtPath(target, "sent")).toThrow();
+    else if (operation === "sent") expect(() => mail.setBridgeSentAtPath(target, "sent", mail.getInbox(agent).root)).toThrow();
     else expect(mail.nackMessage(agent, "record-id", "retry", operation.slice(5) as any)).toBeNull();
     expect(fs.existsSync(target)).toBe(false);
     expect(fs.readdirSync(mail.getInbox(agent).cur)).toEqual([]);
@@ -128,7 +128,7 @@ for (const operation of ["ack", "ack-id", "sent", "nack-transient", "nack-agent"
 
 test("helper returns gone without invoking mutate or writing", () => {
   let mutated = false;
-  expect(mail.updateExistingRecord(target, (record) => { mutated = true; return record; })).toEqual({ status: "gone" });
+  expect(mail.updateExistingRecord(target, (record) => { mutated = true; return record; }, { mailboxRoot: mail.getInbox(agent).root })).toEqual({ status: "gone" });
   expect(mutated).toBe(false);
   expect(fs.readdirSync(mail.getInbox(agent).cur)).toEqual([]);
 });
@@ -156,7 +156,7 @@ test("nack and ack interleaving never recreates the removed record", async () =>
     });
     const mail = await import(source);
     if (role === "nack") mail.nackMessage(agent, "record-id", "retry");
-    else mail.ackMessageAtPath(target);
+    else mail.ackMessageAtPath(target, mail.getInbox(agent).root);
     signal(role + "-done");
     process.exit(0);
   `);
