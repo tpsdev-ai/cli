@@ -141,9 +141,14 @@ const obligations = {
   beforeScan: null as null | ((expectedReplyId: string | undefined) => void),
 };
 const realObligations = { ...obligationsModule };
+// cli#1006 r4: bun's mock.module replacement is process-wide, so the wrapper is
+// what the other test files get too. A fixed six-parameter wrapper dropped
+// `expect` — the obligation store's prior-state guard — for those callers.
+const realTransition = realObligations.transitionObligation as (...args: any[]) => any;
 mock.module("../src/obligations.js", () => ({
   ...realObligations,
-  transitionObligation: (mailDir: string, agent: string, inboundId: string, next: string, patch?: any, log?: any) => {
+  transitionObligation: (...args: any[]) => {
+    const next = args[3];
     if (obligations.failPostedTransition && next === "posted") {
       throw new Error("injected: the posted transition threw");
     }
@@ -159,7 +164,7 @@ mock.module("../src/obligations.js", () => ({
     if (obligations.refuseFailedTransition && next === "failed") {
       return null; // refused, not thrown — obligations.ts returns null for that
     }
-    return realObligations.transitionObligation(mailDir, agent, inboundId, next as any, patch, log);
+    return realTransition(...args);
   },
   scanForReceipt: (...args: any[]) => {
     if (obligations.failReceiptScan) throw new Error("injected: the receipt scan threw");
