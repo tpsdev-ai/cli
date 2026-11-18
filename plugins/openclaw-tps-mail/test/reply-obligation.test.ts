@@ -2520,6 +2520,89 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     return awaitStartupCurSweepForTests("default", inboundId, ms);
   }
 
+  it("startup sweep wait returns false for an unstarted account", async () => {
+    expect(await awaitStartupCurSweepForTests("unstarted-account", "msg-unstarted", 20)).toBe(false);
+  });
+
+  it("startup sweep wait includes the second bound agent while the first agent's receipt scan is suspended", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-first-agent-receipt";
+    const { obligationId, envelopeId } = seedOrphan(inboundId, { deadlineInMs: 60000 });
+    const replyId = "reply-first-agent";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const signedReply = signEnvelope(
+      { v: 1, from: AGENT, to: SENDER, body: "recovered reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+      { [AGENT]: ANVIL_SEED },
+    );
+    writeReceipt(tempMailDir, AGENT, {
+      replyId, obligationId, replyToId: envelopeId, route: "local", ts: now, signedReply: JSON.stringify(signedReply),
+    });
+
+    const secondAgent = "agent-b";
+    const secondInbound = "msg-second-agent-invalid-signature";
+    const secondCur = resolve(tempMailDir, secondAgent, "cur", `${secondInbound}.json`);
+    const secondDlq = resolve(tempMailDir, secondAgent, "dlq", `${secondInbound}.json`);
+    const secondEnvelope = JSON.parse(buildSignedBody(SENDER, secondAgent, "payload", ANVIL_SEED));
+    mkdirSync(resolve(tempMailDir, secondAgent, "cur"), { recursive: true });
+    writeFileSync(secondCur, JSON.stringify({
+      id: secondInbound, from: SENDER, to: secondAgent,
+      body: secondEnvelope.body, timestamp: secondEnvelope.timestamp, read: false,
+      envelopeId: secondEnvelope.messageId, envelope: secondEnvelope,
+    }));
+    mailboxReplayStore(resolve(tempMailDir, secondAgent)).recordConsumed(secondEnvelope.messageId);
+
+    let releaseScan!: () => void;
+    const scanGate = new Promise<void>((r) => { releaseScan = r; });
+    let scanEntered = false;
+    let releaseRecovery!: () => void;
+    const recoveryGate = new Promise<void>((r) => { releaseRecovery = r; });
+    let recoveryEntered = false;
+    const h = await start(AGENT, SENDER, {
+      noInbound: true,
+      localSender: true,
+      bindings: [AGENT, secondAgent].map((agentId) => ({ agentId, match: { channel: "tps-mail", accountId: "default" } })),
+      beforeVerify: async (name) => {
+        if (name === AGENT) {
+          scanEntered = true;
+          await scanGate;
+        } else if (name === SENDER) {
+          recoveryEntered = true;
+          await recoveryGate;
+        }
+      },
+    });
+    try {
+      expect(scanEntered, "the first agent's receipt scan is suspended").toBe(true);
+      expect(existsSync(secondCur)).toBe(true);
+      expect(existsSync(secondDlq)).toBe(false);
+      let resolved = false;
+      const waiting = waitForStartupSweep(secondInbound).then((completed) => {
+        resolved = true;
+        return {
+          completed,
+          curExists: existsSync(secondCur),
+          quarantinedId: existsSync(secondDlq) ? JSON.parse(readFileSync(secondDlq, "utf8")).id : null,
+        };
+      });
+      await sleep(30);
+      expect(resolved, "the wait includes the second agent's unscheduled sweep").toBe(false);
+      releaseScan();
+      expect(await pollUntil(() => recoveryEntered), "the second agent's recovery is suspended").toBe(true);
+      await sleep(30);
+      expect(resolved, "the wait includes the second agent's recovery").toBe(false);
+      releaseRecovery();
+      expect(await waiting).toEqual({ completed: true, curExists: false, quarantinedId: secondInbound });
+    } finally {
+      releaseScan();
+      releaseRecovery();
+      await h.stop();
+    }
+  }, 30000);
+
   it("startup sweep wait retains the first bound agent's recovery after the second sweep starts", async () => {
     seedSigningKeys();
     const inboundId = "msg-first-bound-agent";
@@ -2561,6 +2644,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       });
       await sleep(30);
       expect(resolved, "the wait includes the delayed first recovery").toBe(false);
+      expect(await awaitStartupCurSweepForTests("default", inboundId, 20)).toBe(false);
       releaseRecovery();
       expect(await pollUntil(() => h.dispatched !== null), "the first recovery dispatches").toBe(true);
       await h.deliver("recovered reply", "final");
