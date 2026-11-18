@@ -243,36 +243,70 @@ function settledListing(files: Array<{ name: string; body: string }>): SettledFi
 }
 
 /**
- * A node child that prints `ready` and exits 0 on SIGTERM: the graceful
+ * The default child prints `ready` and exits 0 on SIGTERM: the graceful
  * counterpart of the killed-gateway stub below.
  */
-async function startGracefulStub(node: string): Promise<ReturnType<typeof spawn>> {
-  const stub = spawn(
-    node,
-    [
-      "--input-type=module",
-      "-e",
-      'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
-    ],
-    { stdio: ["ignore", "pipe", "pipe"] },
-  );
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("stub gateway never booted")), 5_000);
-    stub.stdout!.once("data", () => {
-      clearTimeout(timer);
-      resolve();
+async function startGracefulStub(
+  node: string,
+  script = 'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+  timeoutMs = 5_000,
+): Promise<ReturnType<typeof spawn>> {
+  const stub = spawn(node, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stub gateway never booted")), timeoutMs);
+      stub.stdout!.once("data", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      stub.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      stub.once("exit", () => {
+        clearTimeout(timer);
+        reject(new Error("stub gateway exited before it booted"));
+      });
     });
-    stub.once("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-    stub.once("exit", () => {
-      clearTimeout(timer);
-      reject(new Error("stub gateway exited before it booted"));
-    });
-  });
+  } catch (err) {
+    if (stub.pid !== undefined && stub.exitCode === null && stub.signalCode === null) {
+      stub.kill("SIGKILL");
+      await new Promise((resolve) => stub.once("exit", resolve));
+    }
+    throw err;
+  }
   return stub;
 }
+
+it("stops a stub that times out before readiness", async () => {
+  const node = process.env.TPS_LANE_NODE || "node";
+  const root = mkdtempSync(join(tmpdir(), "tps-stub-timeout-"));
+  const pidPath = join(root, "pid");
+  try {
+    await expect(
+      startGracefulStub(
+        node,
+        `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
+        500,
+      ),
+    ).rejects.toThrow("stub gateway never booted");
+    const pid = Number(readFileSync(pidPath, "utf8"));
+    expect(Number.isInteger(pid) && pid > 0).toBe(true);
+    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+  } finally {
+    if (existsSync(pidPath)) {
+      const pid = Number(readFileSync(pidPath, "utf8"));
+      if (Number.isInteger(pid) && pid > 0) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (err) {
+          expect(err).toHaveProperty("code", "ESRCH");
+        }
+      }
+    }
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 function runDriver(): { status: number | null; stdout: string; stderr: string; report: Report | null; root: string } {
   const root = mkdtempSync(join(tmpdir(), "tps-real-gateway-"));
