@@ -886,6 +886,8 @@ function endAccountLifetime(accountId: string, incarnation?: symbol): void {
   const lifetime = accountLifetimes.get(accountId);
   if (incarnation !== undefined && lifetime?.incarnation !== incarnation) return;
   accountLifetimes.delete(accountId);
+  startupSweepDone.delete(accountId);
+  startupCurRecoveries.delete(accountId);
   if (lifetime) {
     lifetime.resolveShutdown();
     for (const timer of lifetime.timers) clearTimeout(timer);
@@ -895,6 +897,46 @@ function endAccountLifetime(accountId: string, incarnation?: symbol): void {
     }
   }
   releaseAccountState(accountId);
+}
+
+/**
+ * cli#1006 r18: completion of the startup cur/ sweep, per account. The sweep
+ * stays fire-and-forget; this records what it scheduled so a test can await
+ * the exact sweep it asserts about instead of guessing a delay. Production
+ * never reads either map.
+ */
+const startupSweepDone = new Map<string, Promise<void>>();
+const startupCurRecoveries = new Map<string, Map<string, Promise<void>[]>>();
+
+/**
+ * Test-only: wait until the startup sweep has finished handling `inboundId`
+ * for one account, including any recovery it scheduled for that inbound.
+ * Returns false when the sweep never reports completion within `ms`, so a
+ * bypass that outlives the old polling window fails the caller's assertion.
+ */
+export async function awaitStartupCurSweepForTests(
+  accountId: string,
+  inboundId: string,
+  ms = 10000,
+): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!startupSweepDone.has(accountId)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  const pending = startupCurRecoveries.get(accountId)?.get(inboundId) ?? [];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((r) => {
+    timer = setTimeout(() => r(false), Math.max(0, deadline - Date.now()));
+  });
+  try {
+    return await Promise.race([
+      Promise.all([startupSweepDone.get(accountId)!, ...pending]).then(() => true as const),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Test-only snapshot of obligation contexts and deadlines. */
@@ -2905,15 +2947,27 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // record that cannot prove provenance; a Flair outage defers to the next
         // start.
         try {
-          if (existsSync(curDir)) {
-            for (const filename of readdirSync(curDir)) {
-              if (!filename.endsWith(".json")) continue;
-              const curPath = resolve(curDir, filename);
-              if (seenFiles.has(curPath)) continue;
-              const record = readMailFile(curPath);
-              if (!record || record.ackedAt || record.nackedAt || unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
-              void recoverUnackedCurRecord(agentId, curPath, record);
+          const sweepRecoveries = new Map<string, Promise<void>[]>();
+          startupCurRecoveries.set(account.accountId, sweepRecoveries);
+          let resolveSweepDone!: () => void;
+          startupSweepDone.set(account.accountId, new Promise<void>((resolve) => { resolveSweepDone = resolve; }));
+          try {
+            if (existsSync(curDir)) {
+              for (const filename of readdirSync(curDir)) {
+                if (!filename.endsWith(".json")) continue;
+                const curPath = resolve(curDir, filename);
+                if (seenFiles.has(curPath)) continue;
+                const record = readMailFile(curPath);
+                if (!record || record.ackedAt || record.nackedAt || unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
+                const recovery = recoverUnackedCurRecord(agentId, curPath, record);
+                const forInbound = sweepRecoveries.get(record.id);
+                if (forInbound) forInbound.push(recovery);
+                else sweepRecoveries.set(record.id, [recovery]);
+                void recovery;
+              }
             }
+          } finally {
+            resolveSweepDone();
           }
         } catch { /* ignore */ }
 
@@ -3012,7 +3066,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // malformed file, SCAN_LIMIT or AMBIGUOUS_ID leaves the obligation
           // untouched. Above the scan limit findCurPath does not report unrelated
           // read errors, so a matching entry beyond the limit still proves
-          // presence and startup proceeds.
+          // presence and startup proceeds. An absent lookup passes no path: a
+          // record at the conventional name for another message id proves
+          // nothing, so it must not suppress missing-entry recovery.
           const lookup = startupCurLookups.get(rec.inboundId) ?? lookupOpenObligationCur(rec.inboundId);
           if (lookup.error !== null) {
             reportObligationCurLookupFailure(
@@ -3030,7 +3086,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             agentId,
             rec.from,
             account.accountId,
-            lookup.curPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
+            lookup.curPath ?? "",
             rec.inboundId,
             cfg,
             log,

@@ -12,4 +12,6 @@
   untouched with `SCAN_LIMIT`, reported once per process for the same maildir,
   agent, inbound id and error code. Failed outcomes owe a nack through the
   existing at-least-once delivery path. The archiver retains cur/ while its
-  obligation is non-terminal.
+  obligation is non-terminal. An absent clean lookup passes no `cur/` path, so a
+  record for another message id at the conventional `<inboundId>.json` name does
+  not suppress missing-entry recovery.
