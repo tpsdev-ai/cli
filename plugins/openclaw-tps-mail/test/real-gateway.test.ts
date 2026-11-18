@@ -28,7 +28,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { decideSettledRead, finalizeGatewayRun, readSettledState } from "./real-gateway-driver.mjs";
+import { decideSettledRead, finalizeGatewayRun, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -908,5 +908,15 @@ describe("cli#1034 — a gateway that exits on its first SIGTERM is reported as 
     report.stopSignal = "SIGKILL";
     expect(() => expectGatewayReport(report)).toThrow();
   });
+});
+
+describe("cli#1034 — stopGateway without a child", () => {
+  it("reports stopped and graceful with null exit fields, promptly", async () => {
+    const result = await Promise.race([
+      stopGateway(undefined),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("stopGateway did not resolve promptly")), 1_000)),
+    ]);
+    expect(result).toEqual({ stopped: true, stoppedGracefully: true, exitCode: null, signalCode: null });
+  }, 5_000);
 });
 
