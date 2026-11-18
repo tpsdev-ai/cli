@@ -196,13 +196,13 @@ describe("pid files", () => {
     expect(readFileSync(path, "utf-8")).toBe(bytes);
   });
 
-  test("mail relay stop refuses a recorded ps: token it cannot compare and signals nothing", async () => {
+  test("mail relay stop refuses a recorded ps: token it cannot compare and sends no SIGTERM", async () => {
     const node = Bun.which("node");
     if (!node) throw new Error("Node is required for the mail relay stop subprocess test");
     process.env.HOME = root;
     mkdirSync(join(root, ".tps"), { recursive: true });
     // The recorder installs its SIGTERM handler before it reports ready, and
-    // stays alive on SIGTERM, so the marker proves whether stop signalled it.
+    // stays alive on SIGTERM, so the marker proves whether stop sent it SIGTERM.
     const marker = join(root, "sigterm.log");
     const recorder = spawnSigtermRecorder(marker);
     child = recorder;

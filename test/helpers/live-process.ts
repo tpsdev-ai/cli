@@ -72,7 +72,7 @@ export interface SpawnLiveProcessOptions {
 /**
  * A live process that records every SIGTERM it receives. It appends a line to
  * the marker file in the handler and stays alive, so a test can assert that a
- * command sent it no signal — `kill(pid, 0)` cannot show that, because it also
+ * command sent it no SIGTERM — `kill(pid, 0)` cannot show that, because it also
  * succeeds for an exited child that has not been reaped.
  */
 export const SIGTERM_RECORDER_SCRIPT = `
