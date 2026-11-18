@@ -52,7 +52,7 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
@@ -787,6 +787,11 @@ function isPostableFinalText(text: string): boolean {
 
 const OBLIGATION_DEFAULT_DEADLINE_MS = 60 * 60 * 1000;
 
+/** cli#1006: the named reason carried on an obligation record when restart
+ *  recovery or an in-process deadline settled or re-armed it from the record
+ *  because the inbound's cur/ entry was gone. A reason, never a verdict. */
+const MISSING_CUR_REASON = "cur-record-missing";
+
 /** The yield→deadline window. Test-only override via env; production is 60 min. */
 function obligationDeadlineMs(): number {
   const v = Number(process.env.TPS_OBLIGATION_DEADLINE_MS);
@@ -881,6 +886,8 @@ function endAccountLifetime(accountId: string, incarnation?: symbol): void {
   const lifetime = accountLifetimes.get(accountId);
   if (incarnation !== undefined && lifetime?.incarnation !== incarnation) return;
   accountLifetimes.delete(accountId);
+  startupSweepDone.delete(accountId);
+  startupCurRecoveries.delete(accountId);
   if (lifetime) {
     lifetime.resolveShutdown();
     for (const timer of lifetime.timers) clearTimeout(timer);
@@ -890,6 +897,45 @@ function endAccountLifetime(accountId: string, incarnation?: symbol): void {
     }
   }
   releaseAccountState(accountId);
+}
+
+/**
+ * Track startup cur/ sweeps and recoveries per account so tests await completion
+ * instead of guessing a delay; recoveries stay fire-and-forget in production.
+ */
+const startupSweepDone = new Map<string, Promise<void>>();
+const startupCurRecoveries = new Map<string, Map<string, Promise<void>[]>>();
+
+/**
+ * Test-only: wait for the account's bound-agent startup cur/ sweeps and their
+ * recoveries for `inboundId`. Returns false on timeout so unfinished work fails
+ * the caller's completion assertion.
+ */
+export async function awaitStartupCurSweepForTests(
+  accountId: string,
+  inboundId: string,
+  ms = 10000,
+): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (!startupSweepDone.has(accountId)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((r) => {
+    timer = setTimeout(() => r(false), Math.max(0, deadline - Date.now()));
+  });
+  try {
+    return await Promise.race([
+      startupSweepDone.get(accountId)!.then(async () => {
+        await Promise.all(startupCurRecoveries.get(accountId)?.get(inboundId) ?? []);
+        return true as const;
+      }),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Test-only snapshot of obligation contexts and deadlines. */
@@ -946,6 +992,12 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
   return { direct, posted: [resolve(outbox, "new"), resolve(outbox, "sent")] };
 }
 
+/** SCHEDULE a retry that re-reads the record and re-arms its deadline while it
+ *  is live. Also called when a settlement write was refused on a LIVE record
+ *  (cli#1006 r10). The retry is scheduled, not guaranteed: it removes its own
+ *  timer before re-arming, and an arm refused twice or a store write that
+ *  throws on lock contention leaves the record without a timer. An arm failure
+ *  inside that retry is not re-tried by this change (a follow-up). */
 function retryObligationRead(ctx: YieldContext, obligationId: string): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const timer = accountTimer(ctx, () => {
@@ -1004,14 +1056,20 @@ function stampTerminalCur(
 }
 
 
-function ackObligation(ctx: YieldContext, obligationId: string, why: string): void {
+function ackObligation(
+  ctx: YieldContext,
+  obligationId: string,
+  why: string,
+  patch: Partial<ObligationRecord> = {},
+  stampCur = true,
+): void {
   if (!isLiveContext(ctx)) return;
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
   // record (e.g. a deadline that already FAILED the obligation) refuses the
   // transition (obligations.ts: TERMINAL_STATES is final, never resurrected)
   // and must not get an ackedAt — otherwise a late final acks the inbound
   // while the obligation stays failed (cli#400).
-  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", {}, ctx.log);
+  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", patch, ctx.log);
   if (!updated || updated.state !== "acked") {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") return;
@@ -1021,7 +1079,8 @@ function ackObligation(ctx: YieldContext, obligationId: string, why: string): vo
     );
     return;
   }
-  stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
+  // A missing cur/ entry has no record to stamp (cli#1006).
+  if (stampCur) stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
   releaseObligationState(obligationId);
 }
@@ -1100,9 +1159,18 @@ async function settleObligation(
      *  the stamp. The nack MAIL is a separate question and is still owed unless
      *  the record itself says it was sent. */
     alreadyStamped?: boolean;
+    /** cli#1006: restart recovery or an in-process deadline is settling from
+     *  the obligation RECORD because the inbound's cur/ entry is GONE. The record is the durable truth and this
+     *  path dispatches no agent reply, so the internal-inbound gate (which
+     *  binds the dispatch path) does not apply. The only mail settlement may
+     *  send is a nack to the recorded sender; delivery retries follow the
+     *  existing at-least-once contract. */
+    missingCur?: boolean;
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return "none";
+  if (!isLiveContext(ctx)) return "none";
+  if (!s.missingCur && !(await internalInbound(ctx))) return "none";
+  if (!isLiveContext(ctx)) return "none";
   const result = readObligationForCleanup(ctx, obligationId);
   if (result.status !== "found") return "none";
   const rec = result.record;
@@ -1113,7 +1181,13 @@ async function settleObligation(
     return "none";
   }
   if (s.receipt === "found" && !s.verdict) {
-    ackObligation(ctx, obligationId, s.reason);
+    ackObligation(
+      ctx,
+      obligationId,
+      s.reason,
+      s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {},
+      !s.missingCur,
+    );
     return "acked";
   }
   const committed = rec.state === "delivering" || rec.state === "posted";
@@ -1127,16 +1201,30 @@ async function settleObligation(
         ctx.agent,
         ctx.inboundId,
         "unconfirmed",
-        { failure: s.reason },
+        {
+          failure: s.reason,
+          ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+        },
         ctx.log,
+        { from: rec.state },
       );
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
         if (result.status === "unverified") return "none";
+        // cli#1006 r10: readObligationForCleanup released a terminal or gone
+        // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
+        // needs its deadline re-armed — the fired one is already disarmed, and
+        // a past-deadline startup settlement never had one — so schedule the
+        // retry that re-reads and re-arms it. When that re-arm lands, the
+        // deadline rescans the evidence instead of reusing this decision; an
+        // arm failure inside the retry is not re-tried here (a follow-up).
         const cur = result.status === "found" ? result.record : null;
+        const live = cur !== null && !TERMINAL_STATES.has(cur.state);
         ctx.log?.warn?.(
-          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; it stays as it is`,
+          `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
+            (live ? "it keeps its state and is left to its deadline" : "it stays as it is"),
         );
+        if (live) retryObligationRead(ctx, obligationId);
         return "none";
       }
     } catch (err: any) {
@@ -1172,8 +1260,13 @@ async function settleObligation(
       ctx.agent,
       ctx.inboundId,
       "failed",
-      { failure: failedOn, nackPending: true },
+      {
+        failure: failedOn,
+        nackPending: true,
+        ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+      },
       ctx.log,
+      { from: rec.state },
     );
   } catch (err: any) {
     ctx.log?.warn?.(
@@ -1185,22 +1278,33 @@ async function settleObligation(
   if (appliedFailed === null) {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") return "none";
+    // cli#1006 r10: readObligationForCleanup released a terminal or gone
+    // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
+    // keeps no timer here — the fired deadline is already disarmed, and a
+    // past-deadline startup settlement never had one — so schedule the retry
+    // that re-reads and re-arms it. When that re-arm lands, the deadline
+    // rescans the evidence instead of reusing this decision; an arm failure
+    // inside the retry is not re-tried here (a follow-up).
     const cur = result.status === "found" ? result.record : null;
+    const live = cur !== null && !TERMINAL_STATES.has(cur.state);
     ctx.log?.warn?.(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
-        `the inbound keeps no nack stamp and no nack mail is sent`,
+        (live ? "it keeps its state and is left to its deadline" : "the inbound keeps no nack stamp and no nack mail is sent"),
     );
+    if (live) retryObligationRead(ctx, obligationId);
     return "none";
   }
   // The failure is terminal: drop the context and its timer before the nack is
   // handed off (cli#403).
   releaseObligationState(obligationId);
-  if (!s.alreadyStamped) {
+  // A missing cur/ entry has no record to stamp; the obligation record carries
+  // the outcome (cli#1006).
+  if (!s.alreadyStamped && !s.missingCur) {
     stampTerminalCur(ctx, "nack", { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
-  const nackHandedOff = await deliverNack(ctx, failedOn);
+  const nackHandedOff = await deliverNack(ctx, failedOn, { allowMissingInbound: s.missingCur });
   if (!isLiveContext(ctx)) return "none";
   ctx.log?.warn?.(
     `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
@@ -1234,7 +1338,7 @@ async function settleObligation(
 async function deliverNack(
   ctx: YieldContext,
   reason: string,
-  opts: { timeoutMs?: number; ackTimeoutMs?: number } = {},
+  opts: { timeoutMs?: number; ackTimeoutMs?: number; allowMissingInbound?: boolean } = {},
 ): Promise<boolean> {
   if (!isLiveContext(ctx)) return false;
   let handedOff = false;
@@ -1291,6 +1395,7 @@ function retryOwedNackInBackground(
   log: any,
   incarnation: symbol,
   inboundEnvelopeId?: string,
+  allowMissingInbound = false,
 ): void {
   if (!isLiveContext({ accountId, incarnation })) return;
   const timeoutMs = resolveNackRetryTimeoutMs();
@@ -1364,7 +1469,7 @@ function retryOwedNackInBackground(
     }
   });
   void Promise.race([
-    deliverNack(ctx, reason, { timeoutMs, ackTimeoutMs }).then(
+    deliverNack(ctx, reason, { timeoutMs, ackTimeoutMs, allowMissingInbound }).then(
       () => "done" as const,
       () => "done" as const,
     ),
@@ -1427,19 +1532,26 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 }
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt. */
-function armDeadline(ctx: YieldContext, obligationId: string, deadlineAt?: string | null): void {
+function armDeadline(
+  ctx: YieldContext,
+  obligationId: string,
+  deadlineAt?: string | null,
+  patch: Partial<ObligationRecord> = {},
+): void {
   if (!isLiveContext(ctx)) return;
-  const result = readObligationForCleanup(ctx, obligationId);
-  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
-  const rec = result.record;
-  const at = deadlineAt ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
-  // The state records WHAT THE DELIVERY HAS DONE, so arming a deadline never
-  // downgrades a committed record (cli#389 round 8): `delivering`/`posted` keep
-  // their state and only gain `deadlineAt`. The deadline must be able to tell
-  // "committed, no evidence yet" from "never delivered" — that is the whole
-  // difference between `unconfirmed` and `failed`.
-  const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
-  transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { deadlineAt: at }, ctx.log);
+  let updated: ObligationRecord | null = null;
+  // Arming must preserve committed delivery state: the deadline distinguishes
+  // `unconfirmed` from `failed`. Re-read once if the state moves before writing.
+  for (let attempt = 0; attempt < 2 && !updated; attempt++) {
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+    const rec = result.record;
+    const at = (attempt === 0 ? deadlineAt : rec.deadlineAt) ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
+    updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, { from: rec.state });
+  }
+  if (!updated) return;
+  const at = updated.deadlineAt!;
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearAccountTimer(prev.accountId, prev.timer);
@@ -1458,6 +1570,8 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
   const rec = result.record;
   const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
   if (!isLiveContext(ctx)) return;
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur === "error") return;
   // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
   // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
   // record once it had stayed malformed for at least the partial-write grace, or was
@@ -1477,6 +1591,8 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
     receipt: receipt.status === "found" ? "found" : "none",
     verdict,
     reason,
+    // A restored inbound must pass the normal gate; the marker is historical.
+    missingCur: cur === "missing",
   });
 }
 
@@ -1555,6 +1671,117 @@ function scanObligationReceipt(
   );
 }
 
+const warnedObligationCurLookups = new Set<string>();
+
+/**
+ * Report a failed cur/ lookup for an obligation at most once per process for
+ * the same maildir, agent, inbound id AND error code: a later lookup that fails
+ * with a DIFFERENT code is still reported. The startup pass and the in-process
+ * deadline both go through this.
+ */
+function reportObligationCurLookupFailure(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  obligationId: string,
+  code: string,
+  log: any,
+): void {
+  const key = `${resolve(mailDir, agent)}|${inboundId}|${code}`;
+  if (warnedObligationCurLookups.has(key)) return;
+  warnedObligationCurLookups.add(key);
+  log?.warn?.(
+    `tps-mail: obligation-cur-lookup-failed: obligation ${obligationId} for inbound ${inboundId}: the cur/ lookup failed (${code}); leaving the obligation untouched`,
+  );
+}
+
+/** The missing-file allowance requires a clean lookup at the decision point. */
+function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing" | "present" | "error" {
+  const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
+  // cli#1006 r10: the context carries the inbound's cur/ path when one is
+  // known, and a probe there proves PRESENCE without a directory scan, which a
+  // cur/ holding more names than the scan reads would refuse. A record at that
+  // path for a DIFFERENT id proves nothing, so the scan below decides.
+  if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return "present";
+  let error: string | undefined;
+  const found = findCurPath(ctx.mailDir, ctx.agent, ctx.inboundId, (path, code) => {
+    if (code === "ENOENT" && path === curDir) return;
+    error ??= code ?? "INVALID_JSON";
+  });
+  if (error !== undefined) {
+    reportObligationCurLookupFailure(ctx.mailDir, ctx.agent, ctx.inboundId, obligationId, error, ctx.log);
+    return "error";
+  }
+  if (found !== null) {
+    ctx.curPath = found;
+    return "present";
+  }
+  return "missing";
+}
+
+/**
+ * cli#1006 — recovery for an open obligation whose inbound cur/ entry is GONE.
+ *
+ * The obligation record is the durable truth; cur/ only corroborates it. With no
+ * record to verify there is nothing to dispatch, so this path settles from the
+ * record: a verified receipt if one exists, otherwise the deadline verdict (re-arm while
+ * the deadline is ahead; at/after it, the deadline's own terminal outcome).
+ * The only mail settlement may send is a nack to the recorded sender; delivery
+ * retries follow the existing at-least-once contract. The internal-inbound gate
+ * does not apply because no agent reply is dispatched. The missing cur/ entry
+ * is carried as the named `missingCurReason` field, not as a verdict.
+ */
+async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: string): Promise<void> {
+  if (!isLiveContext(ctx)) return;
+  const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  const current = result.record;
+  ctx.log?.warn?.(
+    `tps-mail: obligation-missing-cur: obligation ${current.obligationId} for inbound ${current.inboundId}: ` +
+      `the cur/ record is missing (${MISSING_CUR_REASON}); recovering from the obligation record`,
+  );
+
+  const receipt = await scanObligationReceipt(ctx, current.obligationId, current, current.replyId);
+  if (!isLiveContext(ctx)) return;
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur === "error") return;
+  if (cur === "present") {
+    await reconcileObligation(ctx, current);
+    return;
+  }
+  if (receipt.status === "found") {
+    await settleObligation(ctx, current.obligationId, {
+      receipt: "found",
+      reason: "recovered: receipt already posted",
+      missingCur: true,
+    });
+    return;
+  }
+
+  // Decide from the post-scan state. The store guard refuses a STATE change
+  // after the re-read; a concurrent same-state update is not detected.
+  const fresh = readObligationForCleanup(ctx, current.obligationId);
+  if (fresh.status !== "found" || TERMINAL_STATES.has(fresh.record.state)) return;
+  const parsedDeadline = fresh.record.deadlineAt === null ? NaN : Date.parse(fresh.record.deadlineAt);
+  if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
+    const at = Number.isFinite(parsedDeadline)
+      ? fresh.record.deadlineAt!
+      : new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    armDeadline(ctx, current.obligationId, at, { missingCurReason: MISSING_CUR_REASON });
+    return;
+  }
+
+  // The deadline has passed: apply the deadline's own terminal outcome.
+  const reason = "yielded-without-resumption";
+  const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
+  await settleObligation(ctx, current.obligationId, {
+    receipt: "none",
+    verdict,
+    reason,
+    missingCur: true,
+  });
+}
+
 /**
  * Derive an obligation's truth from the maildir/outbox: a nacked cur/ record is
  * a failure; a posted marker is an ack; otherwise the work is outstanding and
@@ -1568,7 +1795,16 @@ async function reconcileObligation(
   ctx: YieldContext,
   rec: { obligationId: string; deadlineAt: string | null; inboundId: string; inboundEnvelopeId?: string; replyId?: string },
 ): Promise<void> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return;
+  if (!isLiveContext(ctx)) return;
+  // cli#1006: the record is the durable truth of the lifecycle; cur/
+  // corroborates it. When the cur/ entry is gone there is no inbound to
+  // re-verify and nothing to dispatch, so recovery settles or re-arms from the
+  // obligation record itself. The dispatch path keeps its gate below.
+  if (!ctx.curPath || !existsSync(ctx.curPath)) {
+    await reconcileMissingCurObligation(ctx, rec.obligationId);
+    return;
+  }
+  if (!(await internalInbound(ctx)) || !isLiveContext(ctx)) return;
   const curRec = ctx.curPath ? readMailFile(ctx.curPath) : null;
   if (curRec?.nackedAt) {
     // cli#389 round 9, item 3: an OLD stamp is NOT a verdict. A stamp left by
@@ -1615,9 +1851,17 @@ async function reconcileObligation(
 async function sendNackMail(
   ctx: YieldContext,
   reason: string,
-  opts: { timeoutMs?: number; ackTimeoutMs?: number } = {},
+  opts: { timeoutMs?: number; ackTimeoutMs?: number; allowMissingInbound?: boolean } = {},
 ): Promise<boolean> {
-  if (!isLiveContext(ctx) || !(await internalInbound(ctx)) || !isLiveContext(ctx)) return false;
+  if (!isLiveContext(ctx)) return false;
+  // cli#1006: the only mail settlement may send is a nack to the recorded
+  // sender; delivery retries follow the existing at-least-once contract. It
+  // dispatches no agent reply, so the internal-inbound gate (which binds the
+  // dispatch path) is bypassed only for two callers: the missing-cur settle,
+  // and the owed-nack retry for a record carrying MISSING_CUR_REASON, after a
+  // clean lookup still finds cur/ absent. Every other caller keeps it.
+  if (!opts.allowMissingInbound && !(await internalInbound(ctx))) return false;
+  if (!isLiveContext(ctx)) return false;
   const transcript = newestSessionTranscript(process.env.HOME ?? homedir(), ctx.agent);
   const detail = transcript
     ? `${reason}; the newest session transcript is ${transcript.path} (mtime ${transcript.mtime})`
@@ -1731,11 +1975,21 @@ function installYieldSubscription(api: any): boolean {
   return true;
 }
 
-function findCurPath(mailDir: string, agent: string, inboundId: string, onReadError?: (path: string, code?: string) => void): string | null {
+function findCurPath(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  onReadError?: (path: string, code?: string) => void,
+  /** cli#1006 r10: past the scan limit, keep reading for a MATCH only. Presence
+   *  can be proven that way; absence cannot, so an unmatched id still reports
+   *  SCAN_LIMIT. */
+  opts: { presenceBeyondLimit?: boolean } = {},
+): string | null {
   const curDir = resolve(mailDir, agent, "cur");
   try {
     const names = readdirSync(curDir);
-    if (onReadError && names.length > 4096) {
+    const beyondLimit = onReadError !== undefined && names.length > 4096;
+    if (beyondLimit && !opts.presenceBeyondLimit) {
       onReadError(curDir, "SCAN_LIMIT");
       return null;
     }
@@ -1743,7 +1997,10 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
     for (const name of names) {
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
-      const rec = readMailFile(p, onReadError);
+      // Past the limit a read error on an unrelated entry cannot establish
+      // absence, and a single match settles the question (a second reports
+      // AMBIGUOUS_ID): scan without reporting unrelated errors.
+      const rec = readMailFile(p, beyondLimit ? undefined : onReadError);
       if (rec?.id !== inboundId) continue;
       if (!onReadError) return p;
       if (match) {
@@ -1752,12 +2009,31 @@ function findCurPath(mailDir: string, agent: string, inboundId: string, onReadEr
       }
       match = p;
     }
-    if (!match) onReadError?.(curDir, "ENOENT");
+    if (!match) {
+      if (beyondLimit) onReadError?.(curDir, "SCAN_LIMIT");
+      else onReadError?.(curDir, "ENOENT");
+    }
     return match;
   } catch (err: any) {
-    onReadError?.(curDir, err?.code);
+    // cli#1006: readdir's ENOENT is a clean "nothing to scan" only when the
+    // cur/ directory itself is absent. A dangling cur/ symlink also reads
+    // ENOENT but exists, so it is a lookup ERROR, not an absence.
+    if (err?.code === "ENOENT" && !curDirAbsent(curDir)) {
+      onReadError?.(curDir, "DANGLING_SYMLINK");
+    } else {
+      onReadError?.(curDir, err?.code);
+    }
   }
   return null;
+}
+
+/** True when `dir` does not exist; a dangling symlink is not absent. */
+function curDirAbsent(dir: string): boolean {
+  try {
+    return lstatSync(dir, { throwIfNoEntry: false }) === undefined;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Channel Plugin ──────────────────────────────────────────────────────────
@@ -2493,6 +2769,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       }
     }
 
+    let resolveSweepDone!: () => void;
+    startupSweepDone.set(account.accountId, new Promise<void>((resolve) => { resolveSweepDone = resolve; }));
+
     // Launch a watcher per agent inbox.
     for (const agentId of boundAgents) {
       if (!isLive()) break;
@@ -2621,6 +2900,46 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         } catch { /* ignore */ }
 
         const unknownInbounds = reconcileTerminalCurStamps(account.mailDir, agentId, log);
+        const curDir = resolve(account.mailDir, agentId, "cur");
+
+        // cli#1006 r16: resolve each OPEN obligation's cur/ lookup BEFORE the
+        // unacked-cur/ recovery is scheduled. An error REPORTED here keeps the
+        // sweep off that inbound — otherwise the sweep would reconcile, ack,
+        // arm or fail the very obligation the startup loop leaves untouched —
+        // and the loop below reuses this result instead of scanning twice. The
+        // scan is a snapshot: later filesystem changes are not covered.
+        const lookupOpenObligationCur = (inboundId: string): { curPath: string | null; error: string | null } => {
+          let lookupError: string | null = null;
+          const curPath = findCurPath(
+            account.mailDir,
+            agentId,
+            inboundId,
+            (path, code) => {
+              // Only the scan's clean signals — no matching entry, or the cur/
+              // directory itself absent — are a miss; a dangling cur/ symlink or
+              // a listed file that is gone is a read error.
+              if (code === "ENOENT" && path === curDir) return;
+              lookupError ??= code ?? "INVALID_JSON";
+            },
+            // cli#1006 r10: startup knows no cur/ path yet. Reading past the
+            // limit can still prove the entry is THERE; a miss still reports
+            // SCAN_LIMIT, because absence is not provable that way.
+            { presenceBeyondLimit: true },
+          );
+          return { curPath, error: lookupError };
+        };
+        const startupCurLookups = new Map<string, { curPath: string | null; error: string | null }>();
+        for (const rec of listObligations(account.mailDir, agentId)) {
+          if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
+          const lookup = lookupOpenObligationCur(rec.inboundId);
+          if (lookup.error !== null) {
+            unknownInbounds.add(rec.inboundId);
+            // Reported here, before the recovery sweep is scheduled: the loop
+            // below skips this inbound, so this is its one startup report.
+            reportObligationCurLookupFailure(account.mailDir, agentId, rec.inboundId, rec.obligationId, lookup.error, log);
+          }
+          startupCurLookups.set(rec.inboundId, lookup);
+        }
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
@@ -2630,8 +2949,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // other directory. recoverPromoted() enforces that and quarantines a
         // record that cannot prove provenance; a Flair outage defers to the next
         // start.
-        const curDir = resolve(account.mailDir, agentId, "cur");
         try {
+          const sweepRecoveries = startupCurRecoveries.get(account.accountId) ?? new Map<string, Promise<void>[]>();
+          startupCurRecoveries.set(account.accountId, sweepRecoveries);
           if (existsSync(curDir)) {
             for (const filename of readdirSync(curDir)) {
               if (!filename.endsWith(".json")) continue;
@@ -2639,7 +2959,11 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
               if (seenFiles.has(curPath)) continue;
               const record = readMailFile(curPath);
               if (!record || record.ackedAt || record.nackedAt || unknownInbounds.has("*") || unknownInbounds.has(record.id)) continue;
-              void recoverUnackedCurRecord(agentId, curPath, record);
+              const recovery = recoverUnackedCurRecord(agentId, curPath, record);
+              const forInbound = sweepRecoveries.get(record.id);
+              if (forInbound) forInbound.push(recovery);
+              else sweepRecoveries.set(record.id, [recovery]);
+              void recovery;
             }
           }
         } catch { /* ignore */ }
@@ -2676,6 +3000,18 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (!nackOwed(rec)) continue;
+          // cli#1006 r2: the missing-cur allowance is sound only while a CLEAN
+          // lookup confirms cur/ is still absent. A lookup that errors, or one
+          // that finds the file again, takes the normal gated path.
+          let curStillAbsent = false;
+          if (rec.missingCurReason === MISSING_CUR_REASON) {
+            let retryLookupError: string | null = null;
+            const found = findCurPath(account.mailDir, agentId, rec.inboundId, (path, code) => {
+              if (code === "ENOENT" && path === curDir) return;
+              retryLookupError ??= code ?? "INVALID_JSON";
+            });
+            curStillAbsent = found === null && retryLookupError === null;
+          }
           retryOwedNackInBackground(
             account.mailDir,
             agentId,
@@ -2687,6 +3023,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             log,
             incarnation,
             rec.inboundEnvelopeId,
+            // cli#1006: the owed-nack retry for a record carrying
+            // MISSING_CUR_REASON, after a clean lookup still finds cur/ absent,
+            // keeps the settle-path allowance. Every other record keeps the gate.
+            curStillAbsent,
           );
         }
 
@@ -2717,13 +3057,34 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
-          const recCurPath = findCurPath(account.mailDir, agentId, rec.inboundId);
+          // cli#1006 r16: the lookup resolved before the startup sweep is reused
+          // here; a record that appeared since (created by the sweep) gets its
+          // own. A REPORTED lookup error is not a MISSING cur/: an unreadable or
+          // malformed file, SCAN_LIMIT or AMBIGUOUS_ID leaves the obligation
+          // untouched. Above the scan limit findCurPath does not report unrelated
+          // read errors, so a single matching entry beyond the limit still proves
+          // presence and startup proceeds (two matches report AMBIGUOUS_ID). An
+          // absent lookup passes no path: a
+          // record at the conventional name for another message id proves
+          // nothing, so it must not suppress missing-entry recovery.
+          const lookup = startupCurLookups.get(rec.inboundId) ?? lookupOpenObligationCur(rec.inboundId);
+          if (lookup.error !== null) {
+            reportObligationCurLookupFailure(
+              account.mailDir,
+              agentId,
+              rec.inboundId,
+              rec.obligationId,
+              lookup.error,
+              log,
+            );
+            continue;
+          }
           const ctx = makeYieldCtx(
             account.mailDir,
             agentId,
             rec.from,
             account.accountId,
-            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
+            lookup.curPath ?? "",
             rec.inboundId,
             cfg,
             log,
@@ -2740,6 +3101,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       }
     }
 
+    resolveSweepDone();
     await shutdown;
     ctx.abortSignal?.removeEventListener("abort", abort);
   },
