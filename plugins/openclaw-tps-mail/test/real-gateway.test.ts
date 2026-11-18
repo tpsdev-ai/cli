@@ -250,9 +250,11 @@ async function startGracefulStub(
   node: string,
   script = 'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
   timeoutMs = 5_000,
+  onSpawn?: (stub: ReturnType<typeof spawn>) => void,
 ): Promise<ReturnType<typeof spawn>> {
   const stub = spawn(node, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
   try {
+    onSpawn?.(stub);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("stub gateway never booted")), timeoutMs);
       stub.stdout!.once("data", () => {
@@ -280,31 +282,21 @@ async function startGracefulStub(
 
 it("stops a stub that times out before readiness", async () => {
   const node = process.env.TPS_LANE_NODE || "node";
-  const root = mkdtempSync(join(tmpdir(), "tps-stub-timeout-"));
-  const pidPath = join(root, "pid");
+  let stub: ReturnType<typeof spawn> | undefined;
   try {
     await expect(
-      startGracefulStub(
-        node,
-        `import { writeFileSync } from "node:fs"; writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
-        500,
-      ),
+      startGracefulStub(node, "setInterval(() => {}, 1000);", 500, (child) => {
+        stub = child;
+      }),
     ).rejects.toThrow("stub gateway never booted");
-    const pid = Number(readFileSync(pidPath, "utf8"));
-    expect(Number.isInteger(pid) && pid > 0).toBe(true);
-    expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: "ESRCH" }));
+    expect(stub?.exitCode).toBeNull();
+    expect(stub?.signalCode).toBe("SIGKILL");
   } finally {
-    if (existsSync(pidPath)) {
-      const pid = Number(readFileSync(pidPath, "utf8"));
-      if (Number.isInteger(pid) && pid > 0) {
-        try {
-          process.kill(pid, "SIGKILL");
-        } catch (err) {
-          expect(err).toHaveProperty("code", "ESRCH");
-        }
-      }
+    const child = stub;
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await new Promise((resolve) => child.once("exit", resolve));
     }
-    rmSync(root, { recursive: true, force: true });
   }
 });
 
