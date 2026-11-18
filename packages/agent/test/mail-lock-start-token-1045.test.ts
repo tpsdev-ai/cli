@@ -134,6 +134,22 @@ describe("processStartToken is the same whichever environment reads it", () => {
       child.kill("SIGKILL");
     }
   }, 60_000);
+
+  test("a reader in a non-UTC odd-offset zone agrees with a reader in a local zone", async () => {
+    forcePsStartTokens();
+    const { child, pid, token } = await liveChild();
+    try {
+      expect(token).toStartWith("ps:");
+      // The odd-offset reader's unpinned output is a different text, so its
+      // pinned token below can only match by the pin.
+      expect(`ps:${unpinnedLstart(pid, ODD_ZONE_ENV)}`).not.toBe(token);
+      const odd = tokenReadUnder(pid, ODD_ZONE_ENV);
+      const local = tokenReadUnder(pid, PACIFIC_ENV);
+      expect([odd, local]).toEqual([token, token]);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 60_000);
 });
 
 describe("classifyOwnerToken: one rule for a live pid's current and recorded tokens", () => {

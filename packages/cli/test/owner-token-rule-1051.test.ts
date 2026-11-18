@@ -1,0 +1,201 @@
+/**
+ * cli#1051 — follow-ups from cli#1045.
+ *
+ * The cli consumers of the shared owner-token rule each get an independent
+ * cross-source case (a recorded `proc:` token against a live `ps:` token, or
+ * the reverse): the outbox per-delivery lock, pid files and the launch
+ * snapshot sweep. The pid-file path is also driven through a CLI subprocess
+ * with the test-only `ps` preload. A live owner whose tokens cannot be
+ * compared is never treated as gone: it is reported, its record is kept, and
+ * the outbox refusals say how to recover.
+ */
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { type ChildProcess, execFileSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { processStartToken } from "@tpsdev-ai/agent";
+import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
+import {
+  forcePsStartTokens,
+  PS_START_TOKENS_NODE_ARGS,
+  stageProcStartTokens,
+} from "../../../test/helpers/start-token-source-test.js";
+import { releasedAgentIdentity, stopLaunchProcesses } from "../src/utils/launch-attestation.js";
+import { LAUNCH_SNAPSHOT_OWNER_FILE, LAUNCH_SNAPSHOT_PREFIX, sweepStaleLaunchSnapshots } from "../src/utils/launch-snapshots.js";
+import { MailLockOwnerError, tryAcquireMailLock } from "../src/utils/mail-lock.js";
+import { OutboxLockError, queueOutboxMessage } from "../src/utils/outbox.js";
+import { readPidFile } from "../src/utils/pid-file.js";
+
+const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
+/** An intentionally non-UTC POSIX zone (UTC+13:17). */
+const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
+const GUIDANCE = "inspect the owner process and remove the lock only after confirming no delivery is active";
+
+/** The `ps:` text an unpinned writer in a non-UTC zone would have recorded. */
+function legacyPsToken(pid: number): string {
+  const text = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    env: ODD_ZONE_ENV,
+    encoding: "utf-8",
+    timeout: 5_000,
+  }).trim();
+  return `ps:${text}`;
+}
+
+/** The pinned `ps:` token current code reads for this pid. */
+function pinnedPsToken(pid: number): string {
+  const text = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+    env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
+    encoding: "utf-8",
+    timeout: 5_000,
+  }).trim();
+  return `ps:${text}`;
+}
+
+let root: string;
+let child: ChildProcess | undefined;
+let savedHome: string | undefined;
+
+beforeEach(() => {
+  savedHome = process.env.HOME;
+  root = mkdtempSync(join(tmpdir(), "owner-token-rule-1051-"));
+});
+
+afterEach(() => {
+  child?.kill("SIGKILL");
+  child = undefined;
+  if (savedHome === undefined) delete process.env.HOME;
+  else process.env.HOME = savedHome;
+  rmSync(root, { recursive: true, force: true });
+});
+
+function livePid(): number {
+  child = spawnLiveProcess();
+  const pid = child.pid as number;
+  expect(pid).toBeGreaterThan(0);
+  return pid;
+}
+
+describe("outbox per-delivery lock", () => {
+  test("a live owner whose recorded token comes from another source is not broken", () => {
+    forcePsStartTokens();
+    const pid = livePid();
+    const token = processStartToken(pid);
+    expect(token).toMatch(/^ps:/);
+    const lockDir = join(root, "delivery.lock");
+    mkdirSync(lockDir);
+    const ownerFile = join(lockDir, "owner.json");
+    const owner = { pid, startToken: "proc:1" };
+    writeFileSync(ownerFile, JSON.stringify(owner));
+
+    let lock: ReturnType<typeof tryAcquireMailLock> = null;
+    let thrown: unknown;
+    try {
+      lock = tryAcquireMailLock(lockDir);
+    } catch (error) {
+      thrown = error;
+    } finally {
+      lock?.release();
+    }
+    expect(lock).toBeNull();
+    expect(thrown).toBeInstanceOf(MailLockOwnerError);
+    expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
+  });
+
+  test("an unverifiable-owner refusal carries recovery guidance", () => {
+    process.env.HOME = root;
+    const pid = livePid();
+    const legacy = legacyPsToken(pid);
+    const deliveryId = "a".repeat(64);
+    const lockDir = join(root, ".tps", "outbox", "new", `.github-${deliveryId}.lock`);
+    mkdirSync(lockDir, { recursive: true });
+    const ownerFile = join(lockDir, "owner.json");
+    const owner = { pid, startToken: legacy };
+    writeFileSync(ownerFile, JSON.stringify(owner));
+
+    let thrown: unknown;
+    try {
+      queueOutboxMessage("agent-a", "body", "agent-a", deliveryId);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(OutboxLockError);
+    expect((thrown as Error).message).toContain(GUIDANCE);
+    expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
+  });
+});
+
+describe("pid files", () => {
+  test("a live owner whose recorded token comes from another source is unverified and kept", () => {
+    stageProcStartTokens();
+    const pid = livePid();
+    expect(processStartToken(pid)).toMatch(/^proc:/);
+    const path = join(root, "relay.pid");
+    const bytes = `${JSON.stringify({ pid, startToken: "ps:Tue Nov 17 02:39:30 2026" })}\n`;
+    writeFileSync(path, bytes);
+
+    const state = readPidFile(path);
+    expect(state.kind).toBe("unverified");
+    expect(state.kind === "unverified" ? state.pid : null).toBe(pid);
+    expect(readFileSync(path, "utf-8")).toBe(bytes);
+  });
+
+  test("mail relay stop refuses a recorded ps: token it cannot compare and signals nothing", () => {
+    process.env.HOME = root;
+    mkdirSync(join(root, ".tps"), { recursive: true });
+    const pid = livePid();
+    const legacy = legacyPsToken(pid);
+    expect(legacy).not.toBe(pinnedPsToken(pid));
+    const path = join(root, ".tps", "relay.pid");
+    const bytes = `${JSON.stringify({ pid, startToken: legacy })}\n`;
+    writeFileSync(path, bytes);
+
+    const result = spawnSync(
+      process.execPath,
+      [...PS_START_TOKENS_NODE_ARGS, TPS_BIN, "mail", "relay", "stop"],
+      { env: { ...process.env, HOME: root }, encoding: "utf-8", timeout: 30_000 },
+    );
+    expect(result.status).not.toBe(0);
+    expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).toContain("identity cannot be verified");
+    expect(readFileSync(path, "utf-8")).toBe(bytes);
+    expect(() => process.kill(pid, 0)).not.toThrow();
+    expect(existsSync(path)).toBe(true);
+  }, 30_000);
+});
+
+describe("launch snapshot sweep", () => {
+  test("a live owner whose recorded token comes from another source is kept", () => {
+    forcePsStartTokens();
+    const pid = livePid();
+    expect(processStartToken(pid)).toMatch(/^ps:/);
+    const dir = join(root, `${LAUNCH_SNAPSHOT_PREFIX}a1051b`);
+    mkdirSync(dir);
+    writeFileSync(join(dir, LAUNCH_SNAPSHOT_OWNER_FILE), JSON.stringify({ pid, startToken: "proc:1" }));
+
+    expect(sweepStaleLaunchSnapshots(root, { graceMs: 0 })).toEqual([]);
+    expect(existsSync(dir)).toBe(true);
+  });
+});
+
+describe("released-agent identity", () => {
+  test("a live released agent with a legacy ps: token is a survivor, not a stopped launch", async () => {
+    const pid = livePid();
+    const legacy = legacyPsToken(pid);
+    const pinned = pinnedPsToken(pid);
+    expect(legacy).not.toBe(pinned);
+    try {
+      expect(releasedAgentIdentity({ pid, startToken: legacy }, () => pinned)).toBe("unknown");
+      const stop = await stopLaunchProcesses(
+        { supervisor: null, agent: { pid, startToken: legacy } },
+        "SIGTERM",
+        { boundMs: 50, hooks: { startToken: () => pinned } },
+      );
+      expect(stop.stopped).toBe(false);
+      expect(stop.survivors).toEqual([pid]);
+      expect(() => process.kill(pid, 0)).not.toThrow();
+    } finally {
+      child?.kill("SIGKILL");
+      child = undefined;
+    }
+  });
+});

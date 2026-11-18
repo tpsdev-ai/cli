@@ -493,7 +493,7 @@ test("an inbound refresh whose self token cannot be read keeps retrying and repo
     const skipped = diagnostic.mock.calls.filter(([line]) => String(line).includes("not refreshed"));
     expect(skipped).toHaveLength(1);
     expect(String(skipped[0][0])).toContain(
-      `[relay] host state record ${path} not refreshed: this process's start token could not be read, so ownership cannot be verified; the record keeps its last state and refreshes resume when the token reads again`,
+      `[relay] host state record ${path} not refreshed: this process's start token could not be read or compared, so ownership cannot be verified; the record keeps its last state and refreshes resume when the token can be read and compared again`,
     );
     // The token reads again: the pending retry writes without a new message,
     // and the recovery is reported once.

@@ -71,9 +71,13 @@ function claimLock(lockDir: string, myToken: string | null): boolean {
   }
 }
 
+/** Guidance for an unverifiable owner: the caller must decide by hand, never
+ *  by age. */
+const UNVERIFIABLE_OWNER_GUIDANCE = "; inspect the owner process and remove the lock only after confirming no delivery is active";
+
 export class MailLockOwnerError extends Error {
-  constructor(lockDir: string) {
-    super(`MailLockOwnerError: cannot verify owner of ${lockDir}`);
+  constructor(lockDir: string, guidance?: string) {
+    super(`MailLockOwnerError: cannot verify owner of ${lockDir}${guidance ?? ""}`);
     this.name = "MailLockOwnerError";
   }
 }
@@ -128,7 +132,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
       // A changed identity may indicate contention; retry to re-evaluate the lock path.
       if (lockIdentity(lockDir) !== identity) continue;
       if (!existsSync(lockDir)) continue;
-      throw new MailLockOwnerError(lockDir);
+      throw new MailLockOwnerError(lockDir, UNVERIFIABLE_OWNER_GUIDANCE);
     }
     let reclaim: MailLock | null;
     try {
@@ -150,7 +154,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
         mailLockTestHooks.unverifiedOwner?.(lockDir);
         if (lockIdentity(lockDir) !== currentIdentity) continue;
         if (!existsSync(lockDir)) continue;
-        throw new MailLockOwnerError(lockDir);
+        throw new MailLockOwnerError(lockDir, UNVERIFIABLE_OWNER_GUIDANCE);
       }
       removeClaim(lockDir);
     } catch (error) {
