@@ -955,6 +955,40 @@ describe("cli#1034 — the post-SIGKILL reap has a budget of its own", () => {
     expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
   }, 5_000);
 
+  it("uses the larger default reap budget when stopGateway is given only a SIGTERM budget", async () => {
+    // The reap budget is omitted, so only stopGateway's own default can outlast
+    // the 300 ms SIGKILL exit; a default equal to the 100 ms SIGTERM budget
+    // reports the exit as unconfirmed.
+    const child = new DelayedKillChild();
+    const stop = await stopGateway(child, { deadlineMs: 100 });
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
+  }, 5_000);
+
+  it("uses the larger default reap budget when finalizeGatewayRun is given only a SIGTERM budget", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-default-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.signalCode).toBe("SIGKILL");
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.settledRead).toBe(false);
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
   it("carries the reap budget through finalizeGatewayRun", async () => {
     const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-"));
     try {
