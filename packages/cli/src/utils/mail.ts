@@ -575,8 +575,9 @@ function warnObligationArchiveRead(path: string, code: string | undefined): void
   console.warn(`[mail] keeping cur/ record: obligation ${path} is unreadable (${code ?? "invalid"}); not archiving`);
 }
 
-/** One line per path for a record that exists but does not describe THIS cur/
- *  file, or whose state is not recognized. */
+/** At most one warning per path across read and mismatch reasons: a record that
+ *  exists but does not describe THIS cur/ file, or whose state is not
+ *  recognized. */
 function warnObligationArchiveMismatch(path: string, reason: string): void {
   if (warnedObligationArchiveReads.has(path)) return;
   warnedObligationArchiveReads.add(path);

@@ -341,6 +341,34 @@ describe("mail utils", () => {
     }
   });
 
+  test("archiveOldCur warns at most once per path across a mismatch and a later malformed record", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const cur = join(inbox.cur, "changed.json");
+    writeFileSync(cur, JSON.stringify({ id: "msg-changed", from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+    utimesSync(cur, old, old);
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const record = join(obligationDir, "msg-changed.json");
+    // First condition for the one retained cur/ path: a mismatch.
+    writeFileSync(record, JSON.stringify({ obligationId: "ob-other", inboundId: "msg-other", state: "acked" }));
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      // Same path, same process, second condition: the record is malformed.
+      writeFileSync(record, "{not json");
+      expect(archiveOldCur("agent-a", 30)).toBe(0);
+      expect(existsSync(cur), "the cur/ record is retained through both calls").toBe(true);
+      expect(warnings.filter((line) => line.includes("msg-changed.json")).length, "only the first warning for the path appears").toBe(1);
+      expect(warnings.find((line) => line.includes("msg-changed.json")), "the first warning is the mismatch").toContain("names inbound msg-other");
+    } finally {
+      restoreWarn();
+    }
+  });
+
   test("checkMessages opportunistically archives old cur entries", async () => {
     const { getInbox } = await import("../src/utils/mail.js");
     const inbox = getInbox("kern");
