@@ -58,13 +58,21 @@ function waitForExit(child, deadlineMs) {
   ]);
 }
 
+export const SIGTERM_BUDGET_MS = 5_000;
+export const SIGKILL_REAP_BUDGET_MS = 15_000;
+
 /**
- * Stop a gateway child: SIGTERM, then SIGKILL after the budget. Signal death
- * leaves `exitCode` null. A child that exits within the SIGTERM budget without
- * SIGKILL being sent stopped GRACEFULLY; this makes no claim that application
- * cleanup ran. A child that needed SIGKILL did not.
+ * Stop a gateway child: SIGTERM, then SIGKILL after the SIGTERM budget. Signal
+ * death leaves `exitCode` null. A child that exits within the SIGTERM budget
+ * without SIGKILL being sent stopped GRACEFULLY; this makes no claim that
+ * application cleanup ran. A child that needed SIGKILL did not. The reap budget
+ * is separate and larger than the SIGTERM budget: SIGKILL delivery and child
+ * teardown are not bounded by the deadline that ended the SIGTERM wait.
  */
-export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
+export async function stopGateway(child, {
+  deadlineMs = SIGTERM_BUDGET_MS,
+  reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
+} = {}) {
   let sigkillSent = false;
   if (child) {
     if (child.exitCode === null && child.signalCode === null) {
@@ -74,7 +82,7 @@ export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
     if (child.exitCode === null && child.signalCode === null) {
       sigkillSent = true;
       child.kill("SIGKILL");
-      await waitForExit(child, deadlineMs);
+      await waitForExit(child, reapDeadlineMs);
     }
   }
   const exitCode = child?.exitCode ?? null;
@@ -128,10 +136,11 @@ export async function finalizeGatewayRun({
   report,
   mailDir,
   reportPath,
-  stopDeadlineMs = 5_000,
+  stopDeadlineMs = SIGTERM_BUDGET_MS,
+  reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
   beforeWrite = null,
 }) {
-  const stop = await stopGateway(child, { deadlineMs: stopDeadlineMs });
+  const stop = await stopGateway(child, { deadlineMs: stopDeadlineMs, reapDeadlineMs });
   report.stopped = stop.stopped;
   report.stoppedGracefully = stop.stoppedGracefully;
   report.stopSignal = stop.signalCode;
@@ -178,7 +187,8 @@ async function main() {
   const REPLY_DEADLINE_MS = 45_000;
   const ACK_DEADLINE_MS = 15_000;
   const CUR_MOVE_DEADLINE_MS = 5_000;
-  const STOP_DEADLINE_MS = 5_000;
+  const STOP_DEADLINE_MS = SIGTERM_BUDGET_MS;
+  const STOP_REAP_DEADLINE_MS = SIGKILL_REAP_BUDGET_MS;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   async function until(predicate, deadlineMs, label) {
@@ -556,6 +566,7 @@ async function main() {
       mailDir: MAIL,
       reportPath: REPORT,
       stopDeadlineMs: STOP_DEADLINE_MS,
+      reapDeadlineMs: STOP_REAP_DEADLINE_MS,
       beforeWrite: async () => {
         await new Promise((r) => model.close(r));
         await new Promise((r) => flair.close(r));

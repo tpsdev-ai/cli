@@ -23,6 +23,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -920,3 +921,28 @@ describe("cli#1034 — stopGateway without a child", () => {
   }, 5_000);
 });
 
+describe("cli#1034 — the post-SIGKILL reap has a budget of its own", () => {
+  class DelayedKillChild extends EventEmitter {
+    exitCode: number | null = null;
+    signalCode: string | null = null;
+    signals: string[] = [];
+
+    kill(signal: string): boolean {
+      this.signals.push(signal);
+      if (signal === "SIGKILL") {
+        setTimeout(() => {
+          this.signalCode = "SIGKILL";
+          this.emit("exit", null, "SIGKILL");
+        }, 300);
+      }
+      return true;
+    }
+  }
+
+  it("waits for a SIGKILL exit that lands after the SIGTERM budget", async () => {
+    const child = new DelayedKillChild();
+    const stop = await stopGateway(child, { deadlineMs: 100, reapDeadlineMs: 1_000 });
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
+  }, 5_000);
+});
