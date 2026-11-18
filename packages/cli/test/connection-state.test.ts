@@ -308,6 +308,17 @@ describe("connection-state", () => {
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
   });
 
+  test("claimHostStateAt leaves a recorded bare proc label unverifiable instead of reclaiming it", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-bare-proc-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: "proc" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a" }, "conn-a", undefined, 0, { startToken: () => "proc:4242" });
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
   test.each([
     ["matching", "ps:Tue Nov 17 02:39:30 2026", "other"],
     ["different", "ps:Tue Nov 17 10:39:30 2026", "unverifiable"],
@@ -556,6 +567,68 @@ describe("connection-state", () => {
     expect(readFileSync(path, "utf8")).toBe(raw);
   });
 
+  test.each([
+    ["tokens from different sources", "ps:Tue Nov 17 02:39:30 2026", "proc:4242"],
+    ["two differing ps: tokens", "ps:Tue Nov 17 02:39:30 2026", "ps:Wed Nov 18 02:39:30 2026"],
+  ])("refreshOwnedHostStateAt reports an owner whose %s cannot be compared and leaves the record byte-identical", (_label, recorded, live) => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-owned-incomparable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: recorded });
+    const raw = readFileSync(path);
+    const outcome = refreshOwnedHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      { startToken: () => live },
+    );
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
+  test("refresh, clear and claim treat a same-connection proc: mismatch as another owner", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-same-connection-mismatch-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:stale" });
+    const raw = readFileSync(path, "utf8");
+    const hooks = { startToken: () => "proc:live" };
+    expect(refreshOwnedHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },
+      "conn-a",
+      undefined,
+      0,
+      hooks,
+    )).toEqual({ kind: "other" });
+    expect(readFileSync(path, "utf8")).toBe(raw);
+    expect(() => clearHostStateAt(path, "x", "conn-a", hooks)).not.toThrow();
+    expect(readFileSync(path, "utf8")).toBe(raw);
+    expect(claimHostStateAt(
+      path,
+      { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "claimed" },
+      "conn-a",
+      undefined,
+      0,
+      hooks,
+    )).toEqual({ kind: "written" });
+    expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("claimed");
+  });
+
+  test("clearHostStateAt reports an owner whose tokens cannot be compared and keeps the record", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-clear-incomparable-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "ps:Tue Nov 17 02:39:30 2026" });
+    const raw = readFileSync(path, "utf8");
+    expect(() => clearHostStateAt(path, "x", "conn-a", { startToken: () => "proc:4242" })).toThrow(
+      `Host state record ${path} is present but this process's start token could not be read or compared, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+    );
+    expect(readFileSync(path, "utf8")).toBe(raw);
+  });
+
   test.each([undefined, "conn-a"])("clearHostStateAt keeps and reports an unverifiable record with requested connectionId %j", (connectionId) => {
     home = mkdtempSync(join(tmpdir(), "conn-state-clear-unverifiable-"));
     process.env.HOME = home;
@@ -563,7 +636,7 @@ describe("connection-state", () => {
     writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
     const raw = readFileSync(path, "utf8");
     expect(() => clearHostStateAt(path, "x", connectionId, { startToken: () => null })).toThrow(
-      `Host state record ${path} is present but this process's start token could not be read, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+      `Host state record ${path} is present but this process's start token could not be read or compared, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
     );
     expect(readFileSync(path, "utf8")).toBe(raw);
   });

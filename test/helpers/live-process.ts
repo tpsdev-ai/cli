@@ -69,6 +69,59 @@ export interface SpawnLiveProcessOptions {
   stdout?: "ignore" | "pipe" | number;
 }
 
+/**
+ * A live process that records every SIGTERM it receives. It appends a line to
+ * the marker file in the handler and stays alive, so a test can assert that a
+ * command sent it no SIGTERM — `kill(pid, 0)` cannot show that, because it also
+ * succeeds for an exited child that has not been reaped.
+ */
+export const SIGTERM_RECORDER_SCRIPT = `
+const parentPid = Number(process.argv[1]);
+const markerPath = process.argv[2];
+if (!Number.isInteger(parentPid) || parentPid <= 0 || !markerPath) process.exit(2);
+const fs = require("node:fs");
+process.on("SIGTERM", () => {
+  fs.appendFileSync(markerPath, "SIGTERM\\n");
+});
+const stop = () => process.exit(0);
+process.stdin.on("end", stop);
+process.stdin.on("close", stop);
+process.stdin.resume();
+${OWNER_GONE_SCRIPT}
+setInterval(() => {
+  if (ownerGone(parentPid)) stop();
+}, 250);
+process.stdout.write("${LIVE_PROCESS_READY}\\n");
+`;
+
+/** Start a SIGTERM recorder; it prints LIVE_PROCESS_READY only after installing the handler. */
+export function spawnSigtermRecorder(markerPath: string): ChildProcess {
+  return spawn(process.execPath, ["-e", SIGTERM_RECORDER_SCRIPT, String(process.pid), markerPath], {
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+}
+
+/** Wait for a child's ready line, rejecting (or resolving false) at the deadline. */
+export async function waitForReadyLine(child: ChildProcess, timeoutMs = 10_000): Promise<boolean> {
+  const stdout = child.stdout;
+  if (stdout === null) return false;
+  return await new Promise<boolean>((resolve) => {
+    let buffer = "";
+    const timer = setTimeout(() => {
+      stdout.off("data", onData);
+      resolve(false);
+    }, timeoutMs);
+    const onData = (chunk: Buffer | string): void => {
+      buffer += chunk.toString();
+      if (!buffer.includes(LIVE_PROCESS_READY)) return;
+      clearTimeout(timer);
+      stdout.off("data", onData);
+      resolve(true);
+    };
+    stdout.on("data", onData);
+  });
+}
+
 /** Start a process that exits when its stdin closes or its spawner's pid is gone. */
 export function spawnLiveProcess(options: SpawnLiveProcessOptions = {}): ChildProcess {
   const parentPid = process.pid;

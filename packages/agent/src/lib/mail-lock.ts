@@ -155,34 +155,32 @@ export interface LockOwner {
 
 export type OwnerState = "alive" | "dead" | "unverifiable";
 
-/** The source component of a birth token (`proc:` / `ps:`), or the whole string. */
-function tokenSource(token: string): string {
-  const i = token.indexOf(":");
-  return i === -1 ? token : token.slice(0, i);
-}
+/** A `proc:` token that carries a value; only these two together prove reuse. */
+const PROC_TOKEN = /^proc:.+$/;
 
 export type OwnerTokenState = "alive" | "dead" | "unverifiable";
 
 /**
  * The one rule for comparing a LIVE pid's current start token with the token
  * recorded for it (cli#1045). The agent mail lock and pid files, the cli outbox
- * per-delivery lock, pid files and launch snapshot sweep use it; host-state
- * ownership and released-agent identity still compare tokens directly. A gone
- * pid is the caller's to classify (dead) before it gets here.
+ * per-delivery lock, pid files, launch snapshot sweep, host-state ownership
+ * and released-agent identity use it. A gone pid is the caller's to classify
+ * (dead) before it gets here.
  *
  * "alive" — the tokens are equal.
- * "unverifiable" — the tokens come from different sources (`proc:` vs `ps:`),
- * or they are differing `ps:` tokens: `ps` text depended on the reader's
- * timezone and locale until cli#1045 pinned them, and a token written before
- * the pin, or by a process still running older code, may hold local-time
- * text, so a `ps:` mismatch cannot prove reuse.
- * "dead" — differing `proc:` tokens: /proc starttime is kernel-stable, so a
- * different value proves the pid was reused. Only that source proves reuse.
+ * "unverifiable" — anything else that differs: a differing `ps:` token, one
+ * from another source, or a token that is not a `proc:` token with a value (a
+ * bare `proc`, an empty `proc:`). `ps` text depended on the reader's timezone
+ * and locale until cli#1045 pinned them, and a token written before the pin,
+ * or by a process still running older code, may hold local-time text, so a
+ * `ps:` mismatch cannot prove reuse.
+ * "dead" — two differing `proc:` tokens with values: /proc starttime is
+ * kernel-stable, so a different value proves the pid was reused. Only these
+ * prove reuse.
  */
 export function classifyOwnerToken(liveToken: string, recordedToken: string): OwnerTokenState {
   if (liveToken === recordedToken) return "alive";
-  if (tokenSource(liveToken) !== tokenSource(recordedToken)) return "unverifiable";
-  return tokenSource(liveToken) === "proc" ? "dead" : "unverifiable";
+  return PROC_TOKEN.test(liveToken) && PROC_TOKEN.test(recordedToken) ? "dead" : "unverifiable";
 }
 
 function readOwner(lockDir: string): LockOwner | null {

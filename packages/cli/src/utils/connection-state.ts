@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { acquireMailLockSync, mailLockPath, pidState, processStartToken } from "@tpsdev-ai/agent";
+import { acquireMailLockSync, classifyOwnerToken, mailLockPath, pidState, processStartToken } from "@tpsdev-ai/agent";
 import { isPidRecordPid, isPidRecordStartToken } from "./pid-file.js";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
@@ -265,7 +265,7 @@ export interface HostStateReadHooks {
 
 /** What a refresh or claim did under the record lock. `unverifiable` means
  *  ownership is neither confirmed nor denied (a token that cannot be read, or
- *  another owner's liveness that cannot be decided); nothing is written. */
+ *  recorded and live tokens that cannot be compared); nothing is written. */
 export type HostStateRefreshOutcome =
   | { kind: "written" }
   | { kind: "stopped" }
@@ -315,14 +315,18 @@ export function claimHostStateAt(path: string, state: HostConnectionState, conne
   }, timeoutMs);
 }
 
-/** "same" for the same PID, and the same start token when one is present;
- *  "unverifiable" when the record carries a token this process cannot read. */
+/** "same" for the same PID and the same start token when one is present;
+ *  "other" for a different PID or a different `proc:` token (pid reuse);
+ *  "unverifiable" when the record carries a token this process cannot read or
+ *  cannot compare with its own (a differing `ps:` token, or tokens from
+ *  different sources). */
 function selfIdentity(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): "same" | "other" | "unverifiable" {
   if (state.pid !== process.pid) return "other";
   if (state.startToken === undefined || state.startToken === null) return "same";
   const ownToken = readStartToken(process.pid);
   if (ownToken === null) return "unverifiable";
-  return state.startToken === ownToken ? "same" : "other";
+  const verdict = classifyOwnerToken(ownToken, state.startToken);
+  return verdict === "alive" ? "same" : verdict === "dead" ? "other" : "unverifiable";
 }
 
 type HostRecordRead =
@@ -408,19 +412,12 @@ function hostRecordOwnership(path: string, branch: string, connectionId?: string
 
 type OwnerLiveness = "alive" | "gone" | "unknown";
 
-/** The source component of a birth token (`proc:` / `ps:`), or the whole string. */
-function tokenSource(token: string): string {
-  const i = token.indexOf(":");
-  return i === -1 ? token : token.slice(0, i);
-}
-
 /**
  * Whether the process that wrote a record is still the one running under its
- * pid. "gone": the pid is gone, or a live pid carries a different `proc:`
- * token (pid reuse). A changed `proc:` record token is indistinguishable from
- * pid reuse. A live `ps:` mismatch is unknown because a record written before
- * cli#1045 may hold local-time text. For a live pid, missing, unreadable or
- * different-source tokens are also unknown; unknown never licenses a write.
+ * pid: classifyOwnerToken's verdict for a live pid. "gone": the pid is gone,
+ * or a live pid carries a different `proc:` token (pid reuse). A live `ps:`
+ * mismatch, tokens from different sources, or a token that cannot be read are
+ * unknown; unknown never licenses a write.
  */
 function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
   const pid = pidState(state.pid);
@@ -434,9 +431,8 @@ function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number)
     return "unknown";
   }
   if (liveToken === null) return "unknown";
-  if (tokenSource(liveToken) !== tokenSource(state.startToken)) return "unknown";
-  if (liveToken === state.startToken) return "alive";
-  return tokenSource(liveToken) === "proc" ? "gone" : "unknown";
+  const verdict = classifyOwnerToken(liveToken, state.startToken);
+  return verdict === "alive" ? "alive" : verdict === "dead" ? "gone" : "unknown";
 }
 
 type HostRecordClaim =
@@ -486,7 +482,7 @@ export function clearHostStateAt(path: string, branch: string, connectionId?: st
       const reason = ownership.kind === "invalid"
         ? "is not a valid host state record"
         : ownership.kind === "unverifiable"
-          ? "this process's start token could not be read"
+          ? "this process's start token could not be read or compared"
           : ownership.reason;
       throw new Error(
         `Host state record ${path} is present but ${reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,

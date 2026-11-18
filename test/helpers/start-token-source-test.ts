@@ -16,6 +16,8 @@ export const PROC_START_TOKENS_PRELOAD = fileURLToPath(new URL("./start-token-pr
 
 /** `bun` arguments, before `--eval`/the script, that force the `ps` fallback in a bun child. */
 export const PS_START_TOKENS_BUN_ARGS: readonly string[] = ["--preload", PS_START_TOKENS_PRELOAD];
+/** `node` arguments, before the script, that force the `ps` fallback in a node child. */
+export const PS_START_TOKENS_NODE_ARGS: readonly string[] = ["--import", pathToFileURL(PS_START_TOKENS_PRELOAD).href];
 
 /** `node` arguments, before the script, that stage the same `proc:` tokens in a node child. */
 export const PROC_START_TOKENS_NODE_ARGS: readonly string[] = ["--import", pathToFileURL(PROC_START_TOKENS_PRELOAD).href];

@@ -1425,12 +1425,12 @@ function hostStateRefreshReporter(recordPath: string): (outcome: HostStateRefres
     if (reported === outcome.kind) return;
     reported = outcome.kind;
     const reason = outcome.kind === "unverifiable"
-      ? "this process's start token could not be read"
+      ? "this process's start token could not be read or compared"
       : outcome.kind === "invalid"
         ? "the record is not a valid host state record"
         : outcome.reason;
     const next = outcome.kind === "unverifiable"
-      ? "the record keeps its last state and refreshes resume when the token reads again"
+      ? "the record keeps its last state and refreshes resume when the token can be read and compared again"
       : outcome.kind === "invalid"
         ? "the record keeps its last state and refreshes resume when a valid record is present"
         : "the record keeps its last state and refreshes resume when it can be read again";
