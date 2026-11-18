@@ -1091,6 +1091,50 @@ describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", ()
     }
   }, 15_000);
 
+  it("reports an already-observed SIGTERM as not graceful and refuses the settled read", async () => {
+    // A SIGTERM that killed the child before stopGateway ran was not sent by
+    // this call, so it is not a graceful stop even though the signal is SIGTERM.
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sigterm-dead-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      // No SIGTERM handler: the default disposition ends the process on SIGTERM.
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+      stub.kill("SIGTERM");
+      await new Promise((resolve) => stub!.once("exit", resolve));
+      expect(stub.signalCode).toBe("SIGTERM");
+
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGTERM");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGTERM");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGTERM); settled state not read");
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
   it("reports an already-observed SIGKILL as not graceful and refuses the settled read", async () => {
     const node = process.env.TPS_LANE_NODE || "node";
     const root = mkdtempSync(join(tmpdir(), "tps-dead-gateway-"));
