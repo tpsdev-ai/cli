@@ -131,6 +131,15 @@ describe("patchMailFile", () => {
     expect(realFs.existsSync(path)).toBe(false);
   });
 
+  test("reports a dangling record symlink as a write failure, not a missing record", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
+    const absent = join(mailbox, "absent.json");
+    realFs.symlinkSync(absent, path);
+    expect(patchMailFile(path, { read: true }, undefined, "inbound", mailbox)).toEqual({ ok: false, reason: "write-failed", path, code: undefined });
+    expect(realFs.readlinkSync(path)).toBe(absent);
+    expect(realFs.existsSync(absent)).toBe(false);
+  });
+
   test("reports a record removed after the read without recreating it", () => {
     realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));

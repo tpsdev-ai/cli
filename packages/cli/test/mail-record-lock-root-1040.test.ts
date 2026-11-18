@@ -301,11 +301,11 @@ test.skipIf(caseSensitive)("an alias spelled with different letter case is not r
   // production runtime, whose realpathSync keeps the given letter case.
   const distMail = freshDistMail(import.meta.url);
   const script = [
-    `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
-    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }), { mailboxRoot: ${JSON.stringify(mailbox)} });`,
+    `const { updateExistingRecord } = await import(process.argv[1]);`,
+    `const outcome = updateExistingRecord(process.argv[2], (record) => ({ ...record, read: true }), { mailboxRoot: process.argv[3] });`,
     `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
   ].join("\n");
-  const run = spawnSync("node", ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 30_000 });
+  const run = spawnSync("node", ["--input-type=module", "--eval", script, pathToFileURL(distMail).href, aliasedPath, mailbox], { encoding: "utf8", timeout: 30_000 });
   expect(run.status, `node refused the alias update: ${run.stderr}${run.stdout}`).toBe(0);
 });
 
@@ -435,6 +435,56 @@ test("a record path that is a symlink into another mailbox is refused without re
   const afterStat = fs.lstatSync(realRecord);
   expect(afterStat.ino).toBe(beforeStat.ino);
   expect(fs.readdirSync(inboxB.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("a record path that is a dangling symlink is refused as a file type error", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const absent = join(root, "absent.json");
+  fs.symlinkSync(absent, target);
+
+  const mutations: string[] = [];
+  expect(() =>
+    updateExistingRecord(target, (record: { read: boolean }) => {
+      mutations.push("mutated");
+      return { ...record, read: true };
+    }, { mailboxRoot: inbox.root }),
+  ).toThrow(MailRecordFileTypeError);
+
+  expect(mutations).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(absent);
+});
+
+test("a record symlink whose target cannot be resolved is refused as a file type error", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const loopA = join(root, "loop-a.json");
+  const loopB = join(root, "loop-b.json");
+  fs.symlinkSync(loopB, loopA);
+  fs.symlinkSync(loopA, loopB);
+  fs.writeFileSync(join(root, "plain"), "not a directory");
+
+  for (const linkTarget of [loopA, join(root, "plain", "child.json")]) {
+    try {
+      fs.unlinkSync(target);
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+    fs.symlinkSync(linkTarget, target);
+    expect(() => updateExistingRecord(target, () => ({ read: true }), { mailboxRoot: inbox.root })).toThrow(MailRecordFileTypeError);
+    expect(fs.readlinkSync(target)).toBe(linkTarget);
+  }
+});
+
+test("an absent record still reports gone", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+
+  const outcome = updateExistingRecord(target, () => {
+    throw new Error("an absent record must not be mutated");
+  }, { mailboxRoot: inbox.root });
+
+  expect(outcome).toEqual({ status: "gone" });
 });
 
 test("the node rerun refuses a build that is missing or older than the source", () => {

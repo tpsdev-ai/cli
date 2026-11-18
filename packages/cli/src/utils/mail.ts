@@ -566,7 +566,6 @@ export function updateExistingRecord<T extends object>(
       throw new MailRecordLayoutError(path, realRecordDir, realRoot);
     }
     removeLeftoverAckScratch(root, recordDir);
-    statSync(path);
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
     if (options.reserveRelayMove) {
@@ -583,13 +582,12 @@ export function updateExistingRecord<T extends object>(
     }
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
-    statSync(path);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     fd = openSync(scratchPath, "wx", 0o600);
     writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    statSync(path);
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     renameSync(scratchPath, path);
     replaced = true;

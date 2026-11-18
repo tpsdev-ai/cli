@@ -231,7 +231,7 @@ test("the persisted sent marker is absent until adapter send succeeds", async ()
   expect(duringSend!.bridgeSentAt).toBeUndefined();
 });
 
-for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "statSync"] as const) {
+for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "lstatSync"] as const) {
   test(`an ack ${operation} failure leaves the original sent record intact`, () => {
     const target = path("cur");
     const original = JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" });
@@ -240,7 +240,7 @@ for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "st
     let injected = false;
     const fault = spyOn(fs, operation).mockImplementation(((...args: any[]) => {
       const ackOperation = operation === "fsyncSync" || operation === "closeSync"
-        || (operation === "statSync" ? args[0] === target : String(args[0]).includes(".ack-"));
+        || (operation === "lstatSync" ? args[0] === target : String(args[0]).includes(".ack-"));
       if (ackOperation && !injected) {
         injected = true;
         throw new Error(`${operation} fault`);
@@ -259,16 +259,16 @@ for (const operation of ["openSync", "fsyncSync", "closeSync", "renameSync", "st
 test("ack holds the shared mail lock while checking for the existing record", () => {
   const target = path("cur");
   fs.writeFileSync(target, JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" }));
-  const stat = fs.statSync;
+  const lstat = fs.lstatSync;
   let checked = false;
-  faults.push(spyOn(fs, "statSync").mockImplementation(((...args: Parameters<typeof stat>) => {
+  faults.push(spyOn(fs, "lstatSync").mockImplementation(((...args: Parameters<typeof lstat>) => {
     if (args[0] === target) {
       checked = true;
       expect(fs.existsSync(path(".mail-lock", "owner.json"))).toBe(true);
       fs.unlinkSync(target);
     }
-    return stat(...args);
-  }) as typeof stat));
+    return lstat(...args);
+  }) as typeof lstat));
   expect(() => mail.ackMessageAtPath(target, join(root, BRIDGE))).toThrow();
   expect(checked).toBe(true);
   expect(fs.existsSync(target)).toBe(false);
@@ -305,9 +305,9 @@ test("concurrent acknowledgements never recreate the removed cur record", async 
           signal("second-contended");
         return result;
       });
-      const stat = fs.statSync;
-      spyOn(fs, "statSync").mockImplementation((...args) => {
-        const result = stat(...args);
+      const lstat = fs.lstatSync;
+      spyOn(fs, "lstatSync").mockImplementation((...args) => {
+        const result = lstat(...args);
         if (args[0] === target) { signal("second-checked"); wait("release-second"); }
         return result;
       });

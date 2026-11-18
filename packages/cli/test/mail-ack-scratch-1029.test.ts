@@ -358,12 +358,12 @@ test.skipIf(caseSensitive)("the sweep recognises a different-case alias of the m
   const distMail = freshDistMail(import.meta.url);
   const script = [
     `import * as fs from "node:fs";`,
-    `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
-    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }), { mailboxRoot: ${JSON.stringify(inbox.root)} });`,
+    `const { updateExistingRecord } = await import(process.argv[1]);`,
+    `const outcome = updateExistingRecord(process.argv[2], (record) => ({ ...record, read: true }), { mailboxRoot: process.argv[3] });`,
     `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
-    `if (fs.existsSync(${JSON.stringify(aged)})) { console.error("aged scratch remains"); process.exit(3); }`,
+    `if (fs.existsSync(process.argv[4])) { console.error("aged scratch remains"); process.exit(3); }`,
   ].join("\n");
-  const run = spawnSync("node", ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 30_000 });
+  const run = spawnSync("node", ["--input-type=module", "--eval", script, pathToFileURL(distMail).href, aliasedPath, inbox.root, aged], { encoding: "utf8", timeout: 30_000 });
   expect(run.status, `node did not clean the alias sweep: ${run.stderr}${run.stdout}`).toBe(0);
   expect(fs.existsSync(aged)).toBe(false);
   expect(JSON.parse(fs.readFileSync(recordPath, "utf8")).read).toBe(true);
