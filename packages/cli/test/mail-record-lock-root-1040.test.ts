@@ -219,6 +219,35 @@ test("an alias update is refused while the owning mailbox's lock is held", () =>
   expect(outcome.status).toBe("updated");
 });
 
+test("the record-directory check runs while the alias mailbox's lock is held", () => {
+  const { source, targetB, mailboxB } = symlinkedLayout();
+  plantRecord(targetB, "record-id");
+  const aliasRecordDir = join(mailboxB, "cur");
+  const lockDir = mailLockPath(mailboxB);
+  const observed: { ownerPid: unknown }[] = [];
+  const realpath = fs.realpathSync;
+  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
+    if (String(args[0]) === aliasRecordDir) {
+      // The lock's own owner record is read at the instant the check resolves
+      // the record directory: it is absent while the root lock is not held.
+      let ownerPid: unknown = null;
+      try {
+        ownerPid = (JSON.parse(fs.readFileSync(join(lockDir, "owner.json"), "utf-8")) as { pid?: unknown }).pid;
+      } catch {
+        ownerPid = null;
+      }
+      observed.push({ ownerPid });
+    }
+    return realpath(...args);
+  }) as typeof realpath);
+
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+
+  expect(err.recordDir).toBe(fs.realpathSync(source));
+  expect(observed).toHaveLength(1);
+  expect(observed[0].ownerPid).toBe(process.pid);
+});
+
 test.skipIf(caseSensitive)("an alias spelled with different letter case is not refused", () => {
   // Same mailbox, same physical record: the alias resolves to the same cur/
   // through a spelling whose letters are all flipped.
