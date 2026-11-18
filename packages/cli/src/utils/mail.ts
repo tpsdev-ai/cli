@@ -362,11 +362,9 @@ export class MailRecordFileTypeError extends Error {
 
 /**
  * An update locks the mailbox root the caller names, so the record must sit
- * directly in that root's `new/`, `cur/` or `dlq/` directory. Before this
- * change, a record placed directly in a mailbox root was updated under the
- * parent's lock; the prior check already refused that for an ordinarily named
- * mailbox, and the parent-lock update happened for a mailbox whose own name is
- * an accepted record-directory name (such as `cur`).
+ * directly in that root's `new/`, `cur/` or `dlq/` directory. Deriving the lock
+ * root from the path would update a record directly in a mailbox root under
+ * the parent's lock.
  */
 export class MailRecordLayoutError extends Error {
   constructor(
