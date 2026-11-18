@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type BigIntStats } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -332,11 +332,10 @@ export function sameDirectory(a: string, b: string, stat: (path: string) => BigI
 }
 
 /**
- * An update takes the mailbox lock derived from the record path, so the record
- * must really live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory
- * symlinked to another mailbox would otherwise let a lock holder write a
- * mailbox it does not lock, and two lock holders could update one physical
- * record.
+ * An update locks the mailbox root its caller names, so the record must really
+ * live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory symlinked to
+ * another mailbox would otherwise let a lock holder write a mailbox it does
+ * not lock, and two lock holders could update one physical record.
  */
 export class MailRecordLockRootError extends Error {
   constructor(
@@ -363,9 +362,11 @@ export class MailRecordFileTypeError extends Error {
 
 /**
  * An update locks the mailbox root the caller names, so the record must sit
- * directly in that root's `new/`, `cur/` or `dlq/` directory. A record placed
- * directly in a mailbox root would otherwise be updated under its parent's
- * lock.
+ * directly in that root's `new/`, `cur/` or `dlq/` directory. Before this
+ * change, a record placed directly in a mailbox root was updated under the
+ * parent's lock; the prior check already refused that for an ordinarily named
+ * mailbox, and the parent-lock update happened for a mailbox whose own name is
+ * an accepted record-directory name (such as `cur`).
  */
 export class MailRecordLayoutError extends Error {
   constructor(
@@ -410,6 +411,8 @@ const SWEEP_INTERVAL = 10 * 60 * 1000;
 const ACK_SCRATCH_MIN_AGE_MS = 60 * 1000;
 const lastAckScratchSweep = new Map<string, number>();
 export const mailAckScratchTestHooks: { now?: () => number; stat?: (path: string) => BigIntStats } = {};
+/** Test-only pause points around the record open and the final pre-rename check. */
+export const mailRecordFileTestHooks: { beforeOpen?: (path: string) => void; beforeRename?: (path: string) => void } = {};
 
 /**
  * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
@@ -567,7 +570,24 @@ export function updateExistingRecord<T extends object>(
     }
     removeLeftoverAckScratch(root, recordDir);
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
-    const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
+    mailRecordFileTestHooks.beforeOpen?.(path);
+    // Open without following a symlink and read through that descriptor: a
+    // record swapped for a symlink after the check above must not be read.
+    let recordFd: number;
+    try {
+      recordFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { status: "gone" };
+      if (err?.code === "ELOOP" || err?.code === "EMLINK") throw new MailRecordFileTypeError(path);
+      throw err;
+    }
+    let fresh: T;
+    try {
+      if (!fstatSync(recordFd).isFile()) throw new MailRecordFileTypeError(path);
+      fresh = JSON.parse(readFileSync(recordFd, "utf-8")) as T;
+    } finally {
+      closeSync(recordFd);
+    }
     if (options.reserveRelayMove) {
       relayLock = tryAcquireRelayMoveLock(fresh);
       if (!relayLock) {
@@ -588,6 +608,7 @@ export function updateExistingRecord<T extends object>(
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
+    mailRecordFileTestHooks.beforeRename?.(path);
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     renameSync(scratchPath, path);
     replaced = true;

@@ -183,7 +183,17 @@ test("acknowledgement does not recreate a file removed after its read", () => {
   const read = fs.readFileSync;
   faults.push(spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
     const data = read(...args);
-    if (args[0] === target) fs.unlinkSync(target);
+    // The update reads the record through its descriptor: match that read by
+    // file identity, not by path.
+    let recordRead = args[0] === target;
+    if (!recordRead && typeof args[0] === "number") {
+      try {
+        recordRead = fs.fstatSync(args[0]).ino === fs.lstatSync(target).ino;
+      } catch {
+        recordRead = false;
+      }
+    }
+    if (recordRead) fs.unlinkSync(target);
     return data;
   }));
   expect(() => mail.ackMessageAtPath(target, join(root, BRIDGE))).toThrow();

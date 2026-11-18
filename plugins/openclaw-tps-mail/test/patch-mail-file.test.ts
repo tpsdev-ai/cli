@@ -31,9 +31,20 @@ mock.module("node:fs", () => ({
     return (realFs.openSync as any)(...args);
   },
   readFileSync: (...args: any[]) => {
-    if (args[0] === readFailure && --readsUntilFailure <= 0) throw Object.assign(new Error("injected read failure"), { code: "EACCES" });
+    // A record update reads through an open descriptor, so map an fd read
+    // back to the tracked path it belongs to by file identity.
+    let target = args[0];
+    if (typeof target === "number") {
+      for (const candidate of [removeAfterRead, readFailure, stampOnRead?.path]) {
+        if (candidate === undefined) continue;
+        try {
+          if (realFs.fstatSync(target).ino === realFs.lstatSync(candidate).ino) { target = candidate; break; }
+        } catch {}
+      }
+    }
+    if (target === readFailure && --readsUntilFailure <= 0) throw Object.assign(new Error("injected read failure"), { code: "EACCES" });
     const result = (realFs.readFileSync as any)(...args);
-    if (stampOnRead?.path === args[0] && --stampOnRead.count === 0) {
+    if (stampOnRead?.path === target && --stampOnRead.count === 0) {
       const record = JSON.parse(String(result));
       if (replaceIdentity) record.id = "replacement";
       record.ackedAt = "concurrent-ack";
@@ -41,7 +52,7 @@ mock.module("node:fs", () => ({
       realFs.writeFileSync(stampOnRead.path, JSON.stringify(record));
       stampOnRead = undefined;
     }
-    if (args[0] === removeAfterRead && --readsBeforeRemoval === 0) {
+    if (target === removeAfterRead && --readsBeforeRemoval === 0) {
       realFs.unlinkSync(removeAfterRead!);
       removeAfterRead = undefined;
     }
