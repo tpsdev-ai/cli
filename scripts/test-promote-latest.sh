@@ -279,9 +279,9 @@ for (const line of lines) {
 process.stdout.write(String(count));
 COUNT_SIGNALLED
 
-# Names the field a log line was meant to be, so a producer rename reads as a
-# format change in AL and AX instead of only a parser error. Prints nothing on a
-# well-formed log.
+# Reports the first log line matching none of the known shapes (start <ms>, end <ms>,
+# INT, TERM, HUP, KILL), so a producer rename reads as a format change in AL and AX
+# instead of only a parser error. Prints nothing on a well-formed log.
 supervisor_format="$work/supervisor-format.mjs"
 cat >"$supervisor_format" <<'SUPERVISOR_FORMAT'
 import fs from 'node:fs';
@@ -2417,7 +2417,7 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10b/npm-supe
   elif node -e 'process.exit(Number(process.argv[1]) >= 8 ? 0 : 1)' "$per_call"; then
     ok "M10b mutation (b): sleep counting caught" "the signalled call ran ${per_call}s, past AL's 8 s upper bound"
   else
-    bad "M10b mutation (b): sleep counting caught" "the signalled call ran ${per_call}s — inside AL's 2.5..8 s bound, so AL would pass this mutant"
+    bad "M10b mutation (b): sleep counting caught" "the signalled call ran ${per_call}s — under AL's 8 s upper bound, so that bound would not catch this mutant"
   fi
   TOOL=""
 else
