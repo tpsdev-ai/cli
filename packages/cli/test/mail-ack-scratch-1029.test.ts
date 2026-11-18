@@ -1,9 +1,12 @@
+import { createPatchShared } from "./helpers/patch-shared.js";
+const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import * as mail from "../src/utils/mail.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 
@@ -34,6 +37,47 @@ function scratchName(): string {
 
 function plantRecord(path: string, id: string): void {
   fs.writeFileSync(path, JSON.stringify({ id, body: "hello", read: false }));
+}
+
+function swapCase(segment: string): string {
+  return segment.replace(/[a-zA-Z]/g, (letter) => (letter === letter.toLowerCase() ? letter.toUpperCase() : letter.toLowerCase()));
+}
+
+/** True when the filesystem treats a different-case spelling as a different path. */
+function caseSensitiveFs(): boolean {
+  const probe = fs.mkdtempSync(join(tmpdir(), "ack-scratch-probe-"));
+  try {
+    try {
+      return fs.statSync(join(dirname(probe), swapCase(basename(probe)))).ino !== fs.statSync(probe).ino;
+    } catch {
+      return true;
+    }
+  } finally {
+    fs.rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+const caseSensitive = caseSensitiveFs();
+if (caseSensitive) {
+  console.warn("[mail] different-letter-case alias sweep test skipped: this filesystem is case-sensitive, so the alternate spelling does not resolve");
+}
+
+/**
+ * The node case imports the built module. Without a rebuild, a source mutation
+ * is tested against stale bytes, so refuse to run it when dist is missing or
+ * predates the source it was built from.
+ */
+function freshDistMail(): string {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const sourceMail = join(testDir, "..", "src", "utils", "mail.ts");
+  const distMail = join(testDir, "..", "dist", "src", "utils", "mail.js");
+  if (!fs.existsSync(distMail)) {
+    throw new Error(`node rerun needs a build: ${distMail} is missing; run bun run build in packages/cli`);
+  }
+  if (fs.statSync(distMail).mtimeMs < fs.statSync(sourceMail).mtimeMs) {
+    throw new Error(`node rerun would test stale code: ${distMail} is older than ${sourceMail}; rebuild with bun run build`);
+  }
+  return distMail;
 }
 
 function makeOld(path: string, ageMs = DAY_MS): void {
@@ -168,9 +212,17 @@ test("the sweep refuses a directory that resolves to the locked root itself, inc
 
   // dirname("/") === "/", so a directory and root that both resolve to "/" must not pass the direct-child guard.
   const realpath = fs.realpathSync;
-  const guarded = new Set([resolve(inbox.root), resolve(inbox.cur)]);
-  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) =>
-    guarded.has(resolve(String(args[0]))) ? "/" : realpath(...args)) as typeof realpath);
+  // Only the sweep's resolutions are redirected: the update guard and the
+  // layout check see the real directories, and the sweep sees both the root
+  // and the directory resolving to the filesystem root.
+  let rootResolutions = 0;
+  let curResolutions = 0;
+  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
+    const path = resolve(String(args[0]));
+    if (path === resolve(inbox.root) && ++rootResolutions === 2) return "/";
+    if (path === resolve(inbox.cur) && ++curResolutions === 3) return "/";
+    return realpath(...args);
+  }) as typeof realpath);
 
   const { lines } = collectWarnings();
   expect(mail.ackMessageAtPath(target).read).toBe(true);
@@ -217,4 +269,72 @@ test("a bare relative record update contends for the root lock before sweeping",
   } finally {
     process.chdir(cwd);
   }
+});
+
+test("a refused sweep does not postpone the next sweep", () => {
+  const cur = mail.getInbox("mailbox-a").cur;
+  const target = join(cur, "record.json");
+  plantRecord(target, "record-id");
+  const aged = join(cur, scratchName());
+  fs.writeFileSync(aged, "{ partial");
+  makeOld(aged);
+
+  const now = Date.now();
+  const restoreClock = patchShared(mail.mailAckScratchTestHooks, "now", () => now);
+
+  const realpath = fs.realpathSync;
+  let curResolutions = 0;
+  let refused = false;
+  spyOn(fs, "realpathSync").mockImplementation(((...args: Parameters<typeof realpath>) => {
+    if (resolve(String(args[0])) === resolve(cur)) {
+      curResolutions++;
+      // The first resolution is the update guard's, the second the layout
+      // check's, and the third the sweep's listing.
+      if (curResolutions === 3) {
+        refused = true;
+        return "/";
+      }
+    }
+    return realpath(...args);
+  }) as typeof realpath);
+
+  const { lines } = collectWarnings();
+  try {
+    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true })).status).toBe("updated");
+    expect(refused).toBe(true);
+    expect(fs.existsSync(aged)).toBe(true);
+
+    expect(mail.updateExistingRecord(target, (record) => ({ ...record, read: true })).status).toBe("updated");
+  } finally {
+    restoreClock();
+  }
+
+  expect(fs.existsSync(aged)).toBe(false);
+  expect(lines.filter((line) => line.includes("left ack scratch in") && line.includes(cur))).toHaveLength(1);
+  expect(lines.filter((line) => line.includes("removed leftover ack scratch") && line.includes(aged))).toHaveLength(1);
+});
+
+test.skipIf(caseSensitive)("the sweep recognises a different-case alias of the mailbox under node", () => {
+  const inbox = mail.getInbox("mailbox-case");
+  const altRoot = join(dirname(inbox.root), swapCase(basename(inbox.root)));
+  fs.symlinkSync(join(altRoot, "cur"), join(inbox.root, "cur-alias"), "dir");
+  const recordPath = join(inbox.cur, "record.json");
+  const aliasedPath = join(inbox.root, "cur-alias", "record.json");
+  plantRecord(recordPath, "record-id");
+  const aged = join(inbox.cur, scratchName());
+  fs.writeFileSync(aged, "{ partial");
+  makeOld(aged);
+
+  const distMail = freshDistMail();
+  const script = [
+    `import * as fs from "node:fs";`,
+    `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
+    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }));`,
+    `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
+    `if (fs.existsSync(${JSON.stringify(aged)})) { console.error("aged scratch remains"); process.exit(3); }`,
+  ].join("\n");
+  const run = spawnSync("node", ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 30_000 });
+  expect(run.status, `node did not clean the alias sweep: ${run.stderr}${run.stdout}`).toBe(0);
+  expect(fs.existsSync(aged)).toBe(false);
+  expect(JSON.parse(fs.readFileSync(recordPath, "utf8")).read).toBe(true);
 });

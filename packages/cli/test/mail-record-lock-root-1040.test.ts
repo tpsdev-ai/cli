@@ -5,6 +5,8 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import {
+  MailRecordFileTypeError,
+  MailRecordLayoutError,
   MailRecordLockRootError,
   getInbox,
   sameDirectory,
@@ -56,6 +58,24 @@ function caseSensitiveFs(): boolean {
 const caseSensitive = caseSensitiveFs();
 if (caseSensitive) {
   console.warn("[mail] different-letter-case alias test skipped: this filesystem is case-sensitive, so the alternate spelling does not resolve");
+}
+
+/**
+ * The node cases import the built module. Without a rebuild, a source mutation
+ * is tested against stale bytes, so refuse to run those cases when dist is
+ * missing or predates the source it was built from.
+ */
+function freshDistMail(): string {
+  const testDir = dirname(fileURLToPath(import.meta.url));
+  const sourceMail = join(testDir, "..", "src", "utils", "mail.ts");
+  const distMail = join(testDir, "..", "dist", "src", "utils", "mail.js");
+  if (!fs.existsSync(distMail)) {
+    throw new Error(`node rerun needs a build: ${distMail} is missing; run bun run build in packages/cli`);
+  }
+  if (fs.statSync(distMail).mtimeMs < fs.statSync(sourceMail).mtimeMs) {
+    throw new Error(`node rerun would test stale code: ${distMail} is older than ${sourceMail}; rebuild with bun run build`);
+  }
+  return distMail;
 }
 
 function symlinkedLayout(subdir: "cur" | "new" | "dlq" = "cur"): { inboxA: ReturnType<typeof getInbox>; mailboxB: string; source: string; targetA: string; targetB: string } {
@@ -295,7 +315,7 @@ test.skipIf(caseSensitive)("an alias spelled with different letter case is not r
 
   // A second update runs through the BUILT module under node, the plugin's
   // production runtime, whose realpathSync keeps the given letter case.
-  const distMail = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "src", "utils", "mail.js");
+  const distMail = freshDistMail();
   const script = [
     `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
     `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }));`,
@@ -314,4 +334,61 @@ test("a normal non-symlinked update still succeeds", () => {
 
   expect(outcome.status).toBe("updated");
   expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
+});
+
+test("an update through a symlink to the whole mailbox succeeds", () => {
+  const inbox = getInbox("mailbox-a");
+  const mailboxLink = join(root, "mailbox-link");
+  fs.symlinkSync(inbox.root, mailboxLink, "dir");
+  const target = join(mailboxLink, "cur", "record.json");
+  plantRecord(target, "record-id");
+
+  const outcome = updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }));
+
+  expect(outcome.status).toBe("updated");
+  expect(JSON.parse(fs.readFileSync(join(inbox.cur, "record.json"), "utf8")).read).toBe(true);
+});
+
+test("a record directly in a mailbox root is refused and leaves the record unchanged", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.root, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(target, "utf8");
+
+  expect(() => updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }))).toThrow(MailRecordLayoutError);
+
+  expect(fs.readFileSync(target, "utf8")).toBe(before);
+});
+
+test("a record path that is a symlink into another mailbox is refused without reading or replacing the target", () => {
+  const inboxA = getInbox("mailbox-a");
+  const inboxB = getInbox("mailbox-b");
+  const realRecord = join(inboxA.cur, "record.json");
+  plantRecord(realRecord, "record-id");
+  const recordLink = join(inboxB.cur, "link.json");
+  fs.symlinkSync(realRecord, recordLink);
+  const beforeBytes = fs.readFileSync(realRecord, "utf8");
+  const beforeStat = fs.lstatSync(realRecord);
+
+  const reads: string[] = [];
+  const renames: string[] = [];
+  const realRead = fs.readFileSync;
+  const realRename = fs.renameSync;
+  spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path) === realRecord) reads.push(String(path));
+    return (realRead as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.readFileSync);
+  spyOn(fs, "renameSync").mockImplementation(((from: unknown, to: unknown) => {
+    renames.push(`${String(from)} -> ${String(to)}`);
+    return (realRename as (...args: unknown[]) => unknown)(from, to);
+  }) as typeof fs.renameSync);
+
+  expect(() => updateExistingRecord(recordLink, () => ({ read: true }))).toThrow(MailRecordFileTypeError);
+
+  expect(reads).toEqual([]);
+  expect(renames.filter((entry) => entry.includes(".ack-") || entry.endsWith(recordLink))).toEqual([]);
+  expect(fs.readFileSync(realRecord, "utf8")).toBe(beforeBytes);
+  const afterStat = fs.lstatSync(realRecord);
+  expect(afterStat.ino).toBe(beforeStat.ino);
+  expect(fs.readdirSync(inboxB.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
 });

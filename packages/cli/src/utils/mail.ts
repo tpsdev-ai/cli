@@ -349,6 +349,56 @@ export class MailRecordLockRootError extends Error {
   }
 }
 
+/**
+ * `updateExistingRecord` requires the record itself to be a regular file, not
+ * a symlink or another kind of entry, so the guard covers the record file as
+ * well as its directory.
+ */
+export class MailRecordFileTypeError extends Error {
+  constructor(readonly recordPath: string) {
+    super(`refusing to update mail record ${recordPath}: it is not a regular file`);
+    this.name = "MailRecordFileTypeError";
+  }
+}
+
+/**
+ * The lock root is derived from the record path as its grandparent directory,
+ * so the record must sit directly in a `new/`, `cur/` or `dlq/` directory of
+ * the mailbox. A record placed directly in a mailbox root would otherwise be
+ * updated under its parent's lock.
+ */
+export class MailRecordLayoutError extends Error {
+  constructor(
+    readonly recordPath: string,
+    readonly recordDir: string,
+    readonly lockRoot: string,
+  ) {
+    super(`refusing to update mail record ${recordPath}: ${recordDir} is not a new/, cur/ or dlq/ directory directly under the locked mailbox root ${lockRoot}`);
+    this.name = "MailRecordLayoutError";
+  }
+}
+
+/** The directories that hold records `updateExistingRecord` may replace. */
+const RECORD_DIR_NAMES = ["new", "cur", "dlq"] as const;
+
+/**
+ * Whether `recordDir` is the same directory (device and inode) as one of
+ * `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
+ * spelled through a symlink or a different letter case valid.
+ */
+function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
+  for (const name of RECORD_DIR_NAMES) {
+    let candidate: string;
+    try {
+      candidate = realpathSync(join(root, name));
+    } catch {
+      continue;
+    }
+    if (sameDirectory(recordDir, candidate)) return true;
+  }
+  return false;
+}
+
 /** The exact name updateExistingRecord writes beside a record it replaces. */
 const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
 
@@ -367,19 +417,23 @@ export const mailAckScratchTestHooks: { now?: () => number } = {};
  * is reported and leaves the scratch behind. The sweep considers names
  * of that exact shape and removes regular files at least ACK_SCRATCH_MIN_AGE_MS old.
  *
- * Before listing, check that the directory's real path is a direct child of
+ * Before listing, check by directory identity (device and inode) that the
+ * directory is not the locked root itself and that its parent directory is
  * the locked root: a cur/ symlink can share another mailbox's scratch
  * without sharing its lock.
  * A directory replaced or retargeted during the sweep is not detected.
  *
  * After a successful listing, wait ten minutes before sweeping the directory
  * again, so a bulk drain avoids repeated listings. Collecting eligible scratch
- * on a later pass is enough. A failed listing records no sweep time, so the
- * next ack retries it.
+ * on a later pass is enough. A refusal or a failed listing records no sweep
+ * time, so the next ack retries it.
  */
 function removeLeftoverAckScratch(root: string, dir: string): void {
   dir = resolve(dir);
   const now = (mailAckScratchTestHooks.now ?? Date.now)();
+  // The key is the lexical path on purpose: two spellings of one directory get
+  // separate windows, so an alias can cost an extra listing; each listing
+  // re-checks its root.
   const lastSweep = lastAckScratchSweep.get(dir);
   if (lastSweep !== undefined && now - lastSweep < SWEEP_INTERVAL) return;
   let guardedRoot: string;
@@ -391,8 +445,14 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
     console.warn(`[mail] could not resolve ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
     return;
   }
-  if (listedDir === guardedRoot || dirname(listedDir) !== guardedRoot) {
-    lastAckScratchSweep.set(dir, now);
+  let inLockedMailbox: boolean;
+  try {
+    inLockedMailbox = !sameDirectory(listedDir, guardedRoot) && sameDirectory(dirname(listedDir), guardedRoot);
+  } catch (err: any) {
+    console.warn(`[mail] could not compare ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
+    return;
+  }
+  if (!inLockedMailbox) {
     console.warn(`[mail] left ack scratch in ${dir}: not a directory in the mailbox this lock guards`);
     return;
   }
@@ -433,6 +493,13 @@ function removeLeftoverAckScratch(root: string, dir: string): void {
   }
 }
 
+/**
+ * Replace an existing record under the mailbox lock.
+ *
+ * The record must be a regular file directly inside the mailbox's `new/`,
+ * `cur/` or `dlq/` directory: the lock root is derived as
+ * `dirname(dirname(path))`, which is the mailbox root for that layout.
+ */
 export function updateExistingRecord<T extends object>(
   path: string,
   mutate: (record: T) => T | null,
@@ -484,8 +551,12 @@ export function updateExistingRecord<T extends object>(
     if (!sameDirectory(dirname(realRecordDir), realRoot)) {
       throw new MailRecordLockRootError(path, realRecordDir, realRoot);
     }
+    if (!isMaildirRecordDirectory(realRecordDir, realRoot)) {
+      throw new MailRecordLayoutError(path, realRecordDir, realRoot);
+    }
     removeLeftoverAckScratch(root, recordDir);
     statSync(path);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
     if (options.reserveRelayMove) {
       relayLock = tryAcquireRelayMoveLock(fresh);
@@ -508,6 +579,7 @@ export function updateExistingRecord<T extends object>(
     closeSync(fd);
     fd = undefined;
     statSync(path);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     renameSync(scratchPath, path);
     replaced = true;
     options.afterWrite?.(updated);

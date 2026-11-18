@@ -1,0 +1,1 @@
+- **Mail record updates now require a `new/`, `cur/` or `dlq/` record path and a regular record file.** An update refuses a record placed directly in a mailbox root, and a record path that is a symlink. The ack-scratch sweep compares directory identity (device and inode); a refused sweep records no sweep time, so the next ack retries it.

@@ -53,7 +53,8 @@ const { acquireMailLockSync, mailLockPath, mailboxReplayStore } = await import("
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
 const { sweepTerminalObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
-const path = join(root, "record.json");
+const mailbox = join(root, "anvil");
+const path = join(mailbox, "cur", "record.json");
 
 afterEach(() => {
   removeAfterRead = undefined;
@@ -119,6 +120,7 @@ describe("patchMailFile", () => {
   }
 
   test("patches an existing record", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
     expect(patchMailFile(path, { read: true }, undefined, "inbound")).toEqual({ ok: true });
     expect(JSON.parse(realFs.readFileSync(path, "utf-8"))).toEqual({ id: "inbound", body: "hello", read: true });
@@ -130,6 +132,7 @@ describe("patchMailFile", () => {
   });
 
   test("reports a record removed after the read without recreating it", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
     removeAfterRead = path;
     expect(patchMailFile(path, { ackedAt: "receipt", read: true }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "record-missing" });
