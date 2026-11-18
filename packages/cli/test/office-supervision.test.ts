@@ -5,8 +5,9 @@
  * and K&S regression coverage for findings 1–5.
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { describe, test, expect, beforeEach, afterEach, mock, spyOn } from "bun:test";
+import * as childProcess from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import {
@@ -42,6 +43,10 @@ beforeEach(() => {
 
 afterEach(() => {
   rmSync(TMP_HOME, { recursive: true, force: true });
+});
+
+afterEach(() => {
+  mock.restore();
 });
 
 // ---------------------------------------------------------------------------
@@ -474,11 +479,44 @@ describe("validateSshReachable", () => {
   });
 
   test("reports full ssh command in error for debugging", () => {
+    // cli#1036: a real `ssh` to an unknown host waits on this host's resolver,
+    // for as long as the host takes: macOS looks a `.local` name up by multicast
+    // DNS (getaddrinfo measured 35 s on a darwin dev host, past bun's 5 s test
+    // limit), Linux runners fail it at once. The case is about the error message,
+    // so a stand-in `ssh` fails the way an unresolvable host does: no resolver,
+    // no network, no ~/.ssh/config. It records its argv, so the case also proves
+    // the stand-in is what ran.
+    //
+    // The seam is the module's spawnSync, not PATH: bun 1.3.10 (the CI pin)
+    // does not use a PATH set on process.env at runtime to find a command
+    // spawned by name (bun 1.4 does), so a stand-in first on that PATH never
+    // ran on CI. The spy runs the stand-in by its absolute path, with the args
+    // and options validateSshReachable passed, for a call whose command is
+    // "ssh"; every other call goes to the real spawnSync.
+    const fakeBin = join(TMP_HOME, "fake-bin");
+    const fakeSsh = join(fakeBin, "ssh");
+    const argvLog = join(fakeBin, "argv");
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(
+      fakeSsh,
+      `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(argvLog)}\n` +
+        `echo "ssh: Could not resolve hostname $2: stand-in for an unresolvable host" >&2\nexit 255\n`
+    );
+    chmodSync(fakeSsh, 0o755);
+    const realSpawnSync = childProcess.spawnSync;
+    const spawnSpy = spyOn(childProcess, "spawnSync").mockImplementation(((command: string, ...rest: unknown[]) =>
+      (realSpawnSync as (...args: unknown[]) => unknown)(command === "ssh" ? fakeSsh : command, ...rest)
+    ) as typeof childProcess.spawnSync);
+    let message = "";
     try {
       validateSshReachable("nonexistent-host.local");
     } catch (e: any) {
-      expect(e.message).toContain("ssh -- nonexistent-host.local exit 0");
-      expect(e.message).toContain("SSH reachability check failed");
+      message = e.message;
+    } finally {
+      spawnSpy.mockRestore();
     }
+    expect(readFileSync(argvLog, "utf8")).toBe("--\nnonexistent-host.local\nexit\n0\n");
+    expect(message).toContain("ssh -- nonexistent-host.local exit 0");
+    expect(message).toContain("SSH reachability check failed");
   });
 });

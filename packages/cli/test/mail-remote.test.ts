@@ -7,24 +7,11 @@ import { WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
 import { deliverToRemoteBranch } from "../src/utils/relay.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK } from "../src/utils/wire-mail.js";
 import { encodeWireMessage, decodeWireMessage } from "../src/utils/wire-frame.js";
-import net from "node:net";
 import { WebSocketServer } from "ws";
 import { createServer } from "node:http";
 import Noise from "noise-handshake/noise.js";
 import Cipher from "noise-handshake/cipher.js";
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const addr = s.address();
-      if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-      const p = addr.port;
-      s.close(() => resolve(p));
-    });
-    s.once("error", reject);
-  });
-}
+import { listeningPort } from "./helpers/port.js";
 
 const PROLOGUE = Buffer.from("tps-v1");
 
@@ -60,17 +47,9 @@ describe("deliverToRemoteBranch", () => {
     // 1. Register branch in host's registry
     registerBranch("remote-a", branchKp.signing.publicKey, undefined, branchKp.encryption.publicKey);
 
-    // 2. Mock branch-office/<name>/remote.json
-    const port = await freePort();
-    const branchOfficeDir = join(root, ".tps", "branch-office", "remote-a");
-    mkdirSync(branchOfficeDir, { recursive: true });
-    writeFileSync(
-      join(branchOfficeDir, "remote.json"),
-      JSON.stringify({ host: "127.0.0.1", port, transport: "ws" }),
-      "utf-8"
-    );
-
-    // 3. Start a server acting as the branch (Noise responder)
+    // 2. Start a server acting as the branch (Noise responder). It binds port
+    // 0 and reports the port it got, then remote.json points at that port, so
+    // the address is never chosen ahead of the bind.
     const httpServer = createServer();
     const wss = new WebSocketServer({ server: httpServer, path: "/tps/wire" });
     
@@ -112,9 +91,17 @@ describe("deliverToRemoteBranch", () => {
       });
     });
 
-    await new Promise<void>((resolve) => httpServer.listen(port, "127.0.0.1", () => resolve()));
+    await new Promise<void>((resolve) => httpServer.listen(0, "127.0.0.1", () => resolve()));
+    const port = listeningPort(httpServer);
+    const branchOfficeDir = join(root, ".tps", "branch-office", "remote-a");
+    mkdirSync(branchOfficeDir, { recursive: true });
+    writeFileSync(
+      join(branchOfficeDir, "remote.json"),
+      JSON.stringify({ host: "127.0.0.1", port, transport: "ws" }),
+      "utf-8"
+    );
 
-    // 4. Deliver
+    // 3. Deliver
     await deliverToRemoteBranch("remote-a", {
       to: "remote-a",
       from: "host-agent",

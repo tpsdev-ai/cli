@@ -1,6 +1,5 @@
 import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import net from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hostStateLockRoot, hostStatePath } from "../src/utils/connection-state.js";
@@ -10,20 +9,9 @@ import { connectAndKeepAlive } from "../src/utils/relay.js";
 import type { TransportChannel, TransportServer, TpsMessage } from "../src/utils/transport.js";
 import { MSG_HEARTBEAT } from "../src/utils/wire-mail.js";
 import { listenForHostWs, WsNoiseTransport } from "../src/utils/ws-noise-transport.js";
+import { boundPort } from "./helpers/port.js";
 
 afterEach(() => { mock.restore(); });
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") return reject(new Error("no address"));
-      server.close(() => resolve(address.port));
-    });
-  });
-}
 
 async function waitFor(check: () => boolean): Promise<void> {
   const deadline = Date.now() + 12_000;
@@ -76,8 +64,8 @@ test("a real WS late connect closes its socket and stop() clears the host record
     const host = await loadHostIdentity();
     const branch = generateKeyPair();
     registerBranch("remote", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-    const port = await freePort();
-    server = await listenForHostWs(branch, host.encryption.publicKey, port, () => {});
+    server = await listenForHostWs(branch, host.encryption.publicKey, 0, () => {});
+    const port = boundPort(server, "host listener");
     server.onConnection((channel) => { peers.push(channel); });
     const dir = join(root, ".tps", "branch-office", "remote");
     mkdirSync(dir, { recursive: true });
@@ -142,9 +130,9 @@ test("a real WS channel delivers inbound messages while host persistence retries
     const host = await loadHostIdentity();
     const branch = generateKeyPair();
     registerBranch("remote", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-    const port = await freePort();
     let heartbeat = false;
-    server = await listenForHostWs(branch, host.encryption.publicKey, port, () => { heartbeat = true; });
+    server = await listenForHostWs(branch, host.encryption.publicKey, 0, () => { heartbeat = true; });
+    const port = boundPort(server, "host listener");
     server.onConnection((channel) => { peer = channel; });
     const dir = join(root, ".tps", "branch-office", "remote");
     mkdirSync(dir, { recursive: true });

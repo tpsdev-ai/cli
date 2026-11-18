@@ -6,17 +6,19 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { generateKeyPair, saveKeyPair } from "../src/utils/identity.js";
+import { generateKeyPair, saveKeyPair, type TpsKeyPair } from "../src/utils/identity.js";
 import { hostStatePath, writeHostState } from "../src/utils/connection-state.js";
 import { branchPidLockRoot, withBranchPidLock, writeBranchConf } from "../src/commands/branch.js";
 import { acquireMailLockSync } from "../src/utils/mail-lock.js";
 import { readPidFile, serializePidRecord } from "../src/utils/pid-file.js";
 import { probeStdoutUnderRoot, type IdentityVerdict } from "./helpers/branch-daemon-identity.js";
+import { bindErrorIn, holdPort, PORT_ATTEMPTS, withPortRetry } from "./helpers/port.js";
+import { NoiseIkTransport } from "../src/utils/noise-ik-transport.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
@@ -31,23 +33,25 @@ const daemons: { pid: number; startToken: string }[] = [];
 const unverifiedIdentityPids = new Set<number>();
 const children: ChildProcess[] = [];
 
-async function freePort(): Promise<number> {
-  const net = await import("node:net");
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
+/** The log's size before an attempt, so only that attempt's lines are read. */
+function logSize(): number {
+  try {
+    return statSync(logFile).size;
+  } catch {
+    return 0;
+  }
 }
 
-function prepareBranch(port: number): void {
+/** The log written since `offset`. */
+function logSince(offset: number): string {
+  try {
+    return readFileSync(logFile).subarray(offset).toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function prepareBranch(port: number): { branch: TpsKeyPair; host: TpsKeyPair } {
   const branch = generateKeyPair();
   const host = generateKeyPair();
   saveKeyPair(branch, process.env.TPS_IDENTITY_DIR!, "branch");
@@ -56,6 +60,7 @@ function prepareBranch(port: number): void {
     JSON.stringify({ publicKey: Buffer.from(host.encryption.publicKey).toString("base64url") }),
   );
   writeBranchConf(port, "127.0.0.1", "tcp", undefined, "agent-a");
+  return { branch, host };
 }
 
 function startToken(pid: number): string {
@@ -105,16 +110,24 @@ async function waitFor<T>(read: () => T | null, what: string, timeoutMs = WAIT_M
   }
 }
 
-async function waitForReady(phase: string, daemonPid?: number): Promise<string> {
+async function waitForReady(
+  phase: string,
+  daemonPid?: number,
+  failure?: () => Error | undefined,
+): Promise<string> {
   try {
     return await waitFor(
       () => {
+        const failed = failure?.();
+        if (failed) throw failed;
         const name = readdirSync(pauseDir).find((entry) => entry.startsWith(`ready-${phase}-`));
         return name === undefined ? null : join(pauseDir, name);
       },
       `pause ${phase}`,
     );
   } catch (error) {
+    const failed = failure?.();
+    if (failed !== undefined) throw failed;
     throw new Error(`${(error as Error).message}; ${daemonState(daemonPid)}`);
   }
 }
@@ -159,11 +172,13 @@ async function waitForExit(child: ChildProcess, timeoutMs = EXIT_MS): Promise<{ 
   });
 }
 
-async function waitForLogStarted(): Promise<void> {
+async function waitForLogStarted(offset = 0, failure?: () => Error | undefined): Promise<void> {
   await waitFor(
     () => {
+      const failed = failure?.();
+      if (failed) throw failed;
       try {
-        return readFileSync(logFile, "utf8").includes("STARTED") ? true : null;
+        return logSince(offset).includes("STARTED") ? true : null;
       } catch {
         return null;
       }
@@ -172,22 +187,50 @@ async function waitForLogStarted(): Promise<void> {
   );
 }
 
-async function waitForListening(port: number): Promise<void> {
-  const net = await import("node:net");
+/** Wait until only the daemon answers a bounded Noise handshake under the
+ *  branch key it was started with; a foreign listener that holds the port
+ *  cannot answer it. The attempt's failure predicate is checked before every
+ *  wait and before any deadline throw. */
+async function waitForDaemonReady(
+  port: number,
+  branch: TpsKeyPair,
+  host: TpsKeyPair,
+  failure?: () => Error | undefined,
+): Promise<void> {
   const deadline = Date.now() + WAIT_MS;
   for (;;) {
-    const connected = await new Promise<boolean>((resolveConnect) => {
-      const socket = net.connect({ host: "127.0.0.1", port });
-      const finish = (value: boolean) => {
-        socket.destroy();
-        resolveConnect(value);
-      };
-      socket.once("connect", () => finish(true));
-      socket.once("error", () => finish(false));
+    const failed = failure?.();
+    if (failed) throw failed;
+    const transport = new NoiseIkTransport(host);
+    const pending = transport.connect({
+      host: "127.0.0.1",
+      port,
+      branchId: "agent-a",
+      hostPublicKey: branch.encryption.publicKey,
     });
-    if (connected) return;
-    if (Date.now() >= deadline) throw new Error(`daemon did not listen on 127.0.0.1:${port}`);
-    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+    pending.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const channel = await Promise.race([
+        pending,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("connect attempt did not settle")), 500);
+        }),
+      ]);
+      await channel.close();
+      return;
+    } catch {
+      transport.close();
+      void pending.then((channel) => channel.close()).catch(() => {});
+    } finally {
+      clearTimeout(timer);
+    }
+    if (Date.now() >= deadline) {
+      const failed = failure?.();
+      if (failed) throw failed;
+      throw new Error(`daemon did not answer a Noise handshake on 127.0.0.1:${port}`);
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 50));
   }
 }
 
@@ -246,17 +289,71 @@ async function waitForPidGone(pid: number): Promise<void> {
   await waitFor(() => (pidExited(pid) ? true : null), `pid ${pid} to exit`);
 }
 
-function spawnDaemon(phase: string): ChildProcess {
+function spawnDaemon(phase: string, onStderr: (text: string) => void = () => {}): ChildProcess {
   const env = pauseEnv(phase);
   env.TPS_BRANCH_NO_DAEMON = "1";
   delete env.TPS_BRANCH_DAEMON;
   const child = spawn("node", [TPS_BIN, "branch", "start"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  child.stderr?.on("data", (chunk) => onStderr(String(chunk)));
   children.push(child);
   return child;
 }
 
-function reapedPid(): number {
-  const child = spawnSync("true", []);
+/** One daemon start on `port`: only this attempt's log lines and stderr are
+ *  read, and a failed child is killed before the caller retries. */
+async function startDaemonAttempt(port: number, phase: string, readyBeforeListening: boolean): Promise<ChildProcess> {
+  const { branch, host } = prepareBranch(port);
+  const offset = logSize();
+  let stderr = "";
+  let exited: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+  const daemon = spawnDaemon(phase, (text) => {
+    stderr += text;
+  });
+  daemon.once("close", (code, signal) => {
+    exited = { code, signal };
+  });
+  const failure = (): Error | undefined => {
+    const output = logSince(offset) + stderr;
+    const bind = bindErrorIn(output);
+    if (bind) return bind;
+    if (exited !== null && exited.code !== 0) {
+      return new Error(`daemon exited (code ${exited.code}) before listening: ${output}`);
+    }
+    return undefined;
+  };
+  try {
+    await waitForLogStarted(offset, failure);
+    if (readyBeforeListening) await waitForReady(phase, daemon.pid, failure);
+    await waitForDaemonReady(port, branch, host, failure);
+    return daemon;
+  } catch (error) {
+    try {
+      if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    await waitForExit(daemon).catch(() => {});
+    throw error;
+  }
+}
+
+/** Start a daemon from config, retrying on a new port when the chosen one is taken. */
+async function startDaemonOnPort(
+  phase: string,
+  options: { firstPort?: number; readyBeforeListening?: boolean } = {},
+): Promise<{ daemon: ChildProcess; port: number; attempts: number }> {
+  let attempts = 0;
+  const { port, result } = await withPortRetry(
+    async (port) => {
+      attempts += 1;
+      return await startDaemonAttempt(port, phase, options.readyBeforeListening === true);
+    },
+    { firstPort: options.firstPort },
+  );
+  return { daemon: result, port, attempts };
+}
+
+function reapedPid(): number {  const child = spawnSync("true", []);
   if (child.pid === undefined) throw new Error("could not spawn a helper process");
   if (pidState(child.pid) !== "gone") throw new Error("helper pid was reused; rerun the test");
   return child.pid;
@@ -290,11 +387,7 @@ interface PausedStop {
 async function stopWhileDaemonPausesInShutdown(
   record: (pid: number, token: string) => string | Buffer = (pid, token) => serializePidRecord(pid, token),
 ): Promise<PausedStop> {
-  const port = await freePort();
-  prepareBranch(port);
-  const daemon = spawnDaemon("shutdown-before-unlink");
-  await waitForLogStarted();
-  await waitForListening(port);
+  const { daemon, port } = await startDaemonOnPort("shutdown-before-unlink");
   writeFileSync(pidFile, record(daemon.pid!, startToken(daemon.pid!)));
   expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -351,7 +444,7 @@ interface PausedOfficeKill {
 /** Run `office kill` against a stale record and replace that record with a
  *  symlink during the unlocked interval before removal. */
 async function replaceBranchRecordDuringOfficeKill(target: string | null): Promise<PausedOfficeKill> {
-  prepareBranch(await freePort());
+  prepareBranch(0);
   const stale = reapedPid();
   writeFileSync(pidFile, serializePidRecord(stale, null));
 
@@ -557,8 +650,7 @@ afterEach(async () => {
 
 describe("branch pid record ownership (cli#730)", () => {
   test("two launchers started together spawn exactly one daemon and leave one record", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const phase = "launch-before-spawn";
 
     const launchers = [0, 1].map(() => {
@@ -609,7 +701,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a SIGTERM before the listener opens runs shutdown with no server", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port);
     const phase = "startup-before-listener";
     const daemon = spawnDaemon(phase);
@@ -629,13 +721,9 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a SIGTERM while the listener is open and before the outbox watcher runs shutdown", async () => {
-    const port = await freePort();
-    prepareBranch(port);
     const phase = "listening-before-steady-state";
-    const daemon = spawnDaemon(phase);
+    const { port, daemon } = await startDaemonOnPort(phase, { readyBeforeListening: true });
     daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-    await waitForReady(phase, daemon.pid);
-    await waitForListening(port);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -650,13 +738,9 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a second signal during shutdown does not run the shutdown path twice", async () => {
-    const port = await freePort();
-    prepareBranch(port);
     const phase = "shutdown-after-signal";
-    const daemon = spawnDaemon(phase);
+    const { port, daemon } = await startDaemonOnPort(phase);
     daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
-    await waitForLogStarted();
-    await waitForListening(port);
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
 
@@ -676,8 +760,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a pause dir inherited without the isolated test root is ignored", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const env = launcherEnv("unused");
     delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
     delete env.TPS_TEST_ROOT;
@@ -706,8 +789,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a hand-set TPS_TEST_ROOT without a valid marker token ignores the pause", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const env = launcherEnv("unused");
     delete env.TPS_BRANCH_TEST_PAUSE_PHASE;
     env.TPS_TEST_ROOT = root;
@@ -736,8 +818,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a matching token with a pause dir outside TPS_TEST_ROOT is ignored", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const outsideBase = dirname(realpathSync(process.env.TPS_TEST_ROOT!));
     const outside = mkdtempSync(join(outsideBase, "tps-branch-730-outside-"));
     try {
@@ -769,8 +850,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("a registered daemon whose start token changed is reported and not signalled", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
       env: plainEnv(),
       stdio: ["ignore", "ignore", "ignore"],
@@ -795,8 +875,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("stopRecordedDaemons reports a daemon whose identity probe cannot answer and leaves it running", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
       env: plainEnv(),
       stdio: ["ignore", "ignore", "ignore"],
@@ -819,12 +898,8 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("shutdown holds the record lock and preserves a replacement visible at its final read", async () => {
-    const port = await freePort();
-    prepareBranch(port);
     const phase = "shutdown-before-unlink";
-    const daemon = spawnDaemon(phase);
-    await waitForLogStarted();
-    await waitForListening(port);
+    const { port, daemon } = await startDaemonOnPort(phase);
     expect(daemon.pid).toBeDefined();
     writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
     expect(readPidFile(pidFile).kind).toBe("running");
@@ -855,7 +930,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("runStop's final locked read preserves a readable replacement and exits non-zero", async () => {
-    prepareBranch(await freePort());
+    prepareBranch(0);
     const stale = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stale, null));
     const phase = "stop-before-unlink";
@@ -967,8 +1042,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("office kill preserves a launcher's replacement of a stale record it decided on", async () => {
-    const port = await freePort();
-    prepareBranch(port);
+    prepareBranch(0);
     const stale = reapedPid();
     writeFileSync(pidFile, serializePidRecord(stale, null));
 
@@ -1022,7 +1096,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("office kill reports a handled host record before a stale branch record, in order", async () => {
-    prepareBranch(await freePort());
+    prepareBranch(0);
     const hostPid = spawnLiveHost();
     const hostPath = writeHostRecord("host-a", hostPid);
     const stale = reapedPid();
@@ -1059,7 +1133,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("office kill reports a handled host record before a replaced branch record, in order", async () => {
-    prepareBranch(await freePort());
+    prepareBranch(0);
     const hostPid = spawnLiveHost();
     const hostPath = writeHostRecord("host-a", hostPid);
     const stale = reapedPid();
@@ -1105,7 +1179,7 @@ describe("branch pid record ownership (cli#730)", () => {
   }, 40_000);
 
   test("office kill's final read compares raw bytes and preserves a byte-only replacement", async () => {
-    prepareBranch(await freePort());
+    prepareBranch(0);
     const stale = reapedPid();
     writeFileSync(pidFile, recordWithIgnoredByte(stale, null, 0x80));
 
@@ -1200,10 +1274,49 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(withBranchPidLock(pidFile, "test the lock", () => "held")).toBe("held");
   }, 20_000);
 
+  test("a daemon start retries onto a free port after its first port is taken", async () => {
+    const held = await holdPort();
+    try {
+      const { daemon, attempts } = await startDaemonOnPort("unused", { firstPort: held.port });
+      daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
+      expect(pidState(daemon.pid!)).toBe("alive");
+      const exited = waitForExit(daemon);
+      daemon.kill("SIGTERM");
+      expect(await exited).toEqual({ code: 0, signal: null });
+    } finally {
+      await held.close();
+    }
+  }, 40_000);
+
+  test("a paused start retries onto a free port after its first port is taken", async () => {
+    const held = await holdPort();
+    const phase = "listening-before-steady-state";
+    try {
+      const { daemon, attempts } = await startDaemonOnPort(phase, {
+        firstPort: held.port,
+        readyBeforeListening: true,
+      });
+      daemons.push({ pid: daemon.pid!, startToken: startToken(daemon.pid!) });
+      expect(attempts).toBeGreaterThanOrEqual(2);
+      expect(attempts).toBeLessThanOrEqual(PORT_ATTEMPTS);
+      writeFileSync(pidFile, serializePidRecord(daemon.pid!, startToken(daemon.pid!)));
+      const exited = waitForExit(daemon);
+      daemon.kill("SIGTERM");
+      expect(await exited).toEqual({ code: 0, signal: null });
+      expect(stoppedCount()).toBe(1);
+      expect(readPidFile(pidFile).kind).toBe("missing");
+      expect(pidExited(daemon.pid!)).toBe(true);
+    } finally {
+      await held.close();
+    }
+  }, 40_000);
+
   let unannouncedDaemon: { pid: number; startToken: string } | undefined;
 
   test("afterEach stops a launcher's daemon when its announcement is not read", async () => {
-    prepareBranch(await freePort());
+    prepareBranch(0);
     // The launcher's stdout is discarded, so no announcement is parsed and the
     // daemon is never registered in `daemons`. Only the pid record names it.
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {

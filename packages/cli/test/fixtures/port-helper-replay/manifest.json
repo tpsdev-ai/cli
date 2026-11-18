@@ -1,0 +1,194 @@
+{
+  "generatedFrom": "git diff origin/main...HEAD -- packages/cli/test (deleted hunks, origin/main text)",
+  "entries": [
+    {
+      "id": "branch-daemon-sigterm-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-daemon-sigterm.test.ts",
+      "lines": "15-28",
+      "fixture": "branch-daemon-sigterm-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-init-guard-731-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-init-guard-731.test.ts",
+      "lines": "29-43",
+      "fixture": "branch-init-guard-731-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-join-token-after-bind-780-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-join-token-after-bind-780.test.ts",
+      "lines": "59-63",
+      "fixture": "branch-join-token-after-bind-780-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-join-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-join.test.ts",
+      "lines": "11-22",
+      "fixture": "branch-join-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-pid-claim-730-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-pid-claim-730.test.ts",
+      "lines": "34-48",
+      "fixture": "branch-pid-claim-730-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-single-daemon-726-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-single-daemon-726.test.ts",
+      "lines": "21-35",
+      "fixture": "branch-single-daemon-726-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-start-agent-id-734-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-start-agent-id-734.test.ts",
+      "lines": "29-43",
+      "fixture": "branch-start-agent-id-734-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "branch-state-write-failure-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/branch-state-write-failure.test.ts",
+      "lines": "17-30",
+      "fixture": "branch-state-write-failure-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "exit-status-750-office-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/exit-status-750-office.test.ts",
+      "lines": "16-27",
+      "fixture": "exit-status-750-office-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "github-webhook-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/github-webhook.test.ts",
+      "lines": "58-68",
+      "fixture": "github-webhook-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "helpers-scratch-flair-freePorts",
+      "kind": "function",
+      "name": "freePorts",
+      "file": "packages/cli/test/helpers/scratch-flair.ts",
+      "lines": "74-89",
+      "fixture": "helpers-scratch-flair-freePorts.txt",
+      "consumer": "const later = net.createServer();\nconst picked = await freePorts(2);\nlater.listen(picked[0]);\n"
+    },
+    {
+      "id": "listener-close-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/listener-close.test.ts",
+      "lines": "21-34",
+      "fixture": "listener-close-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "mail-remote-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/mail-remote.test.ts",
+      "lines": "16-27",
+      "fixture": "mail-remote-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "mail-send-unconfirmed-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/mail-send-unconfirmed.test.ts",
+      "lines": "100-111",
+      "fixture": "mail-send-unconfirmed-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "office-connect-announce-recovery-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/office-connect-announce-recovery.test.ts",
+      "lines": "83-96",
+      "fixture": "office-connect-announce-recovery-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "office-connect-announce-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/office-connect-announce.test.ts",
+      "lines": "92-105",
+      "fixture": "office-connect-announce-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "office-connect-sigterm-762-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/office-connect-sigterm-762.test.ts",
+      "lines": "39-52",
+      "fixture": "office-connect-sigterm-762-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "relay-host-record-inbound-socket-748-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/relay-host-record-inbound-socket-748.test.ts",
+      "lines": "16-26",
+      "fixture": "relay-host-record-inbound-socket-748-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "ws-noise-transport-freePort",
+      "kind": "function",
+      "name": "freePort",
+      "file": "packages/cli/test/ws-noise-transport.test.ts",
+      "lines": "15-26",
+      "fixture": "ws-noise-transport-freePort.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(await freePort());\n"
+    },
+    {
+      "id": "ws-noise-transport-inline-1",
+      "kind": "inline",
+      "name": "<anonymous>",
+      "file": "packages/cli/test/ws-noise-transport.test.ts",
+      "lines": "96-105",
+      "fixture": "ws-noise-transport-inline-1.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(port);\n"
+    },
+    {
+      "id": "ws-noise-transport-inline-2",
+      "kind": "inline",
+      "name": "<anonymous>",
+      "file": "packages/cli/test/ws-noise-transport.test.ts",
+      "lines": "135-144",
+      "fixture": "ws-noise-transport-inline-2.txt",
+      "consumer": "const later = net.createServer();\nlater.listen(port);\n"
+    }
+  ]
+}

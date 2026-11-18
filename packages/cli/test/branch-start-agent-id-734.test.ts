@@ -26,22 +26,6 @@ const leakCheckPids: number[] = [];
 const unverifiedIdentityPids = new Set<number>();
 const spawnedChildren: ChildProcess[] = [];
 
-async function freePort(): Promise<number> {
-  const net = await import("node:net");
-  return new Promise((resolvePort, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolvePort(address.port));
-    });
-  });
-}
-
 function prepareBranch(port: number, agentId?: string): void {
   const branch = generateKeyPair();
   const host = generateKeyPair();
@@ -344,7 +328,7 @@ afterEach(async () => {
 
 describe("branch start and init recorded-process refusals (cli#734)", () => {
   test("a start with a running recorded process and both agent-id sources cleared names the running pid and the pid file", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
     registerRecordedPid();
@@ -367,7 +351,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
   }, 40_000);
 
   test.each([false, true])("a production init with a running recorded process names the pid and pid file before joining (agent id configured: %s)", async (configured) => {
-    const port = await freePort();
+    const port = 0;
     const agentId = configured ? "agent-a" : undefined;
     prepareBranch(port, agentId);
     const live = startSleep();
@@ -403,7 +387,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
   }, 25_000);
 
   test("a start with no recorded process and no agent id names the missing id", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port, undefined);
 
     const result = await runCli(["branch", "start"], launcherEnv());
@@ -415,7 +399,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
   }, 20_000);
 
   test("a start with a running recorded process and the agent id configured names the running pid", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
     registerRecordedPid();
@@ -464,7 +448,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
   }, 20_000);
 
   test("stopRecordedDaemons re-reads the start token before SIGKILL and leaves a recycled pid unsignalled", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port, "agent-a");
     const first = await runCli(["branch", "start"], launcherEnv());
     registerRecordedPid();
@@ -500,7 +484,7 @@ describe("branch start and init recorded-process refusals (cli#734)", () => {
   });
 
   test("stopRecordedDaemons stops the recorded daemon when the launcher announcement is discarded", async () => {
-    const port = await freePort();
+    const port = 0;
     prepareBranch(port, "agent-a");
     const launcher = spawn("node", [TPS_BIN, "branch", "start"], {
       env: launcherEnv(),

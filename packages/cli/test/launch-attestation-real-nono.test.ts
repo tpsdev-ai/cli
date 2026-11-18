@@ -22,6 +22,7 @@ import { dirname, join, resolve } from "node:path";
 import { resolveNonoBinary, checkNonoPin, pidAlive, SIGNAL_STOP_BOUND_MS } from "../src/utils/launch-attestation.js";
 import { REFUSAL_EXIT_CODE } from "../src/utils/nono.js";
 import { realNonoHomeBase } from "./helpers/launcher-grants.js";
+import { formatStopFailure, stopRealLaunch } from "./helpers/stop-real-launch.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** The runtime the shipped CLI uses: the re-exec child inherits it, and the
@@ -29,37 +30,6 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const NODE =
   process.env.TPS_TEST_NODE ??
   (spawnSync("which", ["node"], { encoding: "utf-8" }).stdout?.trim() || "node");
-async function stopRealLaunch(child: ReturnType<typeof spawn>, output: string): Promise<boolean> {
-  const releasedPid = /released under nono session \S+ \(child pid (\d+)\)/.exec(output)?.[1];
-  const targets = new Set<number>();
-  if (releasedPid) targets.add(Number(releasedPid));
-  else if (child.pid) targets.add(-child.pid);
-  if (child.pid) targets.add(child.pid);
-  const alive = (pid: number) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ESRCH";
-    }
-  };
-  for (const signal of ["SIGTERM", "SIGKILL"] as const) {
-    for (const pid of targets) {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        /* checked below */
-      }
-    }
-    const deadline = Date.now() + 3_000;
-    do {
-      if ([...targets].every((pid) => !alive(pid))) return true;
-      await new Promise((r) => setTimeout(r, 25));
-    } while (Date.now() < deadline);
-  }
-  return false;
-}
-
 const SANDBOX_REQUIRED = "--sandbox-required";
 
 // cli#350 r4g — these tests wait on a real release window (up to 45s / 60s);
@@ -259,9 +229,9 @@ real("4e positive — the attested launch against the pinned nono", () => {
       // file first thing).
       expect(existsSync(pidFile), text).toBe(true);
     } finally {
-      const stopped = !child || await stopRealLaunch(child, text);
+      const stop = child ? await stopRealLaunch(child, text) : null;
       rmSync(sb.root, { recursive: true, force: true });
-      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+      expect(stop?.stopped ?? true, stop ? formatStopFailure(stop) : "teardown: no launcher was spawned").toBe(true);
     }
   });
 
@@ -341,9 +311,9 @@ real("4e positive — the attested launch against the pinned nono", () => {
       expect(exit.aliveAtExit, `${text}\nchild=${childPid} supervisor=${supervisorPid}`).toEqual([]);
       expect(elapsed).toBeLessThan(SIGNAL_STOP_BOUND_MS + 4_000);
     } finally {
-      const stopped = !child || await stopRealLaunch(child, text);
+      const stop = child ? await stopRealLaunch(child, text) : null;
       rmSync(sb.root, { recursive: true, force: true });
-      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+      expect(stop?.stopped ?? true, stop ? formatStopFailure(stop) : "teardown: no launcher was spawned").toBe(true);
     }
   });
 });
@@ -418,9 +388,9 @@ real("4e+r4f positive — a TTY parent still RELEASES (real nono)", () => {
       expect(text).toContain("released under nono session");
       expect(text).not.toContain("no released child within");
     } finally {
-      const stopped = await stopRealLaunch(child, text);
+      const stop = await stopRealLaunch(child, text);
       rmSync(sb.root, { recursive: true, force: true });
-      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+      expect(stop.stopped, formatStopFailure(stop)).toBe(true);
     }
   });
 });
@@ -546,9 +516,9 @@ real("cli#833 — real nono: an autoCommit.repo inside the workspace is granted"
       const subject = spawnSync("git", ["-C", repo, "log", "-1", "--format=%s"], { encoding: "utf-8" });
       expect(subject.stdout.trim()).toBe("sandbox auto-commit");
     } finally {
-      const stopped = !child || await stopRealLaunch(child, text);
+      const stop = child ? await stopRealLaunch(child, text) : null;
       rmSync(sb.root, { recursive: true, force: true });
-      expect(stopped, "teardown could not confirm the released child and launcher are gone").toBe(true);
+      expect(stop?.stopped ?? true, stop ? formatStopFailure(stop) : "teardown: no launcher was spawned").toBe(true);
     }
   });
 });
