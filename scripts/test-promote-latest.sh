@@ -279,6 +279,23 @@ for (const line of lines) {
 process.stdout.write(String(count));
 COUNT_SIGNALLED
 
+# Reports the first log line matching none of the known shapes (start <ms>, end <ms>,
+# INT, TERM, HUP, KILL), so a producer rename reads as a format change in AL and AX
+# instead of only a parser error. Prints nothing on a well-formed log.
+supervisor_format="$work/supervisor-format.mjs"
+cat >"$supervisor_format" <<'SUPERVISOR_FORMAT'
+import fs from 'node:fs';
+
+const text = fs.readFileSync(process.argv[2], 'utf8');
+const body = text.endsWith('\n') ? text.slice(0, -1) : text;
+const lines = text === '' ? [] : body.split('\n');
+for (const line of lines) {
+  if (/^start \d+$/.test(line) || /^end \d+$/.test(line) || /^(INT|TERM|HUP|KILL)$/.test(line)) continue;
+  process.stdout.write('supervisor log format: [' + line + '] is not one of start <ms>, end <ms>, INT, TERM, HUP, KILL');
+  process.exit(1);
+}
+SUPERVISOR_FORMAT
+
 # ── real-npm seam helpers ────────────────────────────────────────────────────
 # A small registry on 127.0.0.1, written at run time, with no dependency beyond
 # node. It serves the packument and dist-tags reads that `npm view` makes, and the
@@ -297,7 +314,10 @@ const requests = [];
 const applied = [];
 const disconnected = [];
 let eventOrder = 0;
-function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied, disconnected }, null, 2)); }
+// The first held read's receipt time and the time its delay ended (recorded just
+// before the response handler runs), so a fixture can assert the hold itself.
+let firstReadHold = null;
+function persist() { fs.writeFileSync(stateFile, JSON.stringify({ latest, requests, applied, disconnected, firstReadHold }, null, 2)); }
 function manifest(pkg, version) {
   return { name: pkg, version, dist: { tarball: 'http://127.0.0.1/' + pkg.replace('/', '-') + '-' + version + '.tgz', shasum: '0' } };
 }
@@ -374,7 +394,13 @@ const server = http.createServer((req, res) => {
     };
     if (req.method === 'GET' && firstReadDelayMs > 0 && !firstReadDelayed) {
       firstReadDelayed = true;
-      setTimeout(handle, firstReadDelayMs);
+      firstReadHold = { received: Date.now(), answered: null };
+      persist();
+      setTimeout(() => {
+        firstReadHold.answered = Date.now();
+        persist();
+        handle();
+      }, firstReadDelayMs);
       return;
     }
     handle();
@@ -881,8 +907,8 @@ setTimeout(() => {
       send('SIGTERM');
       graceTimer = setTimeout(() => {
         graceDone = true;
-        if (gone()) return;
-        send('SIGKILL');
+        if (!gone()) send('SIGKILL');
+        exitWithStatus();
       }, Math.round(graceSeconds * 1000));
       return;
     }
@@ -1105,6 +1131,17 @@ signal_tool() { # <dir> <signal> — signal the tool itself, never the pty runne
   fi
   kill -"$sig" "$pid" 2>/dev/null
 }
+wait_add_entry() { # <package-short> <version|->
+  local pkg="$1" ver="$2" n=0
+  local entry="dist-tag add @tpsdev-ai/$pkg@"
+  [ "$ver" = "-" ] || entry="$entry$ver latest "
+  while [ "$n" -lt 800 ]; do
+    grep -qF "$entry" "$LOG" 2>/dev/null && return 0
+    sleep 0.05
+    n=$((n + 1))
+  done
+  return 1
+}
 run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [args...]
   local d="$1"
   local hold="$2"
@@ -1112,10 +1149,56 @@ run_interrupt() { # [TOOL=...] <dir> <hold-pkg-short> <hold-ver|-> <signal> [arg
   local sig="$4"
   shift 4
   start_held "$d" "$hold" "$holdver" "$@"
-  wait_count "$HCOUNTER" 1
+  # Preflight time is outside the hold wait; signal only after this add is held.
+  if ! wait_add_entry "$hold" "$holdver"; then
+    bad "interrupt: intended add entered" "no matching add before the timeout"
+    finish_held "$d"
+    return 1
+  fi
+  if ! wait_count "$HCOUNTER" 1; then
+    bad "interrupt: intended add held" "no hold marker before the timeout"
+    finish_held "$d"
+    return 1
+  fi
   signal_tool "$d" "$sig"
   finish_held "$d"
 }
+
+probe_interrupt_prerequisite() { # <entry|hold>
+  local phase="$1" record="$work/interrupt-prerequisite-$1" probe_rc=0
+  (
+    start_held() { :; }
+    wait_add_entry() { [ "$phase" = hold ]; }
+    wait_count() { [ "$phase" = entry ]; }
+    bad() { printf 'FAILURE\n' >>"$record"; }
+    signal_tool() { printf 'SIGNAL\n' >>"$record"; }
+    finish_held() { :; }
+    run_interrupt "$work" cli-linux-arm64 0.5.3 TERM 0.5.4 --yes
+  ) >"$record" || probe_rc=$?
+  if [ "$probe_rc" -ne 0 ] && grep -q '^FAILURE$' "$record" && ! grep -q '^SIGNAL$' "$record"; then
+    ok "interrupt prerequisite: expired $phase wait prevents signal" "failure recorded, no signal"
+  else
+    bad "interrupt prerequisite: expired $phase wait prevents signal" "rc $probe_rc, record [$(cat "$record")]"
+  fi
+}
+probe_interrupt_prerequisite entry
+probe_interrupt_prerequisite hold
+
+if (
+  LOG="$work/interrupt-entry-matcher.log"
+  printf '%s\n' 'dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.4 latest --registry fixture' >"$LOG"
+  polls=0
+  sleep() {
+    polls=$((polls + 1))
+    printf '%s\n' 'dist-tag add @tpsdev-ai/cli-linux-arm64@0.5.3 latest --registry fixture' >>"$LOG"
+  }
+  wait_add_entry cli-linux-arm64 0.5.3 && [ "$polls" -eq 1 ]
+); then
+  ok "interrupt entry matcher: waits past unrelated add for rollback" "rollback add observed after one poll"
+else
+  bad "interrupt entry matcher: waits past unrelated add for rollback" "expected a match after one poll"
+fi
+
 adds_count() {
   local n
   n="$(grep -c '^dist-tag add ' "$LOG" 2>/dev/null)"
@@ -1236,6 +1319,14 @@ write_state "$d/state.json" "0.5.4" "0.5.3"
 node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallViewAfterAdd="@tpsdev-ai/cli-darwin-arm64"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
 FAKE_NPM_STALL_VIEW_MS=2000 FAKE_NPM_PIDFILE="$d/view.pid" FAKE_NPM_RELEASE_FILE="$d/release" \
   start_held "$d" cli-darwin-arm64 0.5.3 0.5.4 --yes --no-docker
+# Wait for the call this case is about, not a window from the start of the run:
+# the preflight reads before the first add are unrelated to it, and a slow runner
+# stretches them. Wait for the first add to be issued, then for that add's
+# post-read to be held.
+for ((tries = 0; tries < 800; tries++)); do
+  grep -q '^dist-tag add ' "$LOG" 2>/dev/null && break
+  sleep 0.05
+done
 for ((tries = 0; tries < 200; tries++)); do
   [ -s "$d/view.pid" ] && break
   sleep 0.05
@@ -1597,19 +1688,22 @@ else
   stop_registry
 
   # AJ. The server never answers a PUT: the mutating call times out, so the run
-  # is uncertain (7), not an ordinary failure.
+  # is uncertain (7), not an ordinary failure. The reads keep a 5 s deadline; the
+  # fixture's wrapper bounds the write itself at 1 s, as AN does.
   d="$(new_fixture real-npm-hang)"
   if start_registry "$d" hang-put; then
     mkdir -p "$d/home" "$d/npm-cache"
     raw="$(HOME="$d/home" npm_config_cache="$d/npm-cache" npm_config_userconfig="$d/home/npmrc" \
       npm_config_update_notifier=false npm_config_fund=false npm_config_audit=false npm_config_progress=false \
-      NPM_TIMEOUT_SECONDS=1 NPM_BIN="$npm_bin" NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
+      NPM_TIMEOUT_SECONDS=5 NPM_BIN="$put_deadline_npm" REAL_NPM_BIN="$npm_bin" \
+      REAL_NPM_SUPERVISOR="$work/npm-supervisor.mjs" NPM_PUT_DEADLINE_SECONDS=1 \
+      NPM_REGISTRY="http://127.0.0.1:$REG_PORT" PROMOTE_ROOT="$d/root" \
       python3 "$real_pty_runner" "$BASH_BIN" "$tool" 0.5.4 --yes --no-docker)"
     RC=$?
     OUT="$(printf '%s\n' "$raw" | strip_cr)"
     ERR="$OUT"
     assert_eq "AJ real npm PUT hang: exit" 7 "$RC"
-    assert_contains "AJ real npm PUT hang: timed out" "$ERR" "timed out after 1 seconds: npm dist-tag add @tpsdev-ai/cli-darwin-arm64@0.5.4"
+    assert_contains "AJ real npm PUT hang: timed out" "$ERR" "timed out after 5 seconds: npm dist-tag add @tpsdev-ai/cli-darwin-arm64@0.5.4"
     assert_contains "AJ real npm PUT hang: reports uncertainty" "$ERR" "UNCERTAIN"
     if printf '%s' "$ERR" | grep -qF 'rolled back @tpsdev-ai/cli-darwin-arm64'; then
       bad "AJ real npm PUT hang: no restored line" "printed a rollback for the uncertain package"
@@ -1673,8 +1767,10 @@ assert_contains "AL bound: supervisor attempted KILL" "$(cat "$d/supervisor.log"
 assert_eq "AL bound: exactly one signalled call" 1 "$(node "$count_signalled" "$d/supervisor.log")"
 elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
 if [ -z "$elapsed" ]; then
-  bad "AL bound: at least deadline + grace" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"
-  bad "AL bound: inside deadline + grace + 5s" "no signalled call's start/end pair"
+  al_detail="$(node "$supervisor_format" "$d/supervisor.log" 2>&1 || true)"
+  [ -n "$al_detail" ] || al_detail="$(head -n 1 "$d/parse.err" 2>/dev/null)"
+  bad "AL bound: at least deadline + grace" "no signalled call's start/end pair${al_detail:+ ($al_detail)}"
+  bad "AL bound: inside deadline + grace + 5s" "no signalled call's start/end pair${al_detail:+ ($al_detail)}"
 elif node -e 'process.exit(Number(process.argv[1]) >= 2.5 ? 0 : 1)' "$elapsed"; then
   ok "AL bound: at least deadline + grace" "${elapsed}s"
 else
@@ -1764,6 +1860,14 @@ elif REGISTRY_FIRST_READ_DELAY_MS=2000 start_registry "$d" delayed-put; then
   RC=$?
   OUT="$(printf '%s\n' "$raw" | strip_cr)"
   ERR="$OUT"
+  # Judge the precondition first: the held read must outlast the 1 s PUT deadline
+  # on its own, so a shorter hold fails here rather than passing as AN does.
+  hold_ms="$(node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const h=s.firstReadHold; process.stdout.write(h && h.answered !== null ? String(h.answered - h.received) : "unknown");' "$d/registry.state" 2>/dev/null || printf 'unknown')"
+  if node -e 'process.exit(/^[0-9]+$/.test(process.argv[1]) && Number(process.argv[1]) > 1000 ? 0 : 1)' "$hold_ms"; then
+    ok "AN2 slow read: the hold outlasted the PUT deadline" "the held read's delay ended after ${hold_ms}ms, over the 1 s PUT deadline"
+  else
+    bad "AN2 slow read: the hold outlasted the PUT deadline" "the held first read's delay ended after ${hold_ms}ms; AN2 needs more than the 1 s PUT deadline before it judges the PUT"
+  fi
   assert_eq "AN2 slow read: exit" 7 "$RC"
   assert_eq "AN2 slow read: reached the held PUT" 1 "$(node -e 'const fs=require("fs"); const s=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); process.stdout.write(String((s.requests||[]).some((r)=>r.method==="PUT") ? 1 : 0));' "$d/registry.state")"
   assert_contains "AN2 slow read: reason names the package" "$(cat "$d/root/.promote-latest.lock/reason" 2>/dev/null)" "@tpsdev-ai/cli-darwin-arm64: target 0.5.4"
@@ -1947,6 +2051,106 @@ else
   bad "S-a mutation: second signalled call refused" "could not build the mutant parser"
 fi
 
+# ── BG. the supervisor log format is pinned from the producer side ────────────
+# The parser's rules pin what it READS. This pins what the producer WRITES to the
+# same field names, through one known log, so a rename in npm-supervisor.mjs
+# fails here naming the field instead of looking like a parser defect in AL/AX.
+known_log="$work/known-supervisor.log"
+printf 'start 1700000000000\nTERM\nKILL\nend 1700000002500\n' >"$known_log"
+known_elapsed="$(node "$supervisor_log_parser" "$known_log" 2>"$work/known-parse.err" || true)"
+assert_eq "BG known log: the parser reads the format" "2.50" "$known_elapsed"
+d="$(new_fixture supervisor-format)"
+cat >"$d/ignore-term.mjs" <<'IGNORE_TERM'
+import fs from 'node:fs';
+process.on('SIGTERM', () => {});
+// Written only after the handler is installed, so a marker proves the handler was
+// in place; without one, whether this run tested a child that ignores TERM is
+// unproven.
+fs.writeFileSync(process.argv[2], 'ready');
+setInterval(() => {}, 250);
+IGNORE_TERM
+# At its deadline the supervisor attempts TERM while its child handle still reports
+# running, whether or not the child has installed its handler (the log records the
+# attempt), so the producer rows count only for a run whose child confirmed the
+# handler; a slower start retries with a longer deadline, and a child that never confirms leaves only the failed fixture row.
+bg_supervise() { # <deadline> <child> <ready marker> <supervisor log> -> the supervisor's exit code
+  PROMOTE_SUPERVISOR_LOG="$4" "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" "$1" 0.5 -- "${NODE_BIN:-node}" "$2" "$3"
+}
+bg_run() { # <fixture dir> -> BG rows; non-zero when no deadline saw the ready marker
+  local d="$1" bg_deadline bg_rc=0 bg_ready=no known_lines producer_lines
+  for bg_deadline in 0.5 2 8; do
+    rm -f "$d/ready" "$d/supervisor.log"
+    bg_rc=0
+    bg_supervise "$bg_deadline" "$d/ignore-term.mjs" "$d/ready" "$d/supervisor.log" >"$d/out.txt" 2>"$d/err.txt" || bg_rc=$?
+    if [ -f "$d/ready" ]; then
+      bg_ready=yes
+      break
+    fi
+  done
+  if [ "$bg_ready" = yes ]; then
+    ok "BG fixture: the child confirmed its TERM handler" "deadline ${bg_deadline} s"
+    assert_eq "BG producer log: the timed call ends" 124 "$bg_rc"
+    known_lines="$(sed -E 's/[0-9]+/<ms>/' "$known_log")"
+    producer_lines="$(sed -E 's/[0-9]+/<ms>/' "$d/supervisor.log" 2>/dev/null)"
+    if [ "$producer_lines" = "$known_lines" ]; then
+      ok "BG producer log: the same fields as the known log" "start <ms> / TERM / KILL / end <ms>"
+    else
+      bad "BG producer log: the same fields as the known log" "producer wrote [$(printf '%s' "$producer_lines" | tr '\n' ' ')]; the known log the parser reads is [$(printf '%s' "$known_lines" | tr '\n' ' ')]"
+    fi
+  else
+    bad "BG fixture: the child confirmed its TERM handler" "no ready marker at deadlines 0.5, 2 and 8 s; no producer row was asserted"
+  fi
+  [ "$bg_ready" = yes ]
+}
+bg_run "$d"
+
+# BG gate probes: bg_run with the supervisor call replaced by a fixture that writes
+# what a child would leave at each deadline, so neither probe waits on a deadline.
+# slow: no marker at 0.5 s, marker and a KILL log at 2 s -> retried once, gated rows pass.
+# never: no marker at any deadline -> all three tried, not ready, no producer row.
+probe_bg_gate() { # <slow|never>
+  local kind="$1" record="$work/bg-gate-$1.record" pd="$work/bg-gate-$1" probe_rc=0 tried
+  mkdir -p "$pd"
+  : >"$record"
+  (
+    bg_supervise() {
+      printf 'SUPERVISE %s\n' "$1" >>"$record"
+      if [ "$kind" = slow ] && [ "$1" != 0.5 ]; then
+        printf 'ready' >"$3"
+        printf 'start 1\nTERM\nKILL\nend 2\n' >"$4"
+      else
+        printf 'start 1\nTERM\nend 2\n' >"$4"
+      fi
+      return 124
+    }
+    ok() { printf 'PASS %s | %s\n' "$1" "$2" >>"$record"; }
+    bad() { printf 'FAIL %s | %s\n' "$1" "$2" >>"$record"; }
+    bg_run "$pd"
+  ) >"$pd/probe.out" 2>&1 || probe_rc=$?
+  tried="$(sed -n 's/^SUPERVISE //p' "$record" | tr '\n' ' ')"
+  if [ "$kind" = slow ]; then
+    if [ "$probe_rc" -eq 0 ] && [ "$tried" = "0.5 2 " ] &&
+      grep -qxF 'PASS BG fixture: the child confirmed its TERM handler | deadline 2 s' "$record" &&
+      grep -qxF 'PASS BG producer log: the timed call ends | == 124' "$record" &&
+      grep -qxF 'PASS BG producer log: the same fields as the known log | start <ms> / TERM / KILL / end <ms>' "$record" &&
+      ! grep -q '^FAIL ' "$record"; then
+      ok "BG gate probe: a slow start retries at 2 s" "tried [${tried% }], ready, producer rows passed"
+    else
+      bad "BG gate probe: a slow start retries at 2 s" "rc $probe_rc, tried [${tried% }], record [$(grep -v '^SUPERVISE ' "$record" | tr '\n' ' ')]"
+    fi
+  else
+    if [ "$probe_rc" -ne 0 ] && [ "$tried" = "0.5 2 8 " ] &&
+      grep -q '^FAIL BG fixture: the child confirmed its TERM handler | ' "$record" &&
+      ! grep -q '^[A-Z]* BG producer log:' "$record"; then
+      ok "BG gate probe: never ready runs no producer row" "tried [${tried% }], not ready, only the fixture row"
+    else
+      bad "BG gate probe: never ready runs no producer row" "rc $probe_rc, tried [${tried% }], record [$(grep -v '^SUPERVISE ' "$record" | tr '\n' ' ')]"
+    fi
+  fi
+}
+probe_bg_gate slow
+probe_bg_gate never
+
 # ── AV. mutation: a timed-out call that logs no end turns AL red ─────────────
 # The strict framing rejects the next call's start while the timed-out call is
 # still open, so a supervisor that stops logging `end` on that path fails AL
@@ -2010,7 +2214,11 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$ax/npm-superv
     *) ok "AX mutation: missing grace KILL caught" "AL red: supervisor log contains no KILL attempt" ;;
   esac
   ax_elapsed="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
-  if [ -z "$ax_elapsed" ]; then bad "AX mutation: elapsed bounds stay green" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"; elif node -e 'const n=Number(process.argv[1]); process.exit(n >= 2.5 && n < 8 ? 0 : 1)' "$ax_elapsed"; then
+  if [ -z "$ax_elapsed" ]; then
+    ax_detail="$(node "$supervisor_format" "$d/supervisor.log" 2>&1 || true)"
+    [ -n "$ax_detail" ] || ax_detail="$(head -n 1 "$d/parse.err" 2>/dev/null)"
+    bad "AX mutation: elapsed bounds stay green" "no signalled call's start/end pair${ax_detail:+ ($ax_detail)}"
+  elif node -e 'const n=Number(process.argv[1]); process.exit(n >= 2.5 && n < 8 ? 0 : 1)' "$ax_elapsed"; then
     ok "AX mutation: elapsed bounds stay green" "${ax_elapsed}s"
   else
     bad "AX mutation: elapsed bounds stay green" "${ax_elapsed}s — expected [2.5, 8)"
@@ -2183,13 +2391,14 @@ else
 fi
 
 # ── M10b. mutation (b): count sleeps from an assumed startup, not elapsed ────
-# A slow child-spawn stub sleeps 5 s before exec; the mutant starts its sleep
-# counter after 5 s, so the call runs past deadline + grace + the 5 s margin.
+# A slow child-spawn stub sleeps 8 s before exec; the mutant starts its sleep
+# counter after 8 s, so its signalled call runs past AL's 8 s upper bound. The
+# mutant is judged by AL's own per-call measure, from the shared supervisor log.
 slow_npm="$work/slow-npm"
 cat >"$slow_npm" <<'SLOW_NPM'
 #!/bin/bash
 if [ "${1:-}" = "dist-tag" ] && [ "${2:-}" = "add" ]; then
-  case "${3:-}" in *@0.5.4) sleep 5 ;; esac
+  case "${3:-}" in *@0.5.4) sleep 8 ;; esac
 fi
 exec "$REAL_NPM" "$@"
 SLOW_NPM
@@ -2201,14 +2410,14 @@ if node "$work/mutate-supervisor.mjs" "$here/npm-supervisor.mjs" "$m10b/npm-supe
   d="$(new_fixture mut-count-sleeps)"
   write_state "$d/state.json" "0.5.4" "0.5.3"
   node -e 'const fs=require("fs"), p=process.argv[1], s=JSON.parse(fs.readFileSync(p)); s.stallAdd="@tpsdev-ai/cli-darwin-arm64"; s.stallRollbackVersion="0.5.3"; fs.writeFileSync(p,JSON.stringify(s))' "$d/state.json"
-  t0="$(node -p 'Date.now()')"
-  NPM_TIMEOUT_SECONDS=1 NPM_BIN_OVERRIDE="$slow_npm" REAL_NPM="$fake_npm" PROMOTE_MUTANT_STARTUP_MS=5000 TOOL="$m10b/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
-  t1="$(node -p 'Date.now()')"
-  elapsed="$(node -p '((Number(process.argv[2]) - Number(process.argv[1])) / 1000).toFixed(2)' "$t0" "$t1")"
-  if node -e 'process.exit(Number(process.argv[1]) >= 8 ? 0 : 1)' "$elapsed"; then
-    ok "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s, past deadline + grace + 5s"
+  NPM_TIMEOUT_SECONDS=1 NPM_BIN_OVERRIDE="$slow_npm" REAL_NPM="$fake_npm" PROMOTE_MUTANT_STARTUP_MS=8000 TOOL="$m10b/promote-latest.sh" invoke "$d" 0.5.4 --yes --no-docker
+  per_call="$(node "$supervisor_log_parser" "$d/supervisor.log" 2>"$d/parse.err" || true)"
+  if [ -z "$per_call" ]; then
+    bad "M10b mutation (b): sleep counting caught" "no signalled call's start/end pair ($(head -n 1 "$d/parse.err" 2>/dev/null))"
+  elif node -e 'process.exit(Number(process.argv[1]) >= 8 ? 0 : 1)' "$per_call"; then
+    ok "M10b mutation (b): sleep counting caught" "the signalled call ran ${per_call}s, past AL's 8 s upper bound"
   else
-    bad "M10b mutation (b): sleep counting caught" "mutant ran ${elapsed}s — fixture AL is blind"
+    bad "M10b mutation (b): sleep counting caught" "the signalled call ran ${per_call}s — under AL's 8 s upper bound, so that bound would not catch this mutant"
   fi
   TOOL=""
 else
@@ -2718,7 +2927,50 @@ run_refusal_probe() {
 }
 
 bf_log="$work/bf-records"
-for bf_sub in install ci; do
+# Read the guard's own install classifier instead of copying its verb list.
+guard_ts="$repo_root/test/helpers/npm-ci-workflow-guard.ts"
+extract_install_verbs() { # <guard source>
+  node - "$1" <<'BF_VERBS'
+const fs = require('fs');
+const source = fs.readFileSync(process.argv[2], 'utf8');
+const declarations = source.match(/^const INSTALL_VERB\b.*$/gm) || [];
+const prefix = 'const INSTALL_VERB = /(?:^|[^A-Za-z0-9_-])(?:';
+const suffix = ')(?![A-Za-z0-9_-])/;';
+if (declarations.length !== 1) process.exit(1);
+const line = declarations[0];
+if (!line.startsWith(prefix) || !line.endsWith(suffix)) process.exit(1);
+const group = line.slice(prefix.length, -suffix.length);
+if (!/^[a-z]+(?:\|[a-z]+)*$/.test(group)) process.exit(1);
+const verbs = group.split('|');
+const distinct = new Set(verbs);
+if (distinct.size !== verbs.length || distinct.size < 6 ||
+    !['ci', 'install', 'i', 'add', 'exec', 'x'].every(verb => distinct.has(verb))) process.exit(1);
+console.log(verbs.join(' '));
+BF_VERBS
+}
+install_verbs=""
+if install_verbs="$(extract_install_verbs "$guard_ts")"; then
+  ok "BF verb list: read from the guard" "$install_verbs"
+else
+  bad "BF verb list: read from the guard" "unrecognized or incomplete INSTALL_VERB declaration"
+fi
+
+bf_unrecognized="$work/bf-unrecognized.ts"
+cat >"$bf_unrecognized" <<'BF_UNRECOGNIZED'
+const INSTALL_VERB = new RegExp("(?:^|[^A-Za-z0-9_-])(?:ci|install|i|add|exec|x)(?![A-Za-z0-9_-])");
+BF_UNRECOGNIZED
+bf_split="$work/bf-split.ts"
+cat >"$bf_split" <<'BF_SPLIT'
+const INSTALL_VERB = /(?:^|[^A-Za-z0-9_-])(?:(?:ci|install|i|add)(?![A-Za-z0-9_-])|(?:exec|x)(?![A-Za-z0-9_-]))/;
+BF_SPLIT
+for bf_source in "$bf_unrecognized" "$bf_split"; do
+  if extract_install_verbs "$bf_source" >"$work/bf-extracted"; then
+    bad "BF mutation: rejects $(basename "$bf_source")" "extraction accepted [$(cat "$work/bf-extracted")]"
+  else
+    ok "BF mutation: rejects $(basename "$bf_source")" "extraction failed"
+  fi
+done
+for bf_sub in $install_verbs; do
   run_refusal_probe "$put_deadline_npm" "$bf_log" "$bf_sub"
   if [ "$BF_RC" -ne 0 ]; then ok "BF wrapper refuses $bf_sub: non-zero exit" "rc $BF_RC"; else bad "BF wrapper refuses $bf_sub: non-zero exit" "exited 0"; fi
   assert_contains "BF wrapper refuses $bf_sub: names the subcommand" "$BF_ERR" "refused subcommand: $bf_sub"
@@ -2732,18 +2984,19 @@ NPM_PUT_DEADLINE_SECONDS=5 REAL_NPM_SUPERVISOR="$here/npm-supervisor.mjs" \
   run_refusal_probe "$put_deadline_npm" "$bf_log" dist-tag add '@tpsdev-ai/cli@0.5.4' latest --registry http://127.0.0.1:1
 assert_eq "BF an allowed tag write is forwarded" "argv:dist-tag add @tpsdev-ai/cli@0.5.4 latest --registry http://127.0.0.1:1" "$(cat "$bf_log")"
 
-# BF mutation: forward every subcommand again; BF must catch it.
-bf_mut="$work/npm-put-deadline-forward-all"
-if awk '{ print } /^set -uo pipefail$/ { print "exec \"${REAL_NPM_BIN:?}\" \"$@\"" }' "$put_deadline_npm" >"$bf_mut"; then
+# BF mutation: add an arm that forwards one of the classifier's verbs again;
+# BF's probe for that verb must catch it.
+bf_mut="$work/npm-put-deadline-forward-exec"
+if awk '{ if ($0 == "  dist-tag)") { print "  exec)"; print "    exec \"${REAL_NPM_BIN:?}\" \"$@\""; print "    ;;" } print }' "$put_deadline_npm" >"$bf_mut"; then
   chmod +x "$bf_mut"
-  run_refusal_probe "$bf_mut" "$bf_log" install --ignore-scripts
+  run_refusal_probe "$bf_mut" "$bf_log" exec --version
   if [ "$BF_RC" -eq 0 ] && [ -s "$bf_log" ]; then
-    ok "BF mutation: forward-all wrapper caught" "mutant exited 0, stub saw [$(cat "$bf_log")]"
+    ok "BF mutation: forwarding exec is caught" "mutant exited 0, stub saw [$(cat "$bf_log")]"
   else
-    bad "BF mutation: forward-all wrapper caught" "mutant rc $BF_RC, stub log [$(cat "$bf_log")]"
+    bad "BF mutation: forwarding exec is caught" "mutant rc $BF_RC, stub log [$(cat "$bf_log")]"
   fi
 else
-  bad "BF mutation: forward-all wrapper caught" "could not build the mutant wrapper"
+  bad "BF mutation: forwarding exec is caught" "could not build the mutant wrapper"
 fi
 
 # ── regression guard: the tool must stay clear of known bash-4 syntax ─────────
