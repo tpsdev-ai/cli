@@ -514,28 +514,32 @@ describe("cli#1020 — the driver's settled read decision", () => {
 describe("cli#1027 — a killed gateway is reported as not stopped gracefully", () => {
   it("reports the stub that ignores SIGTERM and ends on SIGKILL, not a count of 0", async () => {
     const node = process.env.TPS_LANE_NODE || "node";
-    const stub = spawn(
-      node,
-      [
-        "--input-type=module",
-        "-e",
-        'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); setInterval(() => {}, 1000);',
-      ],
-      { stdio: ["ignore", "pipe", "pipe"] },
-    );
+    // The temp root exists before the stub does, so a throw while creating the
+    // fixture cannot leave the stub (which ignores SIGTERM) running: the stub is
+    // spawned inside the try, and the finally kills the child it started.
     const root = mkdtempSync(join(tmpdir(), "tps-killed-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
     try {
+      stub = spawn(
+        node,
+        [
+          "--input-type=module",
+          "-e",
+          'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); setInterval(() => {}, 1000);',
+        ],
+        { stdio: ["ignore", "pipe", "pipe"] },
+      );
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => reject(new Error("stub gateway never booted")), 5_000);
-        stub.stdout.once("data", () => {
+        stub!.stdout.once("data", () => {
           clearTimeout(timer);
           resolve();
         });
-        stub.once("error", (err) => {
+        stub!.once("error", (err) => {
           clearTimeout(timer);
           reject(err);
         });
-        stub.once("exit", () => {
+        stub!.once("exit", () => {
           clearTimeout(timer);
           reject(new Error("stub gateway exited before it booted"));
         });
@@ -562,6 +566,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
         stopSignal: null as string | null,
         ackLanded: true,
         ackTimedOut: false,
+        finalizedMarker: undefined as string | undefined,
       };
       const reportPath = join(root, "report.json");
 
@@ -571,6 +576,10 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
         mailDir,
         reportPath,
         stopDeadlineMs: 200,
+        beforeWrite: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          report.finalizedMarker = "before-write-ran";
+        },
       });
       expect(stop.stopped).toBe(true);
       expect(stop.stoppedGracefully).toBe(false);
@@ -583,10 +592,32 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
       expect(written.settledRead).toBe(false);
       expect(written.readErrors.join("; ")).toContain("did not stop gracefully");
       expect(written.replyCountAfterStop).toBeUndefined();
+      // Finalization is the beforeWrite work, and a refused settled read must not
+      // skip it: the async marker the callback adds is in the file on disk.
+      expect(written.finalizedMarker).toBe("before-write-ran");
+
+      // The consumer's own assertion, over the report.json read back. The settled
+      // listing is main()'s unread initial state ([]), so the message must name
+      // the stop decision, not a bare count of 0.
+      const consumerReport = ackedReport();
+      consumerReport.settledRead = written.settledRead;
+      consumerReport.readErrors = written.readErrors;
+      consumerReport.curEntriesSettled = [];
+      let message = "";
+      try {
+        expectGatewayReport(consumerReport);
+      } catch (err) {
+        message = String((err as Error).message);
+      }
+      expect(message).toContain("the settled state was not read:");
+      expect(message).toContain("did not stop gracefully");
+      expect(message).not.toContain("found 0");
     } finally {
-      if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
-      if (stub.exitCode === null && stub.signalCode === null) {
-        await new Promise((resolve) => stub.once("exit", resolve));
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
       }
       rmSync(root, { recursive: true, force: true });
     }
