@@ -1368,7 +1368,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
   /**
    * cli#1006 r10: push cur/ past the 4096-name scan limit with unrelated,
    * well-formed entries. Each carries a terminal stamp, so startup's cur/
-   * sweep leaves it in place (an unacked one is re-dispatched or quarantined).
+   * sweep leaves it in place.
    */
   function exceedCurScanLimit(): void {
     const dir = resolve(tempMailDir, AGENT, "cur");

@@ -1998,7 +1998,8 @@ function findCurPath(
       if (!name.endsWith(".json")) continue;
       const p = resolve(curDir, name);
       // Past the limit a read error on an unrelated entry cannot establish
-      // absence, and a match settles the question: scan without reporting it.
+      // absence, and a single match settles the question (a second reports
+      // AMBIGUOUS_ID): scan without reporting unrelated errors.
       const rec = readMailFile(p, beyondLimit ? undefined : onReadError);
       if (rec?.id !== inboundId) continue;
       if (!onReadError) return p;
@@ -3061,8 +3062,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           // own. A REPORTED lookup error is not a MISSING cur/: an unreadable or
           // malformed file, SCAN_LIMIT or AMBIGUOUS_ID leaves the obligation
           // untouched. Above the scan limit findCurPath does not report unrelated
-          // read errors, so a matching entry beyond the limit still proves
-          // presence and startup proceeds. An absent lookup passes no path: a
+          // read errors, so a single matching entry beyond the limit still proves
+          // presence and startup proceeds (two matches report AMBIGUOUS_ID). An
+          // absent lookup passes no path: a
           // record at the conventional name for another message id proves
           // nothing, so it must not suppress missing-entry recovery.
           const lookup = startupCurLookups.get(rec.inboundId) ?? lookupOpenObligationCur(rec.inboundId);
