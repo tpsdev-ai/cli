@@ -17,7 +17,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
-import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
+import { spawnLiveProcess, spawnSigtermRecorder, waitForReadyLine } from "../../../test/helpers/live-process.js";
 import {
   forcePsStartTokens,
   PS_START_TOKENS_NODE_ARGS,
@@ -32,7 +32,7 @@ import { readPidFile } from "../src/utils/pid-file.js";
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 /** An intentionally non-UTC POSIX zone (UTC+13:17). */
 const ODD_ZONE_ENV = { ...process.env, TZ: "XST-13:17" };
-const GUIDANCE = "inspect the owner process and remove the lock only after confirming no delivery is active";
+const GUIDANCE = "pause every process that acquires or reclaims this lock, confirm no delivery is active, remove the lock, and only then resume them";
 
 /** The `ps:` text an unpinned writer in a non-UTC zone would have recorded. */
 function legacyPsToken(pid: number): string {
@@ -126,6 +126,29 @@ describe("outbox per-delivery lock", () => {
     expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
   });
 
+  test("the outbox refusal for an unverifiable owner of this very pid tells the operator to pause, confirm and resume", () => {
+    process.env.HOME = root;
+    const deliveryId = "c".repeat(64);
+    const lockDir = join(root, ".tps", "outbox", "new", `.github-${deliveryId}.lock`);
+    mkdirSync(lockDir, { recursive: true });
+    const ownerFile = join(lockDir, "owner.json");
+    const owner = { pid: process.pid, startToken: "ps:Tue Nov 17 02:39:30 2026" };
+    writeFileSync(ownerFile, JSON.stringify(owner));
+
+    let thrown: unknown;
+    try {
+      queueOutboxMessage("agent-a", "body", "agent-a", deliveryId);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(OutboxLockError);
+    const message = (thrown as Error).message;
+    expect(message).toContain("pause every process that acquires or reclaims this lock");
+    expect(message).toContain("confirm no delivery is active");
+    expect(message).toContain("remove the lock, and only then resume them");
+    expect(JSON.parse(readFileSync(ownerFile, "utf-8"))).toEqual(owner);
+  });
+
   test("a reclaim that meets a live unverifiable owner reports the guidance and keeps the record", () => {
     process.env.HOME = root;
     const reaped = spawnSync(process.execPath, ["-e", ""]).pid as number;
@@ -173,12 +196,19 @@ describe("pid files", () => {
     expect(readFileSync(path, "utf-8")).toBe(bytes);
   });
 
-  test("mail relay stop refuses a recorded ps: token it cannot compare and signals nothing", () => {
+  test("mail relay stop refuses a recorded ps: token it cannot compare and signals nothing", async () => {
     const node = Bun.which("node");
     if (!node) throw new Error("Node is required for the mail relay stop subprocess test");
     process.env.HOME = root;
     mkdirSync(join(root, ".tps"), { recursive: true });
-    const pid = livePid();
+    // The recorder installs its SIGTERM handler before it reports ready, and
+    // stays alive on SIGTERM, so the marker proves whether stop signalled it.
+    const marker = join(root, "sigterm.log");
+    const recorder = spawnSigtermRecorder(marker);
+    child = recorder;
+    const pid = recorder.pid as number;
+    expect(pid).toBeGreaterThan(0);
+    expect(await waitForReadyLine(recorder)).toBe(true);
     const legacy = legacyPsToken(pid);
     const pinned = pinnedPsToken(pid);
     expect(legacy).not.toBe(pinned);
@@ -217,6 +247,7 @@ describe("pid files", () => {
     expect(result.status).not.toBe(0);
     expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).toContain("identity cannot be verified");
     expect(readFileSync(path, "utf-8")).toBe(bytes);
+    expect(existsSync(marker) ? readFileSync(marker, "utf-8") : "").toBe("");
     expect(() => process.kill(pid, 0)).not.toThrow();
     expect(existsSync(path)).toBe(true);
   }, 30_000);

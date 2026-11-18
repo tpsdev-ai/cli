@@ -178,6 +178,12 @@ describe("classifyOwnerToken: one rule for a live pid's current and recorded tok
     expect(classifyOwnerToken("other:2", "other:1")).toBe("unverifiable");
     expect(classifyOwnerToken("2", "1")).toBe("unverifiable");
   });
+
+  test("a bare proc label or an empty proc: value is unverifiable against a live proc: token", () => {
+    expect(classifyOwnerToken("proc:4242", "proc")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc", "proc:4242")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc:4242", "proc:")).toBe("unverifiable");
+  });
 });
 
 describe("ownerState: a live owner is never reclaimed on a ps: mismatch alone", () => {

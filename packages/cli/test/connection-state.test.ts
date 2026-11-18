@@ -308,6 +308,17 @@ describe("connection-state", () => {
     expect(readRecord<HostConnectionState>(path)?.lastHeartbeatAck).toBe("next");
   });
 
+  test("claimHostStateAt leaves a recorded bare proc label unverifiable instead of reclaiming it", () => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-claim-bare-proc-"));
+    process.env.HOME = home;
+    const path = hostStatePath("x");
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: "proc" });
+    const raw = readFileSync(path);
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a" }, "conn-a", undefined, 0, { startToken: () => "proc:4242" });
+    expect(outcome).toEqual({ kind: "unverifiable" });
+    expect(readFileSync(path)).toEqual(raw);
+  });
+
   test.each([
     ["matching", "ps:Tue Nov 17 02:39:30 2026", "other"],
     ["different", "ps:Tue Nov 17 10:39:30 2026", "unverifiable"],

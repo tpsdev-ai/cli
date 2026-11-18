@@ -73,7 +73,7 @@ function claimLock(lockDir: string, myToken: string | null): boolean {
 
 /** Guidance for an unverifiable owner: the caller must decide by hand, never
  *  by age. */
-const UNVERIFIABLE_OWNER_GUIDANCE = "; inspect the owner process and remove the lock only after confirming no delivery is active";
+const UNVERIFIABLE_OWNER_GUIDANCE = "; pause every process that acquires or reclaims this lock, confirm no delivery is active, remove the lock, and only then resume them";
 
 export class MailLockOwnerError extends Error {
   constructor(lockDir: string, guidance?: string) {
