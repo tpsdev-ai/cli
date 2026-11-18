@@ -1637,8 +1637,8 @@ export async function connectAndKeepAlive(
         // attempt the write when the record is absent or
         // is verified as owned by this connection, or when its recorded process
         // is not running or carries a different `proc:` token (pid reuse).
-        // `ps:` mismatches are unverifiable: their text depends on the reader's
-        // TZ and locale. Either write can fail on the filesystem.
+        // `ps:` mismatches are unverifiable: a record written before cli#1045 may
+        // hold local-time text. Either write can fail on the filesystem.
         // `claimedRecord` tells the two apart.
         const claim = () => {
           if (!claimedRecord) {

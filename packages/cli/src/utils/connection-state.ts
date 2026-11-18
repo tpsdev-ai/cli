@@ -298,8 +298,8 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
  * record lock, while the optional `shouldWrite` gate holds, read the record and
  * attempt the write when it is absent, is verified as owned by this connection,
  * or belongs to a connection whose recorded process is not running or carries
- * a different `proc:` token (pid reuse). `ps:` mismatches are unverifiable:
- * their text depends on the reader's TZ and locale. Filesystem failure can throw.
+ * a different `proc:` token (pid reuse). `ps:` mismatches are unverifiable: a
+ * record written before cli#1045 may hold local-time text. Filesystem failure can throw.
  * An invalid, unreadable or unverifiable record is left as it is.
  * The absent case differs from a refresh: a reconnect may re-establish a record
  * that was removed.
@@ -418,8 +418,8 @@ function tokenSource(token: string): string {
  * Whether the process that wrote a record is still the one running under its
  * pid. "gone": the pid is gone, or a live pid carries a different `proc:`
  * token (pid reuse). A changed `proc:` record token is indistinguishable from
- * pid reuse. A live `ps:` mismatch is unknown because its text depends on the
- * reader's TZ and locale. For a live pid, missing, unreadable or
+ * pid reuse. A live `ps:` mismatch is unknown because a record written before
+ * cli#1045 may hold local-time text. For a live pid, missing, unreadable or
  * different-source tokens are also unknown; unknown never licenses a write.
  */
 function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
@@ -451,7 +451,7 @@ type HostRecordClaim =
  * Ownership for a reconnect claim: the rule in `hostRecordOwnership`, plus a
  * record owned by another connection is claimable when its recorded process is
  * not running or carries a different `proc:` token (pid reuse). `ps:` mismatches
- * are unverifiable because their text depends on the reader's TZ and locale.
+ * are unverifiable because a record written before cli#1045 may hold local-time text.
  * The read and the liveness check run under the caller's record
  * lock, so the evidence and the write share one hold. Cross-environment
  * exclusivity of that lock depends on cli#1045.
