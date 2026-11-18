@@ -166,9 +166,9 @@ export type OwnerTokenState = "alive" | "dead" | "unverifiable";
 /**
  * The one rule for comparing a LIVE pid's current start token with the token
  * recorded for it (cli#1045). The agent mail lock and pid files, the cli outbox
- * per-delivery lock, pid files and launch snapshot sweep use it; host-state
- * ownership and released-agent identity still compare tokens directly. A gone
- * pid is the caller's to classify (dead) before it gets here.
+ * per-delivery lock, pid files, launch snapshot sweep, host-state ownership
+ * and released-agent identity use it. A gone pid is the caller's to classify
+ * (dead) before it gets here.
  *
  * "alive" — the tokens are equal.
  * "unverifiable" — the tokens come from different sources (`proc:` vs `ps:`),

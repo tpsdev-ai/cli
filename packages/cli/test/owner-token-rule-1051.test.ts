@@ -141,6 +141,8 @@ describe("pid files", () => {
   });
 
   test("mail relay stop refuses a recorded ps: token it cannot compare and signals nothing", () => {
+    const node = Bun.which("node");
+    if (!node) throw new Error("Node is required for the mail relay stop subprocess test");
     process.env.HOME = root;
     mkdirSync(join(root, ".tps"), { recursive: true });
     const pid = livePid();
@@ -151,10 +153,20 @@ describe("pid files", () => {
     writeFileSync(path, bytes);
 
     const result = spawnSync(
-      process.execPath,
-      [...PS_START_TOKENS_NODE_ARGS, TPS_BIN, "mail", "relay", "stop"],
+      node,
+      [
+        ...PS_START_TOKENS_NODE_ARGS,
+        "--import",
+        "data:text/javascript,console.log('owner-token-runtime:'+process.release.name+':'+Boolean(process.versions.bun))",
+        TPS_BIN,
+        "mail",
+        "relay",
+        "stop",
+      ],
       { env: { ...process.env, HOME: root }, encoding: "utf-8", timeout: 30_000 },
     );
+    if (result.error) throw result.error;
+    expect(result.stdout).toContain("owner-token-runtime:node:false");
     expect(result.status).not.toBe(0);
     expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).toContain("identity cannot be verified");
     expect(readFileSync(path, "utf-8")).toBe(bytes);
