@@ -1,4 +1,4 @@
-- **A stuck reply obligation is retried in-process, and same-state writes no longer overwrite each other (#1059).**
+- **A stuck reply obligation is retried in-process, and same-state decision writes no longer overwrite each other (#1059).**
   A deadline that hits a lookup error, or a re-arm that does not land, now
   rechecks at 1 s, 4 s and 16 s; each check re-reads the record and the receipt
   evidence, and the cap logs one `obligation-retry-exhausted` warning, leaves

@@ -1652,7 +1652,8 @@ type ArmDeadlineOutcome =
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt, reporting
  *  whether a timer was armed. cli#1059: a caller must be able to tell a failed
- *  arm from a silent refusal, so a live record never waits for a restart. */
+ *  arm from a silent refusal, so it can schedule another attempt instead of
+ *  leaving a live record without a timer. */
 function armDeadline(
   ctx: YieldContext,
   obligationId: string,
