@@ -146,7 +146,7 @@ function expectGatewayReport(r: Report): void {
   expectSettledStateRead(r);
   expect(r.stopped).toBe(true);
   expect(r.stoppedGracefully).toBe(true);
-  expect(r.stopSignal).toBeNull();
+  expect([null, "SIGTERM"]).toContain(r.stopSignal);
   expectOneSettledCurEntry(r.curEntriesSettled, {
     inboundId: r.inboundId!,
     inboundName: r.inboundName!,
@@ -481,9 +481,18 @@ describe("cli#1020 — the driver's settled read decision", () => {
 
   it("skips the read and names a gateway killed after the stop deadline", () => {
     for (const ackLanded of [false, true]) {
-      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, ackLanded })).toEqual({
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, stopSignal: "SIGKILL", ackLanded })).toEqual({
         read: false,
-        readError: "gateway did not stop gracefully (it was killed after the stop deadline); settled state not read",
+        readError: "gateway did not stop gracefully (signal SIGKILL); settled state not read",
+      });
+    }
+  });
+
+  it("names the signal it observed instead of a fixed cause", () => {
+    for (const stopSignal of ["SIGTERM", "SIGHUP", "SIGKILL"]) {
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, stopSignal, ackLanded: true })).toEqual({
+        read: false,
+        readError: `gateway did not stop gracefully (signal ${stopSignal}); settled state not read`,
       });
     }
   });
@@ -826,3 +835,78 @@ describe("cli#1027 — beforeWrite runs after the stop and the settled read", ()
     }
   }, 15_000);
 });
+
+describe("cli#1034 — a gateway that exits on its first SIGTERM is reported as stopped gracefully", () => {
+  it("records SIGTERM, reads the settled listing and satisfies the consumer", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sigterm-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      // No SIGTERM handler: the child is terminated by the first signal.
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+
+      const mailDir = join(root, "mail");
+      for (const dir of [
+        join(mailDir, "agent-a", "new"),
+        join(mailDir, "agent-a", "cur"),
+        join(mailDir, "agent-a", ".obligations"),
+        join(mailDir, "agent-b", "new"),
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const report = {
+        readErrors: [] as string[],
+        inboundId: null as string | null,
+        inboundName: null as string | null,
+        settledRead: false,
+        stopped: false,
+        stoppedGracefully: false,
+        stopSignal: null as string | null,
+        ackLanded: true,
+        ackTimedOut: false,
+      };
+      const reportPath = join(root, "report.json");
+
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir,
+        reportPath,
+        stopDeadlineMs: 5_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(true);
+      expect(stop.signalCode).toBe("SIGTERM");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(true);
+      expect(written.stopSignal).toBe("SIGTERM");
+      expect(written.settledRead).toBe(true);
+      expect(written.replyCountAfterStop).toBe(0);
+      expect(written.readErrors).toEqual([]);
+
+      const consumerReport = ackedReport();
+      consumerReport.stoppedGracefully = written.stoppedGracefully;
+      consumerReport.stopSignal = written.stopSignal;
+      consumerReport.settledRead = written.settledRead;
+      consumerReport.readErrors = written.readErrors;
+      expectGatewayReport(consumerReport);
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("rejects a SIGKILL stop signal", () => {
+    const report = ackedReport();
+    report.stopSignal = "SIGKILL";
+    expect(() => expectGatewayReport(report)).toThrow();
+  });
+});
+

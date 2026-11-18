@@ -33,11 +33,11 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function decideSettledRead({ stopped, stoppedGracefully = true, ackLanded, ackTimedOut, error }) {
+export function decideSettledRead({ stopped, stoppedGracefully = true, stopSignal = null, ackLanded, ackTimedOut, error }) {
   if (stopped && !stoppedGracefully) {
     return {
       read: false,
-      readError: "gateway did not stop gracefully (it was killed after the stop deadline); settled state not read",
+      readError: `gateway did not stop gracefully (signal ${stopSignal ?? "unknown"}); settled state not read`,
     };
   }
   if (stopped && ackLanded) return { read: true, readError: null };
@@ -60,16 +60,19 @@ function waitForExit(child, deadlineMs) {
 
 /**
  * Stop a gateway child: SIGTERM, then SIGKILL after the budget. Signal death
- * leaves `exitCode` null, so a process that ended on SIGKILL is still stopped
- * (dead, no writer left) but not stopped GRACEFULLY.
+ * leaves `exitCode` null. A child that exits within the SIGTERM budget without
+ * SIGKILL being sent stopped GRACEFULLY; this makes no claim that application
+ * cleanup ran. A child that needed SIGKILL did not.
  */
 export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
+  let sigkillSent = false;
   if (child) {
     if (child.exitCode === null && child.signalCode === null) {
       child.kill("SIGTERM");
       await waitForExit(child, deadlineMs);
     }
     if (child.exitCode === null && child.signalCode === null) {
+      sigkillSent = true;
       child.kill("SIGKILL");
       await waitForExit(child, deadlineMs);
     }
@@ -78,7 +81,7 @@ export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
   const signalCode = child?.signalCode ?? null;
   return {
     stopped: !child || exitCode !== null || signalCode !== null,
-    stoppedGracefully: !child || exitCode !== null,
+    stoppedGracefully: !child || (!sigkillSent && (exitCode !== null || signalCode !== null)),
     exitCode,
     signalCode,
   };
