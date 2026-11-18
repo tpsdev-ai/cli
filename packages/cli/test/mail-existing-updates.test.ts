@@ -118,7 +118,9 @@ for (const operation of ["ack", "ack-id", "sent", "nack-transient", "nack-agent"
       let recordRead = args[0] === target;
       if (!recordRead && typeof args[0] === "number") {
         try {
-          recordRead = fs.fstatSync(args[0]).ino === fs.lstatSync(target).ino;
+          const opened = fs.fstatSync(args[0]);
+          const entry = fs.lstatSync(target);
+          recordRead = opened.dev === entry.dev && opened.ino === entry.ino;
         } catch {
           recordRead = false;
         }

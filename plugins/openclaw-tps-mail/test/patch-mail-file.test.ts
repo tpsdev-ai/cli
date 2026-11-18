@@ -38,7 +38,9 @@ mock.module("node:fs", () => ({
       for (const candidate of [removeAfterRead, readFailure, stampOnRead?.path]) {
         if (candidate === undefined) continue;
         try {
-          if (realFs.fstatSync(target).ino === realFs.lstatSync(candidate).ino) { target = candidate; break; }
+          const opened = realFs.fstatSync(target);
+          const entry = realFs.lstatSync(candidate);
+          if (opened.dev === entry.dev && opened.ino === entry.ino) { target = candidate; break; }
         } catch {}
       }
     }

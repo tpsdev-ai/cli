@@ -142,6 +142,7 @@ test("acks share a directory sweep until the interval expires", () => {
     const leftover = join(cur, scratchName());
     fs.writeFileSync(leftover, "partial");
     makeOld(leftover, base);
+    expect(fs.statSync(leftover).mtimeMs).toBe(base - 24 * 60 * 60 * 1000);
     const ack = (path: string) => {
       fs.writeFileSync(path, JSON.stringify({ id: "bounded", body: "hello", read: false }));
       expect(mail.ackMessageAtPath(path, dirname(dirname(path))).read).toBe(true);
@@ -156,6 +157,7 @@ test("acks share a directory sweep until the interval expires", () => {
     const otherLeftover = join(otherDir, scratchName());
     fs.writeFileSync(otherLeftover, "partial");
     makeOld(otherLeftover, base);
+    expect(fs.statSync(otherLeftover).mtimeMs).toBe(base - 24 * 60 * 60 * 1000);
     ack(join(otherDir, "record.json"));
     expect(fs.existsSync(otherLeftover)).toBe(false);
     expect(fs.existsSync(leftover)).toBe(true);

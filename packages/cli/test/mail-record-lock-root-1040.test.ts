@@ -384,7 +384,7 @@ test("a normal record in a mailbox named cur still updates", () => {
   expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
 });
 
-test("a record swapped for a symlink between the check and the read is refused without reading the target", () => {
+test("a record swapped for a symlink before open is refused without reading the target", () => {
   const inbox = getInbox("mailbox-a");
   const other = getInbox("mailbox-b");
   const target = join(inbox.cur, "record.json");
@@ -396,7 +396,7 @@ test("a record swapped for a symlink between the check and the read is refused w
   const reads: string[] = [];
   const realRead = fs.readFileSync;
   spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
-    if (String(path) === elsewhere) reads.push(String(path));
+    if (String(path) === target || String(path) === elsewhere) reads.push(String(path));
     return (realRead as (...args: unknown[]) => unknown)(path, ...rest);
   }) as typeof fs.readFileSync);
   const mutations: string[] = [];
@@ -419,6 +419,64 @@ test("a record swapped for a symlink between the check and the read is refused w
   expect(mutations).toEqual([]);
   expect(fs.readlinkSync(target)).toBe(elsewhere);
   expect(fs.readFileSync(elsewhere, "utf8")).toBe(targetBytes);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record swapped for a symlink after open reads the original descriptor and refuses the update", () => {
+  const inbox = getInbox("mailbox-a");
+  const other = getInbox("mailbox-b");
+  const target = join(inbox.cur, "record.json");
+  const saved = join(inbox.cur, "original.json");
+  const elsewhere = join(other.cur, "target.json");
+  plantRecord(target, "record-id");
+  plantRecord(elsewhere, "target-id");
+  const originalBytes = fs.readFileSync(target, "utf8");
+  const targetBytes = fs.readFileSync(elsewhere, "utf8");
+
+  let recordFd: number | undefined;
+  const descriptorBytes: unknown[] = [];
+  const pathReads: string[] = [];
+  const scratchOpens: string[] = [];
+  const realOpen = fs.openSync;
+  const realRead = fs.readFileSync;
+  // Pause in the test wrapper after the real no-follow open, before its fd
+  // reaches the updater's read. The descriptor still names the original file.
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path).includes(".ack-")) scratchOpens.push(String(path));
+    const fd = (realOpen as (...args: unknown[]) => number)(path, ...rest);
+    if (String(path) === target && rest[0] === (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)) {
+      recordFd = fd;
+      fs.renameSync(target, saved);
+      fs.symlinkSync(elsewhere, target);
+    }
+    return fd;
+  }) as typeof fs.openSync);
+  spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path) === target || String(path) === elsewhere) pathReads.push(String(path));
+    const bytes = (realRead as (...args: unknown[]) => unknown)(path, ...rest);
+    if (typeof path === "number" && path === recordFd) descriptorBytes.push(bytes);
+    return bytes;
+  }) as typeof fs.readFileSync);
+  const records: unknown[] = [];
+
+  expect(() =>
+    updateExistingRecord(target, (record: { read: boolean }) => {
+      records.push(record);
+      return { ...record, read: true };
+    }, { mailboxRoot: inbox.root }),
+  ).toThrow(MailRecordFileTypeError);
+
+  expect(recordFd).toBeDefined();
+  expect(pathReads).toEqual([]);
+  expect(descriptorBytes).toEqual([originalBytes]);
+  expect(records).toEqual([JSON.parse(originalBytes)]);
+  expect(scratchOpens).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(elsewhere);
+  expect(realRead(saved, "utf8")).toBe(originalBytes);
+  expect(realRead(elsewhere, "utf8")).toBe(targetBytes);
   expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
   const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
   expect(lock).not.toBeNull();

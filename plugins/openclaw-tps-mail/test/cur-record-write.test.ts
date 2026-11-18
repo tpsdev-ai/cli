@@ -31,7 +31,9 @@ mock.module("node:fs", () => ({
     let curTarget = args[0];
     if (typeof curTarget === "number" && curReadFailure !== undefined) {
       try {
-        if (realFs.fstatSync(curTarget).ino === realFs.lstatSync(curReadFailure).ino) curTarget = curReadFailure;
+        const opened = realFs.fstatSync(curTarget);
+        const entry = realFs.lstatSync(curReadFailure);
+        if (opened.dev === entry.dev && opened.ino === entry.ino) curTarget = curReadFailure;
       } catch {}
     }
     if (curTarget === curReadFailure && ++curReads >= curReadsUntilFailure) {

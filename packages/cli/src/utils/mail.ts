@@ -571,8 +571,10 @@ export function updateExistingRecord<T extends object>(
     removeLeftoverAckScratch(root, recordDir);
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     mailRecordFileTestHooks.beforeOpen?.(path);
-    // Open without following a symlink and read through that descriptor: a
-    // record swapped for a symlink after the check above must not be read.
+    // Open without following a symlink: its target is not read. After a
+    // successful open, read the original file through its descriptor.
+    // Path checks treat a missing entry as gone and refuse an existing
+    // nonregular entry with MailRecordFileTypeError.
     let recordFd: number;
     try {
       recordFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
