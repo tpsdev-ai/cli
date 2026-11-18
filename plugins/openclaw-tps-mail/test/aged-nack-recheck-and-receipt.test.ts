@@ -94,8 +94,8 @@ describe("owed-nack retention", () => {
     const done = join(mailDir, "done");
     const writer = join(mailDir, "writer.mjs");
     realFs.writeFileSync(writer, `
-      import { readFileSync, writeFileSync } from "node:fs";
-      import { updateExistingRecord } from ${JSON.stringify(import.meta.resolve("@tpsdev-ai/cli/utils/mail"))};
+      import { readFileSync, renameSync, writeFileSync } from "node:fs";
+      import { acquireMailLockSync } from ${JSON.stringify(import.meta.resolve("@tpsdev-ai/agent"))};
       const wait = (p) => {
         const end = Date.now() + 10000;
         for (;;) {
@@ -104,14 +104,20 @@ describe("owed-nack retention", () => {
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
         }
       };
-      updateExistingRecord(${JSON.stringify(path)}, (record) => {
+      const lock = acquireMailLockSync(${JSON.stringify(join(mailDir, AGENT))});
+      if (!lock) throw new Error("obligation store is busy");
+      try {
+        const record = JSON.parse(readFileSync(${JSON.stringify(path)}, "utf8"));
         writeFileSync(${JSON.stringify(ready)}, "ready");
         wait(${JSON.stringify(go)});
-        return { ...record, lastTransitionAt: new Date().toISOString(), nackPending: true };
-      }, { afterWrite: () => {
+        const updated = { ...record, lastTransitionAt: new Date().toISOString(), nackPending: true };
+        writeFileSync(${JSON.stringify(path)} + ".tmp", JSON.stringify(updated, null, 2));
+        renameSync(${JSON.stringify(path)} + ".tmp", ${JSON.stringify(path)});
         writeFileSync(${JSON.stringify(landed)}, "landed");
         wait(${JSON.stringify(done)});
-      } });
+      } finally {
+        lock.release();
+      }
     `);
     const child = spawn(process.execPath, [writer], { stdio: ["ignore", "ignore", "inherit"] });
     const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));

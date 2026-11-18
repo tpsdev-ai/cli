@@ -55,7 +55,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath, isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
@@ -648,7 +648,7 @@ type CurRecordUpdate =
   | { ok: true }
   | { ok: false; reason: "record-missing" | "write-failed"; path: string; code?: string };
 
-export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey: "ackedAt" | "nackedAt" | undefined, inboundId: string): CurRecordUpdate {
+export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKey: "ackedAt" | "nackedAt" | undefined, inboundId: string, mailboxRoot: string): CurRecordUpdate {
   try {
     let alreadyStamped = false;
     const r = updateExistingRecord<TpsMailBody>(path, (current) => {
@@ -660,15 +660,15 @@ export function patchMailFile(path: string, patch: Partial<TpsMailBody>, stampKe
         return null;
       }
       return Object.assign(current, patch);
-    }, { withholdPlacement: true });
+    }, { mailboxRoot, withholdPlacement: true });
     if (r.status === "changed" && alreadyStamped) return { ok: true };
     if (r.status === "withheld") return { ok: false, reason: "write-failed", path, code: "PLACEMENT_WITHHELD" };
     if (r.status === "updated") return { ok: true };
     if (r.status === "gone") return { ok: false, reason: "record-missing", path, code: "ENOENT" };
     return { ok: false, reason: "write-failed", path, code: undefined };
   } catch (err: any) {
-    return { ok: false, reason: "write-failed", path: typeof err?.path === "string" && (err.path === mailLockPath(dirname(dirname(path))) || err.path.startsWith(`${mailLockPath(dirname(dirname(path)))}.`))
-      ? mailLockPath(dirname(dirname(path))) : path, code: typeof err?.code === "string" ? err.code : undefined };
+    return { ok: false, reason: "write-failed", path: typeof err?.path === "string" && (err.path === mailLockPath(mailboxRoot) || err.path.startsWith(`${mailLockPath(mailboxRoot)}.`))
+      ? mailLockPath(mailboxRoot) : path, code: typeof err?.code === "string" ? err.code : undefined };
   }
 }
 
@@ -707,7 +707,7 @@ export function reconcileTerminalCurStamps(mailDir: string, agent: string, log: 
     const patch = kind === "ack"
       ? { ackedAt: new Date().toISOString(), read: true }
       : { nackedAt: new Date().toISOString(), nackReason: rec.failure ?? "failed" };
-    const r = patchMailFile(curPath, patch, key, rec.inboundId);
+    const r = patchMailFile(curPath, patch, key, rec.inboundId, join(mailDir, agent));
     if (r.ok) log?.info?.(`tps-mail: reconciled the ${kind} stamp for ${rec.inboundId} at ${curPath}`);
     else {
       unknownInbounds.add(rec.inboundId);
@@ -1039,7 +1039,7 @@ function stampTerminalCur(
   attempt = 0,
 ): void {
   const key = kind === "ack" ? "ackedAt" : "nackedAt";
-  const stamped = patchMailFile(ctx.curPath, patch, key, ctx.inboundId);
+  const stamped = patchMailFile(ctx.curPath, patch, key, ctx.inboundId, join(ctx.mailDir, ctx.agent));
   if (stamped.ok) {
     if (attempt > 0) ctx.log?.info?.(`tps-mail: ${kind}-stamp-retry-ok: ${ctx.inboundId} at ${ctx.curPath} (retry ${attempt})`);
     return;
@@ -1134,7 +1134,7 @@ async function internalInbound(ctx: YieldContext): Promise<boolean> {
     if (!record) return false;
     if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     const recovered = record.envelope
-      ? await recoverPromoted(ctx.agent, ctx.curPath, {}, { waitForLock: true })
+      ? await recoverPromoted(ctx.agent, ctx.curPath, {}, { waitForLock: true, mailboxRoot: join(ctx.mailDir, ctx.agent) })
       : await verifyRecordForMailbox(ctx.agent, record as any, mailRootForRecordPath(ctx.curPath));
     if (!record.envelope && curPlacementRefusal(ctx.curPath, undefined) !== null) return false;
     if (!isLiveContext(ctx) || !recovered.ok || recovered.message.trustTier === "external") return false;
@@ -2297,7 +2297,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
     async function recoverUnackedCurRecord(recipient: string, curPath: string, record: TpsMailBody): Promise<void> {
       try {
         if (!isLive()) return;
-        const recovered = await recoverPromoted(recipient, curPath, {}, { claim: recipient });
+        const recovered = await recoverPromoted(recipient, curPath, {}, { claim: recipient, mailboxRoot: join(account.mailDir, recipient) });
         if (!isLive()) return;
         if (!recovered.ok) {
           log?.warn?.(
