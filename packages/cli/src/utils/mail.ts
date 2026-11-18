@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
+import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -323,9 +323,9 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
  * Whether two paths resolve to the same filesystem object (same device and
  * inode); `updateExistingRecord` passes directories. Different spellings of one
  * directory (a symlink, or another letter case on a case-insensitive volume)
- * match when they resolve to the same directory.
+ * match when they resolve to the same directory; identities are compared exactly, as bigint.
  */
-export function sameDirectory(a: string, b: string, stat: (path: string) => Stats = statSync): boolean {
+export function sameDirectory(a: string, b: string, stat: (path: string) => BigIntStats = (path) => statSync(path, { bigint: true })): boolean {
   const left = stat(a);
   const right = stat(b);
   return left.dev === right.dev && left.ino === right.ino;

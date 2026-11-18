@@ -84,15 +84,24 @@ function refusal(update: () => unknown): MailRecordLockRootError {
 }
 
 test("sameDirectory compares device and inode, not path spelling", () => {
-  const stats = new Map<string, fs.Stats>([
-    ["/mail/a/cur", { dev: 7, ino: 42 } as fs.Stats],
-    ["/mail/a/CUR", { dev: 7, ino: 42 } as fs.Stats],
-    ["/mail/a/other", { dev: 7, ino: 43 } as fs.Stats],
-    ["/mail/b/cur", { dev: 8, ino: 42 } as fs.Stats],
+  const stats = new Map<string, fs.BigIntStats>([
+    ["/mail/a/cur", { dev: 7n, ino: 42n } as fs.BigIntStats],
+    ["/mail/a/CUR", { dev: 7n, ino: 42n } as fs.BigIntStats],
+    ["/mail/a/other", { dev: 7n, ino: 43n } as fs.BigIntStats],
+    ["/mail/b/cur", { dev: 8n, ino: 42n } as fs.BigIntStats],
   ]);
   const stat = (path: string) => stats.get(path)!;
   expect(sameDirectory("/mail/a/cur", "/mail/a/CUR", stat)).toBe(true);
   expect(sameDirectory("/mail/a/cur", "/mail/a/other", stat)).toBe(false);
+  expect(sameDirectory("/mail/a/cur", "/mail/b/cur", stat)).toBe(false);
+});
+
+test("sameDirectory distinguishes inodes above the safe-integer limit", () => {
+  const stats = new Map<string, fs.BigIntStats>([
+    ["/mail/a/cur", { dev: 7n, ino: 9007199254740992n } as fs.BigIntStats],
+    ["/mail/b/cur", { dev: 7n, ino: 9007199254740993n } as fs.BigIntStats],
+  ]);
+  const stat = (path: string) => stats.get(path)!;
   expect(sameDirectory("/mail/a/cur", "/mail/b/cur", stat)).toBe(false);
 });
 
