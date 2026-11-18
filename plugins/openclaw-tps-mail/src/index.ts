@@ -1632,6 +1632,28 @@ function scanObligationReceipt(
 
 const warnedObligationCurLookups = new Set<string>();
 
+/**
+ * Report a failed cur/ lookup for an obligation at most once per process for
+ * the same maildir, agent, inbound id AND error code: a later lookup that fails
+ * with a DIFFERENT code is still reported. The startup pass and the in-process
+ * deadline both go through this.
+ */
+function reportObligationCurLookupFailure(
+  mailDir: string,
+  agent: string,
+  inboundId: string,
+  obligationId: string,
+  code: string,
+  log: any,
+): void {
+  const key = `${resolve(mailDir, agent)}|${inboundId}|${code}`;
+  if (warnedObligationCurLookups.has(key)) return;
+  warnedObligationCurLookups.add(key);
+  log?.warn?.(
+    `tps-mail: obligation-cur-lookup-failed: obligation ${obligationId} for inbound ${inboundId}: the cur/ lookup failed (${code}); leaving the obligation untouched`,
+  );
+}
+
 /** The missing-file allowance requires a clean lookup at the decision point. */
 function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing" | "present" | "error" {
   const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
@@ -1646,11 +1668,7 @@ function lookupObligationCur(ctx: YieldContext, obligationId: string): "missing"
     error ??= code ?? "INVALID_JSON";
   });
   if (error !== undefined) {
-    const key = resolve(curDir, ctx.inboundId);
-    if (!warnedObligationCurLookups.has(key)) {
-      warnedObligationCurLookups.add(key);
-      ctx.log?.warn?.(`tps-mail: obligation-cur-lookup-failed: obligation ${obligationId} for inbound ${ctx.inboundId}: the cur/ lookup failed (${error}); leaving the obligation untouched`);
-    }
+    reportObligationCurLookupFailure(ctx.mailDir, ctx.agent, ctx.inboundId, obligationId, error, ctx.log);
     return "error";
   }
   if (found !== null) {
@@ -2837,6 +2855,46 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         } catch { /* ignore */ }
 
         const unknownInbounds = reconcileTerminalCurStamps(account.mailDir, agentId, log);
+        const curDir = resolve(account.mailDir, agentId, "cur");
+
+        // cli#1006 r16: resolve each OPEN obligation's cur/ lookup BEFORE the
+        // unacked-cur/ recovery is scheduled. An error REPORTED here keeps the
+        // sweep off that inbound — otherwise the sweep would reconcile, ack,
+        // arm or fail the very obligation the startup loop leaves untouched —
+        // and the loop below reuses this result instead of scanning twice. The
+        // scan is a snapshot: later filesystem changes are not covered.
+        const lookupOpenObligationCur = (inboundId: string): { curPath: string | null; error: string | null } => {
+          let lookupError: string | null = null;
+          const curPath = findCurPath(
+            account.mailDir,
+            agentId,
+            inboundId,
+            (path, code) => {
+              // Only the scan's clean signals — no matching entry, or the cur/
+              // directory itself absent — are a miss; a dangling cur/ symlink or
+              // a listed file that is gone is a read error.
+              if (code === "ENOENT" && path === curDir) return;
+              lookupError ??= code ?? "INVALID_JSON";
+            },
+            // cli#1006 r10: startup knows no cur/ path yet. Reading past the
+            // limit can still prove the entry is THERE; a miss still reports
+            // SCAN_LIMIT, because absence is not provable that way.
+            { presenceBeyondLimit: true },
+          );
+          return { curPath, error: lookupError };
+        };
+        const startupCurLookups = new Map<string, { curPath: string | null; error: string | null }>();
+        for (const rec of listObligations(account.mailDir, agentId)) {
+          if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
+          const lookup = lookupOpenObligationCur(rec.inboundId);
+          if (lookup.error !== null) {
+            unknownInbounds.add(rec.inboundId);
+            // Reported here, before the recovery sweep is scheduled: the loop
+            // below skips this inbound, so this is its one startup report.
+            reportObligationCurLookupFailure(account.mailDir, agentId, rec.inboundId, rec.obligationId, lookup.error, log);
+          }
+          startupCurLookups.set(rec.inboundId, lookup);
+        }
 
         // Crash recovery (at-least-once): re-dispatch cur/ records that were
         // promoted but never acked/nacked. cur/ is a DESTINATION, so the record
@@ -2846,7 +2904,6 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // other directory. recoverPromoted() enforces that and quarantines a
         // record that cannot prove provenance; a Flair outage defers to the next
         // start.
-        const curDir = resolve(account.mailDir, agentId, "cur");
         try {
           if (existsSync(curDir)) {
             for (const filename of readdirSync(curDir)) {
@@ -2949,33 +3006,22 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
-          // cli#1006 r2: a REPORTED lookup error is not a MISSING cur/. Only a
-          // clean scan that finds no matching id may take the missing-cur
-          // path; an unreadable or malformed file, SCAN_LIMIT or
-          // AMBIGUOUS_ID leaves the obligation untouched. Above the scan limit
-          // findCurPath does not report unrelated read errors, so a matching
-          // entry beyond the limit still proves presence and startup proceeds.
-          let curLookupError: string | null = null;
-          const recCurPath = findCurPath(
-            account.mailDir,
-            agentId,
-            rec.inboundId,
-            (path, code) => {
-              // Only the scan's clean signals — no matching entry, or the cur/
-              // directory itself absent — are a miss; a dangling cur/ symlink or
-              // a listed file that is gone is a read error.
-              if (code === "ENOENT" && path === curDir) return;
-              curLookupError ??= code ?? "INVALID_JSON";
-            },
-            // cli#1006 r10: startup knows no cur/ path yet. Reading past the
-            // limit can still prove the entry is THERE; a miss still reports
-            // SCAN_LIMIT, because absence is not provable that way.
-            { presenceBeyondLimit: true },
-          );
-          if (curLookupError) {
-            log?.warn?.(
-              `tps-mail: obligation-cur-lookup-failed: obligation ${rec.obligationId} for inbound ${rec.inboundId}: ` +
-                `the cur/ lookup failed (${curLookupError}); leaving the obligation untouched`,
+          // cli#1006 r16: the lookup resolved before the startup sweep is reused
+          // here; a record that appeared since (created by the sweep) gets its
+          // own. A REPORTED lookup error is not a MISSING cur/: an unreadable or
+          // malformed file, SCAN_LIMIT or AMBIGUOUS_ID leaves the obligation
+          // untouched. Above the scan limit findCurPath does not report unrelated
+          // read errors, so a matching entry beyond the limit still proves
+          // presence and startup proceeds.
+          const lookup = startupCurLookups.get(rec.inboundId) ?? lookupOpenObligationCur(rec.inboundId);
+          if (lookup.error !== null) {
+            reportObligationCurLookupFailure(
+              account.mailDir,
+              agentId,
+              rec.inboundId,
+              rec.obligationId,
+              lookup.error,
+              log,
             );
             continue;
           }
@@ -2984,7 +3030,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             agentId,
             rec.from,
             account.accountId,
-            recCurPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
+            lookup.curPath ?? resolve(account.mailDir, agentId, "cur", `${rec.inboundId}.json`),
             rec.inboundId,
             cfg,
             log,
