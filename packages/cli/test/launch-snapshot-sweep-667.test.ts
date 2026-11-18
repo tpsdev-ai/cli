@@ -28,6 +28,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { spawnLiveProcess } from "../../../test/helpers/live-process.js";
 import { processStartToken } from "@tpsdev-ai/agent";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 import { createPrivateLaunchDir, launchDirLabel } from "../src/utils/launch-attestation.js";
 import {
   LAUNCH_SNAPSHOT_OWNER_FILE,
@@ -140,7 +141,9 @@ describe("sweepStaleLaunchSnapshots", () => {
     }
   });
 
-  test("treats the current pid with a planted mismatched start token from the same source as dead", () => {
+  test("treats the current pid with a planted mismatched proc: start token as dead", () => {
+    // Only a kernel-stable `proc:` mismatch proves reuse (cli#1045); staged on every platform.
+    stageProcStartTokens();
     const fixture = makeFixture();
     try {
       const reused = makeSnapshot(fixture.launch, "config-reused");
@@ -213,6 +216,8 @@ describe("sweepStaleLaunchSnapshots", () => {
   });
 
   test("removes a pending snapshot whose recorded owner is dead and keeps one owned by a running process", async () => {
+    // The `reused` entry is a `proc:` mismatch, which proves reuse on every platform (cli#1045).
+    stageProcStartTokens();
     const fixture = makeFixture();
     const live = await liveProcess();
     try {

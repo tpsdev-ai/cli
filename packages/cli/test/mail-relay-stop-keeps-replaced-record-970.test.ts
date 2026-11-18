@@ -12,6 +12,7 @@ import { join } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runMail, setRelayStopRecordReader, setRelayStopSignal } from "../src/commands/mail.js";
 import { snapshotPidRecord } from "../src/utils/pid-file.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const CASE_TIMEOUT_MS = 20_000;
 const WAIT_DEADLINE_MS = 5_000;
@@ -364,6 +365,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
   test(
     "a stale record replaced by a live relay before its removal is kept and named",
     async () => {
+      stageProcStartTokens();
       const planned = spawnChild();
       const replacement = spawnChild();
       const staleBytes = record(planned.pid, foreignStartToken(childToken(planned.pid)));
@@ -405,6 +407,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
   test(
     "a stale record left unreadable at the final check fails the stop",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, foreignStartToken(childToken(child.pid))));
       const stale = snapshotPidRecord(relayPid);
@@ -437,6 +440,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
   test(
     "an unchanged stale record is still removed",
     async () => {
+      stageProcStartTokens();
       const child = spawnChild();
       writeFileSync(relayPid, record(child.pid, foreignStartToken(childToken(child.pid))));
 

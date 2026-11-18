@@ -145,7 +145,8 @@ export type PidFileState =
  * Classify a pid file, reading only a regular file from its opened descriptor.
  *
  * "stale" — the recorded pid is gone, or the pid is alive and its current
- * start token differs from the recorded token (same source, `processIsGone`).
+ * `proc:` start token differs from the recorded one (`processIsGone`; a
+ * differing `ps:` token is not proof of reuse, cli#1045).
  * "running" — the pid is alive and its current start token equals the recorded
  * one. "unverified" — the pid is not proven gone and its identity is not
  * confirmed; a caller must not signal it. A pid outside 1..2147483647 is

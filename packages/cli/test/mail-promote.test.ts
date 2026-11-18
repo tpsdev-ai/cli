@@ -17,6 +17,7 @@ import { processStartToken } from "../src/utils/mail-lock.js";
 import { spawnSync } from "node:child_process";
 import type { Envelope } from "@tpsdev-ai/agent";
 import { startStubFlair, writeKeyFile, buildSignedEnvelope, type StubFlair } from "./helpers/stub-flair.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 afterEach(() => {
   mock.restore();
@@ -625,6 +626,7 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
   });
 
   test("a lock whose live owner's start token mismatches (same source) is broken (pid reuse)", async () => {
+    stageProcStartTokens();
     const real = processStartToken(process.pid);
     expect(real).not.toBeNull();
     // Same source prefix, different value → provably a reused pid → broken.

@@ -1,6 +1,6 @@
 // The mailbox lock lives in @tpsdev-ai/agent so MailClient and promote() hold the same one.
 export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, type MailLock, mailLockPath, processStartToken } from "@tpsdev-ai/agent";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { classifyOwnerToken, pidState, processStartToken } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -16,11 +16,6 @@ interface LockOwner {
 }
 
 type OwnerState = "alive" | "dead" | "unverifiable" | "unowned";
-
-function tokenSource(token: string): string {
-  const i = token.indexOf(":");
-  return i === -1 ? token : token.slice(0, i);
-}
 
 function readOwner(lockDir: string): LockOwner | null {
   try {
@@ -53,10 +48,8 @@ function ownerState(
   if (strict && (typeof owner.startToken !== "string" || !/^(proc|ps):.+/.test(owner.startToken))) return "unverifiable";
   if (pid === "gone") return "dead";
   const token = resolveToken(owner.pid);
-  if (token !== null && typeof owner.startToken === "string") {
-    if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";
-    return token === owner.startToken ? "alive" : "dead";
-  }
+  // The shared token rule (cli#1045): a differing `ps:` token is unverifiable, never dead.
+  if (token !== null && typeof owner.startToken === "string") return classifyOwnerToken(token, owner.startToken);
   return pidState(owner.pid) === "gone" ? "dead" : "unverifiable";
 }
 
