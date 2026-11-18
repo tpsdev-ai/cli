@@ -2949,10 +2949,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         for (const rec of listObligations(account.mailDir, agentId)) {
           if (!isLive()) break;
           if (TERMINAL_STATES.has(rec.state) || unknownInbounds.has("*") || unknownInbounds.has(rec.inboundId)) continue;
-          // cli#1006 r2: a lookup that FAILED is not a MISSING cur/. Only a
+          // cli#1006 r2: a REPORTED lookup error is not a MISSING cur/. Only a
           // clean scan that finds no matching id may take the missing-cur
           // path; an unreadable or malformed file, SCAN_LIMIT or
-          // AMBIGUOUS_ID leaves the obligation untouched.
+          // AMBIGUOUS_ID leaves the obligation untouched. Above the scan limit
+          // findCurPath does not report unrelated read errors, so a matching
+          // entry beyond the limit still proves presence and startup proceeds.
           let curLookupError: string | null = null;
           const recCurPath = findCurPath(
             account.mailDir,

@@ -1432,6 +1432,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     expect(h.dispatchCount, "settling from the record dispatches nothing").toBe(0);
     expect(warned.join("\n"), "one line names the obligation and the reason").toContain(obligationId);
     expect(warned.join("\n")).toContain(REASON);
+    expect(
+      warned.filter((line) => line.includes("ack-stamp-failed") || line.includes("nack-stamp-failed")),
+      "a missing cur/ entry is not stamped",
+    ).toHaveLength(0);
     await h.stop();
   }, 20000);
 
@@ -1514,6 +1518,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(nackMailsIn(senderNew, "yielded-without-resumption").length, "exactly one nack to the recorded sender").toBe(1);
       expect(nackMailsIn(senderNew).length).toBe(1);
       expect(h.dispatchCount, "the deadline dispatches nothing").toBe(0);
+      expect(
+        warnings.filter((line) => line.includes("ack-stamp-failed") || line.includes("nack-stamp-failed")),
+        "a missing cur/ entry is not stamped",
+      ).toHaveLength(0);
     } finally { await h.stop(); }
   }, 30000);
 
@@ -2454,6 +2462,150 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       } finally { setBeforeTransitionForTests(undefined); await h.stop(); }
     }, 40000);
   }
+
+  it("r15 startup past the scan limit ignores an unrelated malformed entry and finds the match beyond the boundary", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-startup-limit-malformed";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: 60000, envelopeId });
+    placeCurPastScanBoundary({
+      id: inboundId,
+      from: SENDER,
+      to: AGENT,
+      body: signedBody,
+      timestamp: new Date().toISOString(),
+      read: false,
+    });
+    // One unrelated record past the limit cannot be parsed. A read error on it
+    // proves nothing about this inbound, so the scan must not report it.
+    const malformed = "zzz-malformed-r15.json";
+    writeFileSync(resolve(tempMailDir, AGENT, "cur", malformed), "{not json", "utf-8");
+
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: malformed, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "startup finds the entry beyond the boundary and arms its deadline",
+      ).toBe(true);
+      expect(
+        warnings.filter((line) => line.includes("obligation-cur-lookup-failed")),
+        "an unrelated read error past the limit is not reported",
+      ).toHaveLength(0);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the entry is not missing").toBeUndefined();
+    } finally { await h.stop(); }
+  }, 60000);
+
+  it("r15 two cur/ entries for one inbound are reported as AMBIGUOUS_ID and leave the record untouched", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-ambiguous-cur";
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    const before = obligationFile(AGENT, inboundId);
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    for (const name of [`2026-05-26T00-00-00-${inboundId}.json`, `2026-05-26T00-00-01-${inboundId}.json`]) {
+      writeFileSync(
+        resolve(curDir, name),
+        JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false }),
+        "utf-8",
+      );
+    }
+
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 15000),
+        "startup reports the failed lookup",
+      ).toBe(true);
+      expect(warnings.join("\n")).toContain("AMBIGUOUS_ID");
+      expect(
+        warnings.join("\n"),
+        "startup does not fall through to the missing-cur path",
+      ).not.toContain("obligation-missing-cur");
+      expect(obligationFile(AGENT, inboundId), "the record is untouched").toEqual(before);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "no deadline is armed",
+      ).toBe(false);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("r15 a cur/ entry restored after the scan goes through reconcileObligation and is re-armed", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-scan-restored-reconciled";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelope = JSON.parse(signedBody) as { messageId: string; body: string; timestamp: string; replyToId?: string };
+    const envelopeId = envelope.messageId;
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: 8000, state: "yielded", envelopeId });
+    // A receipt carrying a reply signed by the WRONG key keeps the scan pending
+    // at the verifier and then reports no evidence.
+    const replyId = "reply-r15-restored";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const wrongKeyReply = signEnvelope(
+      { v: 1, from: AGENT, to: SENDER, body: "race reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+      { [AGENT]: FLINT_SEED },
+    );
+    writeReceipt(tempMailDir, AGENT, {
+      replyId,
+      obligationId,
+      replyToId: envelopeId,
+      route: "local",
+      ts: now,
+      signedReply: JSON.stringify(wrongKeyReply),
+    });
+
+    let releaseScan!: () => void;
+    const scanGate = new Promise<void>((r) => { releaseScan = r; });
+    let scanEntered = false;
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, {
+      warnCalls: warnings,
+      localSender: true,
+      noInbound: true,
+      beforeVerify: async (name) => {
+        if (name !== AGENT) return;
+        scanEntered = true;
+        await scanGate;
+      },
+    });
+    try {
+      expect(scanEntered, "the receipt scan is awaiting verification").toBe(true);
+      const curDir = resolve(tempMailDir, AGENT, "cur");
+      mkdirSync(curDir, { recursive: true });
+      writeFileSync(
+        resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`),
+        JSON.stringify({
+          id: inboundId,
+          from: SENDER,
+          to: AGENT,
+          body: envelope.body,
+          timestamp: envelope.timestamp,
+          envelopeId,
+          envelope,
+          replyToId: envelope.replyToId,
+          read: true,
+        }),
+        "utf-8",
+      );
+      mailboxReplayStore(resolve(tempMailDir, AGENT)).recordConsumed(envelopeId);
+      releaseScan();
+
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery reconciles the restored entry and re-arms its deadline",
+      ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays open").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally { await h.stop(); }
+  }, 40000);
 });
 
 

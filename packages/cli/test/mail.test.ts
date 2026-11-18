@@ -759,4 +759,83 @@ describe("r3 obligation archiver filesystem seam", () => {
     const archive = join(getInbox("seam-agent").root, "archive");
     expect(readdirSync(archive).flatMap((month) => readdirSync(join(archive, month)))).toContain(`${id}.json`);
   });
+
+  test("r15 the archiver keeps every non-terminal state and archives every terminal one through the real writer", async () => {
+    const { createObligation, transitionObligation } = await import("../../../plugins/openclaw-tps-mail/src/obligations.js");
+    const { archiveOldCur } = await import("../src/utils/mail.js");
+    const nonTerminal = ["pending", "yielded", "delivering", "posted"] as const;
+    const terminal = ["acked", "unconfirmed", "failed"] as const;
+    const files = new Map<string, string>();
+
+    const create = (id: string): void => {
+      const result = createObligation(root, "seam-agent", () => ({
+        obligationId: `ob-${id}`,
+        inboundId: id,
+        inboundTimestamp: new Date().toISOString(),
+        from: "seam-sender",
+        to: "seam-agent",
+        accountId: "default",
+        state: "pending",
+        deadlineAt: null,
+        attempts: 1,
+      }));
+      expect(result.created).toBe(true);
+    };
+    const transition = (id: string, next: "yielded" | "delivering" | "posted" | "acked" | "unconfirmed" | "failed"): void => {
+      expect(transitionObligation(root, "seam-agent", id, next)?.state).toBe(next);
+    };
+
+    for (const state of [...nonTerminal, ...terminal]) {
+      const id = `state-${state}`;
+      files.set(state, agedCur(id));
+      create(id);
+      if (state === "yielded" || state === "delivering" || state === "posted") transition(id, state);
+      if (state === "acked" || state === "unconfirmed") {
+        transition(id, "posted");
+        transition(id, state);
+      }
+      if (state === "failed") transition(id, "failed");
+    }
+
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30), "the three terminal records are archived").toBe(3);
+      for (const state of nonTerminal) {
+        expect(existsSync(files.get(state)!), `${state} keeps the cur/ record`).toBe(true);
+      }
+      for (const state of terminal) {
+        expect(existsSync(files.get(state)!), `${state} does not keep the cur/ record`).toBe(false);
+      }
+      expect(warnings, "every state is read without a warning").toHaveLength(0);
+    } finally { restore(); }
+  });
+
+  test("r15 obligationHoldsCur: an absent record archives the cur/ entry, a dangling record keeps it", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("seam-agent");
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    const absent = agedCur("no-obligation-record");
+    const dangling = agedCur("dangling-obligation-record");
+    symlinkSync(join(root, "absent-record.json"), join(obligationDir, "dangling-obligation-record.json"));
+
+    const warnings: string[] = [];
+    const restore = patchShared(console, "warn", (...args: unknown[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("seam-agent", 30), "only the entry with no record is archived").toBe(1);
+      expect(existsSync(absent), "a clean absent record archives the cur/ entry").toBe(false);
+      expect(existsSync(dangling), "a dangling record keeps the cur/ entry").toBe(true);
+      expect(warnings.filter((line) => line.includes("dangling-obligation-record.json"))).toHaveLength(1);
+      expect(
+        warnings.filter((line) => line.includes("no-obligation-record.json")),
+        "an absent record archives without a warning",
+      ).toHaveLength(0);
+      expect(archiveOldCur("seam-agent", 30), "a second call archives nothing").toBe(0);
+      expect(
+        warnings.filter((line) => line.includes("dangling-obligation-record.json")),
+        "the dangling record warns once per path",
+      ).toHaveLength(1);
+    } finally { restore(); }
+  });
 });
