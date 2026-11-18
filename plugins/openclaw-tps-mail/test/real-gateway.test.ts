@@ -23,12 +23,13 @@
  */
 import { describe, expect, it } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { decideSettledRead, finalizeGatewayRun, readSettledState } from "./real-gateway-driver.mjs";
+import { SIGKILL_REAP_BUDGET_MS, SIGTERM_BUDGET_MS, decideSettledRead, finalizeGatewayRun, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -146,7 +147,7 @@ function expectGatewayReport(r: Report): void {
   expectSettledStateRead(r);
   expect(r.stopped).toBe(true);
   expect(r.stoppedGracefully).toBe(true);
-  expect(r.stopSignal).toBeNull();
+  expect([null, "SIGTERM"]).toContain(r.stopSignal);
   expectOneSettledCurEntry(r.curEntriesSettled, {
     inboundId: r.inboundId!,
     inboundName: r.inboundName!,
@@ -481,9 +482,27 @@ describe("cli#1020 — the driver's settled read decision", () => {
 
   it("skips the read and names a gateway killed after the stop deadline", () => {
     for (const ackLanded of [false, true]) {
-      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, ackLanded })).toEqual({
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, stopSignal: "SIGKILL", ackLanded })).toEqual({
         read: false,
-        readError: "gateway did not stop gracefully (it was killed after the stop deadline); settled state not read",
+        readError: "gateway did not stop gracefully (signal SIGKILL); settled state not read",
+      });
+    }
+  });
+
+  it("names the signal it observed instead of a fixed cause", () => {
+    for (const stopSignal of ["SIGTERM", "SIGHUP", "SIGKILL"]) {
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: false, stopSignal, ackLanded: true })).toEqual({
+        read: false,
+        readError: `gateway did not stop gracefully (signal ${stopSignal}); settled state not read`,
+      });
+    }
+  });
+
+  it("refuses a signal other than null or SIGTERM even when told the stop was graceful", () => {
+    for (const stopSignal of ["SIGHUP", "SIGKILL", "SIGABRT"]) {
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: true, stopSignal, ackLanded: true })).toEqual({
+        read: false,
+        readError: `gateway did not stop gracefully (signal ${stopSignal}); settled state not read`,
       });
     }
   });
@@ -654,7 +673,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
       expect(written.stoppedGracefully).toBe(false);
       expect(written.stopSignal).toBe("SIGKILL");
       expect(written.settledRead).toBe(false);
-      expect(written.readErrors.join("; ")).toContain("did not stop gracefully");
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
       expect(written.replyCountAfterStop).toBeUndefined();
       // Finalization is the beforeWrite work, and a refused settled read must not
       // skip it: the async marker the callback adds is in the file on disk.
@@ -815,6 +834,336 @@ describe("cli#1027 — beforeWrite runs after the stop and the settled read", ()
       expect(probe.entries).not.toContain("report.json");
       const written = JSON.parse(readFileSync(reportPath, "utf8"));
       expect(written.stopped).toBe(true);
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+});
+
+describe("cli#1034 — a gateway that exits on its first SIGTERM is reported as stopped gracefully", () => {
+  it("records SIGTERM, reads the settled listing and satisfies the consumer", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sigterm-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      // No SIGTERM handler: the child is terminated by the first signal.
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+
+      const mailDir = join(root, "mail");
+      for (const dir of [
+        join(mailDir, "agent-a", "new"),
+        join(mailDir, "agent-a", "cur"),
+        join(mailDir, "agent-a", ".obligations"),
+        join(mailDir, "agent-b", "new"),
+      ]) {
+        mkdirSync(dir, { recursive: true });
+      }
+      const report = {
+        readErrors: [] as string[],
+        inboundId: null as string | null,
+        inboundName: null as string | null,
+        settledRead: false,
+        stopped: false,
+        stoppedGracefully: false,
+        stopSignal: null as string | null,
+        ackLanded: true,
+        ackTimedOut: false,
+      };
+      const reportPath = join(root, "report.json");
+
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir,
+        reportPath,
+        stopDeadlineMs: 5_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(true);
+      expect(stop.signalCode).toBe("SIGTERM");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(true);
+      expect(written.stopSignal).toBe("SIGTERM");
+      expect(written.settledRead).toBe(true);
+      expect(written.replyCountAfterStop).toBe(0);
+      expect(written.readErrors).toEqual([]);
+
+      const consumerReport = ackedReport();
+      consumerReport.stoppedGracefully = written.stoppedGracefully;
+      consumerReport.stopSignal = written.stopSignal;
+      consumerReport.settledRead = written.settledRead;
+      consumerReport.readErrors = written.readErrors;
+      expectGatewayReport(consumerReport);
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("rejects a SIGKILL stop signal", () => {
+    const report = ackedReport();
+    report.stopSignal = "SIGKILL";
+    expect(() => expectGatewayReport(report)).toThrow();
+  });
+});
+
+describe("cli#1034 — stopGateway without a child", () => {
+  it("reports stopped and graceful with null exit fields, promptly", async () => {
+    const result = await Promise.race([
+      stopGateway(undefined),
+      new Promise((_, reject) => setTimeout(() => reject(new Error("stopGateway did not resolve promptly")), 1_000)),
+    ]);
+    expect(result).toEqual({ stopped: true, stoppedGracefully: true, exitCode: null, signalCode: null });
+  }, 5_000);
+});
+
+describe("cli#1034 — the post-SIGKILL reap has a budget of its own", () => {
+  class DelayedKillChild extends EventEmitter {
+    exitCode: number | null = null;
+    signalCode: string | null = null;
+    signals: string[] = [];
+
+    kill(signal: string): boolean {
+      this.signals.push(signal);
+      if (signal === "SIGKILL") {
+        setTimeout(() => {
+          this.signalCode = "SIGKILL";
+          this.emit("exit", null, "SIGKILL");
+        }, 300);
+      }
+      return true;
+    }
+  }
+
+  it("waits for a SIGKILL exit that lands after the SIGTERM budget", async () => {
+    const child = new DelayedKillChild();
+    const stop = await stopGateway(child, { deadlineMs: 100, reapDeadlineMs: 1_000 });
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
+  }, 5_000);
+
+  it("uses the larger default reap budget when stopGateway is given only a SIGTERM budget", async () => {
+    // The reap budget is omitted, so only stopGateway's own default can outlast
+    // the 300 ms SIGKILL exit; a default equal to the 100 ms SIGTERM budget
+    // reports the exit as unconfirmed.
+    const child = new DelayedKillChild();
+    const stop = await stopGateway(child, { deadlineMs: 100 });
+    expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
+  }, 5_000);
+
+  it("uses the larger default reap budget when finalizeGatewayRun is given only a SIGTERM budget", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-default-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.signalCode).toBe("SIGKILL");
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.settledRead).toBe(false);
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("carries the reap budget through finalizeGatewayRun", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+        reapDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGKILL");
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("reports an unconfirmed exit when the reap budget ends before the child does", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-short-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+        reapDeadlineMs: 100,
+      });
+      expect(stop.stopped).toBe(false);
+      expect(stop.signalCode).toBeNull();
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(false);
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop within the deadline; settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("exports a positive reap default larger than the SIGTERM default", () => {
+    expect(SIGTERM_BUDGET_MS).toBeGreaterThan(0);
+    expect(SIGKILL_REAP_BUDGET_MS).toBeGreaterThan(0);
+    expect(SIGKILL_REAP_BUDGET_MS).toBeGreaterThan(SIGTERM_BUDGET_MS);
+  });
+});
+
+describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", () => {
+  it("reports a SIGTERM handler that dies on SIGHUP as not graceful and names SIGHUP", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sighup-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      stub = await startGracefulStub(
+        node,
+        'process.on("SIGTERM", () => process.kill(process.pid, "SIGHUP")); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+      );
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGHUP");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGHUP");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGHUP); settled state not read");
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reports an already-observed SIGTERM as not graceful and refuses the settled read", async () => {
+    // A SIGTERM that killed the child before stopGateway ran was not sent by
+    // this call, so it is not a graceful stop even though the signal is SIGTERM.
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sigterm-dead-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      // No SIGTERM handler: the default disposition ends the process on SIGTERM.
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+      stub.kill("SIGTERM");
+      await new Promise((resolve) => stub!.once("exit", resolve));
+      expect(stub.signalCode).toBe("SIGTERM");
+
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGTERM");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGTERM");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGTERM); settled state not read");
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reports an already-observed SIGKILL as not graceful and refuses the settled read", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-dead-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      stub = await startGracefulStub(node);
+      stub.kill("SIGKILL");
+      await new Promise((resolve) => stub!.once("exit", resolve));
+
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGKILL");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGKILL");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
     } finally {
       if (stub) {
         if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
