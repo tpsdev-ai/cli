@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { decideSettledRead, finalizeGatewayRun, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
+import { SIGKILL_REAP_BUDGET_MS, SIGTERM_BUDGET_MS, decideSettledRead, finalizeGatewayRun, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -498,6 +498,15 @@ describe("cli#1020 — the driver's settled read decision", () => {
     }
   });
 
+  it("refuses a signal other than null or SIGTERM even when told the stop was graceful", () => {
+    for (const stopSignal of ["SIGHUP", "SIGKILL", "SIGABRT"]) {
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: true, stopSignal, ackLanded: true })).toEqual({
+        read: false,
+        readError: `gateway did not stop gracefully (signal ${stopSignal}); settled state not read`,
+      });
+    }
+  });
+
   it("skips the read when stopped before the ack was awaited", () => {
     for (const error of [undefined, "gateway boot failed"]) {
       expect(decideSettledRead({ stopped: true, ackLanded: false, ackTimedOut: false, error })).toEqual({
@@ -664,7 +673,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
       expect(written.stoppedGracefully).toBe(false);
       expect(written.stopSignal).toBe("SIGKILL");
       expect(written.settledRead).toBe(false);
-      expect(written.readErrors.join("; ")).toContain("did not stop gracefully");
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
       expect(written.replyCountAfterStop).toBeUndefined();
       // Finalization is the beforeWrite work, and a refused settled read must not
       // skip it: the async marker the callback adds is in the file on disk.
@@ -945,4 +954,146 @@ describe("cli#1034 — the post-SIGKILL reap has a budget of its own", () => {
     expect(child.signals).toEqual(["SIGTERM", "SIGKILL"]);
     expect(stop).toEqual({ stopped: true, stoppedGracefully: false, exitCode: null, signalCode: "SIGKILL" });
   }, 5_000);
+
+  it("carries the reap budget through finalizeGatewayRun", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+        reapDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGKILL");
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("reports an unconfirmed exit when the reap budget ends before the child does", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-finalize-reap-short-"));
+    try {
+      const child = new DelayedKillChild();
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 100,
+        reapDeadlineMs: 100,
+      });
+      expect(stop.stopped).toBe(false);
+      expect(stop.signalCode).toBeNull();
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(false);
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop within the deadline; settled state not read");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("exports a positive reap default larger than the SIGTERM default", () => {
+    expect(SIGTERM_BUDGET_MS).toBeGreaterThan(0);
+    expect(SIGKILL_REAP_BUDGET_MS).toBeGreaterThan(0);
+    expect(SIGKILL_REAP_BUDGET_MS).toBeGreaterThan(SIGTERM_BUDGET_MS);
+  });
+});
+
+describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", () => {
+  it("reports a SIGTERM handler that dies on SIGHUP as not graceful and names SIGHUP", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-sighup-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      stub = await startGracefulStub(
+        node,
+        'process.on("SIGTERM", () => process.kill(process.pid, "SIGHUP")); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+      );
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGHUP");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGHUP");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGHUP); settled state not read");
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
+
+  it("reports an already-observed SIGKILL as not graceful and refuses the settled read", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-dead-gateway-"));
+    let stub: ReturnType<typeof spawn> | null = null;
+    try {
+      stub = await startGracefulStub(node);
+      stub.kill("SIGKILL");
+      await new Promise((resolve) => stub!.once("exit", resolve));
+
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child: stub,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 1_000,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.signalCode).toBe("SIGKILL");
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.stopped).toBe(true);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.stopSignal).toBe("SIGKILL");
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+      expect(written.readErrors).toContain("gateway did not stop gracefully (signal SIGKILL); settled state not read");
+    } finally {
+      if (stub) {
+        if (stub.exitCode === null && stub.signalCode === null) stub.kill("SIGKILL");
+        if (stub.exitCode === null && stub.signalCode === null) {
+          await new Promise((resolve) => stub!.once("exit", resolve));
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

@@ -34,7 +34,9 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export function decideSettledRead({ stopped, stoppedGracefully = true, stopSignal = null, ackLanded, ackTimedOut, error }) {
-  if (stopped && !stoppedGracefully) {
+  // A signal other than the SIGTERM stopGateway itself sent is not a graceful
+  // stop, whatever the caller reports alongside it.
+  if (stopped && (!stoppedGracefully || (stopSignal !== null && stopSignal !== "SIGTERM"))) {
     return {
       read: false,
       readError: `gateway did not stop gracefully (signal ${stopSignal ?? "unknown"}); settled state not read`,
@@ -63,21 +65,31 @@ export const SIGKILL_REAP_BUDGET_MS = 15_000;
 
 /**
  * Stop a gateway child: SIGTERM, then SIGKILL after the SIGTERM budget. Signal
- * death leaves `exitCode` null. A child that exits within the SIGTERM budget
- * without SIGKILL being sent stopped GRACEFULLY; this makes no claim that
- * application cleanup ran. A child that needed SIGKILL did not. The reap budget
- * is separate and larger than the SIGTERM budget: SIGKILL delivery and child
- * teardown are not bounded by the deadline that ended the SIGTERM wait.
+ * death leaves `exitCode` null. GRACEFULLY means an exit code, or termination by
+ * the SIGTERM this call sent within the SIGTERM budget with no SIGKILL; this
+ * makes no claim that application cleanup ran. A child that needed SIGKILL, or
+ * died on any other signal (including one observed before this call), did not
+ * stop gracefully. The reap budget is separate and, by default, larger than the
+ * SIGTERM budget: SIGKILL delivery and child teardown are not bounded by the
+ * deadline that ended the SIGTERM wait.
  */
 export async function stopGateway(child, {
   deadlineMs = SIGTERM_BUDGET_MS,
   reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
 } = {}) {
   let sigkillSent = false;
+  let sigtermSent = false;
+  let exitedInTermWait = false;
   if (child) {
     if (child.exitCode === null && child.signalCode === null) {
+      sigtermSent = true;
+      const markExit = () => {
+        exitedInTermWait = true;
+      };
+      child.once("exit", markExit);
       child.kill("SIGTERM");
       await waitForExit(child, deadlineMs);
+      child.off("exit", markExit);
     }
     if (child.exitCode === null && child.signalCode === null) {
       sigkillSent = true;
@@ -87,9 +99,10 @@ export async function stopGateway(child, {
   }
   const exitCode = child?.exitCode ?? null;
   const signalCode = child?.signalCode ?? null;
+  const terminatedByOwnSigterm = sigtermSent && exitedInTermWait && signalCode === "SIGTERM";
   return {
     stopped: !child || exitCode !== null || signalCode !== null,
-    stoppedGracefully: !child || (!sigkillSent && (exitCode !== null || signalCode !== null)),
+    stoppedGracefully: !child || (!sigkillSent && (exitCode !== null || terminatedByOwnSigterm)),
     exitCode,
     signalCode,
   };
@@ -150,9 +163,12 @@ export async function finalizeGatewayRun({
   // gateway killed after the stop budget is dead but did not stop gracefully,
   // so the settled state is not judged.
   const settledRead = decideSettledRead({
-    ...report,
     stopped: stop.stopped,
     stoppedGracefully: stop.stoppedGracefully,
+    stopSignal: stop.signalCode,
+    ackLanded: report.ackLanded,
+    ackTimedOut: report.ackTimedOut,
+    error: report.error,
   });
   report.settledRead = settledRead.read;
   if (settledRead.readError) report.readErrors.push(settledRead.readError);
