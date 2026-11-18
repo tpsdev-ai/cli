@@ -142,7 +142,7 @@ describe("branch listener with two host connections", () => {
     expect(second.isAlive()).toBe(true);
 
     // A message on the channel that is not active closes the active channel and
-    // makes the sender active (packages/cli/src/commands/branch.ts:594-600);
+    // makes the sender active (the onMessage handler in packages/cli/src/commands/branch.ts);
     // the branch echoes the heartbeat on the sender.
     await exchange(first, 1);
     await waitUntil(() => !second.isAlive(), "active channel closed");
