@@ -369,6 +369,40 @@ describe("mail utils", () => {
     }
   });
 
+  test("archiveOldCur keeps a cur/ entry whose obligation record has no inboundId, warning once per path", async () => {
+    const { archiveOldCur, getInbox } = await import("../src/utils/mail.js");
+    const inbox = getInbox("agent-a");
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    mkdirSync(inbox.cur, { recursive: true });
+    const cur = join(inbox.cur, "no-inbound-id.json");
+    writeFileSync(cur, JSON.stringify({ id: "msg-no-inbound-id", from: "sender-a", to: "agent-a", body: "x", timestamp: old.toISOString() }));
+    utimesSync(cur, old, old);
+    const obligationDir = join(inbox.root, ".obligations");
+    mkdirSync(obligationDir, { recursive: true });
+    // The record cannot be tied to this cur/ entry, so its terminal state says
+    // nothing about this file: the fail-closed answer is to keep it.
+    writeFileSync(
+      join(obligationDir, "msg-no-inbound-id.json"),
+      JSON.stringify({ obligationId: "ob-no-inbound-id", state: "acked" }),
+    );
+
+    const warnings: string[] = [];
+    const restoreWarn = patchShared(console, "warn", (...args: any[]) => { warnings.push(args.map(String).join(" ")); });
+    try {
+      expect(archiveOldCur("agent-a", 30), "nothing is archived").toBe(0);
+      expect(existsSync(cur), "a record with no inboundId keeps the cur/ file").toBe(true);
+      expect(archiveOldCur("agent-a", 30), "a later call archives nothing either").toBe(0);
+      expect(existsSync(cur), "the file is still kept").toBe(true);
+      expect(
+        warnings.filter((line) => line.includes("msg-no-inbound-id.json")),
+        "the shared warning set reports the path once",
+      ).toHaveLength(1);
+      expect(warnings.find((line) => line.includes("msg-no-inbound-id.json"))).toContain("carries no inboundId");
+    } finally {
+      restoreWarn();
+    }
+  });
+
   test("checkMessages opportunistically archives old cur entries", async () => {
     const { getInbox } = await import("../src/utils/mail.js");
     const inbox = getInbox("kern");

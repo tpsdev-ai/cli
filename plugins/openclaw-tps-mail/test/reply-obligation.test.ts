@@ -2139,6 +2139,69 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally { await h.stop(); }
   }, 40000);
 
+  it("r14 a deadline past the scan limit with no matching known path reports SCAN_LIMIT and stays unsettled", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-deadline-scan-limit-gone";
+    const { obligationId, curPath } = seedVerifiedCur(inboundId, "yielded", 8000);
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery armed the deadline with the verified cur/ path",
+      ).toBe(true);
+      // Before the deadline fires, the armed path is gone and cur/ holds more
+      // names than the bounded scan reads: neither the path probe nor the scan
+      // can prove absence.
+      renameSync(curPath, `${curPath}.gone`);
+      exceedCurScanLimit();
+
+      expect(
+        await pollUntil(
+          () => warnings.some((line) => line.includes("obligation-cur-lookup-failed") && line.includes("SCAN_LIMIT")),
+          15000,
+        ),
+        "the unmatched lookup past the limit is reported as SCAN_LIMIT",
+      ).toBe(true);
+      const after = obligationFile(AGENT, inboundId);
+      expect(after?.state, "the obligation stays unsettled").toBe("yielded");
+      expect(after?.missingCurReason, "a failed lookup is not a clean absence").toBeUndefined();
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "the fired deadline is not re-armed",
+      ).toBe(false);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("r14 the unconfirmed settlement writes missingCurReason when the record had none", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-unconfirmed-first-reason";
+    const { obligationId, curPath } = seedVerifiedCur(inboundId, "delivering", 8000);
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery armed the deadline with no missing-entry reason",
+      ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.missingCurReason, "the record is armed with no reason").toBeUndefined();
+      // The verified entry disappears before the deadline: the deadline's clean
+      // lookup finds no match, so the committed record settles unconfirmed.
+      renameSync(curPath, `${curPath}.gone`);
+
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "unconfirmed", 15000),
+        "the committed record settles unconfirmed at the deadline",
+      ).toBe(true);
+      expect(
+        obligationFile(AGENT, inboundId)?.missingCurReason,
+        "the unconfirmed transition writes the reason itself",
+      ).toBe("cur-record-missing");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "an unconfirmed record is not nacked").toHaveLength(0);
+    } finally { await h.stop(); }
+  }, 40000);
+
   it("r10 startup's cur/ scan finds a present entry past the scan limit", async () => {
     seedSigningKeys();
     const inboundId = "msg-startup-scan-limit";
