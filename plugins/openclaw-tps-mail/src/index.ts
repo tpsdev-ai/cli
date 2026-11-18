@@ -1320,7 +1320,7 @@ async function settleObligation(
           ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
         },
         ctx.log,
-        { from: rec.state },
+        { from: rec.state, revision: rec.revision ?? 0 },
       );
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
@@ -1380,7 +1380,7 @@ async function settleObligation(
         ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
       },
       ctx.log,
-      { from: rec.state },
+      { from: rec.state, revision: rec.revision ?? 0 },
     );
   } catch (err: any) {
     ctx.log?.warn?.(
@@ -1677,6 +1677,7 @@ function armDeadline(
     const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
     updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, {
       from: rec.state,
+      revision: rec.revision ?? 0,
     });
   }
   if (!updated) return { outcome: "refused", reason: "moved" };
@@ -1927,8 +1928,8 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     return;
   }
 
-  // Decide from the post-scan state. The store guard refuses a STATE change
-  // after the re-read; a concurrent same-state update is not detected.
+  // Decide from the post-scan state. The store guard refuses a stale STATE or
+  // REVISION after the re-read, so a same-state update is detected too (cli#1059).
   const fresh = readObligationForCleanup(ctx, current.obligationId);
   if (fresh.status !== "found" || TERMINAL_STATES.has(fresh.record.state)) return;
   const parsedDeadline = fresh.record.deadlineAt === null ? NaN : Date.parse(fresh.record.deadlineAt);

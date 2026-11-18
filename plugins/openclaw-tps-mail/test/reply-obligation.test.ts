@@ -3322,6 +3322,69 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  it("1059 a same-state deadline extension refuses the stale settle write and sends no early nack", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-same-state";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    let injected = false;
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeTransitionForTests(undefined);
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", {
+        deadlineAt: new Date(Date.now() + 2500).toISOString(),
+      });
+    });
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 200]);
+    const warnings: string[] = [];
+    const hPromise = start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(await pollUntil(() => injected, 15000), "the settlement reached its guarded write").toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the stale settle write is refused").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no early nack is sent").toHaveLength(0);
+      const h = await hPromise;
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the fresh record is re-evaluated and settles at its extended deadline",
+      ).toBe(true);
+      expect(warnings.join("\n")).toContain("refusing to record the failure");
+      await h.stop();
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setBeforeTransitionForTests(undefined);
+    }
+  }, 40000);
+
+  it("1059 a record with no revision reads as 0 and its first write sets 1", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-legacy-revision";
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: 60000 });
+    expect(obligationFile(AGENT, inboundId)?.revision).toBeUndefined();
+    const written = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-legacy" });
+    expect(written?.revision).toBe(1);
+    expect(obligationFile(AGENT, inboundId)?.revision).toBe(1);
+  });
+
+  it("1059 two writers on the same snapshot revision: exactly one wins", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-revision-race";
+    seedOrphan(inboundId, { state: "posted", deadlineInMs: 60000 });
+    const snapshot = obligationFile(AGENT, inboundId);
+    expect(snapshot?.revision).toBeUndefined();
+    const stale = snapshot?.revision ?? 0;
+    const first = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-first" }, undefined, {
+      from: "posted",
+      revision: stale,
+    });
+    const second = transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "reply-second" }, undefined, {
+      from: "posted",
+      revision: stale,
+    });
+    expect(first?.revision, "the first writer lands revision 1").toBe(1);
+    expect(second, "the second writer on the same revision is refused").toBeNull();
+    expect(obligationFile(AGENT, inboundId)?.replyId).toBe("reply-first");
+    expect(obligationFile(AGENT, inboundId)?.revision).toBe(1);
+  });
 });
 
 
