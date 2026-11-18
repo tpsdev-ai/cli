@@ -34,8 +34,8 @@ import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 export function decideSettledRead({ stopped, stoppedGracefully = true, stopSignal = null, ackLanded, ackTimedOut, error }) {
-  // A signal other than the SIGTERM stopGateway itself sent is not a graceful
-  // stop, whatever the caller reports alongside it.
+  // Only SIGTERM is a graceful signal here: any other observed signal refuses
+  // the read, whatever the caller reports alongside it.
   if (stopped && (!stoppedGracefully || (stopSignal !== null && stopSignal !== "SIGTERM"))) {
     return {
       read: false,
