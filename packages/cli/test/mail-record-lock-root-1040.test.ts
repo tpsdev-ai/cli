@@ -105,6 +105,24 @@ test("sameDirectory distinguishes inodes above the safe-integer limit", () => {
   expect(sameDirectory("/mail/a/cur", "/mail/b/cur", stat)).toBe(false);
 });
 
+test("sameDirectory's default reader requests bigint stats for high inodes", () => {
+  const inodes = new Map([
+    ["/mail/a/cur", 9007199254740992n],
+    ["/mail/b/cur", 9007199254740993n],
+  ]);
+  const optionsSeen: unknown[] = [];
+  spyOn(fs, "statSync").mockImplementation(((path: unknown, options?: { bigint?: boolean }) => {
+    optionsSeen.push(options);
+    const ino = inodes.get(String(path))!;
+    return options?.bigint ? { dev: 7n, ino } : { dev: 7, ino: Number(ino) };
+  }) as typeof fs.statSync);
+
+  const result = sameDirectory("/mail/a/cur", "/mail/b/cur");
+
+  expect(result).toBe(false);
+  expect(optionsSeen).toEqual([{ bigint: true }, { bigint: true }]);
+});
+
 test("an update through a symlinked cur/ is refused and leaves the record unchanged", () => {
   const { inboxA, mailboxB, source, targetA, targetB } = symlinkedLayout();
   plantRecord(targetB, "record-id");
