@@ -1,5 +1,5 @@
 # CP32 Branch Office image
-FROM node:24-bookworm-slim AS base
+FROM node:24-bookworm-slim@sha256:dc26ae92c9fb15cf6b1d63e20f0944b2efe0f115b20e00be48fb23fceb061c54 AS base
 
 # Security: no root package installs after this layer
 # Harden: disable npm update notifier, reduce attack surface
