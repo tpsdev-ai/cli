@@ -176,8 +176,8 @@ export type OwnerTokenState = "alive" | "dead" | "unverifiable";
  * or by a process still running older code, may hold local-time text, so a
  * `ps:` mismatch cannot prove reuse.
  * "dead" — two differing `proc:` tokens with values: /proc starttime is
- * kernel-stable, so a different value proves the pid was reused. Only these
- * prove reuse.
+ * kernel-stable, so a different value is treated as the pid having been
+ * reused. Only these are treated as reuse; the value itself is not validated.
  */
 export function classifyOwnerToken(liveToken: string, recordedToken: string): OwnerTokenState {
   if (liveToken === recordedToken) return "alive";
