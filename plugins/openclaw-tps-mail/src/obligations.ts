@@ -165,14 +165,14 @@ export interface ObligationRecord {
    *  startup retry no longer fires for that record. */
   nackAbandonedAt?: string;
   /** cli#1059: the store increments this under its lock on every write that
-   *  lands. A decision write names the record it examined (state and revision;
-   *  the deadline path also carries the deadline it decided on), so a
-   *  same-state
-   *  update — e.g. one that extends `deadlineAt` — cannot be overwritten by a
-   *  decision made on an older snapshot. A record written before this field
-   *  existed reads as revision 0, and its first write sets 1. Only a
-   *  nonnegative safe integer is a valid revision: any other value makes the
-   *  record unverified, and an unverified record is never written. */
+   *  lands. A decision write names the record it examined: state, revision and
+   *  the reply identity where it applies (the deadline path also carries the
+   *  deadline it decided on), so a same-state update — e.g. one that extends
+   *  `deadlineAt` — cannot be overwritten by a decision made on an older
+   *  snapshot. A record written before this field existed reads as revision 0,
+   *  and its first write sets 1. Only a nonnegative safe integer is a valid
+   *  revision: any other value makes the record unverified, and an unverified
+   *  record is never written. */
   revision?: number;
 }
 
@@ -250,10 +250,15 @@ export function listObligations(mailDir: string, agent: string, onReadError?: (p
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
       const record = JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord;
-      if (onReadError && (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision))) {
-        const ids = [name.slice(0, -5)];
-        if (typeof record?.inboundId === "string") ids.push(record.inboundId);
-        onReadError(resolve(dir, name), undefined, ids, "file");
+      // Validate EVERY listing, whether or not a callback is supplied: a
+      // startup caller acts on these records (an owed-nack send) and a write
+      // refusal cannot retract mail. An invalid record is never returned.
+      if (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) {
+        if (onReadError) {
+          const ids = [name.slice(0, -5)];
+          if (typeof record?.inboundId === "string") ids.push(record.inboundId);
+          onReadError(resolve(dir, name), undefined, ids, "file");
+        }
         continue;
       }
       out.push(record);
@@ -725,7 +730,9 @@ function sweepTerminalObligationsLocked(
     if (typeof record !== "object" || record === null || Array.isArray(record) ||
         typeof state !== "string" || !ALL_STATES.has(state) ||
         typeof inbound !== "string" || `${inbound}.json` !== name ||
-        typeof id !== "string" || id.length === 0) {
+        typeof id !== "string" || id.length === 0 ||
+        // An invalid revision is not a record a sweep may act on; retain it.
+        !isValidObligationRevision((record as { revision?: unknown }).revision)) {
       if (typeof id === "string") liveObligationIds.add(id);
       res.unreadable++;
       leftUnreadable.push(name);
