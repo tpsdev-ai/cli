@@ -33,11 +33,13 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function decideSettledRead({ stopped, stoppedGracefully = true, ackLanded, ackTimedOut, error }) {
-  if (stopped && !stoppedGracefully) {
+export function decideSettledRead({ stopped, stoppedGracefully = true, stopSignal = null, ackLanded, ackTimedOut, error }) {
+  // Only SIGTERM is a graceful signal here: any other observed signal refuses
+  // the read, whatever the caller reports alongside it.
+  if (stopped && (!stoppedGracefully || (stopSignal !== null && stopSignal !== "SIGTERM"))) {
     return {
       read: false,
-      readError: "gateway did not stop gracefully (it was killed after the stop deadline); settled state not read",
+      readError: `gateway did not stop gracefully (signal ${stopSignal ?? "unknown"}); settled state not read`,
     };
   }
   if (stopped && ackLanded) return { read: true, readError: null };
@@ -58,27 +60,49 @@ function waitForExit(child, deadlineMs) {
   ]);
 }
 
+export const SIGTERM_BUDGET_MS = 5_000;
+export const SIGKILL_REAP_BUDGET_MS = 15_000;
+
 /**
- * Stop a gateway child: SIGTERM, then SIGKILL after the budget. Signal death
- * leaves `exitCode` null, so a process that ended on SIGKILL is still stopped
- * (dead, no writer left) but not stopped GRACEFULLY.
+ * Stop a gateway child: SIGTERM, then SIGKILL after the SIGTERM budget. Signal
+ * death leaves `exitCode` null. GRACEFULLY means an exit code, or termination by
+ * the SIGTERM this call sent within the SIGTERM budget with no SIGKILL; this
+ * makes no claim that application cleanup ran. A child that needed SIGKILL, or
+ * died on any other signal (including one observed before this call), did not
+ * stop gracefully. The reap budget is separate and, by default, larger than the
+ * SIGTERM budget: SIGKILL delivery and child teardown are not bounded by the
+ * deadline that ended the SIGTERM wait.
  */
-export async function stopGateway(child, { deadlineMs = 5_000 } = {}) {
+export async function stopGateway(child, {
+  deadlineMs = SIGTERM_BUDGET_MS,
+  reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
+} = {}) {
+  let sigkillSent = false;
+  let sigtermSent = false;
+  let exitedInTermWait = false;
   if (child) {
     if (child.exitCode === null && child.signalCode === null) {
+      sigtermSent = true;
+      const markExit = () => {
+        exitedInTermWait = true;
+      };
+      child.once("exit", markExit);
       child.kill("SIGTERM");
       await waitForExit(child, deadlineMs);
+      child.off("exit", markExit);
     }
     if (child.exitCode === null && child.signalCode === null) {
+      sigkillSent = true;
       child.kill("SIGKILL");
-      await waitForExit(child, deadlineMs);
+      await waitForExit(child, reapDeadlineMs);
     }
   }
   const exitCode = child?.exitCode ?? null;
   const signalCode = child?.signalCode ?? null;
+  const terminatedByOwnSigterm = sigtermSent && exitedInTermWait && signalCode === "SIGTERM";
   return {
     stopped: !child || exitCode !== null || signalCode !== null,
-    stoppedGracefully: !child || exitCode !== null,
+    stoppedGracefully: !child || (!sigkillSent && (exitCode !== null || terminatedByOwnSigterm)),
     exitCode,
     signalCode,
   };
@@ -125,10 +149,11 @@ export async function finalizeGatewayRun({
   report,
   mailDir,
   reportPath,
-  stopDeadlineMs = 5_000,
+  stopDeadlineMs = SIGTERM_BUDGET_MS,
+  reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
   beforeWrite = null,
 }) {
-  const stop = await stopGateway(child, { deadlineMs: stopDeadlineMs });
+  const stop = await stopGateway(child, { deadlineMs: stopDeadlineMs, reapDeadlineMs });
   report.stopped = stop.stopped;
   report.stoppedGracefully = stop.stoppedGracefully;
   report.stopSignal = stop.signalCode;
@@ -138,9 +163,12 @@ export async function finalizeGatewayRun({
   // gateway killed after the stop budget is dead but did not stop gracefully,
   // so the settled state is not judged.
   const settledRead = decideSettledRead({
-    ...report,
     stopped: stop.stopped,
     stoppedGracefully: stop.stoppedGracefully,
+    stopSignal: stop.signalCode,
+    ackLanded: report.ackLanded,
+    ackTimedOut: report.ackTimedOut,
+    error: report.error,
   });
   report.settledRead = settledRead.read;
   if (settledRead.readError) report.readErrors.push(settledRead.readError);
@@ -175,7 +203,8 @@ async function main() {
   const REPLY_DEADLINE_MS = 45_000;
   const ACK_DEADLINE_MS = 15_000;
   const CUR_MOVE_DEADLINE_MS = 5_000;
-  const STOP_DEADLINE_MS = 5_000;
+  const STOP_DEADLINE_MS = SIGTERM_BUDGET_MS;
+  const STOP_REAP_DEADLINE_MS = SIGKILL_REAP_BUDGET_MS;
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   async function until(predicate, deadlineMs, label) {
@@ -553,6 +582,7 @@ async function main() {
       mailDir: MAIL,
       reportPath: REPORT,
       stopDeadlineMs: STOP_DEADLINE_MS,
+      reapDeadlineMs: STOP_REAP_DEADLINE_MS,
       beforeWrite: async () => {
         await new Promise((r) => model.close(r));
         await new Promise((r) => flair.close(r));
