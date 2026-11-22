@@ -16,7 +16,7 @@ import { WireDeliveryTransport } from "./wire-delivery.js";
 import { loadHostIdentity, lookupBranch } from "./identity.js";
 import { MSG_MAIL_DELIVER, MSG_MAIL_ACK, MSG_HEARTBEAT, MailDeliverBodySchema, type MailDeliverBody } from "./wire-mail.js";
 import { registerServiceProxyHandler } from "./service-proxy-host.js";
-import { clearHostState, hostStatePath, writeHostState, type HostConnectionState, type ServiceHealth } from "./connection-state.js";
+import { claimHostStateAt, clearHostStateAt, hostStatePath, refreshOwnedHostStateAt, writeHostStateAt, type HostConnectionState, type HostStateReadHooks, type HostStateRefreshOutcome, type ServiceHealth } from "./connection-state.js";
 import { listServices } from "./service-registry.js";
 import snooplogg from "snooplogg";
 import { z, type ZodError } from "zod";
@@ -1393,7 +1393,7 @@ const LATE_CONNECT_CLOSE_WAIT_MS = 5_000;
  * a write succeeds. The message carries the record path and the error, not the
  * record's contents.
  */
-function hostStateRefresher(branchId: string, persist: () => void): () => void {
+function hostStateRefresher(recordPath: string, persist: () => void): () => void {
   let failureReported = false;
   return () => {
     try {
@@ -1402,8 +1402,67 @@ function hostStateRefresher(branchId: string, persist: () => void): () => void {
     } catch (error) {
       if (failureReported) return;
       failureReported = true;
-      console.error(`[relay] Host state record ${hostStatePath(branchId)} refresh failed; connection continues: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[relay] Host state record ${recordPath} refresh failed; connection continues: ${error instanceof Error ? error.message : String(error)}`);
     }
+  };
+}
+
+/** Report a refresh outcome: one line when refreshes start being skipped for a
+ *  reason that names the record, and one when a write succeeds again. Shared by
+ *  a connection's periodic refresh and its inbound writes, so a state repeated
+ *  by every heartbeat is reported once. */
+function hostStateRefreshReporter(recordPath: string): (outcome: HostStateRefreshOutcome) => void {
+  let reported: "unverifiable" | "invalid" | "unreadable" | null = null;
+  return (outcome) => {
+    if (outcome.kind === "written") {
+      if (reported !== null) {
+        reported = null;
+        console.error(`[relay] host state record ${recordPath} refresh recovered; writes resumed`);
+      }
+      return;
+    }
+    if (outcome.kind !== "unverifiable" && outcome.kind !== "invalid" && outcome.kind !== "unreadable") return;
+    if (reported === outcome.kind) return;
+    reported = outcome.kind;
+    const reason = outcome.kind === "unverifiable"
+      ? "this process's start token could not be read or compared"
+      : outcome.kind === "invalid"
+        ? "the record is not a valid host state record"
+        : outcome.reason;
+    const next = outcome.kind === "unverifiable"
+      ? "the record keeps its last state and refreshes resume when the token can be read and compared again"
+      : outcome.kind === "invalid"
+        ? "the record keeps its last state and refreshes resume when a valid record is present"
+        : "the record keeps its last state and refreshes resume when it can be read again";
+    console.error(`[relay] host state record ${recordPath} not refreshed: ${reason}, so ownership cannot be verified; ${next}`);
+  };
+}
+
+/** Report a reconnect claim's ownership or readability refusal: one line
+ *  naming the record path and the reason, never its contents. */
+function hostStateClaimReporter(recordPath: string): (outcome: HostStateRefreshOutcome) => void {
+  return (outcome) => {
+    let reason: string;
+    switch (outcome.kind) {
+      case "written":
+      case "stopped":
+      case "absent":
+        // A successful claim of an absent record returns `written`.
+        return;
+      case "other":
+        reason = "the record belongs to another connection";
+        break;
+      case "unverifiable":
+        reason = "ownership could not be verified";
+        break;
+      case "invalid":
+        reason = "the record is not a valid host state record";
+        break;
+      case "unreadable":
+        reason = outcome.reason;
+        break;
+    }
+    console.error(`[relay] Host state record ${recordPath} not claimed on reconnect: ${reason}, so it was left as it is; the connection continues`);
   };
 }
 
@@ -1425,10 +1484,20 @@ async function probeServiceHealth(): Promise<ServiceHealth[]> {
 
 export async function connectAndKeepAlive(
   branchId: string,
-  opts: { onMessage?: (msg: TpsMessage) => void; onAccepted?: (msg: TpsMessage) => void } = {}
+  opts: { onMessage?: (msg: TpsMessage) => void; onAccepted?: (msg: TpsMessage) => void; testHooks?: HostStateReadHooks } = {}
 ): Promise<() => Promise<void>> {
+  const recordPath = hostStatePath(branchId);
+  const connectionId = randomUUID();
+  const reportRefresh = hostStateRefreshReporter(recordPath);
+  const reportClaimSkip = hostStateClaimReporter(recordPath);
   let stopped = false;
   let reconnectCount = 0;
+  // Set before this connection's first claim attempt, even if it throws.
+  // On its first claim attempt, a live connection attempts a write
+  // without an ownership check while the stop gate is open; a later claim runs
+  // the ownership rule only while the stop gate is open. Writes can still fail
+  // on the filesystem (a directory at the record path, for one).
+  let claimedRecord = false;
   let currentChannel: TransportChannel | null = null;
   const failedChannels = new Set<TransportChannel>();
   let pendingChannelClose: Promise<void> | null = null;
@@ -1453,7 +1522,7 @@ export async function connectAndKeepAlive(
   /** The close-failure line: it prints the record path and the error text and
    *  does not read host state; it does not filter what `error.message` contains. */
   const channelCloseFailure = (error: unknown): string =>
-    `[relay] Failed channel close for host state record ${hostStatePath(branchId)}: ${error instanceof Error ? error.message : String(error)}`;
+    `[relay] Failed channel close for host state record ${recordPath}: ${error instanceof Error ? error.message : String(error)}`;
   /** Track one channel's close as pending until it settles; retain the channel
    *  when close rejects so stop() can retry it. Shared by both in-loop close paths. */
   const trackChannelClose = async (channel: TransportChannel): Promise<void> => {
@@ -1482,10 +1551,20 @@ export async function connectAndKeepAlive(
     inboundPersistTimer = undefined;
     if (stopped || inboundPersistState === undefined) return;
     try {
-      writeHostState(inboundPersistState, () => !stopped, 0);
+      const outcome = refreshOwnedHostStateAt(recordPath, inboundPersistState, connectionId, () => !stopped, 0, opts.testHooks);
+      reportRefresh(outcome);
+      if (outcome.kind === "unverifiable" || outcome.kind === "invalid" || outcome.kind === "unreadable") {
+        // The record may become readable or valid again; keep this update and
+        // retry on the existing backoff instead of reporting it as done.
+        inboundPersistTimer = setTimeout(attemptInboundPersist, inboundPersistBackoff);
+        inboundPersistBackoff = Math.min(inboundPersistBackoff * 2, INBOUND_PERSIST_RETRY_MAX_MS);
+        return;
+      }
+      // Written, stopped, absent or another connection's record: nothing more
+      // to persist, so the inbound retry ends.
       cancelInboundPersist();
     } catch (error) {
-      console.error(`[relay] Host state record ${hostStatePath(branchId)} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
+      console.error(`[relay] Host state record ${recordPath} update failed; message handling continues: ${error instanceof Error ? error.message : String(error)}`);
       inboundPersistTimer = setTimeout(attemptInboundPersist, inboundPersistBackoff);
       inboundPersistBackoff = Math.min(inboundPersistBackoff * 2, INBOUND_PERSIST_RETRY_MAX_MS);
     }
@@ -1539,6 +1618,7 @@ export async function connectAndKeepAlive(
         const now = new Date().toISOString();
         const state: HostConnectionState = {
           branch: branchId,
+          connectionId,
           connectedAt: now,
           lastHeartbeatSent: now,
           lastHeartbeatAck: null,
@@ -1550,24 +1630,49 @@ export async function connectAndKeepAlive(
           pid: process.pid,
           startToken: processStartToken(process.pid),
         };
-        // stop() sets stopped before clearing; the write gate is checked under the lock.
-        const persist = () => writeHostState(state, () => !stopped);
-        const refresh = hostStateRefresher(branchId, persist);
-        // The connect-time writes stay outside the refresher so a refusal still
-        // reconnects, after one line naming the record path and reason.
-        const persistConnect = () => {
+        // stop() sets stopped before clearing; both gates are checked under the lock.
+        // On its first claim attempt, a live connection attempts a write without an
+        // ownership check while the stop gate is open. Claims after that
+        // attempt check eligibility only while the stop gate is open, and
+        // attempt the write when the record is absent or
+        // is verified as owned by this connection, or when its recorded process
+        // is not running or carries a different `proc:` token (pid reuse).
+        // `ps:` mismatches are unverifiable: a record written before cli#1045 may
+        // hold local-time text. Either write can fail on the filesystem.
+        // `claimedRecord` tells the two apart.
+        const claim = () => {
+          if (!claimedRecord) {
+            claimedRecord = true;
+            writeHostStateAt(recordPath, state, () => !stopped);
+            return;
+          }
+          reportClaimSkip(claimHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks));
+        };
+        const persist = () => {
+          const outcome = refreshOwnedHostStateAt(recordPath, state, connectionId, () => !stopped, undefined, opts.testHooks);
+          reportRefresh(outcome);
+          return outcome;
+        };
+        const refresh = hostStateRefresher(recordPath, persist);
+        // The claim stays outside the refresher so a write that throws still
+        // reconnects, after one line naming the record path and reason; so does
+        // the post-send update. A claim refused for ownership or readability
+        // leaves the record as it is; the claim reporter emits one line, and a
+        // later refresh may report separately. A `stopped` outcome is silent.
+        // An ownership or readability refusal leaves the channel up and serving.
+        const connectWrite = (write: () => void) => {
           try {
-            persist();
+            write();
           } catch (error) {
-            console.error(`[relay] Host state record ${hostStatePath(branchId)} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
+            console.error(`[relay] Host state record ${recordPath} connect write failed; reconnecting: ${error instanceof Error ? error.message : String(error)}`);
             throw error;
           }
         };
-        persistConnect();
+        connectWrite(claim);
 
         await channel.send({ type: MSG_HEARTBEAT, seq: 0, ts: now, body: {} });
         state.messagesSent++;
-        persistConnect();
+        connectWrite(persist);
 
         const hb = setInterval(async () => {
           if (stopped || !channel.isAlive()) return;
@@ -1651,7 +1756,8 @@ export async function connectAndKeepAlive(
 
   void loop();
 
-  return async () => {
+  let stopAttempt: Promise<void> | undefined;
+  const stop = async () => {
     stopped = true;
     cancelInboundPersist();
     stopPrune();
@@ -1689,11 +1795,20 @@ export async function connectAndKeepAlive(
       }
     }
     if (unconfirmedChannelClose || failedChannels.size > 0) {
-      const error = new Error(`Channel close rejected; host state record ${hostStatePath(branchId)} retained`);
+      const error = new Error(`Channel close rejected; host state record ${recordPath} retained`);
       error.name = "HostChannelCloseError";
       throw error;
     }
-    clearHostState(branchId);
+    clearHostStateAt(recordPath, branchId, connectionId, opts.testHooks);
+  };
+  return () => {
+    if (stopAttempt === undefined) {
+      stopAttempt = stop().catch((error: unknown) => {
+        stopAttempt = undefined;
+        throw error;
+      });
+    }
+    return stopAttempt;
   };
 }
 

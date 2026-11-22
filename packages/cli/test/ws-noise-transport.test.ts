@@ -9,21 +9,9 @@ import { CHANNEL_CLOSE_GRACE_MS } from "../src/utils/transport.js";
 import { createHash } from "node:crypto";
 import { WebSocket } from "ws";
 import { createPatchShared } from "./helpers/patch-shared.js";
+import { boundPort } from "./helpers/port.js";
 
 const patchShared = createPatchShared();
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const s = net.createServer();
-    s.listen(0, "127.0.0.1", () => {
-      const addr = s.address();
-      if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-      const p = addr.port;
-      s.close(() => resolve(p));
-    });
-    s.once("error", reject);
-  });
-}
 
 describe("WsNoiseTransport", () => {
   let root: string;
@@ -51,9 +39,9 @@ describe("WsNoiseTransport", () => {
     const branch = generateKeyPair();
     registerBranch("brancha", branch.signing.publicKey, undefined, branch.encryption.publicKey);
 
-    const port = await freePort();
     const serverTransport = new WsNoiseTransport(host, host);
-    const server = await serverTransport.listen(port);
+    const server = await serverTransport.listen(0);
+    const port = boundPort(server);
 
     const recv = new Promise<string>((resolve) => {
       server.onConnection((ch) => {
@@ -93,17 +81,8 @@ describe("WsNoiseTransport", () => {
       const host = generateKeyPair();
       const branch = generateKeyPair();
       const net = await import("node:net");
-      const port = await new Promise((resolve, reject) => {
-        const s = net.createServer();
-        s.listen(0, "127.0.0.1", () => {
-          const addr = s.address();
-          if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-          const p = addr.port;
-          s.close(() => resolve(p));
-        });
-        s.once("error", reject);
-      });
-      const server = await new WsNoiseTransport(host, host).listen(port as number);
+      const server = await new WsNoiseTransport(host, host).listen(0);
+      const port = server.port();
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "unknown",
@@ -132,17 +111,8 @@ describe("WsNoiseTransport", () => {
       const branch = generateKeyPair();
       registerBranch("branch2", branch.signing.publicKey, undefined, branch.encryption.publicKey);
       const net = await import("node:net");
-      const port = await new Promise((resolve, reject) => {
-        const s = net.createServer();
-        s.listen(0, "127.0.0.1", () => {
-          const addr = s.address();
-          if (!addr || typeof addr === "string") return reject(new Error("no addr"));
-          const p = addr.port;
-          s.close(() => resolve(p));
-        });
-        s.once("error", reject);
-      });
-      const server = await new WsNoiseTransport(host, host).listen(port as number);
+      const server = await new WsNoiseTransport(host, host).listen(0);
+      const port = server.port();
       try {
         await new WsNoiseTransport(branch).connect({
           host: "127.0.0.1", port, branchId: "branch2",
@@ -159,8 +129,6 @@ describe("WsNoiseTransport", () => {
     const host = generateKeyPair();
     const branch = generateKeyPair();
     registerBranch("branch3", branch.signing.publicKey, undefined, branch.encryption.publicKey);
-    const port = await freePort();
-
     const captured: Buffer[] = [];
     const origSend = (await import("ws")).WebSocket.prototype.send;
     const restoreSend = patchShared((await import("ws")).WebSocket.prototype, "send", function (this: any, data: any, ...args: any[]) {
@@ -169,7 +137,8 @@ describe("WsNoiseTransport", () => {
       return origSend.call(this, data, ...args);
     } as typeof origSend);
 
-    const server = await new WsNoiseTransport(host, host).listen(port);
+    const server = await new WsNoiseTransport(host, host).listen(0);
+    const port = boundPort(server);
     server.onConnection((ch) => {
       ch.onMessage(() => {});
     });

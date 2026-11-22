@@ -13,7 +13,8 @@
  * Properties:
  *  - normal acquisition publishes a populated lock directory by rename;
  *  - ownership uses pid and process start time when readable; a live pid with
- *    an unverifiable token is retained;
+ *    an unverifiable token (another source, or a differing `ps:` token) is
+ *    retained;
  *  - acquisition and stale reclamation share an atomic claim;
  *  - a stranded claim requires operator recovery;
  *  - release checks the acquisition nonce;
@@ -70,13 +71,19 @@ function readProcStatFields(pid: number): string[] | null {
 }
 
 /**
- * A stable per-process identity token — its kernel birth time — or null only
- * when it cannot be read at all.
+ * A per-process identity token — its birth time — or null only when it cannot
+ * be read at all.
  *
  * Two sources, so it is portable: `/proc/<pid>/stat` (Linux; field 22 is
  * starttime), and `ps -o lstart= -p <pid>` (Darwin and Linux). Without the
  * fallback the token is always null on Darwin, and owner identity degrades to
  * pid alone — exactly the pid-reuse confusion this token exists to prevent.
+ *
+ * `ps` renders `lstart` in the CALLING process's timezone and locale, so the
+ * fallback runs it with TZ=UTC and LC_ALL=C: one live process then yields one
+ * `ps:` token whichever environment reads it (cli#1045). A `ps:` token written
+ * before that pin may hold local-time text, which is why ownerState does not
+ * read a `ps:` mismatch as pid reuse.
  */
 export function processStartToken(pid: number): string | null {
   const fields = readProcStatFields(pid);
@@ -84,12 +91,14 @@ export function processStartToken(pid: number): string | null {
     const token = fields[19];
     if (token) return `proc:${token}`;
   }
-  // Portable fallback — `lstart` is a stable per-process birth time string.
+  // Portable fallback. `lstart` is rendered in the caller's TZ and locale;
+  // pinning both makes the text the same in every reader of one process.
   try {
     const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
       encoding: "utf-8",
       timeout: 2000,
       stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, TZ: "UTC", LC_ALL: "C" },
     });
     const token = out.trim();
     if (token) return `ps:${token}`;
@@ -138,18 +147,41 @@ export function pidStateFromProbeError(error: unknown): PidState {
   return "alive";
 }
 
-interface LockOwner {
+export interface LockOwner {
   pid?: unknown;
   startToken?: unknown;
   nonce?: unknown;
 }
 
-type OwnerState = "alive" | "dead" | "unverifiable";
+export type OwnerState = "alive" | "dead" | "unverifiable";
 
-/** The source component of a birth token (`proc:` / `ps:`), or the whole string. */
-function tokenSource(token: string): string {
-  const i = token.indexOf(":");
-  return i === -1 ? token : token.slice(0, i);
+/** A `proc:` token that carries a value. Two differing tokens of this form are classified as reuse ("dead");
+ *  the value is not otherwise validated, so a malformed recorded value also compares as a difference. */
+const PROC_TOKEN = /^proc:.+$/;
+
+export type OwnerTokenState = "alive" | "dead" | "unverifiable";
+
+/**
+ * The one rule for comparing a LIVE pid's current start token with the token
+ * recorded for it (cli#1045). The agent mail lock and pid files, the cli outbox
+ * per-delivery lock, pid files, launch snapshot sweep, host-state ownership
+ * and released-agent identity use it. A gone pid is the caller's to classify
+ * (dead) before it gets here.
+ *
+ * "alive" — the tokens are equal.
+ * "unverifiable" — anything else that differs: a differing `ps:` token, one
+ * from another source, or a token that is not a `proc:` token with a value (a
+ * bare `proc`, an empty `proc:`). `ps` text depended on the reader's timezone
+ * and locale until cli#1045 pinned them, and a token written before the pin,
+ * or by a process still running older code, may hold local-time text, so a
+ * `ps:` mismatch cannot prove reuse.
+ * "dead" — two differing `proc:` tokens with values: /proc starttime is
+ * kernel-stable, so a different value is treated as the pid having been
+ * reused. Only these are treated as reuse; the value itself is not validated.
+ */
+export function classifyOwnerToken(liveToken: string, recordedToken: string): OwnerTokenState {
+  if (liveToken === recordedToken) return "alive";
+  return PROC_TOKEN.test(liveToken) && PROC_TOKEN.test(recordedToken) ? "dead" : "unverifiable";
 }
 
 function readOwner(lockDir: string): LockOwner | null {
@@ -161,15 +193,17 @@ function readOwner(lockDir: string): LockOwner | null {
 }
 
 /**
- * Classify a lock's owner.
+ * Classify a lock's owner. Exported for tests (the token resolver is
+ * injectable); the package index does not export it.
  *
- * "dead" — pid gone, or pid alive with a DIFFERENT token FROM THE SAME SOURCE.
- * A token from a different source (`proc:` vs `ps:`) for the same live process
- * is "unverifiable", NOT dead — treating it as dead would break a live owner's
- * lock (two owners), the race this lock exists to prevent. Everything
- * unverifiable is neither broken on age nor mistaken for dead.
+ * "dead" — pid gone (whatever its token's source). For a live pid with both
+ * tokens readable, classifyOwnerToken decides: a differing `proc:` token is
+ * dead (reuse); a differing `ps:` token, or one from the other source, is
+ * "unverifiable". Treating those as dead would break a live owner's lock (two
+ * owners), the race this lock exists to prevent. Everything unverifiable is
+ * neither broken on age nor mistaken for dead.
  */
-function ownerState(
+export function ownerState(
   owner: LockOwner | null,
   resolveToken: (pid: number) => string | null = processStartToken,
 ): OwnerState {
@@ -179,19 +213,16 @@ function ownerState(
   if (pid === "invalid") return "unverifiable";
   if (pid === "gone") return "dead";
   const token = resolveToken(owner.pid);
-  if (token !== null && typeof owner.startToken === "string") {
-    if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";
-    return token === owner.startToken ? "alive" : "dead";
-  }
+  if (token !== null && typeof owner.startToken === "string") return classifyOwnerToken(token, owner.startToken);
   // pid is alive and we cannot disprove it — never break.
   return "unverifiable";
 }
 
 /**
  * cli#617 slice (b): is the process named by (pid, start token) provably gone?
- * The same rule a lock owner is reclaimed by: the pid is gone, or it is alive
- * with a different start token from the same source. A live pid whose identity
- * cannot be checked is NOT gone.
+ * The same rule a lock owner is reclaimed by (ownerState): the pid is gone, or
+ * it is alive with a different `proc:` start token. A live pid whose identity
+ * cannot be checked — a differing `ps:` token included (cli#1045) — is NOT gone.
  */
 export function processIsGone(pid: number, startToken: string | null): boolean {
   return ownerState({ pid, startToken }) === "dead";

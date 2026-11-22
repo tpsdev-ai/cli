@@ -1,11 +1,15 @@
 import { describe, expect, test } from "bun:test";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
-import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, makeCase, OPENCLAW_VERSION, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { join, resolve, isAbsolute, relative } from "node:path";
+import { fileURLToPath } from "node:url";
+import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { withPortRetry } from "./helpers/port.js";
+
+const REPO = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 
 const CASE_STUB = { home: "/nonexistent/home", stateDir: "", configPath: "", flairPort: 1 };
 const GATEWAY_RUNNING = { exitCode: null };
@@ -66,15 +70,12 @@ function fakeConnect(event: string, value?: unknown) {
 }
 
 async function refusedPort(): Promise<number> {
-  const server = net.createServer();
-  await new Promise<void>((resolveListen, rejectListen) => {
-    server.once("error", rejectListen);
-    server.listen(0, "127.0.0.1", () => resolveListen());
-  });
-  const address = server.address();
-  if (address === null || typeof address === "string") throw new Error("listener has no port");
-  await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
-  return address.port;
+  // The port must refuse connections now: probe it after the listener closes,
+  // and choose another if something took it in between.
+  const { port } = await withPortRetry(async (port) => {
+    await assertPortClosed(port);
+  }, { retryOn: () => true });
+  return port;
 }
 
 describe("the dead-gateway precondition accepts only a refused connection", () => {
@@ -199,7 +200,12 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     ).rejects.toBe(value);
   });
 
-  test.each([undefined, 0])("preserves thrown %p before the cleanup failure", async (value) => {
+  test.each([
+    [undefined, undefined],
+    [0, undefined],
+    [undefined, "heartbeat also failed"],
+    [0, "heartbeat also failed"],
+  ])("preserves thrown %p before the cleanup failure with label %p", async (value, failureLabel) => {
     const cleanup = new Error("cleanup failed");
     let reported: unknown;
     try {
@@ -210,6 +216,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
         async () => {
           throw cleanup;
         },
+        failureLabel,
       );
     } catch (error) {
       reported = error;
@@ -217,6 +224,7 @@ describe("a cleanup failure does not hide the assertion that failed", () => {
     expect(reported).toBeInstanceOf(AggregateError);
     const aggregate = reported as AggregateError;
     expect(aggregate.message.split("\n")[0]).toBe(String(value));
+    expect(aggregate.message).toBe(`${String(value)}\n${failureLabel ?? "cleanup also failed"}: ${cleanup.message}`);
     expect(aggregate.errors).toHaveLength(2);
     expect(aggregate.errors[0]).toBe(value);
     expect(aggregate.errors[1]).toBe(cleanup);
@@ -359,4 +367,433 @@ describe("cleanup fails the lane when the gateway does not exit", () => {
     });
     expect(child.exitCode).toBe(0);
   });
+});
+
+describe("the temp tree removal failure is attached after the lane failure", () => {
+  test("reports the lane failure first and the removal failure after it", async () => {
+    const laneFailure = new Error("live gateway: heartbeat exit status must be 0");
+    const removalFailure = Object.assign(new Error("EPERM: operation not permitted, rm"), { code: "EPERM" });
+    let removed = "";
+    let reported: unknown;
+    try {
+      await runLane({
+        action: async () => {
+          throw laneFailure;
+        },
+        removeTree: (path: string) => {
+          removed = path;
+          rmSync(path, { recursive: true, force: true });
+          throw removalFailure;
+        },
+      });
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBeInstanceOf(AggregateError);
+    const aggregate = reported as AggregateError;
+    expect(aggregate.errors).toEqual([laneFailure, removalFailure]);
+    expect(aggregate.message.split("\n")).toEqual([
+      laneFailure.message,
+      `cleanup also failed: ${removalFailure.message}`,
+    ]);
+    expect(removed).toContain("tps-heartbeat-lane-");
+  });
+
+  test("a removal failure with no lane failure still fails the lane", async () => {
+    const removalFailure = new Error("EBUSY: resource busy or locked, rm");
+    let reported: unknown;
+    try {
+      await runLane({
+        action: async () => {},
+        removeTree: (path: string) => {
+          rmSync(path, { recursive: true, force: true });
+          throw removalFailure;
+        },
+      });
+    } catch (error) {
+      reported = error;
+    }
+    expect(reported).toBe(removalFailure);
+  });
+});
+
+type InstallCall = { command: string; args: string[]; options: { cwd?: string } };
+
+const HELPER = join(REPO, "scripts", "npm-ci-tracked-lock.sh");
+const FIXTURE = "test/fixtures/heartbeat-openclaw";
+const CI_ARGS = ["--ignore-scripts", "--no-audit", "--no-fund"];
+
+/** Host Bash used directly or as a wrapper target. */
+function realBash(): string {
+  const found = spawnSync("bash", ["-c", "command -v bash"], { encoding: "utf-8" });
+  const bashBin = found.status === 0 ? found.stdout.trim() : "";
+  if (!bashBin.startsWith("/")) throw new Error(`no absolute bash on this host: ${JSON.stringify(bashBin)}`);
+  return bashBin;
+}
+
+function recordingSpawn() {
+  const calls: InstallCall[] = [];
+  const spawnInstall = (command: string, args: string[], options: InstallCall["options"]) => {
+    calls.push({ command, args, options });
+    // Simulate the helper's install: the bin the caller will use must exist.
+    const prefix = args[args.indexOf(FIXTURE) + 1];
+    mkdirSync(join(prefix, "node_modules", ".bin"), { recursive: true });
+    writeFileSync(join(prefix, "node_modules", ".bin", "openclaw"), "");
+    return { status: 0, stdout: "", stderr: "" };
+  };
+  return { calls, spawnInstall };
+}
+
+/** An npm stub that records its argv and creates the bin under --prefix. */
+function npmStub(dir: string, recordPath: string): void {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, "npm"),
+    `#!/bin/sh
+printf '%s\\n' "$@" > ${JSON.stringify(recordPath)}
+prefix=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--prefix" ]; then prefix="$arg"; fi
+  prev="$arg"
+done
+mkdir -p "$prefix/node_modules/.bin"
+: > "$prefix/node_modules/.bin/openclaw"
+`,
+  );
+  chmodSync(join(dir, "npm"), 0o755);
+}
+
+function helperTools(root: string): string {
+  const tools = join(root, "tools");
+  mkdirSync(tools);
+  for (const name of ["bash", "node", "git", "mktemp", "mkdir", "cp", "cmp", "rm", "rmdir"]) {
+    const found = spawnSync("/bin/sh", ["-c", `command -v ${name}`], { encoding: "utf-8" });
+    const tool = found.status === 0 ? found.stdout.trim() : "";
+    if (!tool.startsWith("/")) throw new Error(`no absolute ${name} on this host: ${JSON.stringify(tool)}`);
+    symlinkSync(tool, join(tools, name));
+  }
+  return tools;
+}
+
+describe("the local fallback installs from the committed fixture lock", () => {
+  test("runs the tracked-lock helper on the committed fixture instead of npm install", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
+    try {
+      const { calls, spawnInstall } = recordingSpawn();
+      const pathEnv = helperTools(root);
+      const binDir = installOpenClaw(root, { spawn: spawnInstall, pathEnv, env: { PATH: pathEnv } });
+      expect(calls).toHaveLength(1);
+      const [call] = calls;
+      expect(call.command).toBe(join(pathEnv, "bash"));
+      expect(call.args).toEqual([HELPER, "--via", "npm", FIXTURE, join(root, "openclaw"), ...CI_ARGS]);
+      expect(call.options.cwd).toBe(REPO);
+      expect(binDir).toBe(join(root, "openclaw", "node_modules", ".bin"));
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the sfw path when sfw is on PATH", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-"));
+    try {
+      const stubs = helperTools(root);
+      writeFileSync(join(stubs, "sfw"), "#!/bin/sh\n");
+      chmodSync(join(stubs, "sfw"), 0o755);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { spawn: spawnInstall, pathEnv: stubs, env: { PATH: stubs } });
+      expect(calls[0].args).toEqual([HELPER, "--via", "sfw", FIXTURE, join(root, "run", "openclaw"), ...CI_ARGS]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  function fixtureRepo(root: string): string {
+    const repo = join(root, "repo");
+    mkdirSync(join(repo, "scripts", "lib"), { recursive: true });
+    mkdirSync(join(repo, "test", "fixtures", "heartbeat-openclaw"), { recursive: true });
+    cpSync(join(REPO, "scripts", "npm-ci-tracked-lock.sh"), join(repo, "scripts", "npm-ci-tracked-lock.sh"));
+    cpSync(join(REPO, "scripts", "lib", "npm-ci-revision.sh"), join(repo, "scripts", "lib", "npm-ci-revision.sh"));
+    for (const file of ["package.json", "package-lock.json"]) {
+      cpSync(join(REPO, "test", "fixtures", "heartbeat-openclaw", file), join(repo, "test", "fixtures", "heartbeat-openclaw", file));
+    }
+    const git = (...args: string[]) => {
+      const result = spawnSync("git", args, { cwd: repo, encoding: "utf-8" });
+      if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${result.stderr}`);
+    };
+    git("init", "-q");
+    git("add", "-A");
+    git("-c", "user.email=lane-fixture@example.com", "-c", "user.name=lane-fixture", "commit", "-qm", "fixture");
+    return repo;
+  }
+
+  test("the real helper accepts that argv and installs the committed lock", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-helper-"));
+    try {
+      const repo = fixtureRepo(root);
+      const stubs = helperTools(root);
+      const recordPath = join(root, "npm-args.txt");
+      writeFileSync(join(stubs, "npm"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(recordPath)}\n`);
+      chmodSync(join(stubs, "npm"), 0o755);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const env = { PATH: stubs, HOME: home };
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, env });
+      expect(binDir).toBe(join(throwaway, "openclaw", "node_modules", ".bin"));
+      const argv = readFileSync(recordPath, "utf-8").trim().split("\n");
+      expect(argv[0]).toBe("ci");
+      expect(argv[argv.indexOf("--prefix") + 1]).toBe(join(throwaway, "openclaw"));
+      for (const arg of CI_ARGS) expect(argv).toContain(arg);
+      expect(argv.some((arg) => arg.startsWith("--registry="))).toBe(true);
+      const lock = readFileSync(join(repo, "test", "fixtures", "heartbeat-openclaw", "package-lock.json"), "utf-8");
+      expect(readFileSync(join(throwaway, "openclaw", "package-lock.json"), "utf-8")).toBe(lock);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a relative PATH entry resolves from the helper's working directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-relative-"));
+    const previousCwd = process.cwd();
+    try {
+      const repo = fixtureRepo(root);
+      const laneCwd = join(root, "lane-cwd");
+      const relBin = join(laneCwd, "relbin");
+      mkdirSync(relBin, { recursive: true });
+      writeFileSync(join(relBin, "sfw"), "#!/bin/sh\nexit 0\n");
+      chmodSync(join(relBin, "sfw"), 0o755);
+      const npmDir = helperTools(root);
+      const recordPath = join(root, "npm-args.txt");
+      npmStub(npmDir, recordPath);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `relbin:${npmDir}`;
+      process.chdir(laneCwd);
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      expect(readFileSync(recordPath, "utf-8")).toContain("ci");
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("a relative PATH entry for bash itself: the lane and the helper use the same bash and both see sfw", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-relative-bash-"));
+    const previousCwd = process.cwd();
+    const previousPath = process.env.PATH;
+    try {
+      const repo = fixtureRepo(root);
+      const relBin = join(repo, "relative-bin");
+      mkdirSync(relBin, { recursive: true });
+      const bashRecord = join(root, "bash-calls.txt");
+      writeFileSync(
+        join(relBin, "bash"),
+        `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(bashRecord)}\nexec ${JSON.stringify(realBash())} "$@"\n`,
+      );
+      chmodSync(join(relBin, "bash"), 0o755);
+      const sfwRecord = join(root, "sfw-args.txt");
+      writeFileSync(join(relBin, "sfw"), `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(sfwRecord)}\n`);
+      chmodSync(join(relBin, "sfw"), 0o755);
+      const tools = helperTools(root);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `relative-bin:${tools}`;
+      const laneCwd = join(root, "lane-cwd");
+      mkdirSync(laneCwd);
+      process.env.PATH = pathEnv;
+      process.chdir(laneCwd);
+      const throwaway = join(root, "throwaway");
+      installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      const bashCalls = readFileSync(bashRecord, "utf-8").trim().split("\n");
+      expect(bashCalls.some((line) => line.includes("command -v sfw"))).toBe(true);
+      expect(bashCalls.some((line) => line.includes("--via sfw") && line.includes("npm-ci-tracked-lock.sh"))).toBe(true);
+      expect(readFileSync(sfwRecord, "utf-8")).toContain("ci");
+    } finally {
+      process.chdir(previousCwd);
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  test("an explicit non-executable bash override fails the probe with EACCES", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-probe-fail-"));
+    try {
+      const notExecutable = join(root, "bash");
+      writeFileSync(notExecutable, "");
+      const { calls, spawnInstall } = recordingSpawn();
+      const pathEnv = helperTools(root);
+      let reported: unknown;
+      try {
+        installOpenClaw(join(root, "run"), {
+          spawn: spawnInstall,
+          bashPath: notExecutable,
+          pathEnv,
+          env: { PATH: pathEnv },
+        });
+      } catch (error) {
+        reported = error;
+      }
+      expect(reported).toBeInstanceOf(Error);
+      expect((reported as Error).message).toBe(`sfw probe cannot launch bash at ${notExecutable}: EACCES`);
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty PATH entry selects bash from the helper working directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-empty-"));
+    try {
+      const bashBin = join(root, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `:${helperTools(root)}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe(bashBin);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["directory", "non-executable file"])("skips a %s named bash before a valid executable", (kind) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-skip-"));
+    try {
+      const first = join(root, "first");
+      const valid = join(root, "valid");
+      mkdirSync(first);
+      mkdirSync(valid);
+      if (kind === "directory") mkdirSync(join(first, "bash"));
+      else {
+        writeFileSync(join(first, "bash"), "#!/bin/sh\nexit 0\n");
+        chmodSync(join(first, "bash"), 0o644);
+      }
+      const bashBin = join(valid, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: root, pathEnv: `${first}:${valid}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(calls[0].command).toBe(bashBin);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty install PATH is refused by name, even when the working directory holds bash", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-emptypath-"));
+    try {
+      symlinkSync(realBash(), join(root, "bash"));
+      const { calls, spawnInstall } = recordingSpawn();
+      expect(() => installOpenClaw(join(root, "run"), { repo: root, pathEnv: "", spawn: spawnInstall })).toThrow(
+        "no executable bash on the install PATH: PATH is empty",
+      );
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an empty PATH entry with a relative working directory selects an absolute bash", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-relcwd-"));
+    try {
+      const bashBin = join(root, "bash");
+      symlinkSync(realBash(), bashBin);
+      const { calls, spawnInstall } = recordingSpawn();
+      installOpenClaw(join(root, "run"), { repo: relative(process.cwd(), root), pathEnv: `:${helperTools(root)}`, spawn: spawnInstall });
+      expect(calls).toHaveLength(1);
+      expect(isAbsolute(calls[0].command)).toBe(true);
+      expect(realpathSync(calls[0].command)).toBe(realpathSync(bashBin));
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("a PATH without bash names the resolver refusal before installing", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-bash-missing-"));
+    try {
+      const { calls, spawnInstall } = recordingSpawn();
+      expect(() => installOpenClaw(join(root, "run"), { pathEnv: root, spawn: spawnInstall })).toThrow(
+        `no executable bash on the install PATH: tried ${join(root, "bash")}`,
+      );
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["unexpected exit", "exit 23", "exited with status 23"],
+    ["signal", 'kill -TERM "$$"', "was killed by SIGTERM"],
+    ["ENOENT", null, "ENOENT"],
+  ])("a probe %s is a named failure before installing", (_kind, script, detail) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-probe-outcome-"));
+    try {
+      const bashBin = join(root, "bash");
+      if (script !== null) {
+        writeFileSync(bashBin, `#!/bin/sh\nexec ${JSON.stringify(realBash())} -c ${JSON.stringify(script)}\n`);
+        chmodSync(bashBin, 0o755);
+      }
+      const { calls, spawnInstall } = recordingSpawn();
+      const message = script === null
+        ? `sfw probe cannot launch bash at ${bashBin}: ${detail}`
+        : `sfw probe with bash at ${bashBin} ${detail}`;
+      expect(() => installOpenClaw(join(root, "run"), { bashPath: bashBin, spawn: spawnInstall })).toThrow(message);
+      expect(calls).toHaveLength(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each([
+    ["error", { status: null, error: Object.assign(new Error("missing"), { code: "ENOENT" }) }],
+    ["signal", { status: null, signal: "SIGTERM" }],
+  ])("an install %s names bash and its outcome", (kind, outcome) => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-outcome-"));
+    try {
+      const bashBin = realBash();
+      let installs = 0;
+      let reported: unknown;
+      try {
+        installOpenClaw(root, { bashPath: bashBin, pathEnv: root, spawn: () => {
+          installs++;
+          return outcome;
+        } });
+      } catch (error) {
+        reported = error;
+      }
+      expect(installs).toBe(1);
+      expect(reported).toBeInstanceOf(Error);
+      expect((reported as Error).message).toBe(kind === "error"
+        ? `tracked-lock install cannot launch bash at ${bashBin}: ENOENT`
+        : `tracked-lock install with bash at ${bashBin} was killed by SIGTERM`);
+      expect((reported as Error).message).not.toContain("status null");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("an sfw PATH entry that is a directory is not an installer", () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-install-dir-sfw-"));
+    try {
+      const repo = fixtureRepo(root);
+      const dirEntry = join(root, "dir-entry");
+      mkdirSync(join(dirEntry, "sfw"), { recursive: true });
+      const npmDir = helperTools(root);
+      const recordPath = join(root, "npm-args.txt");
+      npmStub(npmDir, recordPath);
+      const home = join(root, "home");
+      mkdirSync(home);
+      const pathEnv = `${dirEntry}:${npmDir}`;
+      const throwaway = join(root, "throwaway");
+      const binDir = installOpenClaw(throwaway, { repo, pathEnv, env: { PATH: pathEnv, HOME: home } });
+      expect(readFileSync(recordPath, "utf-8")).toContain("ci");
+      expect(existsSync(join(binDir, "openclaw"))).toBe(true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 60_000);
 });

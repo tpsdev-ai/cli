@@ -1,6 +1,6 @@
 // The mailbox lock lives in @tpsdev-ai/agent so MailClient and promote() hold the same one.
 export { acquireMailLock, acquireMailLockSync, MAIL_LOCK_DIR, type MailLock, mailLockPath, processStartToken } from "@tpsdev-ai/agent";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { classifyOwnerToken, pidState, processStartToken } from "@tpsdev-ai/agent";
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -16,11 +16,6 @@ interface LockOwner {
 }
 
 type OwnerState = "alive" | "dead" | "unverifiable" | "unowned";
-
-function tokenSource(token: string): string {
-  const i = token.indexOf(":");
-  return i === -1 ? token : token.slice(0, i);
-}
 
 function readOwner(lockDir: string): LockOwner | null {
   try {
@@ -53,10 +48,8 @@ function ownerState(
   if (strict && (typeof owner.startToken !== "string" || !/^(proc|ps):.+/.test(owner.startToken))) return "unverifiable";
   if (pid === "gone") return "dead";
   const token = resolveToken(owner.pid);
-  if (token !== null && typeof owner.startToken === "string") {
-    if (tokenSource(token) !== tokenSource(owner.startToken)) return "unverifiable";
-    return token === owner.startToken ? "alive" : "dead";
-  }
+  // The shared token rule (cli#1045): a differing `ps:` token is unverifiable, never dead.
+  if (token !== null && typeof owner.startToken === "string") return classifyOwnerToken(token, owner.startToken);
   return pidState(owner.pid) === "gone" ? "dead" : "unverifiable";
 }
 
@@ -78,9 +71,13 @@ function claimLock(lockDir: string, myToken: string | null): boolean {
   }
 }
 
+/** Guidance for an unverifiable owner: the caller must decide by hand, never
+ *  by age. */
+const UNVERIFIABLE_OWNER_GUIDANCE = "; pause every process that acquires or reclaims this lock, confirm no delivery is active, remove the lock, and only then resume them";
+
 export class MailLockOwnerError extends Error {
-  constructor(lockDir: string) {
-    super(`MailLockOwnerError: cannot verify owner of ${lockDir}`);
+  constructor(lockDir: string, guidance?: string) {
+    super(`MailLockOwnerError: cannot verify owner of ${lockDir}${guidance ?? ""}`);
     this.name = "MailLockOwnerError";
   }
 }
@@ -135,7 +132,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
       // A changed identity may indicate contention; retry to re-evaluate the lock path.
       if (lockIdentity(lockDir) !== identity) continue;
       if (!existsSync(lockDir)) continue;
-      throw new MailLockOwnerError(lockDir);
+      throw new MailLockOwnerError(lockDir, UNVERIFIABLE_OWNER_GUIDANCE);
     }
     let reclaim: MailLock | null;
     try {
@@ -157,7 +154,7 @@ export function tryAcquireMailLock(lockDir: string): MailLock | null {
         mailLockTestHooks.unverifiedOwner?.(lockDir);
         if (lockIdentity(lockDir) !== currentIdentity) continue;
         if (!existsSync(lockDir)) continue;
-        throw new MailLockOwnerError(lockDir);
+        throw new MailLockOwnerError(lockDir, UNVERIFIABLE_OWNER_GUIDANCE);
       }
       removeClaim(lockDir);
     } catch (error) {

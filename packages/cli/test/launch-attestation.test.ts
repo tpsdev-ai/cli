@@ -652,6 +652,11 @@ async function runLauncherInProcess(opts: {
   failFirst?: { disableCanaryCheck?: boolean; disablePidBinding?: boolean };
 }): Promise<LauncherRun> {
   const sb = opts.sb;
+  // cli#1036: the wrapped command the fake nono runs, resolved on this host's
+  // PATH. `/bin/true` exists on Linux and not on macOS (/usr/bin/true); a missing
+  // one exits 127 under the fake nono, and a released launch returned that.
+  const trueBin = Bun.which("true");
+  if (!trueBin) throw new Error("no `true` on PATH for the fake nono to run");
   const bin = writeFakeNono(sb, FAKE_NONO);
   const storePath = join(sb.root, "ps.json");
   const stopFile = join(sb.root, "stop");
@@ -727,7 +732,7 @@ exit 0
         readFiles: [],
         allow: [sb.ws, ...(opts.extraAllow ?? [])],
       },
-      ["/bin/true"],
+      [trueBin],
       {
         env: {
           ...(process.env as Record<string, string>),

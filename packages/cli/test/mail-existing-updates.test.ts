@@ -90,7 +90,7 @@ for (const change of ["ack", "body", "id", "lease", "receipt"]) {
     const checking = mail.checkMessages(agent);
     await waitFor(() => verifying);
     expect(fs.existsSync(join(mail.getInbox(agent).root, ".mail-lock"))).toBe(false);
-    if (change === "ack") mail.ackMessageAtPath(target);
+    if (change === "ack") mail.ackMessageAtPath(target, mail.getInbox(agent).root);
     else {
       const current = JSON.parse(fs.readFileSync(target, "utf8"));
       if (change === "body") current.body = "changed";
@@ -113,12 +113,24 @@ for (const operation of ["ack", "ack-id", "sent", "nack-transient", "nack-agent"
     const read = fs.readFileSync;
     faults.push(spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof read>) => {
       const result = read(...args);
-      if (args[0] === target) fs.unlinkSync(target);
+      // The update reads the record through its descriptor: match that read
+      // by file identity, not by path.
+      let recordRead = args[0] === target;
+      if (!recordRead && typeof args[0] === "number") {
+        try {
+          const opened = fs.fstatSync(args[0]);
+          const entry = fs.lstatSync(target);
+          recordRead = opened.dev === entry.dev && opened.ino === entry.ino;
+        } catch {
+          recordRead = false;
+        }
+      }
+      if (recordRead) fs.unlinkSync(target);
       return result;
     }) as typeof read));
-    if (operation === "ack") expect(() => mail.ackMessageAtPath(target)).toThrow();
+    if (operation === "ack") expect(() => mail.ackMessageAtPath(target, mail.getInbox(agent).root)).toThrow();
     else if (operation === "ack-id") expect(() => mail.ackMessage(agent, "record-id")).toThrow();
-    else if (operation === "sent") expect(() => mail.setBridgeSentAtPath(target, "sent")).toThrow();
+    else if (operation === "sent") expect(() => mail.setBridgeSentAtPath(target, "sent", mail.getInbox(agent).root)).toThrow();
     else expect(mail.nackMessage(agent, "record-id", "retry", operation.slice(5) as any)).toBeNull();
     expect(fs.existsSync(target)).toBe(false);
     expect(fs.readdirSync(mail.getInbox(agent).cur)).toEqual([]);
@@ -128,7 +140,7 @@ for (const operation of ["ack", "ack-id", "sent", "nack-transient", "nack-agent"
 
 test("helper returns gone without invoking mutate or writing", () => {
   let mutated = false;
-  expect(mail.updateExistingRecord(target, (record) => { mutated = true; return record; })).toEqual({ status: "gone" });
+  expect(mail.updateExistingRecord(target, (record) => { mutated = true; return record; }, { mailboxRoot: mail.getInbox(agent).root })).toEqual({ status: "gone" });
   expect(mutated).toBe(false);
   expect(fs.readdirSync(mail.getInbox(agent).cur)).toEqual([]);
 });
@@ -146,17 +158,22 @@ test("nack and ack interleaving never recreates the removed record", async () =>
     const signal = (name) => fs.writeFileSync(join(root, name), "ready");
     ${ownerAwareGateWaitScript()}
     const read = fs.readFileSync;
+    const isRecordRead = (arg) => {
+      if (arg === target) return true;
+      if (typeof arg !== "number") return false;
+      try { return fs.fstatSync(arg).ino === fs.lstatSync(target).ino; } catch { return false; }
+    };
     let reads = 0;
     spyOn(fs, "readFileSync").mockImplementation((...args) => {
       const result = read(...args);
-      if (role === "nack" && args[0] === target && ++reads === 2) { signal("nack-read"); wait("release-nack"); }
+      if (role === "nack" && isRecordRead(args[0]) && ++reads === 2) { signal("nack-read"); wait("release-nack"); }
       if (role === "ack" && String(args[0]).endsWith(".mail-lock/owner.json") && JSON.parse(String(result)).pid !== process.pid)
         signal("ack-contended");
       return result;
     });
     const mail = await import(source);
     if (role === "nack") mail.nackMessage(agent, "record-id", "retry");
-    else mail.ackMessageAtPath(target);
+    else mail.ackMessageAtPath(target, mail.getInbox(agent).root);
     signal(role + "-done");
     process.exit(0);
   `);

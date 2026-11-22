@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
-import { acquireMailLockSync, mailLockPath, processStartToken } from "@tpsdev-ai/agent";
+import { acquireMailLockSync, classifyOwnerToken, mailLockPath, pidState, processStartToken } from "@tpsdev-ai/agent";
 import { isPidRecordPid, isPidRecordStartToken } from "./pid-file.js";
 
 const connectionsDir = () => join(process.env.HOME ?? homedir(), ".tps", "connections");
@@ -29,6 +29,7 @@ export interface HostConnectionState {
   /** Process start token; absent from records written before it was captured. */
   startToken?: string | null;
   services?: ServiceHealth[];
+  connectionId?: string;
 }
 
 export interface BranchConnectionState {
@@ -71,8 +72,7 @@ export interface ConnectionTempSweep {
  * never followed. An entry that could not be inspected or removed is reported
  * in `left`; an entry already gone is in neither list.
  */
-export function sweepStaleConnectionTemps(now = Date.now()): ConnectionTempSweep {
-  const dir = connectionsDir();
+export function sweepStaleConnectionTemps(now = Date.now(), dir = connectionsDir()): ConnectionTempSweep {
   let entries: string[];
   try {
     entries = readdirSync(dir);
@@ -168,7 +168,7 @@ const HOST_STATE_LOCK_TIMEOUT_MS = 5000;
  * then rethrows the original error; cleanup errors are swallowed.
  */
 function writeFileAtomic(filePath: string, content: string, mode: number): void {
-  sweepStaleConnectionTemps();
+  sweepStaleConnectionTemps(Date.now(), dirname(filePath));
   const tmpPath = join(dirname(filePath), `.${basename(filePath)}.${randomUUID()}.tmp`);
   // A regular record's observed permission bits are preserved; a symlinked
   // record is treated as absent, as before (the rename replaces the link with a
@@ -243,8 +243,11 @@ export function withHostStateRecordLock<T>(path: string, action: string, fn: () 
 }
 
 export function writeHostState(state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(state.branch);
+  writeHostStateAt(hostStatePath(state.branch), state, shouldWrite, timeoutMs);
+}
+
+export function writeHostStateAt(path: string, state: HostConnectionState, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "write the host state record", () => {
     // Checked inside the lock: a caller that has begun stop() sets its
     // flag before it takes the lock to clear, so a write it starts afterwards
@@ -254,11 +257,76 @@ export function writeHostState(state: HostConnectionState, shouldWrite?: () => b
   }, timeoutMs);
 }
 
-/** True for the same PID, and the same start token when one is present. */
-function recordNamesOwnProcess(state: HostConnectionState): boolean {
-  if (state.pid !== process.pid) return false;
-  if (state.startToken === undefined || state.startToken === null) return true;
-  return state.startToken === processStartToken(process.pid);
+/** IN-PROCESS test seam only: no command, flag or environment variable reaches
+ *  it. Production callers use the default start-token reader. */
+export interface HostStateReadHooks {
+  startToken?: (pid: number) => string | null;
+}
+
+/** What a refresh or claim did under the record lock. `unverifiable` means
+ *  ownership is neither confirmed nor denied (a token that cannot be read, or
+ *  recorded and live tokens that cannot be compared); nothing is written. */
+export type HostStateRefreshOutcome =
+  | { kind: "written" }
+  | { kind: "stopped" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "unverifiable" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Refresh a record this connection still owns. Under the record lock the
+ * record is read and written when the optional `shouldWrite` gate holds and
+ * ownership matches: an absent record or one owned by another connection is
+ * left alone (never recreated or replaced), and an invalid, unreadable or
+ * unverifiable record is left as it is. Returns what happened.
+ */
+export function refreshOwnedHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS, hooks?: HostStateReadHooks): HostStateRefreshOutcome {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withHostStateRecordLock(path, "write the host state record", (): HostStateRefreshOutcome => {
+    if (shouldWrite !== undefined && !shouldWrite()) return { kind: "stopped" };
+    const ownership = hostRecordOwnership(path, state.branch, connectionId, hooks?.startToken);
+    if (ownership.kind !== "owned") return ownership;
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
+    return { kind: "written" };
+  }, timeoutMs);
+}
+
+/**
+ * Claim a record for a connection that has established before. Under the
+ * record lock, while the optional `shouldWrite` gate holds, read the record and
+ * attempt the write when it is absent, is verified as owned by this connection,
+ * or belongs to a connection whose recorded process is not running or carries
+ * a different `proc:` token (treated as pid reuse). `ps:` mismatches are unverifiable: a
+ * record written before cli#1045 may hold local-time text. Filesystem failure can throw.
+ * An invalid, unreadable or unverifiable record is left as it is.
+ * The absent case differs from a refresh: a reconnect may re-establish a record
+ * that was removed.
+ */
+export function claimHostStateAt(path: string, state: HostConnectionState, connectionId: string, shouldWrite?: () => boolean, timeoutMs = HOST_STATE_LOCK_TIMEOUT_MS, hooks?: HostStateReadHooks): HostStateRefreshOutcome {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  return withHostStateRecordLock(path, "write the host state record", (): HostStateRefreshOutcome => {
+    if (shouldWrite !== undefined && !shouldWrite()) return { kind: "stopped" };
+    const ownership = claimableHostRecordOwnership(path, state.branch, connectionId, hooks?.startToken);
+    if (ownership.kind !== "absent" && ownership.kind !== "claimable") return ownership;
+    writeFileAtomic(path, JSON.stringify(state, null, 2), 0o600);
+    return { kind: "written" };
+  }, timeoutMs);
+}
+
+/** "same" for the same PID and the same start token when one is present;
+ *  "other" for a different PID or a different `proc:` token (treated as pid reuse);
+ *  "unverifiable" when this process's start token cannot be read or compared
+ *  with the recorded token (a differing `ps:` token, or tokens from different
+ *  sources). */
+function selfIdentity(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): "same" | "other" | "unverifiable" {
+  if (state.pid !== process.pid) return "other";
+  if (state.startToken === undefined || state.startToken === null) return "same";
+  const ownToken = readStartToken(process.pid);
+  if (ownToken === null) return "unverifiable";
+  const verdict = classifyOwnerToken(ownToken, state.startToken);
+  return verdict === "alive" ? "same" : verdict === "dead" ? "other" : "unverifiable";
 }
 
 type HostRecordRead =
@@ -304,6 +372,7 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
     || typeof state.messagesReceived !== "number"
     || !isPidRecordPid(state.pid)
     || !isPidRecordStartToken(state.startToken)
+    || (state.connectionId !== undefined && (typeof state.connectionId !== "string" || state.connectionId.length === 0))
     || (state.services !== undefined && (!Array.isArray(state.services) || !state.services.every((service: unknown) => {
       if (typeof service !== "object" || service === null || Array.isArray(service)) return false;
       const health = service as Record<string, unknown>;
@@ -316,19 +385,109 @@ function readHostRecord(path: string, branch: string): HostRecordRead {
   return { kind: "record", state: parsed as HostConnectionState };
 }
 
-/** Records classified as unreadable or invalid by the locked read are kept and reported. */
+type HostRecordOwnership =
+  | { kind: "owned" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "unverifiable" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Read the record first; return absent, invalid or unreadable before checking
+ * ownership. A supplied connection id must match before process identity is
+ * checked. Removal and the owned write both use this rule.
+ */
+function hostRecordOwnership(path: string, branch: string, connectionId?: string, readStartToken?: (pid: number) => string | null): HostRecordOwnership {
+  const current = readHostRecord(path, branch);
+  if (current.kind === "absent") return { kind: "absent" };
+  if (current.kind === "invalid") return { kind: "invalid" };
+  if (current.kind === "unreadable") return { kind: "unreadable", reason: current.reason };
+  if (connectionId !== undefined && current.state.connectionId !== connectionId) return { kind: "other" };
+  const identity = selfIdentity(current.state, readStartToken);
+  if (identity === "unverifiable") return { kind: "unverifiable" };
+  if (identity === "other") return { kind: "other" };
+  return { kind: "owned" };
+}
+
+type OwnerLiveness = "alive" | "gone" | "unknown";
+
+/**
+ * Whether the process that wrote a record is still the one running under its
+ * pid: classifyOwnerToken's verdict for a live pid. "gone": the pid is gone,
+ * or a live pid carries a different `proc:` token (treated as pid reuse). A live `ps:`
+ * mismatch, tokens from different sources, or a token that cannot be read are
+ * unknown; unknown never licenses a write.
+ */
+function ownerLiveness(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): OwnerLiveness {
+  const pid = pidState(state.pid);
+  if (pid === "gone") return "gone";
+  if (pid === "invalid") return "unknown";
+  if (state.startToken === undefined || state.startToken === null) return "unknown";
+  let liveToken: string | null;
+  try {
+    liveToken = readStartToken(state.pid);
+  } catch {
+    return "unknown";
+  }
+  if (liveToken === null) return "unknown";
+  const verdict = classifyOwnerToken(liveToken, state.startToken);
+  return verdict === "alive" ? "alive" : verdict === "dead" ? "gone" : "unknown";
+}
+
+type HostRecordClaim =
+  | { kind: "claimable" }
+  | { kind: "absent" }
+  | { kind: "other" }
+  | { kind: "unverifiable" }
+  | { kind: "invalid" }
+  | { kind: "unreadable"; reason: string };
+
+/**
+ * Ownership for a reconnect claim: the rule in `hostRecordOwnership`, plus a
+ * record owned by another connection is claimable when its recorded process is
+ * not running or carries a different `proc:` token (treated as pid reuse). `ps:` mismatches
+ * are unverifiable because a record written before cli#1045 may hold local-time text.
+ * The read and the liveness check run under the caller's record
+ * lock, so the evidence and the write share one hold. Cross-environment
+ * exclusivity of that lock depends on cli#1045.
+ */
+function claimableHostRecordOwnership(path: string, branch: string, connectionId: string, readStartToken?: (pid: number) => string | null): HostRecordClaim {
+  const current = readHostRecord(path, branch);
+  if (current.kind === "absent") return { kind: "absent" };
+  if (current.kind === "invalid") return { kind: "invalid" };
+  if (current.kind === "unreadable") return { kind: "unreadable", reason: current.reason };
+  const ownership = connectionId !== undefined && current.state.connectionId !== connectionId
+    ? "other"
+    : selfIdentity(current.state, readStartToken);
+  if (ownership === "same") return { kind: "claimable" };
+  if (ownership === "unverifiable") return { kind: "unverifiable" };
+  const liveness = ownerLiveness(current.state, readStartToken);
+  if (liveness === "gone") return { kind: "claimable" };
+  return liveness === "unknown" ? { kind: "unverifiable" } : { kind: "other" };
+}
+
 export function clearHostState(branch: string): void {
-  mkdirSync(connectionsDir(), { recursive: true, mode: 0o700 });
-  const path = hostStatePath(branch);
+  clearHostStateAt(hostStatePath(branch), branch);
+}
+
+/** Records classified as unreadable, invalid or unverifiable by the locked
+ *  read are kept and reported. */
+export function clearHostStateAt(path: string, branch: string, connectionId?: string, hooks?: HostStateReadHooks): void {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   withHostStateRecordLock(path, "remove the host state record", () => {
-    const current = readHostRecord(path, branch);
-    if (current.kind === "absent") return;
-    if (current.kind !== "record") {
+    const ownership = hostRecordOwnership(path, branch, connectionId, hooks?.startToken);
+    if (ownership.kind === "absent" || ownership.kind === "other") return;
+    if (ownership.kind !== "owned") {
+      const reason = ownership.kind === "invalid"
+        ? "is not a valid host state record"
+        : ownership.kind === "unverifiable"
+          ? "this process's start token could not be read or compared"
+          : ownership.reason;
       throw new Error(
-        `Host state record ${path} is present but ${current.kind === "invalid" ? "is not a valid host state record" : current.reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
+        `Host state record ${path} is present but ${reason}, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
       );
     }
-    if (!recordNamesOwnProcess(current.state)) return;
     try {
       rmSync(path, { force: true });
     } catch (error) {

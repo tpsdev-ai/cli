@@ -129,6 +129,11 @@ export interface ObligationRecord {
    *  was proven not to have happened (`failed`), or WHY the obligation could
    *  not be resolved either way (`unconfirmed`). Never set on a live record. */
   failure?: string;
+  /** cli#1006: restart recovery or an in-process deadline settled or re-armed
+   *  this obligation from its own record because a clean lookup found the
+   *  inbound's cur/ entry GONE. A reason, never a verdict: it says why the
+   *  record, not the maildir, decided. */
+  missingCurReason?: string;
   /** ISO time of the LAST state transition (create counts as the pending
    *  transition). The retention sweep ages a terminal record by THIS, falling
    *  back to `inboundTimestamp` for records written before this field existed —
@@ -275,6 +280,12 @@ export function createObligation(
   });
 }
 
+/** Test hook before the transition acquires its store lock. */
+let beforeTransitionForTests: ((inboundId: string) => void) | undefined;
+export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTests): void {
+  beforeTransitionForTests = hook;
+}
+
 /**
  * One-way transition. A late event after a TERMINAL state (acked/unconfirmed/
  * failed) is a NO-OP, logged — never a state resurrection. Transitions do not
@@ -287,6 +298,9 @@ export function createObligation(
  * 9, item 4). A refusal must be distinguishable from a landing: a caller that
  * needs to act on "this transition did not happen" (markDelivering, before a
  * delivery call) may never be handed the old record as though it were the result.
+ *
+ * `expect.from` refuses a transition when the record's STATE moved since the
+ * caller's re-read. A concurrent same-state update is not detected.
  */
 export function transitionObligation(
   mailDir: string,
@@ -295,13 +309,21 @@ export function transitionObligation(
   next: ObligationState,
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
+  expect?: { from: ObligationState },
 ): ObligationRecord | null {
+  beforeTransitionForTests?.(inboundId);
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
     if (!current) return null;
     if (TERMINAL_STATES.has(current.state)) {
       log?.info?.(
         `tps-mail: obligation ${current.obligationId} is ${current.state}; refusing the late transition to ${next}`,
+      );
+      return null;
+    }
+    if (expect !== undefined && current.state !== expect.from) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} moved from ${expect.from} to ${current.state}; refusing the stale transition to ${next}`,
       );
       return null;
     }

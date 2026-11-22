@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import { isDeepStrictEqual } from "node:util";
 import { MailDeliverBodySchema } from "./wire-mail.js";
-import { closeSync, constants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, utimesSync, writeFileSync, type BigIntStats } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import {
@@ -319,10 +319,197 @@ export function curPlacementRefusal(curPath: string, envelopeId: unknown): strin
   }
 }
 
+/**
+ * Whether two paths resolve to the same filesystem object (same device and
+ * inode); `updateExistingRecord` passes directories. Different spellings of one
+ * directory (a symlink, or another letter case on a case-insensitive volume)
+ * match when they resolve to the same directory; identities are compared exactly, as bigint.
+ */
+export function sameDirectory(a: string, b: string, stat: (path: string) => BigIntStats = (path) => statSync(path, { bigint: true })): boolean {
+  const left = stat(a);
+  const right = stat(b);
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+/**
+ * An update locks the mailbox root its caller names, so the record must really
+ * live in that mailbox. A `cur/` (or `new/`, `dlq/`) directory symlinked to
+ * another mailbox would otherwise let a lock holder write a mailbox it does
+ * not lock, and two lock holders could update one physical record.
+ */
+export class MailRecordLockRootError extends Error {
+  constructor(
+    readonly recordPath: string,
+    readonly recordDir: string,
+    readonly lockRoot: string,
+  ) {
+    super(`refusing to update mail record ${recordPath}: its directory resolves to ${recordDir}, whose parent is not the locked mailbox root ${lockRoot}; update the record through the mailbox that physically contains it`);
+    this.name = "MailRecordLockRootError";
+  }
+}
+
+/**
+ * `updateExistingRecord` requires the record itself to be a regular file, not
+ * a symlink or another kind of entry, so the guard covers the record file as
+ * well as its directory.
+ */
+export class MailRecordFileTypeError extends Error {
+  constructor(readonly recordPath: string) {
+    super(`refusing to update mail record ${recordPath}: it is not a regular file`);
+    this.name = "MailRecordFileTypeError";
+  }
+}
+
+/**
+ * An update locks the mailbox root the caller names, so the record must sit
+ * directly in that root's `new/`, `cur/` or `dlq/` directory. Deriving the lock
+ * root from the path would update a record directly in a mailbox root under
+ * the parent's lock.
+ */
+export class MailRecordLayoutError extends Error {
+  constructor(
+    readonly recordPath: string,
+    readonly recordDir: string,
+    readonly lockRoot: string,
+  ) {
+    super(`refusing to update mail record ${recordPath}: ${recordDir} is not a new/, cur/ or dlq/ directory directly under the locked mailbox root ${lockRoot}`);
+    this.name = "MailRecordLayoutError";
+  }
+}
+
+/** The directories that hold records `updateExistingRecord` may replace. */
+const RECORD_DIR_NAMES = ["new", "cur", "dlq"] as const;
+
+/**
+ * Whether `recordDir` is the same directory (device and inode) as one of
+ * `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
+ * spelled through a symlink or a different letter case valid.
+ */
+function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
+  for (const name of RECORD_DIR_NAMES) {
+    let candidate: string;
+    try {
+      candidate = realpathSync(join(root, name));
+    } catch {
+      continue;
+    }
+    if (sameDirectory(recordDir, candidate)) return true;
+  }
+  return false;
+}
+
+/** The exact name updateExistingRecord writes beside a record it replaces. */
+const ACK_SCRATCH_RE = /^\.ack-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+const SWEEP_INTERVAL = 10 * 60 * 1000;
+/**
+ * Require at least a minute of age as an additional cleanup precaution.
+ * Age alone does not establish that a writer has stopped.
+ */
+const ACK_SCRATCH_MIN_AGE_MS = 60 * 1000;
+const lastAckScratchSweep = new Map<string, number>();
+export const mailAckScratchTestHooks: { now?: () => number; stat?: (path: string) => BigIntStats } = {};
+/** Test-only pause points around the record open and the final pre-rename check. */
+export const mailRecordFileTestHooks: { beforeOpen?: (path: string) => void; beforeRename?: (path: string) => void } = {};
+
+/**
+ * An ack writes `.ack-<uuid>.tmp` beside the record while holding the mailbox
+ * lock, and attempts to remove it before releasing that lock; a failed removal
+ * is reported and leaves the scratch behind. The sweep considers names
+ * of that exact shape and removes regular files at least ACK_SCRATCH_MIN_AGE_MS old.
+ *
+ * Before listing, check by directory identity (device and inode) that the
+ * directory is not the locked root itself and that its parent directory is
+ * the locked root: a cur/ symlink can share another mailbox's scratch
+ * without sharing its lock.
+ * A directory replaced or retargeted during the sweep is not detected.
+ *
+ * After a successful listing, wait ten minutes before sweeping the directory
+ * again, so a bulk drain avoids repeated listings. Collecting eligible scratch
+ * on a later pass is enough. A refusal or a failed listing records no sweep
+ * time, so the next ack retries it.
+ */
+function removeLeftoverAckScratch(root: string, dir: string): void {
+  dir = resolve(dir);
+  const now = (mailAckScratchTestHooks.now ?? Date.now)();
+  // The key is the lexical path on purpose: two spellings of one directory get
+  // separate windows, so an alias can cost an extra listing; each listing
+  // re-checks its root.
+  const lastSweep = lastAckScratchSweep.get(dir);
+  if (lastSweep !== undefined && now - lastSweep < SWEEP_INTERVAL) return;
+  let guardedRoot: string;
+  let listedDir: string;
+  try {
+    guardedRoot = realpathSync(root);
+    listedDir = realpathSync(dir);
+  } catch (err: any) {
+    console.warn(`[mail] could not resolve ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
+    return;
+  }
+  let inLockedMailbox: boolean;
+  try {
+    const compare = (a: string, b: string) =>
+      sameDirectory(a, b, mailAckScratchTestHooks.stat ?? ((path) => statSync(path, { bigint: true })));
+    inLockedMailbox = !compare(listedDir, guardedRoot) && compare(dirname(listedDir), guardedRoot);
+  } catch (err: any) {
+    console.warn(`[mail] could not compare ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
+    return;
+  }
+  if (!inLockedMailbox) {
+    console.warn(`[mail] left ack scratch in ${dir}: not a directory in the mailbox this lock guards`);
+    return;
+  }
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err: any) {
+    console.warn(`[mail] could not list ack scratch directory ${dir}: ${err?.code ?? err?.message ?? String(err)}`);
+    return;
+  }
+  lastAckScratchSweep.set(dir, now);
+  for (const name of names) {
+    if (!ACK_SCRATCH_RE.test(name)) continue;
+    const scratchPath = join(dir, name);
+    let mtimeMs: number;
+    try {
+      const entry = lstatSync(scratchPath);
+      if (!entry.isFile()) {
+        console.warn(`[mail] left non-regular ack scratch ${scratchPath}`);
+        continue;
+      }
+      mtimeMs = entry.mtimeMs;
+    } catch (err: any) {
+      if (err?.code === "ENOENT") continue;
+      console.warn(`[mail] could not inspect leftover ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);
+      continue;
+    }
+    if (now - mtimeMs < ACK_SCRATCH_MIN_AGE_MS) {
+      console.warn(`[mail] left recent ack scratch ${scratchPath}`);
+      continue;
+    }
+    try {
+      rmSync(scratchPath, { force: true });
+      console.warn(`[mail] removed leftover ack scratch ${scratchPath}`);
+    } catch (err: any) {
+      console.warn(`[mail] could not remove leftover ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);
+    }
+  }
+}
+
+/**
+ * Replace an existing record under the mailbox lock.
+ *
+ * `options.mailboxRoot` is the mailbox that must contain the record: the
+ * update locks that root and requires the record's directory to be its
+ * `new/`, `cur/` or `dlq/` directory, matched by device and inode. The lock
+ * root is never derived from `path`.
+ */
 export function updateExistingRecord<T extends object>(
   path: string,
   mutate: (record: T) => T | null,
   options: {
+    /** The mailbox root that must contain the record. */
+    mailboxRoot: string;
     snapshot?: T;
     afterWrite?: (record: T) => void;
     nonBlocking?: boolean;
@@ -333,9 +520,13 @@ export function updateExistingRecord<T extends object>(
      * `envelopeId`) and refuse with `withheld` instead of mutating.
      */
     withholdPlacement?: boolean;
-  } = {},
+  },
 ): UpdateExistingResult<T> {
-  const root = dirname(dirname(path));
+  path = resolve(path);
+  if (typeof options?.mailboxRoot !== "string" || options.mailboxRoot === "") {
+    throw new Error(`updateExistingRecord requires the expected mailbox root for ${path}`);
+  }
+  const root = resolve(options.mailboxRoot);
   let lock: MailLock | null;
   try {
     lock = acquireMailLockSync(root, options.nonBlocking ? { timeoutMs: 0 } : {});
@@ -346,13 +537,57 @@ export function updateExistingRecord<T extends object>(
     if (options.nonBlocking) return { status: "busy" };
     throw Object.assign(new Error(`mail lock contention timeout for ${path}`), { path: mailLockPath(root) });
   }
-  const scratchPath = join(dirname(path), `.ack-${randomUUID()}.tmp`);
+  const recordDir = dirname(path);
+  const scratchPath = join(recordDir, `.ack-${randomUUID()}.tmp`);
   let fd: number | undefined;
   let replaced = false;
   let relayLock: MailLock | null = null;
   try {
-    statSync(path);
-    const fresh = JSON.parse(readFileSync(path, "utf-8")) as T;
+    // The lock is keyed on the lexical path, so check that the record's
+    // directory is physically the one under that root before writing scratch
+    // or mutating. Compare identity, not spelling: node's realpathSync keeps
+    // the given letter case, so on a case-insensitive volume two spellings of
+    // one directory resolve to different strings (bun canonicalizes the case).
+    let realRoot: string;
+    let realRecordDir: string;
+    try {
+      realRoot = realpathSync(root);
+      realRecordDir = realpathSync(recordDir);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { status: "gone" };
+      throw Object.assign(new Error(`cannot verify the mailbox root for ${path}: ${err?.message ?? String(err)}`), { path: recordDir });
+    }
+    if (sameDirectory(realRecordDir, realRoot)) {
+      throw new MailRecordLayoutError(path, realRecordDir, realRoot);
+    }
+    if (!sameDirectory(dirname(realRecordDir), realRoot)) {
+      throw new MailRecordLockRootError(path, realRecordDir, realRoot);
+    }
+    if (!isMaildirRecordDirectory(realRecordDir, realRoot)) {
+      throw new MailRecordLayoutError(path, realRecordDir, realRoot);
+    }
+    removeLeftoverAckScratch(root, recordDir);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
+    mailRecordFileTestHooks.beforeOpen?.(path);
+    // Open without following a symlink: its target is not read. After a
+    // successful open, read the original file through its descriptor.
+    // Path checks treat a missing entry as gone and refuse an existing
+    // nonregular entry with MailRecordFileTypeError.
+    let recordFd: number;
+    try {
+      recordFd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    } catch (err: any) {
+      if (err?.code === "ENOENT") return { status: "gone" };
+      if (err?.code === "ELOOP" || err?.code === "EMLINK") throw new MailRecordFileTypeError(path);
+      throw err;
+    }
+    let fresh: T;
+    try {
+      if (!fstatSync(recordFd).isFile()) throw new MailRecordFileTypeError(path);
+      fresh = JSON.parse(readFileSync(recordFd, "utf-8")) as T;
+    } finally {
+      closeSync(recordFd);
+    }
     if (options.reserveRelayMove) {
       relayLock = tryAcquireRelayMoveLock(fresh);
       if (!relayLock) {
@@ -367,13 +602,14 @@ export function updateExistingRecord<T extends object>(
     }
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
-    statSync(path);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     fd = openSync(scratchPath, "wx", 0o600);
     writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
     fsyncSync(fd);
     closeSync(fd);
     fd = undefined;
-    statSync(path);
+    mailRecordFileTestHooks.beforeRename?.(path);
+    if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     renameSync(scratchPath, path);
     replaced = true;
     options.afterWrite?.(updated);
@@ -383,7 +619,11 @@ export function updateExistingRecord<T extends object>(
     throw err;
   } finally {
     if (fd !== undefined) { try { closeSync(fd); } catch {} }
-    try { rmSync(scratchPath, { force: true }); } catch {}
+    try {
+      rmSync(scratchPath, { force: true });
+    } catch (err: any) {
+      console.warn(`[mail] could not remove ack scratch ${scratchPath}: ${err?.code ?? err?.message ?? String(err)}`);
+    }
     relayLock?.release();
     lock.release();
   }
@@ -458,6 +698,109 @@ export function inboxFullMessage(recipient: string, count: number): string {
   );
 }
 
+/** Final obligation states (cli#1006): once one of these is on the record the
+ *  reply is no longer owed, so cur/ may age out. */
+const TERMINAL_OBLIGATION_STATES = new Set(["acked", "unconfirmed", "failed"]);
+
+/** Every obligation state the store recognizes; anything else is not a record
+ *  this archiver may act on. */
+const KNOWN_OBLIGATION_STATES = new Set([
+  "pending",
+  "yielded",
+  "delivering",
+  "posted",
+  "acked",
+  "unconfirmed",
+  "failed",
+]);
+
+/** Paths already warned about in this process: at most one warning per path per
+ *  process, whatever the reason — a later reason for the same path is
+ *  suppressed. */
+const warnedObligationArchiveReads = new Set<string>();
+
+function warnObligationArchiveRead(path: string, code: string | undefined): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} is unreadable (${code ?? "invalid"}); not archiving`);
+}
+
+/** At most one warning per path across read and mismatch reasons: a record that
+ *  exists but does not describe THIS cur/ file, or whose state is not
+ *  recognized. */
+function warnObligationArchiveMismatch(path: string, reason: string): void {
+  if (warnedObligationArchiveReads.has(path)) return;
+  warnedObligationArchiveReads.add(path);
+  console.warn(`[mail] keeping cur/ record: obligation ${path} ${reason}; not archiving`);
+}
+
+/** True when the obligation for `messageId` is still live (or cannot be read,
+ *  or does not belong to this cur/ file). Fail-closed: an unreadable or
+ *  malformed record keeps the cur/ file, because archiving on a read error
+ *  could hide an open obligation (cli#1006). */
+function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
+  const path = join(inboxRoot, ".obligations", `${messageId}.json`);
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf-8");
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      // A child's ENOENT can hide an inaccessible store (e.g. a dangling
+      // symlink). Check the store itself before treating the child as absent.
+      try {
+        const store = lstatSync(join(inboxRoot, ".obligations"));
+        if (!store.isDirectory()) {
+          warnObligationArchiveRead(path, "INVALID_STORE");
+          return true;
+        }
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
+      try {
+        lstatSync(path);
+      } catch (inner) {
+        if ((inner as NodeJS.ErrnoException).code === "ENOENT") return false;
+        warnObligationArchiveRead(path, (inner as NodeJS.ErrnoException).code);
+        return true;
+      }
+      warnObligationArchiveRead(path, code);
+      return true;
+    }
+    warnObligationArchiveRead(path, code);
+    return true;
+  }
+  try {
+    const record = JSON.parse(raw) as { state?: unknown; inboundId?: unknown };
+    if (!record || typeof record.state !== "string") {
+      warnObligationArchiveRead(path, "INVALID_RECORD");
+      return true;
+    }
+    // cli#1006 r2: the record must be FOR THIS cur/ file. A record that names
+    // another inbound (or none) says nothing about this one; keeping the file
+    // is the fail-closed answer.
+    if (typeof record.inboundId !== "string" || record.inboundId.length === 0) {
+      warnObligationArchiveMismatch(path, "carries no inboundId");
+      return true;
+    }
+    if (record.inboundId !== messageId) {
+      warnObligationArchiveMismatch(path, `names inbound ${record.inboundId}, not this cur/ record`);
+      return true;
+    }
+    // An unrecognized state is not a terminal one: keep the file and say so.
+    if (!KNOWN_OBLIGATION_STATES.has(record.state)) {
+      warnObligationArchiveMismatch(path, `has an unrecognized state ${record.state}`);
+      return true;
+    }
+    return !TERMINAL_OBLIGATION_STATES.has(record.state);
+  } catch {
+    warnObligationArchiveRead(path, "INVALID_JSON");
+    return true;
+  }
+}
+
 /**
  * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
  *
@@ -488,6 +831,17 @@ export function archiveOldCur(agent: string, maxAgeDays = 30): number {
         // and ones manually touched. Most cur/ entries are written-once when
         // ack'd, so mtime ≈ when the agent processed them.
         if (st.mtimeMs > cutoffMs) continue;
+        // cli#1006: keep the record while its reply obligation is open. Reading
+        // the identity first also means an unreadable cur/ record is kept (its
+        // obligation cannot be checked), never archived on a read error.
+        let messageId: unknown;
+        try {
+          messageId = (JSON.parse(readFileSync(src, "utf-8")) as { id?: unknown }).id;
+        } catch {
+          continue;
+        }
+        if (typeof messageId !== "string" || messageId.length === 0) continue;
+        if (obligationHoldsCur(inbox.root, messageId)) continue;
         const ts = new Date(st.mtimeMs);
         const monthDir = join(archiveRoot, `${ts.getUTCFullYear()}-${String(ts.getUTCMonth() + 1).padStart(2, "0")}`);
         mkdirSync(monthDir, { recursive: true });
@@ -1604,11 +1958,12 @@ export async function recoverPromoted(
    * ack`/`nack` via verifyMailAction, the plugin's internalInbound); the
    * sweeps keep the fail-fast default.
    */
-  options: { waitForLock?: boolean; claim?: string } = {},
+  options: { waitForLock?: boolean; claim?: string; mailboxRoot?: string } = {},
 ): Promise<PromoteReject | (PromoteOk & { snapshot: MailMessage })> {
   assertValidAgentId(agent);
   const dirs = dirsForRecordPath(curPath);
   const mailRoot = mailRootForRecordPath(curPath);
+  const expectedRoot = options.mailboxRoot ?? mailboxRoot(agent);
   const filename = curPath.split("/").pop()!;
 
   let msg: MailMessage;
@@ -1666,6 +2021,7 @@ export async function recoverPromoted(
   if (options.claim !== undefined) {
     const claimed = { ...presented, checkedOutBy: options.claim, checkedOutAt: new Date().toISOString() };
     const result = updateExistingRecord<MailMessage>(curPath, () => claimed, {
+      mailboxRoot: expectedRoot,
       snapshot: msg,
       nonBlocking: !options.waitForLock,
       withholdPlacement: true,
@@ -1813,7 +2169,7 @@ export async function checkMessages(agent: string, checkedOutBy = agent, verify:
           redeliveryAttempts: attempt,
           redelivered: { reason: "lease-expired" as const, previousCheckout, attempt },
         });
-      }, { snapshot: recovered.snapshot, nonBlocking: true });
+      }, { mailboxRoot: inbox.root, snapshot: recovered.snapshot, nonBlocking: true });
       if (result.status === "updated") messages.push(result.record);
     } catch { continue; }
   }
@@ -1865,18 +2221,18 @@ export async function verifyMailAction(agent: string, id: string): Promise<MailM
 export function ackMessage(agent: string, id: string, mailRoot?: string): MailMessage | null {
   const path = messagePathById(agent, id, mailRoot);
   if (!path) return null;
-  return ackMessageAtPath(path);
+  return ackMessageAtPath(path, mailRoot === undefined ? mailboxRoot(agent) : join(mailRoot, agent));
 }
 
-export function setBridgeSentAtPath(path: string, sentAt: string): void {
+export function setBridgeSentAtPath(path: string, sentAt: string, mailboxRoot: string): void {
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.bridgeSentAt = sentAt;
     return msg;
-  });
+  }, { mailboxRoot });
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
 }
 
-export function ackMessageAtPath(path: string): MailMessage {
+export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage {
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
     msg.ackedAt = new Date().toISOString();
@@ -1887,7 +2243,7 @@ export function ackMessageAtPath(path: string): MailMessage {
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { afterWrite: () => {
+  }, { mailboxRoot, afterWrite: () => {
     // Remove the file from cur/ now that it's acked. There is NO ack audit trail
     // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
     // whose event set is only "sent" | "read" | "listed" — there is no "ack"
@@ -1921,7 +2277,7 @@ export function nackMessage(agent: string, id: string, reason: string, type: "tr
       delete msg.retryAfter;
     }
     return msg;
-  }, { reserveRelayMove: type === "permanent", withholdPlacement: true, afterWrite: () => {
+  }, { mailboxRoot: mailboxRoot(agent), reserveRelayMove: type === "permanent", withholdPlacement: true, afterWrite: () => {
     if (type === "permanent") {
       const target = join(getInbox(agent).dlq, path.split("/").pop()!);
       renameSync(path, target);

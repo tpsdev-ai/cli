@@ -350,15 +350,40 @@ describe("host state record lock", () => {
   test(
     "clearHostState leaves a record with a mismatched start token",
     () => {
+      // A differing token from the SAME source as the live one. A differing proc: pair is classified as another
+      // process, so the record is kept silently; a differing ps: pair cannot be compared, so clear
+      // refuses with the named error and keeps the record byte for byte.
       const token = childToken(process.pid);
       const foreign = token.startsWith("ps:") ? "ps:Thu Jan 1 00:00:00 1970" : "proc:1";
       const path = hostStatePath("host-a");
       writeHostState(hostState("host-a", process.pid, foreign));
+      const before = readFileSync(path, "utf8");
 
-      clearHostState("host-a");
+      if (token.startsWith("proc:")) {
+        clearHostState("host-a");
+      } else {
+        expect(() => clearHostState("host-a")).toThrow(/could not be read or compared/);
+      }
 
       expect(readHostRecord("host-a")?.startToken).toBe(foreign);
-      expect(existsSync(path)).toBe(true);
+      expect(readFileSync(path, "utf8")).toBe(before);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "clearHostState refuses and keeps a record whose start token comes from another token source",
+    () => {
+      // A cross-source pair (proc: against ps:) is never comparable, on any platform.
+      const token = childToken(process.pid);
+      const crossSource = token.startsWith("ps:") ? "proc:1" : "ps:Thu Jan 1 00:00:00 1970";
+      const path = hostStatePath("host-a");
+      writeHostState(hostState("host-a", process.pid, crossSource));
+      const before = readFileSync(path, "utf8");
+
+      expect(() => clearHostState("host-a")).toThrow(/could not be read or compared/);
+
+      expect(readFileSync(path, "utf8")).toBe(before);
     },
     TIMEOUT,
   );

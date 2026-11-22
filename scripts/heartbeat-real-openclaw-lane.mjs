@@ -10,7 +10,8 @@
  *           online record.
  *
  * Without OPENCLAW_BIN_DIR, the lane installs OpenClaw into a throwaway prefix
- * with --ignore-scripts. A supplied directory must contain openclaw.
+ * from the committed fixture manifest and lockfile, through the same
+ * tracked-lock helper CI uses. A supplied directory must contain openclaw.
  *
  * The dead and live cases run together, and should not be split: the dead case
  * passes on a failed probe, while the live case is the control that shows the
@@ -23,10 +24,10 @@
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { delimiter, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const OPENCLAW_VERSION = "2026.5.7";
@@ -100,15 +101,90 @@ export function assertOpenClawVersion(stdout) {
   assert.equal(found, OPENCLAW_VERSION, `expected OpenClaw ${OPENCLAW_VERSION}, found: ${found}`);
 }
 
-function installOpenClaw(root) {
+/**
+ * Resolve the bash the install helper will run, with the helper's PATH lookup:
+ * relative entries are relative to its working directory, an empty entry means
+ * that directory, and a match must be an executable regular file.
+ */
+function resolveInstallBash(cwd, env) {
+  // An empty PATH is refused rather than searched: bash and execvp would try the
+  // bare name against the working directory, and the lane does not pick a bash
+  // from there. An empty entry inside a PATH means the working directory.
+  const pathValue = env.PATH ?? "";
+  if (pathValue === "") throw new Error("no executable bash on the install PATH: PATH is empty");
+  const tried = [];
+  for (const entry of pathValue.split(delimiter)) {
+    const candidate = join(resolve(cwd, entry), "bash");
+    tried.push(candidate);
+    try {
+      if (!statSync(candidate).isFile()) continue;
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Not an executable regular file in this PATH entry.
+    }
+  }
+  throw new Error(`no executable bash on the install PATH: tried ${tried.join(", ")}`);
+}
+
+/**
+ * Probe `command -v sfw` with the same bash the install uses, from the helper's
+ * working directory and with its install environment. A probe that cannot run
+ * is an error, not a missing installer.
+ */
+function trackedLockInstaller(repo, env, bashBin) {
+  const probe = spawnSync(bashBin, ["-c", "command -v sfw"], {
+    cwd: repo,
+    env,
+    stdio: "ignore",
+    timeout: 10_000,
+  });
+  if (probe.error) {
+    throw new Error(`sfw probe cannot launch bash at ${bashBin}: ${probe.error.code ?? probe.error.message}`);
+  }
+  if (probe.signal) {
+    throw new Error(`sfw probe with bash at ${bashBin} was killed by ${probe.signal}`);
+  }
+  if (probe.status === 1) return "npm";
+  if (probe.status !== 0) {
+    throw new Error(`sfw probe with bash at ${bashBin} exited with status ${probe.status}`);
+  }
+  return "sfw";
+}
+
+/**
+ * Install the pinned OpenClaw from the committed fixture manifest and lockfile;
+ * the tracked-lock helper is used with `sfw` when the probe finds it and with
+ * npm when the probe reports it absent.
+ */
+export function installOpenClaw(root, options = {}) {
+  const { spawn: spawnInstall = spawnSync, env = process.env, pathEnv = env.PATH ?? "", repo = REPO, bashPath } = options;
   const prefix = join(root, "openclaw");
-  console.error(`[lane] installing openclaw@${OPENCLAW_VERSION} into ${prefix}`);
-  const result = spawnSync(
-    "npm",
-    ["install", "--prefix", prefix, "--ignore-scripts", "--no-audit", "--no-fund", `openclaw@${OPENCLAW_VERSION}`],
-    { stdio: "inherit", timeout: 600_000 },
+  const installEnv = { ...env, PATH: pathEnv };
+  const bashBin = bashPath ?? resolveInstallBash(repo, installEnv);
+  const via = trackedLockInstaller(repo, installEnv, bashBin);
+  console.error(`[lane] installing openclaw@${OPENCLAW_VERSION} from the committed fixture into ${prefix}`);
+  const result = spawnInstall(
+    bashBin,
+    [
+      join(repo, "scripts", "npm-ci-tracked-lock.sh"),
+      "--via",
+      via,
+      "test/fixtures/heartbeat-openclaw",
+      prefix,
+      "--ignore-scripts",
+      "--no-audit",
+      "--no-fund",
+    ],
+    { cwd: repo, env: installEnv, stdio: "inherit", timeout: 600_000 },
   );
-  assert.equal(result.status, 0, `npm install openclaw@${OPENCLAW_VERSION} failed (status ${result.status})`);
+  if (result.error) {
+    throw new Error(`tracked-lock install cannot launch bash at ${bashBin}: ${result.error.code ?? result.error.message}`);
+  }
+  if (result.signal) {
+    throw new Error(`tracked-lock install with bash at ${bashBin} was killed by ${result.signal}`);
+  }
+  assert.equal(result.status, 0, `tracked-lock install of openclaw@${OPENCLAW_VERSION} failed (status ${result.status})`);
   return join(prefix, "node_modules", ".bin");
 }
 
@@ -345,7 +421,7 @@ function formatThrownValue(value) {
 /**
  * Run `action`, then `cleanup`; preserve thrown values, action first.
  */
-export async function finishWithCleanup(action, cleanup) {
+export async function finishWithCleanup(action, cleanup, failureLabel = "cleanup also failed") {
   let actionFailed = false;
   let failure;
   try {
@@ -358,7 +434,7 @@ export async function finishWithCleanup(action, cleanup) {
     await cleanup();
   } catch (error) {
     if (!actionFailed) throw error;
-    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\ncleanup also failed: ${formatThrownValue(error)}`);
+    throw new AggregateError([failure, error], `${formatThrownValue(failure)}\n${failureLabel}: ${formatThrownValue(error)}`);
   }
   if (actionFailed) throw failure;
 }
@@ -428,6 +504,7 @@ export async function runLiveCase(root, binDir, options = {}) {
             async () => assertGatewayAnswersAfterHeartbeat(testCase, port, binDir, logPath, options),
           ),
         async () => assertLiveHeartbeatResult(result, testCase),
+        "heartbeat also failed",
       );
       console.log("PASS live gateway: exit 0, persisted online with no errors");
     },
@@ -437,30 +514,48 @@ export async function runLiveCase(root, binDir, options = {}) {
   );
 }
 
+async function runLaneBody(root) {
+  assert.ok(existsSync(TPS_BIN), `built tps entry point not found: ${TPS_BIN}`);
+  const binDir = process.env.OPENCLAW_BIN_DIR ? resolve(process.env.OPENCLAW_BIN_DIR) : installOpenClaw(root);
+  const openclawBin = join(binDir, "openclaw");
+  assert.ok(existsSync(openclawBin), `openclaw not found in ${binDir}`);
+  const version = spawnSync(openclawBin, ["--version"], { encoding: "utf-8", timeout: 30_000 });
+  assert.equal(version.status, 0, `openclaw --version failed: ${version.stderr ?? ""}`);
+  assertOpenClawVersion(version.stdout);
+  console.log(`[lane] using ${openclawBin} (${version.stdout.trim()})`);
+
+  await runDeadCase(root, binDir);
+  await runLiveCase(root, binDir);
+  console.log("[lane] both cases passed");
+}
+
+/**
+ * Run the lane body, then remove the temp tree. When both fail, the lane's own
+ * failure stays first and the removal failure is attached to it.
+ */
+export async function runLane(options = {}) {
+  const {
+    action = runLaneBody,
+    removeTree = (path) => rmSync(path, { recursive: true, force: true }),
+    keep = KEEP,
+    log = console.log,
+  } = options;
+  const root = mkdtempSync(join(tmpdir(), "tps-heartbeat-lane-"));
+  await finishWithCleanup(
+    () => action(root),
+    async () => {
+      if (keep) log(`[lane] kept ${root}`);
+      else removeTree(root);
+    },
+  );
+}
+
 export async function main() {
   if (process.argv.includes("--pin")) {
     process.stdout.write(`${OPENCLAW_VERSION}\n`);
     return;
   }
-  const root = mkdtempSync(join(tmpdir(), "tps-heartbeat-lane-"));
-  let binDir;
-  try {
-    assert.ok(existsSync(TPS_BIN), `built tps entry point not found: ${TPS_BIN}`);
-    binDir = process.env.OPENCLAW_BIN_DIR ? resolve(process.env.OPENCLAW_BIN_DIR) : installOpenClaw(root);
-    const openclawBin = join(binDir, "openclaw");
-    assert.ok(existsSync(openclawBin), `openclaw not found in ${binDir}`);
-    const version = spawnSync(openclawBin, ["--version"], { encoding: "utf-8", timeout: 30_000 });
-    assert.equal(version.status, 0, `openclaw --version failed: ${version.stderr ?? ""}`);
-    assertOpenClawVersion(version.stdout);
-    console.log(`[lane] using ${openclawBin} (${version.stdout.trim()})`);
-
-    await runDeadCase(root, binDir);
-    await runLiveCase(root, binDir);
-    console.log("[lane] both cases passed");
-  } finally {
-    if (KEEP) console.log(`[lane] kept ${root}`);
-    else rmSync(root, { recursive: true, force: true });
-  }
+  await runLane();
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

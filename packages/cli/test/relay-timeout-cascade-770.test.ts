@@ -268,4 +268,21 @@ describe("a timed-out relay case leaves no environment for the next file (cli#77
     expect(output).toContain("a beforeEach/afterEach hook timed out for this test");
     assertCasePassed(output, "environment stays with the case while the previous cleanup settles");
   }, 120_000);
+
+  test("a later case keeps its root and connection records while an earlier cleanup settles late", () => {
+    const dir = mkdtempSync(join(tmpdir(), "tps-relay-overlap-"));
+    const marker = join(dir, "cleanup.marker");
+    try {
+      const { output, status } = runChild(
+        ["test", "--timeout=2000", "-t", "connect relayed local delivery retention.*(a cleanup that outlasts its hook deadline|environment stays with the case while the previous cleanup settles)", RELAY],
+        { TPS_RELAY_LOSS_SLOW_CLEANUP_MS: "2500", TPS_RELAY_LOSS_CLEANUP_MARKER: marker }
+      );
+      assertCaseTimedOut(output, "a cleanup that outlasts its hook deadline");
+      assertCasePassed(output, "environment stays with the case while the previous cleanup settles");
+      expect(status, output).toBe(1);
+      expect(readFileSync(marker, "utf8"), output).toContain("connect:cleanup-completed\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 120_000);
 });

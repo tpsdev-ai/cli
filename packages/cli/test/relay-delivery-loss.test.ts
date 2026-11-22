@@ -8,6 +8,7 @@ import { gcMessages, getInbox, MAX_INBOX_MESSAGES, sendMessage, ackMessageAtPath
 import { runBranch, writeBranchConf } from "../src/commands/branch.js";
 import { runMail } from "../src/commands/mail.js";
 import { RELAY_ACCEPT_LOCK_STRIPES, syncRemoteBranch, connectAndKeepAlive, deliverRelayedToLocal, relayAcceptanceReceiptPath, pruneRelayAcceptanceReceipts } from "../src/utils/relay.js";
+import { writeBranchState } from "../src/utils/connection-state.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
 import { generateKeyPair, initHostIdentity, registerBranch, saveKeyPair } from "../src/utils/identity.js";
 import { drainOutbox, OUTBOX_RESEND_BASE_MS, queueOutboxMessage } from "../src/utils/outbox.js";
@@ -175,6 +176,7 @@ let slowCleanupMs = 0;
 for (const entry of ["sync", "connect"] as const) {
   describe(`${entry} relayed local delivery retention`, () => {
     let root: string;
+    let donorRoot: string | undefined;
     const roots = new Set<string>();
     let stop: (() => Promise<void>) | undefined;
     let completion: Promise<unknown> | undefined;
@@ -248,9 +250,11 @@ for (const entry of ["sync", "connect"] as const) {
       completion = undefined;
     });
 
-    // Cleanup completed before ownership changes resolves from this case's HOME.
-    // Late filesystem cleanup after ownership moves is tracked in cli#779.
+    // Retain this case's cleanup targets across awaits.
     afterEach(async () => {
+      const caseRoot = root;
+      const caseStop = stop;
+      const caseCompletion = completion;
       const owner = caseOwner;
       const slow = slowCleanupMs;
       slowCleanupMs = 0;
@@ -259,17 +263,21 @@ for (const entry of ["sync", "connect"] as const) {
       restoreSignalListeners();
       mock.restore();
       try {
-        if (stop) {
-          await stop();
+        if (slow > 0) await Bun.sleep(slow);
+        if (caseStop) {
+          await caseStop();
           if (marker) fs.appendFileSync(marker, `${entry}:stop-completed\n`);
         }
-        if (completion) await completion;
+        if (caseCompletion) await caseCompletion;
         if (entry === "connect") await Bun.sleep(1100);
-        if (slow > 0) await Bun.sleep(slow);
+        if (marker && slow > 0 && entry === "connect") {
+          fs.appendFileSync(marker, `connect:own-record-removed:${!fs.existsSync(join(caseRoot, ".tps", "connections", "remote.json"))}\n`);
+        }
       } finally {
         if (processOwner === owner) restoreEnv();
-        fs.rmSync(root, { recursive: true, force: true });
-        roots.delete(root);
+        fs.rmSync(caseRoot, { recursive: true, force: true });
+        roots.delete(caseRoot);
+        if (marker && slow > 0) fs.appendFileSync(marker, `${entry}:cleanup-completed\n`);
       }
     });
 
@@ -710,7 +718,7 @@ for (const entry of ["sync", "connect"] as const) {
     async function ackOnlyRecord(): Promise<void> {
       const inbox = getInbox("local");
       const [file] = jsonFiles(inbox.fresh);
-      ackMessageAtPath(join(inbox.fresh, file));
+      ackMessageAtPath(join(inbox.fresh, file), inbox.root);
       expect(jsonFiles(inbox.fresh)).toEqual([]);
     }
 
@@ -748,7 +756,7 @@ for (const entry of ["sync", "connect"] as const) {
       fs.writeFileSync(marker, "");
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
-      ackMessageAtPath(original.filePath);
+      ackMessageAtPath(original.filePath, getInbox("local").root);
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
       expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
       expect(jsonFiles(getInbox("local").dlq)).toEqual([]);
@@ -1173,7 +1181,14 @@ for (const entry of ["sync", "connect"] as const) {
 
     testCase("a cleanup that outlasts its hook deadline", async () => {
       const raw = Number(process.env.TPS_RELAY_LOSS_SLOW_CLEANUP_MS);
-      if (Number.isFinite(raw) && raw > 0) slowCleanupMs = raw;
+      if (Number.isFinite(raw) && raw > 0) {
+        donorRoot = root;
+        if (entry === "connect") {
+          await start();
+          expect(fs.existsSync(join(root, ".tps", "connections", "remote.json"))).toBe(true);
+        }
+        slowCleanupMs = raw;
+      }
     });
 
     testCase("environment stays with the case while the previous cleanup settles", async () => {
@@ -1182,7 +1197,26 @@ for (const entry of ["sync", "connect"] as const) {
       expect(ownHome).toBe(root);
       expect(ownHome).not.toBe(FILE_ENV.HOME);
       const slow = Number(process.env.TPS_RELAY_LOSS_SLOW_CLEANUP_MS);
-      if (Number.isFinite(slow) && slow > 0) await Bun.sleep(slow + 300);
+      if (Number.isFinite(slow) && slow > 0) {
+        const marker = process.env.TPS_RELAY_LOSS_CLEANUP_MARKER;
+        if (entry === "connect" && marker) {
+          await start();
+          const connections = join(root, ".tps", "connections");
+          const now = new Date().toISOString();
+          writeBranchState({ connectedAt: now, lastSeen: now, messagesReceived: 0, messagesPushed: 0 });
+          const files = ["remote.json", "host.json"];
+          const records = files.map((file) => fs.readFileSync(join(connections, file), "utf8"));
+          for (let i = 0; i < 1000 && !fs.readFileSync(marker, "utf8").includes("connect:cleanup-completed\n"); i++) await Bun.sleep(10);
+          expect(fs.readFileSync(marker, "utf8")).toContain("connect:cleanup-completed\n");
+          expect(fs.existsSync(root), "next-case root survives late cleanup").toBe(true);
+          expect(fs.readFileSync(marker, "utf8"), "own-record removed before own root cleanup").toContain("connect:own-record-removed:true\n");
+          expect(files.map((file) => fs.readFileSync(join(connections, file), "utf8")), "next-case records survive late cleanup").toEqual(records);
+          expect(fs.existsSync(donorRoot!), "late cleanup removes its own root").toBe(false);
+          expect(fs.existsSync(join(donorRoot!, ".tps", "connections", "remote.json"))).toBe(false);
+        } else {
+          await Bun.sleep(slow + 300);
+        }
+      }
       expect(process.env.HOME).toBe(ownHome);
       expect(process.env.TPS_MAIL_DIR).toBe(ownMail);
       expect(process.env.TPS_ROOT).toBe(ownHome);

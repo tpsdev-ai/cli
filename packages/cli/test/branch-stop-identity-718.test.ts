@@ -7,6 +7,7 @@ import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { runBranch, setBranchStopSignal } from "../src/commands/branch.js";
 
 import { readPidFile } from "../src/utils/pid-file.js";
+import { stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const TIMEOUT = 20_000;
@@ -118,6 +119,7 @@ describe("branch stop PID record classification", () => {
   });
 
   test("a live pid with a mismatched same-source token is not signalled; successful unlink removes its stale record", async () => {
+    stageProcStartTokens();
     const child = spawnChild();
     writeFileSync(pidFile, record(child.pid, foreignStartToken(childToken(child.pid))));
     const signals: number[] = [];

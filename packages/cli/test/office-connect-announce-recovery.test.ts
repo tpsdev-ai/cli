@@ -18,7 +18,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { type ChildProcess, spawn } from "node:child_process";
 import * as fs from "node:fs";
-import net from "node:net";
 import { randomUUID } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,6 +28,7 @@ import { generateKeyPair, initHostIdentity, registerBranch } from "../src/utils/
 import { MSG_MAIL_ACK, MSG_MAIL_DELIVER, type MailDeliverBody } from "../src/utils/wire-mail.js";
 import type { TransportChannel, TransportServer } from "../src/utils/transport.js";
 import * as ws from "../src/utils/ws-noise-transport.js";
+import { boundPort } from "./helpers/port.js";
 
 /** The CLI entry point, run from source so the test exercises this tree's command. */
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -71,28 +71,12 @@ function body(content: string): MailDeliverBody {
 }
 
 /** Register branch `remote` (whose keys the relay holds) and point its remote.json at `port`. */
-function registerRemote(root: string, port: number) {
-  const kp = generateKeyPair();
+function registerRemote(root: string, port: number, kp = generateKeyPair()) {
   registerBranch("remote", kp.signing.publicKey, undefined, kp.encryption.publicKey);
   const branchDir = join(root, ".tps", "branch-office", "remote");
   fs.mkdirSync(branchDir, { recursive: true });
   fs.writeFileSync(join(branchDir, "remote.json"), JSON.stringify({ host: "127.0.0.1", port, transport: "ws" }));
   return kp;
-}
-
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = net.createServer();
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
-      const address = server.address();
-      if (!address || typeof address === "string") {
-        server.close(() => reject(new Error("no address")));
-        return;
-      }
-      server.close(() => resolve(address.port));
-    });
-  });
 }
 
 /** Poll (bounded) until `ready()` holds; the failure names what was awaited. */
@@ -187,12 +171,13 @@ describe("tps office connect recovery after kills at the tested pre-announcement
 
   /** Start the relay and register the branch it serves; collect its connections and ACKs. */
   async function startRelay(): Promise<void> {
-    const port = await freePort();
-    const branch = registerRemote(root!, port);
+    const branch = generateKeyPair();
     const host = await initHostIdentity();
-    const server = await ws.listenForHostWs(branch, host.encryption.publicKey, port, (msg) => {
+    const server = await ws.listenForHostWs(branch, host.encryption.publicKey, 0, (msg) => {
       if (msg.type === MSG_MAIL_ACK) acks.push((msg.body as { id: string }).id);
     });
+    const port = boundPort(server);
+    registerRemote(root!, port, branch);
     relay = server;
     server.onConnection((channel) => { connections.push(channel); });
   }
