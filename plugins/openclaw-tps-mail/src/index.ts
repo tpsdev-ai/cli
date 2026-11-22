@@ -1573,7 +1573,8 @@ async function settleObligation(
      *  extension or reply replacement), the decision is stale: nothing is
      *  written and the caller redoes the evidence and the deadline decision.
      *  Every non-ack verdict also carries the reply identity it was gathered
-     *  for (round 3), and a pre-commit verdict the state it expects. */
+     *  for (round 3; the missing-cur receipt-none verdict in round 7), and a
+     *  pre-commit verdict the state it expects. */
     decision?: { revision: number; deadlineAt: string | null; replyId?: string; state?: ObligationState };
   },
 ): Promise<"acked" | "unconfirmed" | "failed" | "none" | "stale" | "retry-scheduled" | "write-failed"> {
@@ -2126,7 +2127,9 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
  *  retryable failure (`error`) lets the caller schedule another bounded
  *  attempt; `retry-scheduled` means the retry state owns the next decision;
  *  `write-failed` is the one-attempt store write that threw and resolves on
- *  restart; `settled`, `re-armed`, `gone-or-terminal` and `none` end it.
+ *  restart; `settled`, `re-armed` and `gone-or-terminal` end it; `none` decides
+ *  nothing, and both callers complete through the retry state, which schedules
+ *  one continuation when a re-check was requested while the check ran.
  *
  * When the record has a parseable deadline at or before now, the deadline's own
  * decision — re-read the record, re-scan the receipts, redo the cur/ lookup — is
@@ -2539,38 +2542,69 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     return;
   }
 
-  // The deadline has passed: apply the deadline's own terminal outcome. The
+  // The deadline has passed: apply the deadline's own terminal outcome. Each
   // verdict travels with the snapshot its scan used; a record that moved is
-  // rescanned before deciding.
+  // re-read, and the reply it names now is rescanned, before the deadline
+  // decision is redone.
   const reason = "yielded-without-resumption";
-  if (receipt.status === "malformed" && receipt.ownRecord) {
-    const applied = await settleScannedQuarantine(ctx, current.obligationId, current, { missingCur: true });
-    if (applied === "stale") {
-      retryAfterArmFailure(
-        ctx,
-        current.obligationId,
-        armDeadline(ctx, current.obligationId, undefined, { missingCurReason: MISSING_CUR_REASON }),
-      );
-    }
-    return;
-  }
-  const applied = await settleObligation(ctx, current.obligationId, {
-    receipt: "none",
-    reason,
-    missingCur: true,
-    decision: {
-      revision: fresh.record.revision ?? 0,
-      deadlineAt: fresh.record.deadlineAt,
-      replyId: fresh.record.replyId,
-    },
-  });
-  if (applied === "stale") {
+  const rearm = () =>
     retryAfterArmFailure(
       ctx,
       current.obligationId,
       armDeadline(ctx, current.obligationId, undefined, { missingCurReason: MISSING_CUR_REASON }),
     );
+  if (receipt.status === "malformed" && receipt.ownRecord) {
+    const applied = await settleScannedQuarantine(ctx, current.obligationId, current, { missingCur: true });
+    if (applied === "stale") rearm();
+    return;
   }
+  // The receipt-`none` verdict was gathered for the reply `current` names. Pass
+  // that snapshot: a replacement reply carrying its own receipt is judged on
+  // its own evidence, never failed and nacked with the old reply's.
+  let decision: { revision?: number; deadlineAt: string | null; replyId?: string } = current;
+  for (let pass = 0; pass < 2; pass++) {
+    const applied = await settleObligation(ctx, current.obligationId, {
+      receipt: "none",
+      reason,
+      missingCur: true,
+      decision: {
+        revision: decision.revision ?? 0,
+        deadlineAt: decision.deadlineAt,
+        replyId: decision.replyId,
+      },
+    });
+    if (applied !== "stale") return;
+    if (pass === 1) break;
+    // The record moved under the verdict: redo the deadline decision, then
+    // rescan the reply the fresh record names before settling again.
+    const moved = readObligationForCleanup(ctx, current.obligationId);
+    if (moved.status !== "found" || TERMINAL_STATES.has(moved.record.state)) return;
+    const movedDeadline = moved.record.deadlineAt === null ? NaN : Date.parse(moved.record.deadlineAt);
+    if (!Number.isFinite(movedDeadline) || movedDeadline > Date.now()) {
+      const at = Number.isFinite(movedDeadline)
+        ? moved.record.deadlineAt!
+        : new Date(Date.now() + obligationDeadlineMs()).toISOString();
+      retryAfterArmFailure(
+        ctx,
+        current.obligationId,
+        armDeadline(ctx, current.obligationId, at, { missingCurReason: MISSING_CUR_REASON }),
+      );
+      return;
+    }
+    const rescanned = await scanObligationReceipt(ctx, current.obligationId, moved.record, moved.record.replyId);
+    if (rescanned.status === "found") {
+      const acked = await settleScannedReceipt(ctx, current.obligationId, moved.record, moved.record.replyId, { missingCur: true });
+      if (acked === "stale") rearm();
+      return;
+    }
+    if (rescanned.status === "malformed" && rescanned.ownRecord) {
+      const quarantined = await settleScannedQuarantine(ctx, current.obligationId, moved.record, { missingCur: true });
+      if (quarantined === "stale") rearm();
+      return;
+    }
+    decision = moved.record;
+  }
+  rearm();
 }
 
 /**

@@ -4201,6 +4201,77 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  it("1059 r7 a missing-cur receipt-none verdict does not fail a reply replaced during the scan", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r7-missing-cur-replace";
+    // No cur/ entry: the missing-cur path decides from the record. The record
+    // names reply-old and its deadline has passed, so the old reply's "no
+    // receipt" scan is the evidence the terminal branch acts on.
+    seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    const obligationId = `ob-${inboundId}`;
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const seeded = JSON.parse(readFileSync(path, "utf-8"));
+    writeFileSync(path, JSON.stringify({ ...seeded, replyId: "reply-old" }, null, 2), "utf-8");
+    const envelopeId = seeded.inboundEnvelopeId as string;
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    // A receipt for reply-old signed by the WRONG key holds the scan at its
+    // verifier, so the replacement lands while the scan is in flight.
+    writeReceipt(tempMailDir, AGENT, {
+      replyId: "reply-old",
+      obligationId,
+      replyToId: envelopeId,
+      route: "local",
+      ts: now,
+      signedReply: JSON.stringify(signEnvelope(
+        { v: 1, from: AGENT, to: SENDER, body: "old reply", messageId: "reply-old", timestamp: now, replyToId: envelopeId, delegationChain: chain },
+        { [AGENT]: FLINT_SEED },
+      )),
+    });
+    let gateEntered = false;
+    let releaseScan: (() => void) | null = null;
+    const scanGate = new Promise<void>((r) => { releaseScan = r; });
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      beforeVerify: async (name) => {
+        if (name !== AGENT) return;
+        gateEntered = true;
+        await scanGate;
+      },
+    });
+    try {
+      expect(await pollUntil(() => gateEntered, 15000), "the missing-cur scan is held at its verifier").toBe(true);
+      // The replacement lands after the scan read its snapshot: it names
+      // reply-new, whose VALID receipt is on disk.
+      writeReceipt(tempMailDir, AGENT, {
+        replyId: "reply-new",
+        obligationId,
+        replyToId: envelopeId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signEnvelope(
+          { v: 1, from: AGENT, to: SENDER, body: "new reply", messageId: "reply-new", timestamp: now, replyToId: envelopeId, delegationChain: chain },
+          { [AGENT]: ANVIL_SEED },
+        )),
+      });
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", { replyId: "reply-new" });
+      releaseScan!();
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "acked", 5000),
+        "the replacement is judged on its own receipt",
+      ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.replyId).toBe("reply-new");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent for the replacement").toHaveLength(0);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
   it("1059 r3 an old nack stamp does not fail a record that moved to posted during its internal-inbound await", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r3-stamp-moved";
