@@ -39,7 +39,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 
 // Import the plugin — default export gives us { register }.
 import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setQuarantineOutcomeForTests } from "../src/index.js";
-import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt, readObligationResult, writeObligation, listObligations } from "../src/obligations.js";
+import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt, readObligation, readObligationResult, writeObligation, listObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
 let capturedSubscription: any;
@@ -4763,8 +4763,17 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       ).toBe(true);
       expect(readFileSync(path, "utf-8"), "an unknown state is never written").toBe(corrupted);
       expect(obligationFile(AGENT, inboundId)?.state, "the unknown state stays as it was").toBe("armed");
+      expect(readObligation(tempMailDir, AGENT, inboundId), "readObligation refuses the unknown state").toBeNull();
+      expect(
+        transitionObligation(tempMailDir, AGENT, inboundId, "posted", { replyId: "r" }),
+        "no transition over the unknown state",
+      ).toBeNull();
+      expect(readFileSync(path, "utf-8"), "the refused transition wrote nothing").toBe(corrupted);
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "an unknown state never reaches the failure branch").toHaveLength(0);
       expect(readObligationResult(tempMailDir, AGENT, inboundId).status, "an unknown state is unverified").toBe("unverified");
+      const exhausted = warnings.find((line) => line.includes("obligation-retry-exhausted"));
+      expect(exhausted, "the cap names the unreadable error").toContain("obligation record unreadable (INVALID_RECORD)");
+      expect(exhausted).not.toContain("re-check requested");
     } finally {
       setObligationRetryDelaysForTests(prevDelays);
       await h.stop();
@@ -5016,6 +5025,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
         "the budget is exhausted",
       ).toBe(true);
       expect(warnings.some((line) => line.includes("record is unresolved")), "the cap read was unverified").toBe(true);
+      const exhausted = warnings.find((line) => line.includes("obligation-retry-exhausted"))!;
+      expect(exhausted, "the cap names the unreadable error").toContain("obligation record unreadable (");
+      expect(exhausted).not.toContain("re-check requested");
       const entry = obligationStateForTests().retries.find((r) => r.obligationId === obligationId)!;
       expect(entry.exhausted).toBe(true);
       expect(entry.state, "the deadline path's verified read is the baseline").toBe("yielded");
@@ -5069,7 +5081,50 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       await h.stop();
     }
   }, 40000);
-});
 
+  it("1059 r8 a deadline whose store write throws does not retry after an event", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r8-deadline-write-failed";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
+    const prevDelays = setObligationRetryDelaysForTests([80]);
+    const warnings: string[] = [];
+    let writeThrows = false;
+    let eventFired = false;
+    setBeforeTransitionForTests((id) => {
+      if (id === inboundId && writeThrows) throw new Error("injected store write throw");
+    });
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId || eventFired) return;
+      eventFired = true;
+      // The settlement's store write now throws, and an event lands in the same
+      // window: the running check would otherwise hand a re-check to a retry.
+      writeThrows = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-write-failed")), 15000),
+        "the deadline's store write threw",
+      ).toBe(true);
+      expect(eventFired, "an event landed during the deadline check").toBe(true);
+      await sleep(500);
+      expect(
+        obligationStateForTests().retries.some((r) => r.obligationId === obligationId),
+        "a thrown store write ends the budget",
+      ).toBe(false);
+      expect(
+        warnings.filter((line) => line.includes("obligation-write-failed")),
+        "the single attempt is not retried",
+      ).toHaveLength(1);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      setBeforeTransitionForTests(undefined);
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+});
 
 });

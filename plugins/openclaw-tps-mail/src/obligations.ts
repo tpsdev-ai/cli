@@ -104,8 +104,10 @@ export type ObligationState =
 export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "unconfirmed", "failed"]);
 
 /** Every recognized state. A record whose `state` is not one of these is a
- *  malformed shape: both readers report it unverified (never written), and the
- *  listing reports it unreadable (never swept). */
+ *  malformed shape: `readObligation` returns null, `readObligationResult`
+ *  reports it `unverified` (and it is never written), `listObligations` skips
+ *  it (reporting through `onReadError` when one is supplied), and
+ *  `sweepTerminalObligations` counts it `unreadable` and keeps it. */
 const ALL_STATES: ReadonlySet<string> = new Set([
   "pending",
   "yielded",
