@@ -1332,6 +1332,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       deadlineInMs?: number;
       envelopeId?: string;
       missingCurReason?: string;
+      /** Seed the record in the shape a completed arm leaves: revision 1 and a
+       *  lastTransitionAt, so a later arm of the same state and deadline is a
+       *  no-op (cli#1059 round 5). */
+      armed?: boolean;
     } = {},
   ): { obligationId: string; envelopeId: string } {
     const envelopeId = opts.envelopeId ?? `env-${inboundId}`;
@@ -1352,6 +1356,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
           state: opts.state ?? "yielded",
           deadlineAt: new Date(Date.now() + (opts.deadlineInMs ?? -1000)).toISOString(),
           attempts: 1,
+          ...(opts.armed ? { revision: 1, lastTransitionAt: new Date().toISOString() } : {}),
           ...(opts.missingCurReason ? { missingCurReason: opts.missingCurReason } : {}),
         },
         null,
@@ -2090,10 +2095,11 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     inboundId: string,
     state: "yielded" | "delivering",
     deadlineInMs: number,
+    opts: { armed?: boolean } = {},
   ): { obligationId: string; curPath: string } {
     const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
     const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
-    const { obligationId } = seedOrphan(inboundId, { state, deadlineInMs, envelopeId });
+    const { obligationId } = seedOrphan(inboundId, { state, deadlineInMs, envelopeId, ...opts });
     const curDir = resolve(tempMailDir, AGENT, "cur");
     mkdirSync(curDir, { recursive: true });
     const curPath = resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`);
@@ -3273,6 +3279,44 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(retry?.dueAt, "an exhausted entry holds no due time").toBe(Number.POSITIVE_INFINITY);
       expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), "no deadline timer is left").toBe(false);
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "the cap sends no nack").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setObligationCurLookupFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 a re-arm of the state and deadline a record already carries writes nothing", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-rearm-noop";
+    // Seed the record in the shape the completed startup arm leaves (revision 1,
+    // lastTransitionAt). Recovery still arms the deadline it reads; the arm has
+    // nothing to record, so it must not write — including while the deadline's
+    // cur/ lookup is faulting and the bounded retries run.
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1200, { armed: true });
+    let lookups = 0;
+    setObligationCurLookupFaultForTests((id) => {
+      if (id !== inboundId) return undefined;
+      lookups++;
+      return "EIO";
+    });
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const warnings: string[] = [];
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const before = readFileSync(path, "utf-8");
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery arms the deadline the record already carries",
+      ).toBe(true);
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
+        "the faulting deadline check exhausts its budget",
+      ).toBe(true);
+      expect(lookups, "the initial check and three retries ran").toBe(4);
+      await sleep(200);
+      expect(readFileSync(path, "utf-8"), "the re-arm is not a write").toBe(before);
     } finally {
       setObligationRetryDelaysForTests(prevDelays);
       setObligationCurLookupFaultForTests(undefined);

@@ -405,6 +405,19 @@ export function transitionObligation(
       );
       return null;
     }
+    // cli#1059 round 5: a transition that leaves every field as it found it is
+    // not a decision, so it writes nothing. A re-arm of the state and deadline a
+    // record already carries used to bump `revision` and `lastTransitionAt` —
+    // while the record's own check could be running. Return the record as it
+    // stands; the caller schedules its timer from it. (Terminal records are
+    // refused above, so no terminal record reaches this point.)
+    if (next === current.state) {
+      const fields = current as unknown as Record<string, unknown>;
+      const changed = Object.entries(patch).some(
+        ([key, value]) => (fields[key] ?? null) !== ((value as unknown) ?? null),
+      );
+      if (!changed) return current;
+    }
     const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
     return writeObligationLocked(mailDir, agent, updated, current.revision ?? 0);
   });
