@@ -212,10 +212,10 @@ Message: ${envelope.content}`;
         this.log(`[bridge:outbound] Delivery failed: ${e}`);
         return;
       }
-      setBridgeSentAtPath(result.path, new Date().toISOString());
+      setBridgeSentAtPath(result.path, new Date().toISOString(), this.mailboxDir(this.bridgeAgentId).root);
       this.log(`[bridge:outbound] → ${envelope.channel}/${envelope.channelId}`);
       try {
-        ackMessageAtPath(result.path);
+        ackMessageAtPath(result.path, this.mailboxDir(this.bridgeAgentId).root);
       } catch (e) {
         this.log(`[bridge:outbound] ack failed for ${result.path} after send: ${e}`);
       }
@@ -227,7 +227,7 @@ Message: ${envelope.content}`;
       if (!existsSync(fullPath)) return;
       try {
         const result = recovery
-          ? await recoverPromoted(this.bridgeAgentId, fullPath, {}, { claim: this.bridgeAgentId })
+          ? await recoverPromoted(this.bridgeAgentId, fullPath, {}, { claim: this.bridgeAgentId, mailboxRoot: this.mailboxDir(this.bridgeAgentId).root })
           : await promote(this.bridgeAgentId, fullPath);
         if (!result.ok) {
           this.log(`[bridge:outbound] ${file} not promoted (${result.class}); not forwarded`);
@@ -285,6 +285,6 @@ Message: ${envelope.content}`;
 
   private mailboxDir(agentId: string) {
     const base = join(this.mailDir, agentId);
-    return { fresh: join(base, "new"), cur: join(base, "cur"), dlq: join(base, "dlq") };
+    return { root: base, fresh: join(base, "new"), cur: join(base, "cur"), dlq: join(base, "dlq") };
   }
 }

@@ -31,9 +31,22 @@ mock.module("node:fs", () => ({
     return (realFs.openSync as any)(...args);
   },
   readFileSync: (...args: any[]) => {
-    if (args[0] === readFailure && --readsUntilFailure <= 0) throw Object.assign(new Error("injected read failure"), { code: "EACCES" });
+    // A record update reads through an open descriptor, so map an fd read
+    // back to the tracked path it belongs to by file identity.
+    let target = args[0];
+    if (typeof target === "number") {
+      for (const candidate of [removeAfterRead, readFailure, stampOnRead?.path]) {
+        if (candidate === undefined) continue;
+        try {
+          const opened = realFs.fstatSync(target);
+          const entry = realFs.lstatSync(candidate);
+          if (opened.dev === entry.dev && opened.ino === entry.ino) { target = candidate; break; }
+        } catch {}
+      }
+    }
+    if (target === readFailure && --readsUntilFailure <= 0) throw Object.assign(new Error("injected read failure"), { code: "EACCES" });
     const result = (realFs.readFileSync as any)(...args);
-    if (stampOnRead?.path === args[0] && --stampOnRead.count === 0) {
+    if (stampOnRead?.path === target && --stampOnRead.count === 0) {
       const record = JSON.parse(String(result));
       if (replaceIdentity) record.id = "replacement";
       record.ackedAt = "concurrent-ack";
@@ -41,7 +54,7 @@ mock.module("node:fs", () => ({
       realFs.writeFileSync(stampOnRead.path, JSON.stringify(record));
       stampOnRead = undefined;
     }
-    if (args[0] === removeAfterRead && --readsBeforeRemoval === 0) {
+    if (target === removeAfterRead && --readsBeforeRemoval === 0) {
       realFs.unlinkSync(removeAfterRead!);
       removeAfterRead = undefined;
     }
@@ -53,7 +66,8 @@ const { acquireMailLockSync, mailLockPath, mailboxReplayStore } = await import("
 const { patchMailFile, reconcileTerminalCurStamps } = await import("../src/index.js");
 const { sweepTerminalObligations } = await import("../src/obligations.js");
 const root = realFs.mkdtempSync(join(tmpdir(), "patch-mail-"));
-const path = join(root, "record.json");
+const mailbox = join(root, "anvil");
+const path = join(mailbox, "cur", "record.json");
 
 afterEach(() => {
   removeAfterRead = undefined;
@@ -81,7 +95,7 @@ describe("patchMailFile", () => {
       firstPresentedAt: new Date().toISOString(), claim: { token: randomUUID(), pid: process.pid, start: null, moduleNonce: randomUUID() },
     }));
     const before = String(realFs.readFileSync(f.curPath));
-    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toEqual({
+    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound", join(root, "anvil"))).toEqual({
       ok: false, reason: "write-failed", path: f.curPath, code: "PLACEMENT_WITHHELD",
     });
     expect(String(realFs.readFileSync(f.curPath))).toBe(before);
@@ -91,7 +105,7 @@ describe("patchMailFile", () => {
     const f = terminalFixture("acked");
     const lock = acquireMailLockSync(join(root, "anvil"))!;
     try {
-      expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "write-failed", path: mailLockPath(join(root, "anvil")) });
+      expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound", join(root, "anvil"))).toMatchObject({ ok: false, reason: "write-failed", path: mailLockPath(join(root, "anvil")) });
     } finally {
       lock.release();
     }
@@ -101,14 +115,14 @@ describe("patchMailFile", () => {
     const f = terminalFixture("acked");
     const lockPath = mailLockPath(join(root, "anvil"));
     realFs.mkdirSync(lockPath);
-    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "write-failed", path: lockPath });
+    expect(patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound", join(root, "anvil"))).toMatchObject({ ok: false, reason: "write-failed", path: lockPath });
   });
 
   for (const code of ["EACCES", "ENOENT"]) {
     test(`a scratch ${code} failure names the target path and preserves the record`, () => {
       const f = terminalFixture("acked");
       scratchErrorCode = code;
-      const result = patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound");
+      const result = patchMailFile(f.curPath, { ackedAt: "done" }, "ackedAt", "inbound", join(root, "anvil"));
       expect(result).toMatchObject({ ok: false, reason: "write-failed", code });
       if (result.ok) throw new Error("expected scratch failure");
       expect(result.path).toBe(f.curPath);
@@ -119,20 +133,31 @@ describe("patchMailFile", () => {
   }
 
   test("patches an existing record", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
-    expect(patchMailFile(path, { read: true }, undefined, "inbound")).toEqual({ ok: true });
+    expect(patchMailFile(path, { read: true }, undefined, "inbound", mailbox)).toEqual({ ok: true });
     expect(JSON.parse(realFs.readFileSync(path, "utf-8"))).toEqual({ id: "inbound", body: "hello", read: true });
   });
 
   test("reports a missing record without creating it", () => {
-    expect(patchMailFile(path, { read: true }, undefined, "inbound")).toMatchObject({ ok: false, reason: "record-missing" });
+    expect(patchMailFile(path, { read: true }, undefined, "inbound", mailbox)).toMatchObject({ ok: false, reason: "record-missing" });
     expect(realFs.existsSync(path)).toBe(false);
   });
 
+  test("reports a dangling record symlink as a write failure, not a missing record", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
+    const absent = join(mailbox, "absent.json");
+    realFs.symlinkSync(absent, path);
+    expect(patchMailFile(path, { read: true }, undefined, "inbound", mailbox)).toEqual({ ok: false, reason: "write-failed", path, code: undefined });
+    expect(realFs.readlinkSync(path)).toBe(absent);
+    expect(realFs.existsSync(absent)).toBe(false);
+  });
+
   test("reports a record removed after the read without recreating it", () => {
+    realFs.mkdirSync(join(mailbox, "cur"), { recursive: true });
     realFs.writeFileSync(path, JSON.stringify({ id: "inbound", body: "hello" }));
     removeAfterRead = path;
-    expect(patchMailFile(path, { ackedAt: "receipt", read: true }, "ackedAt", "inbound")).toMatchObject({ ok: false, reason: "record-missing" });
+    expect(patchMailFile(path, { ackedAt: "receipt", read: true }, "ackedAt", "inbound", mailbox)).toMatchObject({ ok: false, reason: "record-missing" });
     expect(removeAfterRead).toBeUndefined();
     expect(realFs.existsSync(path)).toBe(false);
   });
