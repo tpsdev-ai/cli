@@ -842,7 +842,15 @@ interface ArmedObligationRetry {
   incarnation: symbol;
   /** Retries already consumed (0..delays.length). */
   attempt: number;
-  timer: ReturnType<typeof setTimeout>;
+  /** Epoch ms this attempt is due. A repeated event never moves it. */
+  dueAt: number;
+  /** True once the cap warning was logged: no timer and no new budget until a
+   *  durable change (the record's STATE moves) or shutdown. */
+  exhausted: boolean;
+  /** The record state the budget was exhausted in (used to detect the change). */
+  state?: ObligationState;
+  /** Null while the attempt is running and once exhausted. */
+  timer: ReturnType<typeof setTimeout> | null;
 }
 const obligationRetries = new Map<string, ArmedObligationRetry>();
 
@@ -889,7 +897,7 @@ function releaseObligationState(obligationId: string): void {
 function clearObligationRetry(obligationId: string): void {
   const retry = obligationRetries.get(obligationId);
   if (!retry) return;
-  clearAccountTimer(retry.accountId, retry.timer);
+  if (retry.timer) clearAccountTimer(retry.accountId, retry.timer);
   obligationRetries.delete(obligationId);
 }
 
@@ -905,7 +913,7 @@ function releaseAccountState(accountId: string): void {
   }
   for (const [obligationId, retry] of obligationRetries) {
     if (retry.accountId === accountId) {
-      clearAccountTimer(retry.accountId, retry.timer);
+      if (retry.timer) clearAccountTimer(retry.accountId, retry.timer);
       obligationRetries.delete(obligationId);
     }
   }
@@ -971,7 +979,7 @@ export async function awaitStartupCurSweepForTests(
 export function obligationStateForTests(): {
   contexts: { obligationId: string; accountId: string }[];
   deadlines: { obligationId: string; accountId: string }[];
-  retries: { obligationId: string; accountId: string; attempt: number }[];
+  retries: { obligationId: string; accountId: string; attempt: number; dueAt: number; exhausted: boolean }[];
 } {
   return {
     contexts: [...yieldContexts].map(([obligationId, ctx]) => ({ obligationId, accountId: ctx.accountId })),
@@ -980,6 +988,8 @@ export function obligationStateForTests(): {
       obligationId,
       accountId: retry.accountId,
       attempt: retry.attempt,
+      dueAt: retry.dueAt,
+      exhausted: retry.exhausted,
     })),
   };
 }
@@ -1028,8 +1038,9 @@ function receiptDirs(ctx: YieldContext): ReceiptScanDirs {
 }
 
 /** Delays before each in-process recheck of an obligation whose deadline could
- *  not be settled or re-armed (cli#1059). */
-const OBLIGATION_RETRY_DELAYS_MS = [1000, 4000, 16000];
+ *  not be settled or re-armed (cli#1059). Exported so a test can pin the
+ *  defaults. */
+export const OBLIGATION_RETRY_DELAYS_MS = [1000, 4000, 16000];
 let obligationRetryDelaysMs = [...OBLIGATION_RETRY_DELAYS_MS];
 
 /** Test-only: shorten the obligation retry delays. Returns the previous delays. */
@@ -1053,49 +1064,113 @@ export function setArmDeadlineFaultForTests(hook: typeof armDeadlineFaultForTest
   armDeadlineFaultForTests = hook;
 }
 
+/** Test-only fault at the start of a bounded retry: a message makes that
+ *  attempt throw so the retry callback's own catch can be exercised. */
+let obligationRetryFaultForTests: ((inboundId: string, attempt: number) => string | undefined) | undefined;
+export function setObligationRetryFaultForTests(hook: typeof obligationRetryFaultForTests): void {
+  obligationRetryFaultForTests = hook;
+}
+
+/** Test-only hook immediately before an arm's first record read: a test can
+ *  land a same-state deadline extension first and observe which deadline the
+ *  arm writes. */
+let beforeArmReadForTests: ((inboundId: string) => void) | undefined;
+export function setBeforeArmReadForTests(hook: typeof beforeArmReadForTests): void {
+  beforeArmReadForTests = hook;
+}
+
 /**
- * SCHEDULE the bounded in-process retry (cli#1059). One retry state per
- * obligation: a repeated deadline fire or a failed re-arm continues the same
- * attempt count. Each attempt re-reads the durable record; a missing or
- * terminal record cancels with no write, a live one re-runs the deadline's own
- * receipt scan and cur/ lookup before any settlement. At the cap the record is
- * left open and unchanged, no nack is sent, and ONE named warning says restart
- * recovery will pick it up.
+ * Keep ONE bounded in-process retry state per obligation (cli#1059). A pending
+ * attempt keeps its due time: a repeated deadline fire, a yield event or a
+ * refused re-arm does not restart the wait or the budget. Each attempt
+ * re-reads the durable record. When its deadline is in the future it only
+ * re-arms from that record; otherwise it runs the deadline's own decision,
+ * which re-scans the receipt evidence and the cur/ lookup before any
+ * settlement. At the cap the record is left open and unchanged, no nack is
+ * sent, and ONE named warning says restart recovery will pick it up. The
+ * exhausted state lives until shutdown, the obligation is released (its record
+ * is gone or terminal), or the record's STATE moves (a new delivery attempt or
+ * a terminal outcome), which reopens a fresh budget.
  */
 function retryObligationRead(ctx: YieldContext, obligationId: string, error = "obligation check failed"): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const prev = obligationRetries.get(obligationId);
   if (prev) {
-    clearAccountTimer(prev.accountId, prev.timer);
+    if (!prev.exhausted) {
+      if (prev.timer !== null) return; // one pending timer: its due time stands
+      // An attempt is RUNNING and has consumed `prev.attempt` retries, so the
+      // next one continues the budget rather than restarting it.
+      scheduleObligationRetry(ctx, obligationId, prev.attempt, error);
+      return;
+    }
+    const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+    const gone = result.status === "missing" ||
+      (result.status === "found" && TERMINAL_STATES.has(result.record.state));
+    const moved = result.status === "found" && !TERMINAL_STATES.has(result.record.state) && result.record.state !== prev.state;
+    if (!gone && !moved) return;
     obligationRetries.delete(obligationId);
+    if (gone) return;
   }
-  const attempt = prev?.attempt ?? 0;
+  scheduleObligationRetry(ctx, obligationId, 0, error);
+}
+
+function scheduleObligationRetry(ctx: YieldContext, obligationId: string, attempt: number, error: string): void {
+  if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
+  const prev = obligationRetries.get(obligationId);
+  if (prev?.exhausted) return;
+  if (prev && prev.timer !== null) return; // a pending attempt keeps its due time
   if (attempt >= obligationRetryDelaysMs.length) {
+    const rec = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+    obligationRetries.set(obligationId, {
+      accountId: ctx.accountId,
+      incarnation: ctx.incarnation,
+      attempt,
+      dueAt: Number.POSITIVE_INFINITY,
+      exhausted: true,
+      state: rec.status === "found" ? rec.record.state : undefined,
+      timer: null,
+    });
     ctx.log?.warn?.(
       `tps-mail: obligation-retry-exhausted: obligation ${obligationId} for inbound ${ctx.inboundId}: ${error}; ` +
         `the record is left open and unchanged for restart recovery`,
     );
     return;
   }
+  const delay = obligationRetryDelaysMs[attempt]!;
+  const dueAt = Date.now() + delay;
   const timer = accountTimer(ctx, () => {
+    // This attempt is now running: keep the entry (and its budget) but drop the
+    // timer, so a late event continues the same budget instead of resetting it.
+    const current = obligationRetries.get(obligationId);
+    if (current && current.timer === timer) current.timer = null;
     void runObligationRetry(ctx, obligationId, attempt + 1).catch((err: any) => {
       if (!isLiveContext(ctx)) return;
       ctx.log?.warn?.(
         `tps-mail: obligation-retry-failed: obligation ${obligationId} for inbound ${ctx.inboundId}: ${err?.message ?? err}`,
       );
-      retryObligationRead(ctx, obligationId, `retry threw: ${err?.message ?? err}`);
+      scheduleObligationRetry(ctx, obligationId, attempt + 1, `retry threw: ${err?.message ?? err}`);
     });
-  }, obligationRetryDelaysMs[attempt]!);
+  }, delay);
   if (typeof (timer as any).unref === "function") (timer as any).unref();
-  obligationRetries.set(obligationId, { accountId: ctx.accountId, incarnation: ctx.incarnation, attempt: attempt + 1, timer });
+  obligationRetries.set(obligationId, {
+    accountId: ctx.accountId,
+    incarnation: ctx.incarnation,
+    attempt: attempt + 1,
+    dueAt,
+    exhausted: false,
+    timer,
+  });
 }
 
 async function runObligationRetry(ctx: YieldContext, obligationId: string, attempt: number): Promise<void> {
   if (!isLiveContext(ctx)) return clearObligationRetry(obligationId);
+  const fault = obligationRetryFaultForTests?.(ctx.inboundId, attempt);
+  if (fault !== undefined) throw new Error(fault);
   const result = readObligationForCleanup(ctx, obligationId);
   // readObligationForCleanup already scheduled the next attempt for an
   // unverified record; missing and terminal records have been released.
-  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return;
+  if (result.status === "unverified") return;
+  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return clearObligationRetry(obligationId);
   const rec = result.record;
   const parsedDeadline = rec.deadlineAt === null ? NaN : Date.parse(rec.deadlineAt);
   if (Number.isFinite(parsedDeadline) && parsedDeadline > Date.now()) {
@@ -1105,24 +1180,20 @@ async function runObligationRetry(ctx: YieldContext, obligationId: string, attem
     if (armed.outcome === "refused" && (armed.reason === "gone" || armed.reason === "terminal" || armed.reason === "inactive")) {
       return clearObligationRetry(obligationId);
     }
-    retryObligationRead(ctx, obligationId, armed.outcome === "error" ? armed.error : `deadline re-arm refused (${armed.reason})`);
+    scheduleObligationRetry(ctx, obligationId, attempt, armed.outcome === "error" ? armed.error : `deadline re-arm refused (${armed.reason})`);
     return;
   }
   const outcome = await settleObligationAtDeadline(ctx, obligationId);
   if (outcome.status === "error") {
-    retryObligationRead(ctx, obligationId, outcome.error);
+    scheduleObligationRetry(ctx, obligationId, attempt, outcome.error);
     return;
   }
-  // The shared verb either released a terminal record, armed nothing and asked
-  // for a retry of its own (refused write), or settled it. A record STILL live
-  // and unsettled keeps this obligation's one retry state alive.
-  const after = readObligationForCleanup(ctx, obligationId);
-  if (after.status === "unverified") return;
-  if (after.status === "found" && !TERMINAL_STATES.has(after.record.state)) {
-    retryObligationRead(ctx, obligationId, "the deadline check did not settle the live record");
-  } else {
-    clearObligationRetry(obligationId);
-  }
+  // Only an `error` schedules another attempt here. A settlement that already
+  // scheduled one (`retry-scheduled`), a refused one-attempt store write
+  // (`write-failed`, which resolves on restart), and every settled, re-armed or
+  // gone/terminal outcome end this budget: scheduling again would count a
+  // second attempt.
+  if (outcome.status !== "retry-scheduled") clearObligationRetry(obligationId);
 }
 
 function readObligationForCleanup(ctx: YieldContext, obligationId: string) {
@@ -1170,33 +1241,44 @@ function stampTerminalCur(
 }
 
 
+/**
+ * Land the ack transition on the record the receipt evidence was scanned from
+ * (cli#1059 round 2). `expectState`/`expectRevision` name that snapshot and
+ * `expectReplyId` the reply the evidence was found for, so a same-state writer
+ * that replaced `replyId` after the scan cannot have the OLD receipt ack the
+ * NEW record. Returns `stale` when the write was refused (the caller rescans
+ * the fresh record) or `retry-scheduled` when the fresh record is unverified
+ * (the read helper already scheduled the next bounded attempt).
+ */
 function ackObligation(
   ctx: YieldContext,
   obligationId: string,
   why: string,
   patch: Partial<ObligationRecord> = {},
   stampCur = true,
-): void {
-  if (!isLiveContext(ctx)) return;
+  expect?: { from: ObligationState; revision: number; replyId?: string },
+): "acked" | "stale" | "retry-scheduled" {
+  if (!isLiveContext(ctx)) return "stale";
   // Only stamp the inbound when the ACK TRANSITION actually landed. A terminal
   // record (e.g. a deadline that already FAILED the obligation) refuses the
   // transition (obligations.ts: TERMINAL_STATES is final, never resurrected)
   // and must not get an ackedAt — otherwise a late final acks the inbound
   // while the obligation stays failed (cli#400).
-  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", patch, ctx.log);
+  const updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, "acked", patch, ctx.log, expect);
   if (!updated || updated.state !== "acked") {
     const result = readObligationForCleanup(ctx, obligationId);
-    if (result.status === "unverified") return;
+    if (result.status === "unverified") return "retry-scheduled";
     const cur = result.status === "found" ? result.record : null;
     ctx.log?.warn?.(
       `tps-mail: refusing to ack ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; the inbound keeps no ackedAt`,
     );
-    return;
+    return "stale";
   }
   // A missing cur/ entry has no record to stamp (cli#1006).
   if (stampCur) stampTerminalCur(ctx, "ack", { ackedAt: new Date().toISOString(), read: true });
   ctx.log?.info?.(`tps-mail: acked ${ctx.inboundId} — ${why}`);
   releaseObligationState(obligationId);
+  return "acked";
 }
 
 /**
@@ -1280,12 +1362,18 @@ async function settleObligation(
      *  send is a nack to the recorded sender; delivery retries follow the
      *  existing at-least-once contract. */
     missingCur?: boolean;
+    /** cli#1059 round 2: the record the evidence for this decision was gathered
+     *  from. When a write lands in between (including a same-state deadline
+     *  extension or reply replacement), the decision is stale: nothing is
+     *  written and the caller redoes the evidence and the deadline decision. */
+    decision?: { revision: number; deadlineAt: string | null; replyId?: string };
   },
-): Promise<"acked" | "unconfirmed" | "failed" | "none"> {
+): Promise<"acked" | "unconfirmed" | "failed" | "none" | "stale" | "retry-scheduled" | "write-failed"> {
   if (!isLiveContext(ctx)) return "none";
   if (!s.missingCur && !(await internalInbound(ctx))) return "none";
   if (!isLiveContext(ctx)) return "none";
   const result = readObligationForCleanup(ctx, obligationId);
+  if (result.status === "unverified") return "retry-scheduled";
   if (result.status !== "found") return "none";
   const rec = result.record;
   if (TERMINAL_STATES.has(rec.state)) {
@@ -1294,15 +1382,25 @@ async function settleObligation(
     );
     return "none";
   }
+  if (s.decision !== undefined &&
+      ((rec.revision ?? 0) !== s.decision.revision || (rec.deadlineAt ?? null) !== (s.decision.deadlineAt ?? null))) {
+    // The record this decision examined moved: neither the deadline extension
+    // nor the reply replacement may be overwritten with the old conclusion.
+    ctx.log?.info?.(
+      `tps-mail: obligation ${rec.obligationId} moved from revision ${s.decision.revision} (deadline ${s.decision.deadlineAt ?? "none"}) ` +
+        `to revision ${rec.revision ?? 0} (deadline ${rec.deadlineAt ?? "none"}); redoing the decision on the fresh record`,
+    );
+    return "stale";
+  }
   if (s.receipt === "found" && !s.verdict) {
-    ackObligation(
+    return ackObligation(
       ctx,
       obligationId,
       s.reason,
       s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {},
       !s.missingCur,
+      { from: rec.state, revision: rec.revision ?? 0, replyId: rec.replyId },
     );
-    return "acked";
   }
   const committed = rec.state === "delivering" || rec.state === "posted";
   if (!s.verdict && committed) {
@@ -1324,7 +1422,7 @@ async function settleObligation(
       );
       if (appliedUnconfirmed === null) {
         const result = readObligationForCleanup(ctx, obligationId);
-        if (result.status === "unverified") return "none";
+        if (result.status === "unverified") return "retry-scheduled";
         // cli#1006 r10: readObligationForCleanup released a terminal or gone
         // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
         // needs its deadline re-armed — the fired one is already disarmed, and
@@ -1338,7 +1436,10 @@ async function settleObligation(
           `tps-mail: refusing to record the unconfirmed outcome for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
             (live ? "it keeps its state and is left to its deadline" : "it stays as it is"),
         );
-        if (live) retryObligationRead(ctx, obligationId);
+        if (live) {
+          retryObligationRead(ctx, obligationId);
+          return "retry-scheduled";
+        }
         return "none";
       }
     } catch (err: any) {
@@ -1346,7 +1447,7 @@ async function settleObligation(
         `tps-mail: obligation-write-failed: could not record the unconfirmed outcome for ${ctx.inboundId} ` +
           `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
       );
-      return "none";
+      return "write-failed";
     }
     releaseObligationState(obligationId);
     ctx.log?.warn?.(
@@ -1387,11 +1488,11 @@ async function settleObligation(
       `tps-mail: obligation-write-failed: could not record the failure for ${ctx.inboundId} ` +
         `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
     );
-    return "none";
+    return "write-failed";
   }
   if (appliedFailed === null) {
     const result = readObligationForCleanup(ctx, obligationId);
-    if (result.status === "unverified") return "none";
+    if (result.status === "unverified") return "retry-scheduled";
     // cli#1006 r10: readObligationForCleanup released a terminal or gone
     // record. A STILL-LIVE one (another writer moved it, e.g. to `posted`)
     // keeps no timer here — the fired deadline is already disarmed, and a
@@ -1405,7 +1506,10 @@ async function settleObligation(
       `tps-mail: refusing to record the failure for ${ctx.inboundId} — obligation is ${cur?.state ?? "gone"}; ` +
         (live ? "it keeps its state and is left to its deadline" : "the inbound keeps no nack stamp and no nack mail is sent"),
     );
-    if (live) retryObligationRead(ctx, obligationId);
+    if (live) {
+      retryObligationRead(ctx, obligationId);
+      return "retry-scheduled";
+    }
     return "none";
   }
   // The failure is terminal: drop the context and its timer before the nack is
@@ -1653,8 +1757,23 @@ type ArmDeadlineOutcome =
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt, reporting
  *  whether a timer was armed. cli#1059: a caller must be able to tell a failed
  *  arm from a silent refusal, so it can schedule another attempt instead of
- *  leaving a live record without a timer. */
+ *  leaving a live record without a timer. A store lock or write that throws is
+ *  reported as `error`, never allowed to escape into the caller's dispatch
+ *  catch (where it would settle a live obligation as "dispatch failed"). */
 function armDeadline(
+  ctx: YieldContext,
+  obligationId: string,
+  deadlineAt?: string | null,
+  patch: Partial<ObligationRecord> = {},
+): ArmDeadlineOutcome {
+  try {
+    return armDeadlineOnce(ctx, obligationId, deadlineAt, patch);
+  } catch (err: any) {
+    return { outcome: "error", error: err?.message ?? String(err) };
+  }
+}
+
+function armDeadlineOnce(
   ctx: YieldContext,
   obligationId: string,
   deadlineAt?: string | null,
@@ -1662,6 +1781,7 @@ function armDeadline(
 ): ArmDeadlineOutcome {
   if (!isLiveContext(ctx)) return { outcome: "refused", reason: "inactive" };
   if (armDeadlineFaultForTests?.(ctx.inboundId)) return { outcome: "refused", reason: "injected" };
+  beforeArmReadForTests?.(ctx.inboundId);
   let updated: ObligationRecord | null = null;
   // Arming must preserve committed delivery state: the deadline distinguishes
   // `unconfirmed` from `failed`. Re-read once if the record moves before writing.
@@ -1674,7 +1794,11 @@ function armDeadline(
     if (result.status === "missing") return { outcome: "refused", reason: "gone" };
     if (TERMINAL_STATES.has(result.record.state)) return { outcome: "refused", reason: "terminal" };
     const rec = result.record;
-    const at = (attempt === 0 ? deadlineAt : rec.deadlineAt) ?? rec.deadlineAt ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    // cli#1059 round 2: the CURRENT record owns the deadline. A stored argument
+    // may predate a same-state extension that landed before this read, and
+    // arming with it would overwrite the extension.
+    const currentDeadline = usableDeadline(rec.deadlineAt);
+    const at = currentDeadline ?? usableDeadline(deadlineAt) ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
     const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
     updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, {
       from: rec.state,
@@ -1693,6 +1817,12 @@ function armDeadline(
   if (typeof (timer as any).unref === "function") (timer as any).unref();
   armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
   return { outcome: "armed" };
+}
+
+/** An ISO deadline string this code can schedule from; anything else is
+ *  ignored so a fallback is used instead. */
+function usableDeadline(value: string | null | undefined): string | null {
+  return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
 }
 
 /** Schedule the next bounded attempt after an arm that did not land. A gone or
@@ -1714,49 +1844,130 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
   }
 }
 
-/** The deadline's own evidence step, shared by the fired deadline and every
- *  bounded retry: re-read the record, rescan the receipts, redo the cur/
- *  lookup, and settle only on those fresh facts. `error` means the facts could
- *  not be established (record unreadable or lookup failed) — never a verdict. */
+/** What the deadline check decided. The caller must distinguish these: only a
+ *  retryable failure (`error`) lets the caller schedule another bounded
+ *  attempt; `retry-scheduled` already scheduled one; `write-failed` is the
+ *  documented one-attempt store refusal that resolves on restart; `settled`,
+ *  `re-armed`, `gone-or-terminal` and `none` end this attempt.
+ *
+ * The deadline's own decision — re-read the record, re-scan the receipts, redo
+ * the cur/ lookup — is shared by the fired deadline and every bounded retry.
+ * It runs against a named record snapshot (`decision`); if that record moved,
+ * the evidence and the deadline decision are redone on the fresh record. */
+type DeadlineOutcome =
+  | { status: "settled" }
+  | { status: "gone-or-terminal" }
+  | { status: "re-armed" }
+  | { status: "retry-scheduled" }
+  | { status: "write-failed" }
+  | { status: "none" }
+  | { status: "error"; error: string };
+
 async function settleObligationAtDeadline(
   ctx: YieldContext,
   obligationId: string,
-): Promise<{ status: "settled" | "none" } | { status: "error"; error: string }> {
-  const result = readObligationForCleanup(ctx, obligationId);
-  if (result.status === "unverified") {
-    // Already scheduled by the read helper; this is not a verdict and not a
-    // second attempt.
+): Promise<DeadlineOutcome> {
+  // At most two passes: a record that moves between the evidence and the
+  // settlement gets both redone once; further churn is left to a bounded
+  // retry rather than a loop.
+  for (let pass = 0; pass < 2; pass++) {
+    const result = readObligationForCleanup(ctx, obligationId);
+    if (result.status === "unverified") {
+      // Already scheduled by the read helper; this is not a verdict and not a
+      // second attempt.
+      return { status: "retry-scheduled" };
+    }
+    if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return { status: "gone-or-terminal" };
+    const rec = result.record;
+    const parsedDeadline = rec.deadlineAt === null ? NaN : Date.parse(rec.deadlineAt);
+    if (Number.isFinite(parsedDeadline) && parsedDeadline > Date.now()) {
+      // The deadline moved forward after this check began (cli#1059 round 2):
+      // re-arm from the fresh record rather than settling at the old deadline.
+      const armed = armDeadline(ctx, obligationId, rec.deadlineAt);
+      if (armed.outcome === "armed") return { status: "re-armed" };
+      if (armed.outcome === "refused" && armed.reason === "scheduled") return { status: "retry-scheduled" };
+      if (armed.outcome === "refused" &&
+          (armed.reason === "gone" || armed.reason === "terminal" || armed.reason === "inactive")) {
+        return { status: "gone-or-terminal" };
+      }
+      retryAfterArmFailure(ctx, obligationId, armed);
+      return { status: "retry-scheduled" };
+    }
+    const decision = { revision: rec.revision ?? 0, deadlineAt: rec.deadlineAt, replyId: rec.replyId };
+    const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
+    if (!isLiveContext(ctx)) return { status: "none" };
+    const cur = lookupObligationCur(ctx, obligationId);
+    if (cur.status === "error") return { status: "error", error: `cur/ lookup failed (${cur.code})` };
+    // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
+    // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
+    // record once it had stayed malformed for at least the partial-write grace, or was
+    // dated 1 s or more in the future) is a definitive non-delivery: the obligation fails and
+    // nacks even though its delivery committed. With no evidence and no verdict, a
+    // committed record becomes `unconfirmed` (no nack mail, no nack stamp) and only
+    // a record that never committed fails and is announced to the sender.
+    const reason = "yielded-without-resumption";
+    const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
+    // cli#389 round 9, item 2: the VERB announces a failure — this caller does not
+    // mail on its own, so the deadline and the turn's own scan give the sender the
+    // same outcome. cli#389 round 10, item 1: AWAIT that send here too, so the
+    // deadline's own nack has landed (and its outcome is on the record) before
+    // this path finishes; the mail is at-least-once, and a start retries
+    // delivery of anything still owed.
+    const applied = await settleObligation(ctx, obligationId, {
+      receipt: receipt.status === "found" ? "found" : "none",
+      verdict,
+      reason,
+      // A restored inbound must pass the normal gate; the marker is historical.
+      missingCur: cur.status === "missing",
+      decision,
+    });
+    if (applied === "stale") continue; // redo the evidence and the deadline decision
+    if (applied === "acked" || applied === "unconfirmed" || applied === "failed") return { status: "settled" };
+    if (applied === "retry-scheduled") return { status: "retry-scheduled" };
+    if (applied === "write-failed") return { status: "write-failed" };
     return { status: "none" };
   }
-  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return { status: "none" };
-  const rec = result.record;
-  const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
-  if (!isLiveContext(ctx)) return { status: "none" };
-  const cur = lookupObligationCur(ctx, obligationId);
-  if (cur.status === "error") return { status: "error", error: `cur/ lookup failed (${cur.code})` };
-  // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
-  // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
-  // record once it had stayed malformed for at least the partial-write grace, or was
-  // dated 1 s or more in the future) is a definitive non-delivery: the obligation fails and
-  // nacks even though its delivery committed. With no evidence and no verdict, a
-  // committed record becomes `unconfirmed` (no nack mail, no nack stamp) and only
-  // a record that never committed fails and is announced to the sender.
-  const reason = "yielded-without-resumption";
-  const verdict = receipt.status === "malformed" && receipt.ownRecord ? "receipt-malformed" : undefined;
-  // cli#389 round 9, item 2: the VERB announces a failure — this caller does not
-  // mail on its own, so the deadline and the turn's own scan give the sender the
-  // same outcome. cli#389 round 10, item 1: AWAIT that send here too, so the
-  // deadline's own nack has landed (and its outcome is on the record) before
-  // this path finishes; the mail is at-least-once, and a start retries
-  // delivery of anything still owed.
-  await settleObligation(ctx, obligationId, {
-    receipt: receipt.status === "found" ? "found" : "none",
-    verdict,
-    reason,
-    // A restored inbound must pass the normal gate; the marker is historical.
-    missingCur: cur.status === "missing",
-  });
-  return { status: "settled" };
+  retryObligationRead(ctx, obligationId, "the obligation record changed while the deadline check ran");
+  return { status: "retry-scheduled" };
+}
+
+/**
+ * Settle a receipt-found decision against the record it was scanned from, and
+ * rescan the FRESH record once if a same-state write landed under the ack
+ * (cli#1059 round 2). A receipt for the old reply never acks a record that now
+ * names another. Returns `stale` when the fresh record carries no receipt for
+ * the reply it names now; the caller leaves it to the deadline.
+ */
+async function settleScannedReceipt(
+  ctx: YieldContext,
+  obligationId: string,
+  scanned: { revision?: number; deadlineAt: string | null; replyId?: string },
+  expectedReplyId: string | undefined,
+  opts: { missingCur?: boolean } = {},
+): Promise<"acked" | "stale" | "retry-scheduled" | "none"> {
+  let decision = scanned;
+  for (let pass = 0; pass < 2; pass++) {
+    const applied = await settleObligation(ctx, obligationId, {
+      receipt: "found",
+      reason: "receipt found",
+      ...(opts.missingCur ? { missingCur: true } : {}),
+      decision: {
+        revision: decision.revision ?? 0,
+        deadlineAt: decision.deadlineAt,
+        replyId: decision.replyId,
+      },
+    });
+    if (applied === "acked") return "acked";
+    if (applied === "retry-scheduled") return "retry-scheduled";
+    if (applied !== "stale") return "none";
+    if (pass === 1) break;
+    const fresh = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+    if (fresh.status !== "found" || TERMINAL_STATES.has(fresh.record.state)) return "stale";
+    const receipt = await scanObligationReceipt(ctx, obligationId, fresh.record, fresh.record.replyId ?? expectedReplyId);
+    if (receipt.status !== "found") return "stale";
+    decision = fresh.record;
+  }
+  return "stale";
 }
 
 function makeYieldCtx(
@@ -1921,12 +2132,10 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     return;
   }
   if (receipt.status === "found") {
-    await settleObligation(ctx, current.obligationId, {
-      receipt: "found",
-      reason: "recovered: receipt already posted",
-      missingCur: true,
-    });
-    return;
+    const applied = await settleScannedReceipt(ctx, current.obligationId, current, current.replyId, { missingCur: true });
+    if (applied !== "stale") return;
+    // The record moved under the ack and the fresh one has no receipt for the
+    // reply it names now: fall through to the record-based deadline decision.
   }
 
   // Decide from the post-scan state. The store guard refuses a stale STATE or
@@ -2002,7 +2211,8 @@ async function reconcileObligation(
   const receipt = await scanObligationReceipt(ctx, rec.obligationId, rec, rec.replyId);
   if (!isLiveContext(ctx)) return;
   if (receipt.status === "found") {
-    await settleObligation(ctx, rec.obligationId, { receipt: "found", reason: "recovered: receipt already posted" });
+    const applied = await settleScannedReceipt(ctx, rec.obligationId, rec, rec.replyId);
+    if (applied === "stale") retryAfterArmFailure(ctx, rec.obligationId, armDeadline(ctx, rec.obligationId));
     return;
   }
   retryAfterArmFailure(ctx, rec.obligationId, armDeadline(ctx, rec.obligationId, rec.deadlineAt));
@@ -2870,11 +3080,17 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
         // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
-        const receipt = await scanObligationReceipt(yieldCtx, obId, created.record, postedReplyId ?? undefined);
+        // Bind the scan and the ack to ONE record snapshot (cli#1059 round 2):
+        // the receipt must name that record's revision and the reply it names.
+        const scanSnapshot = readObligationResult(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
+        const scanRecord = scanSnapshot.status === "found" ? scanSnapshot.record : created.record;
+        const expectedReplyId = postedReplyId ?? scanRecord.replyId;
+        const receipt = await scanObligationReceipt(yieldCtx, obId, scanRecord, expectedReplyId);
         if (!isLiveContext(yieldCtx)) return;
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";
-          await settleObligation(yieldCtx, obId, { receipt: "found", reason: "receipt found" });
+          const applied = await settleScannedReceipt(yieldCtx, obId, scanRecord, expectedReplyId);
+          if (applied === "stale") retryAfterArmFailure(yieldCtx, obId, armDeadline(yieldCtx, obId));
         } else if (receipt.status === "malformed" && receipt.ownRecord) {
           // cli#398 T4(e) RESTORED (cli#389 round 8) as ATTRIBUTABLE quarantine.
           // The drain quarantined THIS reply's own record — the quarantined name

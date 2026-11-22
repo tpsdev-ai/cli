@@ -164,11 +164,15 @@ export interface ObligationRecord {
    *  (like `markNackSent` clears it on a hand-off), so it happens ONCE and the
    *  startup retry no longer fires for that record. */
   nackAbandonedAt?: string;
-  /** cli#1059: the store increments this under its lock on every write. A
-   *  decision write names the revision it decided on (with the state), so a
-   *  same-state update — e.g. one that extends `deadlineAt` — cannot be
-   *  overwritten by a decision made on an older snapshot. A record written
-   *  before this field existed reads as revision 0, and its first write sets 1. */
+  /** cli#1059: the store increments this under its lock on every write that
+   *  lands. A decision write names the record it examined (state and revision;
+   *  the deadline path also carries the deadline it decided on), so a
+   *  same-state
+   *  update — e.g. one that extends `deadlineAt` — cannot be overwritten by a
+   *  decision made on an older snapshot. A record written before this field
+   *  existed reads as revision 0, and its first write sets 1. Only a
+   *  nonnegative safe integer is a valid revision: any other value makes the
+   *  record unverified, and an unverified record is never written. */
   revision?: number;
 }
 
@@ -185,10 +189,28 @@ export function obligationPath(mailDir: string, agent: string, inboundId: string
   return resolve(obligationsDir(mailDir, agent), `${inboundId}.json`);
 }
 
+/** The largest revision the store may hold: `revision + 1` must still be an
+ *  exact integer. In a double, `9007199254740992 + 1 === 9007199254740992`, so
+ *  a stale revision comparison could pass after a write at or above this
+ *  limit. A record at the limit reads, but cannot be written again. */
+export const MAX_OBLIGATION_REVISION = Number.MAX_SAFE_INTEGER;
+
+/** True for a usable revision: absent (reads as 0) or a nonnegative safe
+ *  integer. Anything else (a string, a negative, a fraction, null or an
+ *  overflowing value) makes the record unverified. */
+export function isValidObligationRevision(value: unknown): boolean {
+  return value === undefined ||
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_OBLIGATION_REVISION);
+}
+
 export function readObligation(mailDir: string, agent: string, inboundId: string): ObligationRecord | null {
   const p = obligationPath(mailDir, agent, inboundId);
   try {
-    return JSON.parse(readFileSync(p, "utf-8")) as ObligationRecord;
+    const record = JSON.parse(readFileSync(p, "utf-8")) as ObligationRecord;
+    // An invalid revision is not a record a decision may be based on: treat it
+    // exactly like an unreadable one, so no caller writes over it.
+    if (!record || typeof record.state !== "string" || !isValidObligationRevision(record.revision)) return null;
+    return record;
   } catch {
     return null;
   }
@@ -203,6 +225,9 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
     const record = JSON.parse(readFileSync(path, "utf-8")) as ObligationRecord;
     if (!record || typeof record.state !== "string") {
       return { status: "unverified", path, code: "INVALID_RECORD" };
+    }
+    if (!isValidObligationRevision(record.revision)) {
+      return { status: "unverified", path, code: "INVALID_REVISION" };
     }
     return { status: "found", record };
   } catch (error) {
@@ -225,7 +250,7 @@ export function listObligations(mailDir: string, agent: string, onReadError?: (p
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
       const record = JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord;
-      if (onReadError && (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state))) {
+      if (onReadError && (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision))) {
         const ids = [name.slice(0, -5)];
         if (typeof record?.inboundId === "string") ids.push(record.inboundId);
         onReadError(resolve(dir, name), undefined, ids, "file");
@@ -251,15 +276,28 @@ export function writeObligation(mailDir: string, agent: string, record: Obligati
   withObligationLock(mailDir, agent, () => writeObligationLocked(mailDir, agent, record));
 }
 
-function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord): ObligationRecord {
+function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord, revisionBase?: number): ObligationRecord {
   const dir = obligationsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const target = resolve(dir, `${record.inboundId}.json`);
   const tmp = resolve(dir, `.${record.inboundId}.json.tmp`);
-  // The lock is held here, so the revision this write replaces is the one the
-  // last write left. A record from before the field existed reads as 0.
-  const existing = readObligation(mailDir, agent, record.inboundId);
-  const written: ObligationRecord = { ...record, revision: (existing?.revision ?? 0) + 1 };
+  // The lock is held here. A transition passes the revision it read under that
+  // same lock; an unguarded write re-reads it. A record from before the field
+  // existed reads as 0. An unverified record is never written.
+  let base: number;
+  if (revisionBase !== undefined) {
+    base = revisionBase;
+  } else {
+    const existing = readObligationResult(mailDir, agent, record.inboundId);
+    if (existing.status === "unverified") {
+      throw new Error(`obligation record ${record.inboundId} is unverified (${existing.code}); refusing to write`);
+    }
+    base = existing.status === "found" ? (existing.record.revision ?? 0) : 0;
+  }
+  if (!Number.isSafeInteger(base + 1)) {
+    throw new Error(`obligation record ${record.inboundId} reached the revision limit; refusing to write`);
+  }
+  const written: ObligationRecord = { ...record, revision: base + 1 };
   writeFileSync(tmp, JSON.stringify(written, null, 2), "utf-8");
   renameSync(tmp, target);
   return written;
@@ -278,15 +316,19 @@ export function createObligation(
 ): { created: boolean; record: ObligationRecord } {
   return withObligationLock(mailDir, agent, () => {
     const draft = make();
-    const existing = readObligation(mailDir, agent, draft.inboundId);
-    if (existing) {
+    const existing = readObligationResult(mailDir, agent, draft.inboundId);
+    if (existing.status === "unverified") {
+      // Never create over a record the store cannot verify.
+      throw new Error(`obligation record ${draft.inboundId} is unverified (${existing.code}); refusing to create`);
+    }
+    if (existing.status === "found") {
       log?.info?.(
-        `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.obligationId}); not creating a second`,
+        `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.record.obligationId}); not creating a second`,
       );
-      return { created: false, record: existing };
+      return { created: false, record: existing.record };
     }
     draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
-    const written = writeObligationLocked(mailDir, agent, draft);
+    const written = writeObligationLocked(mailDir, agent, draft, 0);
     return { created: true, record: written };
   });
 }
@@ -312,9 +354,14 @@ export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTest
  *
  * `expect.from` refuses a transition when the record's STATE moved since the
  * caller's re-read; `expect.revision` additionally refuses a SAME-STATE update
- * (e.g. a deadline extension) that landed since that read. A decision write
- * passes both. A refused transition returns null and writes nothing, so the
+ * (e.g. a deadline extension) that landed since that read; `expect.replyId`
+ * refuses a same-state reply replacement (a receipt scanned for one reply may
+ * never ack a record that names another). A decision write passes every check
+ * that applies. A refused transition returns null and writes nothing, so the
  * caller must re-read and re-evaluate.
+ *
+ * A record whose revision is not a nonnegative safe integer is unverified:
+ * every transition refuses it and no write ever lands on it.
  */
 export function transitionObligation(
   mailDir: string,
@@ -323,7 +370,7 @@ export function transitionObligation(
   next: ObligationState,
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
-  expect?: { from: ObligationState; revision?: number },
+  expect?: { from: ObligationState; revision?: number; replyId?: string },
 ): ObligationRecord | null {
   beforeTransitionForTests?.(inboundId);
   return withObligationLock(mailDir, agent, () => {
@@ -347,8 +394,14 @@ export function transitionObligation(
       );
       return null;
     }
+    if (expect?.replyId !== undefined && current.replyId !== expect.replyId) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} now names reply ${current.replyId ?? "(none)"}, not ${expect.replyId}; refusing the stale transition to ${next}`,
+      );
+      return null;
+    }
     const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
-    return writeObligationLocked(mailDir, agent, updated);
+    return writeObligationLocked(mailDir, agent, updated, current.revision ?? 0);
   });
 }
 
@@ -396,7 +449,7 @@ export function markNackSent(
       if (!current || current.state !== "failed") return false;
       const { nackPending: _clear, ...rest } = current;
       try {
-        writeObligationLocked(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() });
+        writeObligationLocked(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() }, current.revision ?? 0);
         return true;
       } catch (err) {
         log?.warn?.(
@@ -448,7 +501,7 @@ function abandonOwedNackLocked(
   }
   const { nackPending: _cleared, ...rest } = current;
   try {
-    writeObligationLocked(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
+    writeObligationLocked(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() }, current.revision ?? 0);
     return true;
   } catch (err) {
     log?.warn?.(

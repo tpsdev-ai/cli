@@ -807,9 +807,10 @@ function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
  * Returns the count moved. Best effort PER FILE: a corrupt or unreadable file
  * is skipped without blocking the others. Inbox setup, lock acquisition, the
  * directory listing and the pending-file check can throw — only the per-file
- * stat/read/rename handling is non-fatal. Called opportunistically from mail
- * check / mail watch so the cap doesn't drift back into the combined-count
- * failure mode if a future change re-introduces it.
+ * stat/read, archive-directory creation and rename handling is non-fatal.
+ * Called opportunistically from mail check / mail watch so the cap doesn't
+ * drift back into the combined-count failure mode if a future change
+ * re-introduces it.
  *
  * The 30-day default is conservative: agents that ack mail are essentially
  * done with it, and the audit log + git history are the durable record. cur/
