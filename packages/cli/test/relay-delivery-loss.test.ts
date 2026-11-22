@@ -718,7 +718,7 @@ for (const entry of ["sync", "connect"] as const) {
     async function ackOnlyRecord(): Promise<void> {
       const inbox = getInbox("local");
       const [file] = jsonFiles(inbox.fresh);
-      ackMessageAtPath(join(inbox.fresh, file));
+      ackMessageAtPath(join(inbox.fresh, file), inbox.root);
       expect(jsonFiles(inbox.fresh)).toEqual([]);
     }
 
@@ -756,7 +756,7 @@ for (const entry of ["sync", "connect"] as const) {
       fs.writeFileSync(marker, "");
       const errors = spyOn(console, "error").mockImplementation(() => {});
       await start();
-      ackMessageAtPath(original.filePath);
+      ackMessageAtPath(original.filePath, getInbox("local").root);
       await deliverDirect({ type: MSG_MAIL_DELIVER, seq: 2, ts: new Date().toISOString(), body });
       expect(jsonFiles(getInbox("local").fresh)).toEqual([]);
       expect(jsonFiles(getInbox("local").dlq)).toEqual([]);

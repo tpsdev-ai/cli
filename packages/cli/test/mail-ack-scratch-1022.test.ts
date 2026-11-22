@@ -3,7 +3,7 @@ const patchShared = createPatchShared();
 import { afterEach, beforeEach, expect, spyOn, test, mock } from "bun:test";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import * as mail from "../src/utils/mail.js";
 import {
@@ -65,7 +65,7 @@ test("a failed ack scratch removal is reported once with its path and code", () 
     return remove(...args);
   }) as typeof remove);
   try {
-    expect(mail.ackMessageAtPath(target).read).toBe(true);
+    expect(mail.ackMessageAtPath(target, mail.getInbox(agent).root).read).toBe(true);
   } finally {
     fault.mockRestore();
     warn.mockRestore();
@@ -91,7 +91,7 @@ test("the first ack in the directory removes and reports leftover scratch", () =
     warnings.push(args.map(String).join(" "));
   });
   try {
-    mail.ackMessageAtPath(target);
+    mail.ackMessageAtPath(target, mail.getInbox(agent).root);
   } finally {
     warn.mockRestore();
   }
@@ -119,7 +119,7 @@ test("the sweep preserves records and non-scratch dotfiles", () => {
 
   const warn = spyOn(console, "warn").mockImplementation(() => {});
   try {
-    mail.ackMessageAtPath(target);
+    mail.ackMessageAtPath(target, mail.getInbox(agent).root);
   } finally {
     warn.mockRestore();
   }
@@ -138,13 +138,14 @@ test("acks share a directory sweep until the interval expires", () => {
   try {
     const cur = mail.getInbox(agent).cur;
     const warn = spyOn(console, "warn").mockImplementation(() => {});
-    mail.ackMessageAtPath(target);
+    mail.ackMessageAtPath(target, mail.getInbox(agent).root);
     const leftover = join(cur, scratchName());
     fs.writeFileSync(leftover, "partial");
     makeOld(leftover, base);
+    expect(fs.statSync(leftover).mtimeMs).toBe(base - 24 * 60 * 60 * 1000);
     const ack = (path: string) => {
       fs.writeFileSync(path, JSON.stringify({ id: "bounded", body: "hello", read: false }));
-      expect(mail.ackMessageAtPath(path).read).toBe(true);
+      expect(mail.ackMessageAtPath(path, dirname(dirname(path))).read).toBe(true);
     };
     for (let i = 0; i < 10; i++) ack(join(cur, `record-${i}.json`));
     now = base + 10 * 60 * 1000 - 1;
@@ -156,6 +157,7 @@ test("acks share a directory sweep until the interval expires", () => {
     const otherLeftover = join(otherDir, scratchName());
     fs.writeFileSync(otherLeftover, "partial");
     makeOld(otherLeftover, base);
+    expect(fs.statSync(otherLeftover).mtimeMs).toBe(base - 24 * 60 * 60 * 1000);
     ack(join(otherDir, "record.json"));
     expect(fs.existsSync(otherLeftover)).toBe(false);
     expect(fs.existsSync(leftover)).toBe(true);
@@ -178,7 +180,7 @@ test("a failed leftover sweep warns with path and code without failing the ack",
     if (args[0] === leftover) throw Object.assign(new Error("removal refused"), { code: "EBUSY" });
     return remove(...args);
   }) as typeof remove);
-  const ack = mail.ackMessageAtPath(target);
+  const ack = mail.ackMessageAtPath(target, mail.getInbox(agent).root);
   expect(ack.read).toBe(true);
   expect(ack.ackedAt).toBeDefined();
   expect(fs.existsSync(target)).toBe(false);
@@ -199,7 +201,7 @@ test("distinct records ack across processes without sweeping a live scratch", as
   const worker = join(root, "distinct-worker.ts");
   fs.writeFileSync(worker, `
     import * as fs from "node:fs";
-    import { join } from "node:path";
+    import { dirname, join } from "node:path";
     import { spyOn } from "bun:test";
     ${WORKER_OWNER_WATCH_SCRIPT}
     const [role, root, cur, source, count] = process.argv.slice(2);
@@ -229,7 +231,7 @@ test("distinct records ack across processes without sweeping a live scratch", as
     signal(role + "-ready");
     for (; iteration < Number(count); iteration++) {
       wait(role + "-go-" + iteration);
-      results.push(mail.ackMessageAtPath(join(cur, role + "-" + iteration + ".json")));
+      results.push(mail.ackMessageAtPath(join(cur, role + "-" + iteration + ".json"), dirname(cur)));
       signal(role + "-done-" + iteration);
     }
     fs.writeFileSync(join(root, role + "-results.json"), JSON.stringify({results, warnings}));
@@ -274,7 +276,7 @@ test("concurrent acks of one record produce one ack and no leftover scratch", as
   const worker = join(root, "ack-worker.ts");
   fs.writeFileSync(worker, `
     import * as fs from "node:fs";
-    import { join } from "node:path";
+    import { dirname, join } from "node:path";
     ${WORKER_OWNER_WATCH_SCRIPT}
     const [role, root, target, source] = process.argv.slice(2);
     process.env.TPS_MAIL_DIR = root;
@@ -284,7 +286,7 @@ test("concurrent acks of one record produce one ack and no leftover scratch", as
     signal(role + "-ready");
     wait("go");
     try {
-      mail.ackMessageAtPath(target);
+      mail.ackMessageAtPath(target, dirname(dirname(target)));
       signal(role + "-acked");
     } catch (err) {
       signal(role + (String(err?.message).includes("mail record gone") ? "-gone" : "-error"));

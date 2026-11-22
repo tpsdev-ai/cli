@@ -26,7 +26,17 @@ let curReadsUntilFailure = 1;
 mock.module("node:fs", () => ({
   ...realFs,
   readFileSync: (...args: any[]) => {
-    if (args[0] === curReadFailure && ++curReads >= curReadsUntilFailure) {
+    // A record update reads through an open descriptor, so map an fd read
+    // back to the tracked path it belongs to by file identity.
+    let curTarget = args[0];
+    if (typeof curTarget === "number" && curReadFailure !== undefined) {
+      try {
+        const opened = realFs.fstatSync(curTarget);
+        const entry = realFs.lstatSync(curReadFailure);
+        if (opened.dev === entry.dev && opened.ino === entry.ino) curTarget = curReadFailure;
+      } catch {}
+    }
+    if (curTarget === curReadFailure && ++curReads >= curReadsUntilFailure) {
       throw Object.assign(new Error("injected cur read failure"), { code: "EACCES" });
     }
     if (args[0] === obligationReadFailure && ++obligationReads <= failObligationReads) {

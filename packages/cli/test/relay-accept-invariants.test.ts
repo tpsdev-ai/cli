@@ -56,7 +56,7 @@ test("receipt write failure removes the new record before retry, ACK, and resend
   expect(fs.existsSync(marker)).toBe(false);
   expect(deliverRelayedToLocal("remote", item)).toBe(true);
   const [file] = records();
-  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  ackMessageAtPath(join(getInbox("local").fresh, file!), getInbox("local").root);
   expect(deliverRelayedToLocal("remote", item)).toBe(false);
   expect(records()).toEqual([]);
   expect(fs.statSync(marker).mode & 0o777).toBe(0o600);
@@ -147,7 +147,7 @@ test("a flat per-branch marker with a live record remains an in-flight duplicate
   expect(deliverRelayedToLocal("remote", item)).toBe(false);
   expect(records()).toHaveLength(1);
   expect(fs.existsSync(relayAcceptanceReceiptPath("remote", item.id))).toBe(true);
-  ackMessageAtPath(original.filePath);
+  ackMessageAtPath(original.filePath, getInbox(item.to).root);
   expect(deliverRelayedToLocal("remote", item)).toBe(false);
   expect(records()).toEqual([]);
 });
@@ -156,7 +156,7 @@ test("a receipt in an ended day bucket younger than the TTL survives prune and s
   const item = body();
   expect(deliverRelayedToLocal("remote", item)).toBe(true);
   const [file] = records();
-  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  ackMessageAtPath(join(getInbox("local").fresh, file!), getInbox("local").root);
   const marker = relayAcceptanceReceiptPath("remote", item.id);
   const accepted = dirname(dirname(marker));
   const ended = join(accepted, new Date(Date.now() - 3 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
@@ -171,7 +171,7 @@ test("a receipt that vanishes between listing and stat is treated as absent", ()
   const item = body();
   expect(deliverRelayedToLocal("remote", item)).toBe(true);
   const [file] = records();
-  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  ackMessageAtPath(join(getInbox("local").fresh, file!), getInbox("local").root);
   const marker = relayAcceptanceReceiptPath("remote", item.id);
   const stat = fs.statSync;
   const fault = spyOn(fs, "statSync").mockImplementation(((path: fs.PathLike, options?: unknown) => {
