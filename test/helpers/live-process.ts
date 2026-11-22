@@ -101,7 +101,7 @@ export function spawnSigtermRecorder(markerPath: string): ChildProcess {
   });
 }
 
-/** Wait for a child's ready line, rejecting (or resolving false) at the deadline. */
+/** Wait for a child's ready line; resolves false at the deadline. */
 export async function waitForReadyLine(child: ChildProcess, timeoutMs = 10_000): Promise<boolean> {
   const stdout = child.stdout;
   if (stdout === null) return false;

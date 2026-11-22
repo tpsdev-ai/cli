@@ -317,9 +317,9 @@ export function claimHostStateAt(path: string, state: HostConnectionState, conne
 
 /** "same" for the same PID and the same start token when one is present;
  *  "other" for a different PID or a different `proc:` token (pid reuse);
- *  "unverifiable" when the record carries a token this process cannot read or
- *  cannot compare with its own (a differing `ps:` token, or tokens from
- *  different sources). */
+ *  "unverifiable" when this process's start token cannot be read or compared
+ *  with the recorded token (a differing `ps:` token, or tokens from different
+ *  sources). */
 function selfIdentity(state: HostConnectionState, readStartToken: (pid: number) => string | null = processStartToken): "same" | "other" | "unverifiable" {
   if (state.pid !== process.pid) return "other";
   if (state.startToken === undefined || state.startToken === null) return "same";
