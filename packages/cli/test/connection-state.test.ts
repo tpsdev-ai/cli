@@ -549,6 +549,47 @@ describe("connection-state", () => {
     expect(readFileSync(path)).toEqual(raw);
   });
 
+  test.each([
+    ["refresh with matching connection id", "refresh", "agent-a"],
+    ["removal with matching connection id", "remove", "agent-a"],
+    ["removal with no connection id", "remove", undefined],
+  ] as const)("%s leaves a live foreign pid untouched before reading a start token", async (_label, operation, connectionId) => {
+    home = mkdtempSync(join(tmpdir(), "conn-state-foreign-pid-"));
+    process.env.HOME = home;
+    const child = Bun.spawn([process.execPath, "-e", "process.stdin.resume(); process.stdin.on('end', () => process.exit(0));"], {
+      stdin: "pipe",
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+    try {
+      expect(child.pid).not.toBe(process.pid);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+      const path = hostStatePath("host-a");
+      const state = { ...completeState(), branch: "host-a", connectionId: "agent-a", pid: child.pid, startToken: "proc:4242" };
+      writeHostState(state);
+      const raw = readFileSync(path);
+      const startToken = mock(() => "proc:4243");
+      if (operation === "refresh") {
+        expect(refreshOwnedHostStateAt(
+          path,
+          { ...state, pid: process.pid, lastHeartbeatAck: "moved" },
+          "agent-a",
+          undefined,
+          0,
+          { startToken },
+        )).toEqual({ kind: "other" });
+      } else {
+        clearHostStateAt(path, "host-a", connectionId, { startToken });
+      }
+      expect(startToken).not.toHaveBeenCalled();
+      expect(readFileSync(path)).toEqual(raw);
+      expect(() => process.kill(child.pid, 0)).not.toThrow();
+    } finally {
+      child.stdin.end();
+      await child.exited;
+    }
+  });
+
   test("refreshOwnedHostStateAt reports unverifiable and leaves the record when this process's token cannot be read", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-owned-unverifiable-"));
     process.env.HOME = home;
