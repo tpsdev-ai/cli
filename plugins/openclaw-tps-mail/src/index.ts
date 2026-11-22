@@ -845,14 +845,17 @@ const armedDeadlines = new Map<string, ArmedDeadline>();
  *                saw when it started).
  *   exhausted  — the cap was reached (lastVerifiedState, or undefined when no
  *                read was ever verified). Nothing is armed or written, and a
- *                settlement from a retry path is refused. Only a VERIFIED live
- *                record state different from lastVerifiedState — never an
- *                unknown baseline — reopens a fresh budget.
+ *                settlement from a retry path is refused. A VERIFIED live record
+ *                state different from lastVerifiedState — never an unknown
+ *                baseline — reopens a fresh budget; a check that finds the
+ *                record gone or terminal deletes the entry.
  *
- * Transitions go only through scheduleObligationRetry (absent/scheduled →
+ * Transitions go through scheduleObligationRetry (absent/scheduled →
  * scheduled), the timer's begin transition (scheduled → running),
  * complete/finishObligationRetry (running → scheduled, exhausted or absent),
- * and clearObligationRetry (any → absent).
+ * clearObligationRetry (any → absent), the direct deletes in
+ * retryObligationRead and exhaustObligationRetry (a later or cap read that finds
+ * the record gone or terminal), and releaseObligationState/releaseAccountState.
  */
 type ObligationRetryEntry =
   | {
@@ -864,6 +867,9 @@ type ObligationRetryEntry =
       /** Epoch ms this attempt is due. A repeated event never moves it. */
       dueAt: number;
       lastVerifiedState?: ObligationState;
+      /** The failure that scheduled this attempt; an exhaustion reached from a
+       *  completion names it instead of a generic re-check reason. */
+      lastError?: string;
       timer: ReturnType<typeof setTimeout>;
     }
   | {
@@ -872,6 +878,8 @@ type ObligationRetryEntry =
       incarnation: symbol;
       attempt: number;
       lastVerifiedState?: ObligationState;
+      /** The failure that led to this attempt (or the one it threw). */
+      lastError?: string;
       /** An event or arm failure asked for a re-check while this check ran. */
       recheckWanted: boolean;
     }
@@ -1188,6 +1196,14 @@ function retryObligationRead(ctx: YieldContext, obligationId: string, error = "o
   scheduleObligationRetry(ctx, obligationId, 0, error);
 }
 
+/** Remember the state a VERIFIED read saw, so the cap and the reopen rule keep
+ *  a real baseline. The retry check, the fired deadline and the arm record what
+ *  their live read saw — not only the retry check. */
+function recordVerifiedRetryState(obligationId: string, state: ObligationState): void {
+  const entry = obligationRetries.get(obligationId);
+  if (entry && entry.kind === "running") entry.lastVerifiedState = state;
+}
+
 function scheduleObligationRetry(
   ctx: YieldContext,
   obligationId: string,
@@ -1221,6 +1237,7 @@ function scheduleObligationRetry(
       incarnation: current.incarnation,
       attempt: current.attempt,
       lastVerifiedState: current.lastVerifiedState,
+      lastError: current.lastError,
       recheckWanted: false,
     });
     void runObligationRetry(ctx, obligationId, attempt + 1)
@@ -1242,8 +1259,10 @@ function scheduleObligationRetry(
     incarnation: ctx.incarnation,
     attempt: attempt + 1,
     dueAt,
-    // Carry the last verified state across the next attempt.
+    // Carry the last verified state and the failure that started this budget
+    // across the next attempt.
     lastVerifiedState,
+    lastError: error,
     timer,
   });
 }
@@ -1292,8 +1311,9 @@ function completeObligationRetry(ctx: YieldContext, obligationId: string): void 
   const attempt = entry.attempt;
   const recheck = entry.recheckWanted;
   const state = entry.lastVerifiedState;
+  const error = entry.lastError ?? "re-check requested while the attempt ran";
   obligationRetries.delete(obligationId);
-  if (recheck) scheduleObligationRetry(ctx, obligationId, attempt, "re-check requested while the attempt ran", state);
+  if (recheck) scheduleObligationRetry(ctx, obligationId, attempt, error, state);
 }
 
 /** End a running check's ownership and hand the budget to its next attempt. */
@@ -1313,12 +1333,21 @@ async function runObligationRetry(ctx: YieldContext, obligationId: string, attem
   if (!entry || entry.kind !== "running") return;
   const fault = obligationRetryFaultForTests?.(ctx.inboundId, attempt);
   if (fault !== undefined) throw new Error(fault);
-  const result = readObligationForCleanup(ctx, obligationId);
-  // readObligationForCleanup routed an unverified record through the retry
-  // state (a re-check request on this running entry); missing and terminal
-  // records have been released.
-  if (result.status === "unverified") return;
-  if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return clearObligationRetry(obligationId);
+  const result = readObligationResult(ctx.mailDir, ctx.agent, ctx.inboundId);
+  if (result.status === "unverified") {
+    // The same routing readObligationForCleanup applies: an unverified record
+    // is not a verdict, so this running entry records a re-check and leaves the
+    // next decision to it.
+    retryObligationRead(ctx, obligationId, `obligation record unreadable (${result.code})`);
+    ctx.log?.warn?.(`tps-mail: obligation-read-unverified: ${ctx.inboundId} path=${result.path} code=${result.code}`);
+    return;
+  }
+  // cli#1059 round 6: a record that is GONE or TERMINAL cancels the budget at
+  // THIS attempt — this check must not wait for the cap to clean it up.
+  if (result.status === "missing" || TERMINAL_STATES.has(result.record.state)) {
+    releaseObligationState(obligationId);
+    return;
+  }
   const rec = result.record;
   // A check that completes decides from the entry's CURRENT state, never from
   // what it saw when it started. Remember the last state a verified read saw:
@@ -1344,13 +1373,24 @@ async function runObligationRetry(ctx: YieldContext, obligationId: string, attem
     finishObligationRetry(ctx, obligationId, attempt, armed.outcome === "error" ? armed.error : `deadline re-arm refused (${armed.reason})`);
     return;
   }
-  const outcome = await settleObligationAtDeadline(ctx, obligationId, { owner: true });
-  // The check owns the entry until it completes; if the entry is no longer
-  // running (released, or another owner finished it), it decides nothing more.
+  const outcome = await settleObligationAtDeadline(ctx, obligationId, {
+    owner: true,
+    owns: () => obligationRetries.get(obligationId) === current,
+  });
+  // The check owns the entry until it completes; if the entry is no longer this
+  // running entry (released, exhausted or replaced during an await), it decides
+  // nothing more.
   const after = obligationRetries.get(obligationId);
-  if (!after || after.kind !== "running") return;
+  if (!after || after !== current) return;
   if (outcome.status === "error") {
     finishObligationRetry(ctx, obligationId, attempt, outcome.error);
+    return;
+  }
+  if (outcome.status === "none") {
+    // Nothing was settled (e.g. the inbound gate refused). A re-check asked for
+    // while the decision ran is still a request: hand the entry to the
+    // completion rule instead of dropping it with the entry.
+    completeObligationRetry(ctx, obligationId);
     return;
   }
   // Only an `error` schedules another attempt here. A settlement that already
@@ -1949,10 +1989,11 @@ function armDeadlineNow(
   }
 }
 
-/** The ONE entry point every non-owning caller uses. A scheduled, running or
+/** The ONE entry point every NON-OWNING caller uses. A scheduled, running or
  *  exhausted retry entry owns the next decision, so this neither arms a timer
- *  nor writes the record; only an absent entry arms. An exhausted entry reopens
- *  only through the state machine's verified live-state move. */
+ *  nor writes the record; only an absent entry arms here. The running owner
+ *  (armDeadlineNow) arms directly. An exhausted entry reopens only through the
+ *  state machine's verified live-state move. */
 function armDeadline(
   ctx: YieldContext,
   obligationId: string,
@@ -1988,6 +2029,9 @@ function armDeadlineOnce(
     if (result.status === "missing") return { outcome: "refused", reason: "gone" };
     if (TERMINAL_STATES.has(result.record.state)) return { outcome: "refused", reason: "terminal" };
     const rec = result.record;
+    // An owner's verified read is a baseline for the reopen rule (cli#1059
+    // round 6), like the retry check's and the deadline path's.
+    recordVerifiedRetryState(obligationId, rec.state);
     // cli#1059 round 2: the CURRENT record owns the deadline. A stored argument
     // may predate a same-state extension that landed before this read, and
     // arming with it would overwrite the extension.
@@ -2020,8 +2064,10 @@ function usableDeadline(value: string | null | undefined): string | null {
   return typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null;
 }
 
-/** Schedule the next bounded attempt after an arm that did not land. A gone or
- *  terminal record has nothing to arm; an inactive incarnation is shutting down. */
+/** Schedule the next bounded attempt after an arm that did not land. Only a
+ *  RETRYABLE refusal schedules a re-check: a gone or terminal record has nothing
+ *  to arm, an inactive incarnation is shutting down, and `scheduled` means the
+ *  retry state already owns the next decision — none of them may start one. */
 function retryAfterArmFailure(ctx: YieldContext, obligationId: string, arm: ArmDeadlineOutcome): void {
   if (arm.outcome === "armed") return;
   if (arm.outcome === "refused" && (arm.reason === "gone" || arm.reason === "terminal" || arm.reason === "inactive" || arm.reason === "scheduled")) return;
@@ -2030,8 +2076,9 @@ function retryAfterArmFailure(ctx: YieldContext, obligationId: string, arm: ArmD
 
 /** A yield event asks for an arm. `armDeadline` consults the retry state
  *  machine: while an attempt is pending or running its ownership stands, and an
- *  exhausted budget stays exhausted until a verified live state move or
- *  shutdown. Neither case arms or writes from the event. */
+ *  exhausted budget stays exhausted until shutdown, a later check that finds the
+ *  record gone or terminal, or a verified live state move. Neither case arms or
+ *  writes from the event. */
 function armObligationFromEvent(ctx: YieldContext, obligationId: string): void {
   if (!isLiveContext(ctx)) return;
   retryAfterArmFailure(ctx, obligationId, armDeadline(ctx, obligationId));
@@ -2039,18 +2086,39 @@ function armObligationFromEvent(ctx: YieldContext, obligationId: string): void {
 
 async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void> {
   if (!isLiveContext(ctx)) return;
-  // The deadline timer is not the retry owner: while a retry entry exists, the
-  // state machine owns the next decision, so this only records an event.
+  // cli#1059 round 6: the fired deadline claims the same per-obligation entry as
+  // every other retry decision. It takes ownership before its first await, so an
+  // event, arm failure or replay in its window records a re-check instead of
+  // deciding; the deadline cannot decide alongside a retry check.
   if (obligationRetries.has(obligationId)) {
     retryObligationRead(ctx, obligationId);
     return;
   }
+  const entry: ObligationRetryEntry = {
+    kind: "running",
+    accountId: ctx.accountId,
+    incarnation: ctx.incarnation,
+    attempt: 0,
+    recheckWanted: false,
+  };
+  obligationRetries.set(obligationId, entry);
+  const owns = () => obligationRetries.get(obligationId) === entry;
   try {
-    const outcome = await settleObligationAtDeadline(ctx, obligationId);
-    if (outcome.status === "error") retryObligationRead(ctx, obligationId, outcome.error);
+    const outcome = await settleObligationAtDeadline(ctx, obligationId, { owner: true, owns });
+    // A check that no longer owns its entry (released, exhausted or replaced
+    // during an await) writes nothing further.
+    if (!owns()) return;
+    if (outcome.status === "error") {
+      finishObligationRetry(ctx, obligationId, 0, outcome.error);
+      return;
+    }
+    completeObligationRetry(ctx, obligationId);
   } catch (err: any) {
-    if (!isLiveContext(ctx)) return;
-    retryObligationRead(ctx, obligationId, `deadline check threw: ${err?.message ?? err}`);
+    if (!isLiveContext(ctx) || !owns()) return;
+    ctx.log?.warn?.(
+      `tps-mail: obligation-retry-failed: obligation ${obligationId} for inbound ${ctx.inboundId}: ${err?.message ?? err}`,
+    );
+    finishObligationRetry(ctx, obligationId, 0, `deadline check threw: ${err?.message ?? err}`);
   }
 }
 
@@ -2078,8 +2146,10 @@ type DeadlineOutcome =
 async function settleObligationAtDeadline(
   ctx: YieldContext,
   obligationId: string,
-  opts: { owner?: boolean } = {},
+  opts: { owner?: boolean; owns?: () => boolean } = {},
 ): Promise<DeadlineOutcome> {
+  const owned = () => opts.owns === undefined || opts.owns();
+
   // At most two passes: a record that moves between the evidence and the
   // settlement gets both redone once; further churn is left to a bounded
   // retry rather than a loop.
@@ -2093,6 +2163,9 @@ async function settleObligationAtDeadline(
     }
     if (result.status !== "found" || TERMINAL_STATES.has(result.record.state)) return { status: "gone-or-terminal" };
     const rec = result.record;
+    // The deadline path's verified read is a baseline too (cli#1059 round 6):
+    // the reopen rule must see what this decision saw.
+    recordVerifiedRetryState(obligationId, rec.state);
     const parsedDeadline = rec.deadlineAt === null ? NaN : Date.parse(rec.deadlineAt);
     if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
       // The deadline moved forward after this check began (cli#1059 round 2):
@@ -2116,9 +2189,12 @@ async function settleObligationAtDeadline(
     }
     const decision = { revision: rec.revision ?? 0, deadlineAt: rec.deadlineAt, replyId: rec.replyId };
     const receipt = await scanObligationReceipt(ctx, obligationId, rec, rec.replyId);
-    if (!isLiveContext(ctx)) return { status: "none" };
+    if (!isLiveContext(ctx) || !owned()) return { status: "none" };
     const cur = lookupObligationCur(ctx, obligationId);
     if (cur.status === "error") return { status: "error", error: `cur/ lookup failed (${cur.code})` };
+    // The ownership decision was made before the scan; re-check it before the
+    // settlement is allowed to write.
+    if (!owned()) return { status: "none" };
     // cli#389 round 8: the deadline's own evidence check runs through the ONE verb.
     // The scan's ATTRIBUTED quarantine (the drain quarantined THIS reply's own
     // record once it had stayed malformed for at least the partial-write grace, or was
@@ -2142,6 +2218,7 @@ async function settleObligationAtDeadline(
       missingCur: cur.status === "missing",
       decision,
     });
+    if (!owned()) return { status: "none" };
     if (applied === "stale") continue; // redo the evidence and the deadline decision
     if (applied === "acked" || applied === "unconfirmed" || applied === "failed") return { status: "settled" };
     if (applied === "retry-scheduled") return { status: "retry-scheduled" };

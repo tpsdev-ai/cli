@@ -103,6 +103,19 @@ export type ObligationState =
  */
 export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "unconfirmed", "failed"]);
 
+/** Every recognized state. A record whose `state` is not one of these is a
+ *  malformed shape: both readers report it unverified (never written), and the
+ *  listing reports it unreadable (never swept). */
+const ALL_STATES: ReadonlySet<string> = new Set([
+  "pending",
+  "yielded",
+  "delivering",
+  "posted",
+  "acked",
+  "unconfirmed",
+  "failed",
+]);
+
 export interface ObligationRecord {
   obligationId: string;
   /** The mail file id this obligation is keyed on (the plugin's MessageSid).
@@ -207,9 +220,10 @@ export function readObligation(mailDir: string, agent: string, inboundId: string
   const p = obligationPath(mailDir, agent, inboundId);
   try {
     const record = JSON.parse(readFileSync(p, "utf-8")) as ObligationRecord;
-    // An invalid revision is not a record a decision may be based on: treat it
-    // exactly like an unreadable one, so no caller writes over it.
-    if (!record || typeof record.state !== "string" || !isValidObligationRevision(record.revision)) return null;
+    // An invalid revision or an unknown state is not a record a decision may be
+    // based on: treat it exactly like an unreadable one, so no caller writes
+    // over it.
+    if (!record || typeof record.state !== "string" || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) return null;
     return record;
   } catch {
     return null;
@@ -223,7 +237,7 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   const path = obligationPath(mailDir, agent, inboundId);
   try {
     const record = JSON.parse(readFileSync(path, "utf-8")) as ObligationRecord;
-    if (!record || typeof record.state !== "string") {
+    if (!record || typeof record.state !== "string" || !ALL_STATES.has(record.state)) {
       return { status: "unverified", path, code: "INVALID_RECORD" };
     }
     if (!isValidObligationRevision(record.revision)) {
@@ -405,17 +419,23 @@ export function transitionObligation(
       );
       return null;
     }
-    // cli#1059 round 5: a transition that leaves every field as it found it is
-    // not a decision, so it writes nothing. A re-arm of the state and deadline a
-    // record already carries used to bump `revision` and `lastTransitionAt` —
-    // while the record's own check could be running. Return the record as it
-    // stands; the caller schedules its timer from it. (Terminal records are
-    // refused above, so no terminal record reaches this point.)
+    // cli#1059 round 5: a transition that leaves every PATCHED field as it found
+    // it — same presence and same value — is not a decision, so it writes
+    // nothing. Presence counts: setting a field to null where it is absent, or
+    // replacing a null with an absent field, is a write (an undefined patch value
+    // means absent). A re-arm that adds `missingCurReason` therefore writes
+    // (cli#1006). A re-arm of the state and deadline a record already carries
+    // used to bump `revision` and `lastTransitionAt` — while the record's own
+    // check could be running. Return the record as it stands; the caller
+    // schedules its timer from it. (Terminal records are refused above, so no
+    // terminal record reaches this point.)
     if (next === current.state) {
       const fields = current as unknown as Record<string, unknown>;
-      const changed = Object.entries(patch).some(
-        ([key, value]) => (fields[key] ?? null) !== ((value as unknown) ?? null),
-      );
+      const changed = Object.entries(patch).some(([key, value]) => {
+        const had = Object.hasOwn(fields, key) && fields[key] !== undefined;
+        const wants = value !== undefined;
+        return had !== wants || (had && fields[key] !== value);
+      });
       if (!changed) return current;
     }
     const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
@@ -562,18 +582,6 @@ export interface RetentionResult {
   orphanReceiptsSkipped: number;
   disabled: boolean;
 }
-
-/** Every recognized state — a record whose `state` is not one of these is a
- *  malformed shape (reported as unreadable, never swept). */
-const ALL_STATES: ReadonlySet<string> = new Set([
-  "pending",
-  "yielded",
-  "delivering",
-  "posted",
-  "acked",
-  "unconfirmed",
-  "failed",
-]);
 
 /** True when the agent's cur/ record for this inbound is still UNRESOLVED
  *  (present without ackedAt/nackedAt). Startup recovery may re-dispatch it, so
