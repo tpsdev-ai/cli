@@ -698,7 +698,7 @@ export interface ReleasedAgent {
 
 /** "same": the pid is alive and carries the recorded start token. "gone": the
  * pid names no process, or only an exited (zombie) one. "different": the pid is
- * alive under a different `proc:` start token (pid reuse). "unknown": the
+ * alive under a different `proc:` start token (treated as pid reuse). "unknown": the
  * identity cannot be read, or the recorded and live tokens cannot be compared
  * (a differing `ps:` token, or tokens from different sources). */
 export type ProcessIdentity = "same" | "gone" | "different" | "unknown";

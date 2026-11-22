@@ -155,7 +155,8 @@ export interface LockOwner {
 
 export type OwnerState = "alive" | "dead" | "unverifiable";
 
-/** A `proc:` token that carries a value; only these two together prove reuse. */
+/** A `proc:` token that carries a value. Two differing tokens of this form are classified as reuse ("dead");
+ *  the value is not otherwise validated, so a malformed recorded value also compares as a difference. */
 const PROC_TOKEN = /^proc:.+$/;
 
 export type OwnerTokenState = "alive" | "dead" | "unverifiable";

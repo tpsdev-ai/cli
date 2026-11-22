@@ -350,7 +350,7 @@ describe("host state record lock", () => {
   test(
     "clearHostState leaves a record with a mismatched start token",
     () => {
-      // A differing token from the SAME source as the live one. A differing proc: pair proves another
+      // A differing token from the SAME source as the live one. A differing proc: pair is classified as another
       // process, so the record is kept silently; a differing ps: pair cannot be compared, so clear
       // refuses with the named error and keeps the record byte for byte.
       const token = childToken(process.pid);

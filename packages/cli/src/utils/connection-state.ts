@@ -298,7 +298,7 @@ export function refreshOwnedHostStateAt(path: string, state: HostConnectionState
  * record lock, while the optional `shouldWrite` gate holds, read the record and
  * attempt the write when it is absent, is verified as owned by this connection,
  * or belongs to a connection whose recorded process is not running or carries
- * a different `proc:` token (pid reuse). `ps:` mismatches are unverifiable: a
+ * a different `proc:` token (treated as pid reuse). `ps:` mismatches are unverifiable: a
  * record written before cli#1045 may hold local-time text. Filesystem failure can throw.
  * An invalid, unreadable or unverifiable record is left as it is.
  * The absent case differs from a refresh: a reconnect may re-establish a record
@@ -316,7 +316,7 @@ export function claimHostStateAt(path: string, state: HostConnectionState, conne
 }
 
 /** "same" for the same PID and the same start token when one is present;
- *  "other" for a different PID or a different `proc:` token (pid reuse);
+ *  "other" for a different PID or a different `proc:` token (treated as pid reuse);
  *  "unverifiable" when this process's start token cannot be read or compared
  *  with the recorded token (a differing `ps:` token, or tokens from different
  *  sources). */
@@ -415,7 +415,7 @@ type OwnerLiveness = "alive" | "gone" | "unknown";
 /**
  * Whether the process that wrote a record is still the one running under its
  * pid: classifyOwnerToken's verdict for a live pid. "gone": the pid is gone,
- * or a live pid carries a different `proc:` token (pid reuse). A live `ps:`
+ * or a live pid carries a different `proc:` token (treated as pid reuse). A live `ps:`
  * mismatch, tokens from different sources, or a token that cannot be read are
  * unknown; unknown never licenses a write.
  */
@@ -446,7 +446,7 @@ type HostRecordClaim =
 /**
  * Ownership for a reconnect claim: the rule in `hostRecordOwnership`, plus a
  * record owned by another connection is claimable when its recorded process is
- * not running or carries a different `proc:` token (pid reuse). `ps:` mismatches
+ * not running or carries a different `proc:` token (treated as pid reuse). `ps:` mismatches
  * are unverifiable because a record written before cli#1045 may hold local-time text.
  * The read and the liveness check run under the caller's record
  * lock, so the evidence and the write share one hold. Cross-environment
