@@ -866,7 +866,21 @@ test("a relay reconnect claims a host record on a simulated proc: token mismatch
   // Simulate kernel-token PID reuse on platforms whose real reader uses ps:.
   const connections = await twoRelayConnections(root);
   try {
-    const aId = await connections.start({ startToken: () => "proc:simulated-reuse" });
+    // Before A owns the record, its reader simulates PID reuse against B's proc: token. Once A
+    // has claimed it, A's own writer stamps the real start token (ps: on macOS), so the reader
+    // returns that recorded token and teardown can verify and clear A's own record.
+    let aId = "";
+    aId = await connections.start({
+      startToken: () => {
+        let rec: { connectionId?: string; startToken?: unknown } | null = null;
+        try {
+          rec = JSON.parse(readFileSync(connections.path, "utf8"));
+        } catch {
+          // No record yet: nothing of A's to agree with.
+        }
+        return aId !== "" && rec?.connectionId === aId ? String(rec.startToken) : "proc:simulated-reuse";
+      },
+    });
     const bId = await connections.start();
     expect(bId).not.toBe(aId);
     const bRecord = { ...connections.record(), startToken: "proc:recorded-owner" };
