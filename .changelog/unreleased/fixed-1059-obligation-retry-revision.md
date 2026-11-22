@@ -1,4 +1,4 @@
-- **The deadline check's own failures are retried in-process, and same-state decision writes no longer overwrite each other (#1059).**
+- **A deadline check's cur/ lookup, retryable re-arm and record-read failures are retried in-process, and same-state decision writes no longer overwrite each other (#1059).**
   A deadline whose cur/ lookup errors, a retryable re-arm failure while the
   record is still live and no deadline timer is already armed, and a retry
   whose record read fails recheck at 1 s, 4 s and 16 s on one shared schedule

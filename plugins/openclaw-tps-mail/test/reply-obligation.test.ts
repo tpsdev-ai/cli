@@ -3786,7 +3786,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
-  it("1059 r2 a retry whose store write throws is logged once and not retried again", async () => {
+  it("1059 r2 a retry whose failure write throws is logged once and not retried again", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r2-write-failed";
     const { obligationId } = seedVerifiedCur(inboundId, "yielded", 300);
@@ -5082,7 +5082,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
-  it("1059 r8 a deadline whose store write throws does not retry after an event", async () => {
+  it("1059 r8 a deadline whose failure write throws does not retry after an event", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r8-deadline-write-failed";
     const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
@@ -5120,6 +5120,67 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
     } finally {
       setBeforeSettleReadForTests(undefined);
+      setBeforeTransitionForTests(undefined);
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r9 a deadline whose ack write throws does not retry it", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r9-deadline-ack-write-failed";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 3000);
+    const envelopeId = obligationFile(AGENT, inboundId)?.inboundEnvelopeId as string;
+    const replyId = "reply-r9-ack-write-failed";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const prevDelays = setObligationRetryDelaysForTests([80]);
+    const warnings: string[] = [];
+    let writeThrows = false;
+    let ackThrows = 0;
+    setBeforeTransitionForTests((id) => {
+      if (id !== inboundId || !writeThrows) return;
+      ackThrows++;
+      throw new Error("injected ack write throw");
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "startup armed the deadline",
+      ).toBe(true);
+      // The receipt is written after the arm, so only the fired deadline's scan
+      // finds it, and its ack transition is the write that throws.
+      writeReceipt(tempMailDir, AGENT, {
+        replyId,
+        obligationId,
+        replyToId: envelopeId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signEnvelope(
+          { v: 1, from: AGENT, to: SENDER, body: "acked reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+          { [AGENT]: ANVIL_SEED },
+        )),
+      });
+      writeThrows = true;
+      expect(await pollUntil(() => ackThrows > 0, 15000), "the deadline's ack write threw").toBe(true);
+      await sleep(500);
+      expect(ackThrows, "the ack write is attempted once").toBe(1);
+      expect(
+        obligationStateForTests().retries.some((r) => r.obligationId === obligationId),
+        "a thrown ack write ends the budget",
+      ).toBe(false);
+      expect(
+        warnings.filter((line) => line.includes("obligation-write-failed") && line.includes("could not record the ack")),
+        "logged once by name",
+      ).toHaveLength(1);
+      expect(warnings.filter((line) => line.includes("obligation-retry-failed"))).toHaveLength(0);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record keeps its state").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
       setBeforeTransitionForTests(undefined);
       setObligationRetryDelaysForTests(prevDelays);
       await h.stop();

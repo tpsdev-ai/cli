@@ -834,7 +834,8 @@ const armedDeadlines = new Map<string, ArmedDeadline>();
 /**
  * cli#1059 round 4: ONE state machine owns each obligation's bounded retry.
  *
- *   absent     — no entry: a yield event or a failed arm starts a budget.
+ *   absent     — no entry: a fired deadline claims `running`, and a retryable
+ *                arm/read/settle failure with no armed deadline starts a budget.
  *   scheduled  — one timer owns the next attempt (attempt, dueAt,
  *                lastVerifiedState). A repeated event or arm failure does not
  *                move dueAt or consume an attempt.
@@ -1272,7 +1273,7 @@ function scheduleObligationRetry(
     incarnation: ctx.incarnation,
     attempt: attempt + 1,
     dueAt,
-    // Carry the last verified state and the failure that started this budget
+    // Carry the last verified state and the failure that scheduled this attempt
     // across the next attempt.
     lastVerifiedState,
     lastError: error,
@@ -1406,11 +1407,9 @@ async function runObligationRetry(ctx: YieldContext, obligationId: string, attem
     completeObligationRetry(ctx, obligationId);
     return;
   }
-  // Only an `error` schedules another attempt here. A settlement that already
-  // routed the next decision through the retry state (`retry-scheduled`), a
-  // store write that threw (`write-failed`, which resolves on restart), and
-  // every settled, re-armed or gone/terminal outcome end this budget:
-  // scheduling again would count a second attempt.
+  // `retry-scheduled` leaves the running entry for `.then`'s completion step.
+  // `write-failed` (one attempt, resolves on restart) and every settled,
+  // re-armed or gone/terminal outcome end this budget.
   if (outcome.status !== "retry-scheduled") clearObligationRetry(obligationId);
 }
 
@@ -1461,12 +1460,13 @@ function stampTerminalCur(
 
 /**
  * Land the ack transition on the record the receipt evidence was scanned from
- * (cli#1059 round 2). `expectState`/`expectRevision` name that snapshot and
- * `expectReplyId` the reply the evidence was found for, so a same-state writer
+ * (cli#1059 round 2). `expect.from`/`expect.revision` name that snapshot and
+ * `expect.replyId` the reply the evidence was found for, so a same-state writer
  * that replaced `replyId` after the scan cannot have the OLD receipt ack the
  * NEW record. Returns `stale` when the write was refused (the caller rescans
  * the fresh record) or `retry-scheduled` when the fresh record is unverified
- * (the read helper already scheduled the next bounded attempt).
+ * (the read helper routed it through the retry state unless a deadline timer
+ * is already armed).
  */
 function ackObligation(
   ctx: YieldContext,
@@ -1539,10 +1539,12 @@ function ackObligation(
  * and is sent by the same rule as every other failure.
  *
  * Returns the state it applied; "stale" when the record the decision examined
- * moved; "retry-scheduled" when the retry state owns the next decision;
+ * moved; "retry-scheduled" when the retry state (or an already-armed deadline
+ * timer) owns the next decision;
  * "none" when the record was gone or already terminal, the context is no
  * longer live, or the internal-inbound gate refused; and "write-failed" when
- * the store write itself threw (one attempt, no retry; resolves on restart).
+ * the failure or unconfirmed write itself threw (one attempt, no retry;
+ * resolves on restart).
  */
 async function internalInbound(ctx: YieldContext): Promise<boolean> {
   if (!isLiveContext(ctx)) return false;
@@ -2041,7 +2043,8 @@ function armDeadlineOnce(
   for (let attempt = 0; attempt < 2 && !updated; attempt++) {
     const result = readObligationForCleanup(ctx, obligationId);
     if (result.status === "unverified") {
-      // The read helper already scheduled the bounded retry for this record.
+      // The read helper routed this record through the retry state (unless a
+      // deadline timer is already armed).
       return { outcome: "refused", reason: "scheduled" };
     }
     if (result.status === "missing") return { outcome: "refused", reason: "gone" };
@@ -2131,7 +2134,7 @@ async function onDeadline(ctx: YieldContext, obligationId: string): Promise<void
       completeObligationRetry(ctx, obligationId);
       return;
     }
-    // A thrown store write is one attempt with no retry, and a settled,
+    // `write-failed` is one attempt with no retry, and a settled,
     // re-armed or gone/terminal record has no next decision: none of them may
     // schedule a continuation.
     clearObligationRetry(obligationId);
@@ -2235,14 +2238,27 @@ async function settleObligationAtDeadline(
     // deadline's own nack has landed (and its outcome is on the record) before
     // this path finishes; the mail is at-least-once, and a start retries
     // delivery of anything still owed.
-    const applied = await settleObligation(ctx, obligationId, {
-      receipt: receipt.status === "found" ? "found" : "none",
-      verdict,
-      reason,
-      // A restored inbound must pass the normal gate; the marker is historical.
-      missingCur: cur.status === "missing",
-      decision,
-    });
+    let applied: Awaited<ReturnType<typeof settleObligation>>;
+    try {
+      applied = await settleObligation(ctx, obligationId, {
+        receipt: receipt.status === "found" ? "found" : "none",
+        verdict,
+        reason,
+        // A restored inbound must pass the normal gate; the marker is historical.
+        missingCur: cur.status === "missing",
+        decision,
+      });
+    } catch (err: any) {
+      // cli#1059 round 9: a receipt-found settlement's ack transition throws
+      // rather than returning `write-failed`; the deadline and retry checks
+      // treat it as `write-failed` (one attempt).
+      if (receipt.status !== "found") throw err;
+      ctx.log?.warn?.(
+        `tps-mail: obligation-write-failed: could not record the ack for ${ctx.inboundId} ` +
+          `(${err?.message ?? err}); one attempt, no retry — the obligation resolves on restart`,
+      );
+      return { status: "write-failed" };
+    }
     if (!owned()) return { status: "none" };
     if (applied === "stale") continue; // redo the evidence and the deadline decision
     if (applied === "acked" || applied === "unconfirmed" || applied === "failed") return { status: "settled" };
