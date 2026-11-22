@@ -493,7 +493,7 @@ test("an inbound refresh whose self token cannot be read keeps retrying and repo
     const skipped = diagnostic.mock.calls.filter(([line]) => String(line).includes("not refreshed"));
     expect(skipped).toHaveLength(1);
     expect(String(skipped[0][0])).toContain(
-      `[relay] host state record ${path} not refreshed: this process's start token could not be read, so ownership cannot be verified; the record keeps its last state and refreshes resume when the token reads again`,
+      `[relay] host state record ${path} not refreshed: this process's start token could not be read or compared, so ownership cannot be verified; the record keeps its last state and refreshes resume when the token can be read and compared again`,
     );
     // The token reads again: the pending retry writes without a new message,
     // and the recovery is reported once.
@@ -866,7 +866,22 @@ test("a relay reconnect claims a host record on a simulated proc: token mismatch
   // Simulate kernel-token PID reuse on platforms whose real reader uses ps:.
   const connections = await twoRelayConnections(root);
   try {
-    const aId = await connections.start({ startToken: () => "proc:simulated-reuse" });
+    // The reader returns the simulated reuse token when the record holds B's seeded
+    // proc:recorded-owner token (a proc: mismatch: PID reuse) or when no record or string token
+    // can be read. For any other record, including A's own, which the relay stamps with the real
+    // start token (ps: on macOS), it returns that recorded token, so A's own record verifies.
+    const aId = await connections.start({
+      startToken: () => {
+        let rec: { startToken?: unknown } | null = null;
+        try {
+          rec = JSON.parse(readFileSync(connections.path, "utf8"));
+        } catch {
+          // No record yet: nothing to agree with.
+        }
+        if (rec === null || rec.startToken === "proc:recorded-owner" || typeof rec.startToken !== "string") return "proc:simulated-reuse";
+        return rec.startToken;
+      },
+    });
     const bId = await connections.start();
     expect(bId).not.toBe(aId);
     const bRecord = { ...connections.record(), startToken: "proc:recorded-owner" };

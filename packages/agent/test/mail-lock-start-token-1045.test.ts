@@ -134,6 +134,22 @@ describe("processStartToken is the same whichever environment reads it", () => {
       child.kill("SIGKILL");
     }
   }, 60_000);
+
+  test("a reader in a non-UTC odd-offset zone agrees with a reader in a local zone", async () => {
+    forcePsStartTokens();
+    const { child, pid, token } = await liveChild();
+    try {
+      expect(token).toStartWith("ps:");
+      // The odd-offset reader's unpinned output is a different text, so its
+      // pinned token below can only match by the pin.
+      expect(`ps:${unpinnedLstart(pid, ODD_ZONE_ENV)}`).not.toBe(token);
+      const odd = tokenReadUnder(pid, ODD_ZONE_ENV);
+      const local = tokenReadUnder(pid, PACIFIC_ENV);
+      expect([odd, local]).toEqual([token, token]);
+    } finally {
+      child.kill("SIGKILL");
+    }
+  }, 60_000);
 });
 
 describe("classifyOwnerToken: one rule for a live pid's current and recorded tokens", () => {
@@ -161,6 +177,12 @@ describe("classifyOwnerToken: one rule for a live pid's current and recorded tok
   test("only proc: proves reuse: differing tokens of any other source are unverifiable", () => {
     expect(classifyOwnerToken("other:2", "other:1")).toBe("unverifiable");
     expect(classifyOwnerToken("2", "1")).toBe("unverifiable");
+  });
+
+  test("a bare proc label or an empty proc: value is unverifiable against a live proc: token", () => {
+    expect(classifyOwnerToken("proc:4242", "proc")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc", "proc:4242")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc:4242", "proc:")).toBe("unverifiable");
   });
 });
 

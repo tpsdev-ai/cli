@@ -44,7 +44,7 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync, stat
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { classifyOwnerToken, pidState, processStartToken } from "@tpsdev-ai/agent";
 import {
   buildNonoArgs,
   approveRuntimeNonoOptions,
@@ -697,8 +697,10 @@ export interface ReleasedAgent {
 }
 
 /** "same": the pid is alive and carries the recorded start token. "gone": the
- * pid names no process, or only an exited (zombie) one. "different": the pid is alive under a different start
- * token (pid reuse). "unknown": the identity cannot be read. */
+ * pid names no process, or only an exited (zombie) one. "different": the pid is
+ * alive under a different `proc:` start token (treated as pid reuse). "unknown": the
+ * identity cannot be read, or the recorded and live tokens cannot be compared
+ * (a differing `ps:` token, or tokens from different sources). */
 export type ProcessIdentity = "same" | "gone" | "different" | "unknown";
 
 /** True when /proc/<pid>/stat reports state Z. A zombie has exited; a
@@ -725,7 +727,8 @@ export function releasedAgentIdentity(
   if (pidIsZombie(agent.pid)) return "gone";
   const current = read(agent.pid);
   if (current === null) return "unknown";
-  return current === agent.startToken ? "same" : "different";
+  const verdict = classifyOwnerToken(current, agent.startToken);
+  return verdict === "alive" ? "same" : verdict === "dead" ? "different" : "unknown";
 }
 
 /** The two processes a signalled launch stops. The supervisor is this
