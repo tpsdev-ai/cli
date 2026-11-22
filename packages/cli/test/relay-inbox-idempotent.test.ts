@@ -203,7 +203,7 @@ describe("relay inbox writes are idempotent by branch and delivery id (cli#513)"
       expect(deliverRelayedToLocal("remote", body)).toBe(false);
       expect(newRecords()).toEqual([keyed]);
       // Record acknowledged (removed) and receipt expired: the window has closed.
-      ackMessageAtPath(join(getInbox("local").fresh, keyed));
+      ackMessageAtPath(join(getInbox("local").fresh, keyed), getInbox("local").root);
       expect(newRecords()).toEqual([]);
       expireReceipt();
       expect(deliverRelayedToLocal("remote", body)).toBe(true);

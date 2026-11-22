@@ -168,7 +168,7 @@ function expectReceiptMatchesDeliveredRecord(id: string, bodyPattern: RegExp): v
   const path = join(getInbox(RECIPIENT).fresh, file!);
   const record = JSON.parse(readFileSync(path, "utf8")) as { body: string };
   expect(record.body).toMatch(bodyPattern);
-  ackMessageAtPath(path);
+  ackMessageAtPath(path, getInbox(RECIPIENT).root);
   expectReceiptKeepsDigestOfBody(id, record.body);
 }
 
@@ -283,7 +283,7 @@ describe("relay acceptance (cli#561)", () => {
         const path = join(getInbox(RECIPIENT).fresh, file);
         try {
           acked.push((JSON.parse(readFileSync(path, "utf8")) as { body: string }).body);
-          ackMessageAtPath(path);
+          ackMessageAtPath(path, getInbox(RECIPIENT).root);
         } catch {}
       }
       await new Promise((resolve) => setImmediate(resolve));
@@ -300,7 +300,7 @@ describe("relay acceptance (cli#561)", () => {
       const id = randomUUID();
       expect(deliverRelayedToLocal(BRANCH, { id, from: FROM, to: RECIPIENT, content: id, timestamp: TIMESTAMP })).toBe(true);
       const [file] = jsonFiles(getInbox(RECIPIENT).fresh);
-      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!));
+      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!), getInbox(RECIPIENT).root);
     }
     const lockRoot = join(mail, ".relay-accept-locks");
     const countDirectories = (dir: string): number => readdirSync(dir, { withFileTypes: true }).reduce(
@@ -340,7 +340,7 @@ describe("relay acceptance (cli#561)", () => {
     const other = deliverChild("same-", [id], { RELAY_CHILD_TO: "other" });
     try {
       const [file] = jsonFiles(getInbox(RECIPIENT).fresh);
-      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!));
+      ackMessageAtPath(join(getInbox(RECIPIENT).fresh, file!), getInbox(RECIPIENT).root);
     } finally { await holder.release(); }
     const [a, b] = await Promise.all([local, other]);
     expect(a).toEqual({ delivered: 0, duplicate: 1, refused: 0 });

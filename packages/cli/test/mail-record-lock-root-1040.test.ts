@@ -3,14 +3,21 @@ import { spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 import {
+  MailRecordFileTypeError,
+  MailRecordLayoutError,
   MailRecordLockRootError,
   getInbox,
+  mailRecordFileTestHooks,
   sameDirectory,
   updateExistingRecord,
 } from "../src/utils/mail.js";
 import { acquireMailLockSync, mailLockPath } from "../src/utils/mail-lock.js";
+import { freshDistMail, requireFreshDist } from "./helpers/fresh-dist.js";
+import { createPatchShared } from "./helpers/patch-shared.js";
+
+const patchShared = createPatchShared();
 
 afterEach(() => {
   mock.restore();
@@ -57,6 +64,7 @@ const caseSensitive = caseSensitiveFs();
 if (caseSensitive) {
   console.warn("[mail] different-letter-case alias test skipped: this filesystem is case-sensitive, so the alternate spelling does not resolve");
 }
+
 
 function symlinkedLayout(subdir: "cur" | "new" | "dlq" = "cur"): { inboxA: ReturnType<typeof getInbox>; mailboxB: string; source: string; targetA: string; targetB: string } {
   const inboxA = getInbox("mailbox-a");
@@ -128,7 +136,7 @@ test("an update through a symlinked cur/ is refused and leaves the record unchan
   plantRecord(targetB, "record-id");
   const before = fs.readFileSync(targetA, "utf8");
 
-  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: mailboxB }));
 
   const realRecordDir = fs.realpathSync(source);
   const realRoot = fs.realpathSync(mailboxB);
@@ -143,27 +151,27 @@ test("an update through a symlinked cur/ is refused and leaves the record unchan
 });
 
 test("a refused alias update does not parse the target record first", () => {
-  const { targetB } = symlinkedLayout();
+  const { mailboxB, targetB } = symlinkedLayout();
   fs.writeFileSync(targetB, "{ this is not json");
 
-  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true }), { mailboxRoot: mailboxB }));
 
   expect(err.name).toBe("MailRecordLockRootError");
 });
 
 test("a refused alias whose record path is a directory still throws the lock-root error", () => {
-  const { targetB } = symlinkedLayout();
+  const { mailboxB, targetB } = symlinkedLayout();
   // Reading a directory throws EISDIR, so a raw read placed above the check
   // surfaces as EISDIR instead of the refusal.
   fs.mkdirSync(targetB, { recursive: true });
 
-  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true }), { mailboxRoot: mailboxB }));
 
   expect(err.name).toBe("MailRecordLockRootError");
 });
 
 test("a refused alias update never attempts to create an ack scratch path", () => {
-  const { source, targetB } = symlinkedLayout();
+  const { source, mailboxB, targetB } = symlinkedLayout();
   plantRecord(targetB, "record-id");
 
   const scratchAttempts: string[] = [];
@@ -181,7 +189,7 @@ test("a refused alias update never attempts to create an ack scratch path", () =
     return (realOpenSync as (...args: unknown[]) => number)(path, ...rest);
   }) as typeof fs.openSync);
 
-  refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+  refusal(() => updateExistingRecord(targetB, () => ({ read: true }), { mailboxRoot: mailboxB }));
 
   expect(scratchAttempts).toEqual([]);
   expect(fs.readdirSync(source).filter((name) => name.startsWith(".ack-"))).toEqual([]);
@@ -192,7 +200,7 @@ test("an update through a symlinked new/ is refused", () => {
   plantRecord(targetB, "record-id");
   const before = fs.readFileSync(targetA, "utf8");
 
-  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: mailboxB }));
 
   expect(fs.readFileSync(targetA, "utf8")).toBe(before);
   expect(err.recordDir).toBe(fs.realpathSync(source));
@@ -204,7 +212,7 @@ test("an update through a symlinked dlq/ is refused", () => {
   plantRecord(targetB, "record-id");
   const before = fs.readFileSync(targetA, "utf8");
 
-  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: mailboxB }));
 
   expect(fs.readFileSync(targetA, "utf8")).toBe(before);
   expect(err.recordDir).toBe(fs.realpathSync(source));
@@ -229,7 +237,7 @@ test("an alias update is refused while the owning mailbox's lock is held", () =>
       updateExistingRecord(targetB, (record: { read: boolean }) => {
         mutated = true;
         return { ...record, read: true };
-      }),
+      }, { mailboxRoot: mailboxB }),
     );
     expect(err.recordDir).toBe(fs.realpathSync(source));
     expect(err.lockRoot).toBe(fs.realpathSync(mailboxB));
@@ -242,7 +250,7 @@ test("an alias update is refused while the owning mailbox's lock is held", () =>
   }
 
   // The mailbox that physically owns the record can still update it.
-  const outcome = updateExistingRecord(targetA, (record: { read: boolean }) => ({ ...record, read: true }));
+  const outcome = updateExistingRecord(targetA, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: inboxA.root });
   expect(outcome.status).toBe("updated");
 });
 
@@ -268,7 +276,7 @@ test("the record-directory check runs while the alias mailbox's lock is held", (
     return realpath(...args);
   }) as typeof realpath);
 
-  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true })));
+  const err = refusal(() => updateExistingRecord(targetB, () => ({ read: true }), { mailboxRoot: mailboxB }));
 
   expect(err.recordDir).toBe(fs.realpathSync(source));
   expect(observed).toHaveLength(1);
@@ -286,7 +294,7 @@ test.skipIf(caseSensitive)("an alias spelled with different letter case is not r
   plantRecord(recordPath, "record-id");
   const before = fs.readFileSync(recordPath, "utf8");
 
-  const outcome = updateExistingRecord(aliasedPath, (record: { read: boolean }) => ({ ...record, read: true }));
+  const outcome = updateExistingRecord(aliasedPath, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: mailbox });
 
   expect(outcome.status).toBe("updated");
   expect(fs.readFileSync(recordPath, "utf8")).not.toBe(before);
@@ -295,13 +303,13 @@ test.skipIf(caseSensitive)("an alias spelled with different letter case is not r
 
   // A second update runs through the BUILT module under node, the plugin's
   // production runtime, whose realpathSync keeps the given letter case.
-  const distMail = join(dirname(fileURLToPath(import.meta.url)), "..", "dist", "src", "utils", "mail.js");
+  const distMail = freshDistMail(import.meta.url);
   const script = [
-    `import { updateExistingRecord } from ${JSON.stringify(pathToFileURL(distMail).href)};`,
-    `const outcome = updateExistingRecord(${JSON.stringify(aliasedPath)}, (record) => ({ ...record, read: true }));`,
+    `const { updateExistingRecord } = await import(process.argv[1]);`,
+    `const outcome = updateExistingRecord(process.argv[2], (record) => ({ ...record, read: true }), { mailboxRoot: process.argv[3] });`,
     `if (outcome.status !== "updated") { console.error("status " + outcome.status); process.exit(2); }`,
   ].join("\n");
-  const run = spawnSync("node", ["--input-type=module", "--eval", script], { encoding: "utf8", timeout: 30_000 });
+  const run = spawnSync("node", ["--input-type=module", "--eval", script, pathToFileURL(distMail).href, aliasedPath, mailbox], { encoding: "utf8", timeout: 30_000 });
   expect(run.status, `node refused the alias update: ${run.stderr}${run.stdout}`).toBe(0);
 });
 
@@ -310,8 +318,508 @@ test("a normal non-symlinked update still succeeds", () => {
   const target = join(inbox.cur, "record.json");
   plantRecord(target, "record-id");
 
-  const outcome = updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }));
+  const outcome = updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: inbox.root });
 
   expect(outcome.status).toBe("updated");
   expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
+});
+
+test("an update through a symlink to the whole mailbox succeeds", () => {
+  const inbox = getInbox("mailbox-a");
+  const mailboxLink = join(root, "mailbox-link");
+  fs.symlinkSync(inbox.root, mailboxLink, "dir");
+  const target = join(mailboxLink, "cur", "record.json");
+  plantRecord(target, "record-id");
+
+  const outcome = updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: mailboxLink });
+
+  expect(outcome.status).toBe("updated");
+  expect(JSON.parse(fs.readFileSync(join(inbox.cur, "record.json"), "utf8")).read).toBe(true);
+});
+
+test("a record directly in a mailbox root is refused and leaves the record unchanged", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.root, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(target, "utf8");
+
+  expect(() => updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: inbox.root })).toThrow(MailRecordLayoutError);
+
+  expect(fs.readFileSync(target, "utf8")).toBe(before);
+});
+
+test("a record in the root of a mailbox named cur is refused under that mailbox's lock", () => {
+  const inbox = getInbox("cur");
+  const target = join(inbox.root, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(target);
+
+  // Holding the store lock makes an update that derives its lock root from the
+  // record path report `busy` instead of the layout refusal; a `nonBlocking`
+  // caller is enough to tell those apart without waiting on a timeout.
+  const storeLock = acquireMailLockSync(root);
+  expect(storeLock).not.toBeNull();
+  try {
+    expect(() =>
+      updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), {
+        mailboxRoot: inbox.root,
+        nonBlocking: true,
+      }),
+    ).toThrow(MailRecordLayoutError);
+  } finally {
+    storeLock!.release();
+  }
+
+  expect(fs.readFileSync(target)).toEqual(before);
+});
+
+test("a record in a tmp child of the mailbox root is refused by the layout check", () => {
+  const inbox = getInbox("mailbox-a");
+  const dir = join(inbox.root, "tmp");
+  fs.mkdirSync(dir, { recursive: true });
+  const target = join(dir, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(target);
+  const mutate = mock(() => ({ read: true }));
+  const scratchOpens: string[] = [];
+  const realOpen = fs.openSync;
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path).includes(".ack-")) scratchOpens.push(String(path));
+    return (realOpen as (...args: unknown[]) => number)(path, ...rest);
+  }) as typeof fs.openSync);
+
+  expect(() => updateExistingRecord(target, mutate, { mailboxRoot: inbox.root })).toThrow(MailRecordLayoutError);
+
+  expect(mutate).not.toHaveBeenCalled();
+  expect(fs.readFileSync(target)).toEqual(before);
+  expect(scratchOpens).toEqual([]);
+  expect(fs.readdirSync(dir)).toEqual(["record.json"]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a directory at the record path is refused before opening it", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  fs.mkdirSync(target);
+  const opens: string[] = [];
+  const realOpen = fs.openSync;
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    opens.push(String(path));
+    return (realOpen as (...args: unknown[]) => number)(path, ...rest);
+  }) as typeof fs.openSync);
+  const beforeOpen = mock(() => {});
+  const restoreHook = patchShared(mailRecordFileTestHooks, "beforeOpen", beforeOpen);
+  const mutate = mock(() => ({ read: true }));
+  try {
+    expect(() => updateExistingRecord(target, mutate, { mailboxRoot: inbox.root })).toThrow(MailRecordFileTypeError);
+  } finally {
+    restoreHook();
+  }
+
+  expect(opens.filter((path) => path === target || path.includes(".ack-"))).toEqual([]);
+  expect(beforeOpen).not.toHaveBeenCalled();
+  expect(mutate).not.toHaveBeenCalled();
+  expect(fs.lstatSync(target).isDirectory()).toBe(true);
+  expect(fs.readdirSync(inbox.cur)).toEqual(["record.json"]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record replaced by a directory before open is refused and its descriptor is closed", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+  let recordFd: number | undefined;
+  const scratchOpens: string[] = [];
+  const realOpen = fs.openSync;
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path).includes(".ack-")) scratchOpens.push(String(path));
+    const fd = (realOpen as (...args: unknown[]) => number)(path, ...rest);
+    if (String(path) === target) recordFd = fd;
+    return fd;
+  }) as typeof fs.openSync);
+  const restoreHook = patchShared(mailRecordFileTestHooks, "beforeOpen", () => {
+    fs.rmSync(target);
+    fs.mkdirSync(target);
+  });
+  const mutate = mock(() => ({ read: true }));
+  try {
+    expect(() => updateExistingRecord(target, mutate, { mailboxRoot: inbox.root })).toThrow(MailRecordFileTypeError);
+  } finally {
+    restoreHook();
+  }
+
+  expect(recordFd).toBeDefined();
+  try {
+    fs.fstatSync(recordFd!);
+    throw new Error("record descriptor is still open");
+  } catch (err) {
+    expect((err as NodeJS.ErrnoException).code).toBe("EBADF");
+  }
+  expect(mutate).not.toHaveBeenCalled();
+  expect(scratchOpens).toEqual([]);
+  expect(fs.lstatSync(target).isDirectory()).toBe(true);
+  expect(fs.readdirSync(inbox.cur)).toEqual(["record.json"]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a normal record in a mailbox named cur still updates", () => {
+  const inbox = getInbox("cur");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+
+  const outcome = updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: inbox.root });
+
+  expect(outcome.status).toBe("updated");
+  expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
+});
+
+test("a record swapped for a symlink before open is refused without reading the target", () => {
+  const inbox = getInbox("mailbox-a");
+  const other = getInbox("mailbox-b");
+  const target = join(inbox.cur, "record.json");
+  const elsewhere = join(other.cur, "target.json");
+  plantRecord(target, "record-id");
+  plantRecord(elsewhere, "target-id");
+  const targetBytes = fs.readFileSync(elsewhere, "utf8");
+  const targetStat = fs.statSync(elsewhere, { bigint: true });
+
+  const reads: (string | number)[] = [];
+  const realRead = fs.readFileSync;
+  spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (typeof path === "number") {
+      const opened = fs.fstatSync(path, { bigint: true });
+      if (opened.dev === targetStat.dev && opened.ino === targetStat.ino) reads.push(path);
+    } else if (String(path) === target || String(path) === elsewhere) reads.push(String(path));
+    return (realRead as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.readFileSync);
+  const mutations: string[] = [];
+  const restoreHook = patchShared(mailRecordFileTestHooks, "beforeOpen", () => {
+    fs.rmSync(target);
+    fs.symlinkSync(elsewhere, target);
+  });
+  try {
+    expect(() =>
+      updateExistingRecord(target, (record: { read: boolean }) => {
+        mutations.push("mutated");
+        return { ...record, read: true };
+      }, { mailboxRoot: inbox.root }),
+    ).toThrow(MailRecordFileTypeError);
+  } finally {
+    restoreHook();
+  }
+
+  expect(reads).toEqual([]);
+  expect(mutations).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(elsewhere);
+  expect(fs.readFileSync(elsewhere, "utf8")).toBe(targetBytes);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record swapped for a symlink after open reads the original descriptor and refuses the update", () => {
+  const inbox = getInbox("mailbox-a");
+  const other = getInbox("mailbox-b");
+  const target = join(inbox.cur, "record.json");
+  const saved = join(inbox.cur, "original.json");
+  const elsewhere = join(other.cur, "target.json");
+  plantRecord(target, "record-id");
+  plantRecord(elsewhere, "target-id");
+  const originalBytes = fs.readFileSync(target, "utf8");
+  const targetBytes = fs.readFileSync(elsewhere, "utf8");
+  const targetStat = fs.statSync(elsewhere, { bigint: true });
+
+  let recordFd: number | undefined;
+  const descriptorBytes: unknown[] = [];
+  const pathReads: (string | number)[] = [];
+  const scratchOpens: string[] = [];
+  const realOpen = fs.openSync;
+  const realRead = fs.readFileSync;
+  // Pause in the test wrapper after the real no-follow open, before its fd
+  // reaches the updater's read. The descriptor still names the original file.
+  spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (String(path).includes(".ack-")) scratchOpens.push(String(path));
+    const fd = (realOpen as (...args: unknown[]) => number)(path, ...rest);
+    if (String(path) === target && rest[0] === (fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)) {
+      recordFd = fd;
+      fs.renameSync(target, saved);
+      fs.symlinkSync(elsewhere, target);
+    }
+    return fd;
+  }) as typeof fs.openSync);
+  spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (typeof path === "number") {
+      const opened = fs.fstatSync(path, { bigint: true });
+      if (opened.dev === targetStat.dev && opened.ino === targetStat.ino) pathReads.push(path);
+    } else if (String(path) === target || String(path) === elsewhere) pathReads.push(String(path));
+    const bytes = (realRead as (...args: unknown[]) => unknown)(path, ...rest);
+    if (typeof path === "number" && path === recordFd) descriptorBytes.push(bytes);
+    return bytes;
+  }) as typeof fs.readFileSync);
+  const records: unknown[] = [];
+
+  expect(() =>
+    updateExistingRecord(target, (record: { read: boolean }) => {
+      records.push(record);
+      return { ...record, read: true };
+    }, { mailboxRoot: inbox.root }),
+  ).toThrow(MailRecordFileTypeError);
+
+  expect(recordFd).toBeDefined();
+  expect(pathReads).toEqual([]);
+  expect(descriptorBytes).toEqual([originalBytes]);
+  expect(records).toEqual([JSON.parse(originalBytes)]);
+  expect(scratchOpens).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(elsewhere);
+  expect(realRead(saved, "utf8")).toBe(originalBytes);
+  expect(realRead(elsewhere, "utf8")).toBe(targetBytes);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record swapped for a symlink after the scratch write is refused before the rename", () => {
+  const inbox = getInbox("mailbox-a");
+  const other = getInbox("mailbox-b");
+  const target = join(inbox.cur, "record.json");
+  const elsewhere = join(other.cur, "target.json");
+  plantRecord(target, "record-id");
+  plantRecord(elsewhere, "target-id");
+  const targetBytes = fs.readFileSync(elsewhere, "utf8");
+
+  const renames: string[] = [];
+  const realRename = fs.renameSync;
+  spyOn(fs, "renameSync").mockImplementation(((from: unknown, to: unknown) => {
+    renames.push(`${String(from)} -> ${String(to)}`);
+    return (realRename as (...args: unknown[]) => unknown)(from, to);
+  }) as typeof fs.renameSync);
+  const restoreHook = patchShared(mailRecordFileTestHooks, "beforeRename", () => {
+    fs.rmSync(target);
+    fs.symlinkSync(elsewhere, target);
+  });
+  try {
+    expect(() =>
+      updateExistingRecord(target, (record: { read: boolean }) => ({ ...record, read: true }), { mailboxRoot: inbox.root }),
+    ).toThrow(MailRecordFileTypeError);
+  } finally {
+    restoreHook();
+  }
+
+  expect(renames.filter((entry) => entry.includes(".ack-") || entry.endsWith(target))).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(elsewhere);
+  expect(fs.readFileSync(elsewhere, "utf8")).toBe(targetBytes);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record replaced by a symlink during the mutation is refused before the rename", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const elsewhere = join(root, "elsewhere.json");
+  plantRecord(target, "record-id");
+  fs.writeFileSync(elsewhere, "{ keep me");
+
+  expect(() =>
+    updateExistingRecord(target, (record: { read: boolean }) => {
+      fs.rmSync(target);
+      fs.symlinkSync(elsewhere, target);
+      return { ...record, read: true };
+    }, { mailboxRoot: inbox.root }),
+  ).toThrow(MailRecordFileTypeError);
+
+  expect(fs.readFileSync(target, "utf8")).toBe("{ keep me");
+  expect(fs.readlinkSync(target)).toBe(elsewhere);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root);
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record replaced by a symlink during the mutation is refused before any scratch is opened", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const liveTarget = join(root, "live.json");
+  const danglingTarget = join(root, "absent.json");
+  fs.writeFileSync(liveTarget, JSON.stringify({ id: "elsewhere", body: "keep me" }));
+  const liveBytes = fs.readFileSync(liveTarget, "utf8");
+
+  for (const linkTarget of [liveTarget, danglingTarget]) {
+    fs.rmSync(target, { force: true });
+    plantRecord(target, "record-id");
+
+    const scratchOpens: string[] = [];
+    const realOpen = fs.openSync;
+    const openSpy = spyOn(fs, "openSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+      if (String(path).includes(".ack-")) scratchOpens.push(String(path));
+      return (realOpen as (...args: unknown[]) => number)(path, ...rest);
+    }) as typeof fs.openSync);
+    let reachedScratchWrite = false;
+    const restoreRenameHook = patchShared(mailRecordFileTestHooks, "beforeRename", () => {
+      reachedScratchWrite = true;
+    });
+
+    try {
+      expect(() =>
+        updateExistingRecord(target, (record: { read: boolean }) => {
+          fs.rmSync(target);
+          fs.symlinkSync(linkTarget, target);
+          return { ...record, read: true };
+        }, { mailboxRoot: inbox.root }),
+      ).toThrow(MailRecordFileTypeError);
+    } finally {
+      restoreRenameHook();
+      openSpy.mockRestore();
+    }
+
+    // The pre-scratch check refused it: the scratch open was never reached.
+    expect(scratchOpens).toEqual([]);
+    expect(reachedScratchWrite).toBe(false);
+    expect(fs.readlinkSync(target)).toBe(linkTarget);
+    if (linkTarget === liveTarget) expect(fs.readFileSync(liveTarget, "utf8")).toBe(liveBytes);
+    else expect(fs.existsSync(linkTarget)).toBe(false);
+    expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+    const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+    expect(lock).not.toBeNull();
+    lock!.release();
+  }
+});
+
+test("an update without an expected mailbox root is refused and leaves the record and lock free", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(target, "utf8");
+
+  for (const options of [{ mailboxRoot: "" }, {} as { mailboxRoot: string }]) {
+    expect(() => updateExistingRecord(target, () => ({ read: true }), options)).toThrow(/requires the expected mailbox root/);
+  }
+
+  expect(fs.readFileSync(target, "utf8")).toBe(before);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+  const lock = acquireMailLockSync(inbox.root, { timeoutMs: 0 });
+  expect(lock).not.toBeNull();
+  lock!.release();
+});
+
+test("a record path that is a symlink into another mailbox is refused without reading or replacing the target", () => {
+  const inboxA = getInbox("mailbox-a");
+  const inboxB = getInbox("mailbox-b");
+  const realRecord = join(inboxA.cur, "record.json");
+  plantRecord(realRecord, "record-id");
+  const recordLink = join(inboxB.cur, "link.json");
+  fs.symlinkSync(realRecord, recordLink);
+  const beforeBytes = fs.readFileSync(realRecord, "utf8");
+  const beforeStat = fs.lstatSync(realRecord);
+  const targetStat = fs.statSync(realRecord, { bigint: true });
+
+  const reads: (string | number)[] = [];
+  const renames: string[] = [];
+  const watched = new Set([recordLink, realRecord]);
+  const realRead = fs.readFileSync;
+  const realRename = fs.renameSync;
+  spyOn(fs, "readFileSync").mockImplementation(((path: unknown, ...rest: unknown[]) => {
+    if (typeof path === "number") {
+      const opened = fs.fstatSync(path, { bigint: true });
+      if (opened.dev === targetStat.dev && opened.ino === targetStat.ino) reads.push(path);
+    } else if (watched.has(String(path))) reads.push(String(path));
+    return (realRead as (...args: unknown[]) => unknown)(path, ...rest);
+  }) as typeof fs.readFileSync);
+  spyOn(fs, "renameSync").mockImplementation(((from: unknown, to: unknown) => {
+    renames.push(`${String(from)} -> ${String(to)}`);
+    return (realRename as (...args: unknown[]) => unknown)(from, to);
+  }) as typeof fs.renameSync);
+
+  const mutate = mock(() => ({ read: true }));
+  expect(() => updateExistingRecord(recordLink, mutate, { mailboxRoot: inboxB.root })).toThrow(MailRecordFileTypeError);
+
+  expect(mutate).not.toHaveBeenCalled();
+
+  expect(reads).toEqual([]);
+  expect(renames.filter((entry) => entry.includes(".ack-") || entry.endsWith(recordLink))).toEqual([]);
+  expect(fs.readFileSync(realRecord, "utf8")).toBe(beforeBytes);
+  const afterStat = fs.lstatSync(realRecord);
+  expect(afterStat.ino).toBe(beforeStat.ino);
+  expect(fs.readdirSync(inboxB.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("a record path that is a dangling symlink is refused as a file type error", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const absent = join(root, "absent.json");
+  fs.symlinkSync(absent, target);
+
+  const mutations: string[] = [];
+  expect(() =>
+    updateExistingRecord(target, (record: { read: boolean }) => {
+      mutations.push("mutated");
+      return { ...record, read: true };
+    }, { mailboxRoot: inbox.root }),
+  ).toThrow(MailRecordFileTypeError);
+
+  expect(mutations).toEqual([]);
+  expect(fs.readlinkSync(target)).toBe(absent);
+});
+
+test("a record symlink whose target cannot be resolved is refused as a file type error", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  const loopA = join(root, "loop-a.json");
+  const loopB = join(root, "loop-b.json");
+  fs.symlinkSync(loopB, loopA);
+  fs.symlinkSync(loopA, loopB);
+  fs.writeFileSync(join(root, "plain"), "not a directory");
+
+  for (const linkTarget of [loopA, join(root, "plain", "child.json")]) {
+    try {
+      fs.unlinkSync(target);
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
+    }
+    fs.symlinkSync(linkTarget, target);
+    expect(() => updateExistingRecord(target, () => ({ read: true }), { mailboxRoot: inbox.root })).toThrow(MailRecordFileTypeError);
+    expect(fs.readlinkSync(target)).toBe(linkTarget);
+  }
+});
+
+test("an absent record still reports gone", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+
+  const outcome = updateExistingRecord(target, () => {
+    throw new Error("an absent record must not be mutated");
+  }, { mailboxRoot: inbox.root });
+
+  expect(outcome).toEqual({ status: "gone" });
+});
+
+test("the node rerun refuses a build that is missing or older than the source", () => {
+  const dir = fs.mkdtempSync(join(tmpdir(), "fresh-dist-"));
+  try {
+    const source = join(dir, "mail.ts");
+    const dist = join(dir, "mail.js");
+    fs.writeFileSync(source, "source");
+
+    expect(() => requireFreshDist(source, dist)).toThrow(/is missing/);
+
+    fs.writeFileSync(dist, "dist");
+    const older = new Date(Date.now() - 60_000);
+    fs.utimesSync(dist, older, older);
+    expect(() => requireFreshDist(source, dist)).toThrow(/older than the source/);
+
+    const newer = new Date(Date.now() + 60_000);
+    fs.utimesSync(dist, newer, newer);
+    expect(requireFreshDist(source, dist)).toBe(dist);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

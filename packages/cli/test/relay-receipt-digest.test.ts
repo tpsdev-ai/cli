@@ -46,7 +46,7 @@ function freshFiles(): string[] {
 
 function ackOnlyRecord(): void {
   const [file] = freshFiles();
-  ackMessageAtPath(join(getInbox("local").fresh, file!));
+  ackMessageAtPath(join(getInbox("local").fresh, file!), getInbox("local").root);
   expect(freshFiles()).toEqual([]);
 }
 
@@ -58,7 +58,7 @@ test("maximal wire metadata and a large payload leave a receipt under 384 bytes 
   expect(deliverRelayedToLocal("remote", item)).toBe(true);
   const inbox = getInbox(item.to);
   const [file] = fs.readdirSync(inbox.fresh).filter((name) => name.endsWith(".json"));
-  ackMessageAtPath(join(inbox.fresh, file!));
+  ackMessageAtPath(join(inbox.fresh, file!), inbox.root);
   const raw = fs.readFileSync(relayAcceptanceReceiptPath("remote", item.id), "utf8");
   expect(byteLength(raw)).toBeLessThan(384);
   expect(raw).not.toContain(marker);
