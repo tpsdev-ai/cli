@@ -5186,6 +5186,327 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       await h.stop();
     }
   }, 40000);
+
+  it("1059 r10 a deadline whose unconfirmed write throws does not retry after an event", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r10-deadline-unconfirmed-write-failed";
+    const { obligationId } = seedVerifiedCur(inboundId, "delivering", 1500);
+    const prevDelays = setObligationRetryDelaysForTests([80]);
+    const warnings: string[] = [];
+    let writeThrows = false;
+    let eventFired = false;
+    setBeforeTransitionForTests((id) => {
+      if (id === inboundId && writeThrows) throw new Error("injected store write throw");
+    });
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId || eventFired) return;
+      eventFired = true;
+      // The committed record's unconfirmed write now throws, and an event lands
+      // in the same window.
+      writeThrows = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("could not record the unconfirmed outcome")), 15000),
+        "the deadline's unconfirmed write threw",
+      ).toBe(true);
+      expect(eventFired, "an event landed during the deadline check").toBe(true);
+      await sleep(500);
+      expect(
+        obligationStateForTests().retries.some((r) => r.obligationId === obligationId),
+        "a thrown unconfirmed write ends the budget",
+      ).toBe(false);
+      expect(
+        warnings.filter((line) => line.includes("obligation-write-failed")),
+        "the single attempt is not retried",
+      ).toHaveLength(1);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record keeps its state").toBe("delivering");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      setBeforeTransitionForTests(undefined);
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r10 an ack expecting one reply is refused at the same revision when the record names another", () => {
+    const inboundId = "msg-1059-r10-expect-reply";
+    seedOrphan(inboundId, { state: "posted", deadlineInMs: 60000, armed: true });
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    writeFileSync(path, JSON.stringify({ ...raw, replyId: "reply-r10-new" }, null, 2), "utf-8");
+    const before = readFileSync(path, "utf-8");
+    expect(
+      transitionObligation(tempMailDir, AGENT, inboundId, "acked", {}, undefined, {
+        from: "posted",
+        revision: raw.revision,
+        replyId: "reply-r10-old",
+      }),
+      "an ack expecting reply-r10-old is refused",
+    ).toBeNull();
+    expect(readFileSync(path, "utf-8"), "the refused ack wrote nothing").toBe(before);
+    expect(
+      transitionObligation(tempMailDir, AGENT, inboundId, "acked", {}, undefined, {
+        from: "posted",
+        revision: raw.revision,
+        replyId: "reply-r10-new",
+      })?.state,
+      "the same ack expecting the reply the record names lands",
+    ).toBe("acked");
+  });
+
+  it("1059 r10 a deadline settlement is refused when deadlineAt moved at the same revision", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r10-same-rev-deadline";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const extended = new Date(Date.now() + 60000).toISOString();
+    let injected = false;
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      // A writer that keeps the revision extends the deadline between the
+      // decision and its write.
+      const raw = JSON.parse(readFileSync(path, "utf-8"));
+      writeFileSync(path, JSON.stringify({ ...raw, deadlineAt: extended }, null, 2), "utf-8");
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(await pollUntil(() => injected, 15000), "the deadline settlement reached its record re-read").toBe(true);
+      await sleep(400);
+      expect(obligationFile(AGENT, inboundId)?.state, "the extended record is not failed").toBe("yielded");
+      expect(obligationFile(AGENT, inboundId)?.deadlineAt, "the extension stands").toBe(extended);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no early nack").toHaveLength(0);
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 5000),
+        "the fresh record's deadline is armed",
+      ).toBe(true);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r10 a deadline settlement is refused when replyId moved at the same revision", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r10-same-rev-reply";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const seeded = JSON.parse(readFileSync(path, "utf-8"));
+    writeFileSync(path, JSON.stringify({ ...seeded, replyId: "reply-r10-old" }, null, 2), "utf-8");
+    const envelopeId = seeded.inboundEnvelopeId as string;
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    let injected = false;
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      // A writer that keeps the revision replaces the reply, and the
+      // replacement carries its own receipt.
+      const raw = JSON.parse(readFileSync(path, "utf-8"));
+      writeFileSync(path, JSON.stringify({ ...raw, replyId: "reply-r10-new" }, null, 2), "utf-8");
+      writeReceipt(tempMailDir, AGENT, {
+        replyId: "reply-r10-new",
+        obligationId,
+        replyToId: envelopeId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signEnvelope(
+          { v: 1, from: AGENT, to: SENDER, body: "new reply", messageId: "reply-r10-new", timestamp: now, replyToId: envelopeId, delegationChain: chain },
+          { [AGENT]: ANVIL_SEED },
+        )),
+      });
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(await pollUntil(() => injected, 15000), "the deadline settlement reached its record re-read").toBe(true);
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state !== "yielded", 15000),
+        "the fresh record is settled",
+      ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the replacement is acked on its own receipt").toBe("acked");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "the old reply's verdict sends no nack").toHaveLength(0);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r10 an old nack stamp is refused when the state moved at the same revision", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r10-same-rev-state";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 60000);
+    const curPath = resolve(tempMailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`);
+    const cur = JSON.parse(readFileSync(curPath, "utf-8"));
+    writeFileSync(curPath, JSON.stringify({ ...cur, nackedAt: new Date().toISOString(), nackReason: "old-stamp" }, null, 2), "utf-8");
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    let injected = false;
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      // The record commits through a writer that keeps the revision.
+      const raw = JSON.parse(readFileSync(path, "utf-8"));
+      writeFileSync(path, JSON.stringify({ ...raw, state: "posted" }, null, 2), "utf-8");
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(await pollUntil(() => injected, 15000), "the settlement reached its record re-read").toBe(true);
+      await sleep(400);
+      expect(obligationFile(AGENT, inboundId)?.state, "the committed record is not failed").toBe("posted");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 5000),
+        "the record is left to its deadline",
+      ).toBe(true);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r10 a later check that finds the record terminal or gone releases an exhausted budget", async () => {
+    seedSigningKeys();
+    const terminalId = "msg-1059-r10-release-terminal";
+    const goneId = "msg-1059-r10-release-gone";
+    const obligationIds: Record<string, string> = {};
+    for (const inboundId of [terminalId, goneId]) {
+      obligationIds[inboundId] = seedVerifiedCur(inboundId, "yielded", 60000).obligationId;
+      const p = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+      const raw = JSON.parse(readFileSync(p, "utf-8"));
+      // No envelope pin: a replay carries a fresh signed envelope (as in the r4
+      // replay test).
+      delete raw.inboundEnvelopeId;
+      writeFileSync(p, JSON.stringify(raw, null, 2), "utf-8");
+    }
+    const goneRecord = resolve(tempMailDir, AGENT, ".obligations", `${goneId}.json`);
+    // A decoy receipt for the gone case: it passes the unsigned pins, so the
+    // replay's scan looks up the agent's key, and its wrong signature is not
+    // evidence.
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    writeReceipt(tempMailDir, AGENT, {
+      replyId: "reply-r10-decoy",
+      obligationId: obligationIds[goneId]!,
+      replyToId: goneId,
+      route: "local",
+      ts: now,
+      signedReply: JSON.stringify(signEnvelope(
+        { v: 1, from: AGENT, to: SENDER, body: "decoy", messageId: "reply-r10-decoy", timestamp: now, replyToId: goneId, delegationChain: chain },
+        { [AGENT]: FLINT_SEED },
+      )),
+    });
+    setArmDeadlineFaultForTests((id) => id === terminalId || id === goneId);
+    const prevDelays = setObligationRetryDelaysForTests([100, 100, 100]);
+    const warnings: string[] = [];
+    const infoCalls: string[] = [];
+    let removeGone = false;
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      warnCalls: warnings,
+      infoCalls,
+      beforeVerify: async (name) => {
+        // The record disappears during the replay's reconcile, at the decoy's
+        // key lookup, which runs before that reconcile's arm check.
+        if (name !== AGENT || !removeGone) return;
+        if (!infoCalls.some((line) => line.includes(`inbound ${goneId} already has obligation`))) return;
+        removeGone = false;
+        rmSync(goneRecord, { force: true });
+      },
+    });
+    const replay = (inboundId: string) =>
+      writeFileSync(
+        resolve(tempMailDir, AGENT, "new", `2026-05-26T00-00-01-${inboundId}.json`),
+        JSON.stringify({
+          id: inboundId,
+          from: SENDER,
+          to: AGENT,
+          body: buildSignedBody(SENDER, AGENT, "replay payload", FLINT_SEED),
+          timestamp: new Date().toISOString(),
+          headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" },
+          deliveryAttempts: 0,
+        }, null, 2),
+        "utf-8",
+      );
+    const entry = (inboundId: string) =>
+      obligationStateForTests().retries.find((r) => r.obligationId === obligationIds[inboundId]);
+    try {
+      expect(
+        await pollUntil(() => entry(terminalId)?.exhausted === true && entry(goneId)?.exhausted === true, 15000),
+        "startup recovery exhausts both budgets",
+      ).toBe(true);
+      setArmDeadlineFaultForTests(undefined);
+      expect(transitionObligation(tempMailDir, AGENT, terminalId, "acked", {})?.state).toBe("acked");
+      replay(terminalId);
+      expect(
+        await pollUntil(() => infoCalls.some((line) => line.includes(`inbound ${terminalId} already has obligation`)), 15000),
+        "the replay reaches the non-subscription reconcile path",
+      ).toBe(true);
+      expect(
+        await pollUntil(() => entry(terminalId) === undefined, 3000),
+        "a terminal record releases the exhausted budget",
+      ).toBe(true);
+      removeGone = true;
+      replay(goneId);
+      expect(
+        await pollUntil(() => infoCalls.some((line) => line.includes(`inbound ${goneId} already has obligation`)), 15000),
+        "the second replay reaches the non-subscription reconcile path",
+      ).toBe(true);
+      expect(
+        await pollUntil(() => entry(goneId) === undefined, 3000),
+        "a missing record releases the exhausted budget",
+      ).toBe(true);
+      expect(removeGone, "the record was removed during that reconcile").toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r10 an unparseable deadlineAt arms a fresh window and settles only at that deadline", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r10-unparseable-deadline";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 60000);
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const raw = JSON.parse(readFileSync(path, "utf-8"));
+    writeFileSync(path, JSON.stringify({ ...raw, deadlineAt: "not-a-date" }, null, 2), "utf-8");
+    const prevDeadline = process.env.TPS_OBLIGATION_DEADLINE_MS;
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "1500";
+    const startedAt = Date.now();
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "startup arms the deadline",
+      ).toBe(true);
+      const armedAt = Date.parse(obligationFile(AGENT, inboundId)?.deadlineAt);
+      expect(Number.isFinite(armedAt), "the unparseable deadline is replaced").toBe(true);
+      expect(armedAt, "by a fresh window").toBeGreaterThan(startedAt);
+      await sleep(600);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays yielded inside the window").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no early nack").toHaveLength(0);
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the fresh deadline settles the obligation",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      if (prevDeadline === undefined) delete process.env.TPS_OBLIGATION_DEADLINE_MS;
+      else process.env.TPS_OBLIGATION_DEADLINE_MS = prevDeadline;
+      await h.stop();
+    }
+  }, 40000);
 });
 
 });

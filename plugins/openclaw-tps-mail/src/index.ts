@@ -1186,8 +1186,8 @@ function retryObligationRead(ctx: YieldContext, obligationId: string, error = "o
       obligationRetries.delete(obligationId);
       return;
     }
-    // Only a KNOWN prior state can move. An unverified cap read leaves the
-    // baseline undefined, and a later readable copy is not evidence of a move.
+    // Only a KNOWN prior state can move. With no prior verified state the
+    // baseline stays unknown, and a later readable copy is not evidence of a move.
     const moved = entry.lastVerifiedState !== undefined &&
       result.status === "found" &&
       !TERMINAL_STATES.has(result.record.state) &&
@@ -1461,9 +1461,9 @@ function stampTerminalCur(
 /**
  * Land the ack transition on the record the receipt evidence was scanned from
  * (cli#1059 round 2). `expect.from`/`expect.revision` name that snapshot and
- * `expect.replyId` the reply the evidence was found for, so a same-state writer
- * that replaced `replyId` after the scan cannot have the OLD receipt ack the
- * NEW record. Returns `stale` when the write was refused (the caller rescans
+ * `expect.replyId` the reply the evidence was found for, so a write that landed
+ * after the scan, or a `replyId` replaced at the same revision, refuses this
+ * ack. Returns `stale` when the write was refused (the caller rescans
  * the fresh record) or `retry-scheduled` when the fresh record is unverified
  * (the read helper routed it through the retry state unless a deadline timer
  * is already armed).
@@ -2272,10 +2272,10 @@ async function settleObligationAtDeadline(
 
 /**
  * Settle a receipt-found decision against the record it was scanned from, and
- * rescan the FRESH record once if a same-state write landed under the ack
- * (cli#1059 round 2). A receipt for the old reply never acks a record that now
- * names another. Returns `stale` when the fresh record carries no receipt for
- * the reply it names now; the caller leaves it to the deadline.
+ * rescan the FRESH record once, under the scanner's receipt rules, if a
+ * same-state write landed under the ack (cli#1059 round 2). Returns `stale`
+ * when the fresh record is gone or terminal, its rescan finds no receipt, or the
+ * second ack is refused too; the caller leaves it to the deadline.
  */
 async function settleScannedReceipt(
   ctx: YieldContext,
@@ -3575,8 +3575,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // ONE verb settles from the RECORD's persisted state (cli#389 round 8 —
         // `delivering`/`posted` are never failed by a mere throw).
         yieldCtx.step = "receipt-scan";
-        // Bind the scan and the ack to ONE record snapshot (cli#1059 round 2):
-        // the receipt must name that record's revision and the reply it names.
+        // Bind the scan and the ack to ONE record snapshot (cli#1059 round 2).
+        // The settlement carries the scanned record's revision; the receipt scan
+        // uses the expected reply identity.
         const scanSnapshot = readObligationResult(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
         const scanRecord = scanSnapshot.status === "found" ? scanSnapshot.record : created.record;
         const expectedReplyId = postedReplyId ?? scanRecord.replyId;

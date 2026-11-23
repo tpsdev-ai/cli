@@ -376,10 +376,9 @@ export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTest
  * `expect.from` refuses a transition when the record's STATE moved since the
  * caller's re-read; `expect.revision` additionally refuses a SAME-STATE update
  * (e.g. a deadline extension) that landed since that read; `expect.replyId`
- * refuses a same-state reply replacement (a receipt scanned for one reply may
- * never ack a record that names another). A decision write passes every check
- * that applies. A refused transition returns null and writes nothing, so the
- * caller must re-read and re-evaluate.
+ * refuses a record that names another reply, even at the same revision. A
+ * refused transition returns null and writes nothing, so the caller must
+ * re-read and re-evaluate.
  *
  * A record whose revision is not a nonnegative safe integer is unverified:
  * every transition refuses it and no write ever lands on it.
