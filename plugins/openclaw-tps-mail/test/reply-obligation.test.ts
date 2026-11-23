@@ -5620,6 +5620,173 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       await h.stop();
     }
   }, 40000);
+
+  it("1059 r11 a stale retry that throws after its await leaves the replacement entry and its outcome intact", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r11-stale-retry-throw";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 600000);
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    // The startup arm fails, so startup schedules the first bounded attempt.
+    let armFault = true;
+    setArmDeadlineFaultForTests((id) => id === inboundId && armFault);
+    const prevDelays = setObligationRetryDelaysForTests([1200, 1200, 1200]);
+    const warnings: string[] = [];
+    let holdNextInboundVerify = false;
+    const gates: { release: () => void }[] = [];
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      warnCalls: warnings,
+      beforeVerify: async (name) => {
+        if (name !== SENDER || !holdNextInboundVerify) return;
+        holdNextInboundVerify = false;
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        gates.push({ release });
+        await gate;
+      },
+    });
+    const entryFor = () => obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+    try {
+      expect(
+        await pollUntil(() => entryFor()?.attempt === 1 && entryFor()?.dueAt !== Number.POSITIVE_INFINITY, 15000),
+        "the refused startup arm scheduled the first bounded attempt",
+      ).toBe(true);
+      // The deadline moves into the past, so this attempt settles, and its inbound
+      // verification is held.
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", {
+        deadlineAt: new Date(Date.now() - 1000).toISOString(),
+      });
+      armFault = false;
+      holdNextInboundVerify = true;
+      expect(await pollUntil(() => gates.length === 1, 15000), "the retry is held at its inbound verification").toBe(true);
+      // The retry state is dropped while the check awaits: it no longer owns the
+      // entry.
+      expect(releaseObligationRetryForTests(obligationId), "the running entry is released").toBe(true);
+      expect(entryFor(), "no entry remains").toBeUndefined();
+      // An arm failure schedules the next bounded attempt, which claims the entry
+      // while the stale check stays held.
+      setObligationRetryDelaysForTests([0, 400, 400]);
+      armFault = true;
+      holdNextInboundVerify = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      expect(await pollUntil(() => gates.length === 2, 15000), "a replacement bounded attempt owns the entry").toBe(true);
+      expect(entryFor()?.attempt, "the replacement attempt owns the entry").toBe(1);
+      const before = readFileSync(path, "utf-8");
+      // The stale check resumes from its await and throws at the record re-read.
+      let settleThrows = 0;
+      setBeforeSettleReadForTests((id) => {
+        if (id !== inboundId) return;
+        settleThrows++;
+        throw new Error("injected stale settle throw");
+      });
+      gates[0]!.release();
+      expect(await pollUntil(() => settleThrows === 1, 5000), "the stale check threw after its await").toBe(true);
+      await sleep(400);
+      expect(entryFor()?.attempt, "the replacement entry is not rescheduled").toBe(1);
+      expect(entryFor()?.dueAt, "the replacement is still running, not replaced by a timer").toBe(Number.POSITIVE_INFINITY);
+      expect(entryFor()?.exhausted, "the replacement is not exhausted").toBe(false);
+      expect(warnings.filter((line) => line.includes("obligation-retry-failed")), "the stale catch logs nothing").toHaveLength(0);
+      expect(readFileSync(path, "utf-8"), "the stale check writes nothing").toBe(before);
+      // The replacement finishes on its own: its outcome lands.
+      setBeforeSettleReadForTests(undefined);
+      gates[1]!.release();
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the replacement's own outcome lands",
+      ).toBe(true);
+      expect(
+        nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"),
+        "the replacement nacks once",
+      ).toHaveLength(1);
+      expect(await pollUntil(() => entryFor() === undefined, 5000), "the replacement releases its own entry").toBe(true);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r11 a stale deadline check that throws after its await leaves the replacement entry and its outcome intact", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r11-stale-deadline-throw";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 800);
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const prevDelays = setObligationRetryDelaysForTests([1200, 1200, 1200]);
+    const warnings: string[] = [];
+    let holdNextInboundVerify = false;
+    const gates: { release: () => void }[] = [];
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      warnCalls: warnings,
+      beforeVerify: async (name) => {
+        if (name !== SENDER || !holdNextInboundVerify) return;
+        holdNextInboundVerify = false;
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        gates.push({ release });
+        await gate;
+      },
+    });
+    const entryFor = () => obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "startup armed the deadline",
+      ).toBe(true);
+      holdNextInboundVerify = true;
+      // The fired deadline claims the entry and is held at its inbound
+      // verification.
+      expect(await pollUntil(() => gates.length === 1, 15000), "the fired deadline is held at its inbound verification").toBe(true);
+      expect(entryFor()?.attempt, "the deadline check owns the entry").toBe(0);
+      expect(releaseObligationRetryForTests(obligationId), "the deadline check's entry is released").toBe(true);
+      expect(entryFor(), "no entry remains").toBeUndefined();
+      // An arm failure schedules the next bounded attempt, which claims the entry
+      // while the stale deadline check stays held.
+      setObligationRetryDelaysForTests([0, 400, 400]);
+      setArmDeadlineFaultForTests((id) => id === inboundId);
+      holdNextInboundVerify = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      expect(await pollUntil(() => gates.length === 2, 15000), "a replacement bounded attempt owns the entry").toBe(true);
+      expect(entryFor()?.attempt, "the replacement attempt owns the entry").toBe(1);
+      const before = readFileSync(path, "utf-8");
+      // The stale deadline check resumes from its await and throws at the record
+      // re-read.
+      let settleThrows = 0;
+      setBeforeSettleReadForTests((id) => {
+        if (id !== inboundId) return;
+        settleThrows++;
+        throw new Error("injected stale settle throw");
+      });
+      gates[0]!.release();
+      expect(await pollUntil(() => settleThrows === 1, 5000), "the stale deadline check threw after its await").toBe(true);
+      await sleep(400);
+      expect(entryFor()?.attempt, "the replacement entry is not rescheduled").toBe(1);
+      expect(entryFor()?.dueAt, "the replacement is still running, not replaced by a timer").toBe(Number.POSITIVE_INFINITY);
+      expect(entryFor()?.exhausted, "the replacement is not exhausted").toBe(false);
+      expect(warnings.filter((line) => line.includes("obligation-retry-failed")), "the stale catch logs nothing").toHaveLength(0);
+      expect(readFileSync(path, "utf-8"), "the stale check writes nothing").toBe(before);
+      // The replacement finishes on its own: its outcome lands.
+      setBeforeSettleReadForTests(undefined);
+      gates[1]!.release();
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "the replacement's own outcome lands",
+      ).toBe(true);
+      expect(
+        nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"),
+        "the replacement nacks once",
+      ).toHaveLength(1);
+      expect(await pollUntil(() => entryFor() === undefined, 5000), "the replacement releases its own entry").toBe(true);
+    } finally {
+      setBeforeSettleReadForTests(undefined);
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
 });
 
 });

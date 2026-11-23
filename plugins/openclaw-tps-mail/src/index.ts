@@ -2328,9 +2328,10 @@ async function settleScannedReceipt(
  * Apply a receipt-quarantined verdict against the record the quarantined
  * marker was scanned from (cli#1059 round 3). The scanned revision and reply
  * identity travel with the verdict: if a same-state writer replaced `replyId`
- * (or otherwise moved the record), the fresh record is scanned again before
- * deciding, so one reply's quarantine never fails and nacks the reply a
- * replacement now names.
+ * (or otherwise moved the record), a fresh read that is found and live is
+ * scanned again for the reply it now names before deciding, so one reply's
+ * quarantine is not applied to the reply a replacement now names. A gone,
+ * terminal or unverified fresh read returns `stale` without a rescan.
  */
 async function settleScannedQuarantine(
   ctx: YieldContext,
@@ -2574,8 +2575,10 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
   if (receipt.status === "found") {
     const applied = await settleScannedReceipt(ctx, current.obligationId, current, current.replyId, { missingCur: true });
     if (applied !== "stale") return;
-    // The record moved under the ack and the fresh one has no receipt for the
-    // reply it names now: fall through to the record-based deadline decision.
+    // The record moved under the ack, so `settleScannedReceipt` returned stale:
+    // the fresh read was gone, terminal or unverified, its rescan found no
+    // receipt, or the second ack was refused. Fall through to the record-based
+    // deadline decision.
   }
 
   // Decide from the post-scan state. The store guard refuses a stale STATE or
@@ -2596,9 +2599,10 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
   }
 
   // The deadline has passed: apply the deadline's own terminal outcome. Each
-  // verdict travels with the snapshot its scan used; a record that moved is
-  // re-read, and the reply it names now is rescanned, before the deadline
-  // decision is redone.
+  // verdict travels with the snapshot its scan used. A record that moved is
+  // re-read: a gone, terminal or unverified read returns, and a future deadline
+  // re-arms, both without a rescan; a live record past its deadline goes on to
+  // the verdict.
   const reason = "yielded-without-resumption";
   const rearm = () =>
     retryAfterArmFailure(
@@ -2628,8 +2632,11 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     });
     if (applied !== "stale") return;
     if (pass === 1) break;
-    // The record moved under the verdict: redo the deadline decision, then
-    // rescan the reply the fresh record names before settling again.
+    // The record moved under the verdict: re-read it and redo the deadline
+    // decision. When that read is found, live and past its deadline, the reply
+    // it now names is rescanned before settling again; a gone, terminal or
+    // unverified read returns, and a future deadline re-arms, both without a
+    // rescan.
     const moved = readObligationForCleanup(ctx, current.obligationId);
     if (moved.status !== "found" || TERMINAL_STATES.has(moved.record.state)) return;
     const movedDeadline = moved.record.deadlineAt === null ? NaN : Date.parse(moved.record.deadlineAt);
