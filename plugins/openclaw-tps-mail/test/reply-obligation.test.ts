@@ -5996,7 +5996,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
         revision: current.revision ?? 0,
       });
       // The sender has consumed the posted file: only the metadata receipt for
-      // the dispatch-local reply remains on disk.
+      // the dispatch-local reply is left for the scan.
       const delivered = resolve(tempMailDir, SENDER, "new");
       for (const name of readdirSync(delivered)) {
         if (name.endsWith(".json")) renameSync(resolve(delivered, name), resolve(delivered, `${name}.gone`));
