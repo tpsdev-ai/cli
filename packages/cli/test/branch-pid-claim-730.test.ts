@@ -375,18 +375,30 @@ async function waitForRunningRecord(): Promise<{ pid: number; startToken: string
   );
 }
 
-/** True when the pid is gone or a zombie; a container's PID 1 may not reap. */
+/** True when the pid is gone or a zombie. A container may run no init as
+ *  PID 1, so an orphan whose parent exited is not reaped and a killed
+ *  detached grandchild can stay a zombie that `process.kill(pid, 0)` accepts. */
 function pidExited(pid: number): boolean {
   if (pidState(pid) === "gone") return true;
-  if (process.platform !== "linux") return false;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ESRCH") return true;
-    throw error;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return true;
+      throw error;
+    }
   }
+  if (process.platform === "darwin") {
+    const probe = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
+      encoding: "utf8",
+      timeout: 2_000,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return probe.status === 0 && probe.stdout.trimStart().startsWith("Z");
+  }
+  return false;
 }
 
 async function waitForPidGone(pid: number): Promise<void> {
@@ -424,7 +436,7 @@ async function killDetachedGrandchild(file: string): Promise<void> {
     /* already gone */
   }
   const deadline = Date.now() + EXIT_REPORT_MS;
-  while (signalZeroCode(pid) !== "ESRCH") {
+  while (!pidExited(pid)) {
     if (Date.now() >= deadline) throw new Error(`grandchild ${pid} survived its SIGKILL`);
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
   }
@@ -1043,7 +1055,7 @@ describe("branch pid record ownership (cli#730)", () => {
     }
     const pid = readGrandchildPid(grandchildFile);
     expect(pid).not.toBeNull();
-    expect(signalZeroCode(pid!)).toBe("ESRCH");
+    expect(pidExited(pid!)).toBe(true);
   }, 20_000);
 
   test("a multi-byte stderr flood keeps its last 4096 bytes, in an allocation of that size", async () => {
