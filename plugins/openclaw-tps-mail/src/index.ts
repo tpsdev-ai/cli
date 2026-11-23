@@ -3347,25 +3347,34 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       // The obligation record is created HERE, keyed on the inbound id — a
       // replayed inbound finds its record and opens NO second obligation.
       const obligationId = randomUUID();
-      const created = createObligation(
-        account.mailDir,
-        recipient,
-        () => ({
-          obligationId,
-          inboundId: msg.id,
-          // cli#429: the durable thread id — the inbound's SIGNED envelope id
-          // (promote()/recoverPromoted() stamp it, and the id rule holds there).
-          ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
-          inboundTimestamp: msg.timestamp,
-          from: msg.from,
-          to: recipient,
-          accountId: account.accountId,
-          state: "pending",
-          deadlineAt: null,
-          attempts: 1,
-        }),
-        log,
-      );
+      let created: ReturnType<typeof createObligation>;
+      try {
+        created = createObligation(
+          account.mailDir,
+          recipient,
+          () => ({
+            obligationId,
+            inboundId: msg.id,
+            // cli#429: the durable thread id — the inbound's SIGNED envelope id
+            // (promote()/recoverPromoted() stamp it, and the id rule holds there).
+            ...(isValidEnvelopeId(msg.envelopeId) ? { inboundEnvelopeId: msg.envelopeId } : {}),
+            inboundTimestamp: msg.timestamp,
+            from: msg.from,
+            to: recipient,
+            accountId: account.accountId,
+            state: "pending",
+            deadlineAt: null,
+            attempts: 1,
+          }),
+          log,
+        );
+      } catch (err: any) {
+        // A refused create (an unverified record) must not reject the intake:
+        // the promoted inbound stays in cur/ for recovery after the record is
+        // repaired.
+        log?.warn?.(`tps-mail: obligation-create-failed: ${msg.id}: ${err?.message ?? err}`);
+        return;
+      }
       const obId = created.record.obligationId;
       const yieldCtx = makeYieldCtx(
         account.mailDir,

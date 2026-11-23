@@ -6088,8 +6088,8 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
     try {
       expect(
-        await pollUntil(() => warnings.some((line) => line.includes("processNewFile error")), 15000),
-        "the refused create is logged instead of rejecting unhandled",
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-create-failed")), 15000),
+        "the refused create is logged by name",
       ).toBe(true);
       expect(readFileSync(badPath, "utf-8"), "the unverified record is unchanged").toBe(bad);
       expect(
