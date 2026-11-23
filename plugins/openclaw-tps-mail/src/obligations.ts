@@ -274,7 +274,8 @@ export function listObligations(mailDir: string, agent: string, onReadError?: (p
       const record = JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord;
       // Validate EVERY listing, whether or not a callback is supplied: a
       // startup caller acts on these records (an owed-nack send) and a write
-      // refusal cannot retract mail. An invalid record is never returned.
+      // refusal cannot retract mail. A record whose filename does not match its
+      // inboundId, or whose state or revision is invalid, is not returned.
       if (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) {
         if (onReadError) {
           const ids = [name.slice(0, -5)];

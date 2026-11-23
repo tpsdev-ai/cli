@@ -2430,8 +2430,8 @@ async function settlePreCommitVerdict(
   verdict: string,
   reason: string,
 ): Promise<void> {
-  // Use the shared reader so an unverified record is logged and routed to the
-  // retry state exactly like every other settle path.
+  // Use the shared reader so an unverified record is logged like every other
+  // settle path; it schedules a retry only when no deadline is armed.
   const snapshot = readObligationForCleanup(ctx, obligationId);
   if (snapshot.status === "unverified") return;
   if (snapshot.status !== "found" || TERMINAL_STATES.has(snapshot.record.state)) return;
@@ -2926,8 +2926,8 @@ function installYieldSubscription(api: any): boolean {
       const ctx = yieldContexts.get(runId);
       if (!ctx) return;
       // The classified cleanup read releases a gone or terminal record; an
-      // unverified read is routed through the retry state, never treated as
-      // missing.
+      // unverified read is not treated as missing, and it schedules a retry only
+      // when no deadline is armed (reportObligationFailure returns otherwise).
       const result = readObligationForCleanup(ctx, runId);
       if (result.status !== "found") return;
       armObligationFromEvent(ctx, result.record.obligationId);
