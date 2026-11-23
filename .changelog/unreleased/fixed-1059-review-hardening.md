@@ -1,5 +1,5 @@
 - **Review hardening for the obligation store and deadline timers (#1059).**
-  An arm that verified the record before its write failed keeps that state as
+  An arm whose write throws after it verified the record keeps that state as
   the retry baseline. A deadline beyond the runtime's timer limit arms with a
   capped delay and still waits for the original deadline. A receipt scan uses
   the reply id the scanned record names before the dispatch-local id. A record

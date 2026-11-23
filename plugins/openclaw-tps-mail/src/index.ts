@@ -1144,6 +1144,16 @@ export function setBeforeSettleEntryForTests(hook: typeof beforeSettleEntryForTe
   beforeSettleEntryForTests = hook;
 }
 
+/** Test-only: shorten the delay cap on an armed deadline timer, so a test can
+ *  fire a capped timer without a multi-day wait. Undefined uses
+ *  MAX_TIMER_DELAY_MS. */
+let obligationTimerCapMsForTests: number | undefined;
+export function setObligationTimerCapForTests(ms: number | undefined): number | undefined {
+  const prev = obligationTimerCapMsForTests;
+  obligationTimerCapMsForTests = ms;
+  return prev;
+}
+
 let beforeReceiptScanForTests: ((inboundId: string) => void) | undefined;
 export function setBeforeReceiptScanForTests(hook: typeof beforeReceiptScanForTests): void {
   beforeReceiptScanForTests = hook;
@@ -2112,7 +2122,7 @@ function armDeadlineOnce(
   const timer = accountTimer(ctx, () => {
     armedDeadlines.delete(obligationId);
     void onDeadline(ctx, obligationId);
-  }, Math.min(remaining, MAX_TIMER_DELAY_MS));
+  }, Math.min(remaining, obligationTimerCapMsForTests ?? MAX_TIMER_DELAY_MS));
   if (typeof (timer as any).unref === "function") (timer as any).unref();
   armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
   return { outcome: "armed" };

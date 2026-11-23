@@ -38,7 +38,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 // Import the plugin — default export gives us { register }.
-import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setBeforeReceiptScanForTests, setQuarantineOutcomeForTests, releaseObligationRetryForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setBeforeReceiptScanForTests, setQuarantineOutcomeForTests, setObligationTimerCapForTests, releaseObligationRetryForTests } from "../src/index.js";
 import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt, readObligation, readObligationResult, writeObligation, listObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -184,6 +184,9 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       dispatchFailedCounts?: any;
       warnCalls?: string[];
       infoCalls?: string[];
+      /** Make the runtime's inbound-context finalizer throw, so a startup intake
+       *  rejects after promotion. */
+      finalizeContextThrows?: boolean;
     } = {},
   ) {
     if (abortController.signal.aborted) abortController = new AbortController();
@@ -238,7 +241,10 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     const channelRuntime = {
       routing: { buildAgentSessionKey: (params: any) => `agent:${params.agentId}:tps-mail:default:${params.peer.id}` },
       reply: {
-        finalizeInboundContext: async (ctx: any) => ({ ...ctx, CommandAuthorized: false }),
+        finalizeInboundContext: async (ctx: any) => {
+          if (opts.finalizeContextThrows) throw new Error("context finalizer refused the inbound");
+          return { ...ctx, CommandAuthorized: false };
+        },
         dispatchReplyWithBufferedBlockDispatcher: async (args: any) => {
           dispatchCount++;
           dispatchedArgs = args;
@@ -6038,7 +6044,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const bytes = JSON.stringify(record, null, 2);
     writeFileSync(path, bytes, "utf-8");
     expect(readObligation(tempMailDir, AGENT, "a"), "the mismatched point read is not a record").toBeNull();
-    expect(readObligationResult(tempMailDir, AGENT, "a").status).toBe("unverified");
+    expect(readObligationResult(tempMailDir, AGENT, "a"), "the mismatched point read is unverified for that reason").toMatchObject({ status: "unverified", code: "INBOUND_ID_MISMATCH" });
     expect(
       transitionObligation(tempMailDir, AGENT, "a", "posted", { replyId: "r" }),
       "no transition writes through the mismatched key",
@@ -6097,6 +6103,187 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
         "the promoted inbound stays available in cur/",
       ).toBe(true);
     } finally {
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r14 a cur/ lookup error during the missing-cur rescan settles nothing", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r14-rescan-cur-error";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId) return;
+      setBeforeSettleReadForTests(undefined);
+      // The first verdict's snapshot moves: the caller re-reads and rescans.
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", { replyId: "reply-moved" }, undefined, {
+        from: "yielded",
+        revision: 0,
+      });
+      // The inbound is still gone, but the rescan's own cur/ lookup fails.
+      setObligationCurLookupFaultForTests((faultId) => (faultId === inboundId ? "EIO" : undefined));
+    });
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(
+          () => warnings.some((line) => line.includes("obligation-cur-lookup-failed") && line.includes("EIO")),
+          15000,
+        ),
+        "the failed rescan lookup is reported",
+      ).toBe(true);
+      await sleep(300);
+      const rec = obligationFile(AGENT, inboundId);
+      expect(rec?.state, "the error branch settles nothing").toBe("yielded");
+      expect(rec?.replyId, "the moved reply is left in place").toBe("reply-moved");
+      expect(rec?.failure, "no failure is recorded").toBeUndefined();
+      expect(rec?.nackSentAt, "no nack stamp is written to the record").toBeUndefined();
+      expect(
+        existsSync(resolve(tempMailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`)),
+        "no cur/ record is created to stamp",
+      ).toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setObligationCurLookupFaultForTests(undefined);
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r14 a capped deadline timer re-arms for the remainder and settles at the original deadline", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r14-timer-cap-fires";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
+    const seededDeadline = obligationFile(AGENT, inboundId)!.deadlineAt;
+    const prevCap = setObligationTimerCapForTests(300);
+    let armReads = 0;
+    setBeforeArmReadForTests((id) => { if (id === inboundId) armReads++; });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "the future deadline is armed",
+      ).toBe(true);
+      const firstArmReads = armReads;
+      expect(await pollUntil(() => armReads > firstArmReads, 1200), "the capped timer fires").toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays open when the cap fires").toBe("yielded");
+      expect(obligationFile(AGENT, inboundId)?.deadlineAt, "the durable deadline is unchanged").toBe(seededDeadline);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "the remainder is re-armed",
+      ).toBe(true);
+      expect(Date.now(), "the original deadline is still ahead").toBeLessThan(Date.parse(seededDeadline!));
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack before the deadline").toHaveLength(0);
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 4000),
+        "the record settles at the original deadline",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"), "one nack at the deadline").toHaveLength(1);
+    } finally {
+      setObligationTimerCapForTests(prevCap);
+      setBeforeArmReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r14 a yield event that finds the record missing releases its state", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r14-event-missing";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 20000);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "the record is open with a deadline and a context",
+      ).toBe(true);
+      const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+      rmSync(recordPath);
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      expect(
+        obligationStateForTests().retries.some((r) => r.obligationId === obligationId),
+        "a missing record starts no retry",
+      ).toBe(false);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "the armed deadline is released",
+      ).toBe(false);
+      expect(
+        obligationStateForTests().contexts.some((c) => c.obligationId === obligationId),
+        "the yield context is released",
+      ).toBe(false);
+      expect(existsSync(recordPath), "the missing record is not recreated").toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally { await h.stop(); }
+  }, 40000);
+
+  it("1059 r14 a yield event that finds the record unverified with no armed deadline schedules a retry", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r14-event-unverified";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 20000);
+    setArmDeadlineFaultForTests((id) => id === inboundId);
+    const prevDelays = setObligationRetryDelaysForTests([60000, 60000, 60000]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the failed arm left a scheduled retry",
+      ).toBe(true);
+      expect(releaseObligationRetryForTests(obligationId), "the entry is dropped").toBe(true);
+      expect(
+        obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+        "no deadline is armed",
+      ).toBe(false);
+      const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+      const seeded = JSON.parse(readFileSync(recordPath, "utf-8"));
+      const unverified = JSON.stringify({ ...seeded, revision: "3" }, null, 2);
+      writeFileSync(recordPath, unverified, "utf-8");
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      const retry = obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+      expect(retry, "an unverified event read schedules a retry").toBeDefined();
+      expect(retry!.exhausted, "the retry is not exhausted").toBe(false);
+      expect(retry!.dueAt, "the retry has a due time").toBeGreaterThan(Date.now());
+      expect(readFileSync(recordPath, "utf-8"), "the unverified record is not written").toBe(unverified);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r14 a startup intake rejection after promotion is logged, not unhandled", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r14-startup-finalize-throws";
+    const body = buildSignedBody(SENDER, AGENT, "startup payload", FLINT_SEED);
+    const envelope = JSON.parse(body);
+    mkdirSync(resolve(tempMailDir, AGENT, "new"), { recursive: true });
+    writeFileSync(
+      resolve(tempMailDir, AGENT, "new", `${inboundId}.json`),
+      JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body, timestamp: envelope.timestamp, read: false }),
+      "utf-8",
+    );
+    const warnings: string[] = [];
+    const rejections: unknown[] = [];
+    const onRejection = (reason: unknown) => { rejections.push(reason); };
+    process.on("unhandledRejection", onRejection);
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      finalizeContextThrows: true,
+      warnCalls: warnings,
+    });
+    try {
+      expect(
+        await pollUntil(
+          () => warnings.some((line) => line.includes("processNewFile error") && line.includes("context finalizer refused")),
+          15000,
+        ),
+        "the intake rejection is logged by name",
+      ).toBe(true);
+      await sleep(200);
+      expect(rejections, "no unhandled rejection").toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onRejection);
       await h.stop();
     }
   }, 40000);
