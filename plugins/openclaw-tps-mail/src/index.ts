@@ -1150,6 +1150,14 @@ export function setQuarantineOutcomeForTests(hook: typeof quarantineOutcomeForTe
   quarantineOutcomeForTests = hook;
 }
 
+/** Test-only: drop an obligation's bounded-retry entry, modelling an ownership
+ *  change while a check awaits its scan. Returns whether an entry existed. */
+export function releaseObligationRetryForTests(obligationId: string): boolean {
+  const had = obligationRetries.has(obligationId);
+  clearObligationRetry(obligationId);
+  return had;
+}
+
 /**
  * cli#1059 round 4: the ONE owner of an obligation's bounded retry state. A
  * pending attempt keeps its due time: a repeated deadline fire, a yield event
@@ -1245,7 +1253,7 @@ function scheduleObligationRetry(
     // error); it never starts a second attempt.
     const current = obligationRetries.get(obligationId);
     if (!current || current.kind !== "scheduled" || current.timer !== timer) return;
-    obligationRetries.set(obligationId, {
+    const running: ObligationRetryEntry = {
       kind: "running",
       accountId: current.accountId,
       incarnation: current.incarnation,
@@ -1253,13 +1261,17 @@ function scheduleObligationRetry(
       lastVerifiedState: current.lastVerifiedState,
       lastError: current.lastError,
       recheckWanted: false,
-    });
+    };
+    obligationRetries.set(obligationId, running);
+    // A check owns the entry only while the map still holds `running`: a
+    // completion or reschedule after an await must not touch a replacement.
+    const owns = () => obligationRetries.get(obligationId) === running;
     void runObligationRetry(ctx, obligationId, attempt + 1)
       .then(() => {
-        if (isLiveContext(ctx)) completeObligationRetry(ctx, obligationId);
+        if (isLiveContext(ctx) && owns()) completeObligationRetry(ctx, obligationId);
       })
       .catch((err: any) => {
-        if (!isLiveContext(ctx)) return;
+        if (!isLiveContext(ctx) || !owns()) return;
         ctx.log?.warn?.(
           `tps-mail: obligation-retry-failed: obligation ${obligationId} for inbound ${ctx.inboundId}: ${err?.message ?? err}`,
         );
@@ -2274,8 +2286,10 @@ async function settleObligationAtDeadline(
  * Settle a receipt-found decision against the record it was scanned from, and
  * rescan the FRESH record once, under the scanner's receipt rules, if a
  * same-state write landed under the ack (cli#1059 round 2). Returns `stale`
- * when the fresh record is gone or terminal, its rescan finds no receipt, or the
- * second ack is refused too; the caller leaves it to the deadline.
+ * when the fresh record is gone, terminal or unverified, its rescan finds no
+ * receipt, or the second ack is refused too. An unverified fresh read returns
+ * `stale` without a rescan, and the retry path can route that outcome into the
+ * bounded retry.
  */
 async function settleScannedReceipt(
   ctx: YieldContext,

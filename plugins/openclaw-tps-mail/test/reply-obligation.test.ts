@@ -38,7 +38,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 // Import the plugin — default export gives us { register }.
-import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setQuarantineOutcomeForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setQuarantineOutcomeForTests, releaseObligationRetryForTests } from "../src/index.js";
 import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt, readObligation, readObligationResult, writeObligation, listObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -5504,6 +5504,105 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally {
       if (prevDeadline === undefined) delete process.env.TPS_OBLIGATION_DEADLINE_MS;
       else process.env.TPS_OBLIGATION_DEADLINE_MS = prevDeadline;
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r9 a stale retry does not settle or release a replacement check's entry", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r9-stale-retry-owns";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 600000);
+    const envelopeId = obligationFile(AGENT, inboundId)?.inboundEnvelopeId as string;
+    const replyId = "reply-r9-stale-retry-owns";
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    // The startup arm fails, so startup schedules the first bounded attempt.
+    let armFault = true;
+    setArmDeadlineFaultForTests((id) => id === inboundId && armFault);
+    const prevDelays = setObligationRetryDelaysForTests([1200, 1200, 1200]);
+    const infoCalls: string[] = [];
+    let holdNextScan = false;
+    const gates: { release: () => void }[] = [];
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      infoCalls,
+      beforeVerify: async (name) => {
+        if (name !== AGENT || !holdNextScan) return;
+        holdNextScan = false;
+        let release!: () => void;
+        const gate = new Promise<void>((r) => { release = r; });
+        gates.push({ release });
+        await gate;
+      },
+    });
+    const entryFor = () => obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+    try {
+      expect(
+        await pollUntil(() => entryFor()?.attempt === 1 && entryFor()?.dueAt !== Number.POSITIVE_INFINITY, 15000),
+        "the refused startup arm scheduled the first bounded attempt",
+      ).toBe(true);
+      // The receipt lands while that attempt waits, and the record's deadline is
+      // now past, so its scan is the next AGENT verification and is held there.
+      writeReceipt(tempMailDir, AGENT, {
+        replyId,
+        obligationId,
+        replyToId: envelopeId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signEnvelope(
+          { v: 1, from: AGENT, to: SENDER, body: "held reply", messageId: replyId, timestamp: now, replyToId: envelopeId, delegationChain: chain },
+          { [AGENT]: ANVIL_SEED },
+        )),
+      });
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", {
+        deadlineAt: new Date(Date.now() - 1000).toISOString(),
+      });
+      armFault = false;
+      holdNextScan = true;
+      expect(await pollUntil(() => gates.length === 1, 15000), "the retry is held in its receipt scan").toBe(true);
+      const before = readFileSync(path, "utf-8");
+      // The retry state is dropped while the check awaits its scan: it no
+      // longer owns the entry.
+      expect(releaseObligationRetryForTests(obligationId), "the running entry is released").toBe(true);
+      expect(entryFor(), "no entry remains").toBeUndefined();
+      // A fired deadline claims the entry and is held in its own receipt scan.
+      holdNextScan = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      expect(await pollUntil(() => gates.length === 2, 15000), "the deadline check is held in its scan").toBe(true);
+      expect(entryFor()?.attempt, "the deadline check owns the entry now").toBe(0);
+      // The deadline check loses its entry too, and an arm failure schedules the
+      // next bounded attempt, which claims the entry while both scans stay held.
+      expect(releaseObligationRetryForTests(obligationId), "the deadline check's entry is released").toBe(true);
+      setObligationRetryDelaysForTests([0, 400, 400]);
+      armFault = true;
+      holdNextScan = true;
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      expect(await pollUntil(() => gates.length === 3, 15000), "the next bounded attempt claims the entry").toBe(true);
+      expect(entryFor()?.attempt, "the bounded attempt owns the entry").toBe(1);
+      gates[0]!.release();
+      await sleep(400);
+      expect(readFileSync(path, "utf-8"), "the stale retry writes nothing").toBe(before);
+      expect(entryFor()?.attempt, "the stale retry releases no replacement").toBe(1);
+      gates[1]!.release();
+      await sleep(400);
+      expect(readFileSync(path, "utf-8"), "the stale deadline check writes nothing").toBe(before);
+      expect(entryFor()?.attempt, "the stale deadline check releases no replacement").toBe(1);
+      gates[2]!.release();
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "acked", 15000),
+        "the surviving check acks on the receipt",
+      ).toBe(true);
+      expect(infoCalls.filter((line) => line.includes("tps-mail: acked")).length, "the record is acked once").toBe(1);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+      expect(await pollUntil(() => entryFor() === undefined, 3000), "the retry state is released").toBe(true);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      setArmDeadlineFaultForTests(undefined);
       await h.stop();
     }
   }, 40000);
