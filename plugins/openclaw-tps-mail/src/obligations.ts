@@ -226,6 +226,9 @@ export function readObligation(mailDir: string, agent: string, inboundId: string
     // based on: treat it exactly like an unreadable one, so no caller writes
     // over it.
     if (!record || typeof record.state !== "string" || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) return null;
+    // A record whose own id does not match the lookup key belongs to another
+    // file: a revision read here must never authorize a write to that key.
+    if (record.inboundId !== inboundId) return null;
     return record;
   } catch {
     return null;
@@ -244,6 +247,9 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
     }
     if (!isValidObligationRevision(record.revision)) {
       return { status: "unverified", path, code: "INVALID_REVISION" };
+    }
+    if (record.inboundId !== inboundId) {
+      return { status: "unverified", path, code: "INBOUND_ID_MISMATCH" };
     }
     return { status: "found", record };
   } catch (error) {
@@ -395,6 +401,10 @@ export function transitionObligation(
   expect?: { from: ObligationState; revision?: number; replyId?: string },
 ): ObligationRecord | null {
   beforeTransitionForTests?.(inboundId, next);
+  // The patch may not change the record's write key: the transition was decided
+  // for this inboundId, and a different inboundId would stage the write under
+  // another file.
+  const { inboundId: _ignoredKey, ...safePatch } = patch;
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
     if (!current) return null;
@@ -434,14 +444,14 @@ export function transitionObligation(
     // terminal record reaches this point.)
     if (next === current.state) {
       const fields = current as unknown as Record<string, unknown>;
-      const changed = Object.entries(patch).some(([key, value]) => {
+      const changed = Object.entries(safePatch).some(([key, value]) => {
         const had = Object.hasOwn(fields, key) && fields[key] !== undefined;
         const wants = value !== undefined;
         return had !== wants || (had && fields[key] !== value);
       });
       if (!changed) return current;
     }
-    const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
+    const updated: ObligationRecord = { ...current, ...safePatch, state: next, lastTransitionAt: new Date().toISOString() };
     return writeObligationLocked(mailDir, agent, updated, current.revision ?? 0);
   });
 }

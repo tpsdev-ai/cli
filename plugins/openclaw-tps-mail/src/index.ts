@@ -1144,6 +1144,11 @@ export function setBeforeSettleEntryForTests(hook: typeof beforeSettleEntryForTe
   beforeSettleEntryForTests = hook;
 }
 
+let beforeReceiptScanForTests: ((inboundId: string) => void) | undefined;
+export function setBeforeReceiptScanForTests(hook: typeof beforeReceiptScanForTests): void {
+  beforeReceiptScanForTests = hook;
+}
+
 /** Test-only observer of settleScannedQuarantine's own outcome. */
 let quarantineOutcomeForTests: ((obligationId: string, outcome: string) => void) | undefined;
 export function setQuarantineOutcomeForTests(hook: typeof quarantineOutcomeForTests): void {
@@ -1176,14 +1181,21 @@ export function releaseObligationRetryForTests(obligationId: string): boolean {
  * is gone or terminal), or a VERIFIED live record state different from the last
  * verified baseline reopens a fresh budget. An unknown baseline never reopens.
  */
-function retryObligationRead(ctx: YieldContext, obligationId: string, error = "obligation check failed"): void {
+function retryObligationRead(
+  ctx: YieldContext,
+  obligationId: string,
+  error = "obligation check failed",
+  lastVerifiedState?: ObligationState,
+): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const entry = obligationRetries.get(obligationId);
   if (entry) {
     if (entry.kind === "scheduled") return; // one timer: its due time stands
     if (entry.kind === "running") {
       // The running check owns the next decision: record the request and leave
-      // the state (and the budget) untouched.
+      // the state (and the budget) untouched, keeping a verified arm read as
+      // its baseline.
+      if (lastVerifiedState !== undefined) entry.lastVerifiedState = lastVerifiedState;
       entry.recheckWanted = true;
       return;
     }
@@ -1205,17 +1217,25 @@ function retryObligationRead(ctx: YieldContext, obligationId: string, error = "o
     scheduleObligationRetry(ctx, obligationId, 0, error, result.record.state);
     return;
   }
-  scheduleObligationRetry(ctx, obligationId, 0, error);
+  scheduleObligationRetry(ctx, obligationId, 0, error, lastVerifiedState);
 }
 
 /** A deferral re-check (an event, or an arm deferred to the retry state) only
  *  sets recheckWanted; a reported failure also records the error on a running
  *  check, so an exhaustion reached from its completion names that error. */
-function reportObligationFailure(ctx: YieldContext, obligationId: string, error = "obligation check failed"): void {
+function reportObligationFailure(
+  ctx: YieldContext,
+  obligationId: string,
+  error = "obligation check failed",
+  lastVerifiedState?: ObligationState,
+): void {
   if (!isLiveContext(ctx) || armedDeadlines.has(obligationId)) return;
   const entry = obligationRetries.get(obligationId);
-  if (entry && entry.kind === "running") entry.lastError = error;
-  retryObligationRead(ctx, obligationId, error);
+  if (entry && entry.kind === "running") {
+    entry.lastError = error;
+    if (lastVerifiedState !== undefined) entry.lastVerifiedState = lastVerifiedState;
+  }
+  retryObligationRead(ctx, obligationId, error, lastVerifiedState);
 }
 
 /** Remember the state a VERIFIED read saw, so the cap and the reopen rule keep
@@ -1997,7 +2017,7 @@ function markDelivering(mailDir: string, agent: string, inboundId: string, log: 
 type ArmDeadlineOutcome =
   | { outcome: "armed" }
   | { outcome: "refused"; reason: "inactive" | "gone" | "terminal" | "moved" | "injected" | "scheduled" }
-  | { outcome: "error"; error: string };
+  | { outcome: "error"; error: string; verifiedState?: ObligationState };
 
 /** Arm (or re-arm) the yield deadline from the record's deadlineAt, reporting
  *  whether a timer was armed. cli#1059: a caller must be able to tell a failed
@@ -2069,20 +2089,30 @@ function armDeadlineOnce(
     const currentDeadline = usableDeadline(rec.deadlineAt);
     const at = currentDeadline ?? usableDeadline(deadlineAt) ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
     const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
-    updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, {
-      from: rec.state,
-      revision: rec.revision ?? 0,
-    });
+    recordVerifiedRetryState(obligationId, rec.state);
+    try {
+      updated = transitionObligation(ctx.mailDir, ctx.agent, ctx.inboundId, next, { ...patch, deadlineAt: at }, ctx.log, {
+        from: rec.state,
+        revision: rec.revision ?? 0,
+      });
+    } catch (err: any) {
+      // The read verified this state even though the write did not land: carry
+      // it so an exhausted budget still has a baseline to compare against.
+      return { outcome: "error", error: err?.message ?? String(err), verifiedState: rec.state };
+    }
   }
   if (!updated) return { outcome: "refused", reason: "moved" };
   const at = updated.deadlineAt!;
   const remaining = Math.max(0, Date.parse(at) - Date.now());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearAccountTimer(prev.accountId, prev.timer);
+  // A deadline beyond the runtime's timer limit still arms: the callback reads
+  // the record again and waits out the remainder, so the delay is capped while
+  // the durable deadline keeps its original time.
   const timer = accountTimer(ctx, () => {
     armedDeadlines.delete(obligationId);
     void onDeadline(ctx, obligationId);
-  }, remaining);
+  }, Math.min(remaining, MAX_TIMER_DELAY_MS));
   if (typeof (timer as any).unref === "function") (timer as any).unref();
   armedDeadlines.set(obligationId, { accountId: ctx.accountId, timer });
   return { outcome: "armed" };
@@ -2102,7 +2132,12 @@ function usableDeadline(value: string | null | undefined): string | null {
 function retryAfterArmFailure(ctx: YieldContext, obligationId: string, arm: ArmDeadlineOutcome): void {
   if (arm.outcome === "armed") return;
   if (arm.outcome === "refused" && (arm.reason === "gone" || arm.reason === "terminal" || arm.reason === "inactive" || arm.reason === "scheduled")) return;
-  reportObligationFailure(ctx, obligationId, arm.outcome === "error" ? arm.error : `deadline re-arm refused (${arm.reason})`);
+  reportObligationFailure(
+    ctx,
+    obligationId,
+    arm.outcome === "error" ? arm.error : `deadline re-arm refused (${arm.reason})`,
+    arm.outcome === "error" ? arm.verifiedState : undefined,
+  );
 }
 
 /** A yield event asks for an arm. `armDeadline` consults the retry state
@@ -2653,6 +2688,16 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
       return;
     }
     const rescanned = await scanObligationReceipt(ctx, current.obligationId, moved.record, moved.record.replyId);
+    if (!isLiveContext(ctx)) return;
+    // The inbound can return while the rescan runs. Re-check cur/ so a restored
+    // record takes the gated recovery path (verification and stamp) instead of
+    // settling with the missing-cur allowance.
+    const curNow = lookupObligationCur(ctx, current.obligationId);
+    if (curNow.status === "error") return;
+    if (curNow.status === "present") {
+      await reconcileObligation(ctx, moved.record);
+      return;
+    }
     if (rescanned.status === "found") {
       const acked = await settleScannedReceipt(ctx, current.obligationId, moved.record, moved.record.replyId, { missingCur: true });
       if (acked === "stale") rearm();
@@ -2870,9 +2915,12 @@ function installYieldSubscription(api: any): boolean {
       if (typeof runId !== "string") return;
       const ctx = yieldContexts.get(runId);
       if (!ctx) return;
-      const rec = readObligation(ctx.mailDir, ctx.agent, ctx.inboundId);
-      if (!rec || TERMINAL_STATES.has(rec.state)) return;
-      armObligationFromEvent(ctx, rec.obligationId);
+      // The classified cleanup read releases a gone or terminal record; an
+      // unverified read is routed through the retry state, never treated as
+      // missing.
+      const result = readObligationForCleanup(ctx, runId);
+      if (result.status !== "found") return;
+      armObligationFromEvent(ctx, result.record.obligationId);
     },
   });
   return true;
@@ -3601,9 +3649,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         // Bind the scan and the ack to ONE record snapshot (cli#1059 round 2).
         // The settlement carries the scanned record's revision; the receipt scan
         // uses the expected reply identity.
+        beforeReceiptScanForTests?.(yieldCtx.inboundId);
         const scanSnapshot = readObligationResult(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
         const scanRecord = scanSnapshot.status === "found" ? scanSnapshot.record : created.record;
-        const expectedReplyId = postedReplyId ?? scanRecord.replyId;
+        const expectedReplyId = scanRecord.replyId ?? postedReplyId ?? undefined;
         const receipt = await scanObligationReceipt(yieldCtx, obId, scanRecord, expectedReplyId);
         if (!isLiveContext(yieldCtx)) return;
         if (receipt.status === "found") {
@@ -3805,7 +3854,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
           for (const filename of readdirSync(newDir)) {
             const filePath = resolve(newDir, filename);
             if (!seenFiles.has(filePath)) {
-              void processNewFile(agentId, filePath);
+              void processNewFile(agentId, filePath).catch((err) => {
+                log?.warn?.(`tps-mail: processNewFile error: ${err?.message ?? err}`);
+              });
             }
           }
         } catch { /* ignore */ }
