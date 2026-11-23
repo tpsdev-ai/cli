@@ -4,4 +4,7 @@
   recipient's `new/` cannot settle a later reply's obligation. A missing-cur
   rescan whose `cur/` lookup fails reports the failure through the bounded
   retry state instead of leaving the record with no next check, and the failed
-  attempt settles nothing.
+  attempt settles nothing. A deadline check that lost its owning retry entry
+  while the inbound verified writes nothing, and a missing-`cur/` settlement
+  re-checks `cur/` at the decision point so a restored inbound is verified and
+  stamped instead of acked on the record-only allowance.

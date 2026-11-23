@@ -6062,6 +6062,98 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  it("1059 r15 a deadline check released during inbound verification writes nothing", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r15-released-check";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", -1000);
+    const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const before = readFileSync(recordPath, "utf-8");
+    let entries = 0;
+    setBeforeSettleEntryForTests((id) => {
+      if (id !== inboundId) return;
+      entries++;
+      if (entries !== 1) return;
+      // The record is gone when the yield event looks, so the event releases the
+      // running check; the record returns before verification finishes.
+      rmSync(recordPath);
+      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+      writeFileSync(recordPath, before, "utf-8");
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(await pollUntil(() => entries > 0, 15000), "the deadline check reached the settlement").toBe(true);
+      await sleep(500);
+      expect(obligationFile(AGENT, inboundId)?.state, "the released check writes no terminal state").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"), "no nack is sent").toHaveLength(0);
+    } finally {
+      setBeforeSettleEntryForTests(undefined);
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059 r15 a cur/ entry that returns during the missing-cur rescan is verified and stamped", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r15-rescan-cur-returns";
+    const { obligationId, curPath } = seedVerifiedCur(inboundId, "yielded", -1000);
+    const curBytes = readFileSync(curPath, "utf-8");
+    const replyToId = (JSON.parse(JSON.parse(curBytes).body) as { messageId: string }).messageId;
+    rmSync(curPath);
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: AGENT, kind: "agent", timestamp: now, rationale: "agent reply", signature: null },
+    ];
+    let readPasses = 0;
+    setBeforeSettleReadForTests((id) => {
+      if (id !== inboundId) return;
+      readPasses++;
+      if (readPasses !== 1) return;
+      setBeforeSettleReadForTests(undefined);
+      // The first settlement is stale: the record now names reply B, whose
+      // receipt exists, so the rescan finds it.
+      transitionObligation(tempMailDir, AGENT, inboundId, "yielded", { replyId: "reply-b" }, undefined, {
+        from: "yielded",
+        revision: 0,
+      });
+      writeReceipt(tempMailDir, AGENT, {
+        replyId: "reply-b",
+        obligationId,
+        replyToId,
+        route: "local",
+        ts: now,
+        signedReply: JSON.stringify(signEnvelope(
+          { v: 1, from: AGENT, to: SENDER, body: "reply b", messageId: "reply-b", timestamp: now, replyToId, delegationChain: chain },
+          { [AGENT]: ANVIL_SEED },
+        )),
+      });
+    });
+    let entries = 0;
+    setBeforeSettleEntryForTests((id) => {
+      if (id !== inboundId) return;
+      entries++;
+      // The inbound returns after the caller's lookup, during the nested
+      // rescan; the rescanned receipt must go through the normal gate.
+      if (entries === 2) writeFileSync(curPath, curBytes, "utf-8");
+    });
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
+    try {
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "acked", 15000),
+        "the rescanned receipt acks the obligation",
+      ).toBe(true);
+      expect(
+        (JSON.parse(readFileSync(curPath, "utf-8")) as { ackedAt?: string }).ackedAt,
+        "the restored inbound is verified and stamped",
+      ).toBeDefined();
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setBeforeSettleEntryForTests(undefined);
+      setBeforeSettleReadForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
   it("1059 r13 a record whose inboundId does not match its lookup key is unverified", () => {
     const dir = resolve(tempMailDir, AGENT, ".obligations");
     mkdirSync(dir, { recursive: true });

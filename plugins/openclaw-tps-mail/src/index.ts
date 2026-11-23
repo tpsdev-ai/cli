@@ -1636,8 +1636,13 @@ async function settleObligation(
      *  path dispatches no agent reply, so the internal-inbound gate (which
      *  binds the dispatch path) does not apply. The only mail settlement may
      *  send is a nack to the recorded sender; delivery retries follow the
-     *  existing at-least-once contract. */
+     *  existing at-least-once contract. The allowance re-checks cur/ at the
+     *  decision point: a restored entry takes the normal gate, and a failed
+     *  lookup settles nothing. */
     missingCur?: boolean;
+    /** The caller's ownership predicate for a deadline or retry decision: when
+     *  the entry was released while the inbound verified, nothing is written. */
+    owns?: () => boolean;
     /** cli#1059 round 2: the record the evidence for this decision was gathered
      *  from. When a write lands in between (including a same-state deadline
      *  extension or reply replacement), the decision is stale: nothing is
@@ -1651,9 +1656,24 @@ async function settleObligation(
 ): Promise<"acked" | "unconfirmed" | "failed" | "none" | "stale" | "retry-scheduled" | "write-failed"> {
   if (!isLiveContext(ctx)) return "none";
   beforeSettleEntryForTests?.(ctx.inboundId);
-  if (!s.missingCur && !(await internalInbound(ctx))) return "none";
+  // The missing-cur allowance needs a clean lookup at the decision point: an
+  // inbound that returned since the caller's scan is settled through the normal
+  // gate, and a failed lookup settles nothing.
+  let missingCur = s.missingCur === true;
+  if (missingCur) {
+    const cur = lookupObligationCur(ctx, obligationId);
+    if (cur.status === "error") {
+      reportObligationFailure(ctx, obligationId, `cur/ lookup failed (${cur.code})`);
+      return "retry-scheduled";
+    }
+    if (cur.status === "present") missingCur = false;
+  }
+  if (!missingCur && !(await internalInbound(ctx))) return "none";
   if (!isLiveContext(ctx)) return "none";
   beforeSettleReadForTests?.(ctx.inboundId);
+  // A check that lost its owning entry while the inbound verified writes
+  // nothing; the entry's new owner decides.
+  if (s.owns !== undefined && !s.owns()) return "none";
   const result = readObligationForCleanup(ctx, obligationId);
   if (result.status === "unverified") return "retry-scheduled";
   if (result.status !== "found") return "none";
@@ -1682,8 +1702,8 @@ async function settleObligation(
       ctx,
       obligationId,
       s.reason,
-      s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {},
-      !s.missingCur,
+      missingCur ? { missingCurReason: MISSING_CUR_REASON } : {},
+      !missingCur,
       { from: rec.state, revision: rec.revision ?? 0, replyId: rec.replyId },
     );
   }
@@ -1700,7 +1720,7 @@ async function settleObligation(
         "unconfirmed",
         {
           failure: s.reason,
-          ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+          ...(missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
         },
         ctx.log,
         { from: rec.state, revision: rec.revision ?? 0 },
@@ -1763,7 +1783,7 @@ async function settleObligation(
       {
         failure: failedOn,
         nackPending: true,
-        ...(s.missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
+        ...(missingCur ? { missingCurReason: MISSING_CUR_REASON } : {}),
       },
       ctx.log,
       { from: rec.state, revision: rec.revision ?? 0 },
@@ -1802,12 +1822,12 @@ async function settleObligation(
   releaseObligationState(obligationId);
   // A missing cur/ entry has no record to stamp; the obligation record carries
   // the outcome (cli#1006).
-  if (!s.alreadyStamped && !s.missingCur) {
+  if (!s.alreadyStamped && !missingCur) {
     stampTerminalCur(ctx, "nack", { nackedAt: new Date().toISOString(), nackReason: failedOn });
   }
   // cli#389 round 10, item 1: AWAIT the one send, and record its outcome on the
   // record. The mail is owed until `nackSentAt` says otherwise (at-least-once).
-  const nackHandedOff = await deliverNack(ctx, failedOn, { allowMissingInbound: s.missingCur });
+  const nackHandedOff = await deliverNack(ctx, failedOn, { allowMissingInbound: missingCur });
   if (!isLiveContext(ctx)) return "none";
   ctx.log?.warn?.(
     `tps-mail: obligation for ${ctx.inboundId} FAILED: ${failedOn} — nacked` +
@@ -2314,6 +2334,7 @@ async function settleObligationAtDeadline(
         reason,
         // A restored inbound must pass the normal gate; the marker is historical.
         missingCur: cur.status === "missing",
+        ...(opts.owns ? { owns: opts.owns } : {}),
         decision,
       });
     } catch (err: any) {
