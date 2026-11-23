@@ -909,8 +909,9 @@ describe("branch pid record ownership (cli#730)", () => {
   test("a stale exit record for a reused pid does not reject a live daemon", async () => {
     const phase = "reused-pid";
     // The dead child is tracked under the live child's numeric pid, as a reused
-    // OS pid would be: the dead child's record must stay on its own tracker,
-    // not on the number, or the live wait rejects before its pause file appears.
+    // OS pid would be. The live child's pause file is written only after the
+    // gone-daemon report's whole budget (two EXIT_REPORT_MS waits), so a live
+    // tracker carrying the dead child's exit record fails the wait before it.
     const live = trackDaemon(
       spawn("node", ["-e", "setTimeout(() => {}, 30_000)"], { stdio: ["ignore", "ignore", "pipe"] }),
     );
@@ -923,15 +924,19 @@ describe("branch pid record ownership (cli#730)", () => {
     children.push(dead);
     expect(await dead.tracker.exited).toEqual({ code: 7, signal: null });
 
-    const name = `ready-${phase}-${pid}`;
+    const file = join(pauseDir, `ready-${phase}-${pid}`);
     const appear = new Promise<void>((resolveAppear) => {
       setTimeout(() => {
-        writeFileSync(join(pauseDir, name), "");
+        writeFileSync(file, "");
         resolveAppear();
-      }, 100);
+      }, 2 * EXIT_REPORT_MS + 500);
     });
-    expect(await waitForReady(phase, live.tracker)).toBe(join(pauseDir, name));
-    await appear;
+    try {
+      expect(await waitForReady(phase, live.tracker)).toBe(file);
+    } finally {
+      // The writer lands in this case's pause dir before afterEach removes it.
+      await appear;
+    }
   }, 20_000);
 
   test("an exit with stderr still held open reports the exit code", async () => {
