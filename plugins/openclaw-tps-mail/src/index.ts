@@ -2599,10 +2599,11 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
   }
 
   // The deadline has passed: apply the deadline's own terminal outcome. Each
-  // verdict travels with the snapshot its scan used. A record that moved is
-  // re-read: a gone, terminal or unverified read returns, and a future deadline
-  // re-arms, both without a rescan; a live record past its deadline goes on to
-  // the verdict.
+  // verdict travels with the snapshot its scan used. On the quarantine branch a
+  // `stale` result re-arms the deadline and returns. On the receipt-`none`
+  // branch a record that moved is re-read: a gone, terminal or unverified read
+  // returns, and a future deadline re-arms, both without a rescan; a live record
+  // past its deadline is rescanned before it is settled again.
   const reason = "yielded-without-resumption";
   const rearm = () =>
     retryAfterArmFailure(
