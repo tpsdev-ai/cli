@@ -1263,8 +1263,9 @@ function scheduleObligationRetry(
       recheckWanted: false,
     };
     obligationRetries.set(obligationId, running);
-    // A check owns the entry only while the map still holds `running`: a
-    // completion or reschedule after an await must not touch a replacement.
+    // This check owns the entry only while the map still holds its own
+    // `running` object: a completion or reschedule after an await must not
+    // touch a replacement.
     const owns = () => obligationRetries.get(obligationId) === running;
     void runObligationRetry(ctx, obligationId, attempt + 1)
       .then(() => {
