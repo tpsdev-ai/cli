@@ -196,7 +196,7 @@ describe("pid files", () => {
     expect(readFileSync(path, "utf-8")).toBe(bytes);
   });
 
-  test("mail relay stop refuses a recorded ps: token it cannot compare and sends no signal", async () => {
+  test("mail relay stop refuses a recorded ps: token it cannot compare and sends no signal to the recorded relay pid through process.kill", async () => {
     const node = Bun.which("node");
     if (!node) throw new Error("Node is required for the mail relay stop subprocess test");
     process.env.HOME = root;
@@ -229,9 +229,9 @@ describe("pid files", () => {
     const bytes = `${JSON.stringify({ pid, startToken: legacy })}\n`;
     writeFileSync(path, bytes);
 
-    // Record every signal the stop command sends, in the stop process itself and
-    // before delivery: the record is complete when spawnSync returns, whatever the
-    // recorder has handled by then, and it sees SIGKILL, which the marker cannot.
+    // Record non-probe calls to process.kill before forwarding them; synchronous
+    // appends make those calls observable when spawnSync returns, and the record
+    // sees SIGKILL, which the marker cannot.
     const signalLog = join(root, "stop-signals.log");
     const recordSignals =
       `import { appendFileSync } from "node:fs";` +
@@ -285,8 +285,8 @@ describe("launch snapshot sweep", () => {
 });
 
 /**
- * Record every signal this process sends by pid while `run` is pending (a
- * `kill(pid, 0)` probe is not a signal). `onSignal` sees only the supervisor, so
+ * Record every non-probe call to `process.kill` while `run` is pending (a
+ * `kill(pid, 0)` probe is not recorded). `onSignal` sees only the supervisor, so
  * an agent-directed send is visible only here.
  */
 async function recordingKills<T>(run: () => Promise<T>): Promise<{ result: T; kills: Array<[number, string]> }> {
