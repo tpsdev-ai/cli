@@ -196,7 +196,7 @@ describe("pid files", () => {
     expect(readFileSync(path, "utf-8")).toBe(bytes);
   });
 
-  test("mail relay stop refuses a recorded ps: token it cannot compare and sends no SIGTERM", async () => {
+  test("mail relay stop refuses a recorded ps: token it cannot compare and sends no signal", async () => {
     const node = Bun.which("node");
     if (!node) throw new Error("Node is required for the mail relay stop subprocess test");
     process.env.HOME = root;
@@ -229,12 +229,27 @@ describe("pid files", () => {
     const bytes = `${JSON.stringify({ pid, startToken: legacy })}\n`;
     writeFileSync(path, bytes);
 
+    // Record every signal the stop command sends, in the stop process itself and
+    // before delivery: the record is complete when spawnSync returns, whatever the
+    // recorder has handled by then, and it sees SIGKILL, which the marker cannot.
+    const signalLog = join(root, "stop-signals.log");
+    const recordSignals =
+      `import { appendFileSync } from "node:fs";` +
+      `const kill = process.kill.bind(process);` +
+      `process.kill = (target, signal) => {` +
+      ` if (signal !== 0 && signal !== "0") appendFileSync(${JSON.stringify(signalLog)}, target + " " + String(signal ?? "SIGTERM") + "\\n");` +
+      ` return kill(target, signal);` +
+      `};` +
+      `console.log("stop-signal-recorder:installed");`;
+
     const result = spawnSync(
       node,
       [
         ...PS_START_TOKENS_NODE_ARGS,
         "--import",
         "data:text/javascript,console.log('owner-token-runtime:'+process.release.name+':'+Boolean(process.versions.bun))",
+        "--import",
+        `data:text/javascript,${encodeURIComponent(recordSignals)}`,
         TPS_BIN,
         "mail",
         "relay",
@@ -244,6 +259,8 @@ describe("pid files", () => {
     );
     if (result.error) throw result.error;
     expect(result.stdout).toContain("owner-token-runtime:node:false");
+    expect(result.stdout).toContain("stop-signal-recorder:installed");
+    expect(existsSync(signalLog) ? readFileSync(signalLog, "utf-8") : "").toBe("");
     expect(result.status).not.toBe(0);
     expect(`${result.stdout ?? ""}${result.stderr ?? ""}`).toContain("identity cannot be verified");
     expect(readFileSync(path, "utf-8")).toBe(bytes);
@@ -267,6 +284,25 @@ describe("launch snapshot sweep", () => {
   });
 });
 
+/**
+ * Record every signal this process sends by pid while `run` is pending (a
+ * `kill(pid, 0)` probe is not a signal). `onSignal` sees only the supervisor, so
+ * an agent-directed send is visible only here.
+ */
+async function recordingKills<T>(run: () => Promise<T>): Promise<{ result: T; kills: Array<[number, string]> }> {
+  const kills: Array<[number, string]> = [];
+  const original = process.kill.bind(process);
+  const restore = patchShared(process, "kill", ((target: number, signal?: string | number) => {
+    if (signal !== 0 && signal !== "0") kills.push([target, String(signal ?? "SIGTERM")]);
+    return original(target, signal);
+  }) as typeof process.kill);
+  try {
+    return { result: await run(), kills };
+  } finally {
+    restore();
+  }
+}
+
 describe("released-agent identity", () => {
   test("a live released agent recorded as a proc: token against its live ps: token is a survivor", async () => {
     forcePsStartTokens();
@@ -276,11 +312,12 @@ describe("released-agent identity", () => {
     const signalled: number[] = [];
     try {
       expect(releasedAgentIdentity({ pid, startToken: "proc:1" })).toBe("unknown");
-      const stop = await stopLaunchProcesses(
+      const { result: stop, kills } = await recordingKills(() => stopLaunchProcesses(
         { supervisor: null, agent: { pid, startToken: "proc:1" } },
         "SIGTERM",
         { boundMs: 50, hooks: { startToken: () => live, onSignal: (signalledPid) => signalled.push(signalledPid) } },
-      );
+      ));
+      expect(kills.filter(([target]) => target === pid)).toEqual([]);
       expect(stop.stopped).toBe(false);
       expect(stop.survivors).toEqual([pid]);
       expect(signalled).toEqual([]);
@@ -299,11 +336,12 @@ describe("released-agent identity", () => {
     const signalled: number[] = [];
     try {
       expect(releasedAgentIdentity({ pid, startToken: legacy })).toBe("unknown");
-      const stop = await stopLaunchProcesses(
+      const { result: stop, kills } = await recordingKills(() => stopLaunchProcesses(
         { supervisor: null, agent: { pid, startToken: legacy } },
         "SIGTERM",
         { boundMs: 50, hooks: { onSignal: (signalledPid) => signalled.push(signalledPid) } },
-      );
+      ));
+      expect(kills.filter(([target]) => target === pid)).toEqual([]);
       expect(stop.stopped).toBe(false);
       expect(stop.survivors).toEqual([pid]);
       expect(signalled).toEqual([]);
@@ -321,11 +359,12 @@ describe("released-agent identity", () => {
     expect(legacy).not.toBe(pinned);
     try {
       expect(releasedAgentIdentity({ pid, startToken: legacy }, () => pinned)).toBe("unknown");
-      const stop = await stopLaunchProcesses(
+      const { result: stop, kills } = await recordingKills(() => stopLaunchProcesses(
         { supervisor: null, agent: { pid, startToken: legacy } },
         "SIGTERM",
         { boundMs: 50, hooks: { startToken: () => pinned } },
-      );
+      ));
+      expect(kills.filter(([target]) => target === pid)).toEqual([]);
       expect(stop.stopped).toBe(false);
       expect(stop.survivors).toEqual([pid]);
       expect(() => process.kill(pid, 0)).not.toThrow();
