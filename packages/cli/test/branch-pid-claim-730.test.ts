@@ -963,7 +963,9 @@ describe("branch pid record ownership (cli#730)", () => {
       grandchildPid = await waitFor(
         () => {
           try {
-            return Number(readFileSync(grandchildFile, "utf8"));
+            // The file is created before the pid is written, so an empty read means "not yet".
+            const pid = Number(readFileSync(grandchildFile, "utf8").trim());
+            return Number.isInteger(pid) && pid > 0 ? pid : null;
           } catch {
             return null;
           }
