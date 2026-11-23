@@ -1231,10 +1231,11 @@ export interface ReceiptScanOptions {
  *
  *   (g) THE REPLY BINDING (cli#389 round 6, item 1): when the obligation record
  *       KNOWS the reply it was discharged by (`replyId`, recorded at the posted
- *       transition), a receipt must carry the same `replyId`. Only the forms
- *       that carry a reply id take part: the metadata receipt (1) and the bridge
- *       record (f). A posted marker record (2) is the delivered mail itself and
- *       names no separate reply id, so there is nothing to pin there.
+ *       transition), a receipt must name that reply. The metadata receipt (1)
+ *       and the bridge record (f) carry it as `replyId`; a posted marker record
+ *       (2) carries it as its own `id`, the reply id the delivery wrote. So all
+ *       three forms are pinned when the record knows a reply id, and none is
+ *       when it does not.
  *
  * WHAT THE SIGNATURE CHECK PROVES, AND WHAT IT DOES NOT: it proves the record
  * carries a reply signed by the obligated agent's key (the key Flair holds for
@@ -1335,6 +1336,7 @@ export async function scanForReceipt(
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
+        if (expectedReplyId !== undefined && record?.id !== expectedReplyId) continue;
         if (!(await verified(recordReceiptEnvelope(record)))) continue;
         return { status: "found", path };
       }

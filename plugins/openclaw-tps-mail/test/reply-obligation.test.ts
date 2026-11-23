@@ -38,7 +38,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 // Import the plugin — default export gives us { register }.
-import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setBeforeReceiptScanForTests, setQuarantineOutcomeForTests, setObligationTimerCapForTests, releaseObligationRetryForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, obligationStateForTests, setArmDeadlineFaultForTests, setObligationCurLookupFaultForTests, setObligationRetryDelaysForTests, setObligationRetryFaultForTests, setBeforeArmReadForTests, setBeforeSettleReadForTests, setBeforeRetryCapReadForTests, setBeforeSettleEntryForTests, setBeforeReceiptScanForTests, setQuarantineOutcomeForTests, setObligationTimerCapForTests, setObligationNowForTests, releaseObligationRetryForTests } from "../src/index.js";
 import { createObligation, transitionObligation, setBeforeTransitionForTests, sweepTerminalObligations, writeReceipt, readObligation, readObligationResult, writeObligation, listObligations } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -6025,6 +6025,43 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  it("1059 r15 a moved reply id does not accept an earlier reply's posted file", async () => {
+    seedSigningKeys();
+    const h = await start(AGENT, SENDER, { localSender: true });
+    const inboundId = h.inboundId;
+    let injected = false;
+    setBeforeReceiptScanForTests((id) => {
+      if (id !== inboundId || injected) return;
+      injected = true;
+      setBeforeReceiptScanForTests(undefined);
+      const current = readObligation(tempMailDir, AGENT, inboundId)!;
+      transitionObligation(tempMailDir, AGENT, inboundId, current.state, { replyId: "reply-b" }, undefined, {
+        from: current.state,
+        revision: current.revision ?? 0,
+      });
+      // Reply A's posted file is left in the recipient's new/.
+    });
+    try {
+      await h.deliver("final answer", "final");
+      h.settle();
+      expect(await pollUntil(() => injected, 15000), "the record was replaced before the scan").toBe(true);
+      await sleep(500);
+      expect(
+        readdirSync(resolve(tempMailDir, SENDER, "new")).filter((name) => name.endsWith(".json")).length,
+        "reply A's posted file is still there",
+      ).toBeGreaterThan(0);
+      expect(obligationFile(AGENT, inboundId)?.replyId).toBe("reply-b");
+      expect(
+        obligationFile(AGENT, inboundId)?.state,
+        "reply A's posted file does not ack reply B",
+      ).not.toBe("acked");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setBeforeReceiptScanForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
   it("1059 r13 a record whose inboundId does not match its lookup key is unverified", () => {
     const dir = resolve(tempMailDir, AGENT, ".obligations");
     mkdirSync(dir, { recursive: true });
@@ -6111,6 +6148,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     seedSigningKeys();
     const inboundId = "msg-1059-r14-rescan-cur-error";
     const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    const prevDelays = setObligationRetryDelaysForTests([60000, 60000, 60000]);
     setBeforeSettleReadForTests((id) => {
       if (id !== inboundId) return;
       setBeforeSettleReadForTests(undefined);
@@ -6138,6 +6176,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(rec?.replyId, "the moved reply is left in place").toBe("reply-moved");
       expect(rec?.failure, "no failure is recorded").toBeUndefined();
       expect(rec?.nackSentAt, "no nack stamp is written to the record").toBeUndefined();
+      const retry = obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+      expect(retry, "the failed lookup schedules a bounded retry").toBeDefined();
+      expect(retry!.dueAt, "the retry waits for its bounded delay").toBeGreaterThan(Date.now());
       expect(
         existsSync(resolve(tempMailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`)),
         "no cur/ record is created to stamp",
@@ -6146,6 +6187,8 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally {
       setObligationCurLookupFaultForTests(undefined);
       setBeforeSettleReadForTests(undefined);
+      releaseObligationRetryForTests(obligationId);
+      setObligationRetryDelaysForTests(prevDelays);
       await h.stop();
     }
   }, 40000);
@@ -6153,6 +6196,10 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
   it("1059 r14 a capped deadline timer re-arms for the remainder and settles at the original deadline", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r14-timer-cap-fires";
+    // The plugin reads this clock; it stays still through startup, so the
+    // capped wake-up is observed before the deadline can arrive.
+    let clock = Date.now();
+    setObligationNowForTests(() => clock);
     const { obligationId } = seedVerifiedCur(inboundId, "yielded", 1500);
     const seededDeadline = obligationFile(AGENT, inboundId)!.deadlineAt;
     const prevCap = setObligationTimerCapForTests(300);
@@ -6172,16 +6219,21 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
         obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
         "the remainder is re-armed",
       ).toBe(true);
-      expect(Date.now(), "the original deadline is still ahead").toBeLessThan(Date.parse(seededDeadline!));
+      expect(clock, "the original deadline is still ahead").toBeLessThan(Date.parse(seededDeadline!));
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack before the deadline").toHaveLength(0);
+      // Advance the controlled clock past the deadline. The nack is sent after
+      // the failed state is written, so wait for the mail, not only the state.
+      clock = Date.parse(seededDeadline!) + 1000;
       expect(
-        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 4000),
-        "the record settles at the original deadline",
+        await pollUntil(() => nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption").length > 0, 4000),
+        "the nack lands at the original deadline",
       ).toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record settles at the original deadline").toBe("failed");
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"), "one nack at the deadline").toHaveLength(1);
     } finally {
       setObligationTimerCapForTests(prevCap);
       setBeforeArmReadForTests(undefined);
+      setObligationNowForTests(undefined);
       await h.stop();
     }
   }, 40000);

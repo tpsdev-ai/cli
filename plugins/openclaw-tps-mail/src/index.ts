@@ -1154,6 +1154,16 @@ export function setObligationTimerCapForTests(ms: number | undefined): number | 
   return prev;
 }
 
+/** Test-only clock for the deadline decisions: a test can hold time still while
+ *  an arm settles, then advance past the deadline. Undefined uses Date.now. */
+let obligationNowForTests: (() => number) | undefined;
+export function setObligationNowForTests(now: (() => number) | undefined): void {
+  obligationNowForTests = now;
+}
+function obligationNow(): number {
+  return obligationNowForTests?.() ?? Date.now();
+}
+
 let beforeReceiptScanForTests: ((inboundId: string) => void) | undefined;
 export function setBeforeReceiptScanForTests(hook: typeof beforeReceiptScanForTests): void {
   beforeReceiptScanForTests = hook;
@@ -1413,14 +1423,14 @@ async function runObligationRetry(ctx: YieldContext, obligationId: string, attem
   if (!current || current.kind !== "running") return;
   current.lastVerifiedState = rec.state;
   const parsedDeadline = rec.deadlineAt === null ? NaN : Date.parse(rec.deadlineAt);
-  if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
+  if (!Number.isFinite(parsedDeadline) || parsedDeadline > obligationNow()) {
     // A record whose deadline is null or unparseable must ARM, never settle:
     // its first arm may have failed before it could write a deadline (e.g. a
     // busy mailbox lock), so settling here would nack a fresh yield about a
     // second into a full deadline window.
     const at = Number.isFinite(parsedDeadline)
       ? rec.deadlineAt!
-      : new Date(Date.now() + obligationDeadlineMs()).toISOString();
+      : new Date(obligationNow() + obligationDeadlineMs()).toISOString();
     const armed = armDeadlineNow(ctx, obligationId, at);
     if (armed.outcome === "armed") return clearObligationRetry(obligationId);
     if (armed.outcome === "refused" && armed.reason === "scheduled") return;
@@ -2097,7 +2107,7 @@ function armDeadlineOnce(
     // may predate a same-state extension that landed before this read, and
     // arming with it would overwrite the extension.
     const currentDeadline = usableDeadline(rec.deadlineAt);
-    const at = currentDeadline ?? usableDeadline(deadlineAt) ?? new Date(Date.now() + obligationDeadlineMs()).toISOString();
+    const at = currentDeadline ?? usableDeadline(deadlineAt) ?? new Date(obligationNow() + obligationDeadlineMs()).toISOString();
     const next: ObligationState = rec.state === "pending" || rec.state === "yielded" ? "yielded" : rec.state;
     recordVerifiedRetryState(obligationId, rec.state);
     try {
@@ -2113,7 +2123,7 @@ function armDeadlineOnce(
   }
   if (!updated) return { outcome: "refused", reason: "moved" };
   const at = updated.deadlineAt!;
-  const remaining = Math.max(0, Date.parse(at) - Date.now());
+  const remaining = Math.max(0, Date.parse(at) - obligationNow());
   const prev = armedDeadlines.get(obligationId);
   if (prev) clearAccountTimer(prev.accountId, prev.timer);
   // A deadline beyond the runtime's timer limit still arms: the callback reads
@@ -2253,14 +2263,14 @@ async function settleObligationAtDeadline(
     // the reopen rule must see what this decision saw.
     recordVerifiedRetryState(obligationId, rec.state);
     const parsedDeadline = rec.deadlineAt === null ? NaN : Date.parse(rec.deadlineAt);
-    if (!Number.isFinite(parsedDeadline) || parsedDeadline > Date.now()) {
+    if (!Number.isFinite(parsedDeadline) || parsedDeadline > obligationNow()) {
       // The deadline moved forward after this check began (cli#1059 round 2):
       // re-arm from the fresh record rather than settling at the old deadline.
       // A null or unparseable deadline has no due time to settle, so it arms a
       // fresh window instead of failing a live record.
       const at = Number.isFinite(parsedDeadline)
         ? rec.deadlineAt!
-        : new Date(Date.now() + obligationDeadlineMs()).toISOString();
+        : new Date(obligationNow() + obligationDeadlineMs()).toISOString();
       const armed = opts.owner
         ? armDeadlineNow(ctx, obligationId, at)
         : armDeadline(ctx, obligationId, at);
@@ -2703,7 +2713,12 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
     // record takes the gated recovery path (verification and stamp) instead of
     // settling with the missing-cur allowance.
     const curNow = lookupObligationCur(ctx, current.obligationId);
-    if (curNow.status === "error") return;
+    if (curNow.status === "error") {
+      // Nothing settles on an inconclusive lookup, but the record must not wait
+      // for another event: a bounded retry re-reads it and the inbound.
+      reportObligationFailure(ctx, current.obligationId, `cur/ lookup failed (${curNow.code})`);
+      return;
+    }
     if (curNow.status === "present") {
       await reconcileObligation(ctx, moved.record);
       return;
