@@ -6,6 +6,8 @@
  */
 import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
 import { type Dirent, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, readlinkSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -24,7 +26,7 @@ const TPS_BIN = resolve(import.meta.dir, "../dist/bin/tps.js");
 const WAIT_MS = 20_000;
 const EXIT_MS = 30_000;
 const STDERR_TAIL_BYTES = 4 * 1024;
-/** How long a gone daemon's "close" may lag its pid disappearing. */
+/** How long a gone daemon's report waits for its exit status, and then for its stderr pipe to close. */
 const EXIT_REPORT_MS = 2_000;
 
 let root: string;
@@ -41,7 +43,7 @@ interface DaemonExit {
   signal: NodeJS.Signals | null;
 }
 
-/** One child's exit status and the last STDERR_TAIL_BYTES of its stderr. */
+/** One child's exit status and the last STDERR_TAIL_BYTES of the stderr read from it so far. */
 interface DaemonExitState {
   status: DaemonExit | null;
   stderr: Buffer;
@@ -52,6 +54,8 @@ interface DaemonTracker {
   pid: number;
   state: DaemonExitState;
   exited: Promise<DaemonExit>;
+  /** Settles on "close", after the child's piped stderr has ended. */
+  closed: Promise<void>;
 }
 
 type TrackedChild = ChildProcess & { tracker: DaemonTracker };
@@ -159,6 +163,9 @@ function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<T | nu
 async function daemonExitReport(daemon: DaemonTracker | undefined): Promise<string> {
   if (daemon === undefined) return "daemon pid unknown";
   const recorded = daemon.state.status ?? (await settleWithin(daemon.exited, EXIT_REPORT_MS));
+  // "exit" can land before the last stderr chunk; "close" follows that chunk,
+  // unless something else holds the pipe open: the tail is then what was read.
+  await settleWithin(daemon.closed, EXIT_REPORT_MS);
   const status =
     recorded === null
       ? "exit status not captured"
@@ -177,12 +184,19 @@ function pauseFile(phase: string, pid: number | undefined): string | undefined {
   return entries.includes(name) ? name : undefined;
 }
 
+/** A gone daemon's exit report and process state; undefined while it runs or when it is not tracked. */
+async function goneReport(daemon: DaemonTracker | undefined): Promise<string | undefined> {
+  if (daemon === undefined || (daemon.state.status === null && !pidExited(daemon.pid))) return undefined;
+  return `${await daemonExitReport(daemon)}; ${daemonState(daemon.pid)}`;
+}
+
 /**
  * Wait for `phase`'s pause file. With the daemon's tracker, the file waited for
  * is that child's own exact name, so a sibling pid that shares a prefix cannot
- * satisfy it, and a daemon that has exited can never write it: the wait then
- * fails at once, naming the exit status and the stderr tail, instead of
- * waiting out the timeout for a file that can no longer appear.
+ * satisfy it. Once that child is gone the wait stops instead of waiting out
+ * WAIT_MS, and its error carries the gone daemon's report. When `failure` (the
+ * start's own predicate) reports, its error is thrown instead, with that report
+ * appended once the daemon is gone, so its EADDRINUSE code reaches the port retry.
  */
 async function waitForReady(
   phase: string,
@@ -190,17 +204,24 @@ async function waitForReady(
   failure?: () => Error | undefined,
 ): Promise<string> {
   const deadline = Date.now() + WAIT_MS;
+  const withReport = (failed: Error, report: string | undefined): Error => {
+    if (report !== undefined) failed.message += `; pause ${phase}: ${report}`;
+    return failed;
+  };
   for (;;) {
     const failed = failure?.();
-    if (failed) throw failed;
+    if (failed) throw withReport(failed, await goneReport(daemon));
     const name = pauseFile(phase, daemon?.pid);
     if (name !== undefined) return join(pauseDir, name);
-    if (daemon !== undefined && (daemon.state.status !== null || pidExited(daemon.pid))) {
-      // A daemon may write its file and then exit; check once more before
-      // reporting the pause as never written.
-      const late = pauseFile(phase, daemon.pid);
+    const report = await goneReport(daemon);
+    if (report !== undefined) {
+      // The report waited (bounded) for the exit and the stderr pipe: the daemon
+      // may have written its file before exiting, and a bind failure may be in that stderr.
+      const late = pauseFile(phase, daemon?.pid);
       if (late !== undefined) return join(pauseDir, late);
-      throw new Error(`pause ${phase} never appeared: ${await daemonExitReport(daemon)}; ${daemonState(daemon.pid)}`);
+      const failedLate = failure?.();
+      if (failedLate) throw withReport(failedLate, report);
+      throw new Error(`pause ${phase} never appeared: ${report}`);
     }
     if (Date.now() >= deadline) {
       const failed = failure?.();
@@ -376,6 +397,9 @@ function trackDaemon(child: ChildProcess, pid = child.pid): TrackedChild {
   const exited = new Promise<DaemonExit>((resolveWait) => {
     resolveExited = resolveWait;
   });
+  const closed = new Promise<void>((resolveWait) => {
+    child.once("close", () => resolveWait());
+  });
   const record = (code: number | null, signal: NodeJS.Signals | null): void => {
     if (state.status !== null) return;
     state.status = { code, signal };
@@ -387,10 +411,12 @@ function trackDaemon(child: ChildProcess, pid = child.pid): TrackedChild {
   child.once("close", record);
   child.stderr?.on("data", (chunk: Buffer) => {
     const tail = Buffer.concat([state.stderr, chunk]);
-    state.stderr = tail.length > STDERR_TAIL_BYTES ? tail.subarray(tail.length - STDERR_TAIL_BYTES) : tail;
+    // A copy in its own allocation: a view would keep all of `tail` alive.
+    state.stderr = Buffer.alloc(Math.min(tail.length, STDERR_TAIL_BYTES));
+    tail.copy(state.stderr, 0, tail.length - state.stderr.length);
   });
   const tracked = child as TrackedChild;
-  tracked.tracker = { pid, state, exited };
+  tracked.tracker = { pid, state, exited, closed };
   return tracked;
 }
 
@@ -912,7 +938,7 @@ describe("branch pid record ownership (cli#730)", () => {
     const phase = "held-stderr";
     const grandchildFile = join(root, "grandchild.pid");
     // The detached grandchild inherits stderr, so the parent's piped stderr
-    // never drains: only the "exit" event carries the status.
+    // stays open past the report's wait for "close": only "exit" carries the status.
     const script = `
       import { spawn } from "node:child_process";
       import { writeFileSync } from "node:fs";
@@ -957,14 +983,87 @@ describe("branch pid record ownership (cli#730)", () => {
     }
   }, 20_000);
 
-  test("a multi-byte stderr flood keeps the tail within 4096 bytes", async () => {
-    const script = 'process.stderr.write("€".repeat(5000)); process.exit(4);';
+  test("a multi-byte stderr flood keeps its last 4096 bytes, in an allocation of that size", async () => {
+    const script = 'process.stderr.write("€".repeat(5000) + "TAIL_END"); process.exit(4);';
     const daemon = trackDaemon(spawn("node", ["-e", script], { stdio: ["ignore", "ignore", "pipe"] }));
     children.push(daemon);
 
     expect(await waitForExit(daemon)).toEqual({ code: 4, signal: null });
-    expect(daemon.tracker.state.stderr.length).toBeLessThanOrEqual(STDERR_TAIL_BYTES);
-    expect(daemon.tracker.state.stderr.toString("utf8")).toContain("€");
+    const tail = daemon.tracker.state.stderr;
+    expect(tail.length).toBe(STDERR_TAIL_BYTES);
+    expect(tail.buffer.byteLength).toBe(STDERR_TAIL_BYTES);
+    expect(tail.toString("utf8").endsWith("TAIL_END")).toBe(true);
+  }, 20_000);
+
+  test("a daemon killed by a signal is reported by that signal, also under the start's failure predicate", async () => {
+    const phase = "killed-by-signal";
+    const daemon = trackDaemon(
+      spawn("node", ["-e", "setTimeout(() => {}, 30_000)"], { stdio: ["ignore", "ignore", "pipe"] }),
+    );
+    children.push(daemon);
+    daemon.kill("SIGKILL");
+    expect(await daemon.tracker.exited).toEqual({ code: null, signal: "SIGKILL" });
+
+    const gone = await waitForReady(phase, daemon.tracker).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(gone?.message).toContain(`pause ${phase} never appeared: daemon ${daemon.pid} killed by SIGKILL`);
+
+    // startDaemonAttempt's predicate words this exit as "code null"; the report
+    // appended to its error names the signal, the phase and the pause dir.
+    const predicate = await waitForReady(phase, daemon.tracker, () => new Error("daemon exited (code null) before listening")).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(predicate?.message).toStartWith("daemon exited (code null) before listening; ");
+    expect(predicate?.message).toContain(`pause ${phase}: daemon ${daemon.pid} killed by SIGKILL`);
+    expect(predicate?.message).toContain("pause dir: ");
+  }, 20_000);
+
+  test("a pause file that appears after the wait's first scan is accepted once the daemon is gone", async () => {
+    const phase = "late-pause-file";
+    const daemon = trackDaemon(spawn("node", ["-e", "process.exit(0)"], { stdio: ["ignore", "ignore", "pipe"] }));
+    children.push(daemon);
+    await daemon.tracker.closed;
+    const file = join(pauseDir, `ready-${phase}-${daemon.pid}`);
+
+    // waitForReady scans the pause dir before its first await, so this file,
+    // written right after the call, is first seen by the recheck after the report.
+    const waiting = waitForReady(phase, daemon.tracker);
+    writeFileSync(file, "");
+    expect(await waiting).toBe(file);
+  }, 20_000);
+
+  test("a bind failure that reaches stderr after the daemon's exit is still retried on a new port", async () => {
+    // A stand-in child scripts the order that hides the bind failure from the
+    // wait's first check: "exit", then the stderr, then "close".
+    const phase = "listening-before-steady-state";
+    let attempts = 0;
+    let first: Error | undefined;
+    await withPortRetry(async (port) => {
+      attempts += 1;
+      if (attempts > 1) return "second attempt";
+      const child = Object.assign(new EventEmitter(), { pid: reapedPid(), stderr: new PassThrough() });
+      const daemon = trackDaemon(child as unknown as ChildProcess);
+      let stderr = "";
+      child.stderr.on("data", (chunk) => {
+        stderr += String(chunk);
+      });
+      child.emit("exit", 1, null);
+      setTimeout(() => {
+        child.stderr.once("end", () => child.emit("close", 1, null));
+        child.stderr.end(`Error: listen EADDRINUSE: address already in use 127.0.0.1:${port}\n`);
+      }, 50);
+      return await waitForReady(phase, daemon.tracker, () => bindErrorIn(stderr)).catch((error: Error) => {
+        first = error;
+        throw error;
+      });
+    });
+    expect(attempts).toBe(2);
+    expect(first?.message).toStartWith("Error: listen EADDRINUSE");
+    expect(first?.message).toContain(`pause ${phase}: daemon `);
+    expect(first?.message).toContain("exit code 1");
   }, 20_000);
 
   test("a report that settles inside the deadline cancels its timer", async () => {
@@ -974,7 +1073,7 @@ describe("branch pid record ownership (cli#730)", () => {
       resolveExited = resolveWait;
     });
     const firedBefore = reportTimerFires;
-    const report = daemonExitReport({ pid: 4321, state, exited });
+    const report = daemonExitReport({ pid: 4321, state, exited, closed: Promise.resolve() });
     resolveExited({ code: 0, signal: null });
 
     expect(await report).toContain("exit code 0");
