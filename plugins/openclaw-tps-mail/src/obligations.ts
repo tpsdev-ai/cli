@@ -354,8 +354,10 @@ export function createObligation(
   });
 }
 
-/** Test hook before the transition acquires its store lock. */
-let beforeTransitionForTests: ((inboundId: string) => void) | undefined;
+/** Test hook before the transition acquires its store lock. It receives the
+ *  state the transition targets, so a test that injects a failure can tell an
+ *  ack write from a re-arm or delivery write. */
+let beforeTransitionForTests: ((inboundId: string, next: ObligationState) => void) | undefined;
 export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTests): void {
   beforeTransitionForTests = hook;
 }
@@ -392,7 +394,7 @@ export function transitionObligation(
   log?: ObligationLog,
   expect?: { from: ObligationState; revision?: number; replyId?: string },
 ): ObligationRecord | null {
-  beforeTransitionForTests?.(inboundId);
+  beforeTransitionForTests?.(inboundId, next);
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
     if (!current) return null;

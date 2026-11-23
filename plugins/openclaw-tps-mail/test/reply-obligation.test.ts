@@ -5141,8 +5141,12 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const warnings: string[] = [];
     let writeThrows = false;
     let ackThrows = 0;
-    setBeforeTransitionForTests((id) => {
+    setBeforeTransitionForTests((id, next) => {
       if (id !== inboundId || !writeThrows) return;
+      // Count the ack transition only. A deadline timer can fire slightly
+      // before `deadlineAt` (timer rounding); the deadline path then re-arms
+      // instead of settling, and that re-arm is a different write.
+      if (next !== "acked") return;
       ackThrows++;
       throw new Error("injected ack write throw");
     });
@@ -5167,7 +5171,17 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       });
       writeThrows = true;
       expect(await pollUntil(() => ackThrows > 0, 15000), "the deadline's ack write threw").toBe(true);
-      await sleep(500);
+      // The sequence ends when the write-failed outcome has cleared the retry
+      // entry: wait for that event, not a fixed sleep.
+      expect(
+        await pollUntil(
+          () => warnings.some((line) => line.includes("could not record the ack")) &&
+            !obligationStateForTests().retries.some((r) => r.obligationId === obligationId) &&
+            !obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId),
+          15000,
+        ),
+        "the ack attempt ended and left no retry or deadline",
+      ).toBe(true);
       expect(ackThrows, "the ack write is attempted once").toBe(1);
       expect(
         obligationStateForTests().retries.some((r) => r.obligationId === obligationId),
