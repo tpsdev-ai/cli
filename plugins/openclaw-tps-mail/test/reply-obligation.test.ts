@@ -6068,31 +6068,36 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const { obligationId } = seedVerifiedCur(inboundId, "yielded", -1000);
     const recordPath = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
     const before = readFileSync(recordPath, "utf-8");
-    let entries = 0;
-    setBeforeSettleEntryForTests((id) => {
-      if (id !== inboundId) return;
-      entries++;
-      if (entries !== 1) return;
-      // The record is gone when the yield event looks, so the event releases the
-      // running check; the record returns before verification finishes.
-      rmSync(recordPath);
-      capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
-      writeFileSync(recordPath, before, "utf-8");
+    let released = false;
+    const h = await start(AGENT, SENDER, {
+      localSender: true,
+      noInbound: true,
+      beforeVerify: async () => {
+        if (released) return;
+        // Only the deadline check owns a retry entry; the startup reconcile
+        // verifies before any entry exists and must not release.
+        if (!obligationStateForTests().retries.some((r) => r.obligationId === obligationId)) return;
+        // Hold the inbound verification, release the running deadline check
+        // while that await is pending, then let the verification finish. The
+        // record is gone when the yield event looks, so the event releases the
+        // check; the record returns before the await resolves.
+        released = true;
+        rmSync(recordPath);
+        capturedSubscription.handle({ runId: obligationId, data: { yielded: true } });
+        writeFileSync(recordPath, before, "utf-8");
+      },
     });
-    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
     try {
-      expect(await pollUntil(() => entries > 0, 15000), "the deadline check reached the settlement").toBe(true);
+      expect(await pollUntil(() => released, 15000), "the deadline check paused during inbound verification").toBe(true);
       await sleep(500);
       expect(obligationFile(AGENT, inboundId)?.state, "the released check writes no terminal state").toBe("yielded");
       expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption"), "no nack is sent").toHaveLength(0);
     } finally {
-      setBeforeSettleEntryForTests(undefined);
-      setBeforeSettleReadForTests(undefined);
       await h.stop();
     }
   }, 40000);
 
-  it("1059 r15 a cur/ entry that returns during the missing-cur rescan is verified and stamped", async () => {
+  it("1059 r15 a cur/ entry that returns after the missing-cur rescan is verified and stamped", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r15-rescan-cur-returns";
     const { obligationId, curPath } = seedVerifiedCur(inboundId, "yielded", -1000);
@@ -6132,8 +6137,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     setBeforeSettleEntryForTests((id) => {
       if (id !== inboundId) return;
       entries++;
-      // The inbound returns after the caller's lookup, during the nested
-      // rescan; the rescanned receipt must go through the normal gate.
+      // The inbound returns after the rescan and its cur/ lookup, at the
+      // settlement decision point; the rescanned receipt must go through the
+      // normal gate.
       if (entries === 2) writeFileSync(curPath, curBytes, "utf-8");
     });
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
