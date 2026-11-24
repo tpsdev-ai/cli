@@ -423,6 +423,32 @@ export function removePrivateLaunchDir(dir: Pick<PrivateLaunchDir, "root">): voi
   }
 }
 
+/** What a stop keeps, with the path of each: the launch state always, and the
+ * caller's worktree when it kept one. */
+interface KeptPaths {
+  launchStateRoot: string;
+  worktree?: { path: string; base?: string };
+}
+
+/** The one survivor line both stop paths print (cli#1064): the signal path and
+ * the refusal path share it, so their wording cannot drift. It names what was
+ * kept, by absolute path — the launch state always, and the caller's worktree
+ * when it kept one — and the step that resolves it once the named pids have
+ * exited: removing those paths, with `git worktree prune` for the worktree's
+ * stale registration when the base repository is known (the remedy
+ * agent-lifecycle names for a purposefully removed worktree). */
+function survivorLine(survivors: readonly number[], kept: KeptPaths): string {
+  const roots = kept.worktree ? `${kept.worktree.path} ${kept.launchStateRoot}` : kept.launchStateRoot;
+  const what = kept.worktree
+    ? `the worktree ${kept.worktree.path} and the launch state ${kept.launchStateRoot}`
+    : `the launch state ${kept.launchStateRoot}`;
+  const prune = kept.worktree?.base ? ` && git -C ${kept.worktree.base} worktree prune` : "";
+  return (
+    `❌ pid ${survivors.join(", ")} may still be running; kept ${what}; ` +
+    `once those pids have exited, remove ${kept.worktree ? "them" : "it"} with: rm -rf ${roots}${prune}`
+  );
+}
+
 // ---------------------------------------------------------------------------
 // The child side — derive the canaries from the socket locator
 // ---------------------------------------------------------------------------
@@ -1040,6 +1066,20 @@ export async function launchAttested(
   // handle while it has not exited; the released agent is never signalled, only
   // read back by the identity recorded before its release. A second signal is
   // recorded and ignored: it must not re-enter the stop or cleanup path.
+  // What this stop keeps, with the path of each.
+  const keptPaths: KeptPaths = {
+    launchStateRoot: priv.root,
+    worktree: opts.worktreePath
+      ? {
+          path: opts.worktreePath,
+          base:
+            opts.worktreeBinding && opts.worktreeBinding.kind !== "none"
+              ? opts.worktreeBinding.baseWorkingTree
+              : undefined,
+        }
+      : undefined,
+  };
+
   let stopping = false;
   let interruptDone: Promise<void> | undefined;
   let interruptOutcome: number | undefined;
@@ -1066,8 +1106,7 @@ export async function launchAttested(
         // keep both, name what may still run, and exit with the refusal code
         // (78, or the supervised refusal code when supervised) without
         // re-raising the signal.
-        const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-        console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
+        console.error(survivorLine(stop.survivors, keptPaths));
         keepLaunchState = true;
         for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
         interruptOutcome = refusedCode;
@@ -1141,8 +1180,7 @@ export async function launchAttested(
     if (!stop.stopped) {
       // Name the cause first: the survivor line alone does not say why the launch was refused.
       const code = refuse(reason);
-      const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-      console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
+      console.error(survivorLine(stop.survivors, keptPaths));
       keepLaunchState = true;
       opts.onRefusalSurvivors?.(stop.survivors);
       return code;
