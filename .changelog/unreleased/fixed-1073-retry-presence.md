@@ -1,0 +1,1 @@
+- **The startup pre-scan's retry looks up `cur/` in positive-presence mode (#1073).** Past the 4096-name scan limit the retry now proves the obligation's inbound present from one matching entry, so a repaired path settles in the same process; a miss still reports `SCAN_LIMIT`, because absence is not provable that way. Refs #1059.
