@@ -364,15 +364,23 @@ function supervise(
   });
 }
 
+/**
+ * The report is null after a timeout: the watchdog can kill the driver mid-write,
+ * and a half-written report.json must not throw over the timeout diagnostic.
+ */
+function readDriverReport(root: string, timedOut: boolean): Report | null {
+  if (timedOut) return null;
+  const reportFile = join(root, "report.json");
+  return existsSync(reportFile) ? (JSON.parse(readFileSync(reportFile, "utf8")) as Report) : null;
+}
+
 async function runDriver(): Promise<SupervisedRun & { report: Report | null; root: string }> {
   const root = mkdtempSync(join(tmpdir(), "tps-real-gateway-"));
   const specFile = join(root, "spec.json");
   writeFileSync(specFile, JSON.stringify({ root, pluginDir: PLUGIN_DIR }), { mode: 0o600 });
   const node = process.env.TPS_LANE_NODE || "node";
   const run = await supervise(node, [DRIVER, specFile], { cwd: PLUGIN_DIR, env: { TPS_LANE_NODE: node } });
-  const reportFile = join(root, "report.json");
-  const report = existsSync(reportFile) ? (JSON.parse(readFileSync(reportFile, "utf8")) as Report) : null;
-  return { ...run, report, root };
+  return { ...run, report: readDriverReport(root, run.timedOut), root };
 }
 
 describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
@@ -1381,6 +1389,27 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
     expect(namedWaitBudgetMs({ stop: 1_000 })).toBe(named - SIGTERM_BUDGET_MS + 1_000);
   });
 
+  it("reads no report after a timeout, even with a half-written report.json", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-report-"));
+    try {
+      writeFileSync(join(root, "report.json"), '{"status": "incomplete"');
+      expect(readDriverReport(root, true)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never takes a 0 pid from an empty pid file", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-pid-"));
+    try {
+      const pidFile = join(root, "grandchild.pid");
+      writeFileSync(pidFile, "");
+      expect(await waitForPidFile(pidFile, 200)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("resolves successfully when the exited driver's process group is empty", async () => {
     const node = process.env.TPS_LANE_NODE || "node";
     const run = await supervise(node, ["-e", "process.exit(0);"], { timeoutMs: 1_500 });
@@ -1432,18 +1461,23 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
     const pidFile = join(root, "grandchild.pid");
     let grandchildPid: number | null = null;
     try {
+      // The descendant inherits the driver's stdio, so `close` on the driver's
+      // pipes cannot fire while it lives: only the watchdog's group kill can end it.
       const script = `
         import { spawn } from "node:child_process";
         import { writeFileSync } from "node:fs";
-        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: "ignore" });
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: ["ignore", "inherit", "inherit"] });
         writeFileSync(process.argv[1], String(grandchild.pid));
         setInterval(() => {}, 1000);
       `;
-      const run = await supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
+      const runPromise = supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
+      // Read the PID beside the run: cleanup needs it even if `supervise` does not return.
+      const recordedPid = await waitForPidFile(pidFile, 5_000);
+      if (recordedPid === null) throw new Error(`no descendant pid written to ${pidFile} within 5000ms`);
+      grandchildPid = recordedPid;
+      expect(await waitForNotRunning(recordedPid, 2_000)).toBe(true);
+      const run = await runPromise;
       expect(run.timedOut).toBe(true);
-      grandchildPid = Number(readFileSync(pidFile, "utf8").trim());
-      expect(Number.isInteger(grandchildPid) && grandchildPid > 0).toBe(true);
-      expect(await waitForNotRunning(grandchildPid, 2_000)).toBe(true);
     } finally {
       if (grandchildPid !== null && isProcessRunning(grandchildPid)) {
         try {
@@ -1476,6 +1510,24 @@ function isProcessRunning(pid: number): boolean {
     // No /proc entry: the zero-signal probe already answered.
   }
   return true;
+}
+
+/**
+ * A pid read straight from a file can be empty (the writer truncates first) or
+ * 0, and 0 must never reach a probe or a signal: it addresses this process group.
+ */
+async function waitForPidFile(pidFile: string, timeoutMs: number): Promise<number | null> {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+      // not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return null;
 }
 
 async function waitForNotRunning(pid: number, timeoutMs: number): Promise<boolean> {
