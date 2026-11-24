@@ -248,7 +248,7 @@ test("a changed live owner token is read again while polling", async () => {
   expect(reclaimed).not.toBeNull();
   reclaimed?.release();
   fs.mkdirSync(lockDir);
-  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "proc:old" }));
+  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "ps:old" }));
   const change = setTimeout(() => {
     token = "200";
     fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: `proc:${token}` }));

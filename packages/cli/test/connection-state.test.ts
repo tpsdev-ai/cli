@@ -208,9 +208,9 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-other-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:5001" });
     const raw = readFileSync(path);
-    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:b" });
+    const outcome = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:5001" });
     expect(outcome).toEqual({ kind: "other" });
     expect(readFileSync(path)).toEqual(raw);
   });
@@ -220,7 +220,7 @@ describe("connection-state", () => {
     process.env.HOME = home;
     const path = hostStatePath("x");
     // A simulated proc: mismatch makes the record reclaimable without the gate.
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:stale" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:5002" });
     const raw = readFileSync(path);
     const absentPath = hostStatePath("absent");
     let checked = 0;
@@ -229,7 +229,7 @@ describe("connection-state", () => {
       expect(existsSync(mailLockPath(hostStateLockRoot(recordPath)))).toBe(true);
       return false;
     };
-    const other = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", gate(path), 0, { startToken: () => "proc:live" });
+    const other = claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", gate(path), 0, { startToken: () => "proc:5003" });
     const absent = claimHostStateAt(absentPath, { ...completeState(), connectionId: "conn-a" }, "conn-a", gate(absentPath));
     expect(other).toEqual({ kind: "stopped" });
     expect(absent).toEqual({ kind: "stopped" });
@@ -242,7 +242,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-unverifiable-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:5004" });
     const raw = readFileSync(path);
     const outcome = claimHostStateAt(
       path,
@@ -399,7 +399,7 @@ describe("connection-state", () => {
       "conn-a",
       undefined,
       0,
-      { startToken: () => "proc:current-owner" },
+      { startToken: () => "proc:5005" },
     );
     expect(outcome).toEqual({ kind: "unverifiable" });
     expect(readFileSync(path)).toEqual(raw);
@@ -413,7 +413,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-token-unreadable-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:5006" });
     const raw = readFileSync(path);
     const outcome = claimHostStateAt(
       path,
@@ -470,7 +470,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-locked-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:b" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:5007" });
     const raw = readFileSync(path);
     const lockRoot = hostStateLockRoot(path);
     // A separate process takes the real record lock and holds it; the claim is
@@ -498,7 +498,7 @@ describe("connection-state", () => {
       const deadline = Date.now() + 15_000;
       while (!seen.includes("locked") && holder.exitCode === null && Date.now() < deadline) await Bun.sleep(10);
       expect({ seen, errText, exitCode: holder.exitCode }).toMatchObject({ seen: expect.stringContaining("locked") });
-      expect(() => claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:b" })).toThrow(
+      expect(() => claimHostStateAt(path, { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" }, "conn-a", undefined, 0, { startToken: () => "proc:5007" })).toThrow(
         `Host state record lock ${mailLockPath(lockRoot)} could not be acquired within 0 ms; refusing to write the host state record. The lock or its reclamation claim is held, or its owner could not be verified. Retry after any running tps command finishes; if none is running, remove ${lockRoot} and retry.`,
       );
       expect(readFileSync(path)).toEqual(raw);
@@ -521,7 +521,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-owned-other-token-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId, startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId, startToken: "proc:5008" });
     const raw = readFileSync(path);
     const startToken = mock(() => null);
     const outcome = refreshOwnedHostStateAt(
@@ -541,7 +541,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-clear-other-token-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId, startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId, startToken: "proc:5009" });
     const raw = readFileSync(path);
     const startToken = mock(() => null);
     expect(() => clearHostStateAt(path, "x", "conn-a", { startToken })).not.toThrow();
@@ -594,7 +594,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-owned-unverifiable-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:5010" });
     const raw = readFileSync(path, "utf8");
     const outcome = refreshOwnedHostStateAt(
       path,
@@ -674,7 +674,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-clear-unverifiable-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:other" });
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:5011" });
     const raw = readFileSync(path, "utf8");
     expect(() => clearHostStateAt(path, "x", connectionId, { startToken: () => null })).toThrow(
       `Host state record ${path} is present but this process's start token could not be read or compared, so its owner cannot be verified; the record was kept. Inspect it and remove it if no connector for that host is running.`,
