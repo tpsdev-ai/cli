@@ -3395,6 +3395,143 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  // ── cli#1073: the startup pre-scan's retry keeps the positive-presence
+  // lookup, so a match past the 4096-name scan limit proves the inbound is
+  // present while a miss still reports SCAN_LIMIT (an unproven absence).
+  it("1073 C1-a a repaired startup lookup settles in process while cur/ is past the scan limit", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-c1a-startup-repair-past-limit";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000, envelopeId });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const curPath = resolve(curDir, `${inboundId}.json`);
+    // A REAL dangling cur/ path: the entry's target is absent.
+    symlinkSync(resolve(curDir, "absent-cur"), curPath);
+    exceedCurScanLimit();
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([800, 800, 800]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the startup lookup error entered the bounded retry",
+      ).toBe(true);
+      // Repair: the real record replaces the dangling link. Nothing restarts.
+      unlinkSync(curPath);
+      writeFileSync(
+        curPath,
+        JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false }),
+        "utf-8",
+      );
+      const settled = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000);
+      expect(settled, "a later attempt settles the live obligation in this process").toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 60000);
+
+  it("1073 C1-b a startup AMBIGUOUS_ID repaired by removing the duplicate settles in process past the scan limit", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-c1b-startup-ambiguous-past-limit";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000, envelopeId });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const raw = JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false });
+    const curPath = resolve(curDir, `${inboundId}.json`);
+    const dupPath = resolve(curDir, `dup-${inboundId}.json`);
+    writeFileSync(curPath, raw, "utf-8");
+    writeFileSync(dupPath, raw, "utf-8");
+    exceedCurScanLimit();
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([800, 800, 800]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the startup lookup error entered the bounded retry",
+      ).toBe(true);
+      const startupLine = warnings.find((l) => l.includes("obligation-cur-lookup-failed"));
+      expect(startupLine, "the startup error is AMBIGUOUS_ID, not SCAN_LIMIT").toContain("AMBIGUOUS_ID");
+      // Repair: the duplicate goes away. The inbound itself was never touched.
+      unlinkSync(dupPath);
+      const settled = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000);
+      expect(settled, "a later attempt settles the live obligation in this process").toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 60000);
+
+  // Control for the fail-closed rule: an inbound that stays ABSENT past the
+  // scan limit must still exhaust without settling, with or without the fix.
+  it("1073 C1-c a startup SCAN_LIMIT whose inbound stays absent still exhausts: record open, no nack", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-c1c-startup-absent-past-limit";
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    exceedCurScanLimit();
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const before = readFileSync(path, "utf-8");
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([300, 300, 300]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((l) => l.includes("obligation-retry-exhausted")), 15000),
+        "an unproven absence exhausts the budget",
+      ).toBe(true);
+      const exhausted = warnings.filter((l) => l.includes("obligation-retry-exhausted"));
+      expect(exhausted[0]).toContain("SCAN_LIMIT");
+      await new Promise((r) => setTimeout(r, 200));
+      expect(readFileSync(path, "utf-8"), "the record is unchanged").toBe(before);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack").toHaveLength(0);
+      expect(obligationStateForTests().retries.find((r) => r.obligationId === obligationId)?.exhausted).toBe(true);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 60000);
+
+  // Control: under the scan limit the same AMBIGUOUS_ID repair settles as before.
+  it("1073 C1-d control: an AMBIGUOUS_ID repair below the scan limit settles in process", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-c1d-startup-ambiguous-below-limit";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000, envelopeId });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const raw = JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false });
+    const curPath = resolve(curDir, `${inboundId}.json`);
+    const dupPath = resolve(curDir, `dup-${inboundId}.json`);
+    writeFileSync(curPath, raw, "utf-8");
+    writeFileSync(dupPath, raw, "utf-8");
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([800, 800, 800]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the startup lookup error entered the bounded retry",
+      ).toBe(true);
+      const startupLine = warnings.find((l) => l.includes("obligation-cur-lookup-failed"));
+      expect(startupLine, "the startup error is AMBIGUOUS_ID, not SCAN_LIMIT").toContain("AMBIGUOUS_ID");
+      unlinkSync(dupPath);
+      const settled = await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000);
+      expect(settled, "a later attempt settles the live obligation in this process").toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 60000);
+
   it("1059-F the later lookup reports a dangling cur/ directory through the retry cap", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059f-later-dangling";

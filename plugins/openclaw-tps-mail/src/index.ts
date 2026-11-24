@@ -2609,10 +2609,20 @@ function lookupObligationCur(
   // path for a DIFFERENT id proves nothing, so the scan below decides.
   if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return { status: "present" };
   let error: string | undefined;
-  const found = findCurPath(ctx.mailDir, ctx.agent, ctx.inboundId, (path, code) => {
-    if (code === "ENOENT" && path === curDir) return;
-    error ??= code ?? "INVALID_JSON";
-  });
+  // A context with no proven path (the startup pre-scan's retry entry, cli#1059
+  // item E) must keep the pre-scan's positive-presence mode: past the scan limit
+  // a single match still proves PRESENCE, and a miss still reports SCAN_LIMIT
+  // because absence is not provable that way.
+  const found = findCurPath(
+    ctx.mailDir,
+    ctx.agent,
+    ctx.inboundId,
+    (path, code) => {
+      if (code === "ENOENT" && path === curDir) return;
+      error ??= code ?? "INVALID_JSON";
+    },
+    { presenceBeyondLimit: true },
+  );
   if (error !== undefined) {
     reportObligationCurLookupFailure(ctx.mailDir, ctx.agent, ctx.inboundId, obligationId, error, ctx.log);
     return { status: "error", code: error };
