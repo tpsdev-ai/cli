@@ -447,9 +447,9 @@ async function killDetachedGrandchild(
 /**
  * Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr.
  * The grandchild writes its own pid to `selfReportFile`; the parent records the pid
- * it spawned in `recordedFile`.
+ * it spawned in `recordedFile`, or its own pid when `recordSelf` is true.
  */
-function spawnHeldStderr(recordedFile: string, selfReportFile: string, keepParent = false): TrackedChild {
+function spawnHeldStderr(recordedFile: string, selfReportFile: string, keepParent = false, recordSelf = false): TrackedChild {
   const grandchildScript = `require("node:fs").writeFileSync(${JSON.stringify(selfReportFile)}, String(process.pid)); setTimeout(() => {}, 30_000);`;
   const script = `
     import { spawn } from "node:child_process";
@@ -458,7 +458,7 @@ function spawnHeldStderr(recordedFile: string, selfReportFile: string, keepParen
       detached: true,
       stdio: ["ignore", "ignore", "inherit"],
     });
-    writeFileSync(${JSON.stringify(recordedFile)}, String(grandchild.pid));
+    writeFileSync(${JSON.stringify(recordedFile)}, String(${recordSelf ? "process.pid" : "grandchild.pid"}));
     ${keepParent ? "setTimeout(() => {}, 30_000);" : "process.exit(3);"}
   `;
   const daemon = trackDaemon(
@@ -482,8 +482,9 @@ async function withHeldStderrDaemon(
   keepParent = false,
   readCleanupToken: (pid: number) => string | null = processStartToken,
   readVerifyToken: (pid: number) => string | null = processStartToken,
+  recordSelf = false,
 ): Promise<void> {
-  const daemon = spawnHeldStderr(recordedFile, selfReportFile, keepParent);
+  const daemon = spawnHeldStderr(recordedFile, selfReportFile, keepParent, recordSelf);
   let target: { pid: number; token: string | null } | null = null;
   let failure: unknown = null;
   try {
@@ -1208,6 +1209,42 @@ describe("branch pid record ownership (cli#730)", () => {
     const selfPid = readGrandchildPid(selfReportFile);
     expect(selfPid).not.toBeNull();
     expect(pidExited(selfPid!)).toBe(true);
+  }, 20_000);
+
+  test("an equality failure still kills the self-reported grandchild", async () => {
+    const recordedFile = join(root, "grandchild-equality-failure.pid");
+    const selfReportFile = join(root, "grandchild-equality-failure-self.pid");
+    // The parent records its own pid, so the record differs from the grandchild's
+    // self-report and the equality assertion fails before the wait.
+    let waited = false;
+    const failure = await withHeldStderrDaemon(
+      recordedFile,
+      selfReportFile,
+      () => {
+        waited = true;
+        return Promise.resolve();
+      },
+      true,
+      processStartToken,
+      processStartToken,
+      true,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure?.message).not.toContain("cleanup refused");
+      expect(waited).toBe(false);
+      expect(pid).not.toBeNull();
+      expect(pid === null ? false : pidExited(pid)).toBe(true);
+    } finally {
+      if (pid !== null && !pidExited(pid)) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
   }, 20_000);
 
   test("a multi-byte stderr flood keeps its last 4096 bytes, in an allocation of that size", async () => {
