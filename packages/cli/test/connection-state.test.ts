@@ -163,7 +163,7 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-hold-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:stale" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", startToken: "proc:111" });
     const lockDir = mailLockPath(hostStateLockRoot(path));
     const read = fs.readFileSync;
     const rename = fs.renameSync;
@@ -191,7 +191,7 @@ describe("connection-state", () => {
         startToken: (pid) => {
           expect(pid).toBe(process.pid);
           observeHold("liveness");
-          return "proc:live";
+          return "proc:222";
         },
       });
       expect(outcome).toEqual({ kind: "written" });
@@ -296,9 +296,9 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-claim-reuse-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    const live = "proc:live";
+    const live = "proc:222";
     const hooks = { startToken: () => live };
-    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: "proc:stale" });
+    writeHostState({ ...completeState(), connectionId: "conn-b", pid: process.pid, startToken: "proc:111" });
     const aState = { ...completeState(), connectionId: "conn-a", startToken: live, lastHeartbeatAck: "ack" };
     const outcome = claimHostStateAt(path, aState, "conn-a", undefined, 0, hooks);
     expect(outcome).toEqual({ kind: "written" });
@@ -633,9 +633,9 @@ describe("connection-state", () => {
     home = mkdtempSync(join(tmpdir(), "conn-state-same-connection-mismatch-"));
     process.env.HOME = home;
     const path = hostStatePath("x");
-    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:stale" });
+    writeHostState({ ...completeState(), connectionId: "conn-a", startToken: "proc:111" });
     const raw = readFileSync(path, "utf8");
-    const hooks = { startToken: () => "proc:live" };
+    const hooks = { startToken: () => "proc:222" };
     expect(refreshOwnedHostStateAt(
       path,
       { ...completeState(), connectionId: "conn-a", lastHeartbeatAck: "moved" },

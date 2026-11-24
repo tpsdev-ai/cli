@@ -150,7 +150,8 @@ describe("sweepStaleLaunchSnapshots", () => {
       const token = processStartToken(process.pid);
       expect(token).not.toBeNull();
       const source = token!.slice(0, token!.indexOf(":") + 1);
-      writeOwner(reused, { pid: process.pid, startToken: `${source}stale-token` });
+      const recorded = token!.startsWith("proc:") ? "proc:1" : `${source}stale-token`;
+      writeOwner(reused, { pid: process.pid, startToken: recorded });
 
       expect(sweepStaleLaunchSnapshots(fixture.launch)).toEqual([reused]);
       expect(existsSync(reused)).toBe(false);
@@ -226,8 +227,9 @@ describe("sweepStaleLaunchSnapshots", () => {
       const token = processStartToken(process.pid);
       expect(token).not.toBeNull();
       const source = token!.slice(0, token!.indexOf(":") + 1);
+      const recorded = token!.startsWith("proc:") ? "proc:1" : `${source}stale-token`;
       const reused = makeSnapshot(fixture.launch, ".pending-config-reused");
-      writeOwner(reused, { pid: process.pid, startToken: `${source}stale-token` });
+      writeOwner(reused, { pid: process.pid, startToken: recorded });
       // Owned by a running process: kept however old, with its token and with none.
       const owned = makeSnapshot(fixture.launch, ".pending-config-owned0");
       writeOwner(owned, { pid: live.pid, startToken: live.token });
