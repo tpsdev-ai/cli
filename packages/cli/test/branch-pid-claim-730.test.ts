@@ -411,10 +411,26 @@ function readGrandchildPid(file: string): number | null {
   }
 }
 
-/** Kill the detached grandchild `file` records, reading the file now, then wait until the pid is gone or a zombie. */
-async function killDetachedGrandchild(file: string): Promise<void> {
-  const pid = readGrandchildPid(file);
-  if (pid === null) return;
+/**
+ * Kill the detached grandchild at `pid` only while it still carries `expectedToken`,
+ * the start token captured by the test process after reading the grandchild's
+ * self-reported PID, then wait until it is gone or a zombie. A null token at a
+ * live pid is a refusal: nothing is signalled and a report is returned.
+ * Returns a report when the identity could not be confirmed and nothing was signalled.
+ * The token narrows pid reuse but is not absolute: macOS `ps` start time has
+ * one-second precision, and a check-then-signal window remains.
+ */
+async function killDetachedGrandchild(
+  pid: number,
+  expectedToken: string | null,
+  readToken: (pid: number) => string | null = processStartToken,
+): Promise<string | null> {
+  if (pidExited(pid)) return null;
+  const token = expectedToken === null ? null : readToken(pid);
+  if (token === null || token !== expectedToken) {
+    unverifiedIdentityPids.add(pid);
+    return `grandchild ${pid}: identity could not be verified; not signalled`;
+  }
   try {
     process.kill(pid, "SIGKILL");
   } catch {
@@ -425,18 +441,24 @@ async function killDetachedGrandchild(file: string): Promise<void> {
     if (Date.now() >= deadline) throw new Error(`grandchild ${pid} survived its SIGKILL`);
     await new Promise((resolveWait) => setTimeout(resolveWait, 5));
   }
+  return null;
 }
 
-/** Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr, and the parent records its pid. */
-function spawnHeldStderr(grandchildFile: string, keepParent = false): TrackedChild {
+/**
+ * Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr.
+ * The grandchild writes its own pid to `selfReportFile`; the parent records the pid
+ * it spawned in `recordedFile`, or its own pid when `recordSelf` is true.
+ */
+function spawnHeldStderr(recordedFile: string, selfReportFile: string, keepParent = false, recordSelf = false): TrackedChild {
+  const grandchildScript = `require("node:fs").writeFileSync(${JSON.stringify(selfReportFile)}, String(process.pid)); setTimeout(() => {}, 30_000);`;
   const script = `
     import { spawn } from "node:child_process";
     import { writeFileSync } from "node:fs";
-    const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], {
+    const grandchild = spawn(process.execPath, ["-e", ${JSON.stringify(grandchildScript)}], {
       detached: true,
       stdio: ["ignore", "ignore", "inherit"],
     });
-    writeFileSync(${JSON.stringify(grandchildFile)}, String(grandchild.pid));
+    writeFileSync(${JSON.stringify(recordedFile)}, String(${recordSelf ? "process.pid" : "grandchild.pid"}));
     ${keepParent ? "setTimeout(() => {}, 30_000);" : "process.exit(3);"}
   `;
   const daemon = trackDaemon(
@@ -447,20 +469,41 @@ function spawnHeldStderr(grandchildFile: string, keepParent = false): TrackedChi
 }
 
 /**
- * Spawn the held-stderr pair and run `wait` inside one lifecycle: whether the wait
- * resolves or rejects, the finally kills the grandchild the pid file records.
+ * Spawn the held-stderr pair and run `wait` inside one lifecycle. Before the wait,
+ * the parent's record is checked against the pid the grandchild reports itself.
+ * Cleanup targets that self-reported pid, after an equality-check failure too: it
+ * signals only while the captured token on a live pid still matches; a refusal is
+ * reported to the caller.
  */
 async function withHeldStderrDaemon(
-  grandchildFile: string,
+  recordedFile: string,
+  selfReportFile: string,
   wait: (daemon: TrackedChild) => Promise<unknown>,
   keepParent = false,
+  readCleanupToken: (pid: number) => string | null = processStartToken,
+  readVerifyToken: (pid: number) => string | null = processStartToken,
+  recordSelf = false,
 ): Promise<void> {
-  const daemon = spawnHeldStderr(grandchildFile, keepParent);
+  const daemon = spawnHeldStderr(recordedFile, selfReportFile, keepParent, recordSelf);
+  let target: { pid: number; token: string | null } | null = null;
+  let failure: unknown = null;
   try {
-    await waitFor(() => readGrandchildPid(grandchildFile), "detached grandchild pid");
+    const recorded = await waitFor(() => readGrandchildPid(recordedFile), "detached grandchild pid");
+    const reported = await waitFor(() => readGrandchildPid(selfReportFile), "the grandchild's self-reported pid");
+    // Captured before the wait: the pid may name a successor when the wait returns.
+    target = { pid: reported, token: readCleanupToken(reported) };
+    expect(recorded).toBe(reported);
     await wait(daemon);
+  } catch (error) {
+    failure = error;
+    throw error;
   } finally {
-    await killDetachedGrandchild(grandchildFile);
+    if (target !== null) {
+      const refused = await killDetachedGrandchild(target.pid, target.token, readVerifyToken);
+      if (refused !== null) {
+        throw new Error(`cleanup refused: ${refused}`, failure === null ? undefined : { cause: failure });
+      }
+    }
   }
 }
 
@@ -1017,9 +1060,10 @@ describe("branch pid record ownership (cli#730)", () => {
   test("an exit with stderr still held open reports the exit code", async () => {
     const phase = "held-stderr";
     const grandchildFile = join(root, "grandchild.pid");
+    const selfReportFile = join(root, "grandchild-self.pid");
     // The detached grandchild inherits stderr, so the parent's piped stderr
     // stays open past the report's wait for "close": only "exit" carries the status.
-    const failure = await withHeldStderrDaemon(grandchildFile, (daemon) => waitForReady(phase, daemon.tracker)).then(
+    const failure = await withHeldStderrDaemon(grandchildFile, selfReportFile, (daemon) => waitForReady(phase, daemon.tracker)).then(
       () => null,
       (error: Error) => error,
     );
@@ -1027,11 +1071,129 @@ describe("branch pid record ownership (cli#730)", () => {
     expect(failure!.message).toContain("exit code 3");
   }, 20_000);
 
+  test("cleanup leaves a pid whose start token differs alive and reports the refusal", async () => {
+    // A live stand-in for a reused pid: the cleanup is handed a token that is not
+    // this process's, so it must refuse to signal it.
+    const child = trackDaemon(spawn("node", ["-e", "setTimeout(() => {}, 30_000)"], { stdio: "ignore" }));
+    children.push(child);
+    const pid = child.tracker.pid;
+    const report = await killDetachedGrandchild(pid, "proc:0");
+    expect(pidExited(pid)).toBe(false);
+    expect(report).toContain("identity could not be verified; not signalled");
+    process.kill(pid, "SIGKILL");
+    await waitForPidGone(pid);
+  }, 20_000);
+
+  test("a missing cleanup token reaches the caller and leaves the grandchild alive", async () => {
+    const grandchildFile = join(root, "grandchild-missing-token.pid");
+    const selfReportFile = join(root, "grandchild-missing-token-self.pid");
+    // The wait fails, and the captured token is missing, so the cleanup refuses.
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      selfReportFile,
+      () => waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100),
+      false,
+      () => null,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure?.message).toContain("cleanup refused");
+      expect(failure?.message).toContain("identity could not be verified; not signalled");
+      expect((failure?.cause as Error | undefined)?.message).toContain("timed out");
+      expect(pid).not.toBeNull();
+      if (pid !== null) expect(pidExited(pid)).toBe(false);
+    } finally {
+      if (pid !== null) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
+  }, 20_000);
+
+  test("a mismatched cleanup token reaches the caller and leaves the grandchild alive", async () => {
+    const grandchildFile = join(root, "grandchild-mismatched-token.pid");
+    const selfReportFile = join(root, "grandchild-mismatched-token-self.pid");
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      selfReportFile,
+      () => waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100),
+      false,
+      (pid) => `${processStartToken(pid)}-stale`,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure?.message).toContain("cleanup refused");
+      expect(failure?.message).toContain("identity could not be verified; not signalled");
+      expect((failure?.cause as Error | undefined)?.message).toContain("timed out");
+      expect(pid).not.toBeNull();
+      if (pid !== null) expect(pidExited(pid)).toBe(false);
+    } finally {
+      if (pid !== null) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
+  }, 20_000);
+
+  test("cleanup uses the token captured before the wait when the identity changes later", async () => {
+    const grandchildFile = join(root, "grandchild-capture-point.pid");
+    const selfReportFile = join(root, "grandchild-capture-point-self.pid");
+    // Identity reads answer with the original while the wait has not run and with
+    // a successor afterwards, as a reused pid would.
+    let afterWait = false;
+    let captures = 0;
+    const readIdentity = (pid: number): string | null => {
+      const token = processStartToken(pid);
+      return token === null ? null : `${token}-${afterWait ? "successor" : "original"}`;
+    };
+    const captureRead = (pid: number): string | null => {
+      captures += 1;
+      return readIdentity(pid);
+    };
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      selfReportFile,
+      () => {
+        // A capture moved into the cleanup leaves the wait with none.
+        expect(captures).toBe(1);
+        afterWait = true;
+        return waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100);
+      },
+      false,
+      captureRead,
+      readIdentity,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure?.message).toContain("cleanup refused");
+      expect(failure?.message).toContain("identity could not be verified; not signalled");
+      expect((failure?.cause as Error | undefined)?.message).toContain("timed out");
+      expect(pid).not.toBeNull();
+      if (pid !== null) expect(pidExited(pid)).toBe(false);
+    } finally {
+      if (pid !== null) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
+  }, 20_000);
+
   test("cleanup kills the detached grandchild when the pid-file wait times out", async () => {
     const grandchildFile = join(root, "grandchild-timeout.pid");
+    const selfReportFile = join(root, "grandchild-timeout-self.pid");
     // The parent stays alive after recording the pid, so it reaps the grandchild.
     const failure = await withHeldStderrDaemon(
       grandchildFile,
+      selfReportFile,
       () =>
         // Force the wait to time out: it reads a path this case never writes, so
         // only the lifecycle's finally runs the cleanup.
@@ -1042,9 +1204,47 @@ describe("branch pid record ownership (cli#730)", () => {
       (error: Error) => error,
     );
     expect(failure?.message).toContain("timed out");
-    const pid = readGrandchildPid(grandchildFile);
-    expect(pid).not.toBeNull();
-    expect(pidExited(pid!)).toBe(true);
+    // The cleanup targets the self-reported pid, which the pair's assertion
+    // already matched against the parent's record.
+    const selfPid = readGrandchildPid(selfReportFile);
+    expect(selfPid).not.toBeNull();
+    expect(pidExited(selfPid!)).toBe(true);
+  }, 20_000);
+
+  test("an equality failure still kills the self-reported grandchild", async () => {
+    const recordedFile = join(root, "grandchild-equality-failure.pid");
+    const selfReportFile = join(root, "grandchild-equality-failure-self.pid");
+    // The parent records its own pid, so the record differs from the grandchild's
+    // self-report and the equality assertion fails before the wait.
+    let waited = false;
+    const failure = await withHeldStderrDaemon(
+      recordedFile,
+      selfReportFile,
+      () => {
+        waited = true;
+        return Promise.resolve();
+      },
+      true,
+      processStartToken,
+      processStartToken,
+      true,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure).toBeInstanceOf(Error);
+      expect(failure?.message).not.toContain("cleanup refused");
+      expect(waited).toBe(false);
+      expect(pid).not.toBeNull();
+      expect(pid === null ? false : pidExited(pid)).toBe(true);
+    } finally {
+      if (pid !== null && !pidExited(pid)) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
   }, 20_000);
 
   test("a multi-byte stderr flood keeps its last 4096 bytes, in an allocation of that size", async () => {
