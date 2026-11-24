@@ -177,9 +177,10 @@ async function daemonExitReport(daemon: DaemonTracker | undefined): Promise<stri
 }
 
 /**
- * The pause file a wait accepts: the daemon's own exact name, or any for a phase without one.
- * The exact-name match is correct because the tracked child writes its own pause file;
- * a launcher waiting for a daemon's pause file would need a different match.
+ * The pause file a wait accepts: `ready-<phase>-<pid>` for a tracked child, or any
+ * entry for a phase without one. The exact-name match assumes the file is named after
+ * the pid that wrote it, as the real daemon's is; some fixtures instead write a
+ * synthetic file from the test process under a tracked child's pid.
  */
 function pauseFile(phase: string, pid: number | undefined): string | undefined {
   const entries = readdirSync(pauseDir);
@@ -377,7 +378,9 @@ async function waitForRunningRecord(): Promise<{ pid: number; startToken: string
 
 /** True when the pid is gone or a zombie. A container may run no init as
  *  PID 1, so an orphan whose parent exited is not reaped and a killed
- *  detached grandchild can stay a zombie that `process.kill(pid, 0)` accepts. */
+ *  detached grandchild can stay a zombie that `process.kill(pid, 0)` accepts.
+ *  macOS needs no zombie check: launchd adopts and reaps the orphan, so the
+ *  process is gone and `process.kill(pid, 0)` raises ESRCH. */
 function pidExited(pid: number): boolean {
   if (pidState(pid) === "gone") return true;
   if (process.platform === "linux") {
@@ -390,14 +393,6 @@ function pidExited(pid: number): boolean {
       throw error;
     }
   }
-  if (process.platform === "darwin") {
-    const probe = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], {
-      encoding: "utf8",
-      timeout: 2_000,
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    return probe.status === 0 && probe.stdout.trimStart().startsWith("Z");
-  }
   return false;
 }
 
@@ -405,7 +400,7 @@ async function waitForPidGone(pid: number): Promise<void> {
   await waitFor(() => (pidExited(pid) ? true : null), `pid ${pid} to exit`);
 }
 
-/** The pid a detached grandchild recorded in `file`, or null while it is absent or unreadable. */
+/** The pid recorded for the detached grandchild in `file`, or null while it is absent or unreadable. */
 function readGrandchildPid(file: string): number | null {
   try {
     // The file is created before the pid is written, so an empty read means "not yet".
@@ -416,17 +411,7 @@ function readGrandchildPid(file: string): number | null {
   }
 }
 
-/** The errno `process.kill(pid, 0)` raises, or null while the pid exists. */
-function signalZeroCode(pid: number): string | null {
-  try {
-    process.kill(pid, 0);
-    return null;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code ?? "unknown";
-  }
-}
-
-/** Kill the detached grandchild `file` records, reading the file now, then wait for the pid to be reaped. */
+/** Kill the detached grandchild `file` records, reading the file now, then wait until the pid is gone or a zombie. */
 async function killDetachedGrandchild(file: string): Promise<void> {
   const pid = readGrandchildPid(file);
   if (pid === null) return;
@@ -442,7 +427,7 @@ async function killDetachedGrandchild(file: string): Promise<void> {
   }
 }
 
-/** Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr and records its pid. */
+/** Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr, and the parent records its pid. */
 function spawnHeldStderr(grandchildFile: string, keepParent = false): TrackedChild {
   const script = `
     import { spawn } from "node:child_process";
@@ -459,6 +444,24 @@ function spawnHeldStderr(grandchildFile: string, keepParent = false): TrackedChi
   );
   children.push(daemon);
   return daemon;
+}
+
+/**
+ * Spawn the held-stderr pair and run `wait` inside one lifecycle: whether the wait
+ * resolves or rejects, the finally kills the grandchild the pid file records.
+ */
+async function withHeldStderrDaemon(
+  grandchildFile: string,
+  wait: (daemon: TrackedChild) => Promise<unknown>,
+  keepParent = false,
+): Promise<void> {
+  const daemon = spawnHeldStderr(grandchildFile, keepParent);
+  try {
+    await waitFor(() => readGrandchildPid(grandchildFile), "detached grandchild pid");
+    await wait(daemon);
+  } finally {
+    await killDetachedGrandchild(grandchildFile);
+  }
 }
 
 /** Track one child: exit status on both `exit` and `close`, and a byte-bounded stderr tail. */
@@ -1016,43 +1019,29 @@ describe("branch pid record ownership (cli#730)", () => {
     const grandchildFile = join(root, "grandchild.pid");
     // The detached grandchild inherits stderr, so the parent's piped stderr
     // stays open past the report's wait for "close": only "exit" carries the status.
-    const daemon = spawnHeldStderr(grandchildFile);
-    try {
-      await waitFor(() => readGrandchildPid(grandchildFile), "detached grandchild pid");
-
-      const failure = await waitForReady(phase, daemon.tracker).then(
-        () => null,
-        (error: Error) => error,
-      );
-      expect(failure).not.toBeNull();
-      expect(failure!.message).toContain("exit code 3");
-    } finally {
-      await killDetachedGrandchild(grandchildFile);
-    }
+    const failure = await withHeldStderrDaemon(grandchildFile, (daemon) => waitForReady(phase, daemon.tracker)).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain("exit code 3");
   }, 20_000);
 
   test("cleanup kills the detached grandchild when the pid-file wait times out", async () => {
     const grandchildFile = join(root, "grandchild-timeout.pid");
-    // The parent stays alive after recording the pid, so it reaps the grandchild
-    // once cleanup kills it and the pid itself is gone.
-    spawnHeldStderr(grandchildFile, true);
-    try {
-      const grandchildPid = await waitFor(() => readGrandchildPid(grandchildFile), "detached grandchild pid");
-      // Force the wait to time out: it reads a path this case never writes, so
-      // the grandchild's cleanup depends on the finally.
-      const timedOut = await waitFor(
-        () => readGrandchildPid(join(root, "never-written.pid")),
-        "a pid file that never appears",
-        100,
-      ).then(
-        () => null,
-        (error: Error) => error,
-      );
-      expect(timedOut?.message).toContain("timed out");
-      expect(signalZeroCode(grandchildPid)).toBeNull();
-    } finally {
-      await killDetachedGrandchild(grandchildFile);
-    }
+    // The parent stays alive after recording the pid, so it reaps the grandchild.
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      () =>
+        // Force the wait to time out: it reads a path this case never writes, so
+        // only the lifecycle's finally runs the cleanup.
+        waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100),
+      true,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toContain("timed out");
     const pid = readGrandchildPid(grandchildFile);
     expect(pid).not.toBeNull();
     expect(pidExited(pid!)).toBe(true);
