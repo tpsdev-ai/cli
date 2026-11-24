@@ -33,7 +33,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync,
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function decideSettledRead({ stopped, stoppedGracefully = true, stopSignal = null, ackLanded, ackTimedOut, error }) {
+export function decideSettledRead({ stopped, stoppedGracefully = false, stopSignal = null, ackLanded, ackTimedOut, error }) {
   // Only SIGTERM is a graceful signal here: any other observed signal refuses
   // the read, whatever the caller reports alongside it.
   if (stopped && (!stoppedGracefully || (stopSignal !== null && stopSignal !== "SIGTERM"))) {
@@ -53,56 +53,106 @@ export function decideSettledRead({ stopped, stoppedGracefully = true, stopSigna
   };
 }
 
-function waitForExit(child, deadlineMs) {
-  return Promise.race([
-    new Promise((resolve) => child.once("exit", resolve)),
-    new Promise((resolve) => setTimeout(resolve, deadlineMs)),
-  ]);
+/**
+ * Wait up to `deadlineMs` for the child's exit, resolving true when it was
+ * observed and false at the deadline. `arm` runs after the exit listener is
+ * installed, so a signal sent there cannot race it. One settle path removes
+ * both the listener and the deadline timer: neither outlives the wait.
+ */
+function waitForExit(child, deadlineMs, arm) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const settle = (sawExit) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      child.off("exit", onExit);
+      resolve(sawExit);
+    };
+    const onExit = () => settle(true);
+    child.once("exit", onExit);
+    timer = setTimeout(() => settle(false), deadlineMs);
+    arm?.();
+    if (child.exitCode !== null || child.signalCode !== null) settle(true);
+  });
 }
 
 export const SIGTERM_BUDGET_MS = 5_000;
 export const SIGKILL_REAP_BUDGET_MS = 15_000;
 
+export const GATEWAY_BOOT_DEADLINE_MS = 30_000;
+export const REPLY_DEADLINE_MS = 45_000;
+export const ACK_DEADLINE_MS = 15_000;
+export const CUR_MOVE_DEADLINE_MS = 5_000;
+
+/** Setup and finalization outside the named waits: stubs, mail seeding, log read, report write. */
+export const SUPERVISOR_MARGIN_MS = 20_000;
+/** Supervisor-side cleanup after a timed-out driver: group SIGKILL, exit, report read. */
+export const SUPERVISOR_CLEANUP_MS = 10_000;
+
+/**
+ * The named waits the driver can spend, summed. `overrides` replaces a named
+ * wait, so a caller can see how the derived budget moves with one deadline.
+ */
+export function namedWaitBudgetMs(overrides = {}) {
+  const waits = {
+    gatewayBoot: GATEWAY_BOOT_DEADLINE_MS,
+    reply: REPLY_DEADLINE_MS,
+    ack: ACK_DEADLINE_MS,
+    curMove: CUR_MOVE_DEADLINE_MS,
+    stop: SIGTERM_BUDGET_MS,
+    reap: SIGKILL_REAP_BUDGET_MS,
+    ...overrides,
+  };
+  return Object.values(waits).reduce((sum, ms) => sum + ms, 0);
+}
+
+export const NAMED_WAIT_BUDGET_MS = namedWaitBudgetMs();
+/** The supervisor's budget for one driver run: every named wait plus the margin. */
+export const DRIVER_SUPERVISOR_TIMEOUT_MS = NAMED_WAIT_BUDGET_MS + SUPERVISOR_MARGIN_MS;
+/** The Bun test's budget: past the supervisor's own cleanup after a timeout. */
+export const DRIVER_TEST_TIMEOUT_MS = DRIVER_SUPERVISOR_TIMEOUT_MS + SUPERVISOR_CLEANUP_MS;
+
 /**
  * Stop a gateway child: SIGTERM, then SIGKILL after the SIGTERM budget. Signal
- * death leaves `exitCode` null. GRACEFULLY means an exit code, or termination by
- * the SIGTERM this call sent within the SIGTERM budget with no SIGKILL; this
- * makes no claim that application cleanup ran. A child that needed SIGKILL, or
- * died on any other signal (including one observed before this call), did not
- * stop gracefully. The reap budget is separate and, by default, larger than the
- * SIGTERM budget: SIGKILL delivery and child teardown are not bounded by the
- * deadline that ended the SIGTERM wait.
+ * death leaves `exitCode` null. GRACEFULLY means all of: no exit was observed
+ * when the call began, child.kill("SIGTERM") returned true, an exit was observed
+ * within the SIGTERM budget without SIGKILL, and that exit was code 0 or a
+ * SIGTERM death observed during the wait after this call's accepted send. This
+ * makes no claim that application cleanup ran. A child that needed SIGKILL, died
+ * on any other signal, or whose send was refused did not stop gracefully. The
+ * reap budget is separate and, by default, larger than the SIGTERM budget:
+ * SIGKILL delivery and child teardown are not bounded by the deadline that ended
+ * the SIGTERM wait.
  */
 export async function stopGateway(child, {
   deadlineMs = SIGTERM_BUDGET_MS,
   reapDeadlineMs = SIGKILL_REAP_BUDGET_MS,
 } = {}) {
-  let sigkillSent = false;
-  let sigtermSent = false;
+  if (!child) return { stopped: true, stoppedGracefully: true, exitCode: null, signalCode: null };
+
+  let sigtermAccepted = false;
   let exitedInTermWait = false;
-  if (child) {
-    if (child.exitCode === null && child.signalCode === null) {
-      sigtermSent = true;
-      const markExit = () => {
-        exitedInTermWait = true;
-      };
-      child.once("exit", markExit);
-      child.kill("SIGTERM");
-      await waitForExit(child, deadlineMs);
-      child.off("exit", markExit);
-    }
-    if (child.exitCode === null && child.signalCode === null) {
-      sigkillSent = true;
-      child.kill("SIGKILL");
-      await waitForExit(child, reapDeadlineMs);
-    }
+  let sigkillSent = false;
+  if (child.exitCode === null && child.signalCode === null) {
+    let killReturned;
+    exitedInTermWait = await waitForExit(child, deadlineMs, () => {
+      killReturned = child.kill("SIGTERM");
+    });
+    sigtermAccepted = killReturned === true;
   }
-  const exitCode = child?.exitCode ?? null;
-  const signalCode = child?.signalCode ?? null;
-  const terminatedByOwnSigterm = sigtermSent && exitedInTermWait && signalCode === "SIGTERM";
+  if (child.exitCode === null && child.signalCode === null) {
+    sigkillSent = true;
+    await waitForExit(child, reapDeadlineMs, () => child.kill("SIGKILL"));
+  }
+  const exitCode = child.exitCode ?? null;
+  const signalCode = child.signalCode ?? null;
+  const gracefulExit = exitCode === 0 || signalCode === "SIGTERM";
   return {
-    stopped: !child || exitCode !== null || signalCode !== null,
-    stoppedGracefully: !child || (!sigkillSent && (exitCode !== null || terminatedByOwnSigterm)),
+    stopped: exitCode !== null || signalCode !== null,
+    stoppedGracefully: sigtermAccepted && exitedInTermWait && !sigkillSent && gracefulExit,
     exitCode,
     signalCode,
   };
@@ -157,6 +207,7 @@ export async function finalizeGatewayRun({
   report.stopped = stop.stopped;
   report.stoppedGracefully = stop.stoppedGracefully;
   report.stopSignal = stop.signalCode;
+  report.exitCode = stop.exitCode;
   // Read the settled state only after the gateway has stopped (a second reply
   // or a late stamp from a running gateway would race the read) and only after
   // an observed ack (without one, cur/ was never settled by the ack). A
@@ -198,11 +249,7 @@ async function main() {
   const PLUGIN = resolve(spec.pluginDir);
   const OPENCLAW = join(PLUGIN, "node_modules", "openclaw", "openclaw.mjs");
 
-  // ── named deadlines ─────────────────────────────────────────────────────────
-  const GATEWAY_BOOT_DEADLINE_MS = 30_000;
-  const REPLY_DEADLINE_MS = 45_000;
-  const ACK_DEADLINE_MS = 15_000;
-  const CUR_MOVE_DEADLINE_MS = 5_000;
+  // ── named deadlines (exported; the test derives its supervisor timeout) ────
   const STOP_DEADLINE_MS = SIGTERM_BUDGET_MS;
   const STOP_REAP_DEADLINE_MS = SIGKILL_REAP_BUDGET_MS;
 
@@ -242,6 +289,7 @@ async function main() {
     stopped: false,
     stoppedGracefully: false,
     stopSignal: null,
+    exitCode: null,
     ackLanded: false,
     ackTimedOut: false,
     ackLines: [],

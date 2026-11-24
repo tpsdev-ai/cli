@@ -29,7 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
-import { SIGKILL_REAP_BUDGET_MS, SIGTERM_BUDGET_MS, decideSettledRead, finalizeGatewayRun, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
+import { ACK_DEADLINE_MS, CUR_MOVE_DEADLINE_MS, DRIVER_SUPERVISOR_TIMEOUT_MS, DRIVER_TEST_TIMEOUT_MS, GATEWAY_BOOT_DEADLINE_MS, NAMED_WAIT_BUDGET_MS, REPLY_DEADLINE_MS, SIGKILL_REAP_BUDGET_MS, SIGTERM_BUDGET_MS, SUPERVISOR_CLEANUP_MS, SUPERVISOR_MARGIN_MS, decideSettledRead, finalizeGatewayRun, namedWaitBudgetMs, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const DRIVER = join(PLUGIN_DIR, "test", "real-gateway-driver.mjs");
@@ -63,6 +63,7 @@ type Report = {
   stopped: boolean;
   stoppedGracefully: boolean;
   stopSignal: string | null;
+  exitCode: number | null;
   ackLanded: boolean;
   ackTimedOut: boolean;
   ackLines: string[];
@@ -203,6 +204,7 @@ function ackedReport(): Report {
     stopped: true,
     stoppedGracefully: true,
     stopSignal: null,
+    exitCode: null,
     ackLanded: true,
     ackTimedOut: false,
     ackLines: ["acked msg-one: receipt found"],
@@ -301,30 +303,94 @@ it("stops a stub that times out before readiness", async () => {
   }
 });
 
-function runDriver(): { status: number | null; stdout: string; stderr: string; report: Report | null; root: string } {
+type SupervisedRun = {
+  status: number | null;
+  signal: string | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  budgetMs: number;
+};
+
+/**
+ * Run a command in its OWN process group and kill the group on close or timeout.
+ * A kill of the group is what reaches a gateway the driver started:
+ * killing the direct child alone can leave the gateway running.
+ */
+function supervise(
+  command: string,
+  args: string[],
+  { timeoutMs = DRIVER_SUPERVISOR_TIMEOUT_MS, env = {}, cwd }: { timeoutMs?: number; env?: Record<string, string>; cwd?: string } = {},
+): Promise<SupervisedRun> {
+  return new Promise((resolveRun, reject) => {
+    const child = spawn(command, args, {
+      cwd,
+      // The launcher's environment is an allowlist, like the suite launcher's:
+      // PATH for the lookup, plus whatever this test names.
+      env: { PATH: process.env.PATH ?? "", ...env },
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    child.stdout!.on("data", (chunk) => {
+      stdout += String(chunk);
+    });
+    child.stderr!.on("data", (chunk) => {
+      stderr += String(chunk);
+    });
+    const killGroup = (signal: string) => {
+      if (child.pid === undefined) return;
+      try {
+        process.kill(-child.pid, signal as NodeJS.Signals);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+      }
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      killGroup("SIGKILL");
+    }, timeoutMs);
+    child.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.once("close", (status, signal) => {
+      killGroup("SIGKILL");
+      clearTimeout(timer);
+      resolveRun({ status, signal, stdout, stderr, timedOut, budgetMs: timeoutMs });
+    });
+  });
+}
+
+/**
+ * The report is null after a timeout: the watchdog can kill the driver mid-write,
+ * and a half-written report.json must not throw over the timeout diagnostic.
+ */
+function readDriverReport(root: string, timedOut: boolean): Report | null {
+  if (timedOut) return null;
+  const reportFile = join(root, "report.json");
+  return existsSync(reportFile) ? (JSON.parse(readFileSync(reportFile, "utf8")) as Report) : null;
+}
+
+async function runDriver(): Promise<SupervisedRun & { report: Report | null; root: string }> {
   const root = mkdtempSync(join(tmpdir(), "tps-real-gateway-"));
   const specFile = join(root, "spec.json");
   writeFileSync(specFile, JSON.stringify({ root, pluginDir: PLUGIN_DIR }), { mode: 0o600 });
   const node = process.env.TPS_LANE_NODE || "node";
-  const res = spawnSync(node, [DRIVER, specFile], {
-    cwd: PLUGIN_DIR,
-    encoding: "utf8",
-    timeout: 120_000,
-    killSignal: "SIGKILL",
-    env: {
-      PATH: process.env.PATH ?? "",
-      TPS_LANE_NODE: node,
-    },
-  });
-  const reportFile = join(root, "report.json");
-  const report = existsSync(reportFile) ? (JSON.parse(readFileSync(reportFile, "utf8")) as Report) : null;
-  return { status: res.status, stdout: res.stdout ?? "", stderr: res.stderr ?? "", report, root };
+  const run = await supervise(node, [DRIVER, specFile], { cwd: PLUGIN_DIR, env: { TPS_LANE_NODE: node } });
+  return { ...run, report: readDriverReport(root, run.timedOut), root };
 }
 
 describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
-  it("one signed mail → one dispatch → the FINAL text is mailed and the inbound is acked", () => {
-    const { status, stdout, stderr, report, root } = runDriver();
+  it("one signed mail → one dispatch → the FINAL text is mailed and the inbound is acked", async () => {
+    const { status, stdout, stderr, report, root, timedOut, budgetMs } = await runDriver();
     try {
+      expect(budgetMs).toBe(DRIVER_SUPERVISOR_TIMEOUT_MS);
+      if (timedOut) {
+        throw new Error(`real-gateway-driver exceeded its ${budgetMs}ms supervisor budget; its process group was killed`);
+      }
       if (status !== 0) {
         throw new Error(
           `real-gateway-driver exited ${status}: ${stderr || stdout}\n${report?.error ?? ""}\n${(report?.logs ?? []).join("\n")}`,
@@ -339,7 +405,7 @@ describe("cli#874 — real OpenClaw dispatch for openclaw-tps-mail", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
-  }, 130_000);
+  }, DRIVER_TEST_TIMEOUT_MS);
 });
 
 describe("cli#1020 — the cur/ assertion reports what it found", () => {
@@ -461,11 +527,21 @@ describe("cli#1020 — a timed-out ack is judged on its own assertion", () => {
 
 describe("cli#1020 — the driver's settled read decision", () => {
   it("reads after the gateway stops and the ack lands", () => {
-    expect(decideSettledRead({ stopped: true, ackLanded: true, ackTimedOut: false })).toEqual({ read: true, readError: null });
+    expect(decideSettledRead({ stopped: true, stoppedGracefully: true, ackLanded: true, ackTimedOut: false })).toEqual({
+      read: true,
+      readError: null,
+    });
+  });
+
+  it("refuses the read when the caller does not say the stop was graceful", () => {
+    expect(decideSettledRead({ stopped: true, ackLanded: true })).toEqual({
+      read: false,
+      readError: "gateway did not stop gracefully (signal unknown); settled state not read",
+    });
   });
 
   it("skips the read and names the ack timeout", () => {
-    expect(decideSettledRead({ stopped: true, ackLanded: false, ackTimedOut: true })).toEqual({
+    expect(decideSettledRead({ stopped: true, stoppedGracefully: true, ackLanded: false, ackTimedOut: true })).toEqual({
       read: false,
       readError: "ack wait timed out; settled state not read",
     });
@@ -509,7 +585,7 @@ describe("cli#1020 — the driver's settled read decision", () => {
 
   it("skips the read when stopped before the ack was awaited", () => {
     for (const error of [undefined, "gateway boot failed"]) {
-      expect(decideSettledRead({ stopped: true, ackLanded: false, ackTimedOut: false, error })).toEqual({
+      expect(decideSettledRead({ stopped: true, stoppedGracefully: true, ackLanded: false, ackTimedOut: false, error })).toEqual({
         read: false,
         readError: error
           ? "ack never awaited (the run failed before it: gateway boot failed); settled state not read"
@@ -1175,3 +1251,290 @@ describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", ()
     }
   }, 15_000);
 });
+
+/**
+ * A deterministic child for the stop contract: `kill` records the signal and
+ * returns `killResult`; each case decides when the exit event arrives.
+ */
+class ScriptedChild extends EventEmitter {
+  exitCode: number | null = null;
+  signalCode: string | null = null;
+  signals: string[] = [];
+  killResult = true;
+  onKill: ((signal: string) => void) | null = null;
+
+  kill(signal: string): boolean {
+    this.signals.push(signal);
+    if (this.killResult) this.onKill?.(signal);
+    return this.killResult;
+  }
+}
+
+describe("cli#1061 — a graceful stop needs a delivered SIGTERM and a clean exit", () => {
+  it("records a nonzero exit code and refuses the settled read", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-nonzero-exit-"));
+    try {
+      const child = new ScriptedChild();
+      child.onKill = (signal) => {
+        if (signal !== "SIGTERM") return;
+        setTimeout(() => {
+          child.exitCode = 1;
+          child.emit("exit", 1, null);
+        }, 5);
+      };
+      const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
+      const reportPath = join(root, "report.json");
+      const stop = await finalizeGatewayRun({
+        child,
+        report,
+        mailDir: join(root, "mail"),
+        reportPath,
+        stopDeadlineMs: 500,
+      });
+      expect(stop.stopped).toBe(true);
+      expect(stop.stoppedGracefully).toBe(false);
+      expect(stop.exitCode).toBe(1);
+
+      const written = JSON.parse(readFileSync(reportPath, "utf8"));
+      expect(written.exitCode).toBe(1);
+      expect(written.stoppedGracefully).toBe(false);
+      expect(written.settledRead).toBe(false);
+      expect(written.replyCountAfterStop).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 5_000);
+
+  it("removes the exit listener when the deadline settles the wait", async () => {
+    const child = new ScriptedChild();
+    const stop = await stopGateway(child, { deadlineMs: 50, reapDeadlineMs: 50 });
+    expect(stop.stoppedGracefully).toBe(false);
+    expect(child.listenerCount("exit")).toBe(0);
+  }, 5_000);
+
+  it("cancels the deadline timer when the exit settles the wait", async () => {
+    const child = new ScriptedChild();
+    child.onKill = (signal) => {
+      if (signal !== "SIGTERM") return;
+      setTimeout(() => {
+        child.exitCode = 0;
+        child.emit("exit", 0, null);
+      }, 5);
+    };
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const deadlineTimers: unknown[] = [];
+    const cleared: unknown[] = [];
+    try {
+      globalThis.setTimeout = ((fn: (...args: unknown[]) => void, ms?: number, ...rest: unknown[]) => {
+        const handle = (realSetTimeout as (...args: unknown[]) => ReturnType<typeof setTimeout>)(fn, ms, ...rest);
+        if (ms === 4_321) deadlineTimers.push(handle);
+        return handle;
+      }) as typeof setTimeout;
+      globalThis.clearTimeout = ((handle: unknown) => {
+        if (deadlineTimers.includes(handle)) cleared.push(handle);
+        return realClearTimeout(handle as ReturnType<typeof setTimeout>);
+      }) as typeof clearTimeout;
+      const stop = await stopGateway(child, { deadlineMs: 4_321, reapDeadlineMs: 50 });
+      expect(stop.stoppedGracefully).toBe(true);
+      expect(deadlineTimers).toHaveLength(1);
+      expect(cleared).toEqual(deadlineTimers);
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+  }, 5_000);
+
+  it("does not treat a refused SIGTERM send as a graceful stop", async () => {
+    const child = new ScriptedChild();
+    child.killResult = false;
+    setTimeout(() => {
+      child.signalCode = "SIGTERM";
+      child.emit("exit", null, "SIGTERM");
+    }, 10);
+    const stop = await stopGateway(child, { deadlineMs: 200, reapDeadlineMs: 200 });
+    expect(child.signals).toEqual(["SIGTERM"]);
+    expect(stop.stopped).toBe(true);
+    expect(stop.stoppedGracefully).toBe(false);
+    expect(stop.signalCode).toBe("SIGTERM");
+  }, 5_000);
+
+  it("does not treat a child that died before the call as a graceful stop", async () => {
+    const child = new ScriptedChild();
+    // The process was already gone when the call began: the SIGTERM cannot be
+    // delivered, and the exit event (code 0) arrives during the wait.
+    child.killResult = false;
+    setTimeout(() => {
+      child.exitCode = 0;
+      child.emit("exit", 0, null);
+    }, 10);
+    const stop = await stopGateway(child, { deadlineMs: 200, reapDeadlineMs: 200 });
+    expect(stop.stopped).toBe(true);
+    expect(stop.stoppedGracefully).toBe(false);
+    expect(stop.exitCode).toBe(0);
+  }, 5_000);
+});
+
+describe("cli#1061 — the supervisor budget follows the named waits", () => {
+  it("derives the supervisor and test timeouts from the named waits", () => {
+    const named =
+      GATEWAY_BOOT_DEADLINE_MS + REPLY_DEADLINE_MS + ACK_DEADLINE_MS + CUR_MOVE_DEADLINE_MS + SIGTERM_BUDGET_MS + SIGKILL_REAP_BUDGET_MS;
+    expect(NAMED_WAIT_BUDGET_MS).toBe(named);
+    expect(NAMED_WAIT_BUDGET_MS).toBe(115_000);
+    expect(SUPERVISOR_MARGIN_MS).toBeGreaterThan(0);
+    expect(DRIVER_SUPERVISOR_TIMEOUT_MS).toBe(named + SUPERVISOR_MARGIN_MS);
+    expect(DRIVER_TEST_TIMEOUT_MS).toBe(DRIVER_SUPERVISOR_TIMEOUT_MS + SUPERVISOR_CLEANUP_MS);
+    // One named deadline moved moves the derived sum by the same amount.
+    expect(namedWaitBudgetMs({ reply: REPLY_DEADLINE_MS + 7_000 })).toBe(named + 7_000);
+    expect(namedWaitBudgetMs({ stop: 1_000 })).toBe(named - SIGTERM_BUDGET_MS + 1_000);
+  });
+
+  it("reads no report after a timeout, even with a half-written report.json", () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-report-"));
+    try {
+      writeFileSync(join(root, "report.json"), '{"status": "incomplete"');
+      expect(readDriverReport(root, true)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("never takes a 0 pid from an empty pid file", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-pid-"));
+    try {
+      const pidFile = join(root, "grandchild.pid");
+      writeFileSync(pidFile, "");
+      expect(await waitForPidFile(pidFile, 200)).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves successfully when the exited driver's process group is empty", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const run = await supervise(node, ["-e", "process.exit(0);"], { timeoutMs: 1_500 });
+    expect(run.status).toBe(0);
+    expect(run.signal).toBeNull();
+    expect(run.timedOut).toBe(false);
+  });
+
+  it("kills a descendant after the driver exits before its deadline", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-close-"));
+    const pidFile = join(root, "grandchild.pid");
+    let grandchildPid: number | null = null;
+    try {
+      const descendantScript = `
+        import { writeFileSync } from "node:fs";
+        writeFileSync(process.argv[1], String(process.pid));
+        setInterval(() => {}, 1000);
+        process.send("ready");
+      `;
+      const script = `
+        import { spawn } from "node:child_process";
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(descendantScript)}, process.argv[1]], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+        grandchild.once("message", () => process.exit(0));
+      `;
+      const run = await supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
+      const recordedPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(recordedPid) && recordedPid > 0).toBe(true);
+      grandchildPid = recordedPid;
+      expect(run.status).toBe(0);
+      expect(run.signal).toBeNull();
+      expect(run.timedOut).toBe(false);
+      expect(await waitForNotRunning(grandchildPid, 2_000)).toBe(true);
+    } finally {
+      if (grandchildPid !== null && isProcessRunning(grandchildPid)) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+
+  it("kills the driver's whole process group, so a timed-out driver leaves no grandchild", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-group-"));
+    const pidFile = join(root, "grandchild.pid");
+    let grandchildPid: number | null = null;
+    try {
+      // The descendant inherits the driver's stdio, so `close` on the driver's
+      // pipes cannot fire while it lives: only the watchdog's group kill can end it.
+      const script = `
+        import { spawn } from "node:child_process";
+        import { writeFileSync } from "node:fs";
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: ["ignore", "inherit", "inherit"] });
+        writeFileSync(process.argv[1], String(grandchild.pid));
+        setInterval(() => {}, 1000);
+      `;
+      const runPromise = supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
+      // Read the PID beside the run: cleanup needs it even if `supervise` does not return.
+      const recordedPid = await waitForPidFile(pidFile, 5_000);
+      if (recordedPid === null) throw new Error(`no descendant pid written to ${pidFile} within 5000ms`);
+      grandchildPid = recordedPid;
+      expect(await waitForNotRunning(recordedPid, 2_000)).toBe(true);
+      const run = await runPromise;
+      expect(run.timedOut).toBe(true);
+    } finally {
+      if (grandchildPid !== null && isProcessRunning(grandchildPid)) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
+});
+
+/**
+ * "Not running" is ESRCH, or Linux's zombie state: a killed orphan under a
+ * container with no init stays a zombie, and kill(pid, 0) still succeeds for it.
+ */
+function isProcessRunning(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ESRCH") return false;
+  }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    const state = stat.slice(close + 2, close + 3);
+    if (state === "Z") return false;
+  } catch {
+    // No /proc entry: the zero-signal probe already answered.
+  }
+  return true;
+}
+
+/**
+ * A pid read straight from a file can be empty (the writer truncates first) or
+ * 0, and 0 must never reach a probe or a signal: it addresses this process group.
+ */
+async function waitForPidFile(pidFile: string, timeoutMs: number): Promise<number | null> {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    try {
+      const pid = Number(readFileSync(pidFile, "utf8").trim());
+      if (Number.isInteger(pid) && pid > 0) return pid;
+    } catch {
+      // not written yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return null;
+}
+
+async function waitForNotRunning(pid: number, timeoutMs: number): Promise<boolean> {
+  const end = Date.now() + timeoutMs;
+  while (Date.now() < end) {
+    if (!isProcessRunning(pid)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return !isProcessRunning(pid);
+}
