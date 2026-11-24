@@ -334,7 +334,10 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
       try {
         if (site === "settlement without timer") h.settle(0);
         expect(await pollUntil(() => h.logs.some((s) => s.includes(`obligation-read-unverified: ${inb}`)))).toBe(true);
-        expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(true);
+        expect(
+          obligationStateForTests().retries.some((r) => r.obligationId === obId),
+          "the unreadable record scheduled an in-process retry",
+        ).toBe(true);
         expect(h.logs.some((s) => s.includes(`path=${path} code=EIO`))).toBe(true);
         expect(await pollUntil(() => failedReads >= 2)).toBe(true);
         expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(true);
@@ -351,6 +354,7 @@ describe("openclaw-tps-mail: obligation state has an account lifetime (cli#403)"
         if (site === "deadline firing") expect(obFile(A, inb)?.deadlineAt).toBe(priorDeadline);
         expect(obligationStateForTests().contexts.some((c) => c.obligationId === obId)).toBe(false);
         expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obId)).toBe(false);
+        expect(obligationStateForTests().retries.some((r) => r.obligationId === obId)).toBe(false);
       } finally {
         h.settle(0);
         await h.stop();

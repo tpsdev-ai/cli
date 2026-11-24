@@ -103,6 +103,21 @@ export type ObligationState =
  */
 export const TERMINAL_STATES: ReadonlySet<ObligationState> = new Set(["acked", "unconfirmed", "failed"]);
 
+/** Every recognized state. A record whose `state` is not one of these is a
+ *  malformed shape: `readObligation` returns null, `readObligationResult`
+ *  reports it `unverified` (and it is never written), `listObligations` skips
+ *  it (reporting through `onReadError` when one is supplied), and
+ *  `sweepTerminalObligations` counts it `unreadable` and keeps it. */
+const ALL_STATES: ReadonlySet<string> = new Set([
+  "pending",
+  "yielded",
+  "delivering",
+  "posted",
+  "acked",
+  "unconfirmed",
+  "failed",
+]);
+
 export interface ObligationRecord {
   obligationId: string;
   /** The mail file id this obligation is keyed on (the plugin's MessageSid).
@@ -164,6 +179,16 @@ export interface ObligationRecord {
    *  (like `markNackSent` clears it on a hand-off), so it happens ONCE and the
    *  startup retry no longer fires for that record. */
   nackAbandonedAt?: string;
+  /** cli#1059: the store increments this under its lock on every write that
+   *  lands. A decision write names the record it examined: state, revision and
+   *  the reply identity where it applies (the deadline path also carries the
+   *  deadline it decided on), so a same-state update — e.g. one that extends
+   *  `deadlineAt` — cannot be overwritten by a decision made on an older
+   *  snapshot. A record written before this field existed reads as revision 0,
+   *  and its first write sets 1. Only a nonnegative safe integer is a valid
+   *  revision: any other value makes the record unverified, and an unverified
+   *  record is never written. */
+  revision?: number;
 }
 
 export interface ObligationLog {
@@ -179,10 +204,32 @@ export function obligationPath(mailDir: string, agent: string, inboundId: string
   return resolve(obligationsDir(mailDir, agent), `${inboundId}.json`);
 }
 
+/** The largest revision the store may hold: `revision + 1` must still be an
+ *  exact integer. In a double, `9007199254740992 + 1 === 9007199254740992`, so
+ *  a stale revision comparison could pass after a write at or above this
+ *  limit. A record at the limit reads, but cannot be written again. */
+export const MAX_OBLIGATION_REVISION = Number.MAX_SAFE_INTEGER;
+
+/** True for a usable revision: absent (reads as 0) or a nonnegative safe
+ *  integer. Anything else (a string, a negative, a fraction, null or an
+ *  overflowing value) makes the record unverified. */
+export function isValidObligationRevision(value: unknown): boolean {
+  return value === undefined ||
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0 && value <= MAX_OBLIGATION_REVISION);
+}
+
 export function readObligation(mailDir: string, agent: string, inboundId: string): ObligationRecord | null {
   const p = obligationPath(mailDir, agent, inboundId);
   try {
-    return JSON.parse(readFileSync(p, "utf-8")) as ObligationRecord;
+    const record = JSON.parse(readFileSync(p, "utf-8")) as ObligationRecord;
+    // An invalid revision or an unknown state is not a record a decision may be
+    // based on: treat it exactly like an unreadable one, so no caller writes
+    // over it.
+    if (!record || typeof record.state !== "string" || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) return null;
+    // A record whose own id does not match the lookup key belongs to another
+    // file: a revision read here must never authorize a write to that key.
+    if (record.inboundId !== inboundId) return null;
+    return record;
   } catch {
     return null;
   }
@@ -195,8 +242,14 @@ export function readObligationResult(mailDir: string, agent: string, inboundId: 
   const path = obligationPath(mailDir, agent, inboundId);
   try {
     const record = JSON.parse(readFileSync(path, "utf-8")) as ObligationRecord;
-    if (!record || typeof record.state !== "string") {
+    if (!record || typeof record.state !== "string" || !ALL_STATES.has(record.state)) {
       return { status: "unverified", path, code: "INVALID_RECORD" };
+    }
+    if (!isValidObligationRevision(record.revision)) {
+      return { status: "unverified", path, code: "INVALID_REVISION" };
+    }
+    if (record.inboundId !== inboundId) {
+      return { status: "unverified", path, code: "INBOUND_ID_MISMATCH" };
     }
     return { status: "found", record };
   } catch (error) {
@@ -219,10 +272,16 @@ export function listObligations(mailDir: string, agent: string, onReadError?: (p
     if (!name.endsWith(".json") || name.startsWith(".")) continue;
     try {
       const record = JSON.parse(readFileSync(resolve(dir, name), "utf-8")) as ObligationRecord;
-      if (onReadError && (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state))) {
-        const ids = [name.slice(0, -5)];
-        if (typeof record?.inboundId === "string") ids.push(record.inboundId);
-        onReadError(resolve(dir, name), undefined, ids, "file");
+      // Validate EVERY listing, whether or not a callback is supplied: a
+      // startup caller acts on these records (an owed-nack send) and a write
+      // refusal cannot retract mail. A record whose filename does not match its
+      // inboundId, or whose state or revision is invalid, is not returned.
+      if (!record || typeof record.inboundId !== "string" || `${record.inboundId}.json` !== name || !ALL_STATES.has(record.state) || !isValidObligationRevision(record.revision)) {
+        if (onReadError) {
+          const ids = [name.slice(0, -5)];
+          if (typeof record?.inboundId === "string") ids.push(record.inboundId);
+          onReadError(resolve(dir, name), undefined, ids, "file");
+        }
         continue;
       }
       out.push(record);
@@ -245,13 +304,31 @@ export function writeObligation(mailDir: string, agent: string, record: Obligati
   withObligationLock(mailDir, agent, () => writeObligationLocked(mailDir, agent, record));
 }
 
-function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord): void {
+function writeObligationLocked(mailDir: string, agent: string, record: ObligationRecord, revisionBase?: number): ObligationRecord {
   const dir = obligationsDir(mailDir, agent);
   mkdirSync(dir, { recursive: true });
   const target = resolve(dir, `${record.inboundId}.json`);
   const tmp = resolve(dir, `.${record.inboundId}.json.tmp`);
-  writeFileSync(tmp, JSON.stringify(record, null, 2), "utf-8");
+  // The lock is held here. A transition passes the revision it read under that
+  // same lock; an unguarded write re-reads it. A record from before the field
+  // existed reads as 0. An unverified record is never written.
+  let base: number;
+  if (revisionBase !== undefined) {
+    base = revisionBase;
+  } else {
+    const existing = readObligationResult(mailDir, agent, record.inboundId);
+    if (existing.status === "unverified") {
+      throw new Error(`obligation record ${record.inboundId} is unverified (${existing.code}); refusing to write`);
+    }
+    base = existing.status === "found" ? (existing.record.revision ?? 0) : 0;
+  }
+  if (!Number.isSafeInteger(base + 1)) {
+    throw new Error(`obligation record ${record.inboundId} reached the revision limit; refusing to write`);
+  }
+  const written: ObligationRecord = { ...record, revision: base + 1 };
+  writeFileSync(tmp, JSON.stringify(written, null, 2), "utf-8");
   renameSync(tmp, target);
+  return written;
 }
 
 /**
@@ -267,21 +344,27 @@ export function createObligation(
 ): { created: boolean; record: ObligationRecord } {
   return withObligationLock(mailDir, agent, () => {
     const draft = make();
-    const existing = readObligation(mailDir, agent, draft.inboundId);
-    if (existing) {
+    const existing = readObligationResult(mailDir, agent, draft.inboundId);
+    if (existing.status === "unverified") {
+      // Never create over a record the store cannot verify.
+      throw new Error(`obligation record ${draft.inboundId} is unverified (${existing.code}); refusing to create`);
+    }
+    if (existing.status === "found") {
       log?.info?.(
-        `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.obligationId}); not creating a second`,
+        `tps-mail: obligation for inbound ${draft.inboundId} already exists (${existing.record.obligationId}); not creating a second`,
       );
-      return { created: false, record: existing };
+      return { created: false, record: existing.record };
     }
     draft.lastTransitionAt = draft.lastTransitionAt ?? new Date().toISOString();
-    writeObligationLocked(mailDir, agent, draft);
-    return { created: true, record: draft };
+    const written = writeObligationLocked(mailDir, agent, draft, 0);
+    return { created: true, record: written };
   });
 }
 
-/** Test hook before the transition acquires its store lock. */
-let beforeTransitionForTests: ((inboundId: string) => void) | undefined;
+/** Test hook before the transition acquires its store lock. It receives the
+ *  state the transition targets, so a test that injects a failure can tell an
+ *  ack write from a re-arm or delivery write. */
+let beforeTransitionForTests: ((inboundId: string, next: ObligationState) => void) | undefined;
 export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTests): void {
   beforeTransitionForTests = hook;
 }
@@ -300,7 +383,14 @@ export function setBeforeTransitionForTests(hook: typeof beforeTransitionForTest
  * delivery call) may never be handed the old record as though it were the result.
  *
  * `expect.from` refuses a transition when the record's STATE moved since the
- * caller's re-read. A concurrent same-state update is not detected.
+ * caller's re-read; `expect.revision` additionally refuses a SAME-STATE update
+ * (e.g. a deadline extension) that landed since that read; `expect.replyId`
+ * refuses a record that names another reply, even at the same revision. A
+ * refused transition returns null and writes nothing, so the caller must
+ * re-read and re-evaluate.
+ *
+ * A record whose revision is not a nonnegative safe integer is unverified:
+ * every transition refuses it and no write ever lands on it.
  */
 export function transitionObligation(
   mailDir: string,
@@ -309,9 +399,13 @@ export function transitionObligation(
   next: ObligationState,
   patch: Partial<ObligationRecord> = {},
   log?: ObligationLog,
-  expect?: { from: ObligationState },
+  expect?: { from: ObligationState; revision?: number; replyId?: string },
 ): ObligationRecord | null {
-  beforeTransitionForTests?.(inboundId);
+  beforeTransitionForTests?.(inboundId, next);
+  // The patch may not change the record's write key: the transition was decided
+  // for this inboundId, and a different inboundId would stage the write under
+  // another file.
+  const { inboundId: _ignoredKey, ...safePatch } = patch;
   return withObligationLock(mailDir, agent, () => {
     const current = readObligation(mailDir, agent, inboundId);
     if (!current) return null;
@@ -327,9 +421,39 @@ export function transitionObligation(
       );
       return null;
     }
-    const updated: ObligationRecord = { ...current, ...patch, state: next, lastTransitionAt: new Date().toISOString() };
-    writeObligationLocked(mailDir, agent, updated);
-    return updated;
+    if (expect?.revision !== undefined && (current.revision ?? 0) !== expect.revision) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} moved from revision ${expect.revision} to ${current.revision ?? 0}; refusing the stale transition to ${next}`,
+      );
+      return null;
+    }
+    if (expect?.replyId !== undefined && current.replyId !== expect.replyId) {
+      log?.info?.(
+        `tps-mail: obligation ${current.obligationId} now names reply ${current.replyId ?? "(none)"}, not ${expect.replyId}; refusing the stale transition to ${next}`,
+      );
+      return null;
+    }
+    // cli#1059 round 5: a transition that leaves every PATCHED field as it found
+    // it — same presence and same value — is not a decision, so it writes
+    // nothing. Presence counts: setting a field to null where it is absent, or
+    // replacing a null with an absent field, is a write (an undefined patch value
+    // means absent). A re-arm that adds `missingCurReason` therefore writes
+    // (cli#1006). A re-arm of the state and deadline a record already carries
+    // used to bump `revision` and `lastTransitionAt` — while the record's own
+    // check could be running. Return the record as it stands; the caller
+    // schedules its timer from it. (Terminal records are refused above, so no
+    // terminal record reaches this point.)
+    if (next === current.state) {
+      const fields = current as unknown as Record<string, unknown>;
+      const changed = Object.entries(safePatch).some(([key, value]) => {
+        const had = Object.hasOwn(fields, key) && fields[key] !== undefined;
+        const wants = value !== undefined;
+        return had !== wants || (had && fields[key] !== value);
+      });
+      if (!changed) return current;
+    }
+    const updated: ObligationRecord = { ...current, ...safePatch, state: next, lastTransitionAt: new Date().toISOString() };
+    return writeObligationLocked(mailDir, agent, updated, current.revision ?? 0);
   });
 }
 
@@ -377,7 +501,7 @@ export function markNackSent(
       if (!current || current.state !== "failed") return false;
       const { nackPending: _clear, ...rest } = current;
       try {
-        writeObligationLocked(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() });
+        writeObligationLocked(mailDir, agent, { ...rest, nackSentAt: when ?? new Date().toISOString() }, current.revision ?? 0);
         return true;
       } catch (err) {
         log?.warn?.(
@@ -429,7 +553,7 @@ function abandonOwedNackLocked(
   }
   const { nackPending: _cleared, ...rest } = current;
   try {
-    writeObligationLocked(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() });
+    writeObligationLocked(mailDir, agent, { ...rest, nackAbandonedAt: when ?? new Date().toISOString() }, current.revision ?? 0);
     return true;
   } catch (err) {
     log?.warn?.(
@@ -472,18 +596,6 @@ export interface RetentionResult {
   orphanReceiptsSkipped: number;
   disabled: boolean;
 }
-
-/** Every recognized state — a record whose `state` is not one of these is a
- *  malformed shape (reported as unreadable, never swept). */
-const ALL_STATES: ReadonlySet<string> = new Set([
-  "pending",
-  "yielded",
-  "delivering",
-  "posted",
-  "acked",
-  "unconfirmed",
-  "failed",
-]);
 
 /** True when the agent's cur/ record for this inbound is still UNRESOLVED
  *  (present without ackedAt/nackedAt). Startup recovery may re-dispatch it, so
@@ -653,7 +765,9 @@ function sweepTerminalObligationsLocked(
     if (typeof record !== "object" || record === null || Array.isArray(record) ||
         typeof state !== "string" || !ALL_STATES.has(state) ||
         typeof inbound !== "string" || `${inbound}.json` !== name ||
-        typeof id !== "string" || id.length === 0) {
+        typeof id !== "string" || id.length === 0 ||
+        // An invalid revision is not a record a sweep may act on; retain it.
+        !isValidObligationRevision((record as { revision?: unknown }).revision)) {
       if (typeof id === "string") liveObligationIds.add(id);
       res.unreadable++;
       leftUnreadable.push(name);
@@ -1117,10 +1231,11 @@ export interface ReceiptScanOptions {
  *
  *   (g) THE REPLY BINDING (cli#389 round 6, item 1): when the obligation record
  *       KNOWS the reply it was discharged by (`replyId`, recorded at the posted
- *       transition), a receipt must carry the same `replyId`. Only the forms
- *       that carry a reply id take part: the metadata receipt (1) and the bridge
- *       record (f). A posted marker record (2) is the delivered mail itself and
- *       names no separate reply id, so there is nothing to pin there.
+ *       transition), a receipt must name that reply. The metadata receipt (1)
+ *       and the bridge record (f) carry it as `replyId`; a posted marker record
+ *       (2) carries it as its own `id`, the reply id the delivery wrote. So all
+ *       three forms are pinned when the record knows a reply id, and none is
+ *       when it does not.
  *
  * WHAT THE SIGNATURE CHECK PROVES, AND WHAT IT DOES NOT: it proves the record
  * carries a reply signed by the obligated agent's key (the key Flair holds for
@@ -1221,6 +1336,7 @@ export async function scanForReceipt(
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
         if (record?.replyToId !== replyToId) continue;
+        if (expectedReplyId !== undefined && record?.id !== expectedReplyId) continue;
         if (!(await verified(recordReceiptEnvelope(record)))) continue;
         return { status: "found", path };
       }

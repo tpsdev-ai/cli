@@ -804,10 +804,13 @@ function obligationHoldsCur(inboxRoot: string, messageId: string): boolean {
 /**
  * Archive cur/ messages older than maxAgeDays to archive/YYYY-MM/.
  *
- * Returns the count moved. Idempotent and non-failing — corrupt or unreadable
- * files are skipped without blocking the others. Called opportunistically
- * from mail check / mail watch so the cap doesn't drift back into the
- * combined-count failure mode if a future change re-introduces it.
+ * Returns the count moved. Best effort PER FILE: a corrupt or unreadable file
+ * is skipped without blocking the others. Inbox setup, lock acquisition, the
+ * directory listing and the pending-file check can throw — only the per-file
+ * stat/read, archive-directory creation and rename handling is non-fatal.
+ * Called opportunistically from mail check / mail watch so the cap doesn't
+ * drift back into the combined-count failure mode if a future change
+ * re-introduces it.
  *
  * The 30-day default is conservative: agents that ack mail are essentially
  * done with it, and the audit log + git history are the durable record. cur/
