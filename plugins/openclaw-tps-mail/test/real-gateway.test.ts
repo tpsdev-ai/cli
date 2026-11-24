@@ -313,9 +313,9 @@ type SupervisedRun = {
 };
 
 /**
- * Run a command in its OWN process group and kill the group when the budget
- * runs out. A kill of the group is what reaches a gateway the driver started:
- * killing the direct child alone leaves the gateway running with no report.
+ * Run a command in its OWN process group and kill the group on close or timeout.
+ * A kill of the group is what reaches a gateway the driver started:
+ * killing the direct child alone can leave the gateway running.
  */
 function supervise(
   command: string,
@@ -357,6 +357,7 @@ function supervise(
       reject(err);
     });
     child.once("close", (status, signal) => {
+      killGroup("SIGKILL");
       clearTimeout(timer);
       resolveRun({ status, signal, stdout, stderr, timedOut, budgetMs: timeoutMs });
     });
@@ -1379,6 +1380,51 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
     expect(namedWaitBudgetMs({ reply: REPLY_DEADLINE_MS + 7_000 })).toBe(named + 7_000);
     expect(namedWaitBudgetMs({ stop: 1_000 })).toBe(named - SIGTERM_BUDGET_MS + 1_000);
   });
+
+  it("resolves successfully when the exited driver's process group is empty", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const run = await supervise(node, ["-e", "process.exit(0);"], { timeoutMs: 1_500 });
+    expect(run.status).toBe(0);
+    expect(run.signal).toBeNull();
+    expect(run.timedOut).toBe(false);
+  });
+
+  it("kills a descendant after the driver exits before its deadline", async () => {
+    const node = process.env.TPS_LANE_NODE || "node";
+    const root = mkdtempSync(join(tmpdir(), "tps-supervisor-close-"));
+    const pidFile = join(root, "grandchild.pid");
+    let grandchildPid: number | null = null;
+    try {
+      const descendantScript = `
+        import { writeFileSync } from "node:fs";
+        writeFileSync(process.argv[1], String(process.pid));
+        setInterval(() => {}, 1000);
+        process.send("ready");
+      `;
+      const script = `
+        import { spawn } from "node:child_process";
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(descendantScript)}, process.argv[1]], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+        grandchild.once("message", () => process.exit(0));
+      `;
+      const run = await supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
+      const recordedPid = Number(readFileSync(pidFile, "utf8").trim());
+      expect(Number.isInteger(recordedPid) && recordedPid > 0).toBe(true);
+      grandchildPid = recordedPid;
+      expect(run.status).toBe(0);
+      expect(run.signal).toBeNull();
+      expect(run.timedOut).toBe(false);
+      expect(await waitForNotRunning(grandchildPid, 2_000)).toBe(true);
+    } finally {
+      if (grandchildPid !== null && isProcessRunning(grandchildPid)) {
+        try {
+          process.kill(grandchildPid, "SIGKILL");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ESRCH") throw err;
+        }
+      }
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 10_000);
 
   it("kills the driver's whole process group, so a timed-out driver leaves no grandchild", async () => {
     const node = process.env.TPS_LANE_NODE || "node";
