@@ -156,7 +156,7 @@ export interface LockOwner {
 export type OwnerState = "alive" | "dead" | "unverifiable";
 
 /** A `proc:` token whose value has the shape processStartToken writes (`proc:<digits>`). Two differing
- *  tokens of this shape are classified as reuse ("dead"); any other shape is unverifiable. */
+ *  tokens of this shape are classified as reuse ("dead"); a differing token of any other shape is unverifiable. */
 const PROC_TOKEN = /^proc:\d+$/;
 
 export type OwnerTokenState = "alive" | "dead" | "unverifiable";
