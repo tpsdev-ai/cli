@@ -20,6 +20,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { pidState } from "@tpsdev-ai/agent";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
@@ -2848,13 +2849,11 @@ process.exit(typeof code === "number" ? code : 1);
     return check();
   }
 
+  /** Liveness through the product's own rule (@tpsdev-ai/agent pidState): a pid
+   * whose /proc stat reports state Z has exited. A bare `kill(pid, 0)` probe
+   * keeps reading a killed survivor as alive where nothing reaps it. */
   function alive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ESRCH";
-    }
+    return pidState(pid) !== "gone";
   }
 
   function observed(path: string): string[] {
