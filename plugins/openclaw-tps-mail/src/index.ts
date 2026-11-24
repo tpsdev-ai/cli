@@ -868,6 +868,8 @@ type ObligationRetryEntry =
       attempt: number;
       /** Epoch ms this attempt is due. A repeated event never moves it. */
       dueAt: number;
+      /** Epoch ms this attempt was scheduled (`dueAt` minus its delay). */
+      scheduledAt: number;
       lastVerifiedState?: ObligationState;
       /** The failure that scheduled this attempt; an exhaustion reached from a
        *  completion names it instead of a generic re-check reason. */
@@ -1021,7 +1023,7 @@ export async function awaitStartupCurSweepForTests(
 export function obligationStateForTests(): {
   contexts: { obligationId: string; accountId: string }[];
   deadlines: { obligationId: string; accountId: string }[];
-  retries: { obligationId: string; accountId: string; attempt: number; dueAt: number; exhausted: boolean; state?: ObligationState }[];
+  retries: { obligationId: string; accountId: string; attempt: number; dueAt: number; scheduledAt?: number; exhausted: boolean; state?: ObligationState }[];
 } {
   return {
     contexts: [...yieldContexts].map(([obligationId, ctx]) => ({ obligationId, accountId: ctx.accountId })),
@@ -1031,6 +1033,7 @@ export function obligationStateForTests(): {
       accountId: retry.accountId,
       attempt: retry.attempt,
       dueAt: retry.kind === "scheduled" ? retry.dueAt : Number.POSITIVE_INFINITY,
+      scheduledAt: retry.kind === "scheduled" ? retry.scheduledAt : undefined,
       exhausted: retry.kind === "exhausted",
       state: retry.lastVerifiedState,
     })),
@@ -1286,7 +1289,8 @@ function scheduleObligationRetry(
     return;
   }
   const delay = obligationRetryDelaysMs[attempt]!;
-  const dueAt = Date.now() + delay;
+  const scheduledAt = Date.now();
+  const dueAt = scheduledAt + delay;
   const timer = accountTimer(ctx, () => {
     // The timer hands ownership to a single running check. Every event or arm
     // failure in this interval only records a re-check (and, for a failure, its
@@ -1326,6 +1330,7 @@ function scheduleObligationRetry(
     incarnation: ctx.incarnation,
     attempt: attempt + 1,
     dueAt,
+    scheduledAt,
     // Carry the last verified state and the failure that scheduled this attempt
     // across the next attempt.
     lastVerifiedState,
@@ -2643,7 +2648,12 @@ async function reconcileMissingCurObligation(ctx: YieldContext, obligationId: st
   const receipt = await scanObligationReceipt(ctx, current.obligationId, current, current.replyId);
   if (!isLiveContext(ctx)) return;
   const cur = lookupObligationCur(ctx, obligationId);
-  if (cur.status === "error") return;
+  if (cur.status === "error") {
+    // Nothing settles on an inconclusive lookup; the failure goes to the
+    // bounded retry state, as the rescan's lookup error below does.
+    reportObligationFailure(ctx, current.obligationId, `cur/ lookup failed (${cur.code})`);
+    return;
+  }
   if (cur.status === "present") {
     await reconcileObligation(ctx, current);
     return;

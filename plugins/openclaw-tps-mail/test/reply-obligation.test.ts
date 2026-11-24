@@ -2070,6 +2070,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const scanGate = new Promise<void>((r) => { releaseScan = r; });
     let scanEntered = false;
     const warnings: string[] = [];
+    // A long first delay keeps the retry from re-arming the deadline before
+    // the assertions below run.
+    const prevDelays = setObligationRetryDelaysForTests([60000, 60000, 60000]);
     const h = await start(AGENT, SENDER, {
       warnCalls: warnings,
       localSender: true,
@@ -2080,20 +2083,29 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
         await scanGate;
       },
     });
-    expect(scanEntered, "the receipt scan is awaiting verification").toBe(true);
+    try {
+      expect(scanEntered, "the receipt scan is awaiting verification").toBe(true);
 
-    const before = obligationFile(AGENT, inboundId);
-    const path = resolve(tempMailDir, AGENT, "cur", `${inboundId}.json`);
-    mkdirSync(resolve(tempMailDir, AGENT, "cur"), { recursive: true });
-    writeFileSync(path, "{not json");
-    releaseScan();
+      const before = obligationFile(AGENT, inboundId);
+      const path = resolve(tempMailDir, AGENT, "cur", `${inboundId}.json`);
+      mkdirSync(resolve(tempMailDir, AGENT, "cur"), { recursive: true });
+      writeFileSync(path, "{not json");
+      releaseScan();
 
-    await sleep(300);
-    expect(obligationFile(AGENT, inboundId)).toEqual(before);
-    expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(1);
-    expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId)).toBe(false);
-    expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
-    await h.stop();
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 5000),
+        "the failed lookup schedules a bounded retry",
+      ).toBe(true);
+      await sleep(300);
+      expect(obligationFile(AGENT, inboundId)).toEqual(before);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(1);
+      expect(obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId)).toBe(false);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"))).toHaveLength(0);
+    } finally {
+      releaseObligationRetryForTests(obligationId);
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
   }, 30000);
 
   /** A signed cur/ entry (promoted by the launcher) plus an obligation record at `state`. */
@@ -3691,25 +3703,22 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     setObligationCurLookupFaultForTests((id) => (id === inboundId && faulty ? "EIO" : undefined));
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true });
     try {
-      // Record each attempt's due time as it is scheduled. Attempt 3 is
-      // observable after 1 s + 4 s; its own 16 s wait is not consumed.
-      const seen = new Map<number, { dueAt: number; observedAt: number }>();
+      // Record each attempt's interval from the time it was scheduled to its
+      // due time, so a late poll does not shorten it. Attempt 3 is observable
+      // after 1 s + 4 s; its own 16 s wait is not consumed.
+      const seen = new Map<number, number>();
       const deadline = Date.now() + 15000;
       while (Date.now() < deadline && !seen.has(3)) {
         const entry = obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
-        if (entry && !seen.has(entry.attempt)) seen.set(entry.attempt, { dueAt: entry.dueAt, observedAt: Date.now() });
+        if (entry?.scheduledAt !== undefined && !seen.has(entry.attempt)) seen.set(entry.attempt, entry.dueAt - entry.scheduledAt);
         await sleep(20);
       }
       faulty = false;
       const expected = [1000, 4000, 16000];
       for (let attempt = 1; attempt <= 3; attempt++) {
-        const entry = seen.get(attempt);
-        expect(entry, `attempt ${attempt} was scheduled`).toBeDefined();
-        const remaining = entry!.dueAt - entry!.observedAt;
-        expect(remaining, `attempt ${attempt} uses the active ${expected[attempt - 1]} ms delay`)
-          .toBeGreaterThanOrEqual(expected[attempt - 1] - 250);
-        expect(remaining, `attempt ${attempt} uses the active ${expected[attempt - 1]} ms delay`)
-          .toBeLessThanOrEqual(expected[attempt - 1] + 250);
+        const interval = seen.get(attempt);
+        expect(interval, `attempt ${attempt} was scheduled`).toBeDefined();
+        expect(interval, `attempt ${attempt} uses the active ${expected[attempt - 1]} ms delay`).toBe(expected[attempt - 1]);
       }
     } finally {
       setObligationCurLookupFaultForTests(undefined);
@@ -3927,9 +3936,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     let faulty = true;
     let lookups = 0;
     setObligationCurLookupFaultForTests((id) => {
-      if (id !== inboundId || !faulty) return undefined;
+      if (id !== inboundId) return undefined;
       lookups++;
-      return "EIO";
+      return faulty ? "EIO" : undefined;
     });
     const prevDelays = setObligationRetryDelaysForTests([200, 200, 200]);
     const warnings: string[] = [];
@@ -3987,9 +3996,9 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     let faulty = true;
     let lookups = 0;
     setObligationCurLookupFaultForTests((id) => {
-      if (id !== inboundId || !faulty) return undefined;
+      if (id !== inboundId) return undefined;
       lookups++;
-      return "EIO";
+      return faulty ? "EIO" : undefined;
     });
     const prevDelays = setObligationRetryDelaysForTests([50, 60, 70]);
     const warnings: string[] = [];
@@ -6012,7 +6021,15 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       await h.deliver("final answer", "final");
       h.settle();
       expect(await pollUntil(() => injected, 15000), "the record was replaced before the scan").toBe(true);
-      await sleep(500);
+      // Wait for the receipt decision: the fallback deadline arm, or an ack.
+      expect(
+        await pollUntil(
+          () => obligationStateForTests().deadlines.some((d) => d.obligationId === h.obligationId()) ||
+            obligationFile(AGENT, inboundId)?.state === "acked",
+          15000,
+        ),
+        "the receipt decision completed",
+      ).toBe(true);
       expect(obligationFile(AGENT, inboundId)?.replyId).toBe("reply-replaced");
       expect(
         obligationFile(AGENT, inboundId)?.state,
@@ -6045,7 +6062,15 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       await h.deliver("final answer", "final");
       h.settle();
       expect(await pollUntil(() => injected, 15000), "the record was replaced before the scan").toBe(true);
-      await sleep(500);
+      // Wait for the receipt decision: the fallback deadline arm, or an ack.
+      expect(
+        await pollUntil(
+          () => obligationStateForTests().deadlines.some((d) => d.obligationId === h.obligationId()) ||
+            obligationFile(AGENT, inboundId)?.state === "acked",
+          15000,
+        ),
+        "the receipt decision completed",
+      ).toBe(true);
       expect(
         readdirSync(resolve(tempMailDir, SENDER, "new")).filter((name) => name.endsWith(".json")).length,
         "reply A's posted file is still there",
@@ -6291,6 +6316,52 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     }
   }, 40000);
 
+  it("1059 r17 a failed first post-scan cur/ lookup at startup schedules a retry that settles once the lookup recovers", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059-r17-first-lookup-error";
+    const { obligationId } = seedOrphan(inboundId, { deadlineInMs: -1000 });
+    // Only the first lookup (the startup recovery's post-scan lookup) fails.
+    // The second records the state the failed lookup left and who runs it.
+    let lookups = 0;
+    let atNextLookup: { state?: string; retryRunning: boolean } | undefined;
+    setObligationCurLookupFaultForTests((id) => {
+      if (id !== inboundId) return undefined;
+      lookups++;
+      if (lookups === 1) return "EIO";
+      if (lookups === 2) {
+        const retry = obligationStateForTests().retries.find((r) => r.obligationId === obligationId);
+        atNextLookup = {
+          state: obligationFile(AGENT, inboundId)?.state,
+          retryRunning: retry !== undefined && !retry.exhausted && retry.dueAt === Number.POSITIVE_INFINITY,
+        };
+      }
+      return undefined;
+    });
+    const prevDelays = setObligationRetryDelaysForTests([300, 300, 300]);
+    const warnings: string[] = [];
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      // The nack is sent after the failed state is written: wait for the mail.
+      expect(
+        await pollUntil(() => nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption").length > 0, 15000),
+        "a retry settles the overdue record once the lookup recovers",
+      ).toBe(true);
+      expect(
+        warnings.some((line) => line.includes("obligation-cur-lookup-failed") && line.includes("EIO")),
+        "the failed lookup is reported",
+      ).toBe(true);
+      expect(atNextLookup?.state, "the failed lookup settled nothing").toBe("yielded");
+      expect(atNextLookup?.retryRunning, "the next lookup runs in the bounded retry").toBe(true);
+      expect(obligationFile(AGENT, inboundId)?.state).toBe("failed");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationCurLookupFaultForTests(undefined);
+      releaseObligationRetryForTests(obligationId);
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
   it("1059 r14 a capped deadline timer re-arms for the remainder and settles at the original deadline", async () => {
     seedSigningKeys();
     const inboundId = "msg-1059-r14-timer-cap-fires";
@@ -6416,13 +6487,14 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const rejections: unknown[] = [];
     const onRejection = (reason: unknown) => { rejections.push(reason); };
     process.on("unhandledRejection", onRejection);
-    const h = await start(AGENT, SENDER, {
-      localSender: true,
-      noInbound: true,
-      finalizeContextThrows: true,
-      warnCalls: warnings,
-    });
+    let h: Awaited<ReturnType<typeof start>> | undefined;
     try {
+      h = await start(AGENT, SENDER, {
+        localSender: true,
+        noInbound: true,
+        finalizeContextThrows: true,
+        warnCalls: warnings,
+      });
       expect(
         await pollUntil(
           () => warnings.some((line) => line.includes("processNewFile error") && line.includes("context finalizer refused")),
@@ -6434,7 +6506,7 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
       expect(rejections, "no unhandled rejection").toHaveLength(0);
     } finally {
       process.off("unhandledRejection", onRejection);
-      await h.stop();
+      await h?.stop();
     }
   }, 40000);
 });
