@@ -184,6 +184,17 @@ describe("classifyOwnerToken: one rule for a live pid's current and recorded tok
     expect(classifyOwnerToken("proc", "proc:4242")).toBe("unverifiable");
     expect(classifyOwnerToken("proc:4242", "proc:")).toBe("unverifiable");
   });
+
+  test("a differing malformed recorded proc: value is unverifiable, not pid reuse", () => {
+    expect(classifyOwnerToken("proc:4242", "proc:bogus")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc:4242", "proc:12x")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc:4242", "proc: 12")).toBe("unverifiable");
+    expect(classifyOwnerToken("proc:4242", "proc:-1")).toBe("unverifiable");
+  });
+
+  test("equal malformed tokens are alive", () => {
+    expect(classifyOwnerToken("proc:bogus", "proc:bogus")).toBe("alive");
+  });
 });
 
 describe("ownerState: a live owner is never reclaimed on a ps: mismatch alone", () => {

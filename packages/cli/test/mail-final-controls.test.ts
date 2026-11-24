@@ -234,7 +234,7 @@ test("a changed live owner token is read again while polling", async () => {
   const lockDir = join(root, ".mail-lock");
   const ownerPath = join(lockDir, "owner.json");
   fs.mkdirSync(lockDir);
-  let token = "old";
+  let token = "100";
   fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: `proc:${token}` }));
   const read = fs.readFileSync;
   const kernel = spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof read>) => {
@@ -243,20 +243,20 @@ test("a changed live owner token is read again while polling", async () => {
   });
   fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "ps:old" }));
   expect(await acquireMailLock(root, { timeoutMs: 0 })).toBeNull();
-  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "proc:different" }));
+  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "proc:1" }));
   const reclaimed = await acquireMailLock(root, { timeoutMs: 0 });
   expect(reclaimed).not.toBeNull();
   reclaimed?.release();
   fs.mkdirSync(lockDir);
-  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "proc:old" }));
+  fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: "proc:100" }));
   const change = setTimeout(() => {
-    token = "new";
+    token = "200";
     fs.writeFileSync(ownerPath, JSON.stringify({ pid: process.pid, startToken: `proc:${token}` }));
   }, 5);
   let lock: MailLock | null = null;
   try {
     lock = await acquireMailLock(root, { timeoutMs: 40, pollMs: 10 });
     expect(lock).toBeNull();
-    expect(JSON.parse(fs.readFileSync(ownerPath, "utf8")).startToken).toBe("proc:new");
+    expect(JSON.parse(fs.readFileSync(ownerPath, "utf8")).startToken).toBe("proc:200");
   } finally { clearTimeout(change); kernel.mockRestore(); lock?.release(); }
 });
