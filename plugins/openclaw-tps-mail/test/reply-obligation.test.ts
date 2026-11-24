@@ -3352,15 +3352,35 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
     const before = readFileSync(path, "utf-8");
     const warnings: string[] = [];
-    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const prevDelays = setObligationRetryDelaysForTests([1200, 60, 60]);
     const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
     try {
+      const lookupFailure = warnings.find((line) => line.includes("obligation-cur-lookup-failed"));
+      const observedCode = /the cur\/ lookup failed \(([A-Z0-9_]+)\)/.exec(lookupFailure ?? "")?.[1];
+      expect(observedCode, "the reported lookup failure names a code").toBeTruthy();
+      // The first attempt is 1.2 s away: its scheduled entry still carries the
+      // error the pre-scan reported, so sample its own value now, before the
+      // attempt runs and replaces it.
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 2000),
+        "the startup lookup error entered the bounded retry",
+      ).toBe(true);
+      expect(
+        obligationStateForTests().retries.find((r) => r.obligationId === obligationId)?.lastError,
+        "the retry entry carries the observed lookup error",
+      ).toBe(`cur/ lookup failed (${observedCode})`);
       expect(
         await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
         "the shared budget is exhausted with a named warning",
       ).toBe(true);
-      expect(warnings.filter((line) => line.includes("obligation-retry-exhausted")), "exactly one cap warning").toHaveLength(1);
+      const exhaustedLines = warnings.filter((line) => line.includes("obligation-retry-exhausted"));
+      expect(exhaustedLines, "exactly one cap warning").toHaveLength(1);
       expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed")), "the lookup error is reported once").toHaveLength(1);
+      // The cap warning itself must name the lookup error the dangling cur/
+      // path produces, not just that the budget ran out.
+      expect(exhaustedLines[0], "the exhaustion warning names the observed lookup error code").toContain(
+        `cur/ lookup failed (${observedCode})`,
+      );
       await sleep(200);
       expect(readFileSync(path, "utf-8"), "the record is unchanged").toBe(before);
       expect(obligationFile(AGENT, inboundId)?.state, "the record stays open").toBe("yielded");

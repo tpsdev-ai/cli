@@ -1023,7 +1023,7 @@ export async function awaitStartupCurSweepForTests(
 export function obligationStateForTests(): {
   contexts: { obligationId: string; accountId: string }[];
   deadlines: { obligationId: string; accountId: string }[];
-  retries: { obligationId: string; accountId: string; attempt: number; dueAt: number; scheduledAt?: number; exhausted: boolean; state?: ObligationState }[];
+  retries: { obligationId: string; accountId: string; attempt: number; dueAt: number; scheduledAt?: number; exhausted: boolean; state?: ObligationState; lastError?: string }[];
 } {
   return {
     contexts: [...yieldContexts].map(([obligationId, ctx]) => ({ obligationId, accountId: ctx.accountId })),
@@ -1036,6 +1036,7 @@ export function obligationStateForTests(): {
       scheduledAt: retry.kind === "scheduled" ? retry.scheduledAt : undefined,
       exhausted: retry.kind === "exhausted",
       state: retry.lastVerifiedState,
+      lastError: retry.kind === "exhausted" ? undefined : retry.lastError,
     })),
   };
 }
