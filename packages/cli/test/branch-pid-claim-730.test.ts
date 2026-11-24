@@ -420,9 +420,13 @@ function readGrandchildPid(file: string): number | null {
  * The token narrows pid reuse but is not absolute: macOS `ps` start time has
  * one-second precision, and a check-then-signal window remains.
  */
-async function killDetachedGrandchild(pid: number, expectedToken: string | null): Promise<string | null> {
+async function killDetachedGrandchild(
+  pid: number,
+  expectedToken: string | null,
+  readToken: (pid: number) => string | null = processStartToken,
+): Promise<string | null> {
   if (pidExited(pid)) return null;
-  const token = expectedToken === null ? null : processStartToken(pid);
+  const token = expectedToken === null ? null : readToken(pid);
   if (token === null || token !== expectedToken) {
     unverifiedIdentityPids.add(pid);
     return `grandchild ${pid}: identity could not be verified; not signalled`;
@@ -477,14 +481,16 @@ async function withHeldStderrDaemon(
   wait: (daemon: TrackedChild) => Promise<unknown>,
   keepParent = false,
   readCleanupToken: (pid: number) => string | null = processStartToken,
+  readVerifyToken: (pid: number) => string | null = processStartToken,
 ): Promise<void> {
   const daemon = spawnHeldStderr(recordedFile, selfReportFile, keepParent);
-  let target: number | null = null;
+  let target: { pid: number; token: string | null } | null = null;
   let failure: unknown = null;
   try {
     const recorded = await waitFor(() => readGrandchildPid(recordedFile), "detached grandchild pid");
     const reported = await waitFor(() => readGrandchildPid(selfReportFile), "the grandchild's self-reported pid");
-    target = reported;
+    // Captured before the wait: the pid may name a successor when the wait returns.
+    target = { pid: reported, token: readCleanupToken(reported) };
     expect(recorded).toBe(reported);
     await wait(daemon);
   } catch (error) {
@@ -492,7 +498,7 @@ async function withHeldStderrDaemon(
     throw error;
   } finally {
     if (target !== null) {
-      const refused = await killDetachedGrandchild(target, readCleanupToken(target));
+      const refused = await killDetachedGrandchild(target.pid, target.token, readVerifyToken);
       if (refused !== null) {
         throw new Error(`cleanup refused: ${refused}`, failure === null ? undefined : { cause: failure });
       }
@@ -1115,6 +1121,52 @@ describe("branch pid record ownership (cli#730)", () => {
       () => waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100),
       false,
       (pid) => `${processStartToken(pid)}-stale`,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    const pid = readGrandchildPid(selfReportFile);
+    try {
+      expect(failure?.message).toContain("cleanup refused");
+      expect(failure?.message).toContain("identity could not be verified; not signalled");
+      expect((failure?.cause as Error | undefined)?.message).toContain("timed out");
+      expect(pid).not.toBeNull();
+      if (pid !== null) expect(pidExited(pid)).toBe(false);
+    } finally {
+      if (pid !== null) {
+        process.kill(pid, "SIGKILL");
+        await waitForPidGone(pid);
+      }
+    }
+  }, 20_000);
+
+  test("cleanup uses the token captured before the wait when the identity changes later", async () => {
+    const grandchildFile = join(root, "grandchild-capture-point.pid");
+    const selfReportFile = join(root, "grandchild-capture-point-self.pid");
+    // Identity reads answer with the original while the wait has not run and with
+    // a successor afterwards, as a reused pid would.
+    let afterWait = false;
+    let captures = 0;
+    const readIdentity = (pid: number): string | null => {
+      const token = processStartToken(pid);
+      return token === null ? null : `${token}-${afterWait ? "successor" : "original"}`;
+    };
+    const captureRead = (pid: number): string | null => {
+      captures += 1;
+      return readIdentity(pid);
+    };
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      selfReportFile,
+      () => {
+        // A capture moved into the cleanup leaves the wait with none.
+        expect(captures).toBe(1);
+        afterWait = true;
+        return waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100);
+      },
+      false,
+      captureRead,
+      readIdentity,
     ).then(
       () => null,
       (error: Error) => error,
