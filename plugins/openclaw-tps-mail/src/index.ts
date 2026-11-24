@@ -3964,6 +3964,25 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             // Reported here, before the recovery sweep is scheduled: the loop
             // below skips this inbound, so this is its one startup report.
             reportObligationCurLookupFailure(account.mailDir, agentId, rec.inboundId, rec.obligationId, lookup.error, log);
+            // cli#1059 item E: the sweep's skip keeps this inbound out of the
+            // recovery loop, so a failed lookup here would leave the live
+            // obligation with no context and no timer until the next restart.
+            // Give it the SAME bounded in-process retry the deadline path uses:
+            // one retry entry, budget and cap per obligation.
+            const retryCtx = makeYieldCtx(
+              account.mailDir,
+              agentId,
+              rec.from,
+              account.accountId,
+              lookup.curPath ?? "",
+              rec.inboundId,
+              cfg,
+              log,
+              incarnation,
+              rec.inboundEnvelopeId,
+            );
+            yieldContexts.set(rec.obligationId, retryCtx);
+            retryObligationRead(retryCtx, rec.obligationId, `cur/ lookup failed (${lookup.error})`, rec.state);
           }
           startupCurLookups.set(rec.inboundId, lookup);
         }

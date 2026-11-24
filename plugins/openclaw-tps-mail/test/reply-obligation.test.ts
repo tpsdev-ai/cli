@@ -20,7 +20,7 @@ import { MailClient, mailboxReplayStore, acquireMailLockSync } from "@tpsdev-ai/
  * cross-account rejection; plus the replayed-inbound no-second-obligation case.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync, renameSync, rmdirSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -3300,6 +3300,154 @@ describe("cli#1006 — recovery settles or re-arms an obligation with no cur/ re
     } finally {
       setObligationRetryDelaysForTests(prevDelays);
       setObligationCurLookupFaultForTests(undefined);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059-E a startup pre-scan lookup error enters the bounded retry and settles after the cur/ path is repaired", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059e-startup-repair";
+    const signedBody = buildSignedBody(SENDER, AGENT, "inbound payload", FLINT_SEED);
+    const envelopeId = (JSON.parse(signedBody) as { messageId: string }).messageId;
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000, envelopeId });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    const curPath = resolve(curDir, `${inboundId}.json`);
+    // A REAL dangling cur/ path (no injected fault): the entry's target is absent.
+    symlinkSync(resolve(curDir, "absent-cur"), curPath);
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([800, 800, 800]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().retries.some((r) => r.obligationId === obligationId), 15000),
+        "the startup lookup error entered the bounded retry",
+      ).toBe(true);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed"))).toHaveLength(1);
+      // Repair: the real record replaces the dangling link. Nothing restarts.
+      unlinkSync(curPath);
+      writeFileSync(
+        curPath,
+        JSON.stringify({ id: inboundId, from: SENDER, to: AGENT, body: signedBody, timestamp: new Date().toISOString(), read: false }),
+        "utf-8",
+      );
+      expect(
+        await pollUntil(() => obligationFile(AGENT, inboundId)?.state === "failed", 15000),
+        "a later attempt settles the live obligation in this process",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new"), "yielded-without-resumption")).toHaveLength(1);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059-E a startup lookup error that never clears exhausts the shared budget: one warning, record open, no nack", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059e-startup-exhausted";
+    const { obligationId } = seedOrphan(inboundId, { state: "yielded", deadlineInMs: -1000 });
+    const curDir = resolve(tempMailDir, AGENT, "cur");
+    mkdirSync(curDir, { recursive: true });
+    symlinkSync(resolve(curDir, "absent-cur"), resolve(curDir, `${inboundId}.json`));
+    const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+    const before = readFileSync(path, "utf-8");
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, keepRawCur: `${inboundId}.json`, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
+        "the shared budget is exhausted with a named warning",
+      ).toBe(true);
+      expect(warnings.filter((line) => line.includes("obligation-retry-exhausted")), "exactly one cap warning").toHaveLength(1);
+      expect(warnings.filter((line) => line.includes("obligation-cur-lookup-failed")), "the lookup error is reported once").toHaveLength(1);
+      await sleep(200);
+      expect(readFileSync(path, "utf-8"), "the record is unchanged").toBe(before);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays open").toBe("yielded");
+      expect(
+        obligationStateForTests().retries.find((r) => r.obligationId === obligationId)?.exhausted,
+        "the budget stays exhausted",
+      ).toBe(true);
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "the cap sends no nack").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059-F the later lookup reports a dangling cur/ directory through the retry cap", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059f-later-dangling";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 4000);
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery arms the deadline before the path breaks",
+      ).toBe(true);
+      // Replace cur/ itself with a dangling link, before the deadline.
+      const curDir = resolve(tempMailDir, AGENT, "cur");
+      rmSync(curDir, { recursive: true, force: true });
+      symlinkSync(resolve(tempMailDir, AGENT, "absent-cur"), curDir);
+      const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+      const before = readFileSync(path, "utf-8");
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 20000),
+        "the later lookup reports an error",
+      ).toBe(true);
+      const lookupLines = warnings.filter((line) => line.includes("obligation-cur-lookup-failed"));
+      expect(lookupLines, "the later lookup reports the error once").toHaveLength(1);
+      expect(lookupLines[0]).toContain("DANGLING_SYMLINK");
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
+        "the deadline lookup error runs the bounded retry to its cap",
+      ).toBe(true);
+      await sleep(200);
+      expect(readFileSync(path, "utf-8"), "the record is unchanged through the cap").toBe(before);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays open").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
+      await h.stop();
+    }
+  }, 40000);
+
+  it("1059-F the later lookup reports cur/ as a regular file through the retry cap", async () => {
+    seedSigningKeys();
+    const inboundId = "msg-1059f-later-notdir";
+    const { obligationId } = seedVerifiedCur(inboundId, "yielded", 4000);
+    const warnings: string[] = [];
+    const prevDelays = setObligationRetryDelaysForTests([50, 100, 150]);
+    const h = await start(AGENT, SENDER, { localSender: true, noInbound: true, warnCalls: warnings });
+    try {
+      expect(
+        await pollUntil(() => obligationStateForTests().deadlines.some((d) => d.obligationId === obligationId), 15000),
+        "recovery arms the deadline before the path breaks",
+      ).toBe(true);
+      const curDir = resolve(tempMailDir, AGENT, "cur");
+      rmSync(curDir, { recursive: true, force: true });
+      writeFileSync(curDir, "not a directory", "utf-8");
+      const path = resolve(tempMailDir, AGENT, ".obligations", `${inboundId}.json`);
+      const before = readFileSync(path, "utf-8");
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-cur-lookup-failed")), 20000),
+        "the later lookup reports an error",
+      ).toBe(true);
+      const lookupLines = warnings.filter((line) => line.includes("obligation-cur-lookup-failed"));
+      expect(lookupLines, "the later lookup reports the error once").toHaveLength(1);
+      expect(lookupLines[0]).toContain("ENOTDIR");
+      expect(
+        await pollUntil(() => warnings.some((line) => line.includes("obligation-retry-exhausted")), 15000),
+        "the deadline lookup error runs the bounded retry to its cap",
+      ).toBe(true);
+      await sleep(200);
+      expect(readFileSync(path, "utf-8"), "the record is unchanged through the cap").toBe(before);
+      expect(obligationFile(AGENT, inboundId)?.state, "the record stays open").toBe("yielded");
+      expect(nackMailsIn(resolve(tempMailDir, SENDER, "new")), "no nack is sent").toHaveLength(0);
+    } finally {
+      setObligationRetryDelaysForTests(prevDelays);
       await h.stop();
     }
   }, 40000);
