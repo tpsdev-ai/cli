@@ -176,7 +176,12 @@ async function daemonExitReport(daemon: DaemonTracker | undefined): Promise<stri
   return `daemon ${daemon.pid} ${status}; stderr tail: ${tail === "" ? "(empty)" : tail}`;
 }
 
-/** The pause file a wait accepts: the daemon's own exact name, or any for a phase without one. */
+/**
+ * The pause file a wait accepts: `ready-<phase>-<pid>` for a tracked child, or any
+ * entry for a phase without one. The exact-name match assumes the file is named after
+ * the pid that wrote it, as the real daemon's is; some fixtures instead write a
+ * synthetic file from the test process under a tracked child's pid.
+ */
 function pauseFile(phase: string, pid: number | undefined): string | undefined {
   const entries = readdirSync(pauseDir);
   if (pid === undefined) return entries.find((entry) => entry.startsWith(`ready-${phase}-`));
@@ -371,22 +376,92 @@ async function waitForRunningRecord(): Promise<{ pid: number; startToken: string
   );
 }
 
-/** True when the pid is gone or a zombie; a container's PID 1 may not reap. */
+/** True when the pid is gone or a zombie. A container may run no init as
+ *  PID 1, so an orphan whose parent exited is not reaped and a killed
+ *  detached grandchild can stay a zombie that `process.kill(pid, 0)` accepts.
+ *  macOS needs no zombie check: launchd adopts and reaps the orphan, so the
+ *  process is gone and `process.kill(pid, 0)` raises ESRCH. */
 function pidExited(pid: number): boolean {
   if (pidState(pid) === "gone") return true;
-  if (process.platform !== "linux") return false;
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    return stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOENT" || code === "ESRCH") return true;
-    throw error;
+  if (process.platform === "linux") {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 1).trimStart()[0] === "Z";
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOENT" || code === "ESRCH") return true;
+      throw error;
+    }
   }
+  return false;
 }
 
 async function waitForPidGone(pid: number): Promise<void> {
   await waitFor(() => (pidExited(pid) ? true : null), `pid ${pid} to exit`);
+}
+
+/** The pid recorded for the detached grandchild in `file`, or null while it is absent or unreadable. */
+function readGrandchildPid(file: string): number | null {
+  try {
+    // The file is created before the pid is written, so an empty read means "not yet".
+    const pid = Number(readFileSync(file, "utf8").trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Kill the detached grandchild `file` records, reading the file now, then wait until the pid is gone or a zombie. */
+async function killDetachedGrandchild(file: string): Promise<void> {
+  const pid = readGrandchildPid(file);
+  if (pid === null) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    /* already gone */
+  }
+  const deadline = Date.now() + EXIT_REPORT_MS;
+  while (!pidExited(pid)) {
+    if (Date.now() >= deadline) throw new Error(`grandchild ${pid} survived its SIGKILL`);
+    await new Promise((resolveWait) => setTimeout(resolveWait, 5));
+  }
+}
+
+/** Spawn the held-stderr pair: a parent whose detached grandchild inherits stderr, and the parent records its pid. */
+function spawnHeldStderr(grandchildFile: string, keepParent = false): TrackedChild {
+  const script = `
+    import { spawn } from "node:child_process";
+    import { writeFileSync } from "node:fs";
+    const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], {
+      detached: true,
+      stdio: ["ignore", "ignore", "inherit"],
+    });
+    writeFileSync(${JSON.stringify(grandchildFile)}, String(grandchild.pid));
+    ${keepParent ? "setTimeout(() => {}, 30_000);" : "process.exit(3);"}
+  `;
+  const daemon = trackDaemon(
+    spawn("node", ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "pipe"] }),
+  );
+  children.push(daemon);
+  return daemon;
+}
+
+/**
+ * Spawn the held-stderr pair and run `wait` inside one lifecycle: whether the wait
+ * resolves or rejects, the finally kills the grandchild the pid file records.
+ */
+async function withHeldStderrDaemon(
+  grandchildFile: string,
+  wait: (daemon: TrackedChild) => Promise<unknown>,
+  keepParent = false,
+): Promise<void> {
+  const daemon = spawnHeldStderr(grandchildFile, keepParent);
+  try {
+    await waitFor(() => readGrandchildPid(grandchildFile), "detached grandchild pid");
+    await wait(daemon);
+  } finally {
+    await killDetachedGrandchild(grandchildFile);
+  }
 }
 
 /** Track one child: exit status on both `exit` and `close`, and a byte-bounded stderr tail. */
@@ -944,50 +1019,32 @@ describe("branch pid record ownership (cli#730)", () => {
     const grandchildFile = join(root, "grandchild.pid");
     // The detached grandchild inherits stderr, so the parent's piped stderr
     // stays open past the report's wait for "close": only "exit" carries the status.
-    const script = `
-      import { spawn } from "node:child_process";
-      import { writeFileSync } from "node:fs";
-      const grandchild = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30_000)"], {
-        detached: true,
-        stdio: ["ignore", "ignore", "inherit"],
-      });
-      writeFileSync(${JSON.stringify(grandchildFile)}, String(grandchild.pid));
-      process.exit(3);
-    `;
-    const daemon = trackDaemon(
-      spawn("node", ["--input-type=module", "-e", script], { stdio: ["ignore", "ignore", "pipe"] }),
+    const failure = await withHeldStderrDaemon(grandchildFile, (daemon) => waitForReady(phase, daemon.tracker)).then(
+      () => null,
+      (error: Error) => error,
     );
-    children.push(daemon);
-    let grandchildPid = 0;
-    try {
-      grandchildPid = await waitFor(
-        () => {
-          try {
-            // The file is created before the pid is written, so an empty read means "not yet".
-            const pid = Number(readFileSync(grandchildFile, "utf8").trim());
-            return Number.isInteger(pid) && pid > 0 ? pid : null;
-          } catch {
-            return null;
-          }
-        },
-        "detached grandchild pid",
-      );
+    expect(failure).not.toBeNull();
+    expect(failure!.message).toContain("exit code 3");
+  }, 20_000);
 
-      const failure = await waitForReady(phase, daemon.tracker).then(
-        () => null,
-        (error: Error) => error,
-      );
-      expect(failure).not.toBeNull();
-      expect(failure!.message).toContain("exit code 3");
-    } finally {
-      if (grandchildPid > 0) {
-        try {
-          process.kill(grandchildPid, "SIGKILL");
-        } catch {
-          /* already gone */
-        }
-      }
-    }
+  test("cleanup kills the detached grandchild when the pid-file wait times out", async () => {
+    const grandchildFile = join(root, "grandchild-timeout.pid");
+    // The parent stays alive after recording the pid, so it reaps the grandchild.
+    const failure = await withHeldStderrDaemon(
+      grandchildFile,
+      () =>
+        // Force the wait to time out: it reads a path this case never writes, so
+        // only the lifecycle's finally runs the cleanup.
+        waitFor(() => readGrandchildPid(join(root, "never-written.pid")), "a pid file that never appears", 100),
+      true,
+    ).then(
+      () => null,
+      (error: Error) => error,
+    );
+    expect(failure?.message).toContain("timed out");
+    const pid = readGrandchildPid(grandchildFile);
+    expect(pid).not.toBeNull();
+    expect(pidExited(pid!)).toBe(true);
   }, 20_000);
 
   test("a multi-byte stderr flood keeps its last 4096 bytes, in an allocation of that size", async () => {
