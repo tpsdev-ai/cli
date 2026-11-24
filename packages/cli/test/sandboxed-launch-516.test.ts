@@ -2679,11 +2679,11 @@ const hooks = {
 };
 const tokens = process.env.D_TOKENS;
 if (tokens === "release-relative") {
-  hooks.startToken = () => existsSync(process.env.D_RELEASE_TOKEN_FLAG) ? "proc:after" : "proc:before";
+  hooks.startToken = () => existsSync(process.env.D_RELEASE_TOKEN_FLAG) ? "proc:2002" : "proc:2001";
 } else if (tokens) {
   hooks.startToken = () => {
     if (tokens === "null") return null;
-    return calls++ === 0 ? "proc:recorded" : "proc:different";
+    return calls++ === 0 ? "proc:1001" : "proc:1002";
   };
 }
 const releaseTestHooks = process.env.D_HOLD_RELEASE === "1" ? {

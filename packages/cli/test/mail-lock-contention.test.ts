@@ -52,7 +52,7 @@ const shapes: Array<[string, () => string]> = [
   ["a token from a DIFFERENT source prefix on a live owner is unverifiable, not broken", () => {
     const token = processStartToken(process.pid);
     expect(token).not.toBeNull();
-    return JSON.stringify({ pid: process.pid, startToken: token!.startsWith("proc:") ? "ps:other" : "proc:other" });
+    return JSON.stringify({ pid: process.pid, startToken: token!.startsWith("proc:") ? "ps:other" : "proc:6001" });
   }],
   ["a lock whose live owner's start token matches is respected", () => {
     const token = processStartToken(process.pid);
