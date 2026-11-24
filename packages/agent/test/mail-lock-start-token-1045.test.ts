@@ -185,7 +185,7 @@ describe("classifyOwnerToken: one rule for a live pid's current and recorded tok
     expect(classifyOwnerToken("proc:4242", "proc:")).toBe("unverifiable");
   });
 
-  test("a malformed recorded proc: value is unverifiable, not pid reuse", () => {
+  test("a differing malformed recorded proc: value is unverifiable, not pid reuse", () => {
     expect(classifyOwnerToken("proc:4242", "proc:bogus")).toBe("unverifiable");
     expect(classifyOwnerToken("proc:4242", "proc:12x")).toBe("unverifiable");
     expect(classifyOwnerToken("proc:4242", "proc: 12")).toBe("unverifiable");
