@@ -867,7 +867,7 @@ test("a relay reconnect claims a host record on a simulated proc: token mismatch
   const connections = await twoRelayConnections(root);
   try {
     // The reader returns the simulated reuse token when the record holds B's seeded
-    // proc:recorded-owner token (a proc: mismatch: PID reuse) or when no record or string token
+    // proc:111 token (a proc: mismatch: PID reuse) or when no record or string token
     // can be read. For any other record, including A's own, which the relay stamps with the real
     // start token (ps: on macOS), it returns that recorded token, so A's own record verifies.
     const aId = await connections.start({
@@ -878,13 +878,13 @@ test("a relay reconnect claims a host record on a simulated proc: token mismatch
         } catch {
           // No record yet: nothing to agree with.
         }
-        if (rec === null || rec.startToken === "proc:recorded-owner" || typeof rec.startToken !== "string") return "proc:simulated-reuse";
+        if (rec === null || rec.startToken === "proc:111" || typeof rec.startToken !== "string") return "proc:222";
         return rec.startToken;
       },
     });
     const bId = await connections.start();
     expect(bId).not.toBe(aId);
-    const bRecord = { ...connections.record(), startToken: "proc:recorded-owner" };
+    const bRecord = { ...connections.record(), startToken: "proc:111" };
     writeFileSync(connections.path, JSON.stringify(bRecord));
     const bBytes = readFileSync(connections.path);
 
