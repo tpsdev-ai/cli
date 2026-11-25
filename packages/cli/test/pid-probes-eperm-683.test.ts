@@ -12,7 +12,7 @@ import { processAlive } from "../src/commands/branch.js";
 import { pidAlive } from "../src/utils/launch-attestation.js";
 import { proxyStatus } from "../src/utils/llm-proxy.js";
 import { bridgeStatus } from "../src/utils/mail-bridge.js";
-import { getRelayPid } from "../src/utils/mail-relay.js";
+import { readRelayPidFile } from "../src/utils/mail-relay.js";
 
 /** A pid that was live and is now reaped, or null when the spawn failed or
  *  pidState(child.pid) is not "gone" at registration. */
@@ -66,29 +66,29 @@ describe("mail relay pid probe", () => {
     const pidPath = join(runDir, "relay.pid");
     writeFileSync(pidPath, "1\n");
 
-    expect(getRelayPid()).toBe(1);
+    expect(["unverified", "running"]).toContain(readRelayPidFile().kind);
     expect(existsSync(pidPath)).toBe(true);
   });
 
-  test("removes a pid file naming an invalid pid", () => {
+  test("classifies a pid file naming an invalid pid as invalid", () => {
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
     writeFileSync(pidPath, "2147483648\n");
 
-    expect(getRelayPid()).toBeNull();
-    expect(existsSync(pidPath)).toBe(false);
+    expect(readRelayPidFile().kind).toBe("invalid");
+    expect(existsSync(pidPath)).toBe(true);
   });
 
-  test.skipIf(gonePid === null)("removes a pid file whose process has exited and been reaped", () => {
+  test.skipIf(gonePid === null)("classifies a pid file whose process has exited and been reaped as stale", () => {
     const runDir = join(home, ".tps");
     mkdirSync(runDir, { recursive: true });
     const pidPath = join(runDir, "relay.pid");
     const pid = requireGonePid(gonePid);
     writeFileSync(pidPath, `${pid}\n`);
 
-    expect(getRelayPid()).toBeNull();
-    expect(existsSync(pidPath)).toBe(false);
+    expect(readRelayPidFile().kind).toBe("stale");
+    expect(existsSync(pidPath)).toBe(true);
   });
 });
 

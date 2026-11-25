@@ -84,14 +84,18 @@ describe("cli#439: home-relative paths follow the HOME in effect at each call", 
     expect(mod.proxyStatus()).toEqual({ running: true, pid: process.pid, port: 6459 });
   });
 
-  test("utils/mail-relay.ts: getRelayPid reads the pid file of the current HOME", async () => {
+  test("utils/mail-relay.ts: readRelayPidFile reads the pid file of the current HOME", async () => {
     const mod = await importUnder<any>(homeA, "../src/utils/mail-relay.js?home-per-call");
     process.env.HOME = homeB;
+    const pidPath = join(homeB, ".tps", "relay.pid");
     mkdirSync(join(homeB, ".tps"), { recursive: true });
-    writeFileSync(join(homeB, ".tps", "relay.pid"), `${process.pid}\n`);
+    writeFileSync(pidPath, `${process.pid}\n`);
     expect(existsSync(join(homeA, ".tps", "relay.pid"))).toBe(false);
 
-    expect(mod.getRelayPid()).toBe(process.pid);
+    const state = mod.readRelayPidFile();
+    expect(state.kind).toBe("unverified");
+    expect(state.path).toBe(pidPath);
+    expect(state.pid).toBe(process.pid);
   });
 
   test("utils/flair-task-loop.ts: the task cursor is read and written under the current HOME", async () => {
