@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { pidState, processStartToken, type PidState } from "@tpsdev-ai/agent";
+import { processStartToken } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
 import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
@@ -143,22 +143,3 @@ export function readRelayPidFile(): PidFileState {
   return readPidFile(relayPidPath());
 }
 
-/** Get relay PID if running, else null. */
-export function getRelayPid(probe: (pid: number) => PidState = pidState): number | null {
-  const state = readRelayPidFile();
-  if (state.kind === "missing" || state.kind === "unreadable") return null;
-  // Invalid content may name a live pid, and a stale record's pid is gone or
-  // its live pid carries a different token; remove the file, but report
-  // neither as running.
-  if (state.kind === "invalid" || state.kind === "stale") {
-    removePidFile(state.path);
-    return null;
-  }
-  if (state.kind === "running") return state.pid;
-  // An unverified record is not proven gone and its identity is not confirmed:
-  // it may carry a non-null token that does not match. Stop reads the record
-  // once and refuses to signal an unverified one.
-  if (probe(state.pid) === "alive") return state.pid;
-  removePidFile(state.path);
-  return null;
-}
