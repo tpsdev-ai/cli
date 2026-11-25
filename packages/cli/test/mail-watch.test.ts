@@ -567,8 +567,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
     // One verification for the record, one for the barrier. The per-file guard is
-    // what holds the count down: with it removed, each of the ten re-events
-    // re-verifies the record. The bounds leave the exact debounce coalescing open.
+    // what holds the count down: with it removed, the re-events can re-verify
+    // the record. The bounds leave the exact debounce coalescing open.
     expect(verifications).toBeGreaterThanOrEqual(2);
     expect(verifications).toBeLessThan(8);
   }, 10_000);
@@ -623,7 +623,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("a second file carrying an already-presented envelope id is not presented again after the first file's entry is trimmed", async () => {
+  it("a second file carrying an already-presented envelope id is not presented again while that id's entry is retained", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -651,22 +651,233 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
       // The first file is REPLACED by a copy of the same signed envelope under a
       // different file name and wrapper id, so the scan below lists the copy and
-      // not the first file: that scan trims the first file's entry.
+      // not the first file: that scan drops the first file from the id's file
+      // set and retains the id.
       const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      const copyB = join(dirname(first), "id-copy-b.json");
       writeRecord({ ...raw, id: "id-copy-b" });
       rmSync(first);
-      deliverSigned("barrier");
+      deliverSigned("barrier-1");
       const files = jsonFiles(dirname(first)).map((f) => join(dirname(first), f));
       const barrierFile = files.find((p) => basename(p) !== "id-copy-b.json");
       expect(barrierFile).toBeDefined();
       events.fire(barrierFile!);
       await waitFor(
-        () => bodies.includes("barrier"),
+        () => bodies.includes("barrier-1"),
         SCAN_SETTLE_MS,
         () => `the fs event did not present the barrier record; received: ${JSON.stringify(bodies)}`,
       );
+
+      // A further scan with the copy still in new/.
+      events.fire(copyB);
+      await sleep(100);
+
+      // Another copy arrives while the first copy is still in new/: the id is
+      // still presented once.
+      const copyRaw = JSON.parse(readFileSync(copyB, "utf8")) as Record<string, unknown>;
+      writeRecord({ ...copyRaw, id: "id-copy-c" });
+      const beforeThird = new Set(jsonFiles(dirname(first)));
+      deliverSigned("barrier-2");
+      const thirdBarrier = jsonFiles(dirname(first)).find((f) => !beforeThird.has(f));
+      expect(thirdBarrier).toBeDefined();
+      events.fire(join(dirname(first), thirdBarrier!));
+      await waitFor(
+        () => bodies.includes("barrier-2"),
+        SCAN_SETTLE_MS,
+        () => `the scan with the third copy did not present the barrier; received: ${JSON.stringify(bodies)}`,
+      );
+      expect(jsonFiles(dirname(first))).toContain("id-copy-b.json");
     } finally {
       watcher.stop();
+    }
+
+    expect(ids.filter((id) => id === envId)).toHaveLength(1);
+  }, 10_000);
+
+  it("an envelope id stays presented while any listed file carries it, even when the latest file leaves", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    let envId = "";
+    // Present a barrier record, so the scan that listed every file before it has
+    // finished and the assertion below sees its effect.
+    const presentBarrier = async (body: string) => {
+      const before = new Set(jsonFiles(getInbox(AGENT).fresh));
+      deliverSigned(body);
+      const added = jsonFiles(getInbox(AGENT).fresh).find((f) => !before.has(f));
+      expect(added).toBeDefined();
+      events.fire(join(getInbox(AGENT).fresh, added!));
+      await waitFor(
+        () => bodies.includes(body),
+        SCAN_SETTLE_MS,
+        () => `the scan before ${body} did not present the barrier record; received: ${JSON.stringify(bodies)}`,
+      );
+    };
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, many files");
+      envId = env.messageId;
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => ids.includes(env.messageId),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
+      );
+
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      // B: a second copy of the same signed id arrives while A stays in new/.
+      const copyB = join(dirname(first), "id-copy-b.json");
+      writeRecord({ ...raw, id: "id-copy-b" });
+      await presentBarrier("scan with A and B");
+      expect(ids.filter((id) => id === envId)).toHaveLength(1);
+
+      // B leaves while A is still in new/: the id must stay presented.
+      rmSync(copyB);
+      await presentBarrier("scan with A only");
+
+      // C: a third copy arrives while A is still in new/.
+      writeRecord({ ...raw, id: "id-copy-c" });
+      await presentBarrier("scan with A and C");
+    } finally {
+      watcher.stop();
+    }
+
+    expect(ids.filter((id) => id === envId)).toHaveLength(1);
+  }, 10_000);
+
+  it("a presented id is not dropped in a scan where a listed copy fails to read", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    let envId = "";
+    let restore = () => {};
+    const presentBarrier = async (body: string) => {
+      const before = new Set(jsonFiles(getInbox(AGENT).fresh));
+      deliverSigned(body);
+      const added = jsonFiles(getInbox(AGENT).fresh).find((f) => !before.has(f));
+      expect(added).toBeDefined();
+      events.fire(join(getInbox(AGENT).fresh, added!));
+      await waitFor(
+        () => bodies.includes(body),
+        SCAN_SETTLE_MS,
+        () => `the scan before ${body} did not present the barrier record; received: ${JSON.stringify(bodies)}`,
+      );
+    };
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, failing copy");
+      envId = env.messageId;
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => ids.includes(env.messageId),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
+      );
+
+      // A leaves; B (the same signed id) is listed but cannot be read.
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      const copyB = join(dirname(first), "id-copy-b.json");
+      writeRecord({ ...raw, id: "id-copy-b" });
+      rmSync(first);
+      const injected = failReadsOf("readFileSync", copyB);
+      restore = injected.restore;
+      await presentBarrier("scan with the unreadable copy");
+      expect(injected.fault.injected).toBeGreaterThan(0);
+      expect(log.lines.some((l) => l.includes("id-copy-b.json not presented — cannot read"))).toBe(true);
+
+      // The read works again: the copy verifies, and its id is still presented.
+      injected.fault.armed = false;
+      await presentBarrier("scan after the read recovers");
+    } finally {
+      watcher.stop();
+      restore();
+      log.restore();
+    }
+
+    expect(ids.filter((id) => id === envId)).toHaveLength(1);
+  }, 10_000);
+
+  it("a presented id is not dropped in a scan where a listed copy fails to verify", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    let envId = "";
+    let savedUrl: string | undefined;
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, failing verification");
+      envId = env.messageId;
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => ids.includes(env.messageId),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
+      );
+
+      // A leaves; B (the same signed id) is listed while Flair cannot be reached.
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      writeRecord({ ...raw, id: "id-copy-b" });
+      rmSync(first);
+      // The barrier record is delivered now; the recovery scan presents it.
+      const before = new Set(jsonFiles(getInbox(AGENT).fresh));
+      deliverSigned("scan after verification recovers");
+      const barrierName = jsonFiles(getInbox(AGENT).fresh).find((f) => !before.has(f));
+      expect(barrierName).toBeDefined();
+      const barrierPath = join(getInbox(AGENT).fresh, barrierName!);
+      savedUrl = process.env.FLAIR_URL;
+      process.env.FLAIR_URL = "http://127.0.0.1:1";
+      events.fire(barrierPath);
+      await waitFor(
+        () => log.lines.some((l) => l.includes("verification error")),
+        SCAN_SETTLE_MS,
+        () => `the scan did not log a verification error; log: ${JSON.stringify(log.lines)}`,
+      );
+
+      // Flair is reachable again: the copy verifies, and its id is still presented.
+      process.env.FLAIR_URL = savedUrl;
+      events.fire(barrierPath);
+      await waitFor(
+        () => bodies.includes("scan after verification recovers"),
+        SCAN_SETTLE_MS,
+        () => `the recovery scan did not present the barrier record; received: ${JSON.stringify(bodies)}`,
+      );
+    } finally {
+      watcher.stop();
+      if (savedUrl === undefined) delete process.env.FLAIR_URL;
+      else process.env.FLAIR_URL = savedUrl;
+      log.restore();
     }
 
     expect(ids.filter((id) => id === envId)).toHaveLength(1);

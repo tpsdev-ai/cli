@@ -242,17 +242,26 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
   const inbox = getInbox(opts.agent);
 
-  // Presented records, keyed on the VERIFIED envelope id → the `new/` filename
-  // that carried it. A scan that verifies another file with the same id re-points
-  // the entry at that file; the trim loop after the record loop in `processNew`
-  // drops the entry when its file is gone from `new/`. Pinned by the same-id
-  // second-file case.
-  const presented = new Map<string, string>();
+  /** Consecutive unreadable/unverifiable scans after which a file is classified `unresolved`. */
+  const MAX_UNRESOLVED_ATTEMPTS = 10;
+
+  // Presented records, keyed on the VERIFIED envelope id → every `new/` filename
+  // verified to carry that id. A scan that verifies another file with a
+  // presented id adds it to the set and presents nothing; the trim loop after
+  // the record loop in `processNew` removes files that left `new/` and drops the
+  // id only when the set is empty. Pinned by the same-id second-file case.
+  const presented = new Map<string, Set<string>>();
+  // Consecutive scans in which a listed file could not be read or verified,
+  // keyed on the filename. An unresolved file's envelope id is unknown, so it
+  // holds the trim below; after MAX_UNRESOLVED_ATTEMPTS it is classified
+  // `unresolved` and stops holding, which bounds the dedup state.
+  const unresolvedAttempts = new Map<string, number>();
   // Files already classified this residence, keyed on the filename, with the
-  // verdict ("presented", "corrupt", "refused:*" or "already-consumed"), so a
-  // later pass does not re-verify or re-log a file still sitting in `new/`. Like
-  // `presented`, an entry is trimmed only when a scan finds the file gone (the
-  // same trim loop below). Pinned by the ONCE counter case.
+  // verdict ("presented", "corrupt", "refused:*", "already-consumed" or
+  // "unresolved"), so a later pass does not re-verify or re-log a file still
+  // sitting in `new/`. Like `presented`, an entry is trimmed only when a scan
+  // finds the file gone (the same trim loop below). Pinned by the ONCE counter
+  // case.
   const classified = new Map<string, string>();
 
   // Verified records waiting for a free slot. The concurrency cap must hold
@@ -319,14 +328,37 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
       const present = new Set(files);
 
+      // Files whose read or verification stayed unresolved this scan. While this
+      // is non-empty, no presented id is dropped: such a file may carry an id
+      // that is still presented, and a failed read or verification is not
+      // evidence that the id left `new/`.
+      const unresolvedFiles = new Set<string>();
+      const noteUnresolved = (file: string) => {
+        const attempts = (unresolvedAttempts.get(file) ?? 0) + 1;
+        unresolvedAttempts.set(file, attempts);
+        if (attempts < MAX_UNRESOLVED_ATTEMPTS) {
+          unresolvedFiles.add(file);
+          return true;
+        }
+        classified.set(file, "unresolved");
+        console.error(
+          `[mail-watch] ${file}: not presented (read or verification failed on ${attempts} consecutive scans; classified)`,
+        );
+        return false;
+      };
+
       for (const file of files) {
         if (classified.has(file)) continue;
         const path = join(inbox.fresh, file);
         const read = readNewRecord(path);
         // Removed after the listing: nothing to present, and not classified.
-        if (read.kind === "gone") continue;
+        if (read.kind === "gone") {
+          unresolvedAttempts.delete(file);
+          continue;
+        }
         if (read.kind === "read-error") {
           // A read ERROR is not a verdict: withhold it WITHOUT classifying it.
+          if (!noteUnresolved(file)) continue;
           console.error(
             `[mail-watch] ${opts.agent}: ${file} not presented — cannot read ${path} (${read.detail}); ` +
               "the file is left untouched and is retried on the next scan if it remains in new/. " +
@@ -335,6 +367,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (read.kind === "corrupt") {
+          unresolvedAttempts.delete(file);
           classified.set(file, "corrupt");
           console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
           continue;
@@ -348,18 +381,22 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           // A verification ERROR — Flair unreachable, or a malformed envelope
           // structure — is not a verdict. The record is withheld and logged, and
           // the next pass tries again (do NOT mark it classified).
-          console.error(
-            `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
-          );
+          if (noteUnresolved(file)) {
+            console.error(
+              `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
+            );
+          }
           continue;
         }
         if (!result.ok) {
+          unresolvedAttempts.delete(file);
           classified.set(file, `refused:${result.class}`);
           console.error(`[mail-watch] ${record.id}: not presented (${result.class}: ${result.reason})`);
           continue;
         }
         const envId = result.message.envelopeId;
         if (envId === undefined) {
+          unresolvedAttempts.delete(file);
           classified.set(file, "refused:no-envelope-id");
           continue;
         }
@@ -368,6 +405,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         // (the hook does not run), with a named reason.
         const refusal = externalDispatchRefusal(result.message.envelope, result.message.from, result.message.trustTier);
         if (refusal) {
+          unresolvedAttempts.delete(file);
           classified.set(file, "refused:external-tier");
           console.error(`[mail-watch] ${envId}: not presented (${refusal})`);
           continue;
@@ -378,6 +416,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         try {
           consumed = isConsumedForMailbox(opts.agent, envId);
         } catch (err) {
+          if (!noteUnresolved(file)) continue;
           console.error(
             `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
               "the file is left untouched and is retried on the next scan if it remains in new/. " +
@@ -386,26 +425,43 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (consumed) {
+          unresolvedAttempts.delete(file);
           classified.set(file, "already-consumed");
           console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
           continue;
         }
         classified.set(file, "presented");
-        // Dedup on the VERIFIED envelope id. A second file with an id already
-        // presented re-points the entry at itself, so the trim below keeps the id
-        // while that file stays in `new/`.
-        const alreadyPresented = presented.has(envId);
-        presented.set(envId, file);
+        unresolvedAttempts.delete(file);
+        // Dedup on the VERIFIED envelope id. Record every file that verifies to
+        // it, and present the id only when its set held no file: the trim below
+        // keeps the id while any listed file carries it.
+        let filesWithId = presented.get(envId);
+        const alreadyPresented = (filesWithId?.size ?? 0) > 0;
+        if (filesWithId === undefined) {
+          filesWithId = new Set<string>();
+          presented.set(envId, filesWithId);
+        }
+        filesWithId.add(file);
         if (alreadyPresented) continue;
         pending.push(projectVerified(result.message));
       }
-      // Forget records whose file has left `new/`. This is the ONLY place a dedup
-      // map is trimmed: a file that is still present keeps its entry, and a
-      // failed listing above returns before this point (state kept). It runs
-      // after the record loop so a file that verifies to an already-presented id
-      // re-points the entry first.
-      for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
+      // Forget records whose file has left `new/`: remove each such file from the
+      // id's set, and drop the id only when no listed file carries it. A scan in
+      // which a listed file's read or verification is unresolved drops no id —
+      // that file may be the one carrying a presented id. The hold ends when the
+      // file is classified `unresolved` after MAX_UNRESOLVED_ATTEMPTS. This is
+      // the ONLY place a dedup map is trimmed: a file still in `new/` keeps its
+      // entry, and a failed listing above returns before this point (state kept).
+      // It runs after the record loop so a file that verifies to a presented id
+      // is recorded first.
+      if (unresolvedFiles.size === 0) {
+        for (const [envId, filesWithId] of presented) {
+          for (const file of filesWithId) if (!present.has(file)) filesWithId.delete(file);
+          if (filesWithId.size === 0) presented.delete(envId);
+        }
+      }
       for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
+      for (const file of [...unresolvedAttempts.keys()]) if (!present.has(file)) unresolvedAttempts.delete(file);
     } finally {
       checking = false;
       fireReady();
