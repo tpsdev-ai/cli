@@ -1660,6 +1660,59 @@ describe("the workflow guard checks physical lines containing npm", () => {
   }, 5_000);
 });
 
+describe("the workflow guard reads shell: and refuses spelled command words in unapproved run blocks (#941)", () => {
+  const WORKFLOW = "workflow-c";
+
+  function runBlock(run: string): string {
+    return run.split("\n").map((line) => `          ${line}`).join("\n");
+  }
+
+  function stepWithShell(run: string, shell?: string): string {
+    const shellLine = shell === undefined ? "" : `        shell: ${shell}\n`;
+    return `jobs:\n  build:\n    steps:\n      - name: install step\n${shellLine}        run: |\n${runBlock(run)}\n`;
+  }
+
+  function jobDefaultsShell(run: string, shell: string): string {
+    return `jobs:\n  build:\n    defaults:\n      run:\n        shell: ${shell}\n    steps:\n      - name: install step\n        run: |\n${runBlock(run)}\n`;
+  }
+
+  function workflowDefaultsShell(run: string, shell: string): string {
+    return `defaults:\n  run:\n    shell: ${shell}\njobs:\n  build:\n    steps:\n      - name: install step\n        run: |\n${runBlock(run)}\n`;
+  }
+
+  it.each([
+    ["workflow-level", (run: string) => workflowDefaultsShell(run, "sh")],
+    ["job-level", (run: string) => jobDefaultsShell(run, "sh")],
+    ["step-level", (run: string) => stepWithShell(run, "sh")],
+  ] as const)("refuses an unapproved run block under a %s shell, naming the step and the shell", (_where, build) => {
+    expect(() => assertNpmCiLockfilesRead(build("echo hi"), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: the step's effective shell is sh, not the default bash`,
+    );
+  }, 5_000);
+
+  it("accepts an approved run block under another shell", () => {
+    const approved = EXACT_BLOCK_ALLOWLIST[0].text;
+    expect(assertNpmCiLockfilesRead(stepWithShell(approved, "sh"), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+
+  it("refuses a command word that spells npm with ANSI-C quoting", () => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell("$'np\\155' ci"), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with ANSI-C quoting: $'np\\155' ci (physical line 1)`,
+    );
+  }, 5_000);
+
+  it.each(["np? ci", "n*p ci", "np[m] ci"])("refuses a command word with a glob character: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with a glob character: ${run} (physical line 1)`,
+    );
+  }, 5_000);
+
+  it("accepts the test builtin, a plain command word and case patterns in an unapproved block", () => {
+    expect(assertNpmCiLockfilesRead(stepWithShell("if [ -f x ]; then echo ok; fi"), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(assertNpmCiLockfilesRead(stepWithShell('case "$v" in a|*.txt) echo ok;; esac'), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+});
+
 describe("the workflow guard refuses conservative install-like spellings", () => {
   const WORKFLOW = "workflow-b";
   it.each([

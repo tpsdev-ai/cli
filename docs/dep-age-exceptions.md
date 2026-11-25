@@ -28,8 +28,18 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
   `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
   a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
 
-Refusals name the workflow, job, step and physical line. Variable or substitution
-indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
+Refusals name the workflow, job, step and physical line. The spelling check is a
+best-effort lint for plainly spelled installs: variable or substitution
+indirection such as `n${x}pm` or `$(printf n)pm`, and a glob character inside a
+quoted word, are not covered.
+
+A step whose effective shell — its own `shell:`, else its job's
+`defaults.run.shell`, else the workflow's — is set to anything other than
+`bash` is refused unless its run block is a pinned entry; the refusal names the
+step and the shell, because anything a non-default shell would interpret is
+outside the check. In a run block that is not a pinned entry, the guard also
+refuses a command word spelled with ANSI-C quoting (`$'...'`) or with a glob
+character (`*`, `?`, `[...]`).
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,

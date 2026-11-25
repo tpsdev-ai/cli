@@ -2,10 +2,10 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { load } from "js-yaml";
 
-type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string; env?: Record<string, unknown> };
+type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string; shell?: string; env?: Record<string, unknown> };
 type WorkflowJob = {
   steps: WorkflowStep[];
-  defaults?: { run?: { "working-directory"?: string } };
+  defaults?: { run?: { "working-directory"?: string; shell?: string } };
   env?: Record<string, unknown>;
 };
 
@@ -367,6 +367,9 @@ function hasUnbalancedLineQuotes(lines: PhysicalLine[]): boolean {
   return false;
 }
 
+/** A plainly spelled word that contains a glob character: `np?`, `n*p`, `np[m]`. */
+const PLAIN_GLOB_WORD = /^[A-Za-z0-9_.+-]*(?:\*|\?|\[[A-Za-z0-9_!^.-]*\])[A-Za-z0-9_./+-]*$/;
+
 /** Check physical run-step lines containing npm against approved blocks and shapes. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = physicalLines(run);
@@ -375,6 +378,47 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   };
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
+  if (!approved) {
+    // A `case` pattern is not a command word: track the statement so a pattern
+    // such as `*)` is not refused as a glob command.
+    let inCase = false;
+    let patternOpen = false;
+    for (const entry of logicalShellLines(run)) {
+      if (entry.body) continue;
+      for (const clause of clausesWithSeparators(entry.text)) {
+        const words = clause.tokens.filter((token) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text));
+        const head = words.find((token) => !token.quoted && !SHELL_KEYWORDS.has(token.text)) ?? words[0];
+        if (head !== undefined && !head.quoted && head.text === "esac") {
+          inCase = false;
+          patternOpen = false;
+          continue;
+        }
+        if (inCase) {
+          // The operator that ends the separator is the one that opened this
+          // clause: `;;` (or `;&`) starts a pattern, `)` starts a command.
+          if (/(?:;;|;&)$/.test(clause.separator)) patternOpen = true;
+          else if (clause.separator.endsWith(")")) patternOpen = false;
+        }
+        if (head !== undefined && !head.quoted && head.text === "case") {
+          inCase = true;
+          patternOpen = true;
+          continue;
+        }
+        // A `case` pattern list is not a command word, and its alternatives are
+        // separated by `|`, which the clause splitter treats as a pipeline.
+        if (inCase && patternOpen) continue;
+        const word = commandWord(clause.tokens);
+        if (word === null) continue;
+        const text = word.token.text;
+        if (text.startsWith("$'")) {
+          refuse(entry, "an unapproved run block has a command word with ANSI-C quoting");
+        }
+        if (PLAIN_GLOB_WORD.test(text)) {
+          refuse(entry, "an unapproved run block has a command word with a glob character");
+        }
+      }
+    }
+  }
   if (!approved && flagged.length > 0 &&
       (run.includes("`") || run.includes("$(") || hasUnbalancedLineQuotes(lines))) {
     refuse(lines.find((entry) => entry.text.includes("$(")) ?? flagged[0], "unapproved run block has a shell wrapper");
@@ -442,9 +486,15 @@ export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, w
   let installs = 0;
   for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
     const defaultWorkdir = job.defaults?.run?.["working-directory"] ?? workflow.defaults?.run?.["working-directory"] ?? "";
+    const defaultShell = job.defaults?.run?.shell ?? workflow.defaults?.run?.shell;
     for (const [index, step] of job.steps.entries()) {
       if (step.run === undefined) continue;
       const label = `${workflowName === undefined ? "" : `workflow ${workflowName} `}job ${jobName} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
+      const shell = step.shell ?? defaultShell;
+      if (shell !== undefined && shell !== "bash" &&
+          !EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === step.run.replace(/\n+$/, ""))) {
+        throw new Error(`${label}: cannot establish the npm ci directory: the step's effective shell is ${shell}, not the default bash`);
+      }
       const dirs = npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label);
       const helperLines = physicalLines(step.run).filter((entry) => HELPER_CALL.test(entry.text));
       for (const [installIndex, dir] of dirs.entries()) {
@@ -899,6 +949,29 @@ function logicalShellLines(text: string): LogicalLine[] {
   }
   flush();
   return lines;
+}
+
+type ClauseWithSeparator = { tokens: ShellToken[]; separator: string };
+
+/** splitClauses, keeping each clause's leading operator run so `case` patterns can be told from commands. */
+function clausesWithSeparators(line: string): ClauseWithSeparator[] {
+  const clauses: ClauseWithSeparator[] = [];
+  let tokens: ShellToken[] = [];
+  let separator = "";
+  for (const token of shellTokens(line)) {
+    if (/^(?:;|&|\||\(|\)|\{|\})$/.test(token.text)) {
+      if (tokens.length > 0) {
+        clauses.push({ tokens, separator });
+        tokens = [];
+        separator = "";
+      }
+      separator += token.text;
+      continue;
+    }
+    tokens.push(token);
+  }
+  if (tokens.length > 0) clauses.push({ tokens, separator });
+  return clauses;
 }
 
 function splitClauses(line: string): Clause[] {
