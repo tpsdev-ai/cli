@@ -36,7 +36,7 @@
  * process that spawns it — that process already owns it.
  */
 
-import { gitEnv, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
+import { gitEnv, shellQuote, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
 import { randomBytes, createHash } from "node:crypto";
@@ -384,7 +384,9 @@ export function createPrivateLaunchDir(opts: {
   agentId: string;
   env?: NodeJS.ProcessEnv;
 }): PrivateLaunchDir {
-  const home = opts.home ?? opts.env?.HOME ?? homedir() ?? "/tmp";
+  // Resolve before joining: a relative HOME would otherwise yield a relative
+  // root, and the survivor line promises an absolute path.
+  const home = resolve(opts.home ?? opts.env?.HOME ?? homedir() ?? "/tmp");
   const parent = join(home, ".tps", "launch");
   const label = launchDirLabel(home, opts.agentId, nonce());
   mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -434,15 +436,20 @@ interface KeptPaths {
  * the refusal path share it, so their wording cannot drift. It names what was
  * kept, by absolute path — the launch state always, and the caller's worktree
  * when it kept one — and the step that resolves it once the named pids have
- * exited: removing those paths, with `git worktree prune` for the worktree's
- * stale registration when the base repository is known (the remedy
- * agent-lifecycle names for a purposefully removed worktree). */
+ * exited: removing those paths (each operand shell-quoted), with
+ * `git worktree prune` for the worktree's stale registration when the base
+ * repository is known (the remedy agent-lifecycle names for a purposefully
+ * removed worktree). */
 function survivorLine(survivors: readonly number[], kept: KeptPaths): string {
-  const roots = kept.worktree ? `${kept.worktree.path} ${kept.launchStateRoot}` : kept.launchStateRoot;
+  // Every operand is POSIX single-quoted: the paths are caller-supplied, so a
+  // space, quote or metacharacter must not change what the pasted step does.
+  const roots = (kept.worktree ? [kept.worktree.path, kept.launchStateRoot] : [kept.launchStateRoot])
+    .map(shellQuote)
+    .join(" ");
   const what = kept.worktree
     ? `the worktree ${kept.worktree.path} and the launch state ${kept.launchStateRoot}`
     : `the launch state ${kept.launchStateRoot}`;
-  const prune = kept.worktree?.base ? ` && git -C ${kept.worktree.base} worktree prune` : "";
+  const prune = kept.worktree?.base ? ` && git -C ${shellQuote(kept.worktree.base)} worktree prune` : "";
   return (
     `❌ pid ${survivors.join(", ")} may still be running; kept ${what}; ` +
     `once those pids have exited, remove ${kept.worktree ? "them" : "it"} with: rm -rf ${roots}${prune}`
