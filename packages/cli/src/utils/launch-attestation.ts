@@ -435,11 +435,11 @@ interface KeptPaths {
 /** The one survivor line both stop paths print (cli#1064): the signal path and
  * the refusal path share it, so their wording cannot drift. It names what was
  * kept, by absolute path — the launch state always, and the caller's worktree
- * when it kept one — and the step that resolves it once the named pids have
- * exited: removing those paths (each operand shell-quoted), with
- * `git worktree prune` for the worktree's stale registration when the base
- * repository is known (the remedy agent-lifecycle names for a purposefully
- * removed worktree). */
+ * when it kept one — and a shell-quoted removal step for after the named pids
+ * exit, with `git worktree prune` when the base is known (agent-lifecycle's
+ * remedy for a purposefully removed worktree). Prune acts on every stale
+ * registration in that repository; a locked registration is not pruned and
+ * needs inspection and separate recovery. */
 function survivorLine(survivors: readonly number[], kept: KeptPaths): string {
   // Every operand is POSIX single-quoted: the paths are caller-supplied, so a
   // space, quote or metacharacter must not change what the pasted step does.

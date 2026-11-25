@@ -2954,8 +2954,8 @@ process.exit(typeof code === "number" ? code : 1);
       expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(`worktree ${f.sb.ws}\n`);
       const result = JSON.parse(readFileSync(f.result, "utf-8"));
       expect(result).toEqual({ stopped: false, survivors: [peerPid] });
-      // PROVE THE STEP: once the survivor has exited, the printed step resolves
-      // the kept state — both paths gone — and a fresh launch proceeds.
+      // After the survivor exits, remove the kept paths and check that the next
+      // launch recreates this unlocked worktree and its registration.
       const step = survivorStep(text());
       process.kill(peerPid, "SIGKILL");
       expect(await waitFor(() => !alive(peerPid!), 5_000), text()).toBe(true);
@@ -2969,6 +2969,10 @@ process.exit(typeof code === "number" ? code : 1);
           await waitFor(() => /released under nono session/.test(again.text()), 20_000),
           again.text(),
         ).toBe(true);
+        expect(existsSync(f.sb.ws)).toBe(true);
+        const listed = spawnSync(GIT, ["-C", f.base, "worktree", "list", "--porcelain"], { encoding: "utf8" });
+        expect(listed.status, listed.stderr).toBe(0);
+        expect(listed.stdout).toContain(`worktree ${f.sb.ws}\n`);
       } finally {
         if (again.launcher.pid && alive(again.launcher.pid)) process.kill(again.launcher.pid, "SIGTERM");
         await waitFor(() => again.launcher.exitCode !== null || again.launcher.signalCode !== null, 10_000);
@@ -3030,7 +3034,7 @@ process.exit(typeof code === "number" ? code : 1);
     }
   }, 30_000);
 
-  test("the printed step removes shell-sensitive kept paths and nothing beside them", async () => {
+  test("the printed step removes shell-sensitive kept paths and preserves the sentinel and base", async () => {
     // Space, single quote, `$`, `;` and a leading-dash component in the fixture
     // path: unquoted, the printed step would split, re-parse or abort.
     const f = stopFixture(
@@ -3063,7 +3067,7 @@ process.exit(typeof code === "number" ? code : 1);
       expect(await waitFor(() => !alive(peerPid!), 5_000), text()).toBe(true);
       const ran = spawnSync("sh", ["-c", step], { encoding: "utf-8" });
       expect(ran.status, ran.stderr).toBe(0);
-      // Exactly the kept paths are removed; the sentinel sibling and base survive.
+      // The kept paths are removed; the sentinel sibling and base survive.
       expect(existsSync(f.sb.ws)).toBe(false);
       expect(existsSync(root)).toBe(false);
       expect(existsSync(sentinel)).toBe(true);

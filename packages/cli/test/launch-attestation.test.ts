@@ -1014,10 +1014,11 @@ describe("4e — the private dir is removed on every path", () => {
   });
 
   test("a relative HOME yields an absolute private dir and launch-state root", () => {
-    const sb = makeSandbox("relative-home");
+    // Short names: the launcher socket path under this root must fit macOS sun_path (104 bytes).
+    const sb = makeSandbox("rh");
     const cwd = process.cwd();
     try {
-      const relative = "relative-home";
+      const relative = "rh";
       process.chdir(sb.root);
       const dir = createPrivateLaunchDir({ home: relative, agentId: "probe" });
       expect(isAbsolute(dir.root)).toBe(true);
