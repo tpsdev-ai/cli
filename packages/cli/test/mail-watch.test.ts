@@ -883,6 +883,41 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
+  it("an unreadable file is classified after ten failed scans and stops being retried", async () => {
+    let polls = 0;
+    const log = captureErrors();
+    let restore = () => {};
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 20,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+      });
+      await sleep(40);
+      const path = join(getInbox(AGENT).fresh, "stuck.json");
+      const injected = failReadsOf("readFileSync", path);
+      restore = injected.restore;
+      writeRecord({ id: "stuck", from: "flint", to: AGENT, body: "stuck", timestamp: new Date().toISOString(), read: false });
+      const classified = () =>
+        log.lines.filter((l) => l.includes("stuck.json: not presented (read or verification failed on 10 consecutive scans; classified)")).length;
+      await waitFor(() => classified() > 0, 5000);
+      expect(injected.fault.injected).toBe(10);
+
+      // Classified: the file is not read again, so its failure count cannot grow.
+      const startPolls = polls;
+      await waitFor(() => polls - startPolls >= 3, 5000);
+      expect(injected.fault.injected).toBe(10);
+      expect(classified()).toBe(1);
+    } finally {
+      watcher?.stop();
+      restore();
+      log.restore();
+    }
+  }, 10_000);
+
   it("dedups by the VERIFIED envelope id: two files bearing the same signed id are presented once", async () => {
     const received: string[] = [];
     const watcher = watchMail({
