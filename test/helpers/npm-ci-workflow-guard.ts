@@ -9,8 +9,37 @@ type WorkflowJob = {
   env?: Record<string, unknown>;
 };
 
-export function parseWorkflow(source: string) {
-  return load(source) as { jobs: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"]; env?: Record<string, unknown> };
+type SourceLines = WeakMap<object, Map<string, number>>;
+
+export function parseWorkflow(source: string, locations?: SourceLines) {
+  const stack: { line: number; children: { value: unknown; line: number }[] }[] = [];
+  return load(source, locations === undefined ? undefined : {
+    listener(event, state) {
+      if (event === "open") {
+        stack.push({ line: state.line + 1, children: [] });
+        return;
+      }
+      const node = stack.pop();
+      if (node === undefined) return;
+      if (state.kind === "mapping" && state.result !== null && typeof state.result === "object") {
+        const keys = new Map<string, number>();
+        for (let index = 0; index + 1 < node.children.length; index += 2) {
+          const key = node.children[index];
+          if (key.value === "<<") {
+            const merged = node.children[index + 1].value;
+            for (const source of Array.isArray(merged) ? merged : [merged]) {
+              if (source === null || typeof source !== "object") continue;
+              for (const [name, line] of locations.get(source) ?? []) {
+                if (!keys.has(name)) keys.set(name, line);
+              }
+            }
+          } else if (typeof key.value === "string") keys.set(key.value, key.line);
+        }
+        if (keys.size > 0) locations.set(state.result, keys);
+      }
+      stack.at(-1)?.children.push({ value: state.result, line: node.line });
+    },
+  }) as { jobs: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"]; env?: Record<string, unknown> };
 }
 
 export function scanQuotedValue(value: string): string[] | null {
@@ -367,9 +396,6 @@ function hasUnbalancedLineQuotes(lines: PhysicalLine[]): boolean {
   return false;
 }
 
-/** A plainly spelled word that contains a glob character: `np?`, `n*p`, `np[m]`. */
-const PLAIN_GLOB_WORD = /^[A-Za-z0-9_.+-]*(?:\*|\?|\[[A-Za-z0-9_!^.-]*\])[A-Za-z0-9_./+-]*$/;
-
 /** Check physical run-step lines containing npm against approved blocks and shapes. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = physicalLines(run);
@@ -379,8 +405,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
   if (!approved) {
-    // A `case` pattern is not a command word: track the statement so a pattern
-    // such as `*)` is not refused as a glob command.
+    // Track `case` patterns separately from command words.
     let inCase = false;
     let patternOpen = false;
     for (const entry of logicalShellLines(run)) {
@@ -407,13 +432,13 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         // A `case` pattern list is not a command word, and its alternatives are
         // separated by `|`, which the clause splitter treats as a pipeline.
         if (inCase && patternOpen) continue;
-        const word = commandWord(clause.tokens);
+        const word = commandWord(clause.tokens, true);
         if (word === null) continue;
         const text = word.token.text;
-        if (text.startsWith("$'")) {
+        if (text.includes("$'")) {
           refuse(entry, "an unapproved run block has a command word with ANSI-C quoting");
         }
-        if (PLAIN_GLOB_WORD.test(text)) {
+        if (text !== "[" && text !== "[[" && /[*?\[]/.test(text)) {
           refuse(entry, "an unapproved run block has a command word with a glob character");
         }
       }
@@ -482,21 +507,26 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, workflowName?: string): number {
-  const workflow = parseWorkflow(source);
+  const locations: SourceLines = new WeakMap();
+  const workflow = parseWorkflow(source, locations);
   let installs = 0;
   for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
     const defaultWorkdir = job.defaults?.run?.["working-directory"] ?? workflow.defaults?.run?.["working-directory"] ?? "";
-    const defaultShell = job.defaults?.run?.shell ?? workflow.defaults?.run?.shell;
+    const defaultShellSource = job.defaults?.run?.shell != null ? job.defaults.run : workflow.defaults?.run;
+    const defaultShell = defaultShellSource?.shell;
     for (const [index, step] of job.steps.entries()) {
-      if (step.run === undefined) continue;
+      const run = step.run;
+      if (run === undefined) continue;
       const label = `${workflowName === undefined ? "" : `workflow ${workflowName} `}job ${jobName} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
       const shell = step.shell ?? defaultShell;
       if (shell !== undefined && shell !== "bash" &&
-          !EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === step.run.replace(/\n+$/, ""))) {
-        throw new Error(`${label}: cannot establish the npm ci directory: the step's effective shell is ${shell}, not the default bash`);
+          !EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""))) {
+        const shellSource = step.shell != null ? step : defaultShellSource;
+        const line = (shellSource === undefined ? undefined : locations.get(shellSource)?.get("shell")) ?? locations.get(step)?.get("run");
+        throw new Error(`${label}: cannot establish the npm ci directory: the step's effective shell is ${shell}, not the default bash (physical line ${line})`);
       }
-      const dirs = npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label);
-      const helperLines = physicalLines(step.run).filter((entry) => HELPER_CALL.test(entry.text));
+      const dirs = npmCiLockDirs(run, step["working-directory"] ?? defaultWorkdir, label);
+      const helperLines = physicalLines(run).filter((entry) => HELPER_CALL.test(entry.text));
       for (const [installIndex, dir] of dirs.entries()) {
         installs++;
         const lockfile = dir === "" ? "package-lock.json" : `${dir}/package-lock.json`;
@@ -720,7 +750,7 @@ type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?:
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
 /** Split a line into words, keeping quoted spans whole and honoring escapes and substitutions. */
-function shellTokens(line: string): ShellToken[] {
+function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] {
   const tokens: ShellToken[] = [];
   let index = 0;
   while (index < line.length) {
@@ -739,7 +769,8 @@ function shellTokens(line: string): ShellToken[] {
     let quoted = false;
     while (index < line.length) {
       const next = line[index];
-      if (/\s/.test(next) || /[;&|(){}]/.test(next)) break;
+      if (/\s/.test(next) || (/[;&|(){}]/.test(next) &&
+          !(keepRedirectAmpersand && next === "&" && /[<>]$/.test(text)))) break;
       if (next === "\\") {
         text += next;
         index++;
@@ -753,6 +784,15 @@ function shellTokens(line: string): ShellToken[] {
         index++;
         while (index < line.length) {
           const inner = line[index];
+          // Keep assignment substitutions whole when locating the outer command word.
+          if (keepRedirectAmpersand && quote === '"' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(text) && inner === "$" && line[index + 1] === "(") {
+            const span = parenSpan(line, index + 1);
+            if (span !== null && "end" in span) {
+              text += line.slice(index, span.end + 1);
+              index = span.end + 1;
+              continue;
+            }
+          }
           if (inner === "\\" && quote === '"') {
             text += inner;
             index++;
@@ -958,7 +998,7 @@ function clausesWithSeparators(line: string): ClauseWithSeparator[] {
   const clauses: ClauseWithSeparator[] = [];
   let tokens: ShellToken[] = [];
   let separator = "";
-  for (const token of shellTokens(line)) {
+  for (const token of shellTokens(line, true)) {
     if (/^(?:;|&|\||\(|\)|\{|\})$/.test(token.text)) {
       if (tokens.length > 0) {
         clauses.push({ tokens, separator });
@@ -996,7 +1036,7 @@ function splitClauses(line: string): Clause[] {
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
  * header is not an invocation.
  */
-function commandWord(tokens: ShellToken[]): { index: number; token: ShellToken } | null {
+function commandWord(tokens: ShellToken[], skipRedirections = false): { index: number; token: ShellToken } | null {
   let index = 0;
   let sawPrefix = false;
   while (index < tokens.length) {
@@ -1005,6 +1045,13 @@ function commandWord(tokens: ShellToken[]): { index: number; token: ShellToken }
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
       index++;
       continue;
+    }
+    if (skipRedirections) {
+      const redirect = token.text.match(/^(?:[0-9]+)?(?:>>?|<)(?:&)?(.*)$/);
+      if (redirect !== null) {
+        index += redirect[1] === "" ? 2 : 1;
+        continue;
+      }
     }
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
     if (!token.quoted && PREFIX_COMMANDS.has(text)) {

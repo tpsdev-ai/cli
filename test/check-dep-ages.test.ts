@@ -1681,13 +1681,41 @@ describe("the workflow guard reads shell: and refuses spelled command words in u
   }
 
   it.each([
-    ["workflow-level", (run: string) => workflowDefaultsShell(run, "sh")],
-    ["job-level", (run: string) => jobDefaultsShell(run, "sh")],
-    ["step-level", (run: string) => stepWithShell(run, "sh")],
-  ] as const)("refuses an unapproved run block under a %s shell, naming the step and the shell", (_where, build) => {
+    ["workflow-level", (run: string) => workflowDefaultsShell(run, "sh"), 3],
+    ["job-level", (run: string) => jobDefaultsShell(run, "sh"), 5],
+    ["step-level", (run: string) => stepWithShell(run, "sh"), 5],
+  ] as const)("refuses an unapproved run block under a %s shell, naming its source line", (_where, build, line) => {
     expect(() => assertNpmCiLockfilesRead(build("echo hi"), READ_TRACKED, WORKFLOW)).toThrow(
-      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: the step's effective shell is sh, not the default bash`,
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: the step's effective shell is sh, not the default bash (physical line ${line})`,
     );
+  }, 5_000);
+
+  it.each([
+    ["bash", "sh", "sh", true, 10],
+    ["sh", "bash", "bash", false, 10],
+    [undefined, "bash", "sh", true, 8],
+    [undefined, "sh", "bash", false, 8],
+  ] as const)("selects step %s over job %s over workflow %s", (step, job, workflow, accepted, line) => {
+    const source = `defaults:\n  run:\n    shell: ${workflow}\njobs:\n  build:\n    defaults:\n      run:\n        shell: ${job}\n    steps:\n      - ${step === undefined ? "" : `shell: ${step}\n        `}run: echo ok\n`;
+    if (accepted) expect(assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toBe(0);
+    else expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: the step's effective shell is sh, not the default bash (physical line ${line})`,
+    );
+  }, 5_000);
+
+  it("locates a quoted shell key in a flow mapping", () => {
+    const source = 'jobs:\n  build:\n    steps:\n      - {"shell": sh, run: echo ok}\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 4)");
+  }, 5_000);
+
+  it("locates the shell supplied by a YAML merge", () => {
+    const source = 'settings: &shell\n  shell: sh\njobs:\n  build:\n    steps:\n      - <<: *shell\n        run: echo ok\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 2)");
+  }, 5_000);
+
+  it("locates the shell when a step inherits its run block too", () => {
+    const source = 'settings: &step\n  shell: sh\n  run: echo ok\njobs:\n  build:\n    steps:\n      - <<: *step\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 2)");
   }, 5_000);
 
   it("accepts an approved run block under another shell", () => {
@@ -1701,13 +1729,36 @@ describe("the workflow guard reads shell: and refuses spelled command words in u
     );
   }, 5_000);
 
-  it.each(["np? ci", "n*p ci", "np[m] ci"])("refuses a command word with a glob character: %s", (run) => {
+  it.each([
+    "np? ci", "n*p ci", "np[m] ci", "./np? ci", "/usr/bin/np? ci", "n?? ci",
+    "n[p][m] ci", "np[[:alpha:]] ci", ">/dev/null np? ci", "2>&1 np? ci",
+    "</dev/null np? ci", ">>x np? ci", "A=x >out B=y 2>&1 </dev/null np? ci",
+    "> /dev/null np? ci", '"np?" ci', "np\\? ci", "np[ ci",
+  ])("refuses a command word with a glob character: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(
       `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with a glob character: ${run} (physical line 1)`,
     );
   }, 5_000);
 
-  it("accepts the test builtin, a plain command word and case patterns in an unapproved block", () => {
+  it("skips a leading assignment with a quoted substitution payload", () => {
+    const assignment = `pin="$(node -p "require('./p.json').optionalDependencies?.['p'] ?? ''")"`;
+    expect(assertNpmCiLockfilesRead(stepWithShell(assignment), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(`${assignment} np? ci`), READ_TRACKED, WORKFLOW)).toThrow("command word with a glob character");
+  }, 5_000);
+
+  it.each(["n$'p\\155' ci", "./n$'p\\155' ci", "n$'p'$'m' ci"])("refuses ANSI-C quoting within the command word: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow("command word with ANSI-C quoting");
+  }, 5_000);
+
+  it.each(['[ -f x ]', '[[ -n "$X" ]]', "echo ok", "echo case", '"echo" case'])("preserves the plain command outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+
+  it.each(['"npm" ci', "'npm' ci", "n\\pm ci"])("preserves the plain npm refusal: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow("a run block containing npm is refused");
+  }, 5_000);
+
+  it("accepts the bracket builtin and the inline case fixture", () => {
     expect(assertNpmCiLockfilesRead(stepWithShell("if [ -f x ]; then echo ok; fi"), READ_TRACKED, WORKFLOW)).toBe(0);
     expect(assertNpmCiLockfilesRead(stepWithShell('case "$v" in a|*.txt) echo ok;; esac'), READ_TRACKED, WORKFLOW)).toBe(0);
   }, 5_000);
@@ -1743,6 +1794,13 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
       writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
       for (const [line, expected] of [
         ["{npm,} ci", "ci"],
+        ["./np? ci", "ci"],
+        [`${stubDir}/np? ci`, "ci"],
+        ["n?? ci", "ci"],
+        ["n[p][m] ci", "ci"],
+        ["np[[:alpha:]] ci", "ci"],
+        ["n$'p\\155' ci", "ci"],
+        [">/dev/null np? ci", "ci"],
         ["$'npm' $'ci'", "ci"],
         ["npm </dev/null ci", "ci"],
         ['printf "%s" "$(npm ci)"', "ci"],
@@ -1752,6 +1810,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
       ] as const) {
         rmSync(argvFile, { force: true });
         const result = spawnSync("bash", ["-c", line], {
+          cwd: stubDir,
           env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
           encoding: "utf8",
           timeout: 5_000,

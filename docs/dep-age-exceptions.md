@@ -29,17 +29,16 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
   a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
 
 Refusals name the workflow, job, step and physical line. The spelling check is a
-best-effort lint for plainly spelled installs: variable or substitution
-indirection such as `n${x}pm` or `$(printf n)pm`, and a glob character inside a
-quoted word, are not covered.
+best-effort lint: variable or substitution indirection such as `n${x}pm` or
+`$(printf n)pm`, and composite-action shells, are not covered.
 
 A step whose effective shell — its own `shell:`, else its job's
 `defaults.run.shell`, else the workflow's — is set to anything other than
 `bash` is refused unless its run block is a pinned entry; the refusal names the
-step and the shell, because anything a non-default shell would interpret is
-outside the check. In a run block that is not a pinned entry, the guard also
-refuses a command word spelled with ANSI-C quoting (`$'...'`) or with a glob
-character (`*`, `?`, `[...]`).
+step, shell and source line. For command words selected in workflow steps
+in an unapproved run block, leading assignments and redirections are skipped,
+and words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
+remain accepted. The existing `case` handling remains.
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
