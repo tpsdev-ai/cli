@@ -408,9 +408,12 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     for (const entry of logicalShellLines(run)) {
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
-        const word = commandWord(clause.tokens, true, true);
+        const word = commandWord(clause.tokens, true);
         if (word === null) continue;
         const text = word.token.text;
+        if (/^[0-9]*[<>]/.test(text)) {
+          refuse(entry, "an unapproved run block has a redirection before the command word");
+        }
         if (!word.token.quoted && text === "case") {
           refuse(entry, "an unapproved run block has a case reserved word in command position");
         }
@@ -992,7 +995,7 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
  * header is not an invocation unless `case` is requested for refusal.
  */
-function commandWord(tokens: ShellToken[], skipRedirections = false, includeCase = false): { index: number; token: ShellToken } | null {
+function commandWord(tokens: ShellToken[], includeCase = false): { index: number; token: ShellToken } | null {
   let index = 0;
   let sawPrefix = false;
   while (index < tokens.length) {
@@ -1001,13 +1004,6 @@ function commandWord(tokens: ShellToken[], skipRedirections = false, includeCase
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
       index++;
       continue;
-    }
-    if (skipRedirections) {
-      const redirect = token.text.match(/^(?:[0-9]+)?(?:>>?|<)(?:&)?(.*)$/);
-      if (redirect !== null) {
-        index += redirect[1] === "" ? 2 : 1;
-        continue;
-      }
     }
     if (includeCase && !token.quoted && text === "case") return { index, token };
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;

@@ -1660,7 +1660,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   }, 5_000);
 });
 
-describe("the workflow guard reads shell: and refuses spelled command words in unapproved run blocks (#941)", () => {
+describe("the workflow guard reads shell: and refuses redirections before command words in unapproved run blocks (#941)", () => {
   const WORKFLOW = "workflow-c";
 
   function runBlock(run: string): string {
@@ -1731,13 +1731,46 @@ describe("the workflow guard reads shell: and refuses spelled command words in u
 
   it.each([
     "np? ci", "n*p ci", "np[m] ci", "./np? ci", "/usr/bin/np? ci", "n?? ci",
-    "n[p][m] ci", "np[[:alpha:]] ci", ">/dev/null np? ci", "2>&1 np? ci",
-    "</dev/null np? ci", ">>x np? ci", "A=x >out B=y 2>&1 </dev/null np? ci",
-    "> /dev/null np? ci", '"np?" ci', "np\\? ci", "np[ ci",
+    "n[p][m] ci", "np[[:alpha:]] ci", '"np?" ci', "np\\? ci", "np[ ci",
   ])("refuses a command word with a glob character: %s", (run) => {
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(
       `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with a glob character: ${run} (physical line 1)`,
     );
+  }, 5_000);
+
+  it.each([
+    "<> /dev/null n$'p\\155' ci", ">| /dev/null n$'p\\155' ci",
+    ">/dev/null np? ci", "2>&1 npm ci", "&>/dev/null npm ci",
+    "> /dev/null np? ci", "</dev/null np? ci", ">>x np? ci",
+    "A=x >out B=y 2>&1 </dev/null np? ci", "<<<text npm ci", "{fd}>out npm ci",
+    "echo ok; <> /dev/null npm ci", "if true; then 2>&1 npm ci; fi", ">/dev/null",
+  ])("refuses a redirection before the command word: %s", (run) => {
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a redirection before the command word: ${run} (physical line 1)`;
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it("preserves redirections after the command word", () => {
+    expect(assertNpmCiLockfilesRead(stepWithShell("echo ok >/dev/null"), READ_TRACKED, WORKFLOW)).toBe(0);
+    const entry = EXACT_BLOCK_ALLOWLIST[0];
+    const original = entry.text;
+    try {
+      entry.text = "npm --version 2>&1";
+      expect(assertNpmCiLockfilesRead(stepWithShell(entry.text), READ_TRACKED, WORKFLOW)).toBe(0);
+      expect(assertNpmCiWorkflowTree(stepWithShell(entry.text), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+    } finally {
+      entry.text = original;
+    }
+    expect(() => assertNpmCiLockfilesRead(stepWithShell("npm ci >/dev/null"), READ_TRACKED, WORKFLOW)).toThrow("a run block containing npm is refused");
+  }, 5_000);
+
+  it.each(["<> /dev/null n$'p\\155' ci", ">| /dev/null n$'p\\155' ci"])("shows real bash executes the redirected command: %s", (run) => {
+    const result = spawnSync("bash", ["-c", `npm() { printf '%s' "$*" >&2; return 17; }; ${run}`], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.status).toBe(17);
+    expect(result.stderr).toBe("ci");
   }, 5_000);
 
   it("skips a leading assignment with a quoted substitution payload", () => {
