@@ -1,5 +1,4 @@
-- **Reply obligations carry a deadline, and an unmarked reply can settle one.** A
-  delivered mail gets a durable deadline when its obligation is created; a
-  periodic sweep arms an open record that has none and settles an overdue
-  record no timer owns; and a reply the agent sends to the inbound sender during
-  the turn is matched without carrying the inbound id.
+- **A pending reply obligation gets its deadline at creation, and a periodic
+  sweep arms a pending obligation that has none.** A turn whose end the plugin
+  did not observe settles at its deadline; a record the store cannot read or
+  write is reported, not settled.

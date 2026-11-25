@@ -2562,21 +2562,10 @@ function receiptSignatureCheck(ctx: YieldContext): ReceiptSignatureCheck {
 function scanObligationReceipt(
   ctx: YieldContext,
   obligationId: string,
-  rec: { inboundId: string; inboundEnvelopeId?: string; turnStartedAt?: string; deadlineAt?: string | null },
+  rec: { inboundId: string; inboundEnvelopeId?: string },
   expectedReplyId: string | undefined,
-  windowEndMs?: number,
 ): ReturnType<typeof scanForReceipt> {
   const thread = receiptThread(rec);
-  // cli#1063: a reply sent by the agent to the inbound sender during the turn
-  // may carry no obligation marker and no inbound id. The window starts at the
-  // turn's own stamp (a record written before the field existed gets no
-  // fallback) and ends at the caller's scan time or the record's deadline. A
-  // record with no parseable bounds gets no fallback.
-  const startMs = rec.turnStartedAt ? Date.parse(rec.turnStartedAt) : NaN;
-  const endMs = windowEndMs ?? (rec.deadlineAt ? Date.parse(rec.deadlineAt) : obligationNow());
-  const unmarkedReplyWindow = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs
-    ? { startMs, endMs }
-    : undefined;
   return scanForReceipt(
     receiptDirs(ctx),
     obligationId,
@@ -2587,7 +2576,7 @@ function scanObligationReceipt(
     // envelope must be addressed to it (cli#429).
     ctx.sender,
     receiptSignatureCheck(ctx),
-    { expectedReplyId, threadMode: thread.mode, ...(unmarkedReplyWindow ? { unmarkedReplyWindow } : {}) },
+    { expectedReplyId, threadMode: thread.mode },
   );
 }
 
@@ -3187,10 +3176,9 @@ const outbound: ChannelOutboundAdapter = {
 };
 
 export const NEW_DIR_RESCAN_MS = 30_000;
-/** cli#1063: how often a live account looks for an open obligation that has no
- *  usable deadline. Delivery stamps one on the record; this sweep is the bound
- *  for a record that reached disk without one (an older record, or an arm that
- *  could not write) and the settler for a due record no timer owns. */
+/** cli#1063: how often a live account checks open obligations. Each tick arms
+ *  a pending obligation that has no usable deadline and settles one whose
+ *  deadline is due and that no timer or retry owns. */
 export const OBLIGATION_DEADLINE_SWEEP_MS = 60_000;
 export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 /** cli#922 item 1: the cap on the rescan-tick backoff between watcher re-arm attempts. */
@@ -3204,10 +3192,10 @@ export function rearmBackoffTicks(failures: number): number {
   return Math.min(2 ** (failures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
 }
 
-/** cli#1063: an open obligation must have a deadline, and a due deadline
- *  must not depend on a timer having been armed. This sweep arms an open record
- *  that has no usable deadline, and settles an overdue record that no timer or
- *  retry owns (a turn whose end the plugin never observed left neither). */
+/** cli#1063: arms a pending obligation that has no usable deadline and settles
+ *  a due one that no timer or retry owns, so a turn whose end the plugin did
+ *  not observe settles at its deadline. A record the store cannot read or write
+ *  is reported, not settled. */
 function sweepObligationDeadlines(
   mailDir: string,
   agent: string,
@@ -3216,7 +3204,9 @@ function sweepObligationDeadlines(
   log: any,
   incarnation: symbol,
 ): void {
-  for (const rec of listObligations(mailDir, agent)) {
+  for (const rec of listObligations(mailDir, agent, (path, code) => {
+    log?.warn?.(`tps-mail: obligation-deadline-sweep-unreadable: ${path}: ${code ?? "invalid"}`);
+  })) {
     if (TERMINAL_STATES.has(rec.state)) continue;
     if (armedDeadlines.has(rec.obligationId) || obligationRetries.has(rec.obligationId)) continue;
     const deadline = usableDeadline(rec.deadlineAt);
@@ -3491,12 +3481,10 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             to: recipient,
             accountId: account.accountId,
             state: "pending",
-            // cli#1063: a created obligation carries a bounded outcome. The
-            // turn's deadline exists from the instant the obligation does, so
-            // an arm that never lands still leaves a durable bound, and the
-            // deadline sweep settles a turn whose end is never observed.
+            // cli#1063: stamp the deadline at creation, so a pending obligation
+            // has a durable bound even when no arm lands; the periodic sweep
+            // settles it at that deadline.
             deadlineAt: new Date(obligationNow() + obligationDeadlineMs()).toISOString(),
-            turnStartedAt: new Date(obligationNow()).toISOString(),
             attempts: 1,
           }),
           log,
@@ -3795,7 +3783,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         const scanSnapshot = readObligationResult(yieldCtx.mailDir, yieldCtx.agent, yieldCtx.inboundId);
         const scanRecord = scanSnapshot.status === "found" ? scanSnapshot.record : created.record;
         const expectedReplyId = scanRecord.replyId ?? postedReplyId ?? undefined;
-        const receipt = await scanObligationReceipt(yieldCtx, obId, scanRecord, expectedReplyId, obligationNow());
+        const receipt = await scanObligationReceipt(yieldCtx, obId, scanRecord, expectedReplyId);
         if (!isLiveContext(yieldCtx)) return;
         if (receipt.status === "found") {
           yieldCtx.step = "ack-transition";

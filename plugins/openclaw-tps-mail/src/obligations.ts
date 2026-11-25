@@ -131,11 +131,6 @@ export interface ObligationRecord {
    *  inbound's record id instead, and the scan checks that (see receiptThread). */
   inboundEnvelopeId?: string;
   inboundTimestamp: string;
-  /** ISO time the obligation's turn started (the delivery). The receipt scan
-   *  uses it as the first bound when it matches a reply that carries no
-   *  obligation marker (cli#1063). Absent on records written before the field
-   *  existed; those get no unmarked-reply fallback. */
-  turnStartedAt?: string;
   /** The VERIFIED sender — the value promote() overwrote/wrote. */
   from: string;
   /** The agent that owes the reply. */
@@ -1186,10 +1181,6 @@ export interface ReceiptScanOptions {
   fs?: ReceiptScanFs;
   /** How the thread is checked (receiptThread). Default `legacy`. */
   threadMode?: ReceiptThreadMode;
-  /** cli#1063: the turn window a reply that carries NO obligation marker and
-   *  no inbound id may match. Accepted only when exactly one verified reply
-   *  from the agent to the sender falls inside it. Omitted means no fallback. */
-  unmarkedReplyWindow?: { startMs: number; endMs: number };
 }
 
 /**
@@ -1280,9 +1271,8 @@ export async function scanForReceipt(
   checkSignature: ReceiptSignatureCheck,
   opts: ReceiptScanOptions = {},
 ): Promise<ReceiptScan> {
-  const { expectedReplyId, fs = realFs, threadMode = "legacy", unmarkedReplyWindow } = opts;
+  const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
-  const unmarked: string[] = [];
   const verified = (envelope: Envelope | null): Promise<boolean> =>
     isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
   // (1) METADATA: the direct path, one file. A `direct` dir is NEVER listed —
@@ -1367,31 +1357,8 @@ export async function scanForReceipt(
       ) {
         return { status: "found", path };
       }
-      // (3) UNMARKED REPLY (cli#1063): the agent's own reply mail, sent during
-      //     the turn, may carry no obligation marker and no inbound id. It is a
-      //     candidate only when it is a verified reply from the agent to the
-      //     sender, does not claim another obligation or thread, and its SIGNED
-      //     timestamp falls inside the turn window. One candidate only: two
-      //     overlapping turns cannot be told apart, so neither is evidence.
-      if (unmarkedReplyWindow) {
-        if (record?.headers?.["X-TPS-Obligation"] !== undefined) continue;
-        if (record?.headers?.["X-TPS-Nack"] !== undefined) continue;
-        if (record?.obligationId !== undefined) continue;
-        if (record?.accountId !== accountId) continue;
-        if (record?.from !== agent) continue;
-        if (record?.replyToId !== undefined && record.replyToId !== replyToId) continue;
-        if (expectedReplyId !== undefined && record?.id !== expectedReplyId) continue;
-        const envelope = recordReceiptEnvelope(record);
-        if (!envelope) continue;
-        const at = Date.parse(envelope.timestamp);
-        if (!Number.isFinite(at) || at < unmarkedReplyWindow.startMs || at > unmarkedReplyWindow.endMs) continue;
-        if (envelope.replyToId !== undefined && envelope.replyToId !== replyToId) continue;
-        if (!(await isVerifiedReceiptReply(envelope, agent, recipient, replyToId, "legacy", checkSignature))) continue;
-        unmarked.push(path);
-      }
     }
   }
-  if (unmarked.length === 1) return { status: "found", path: unmarked[0]! };
   if (malformed) return { status: "malformed", path: malformed.path, ownRecord: malformed.ownRecord };
   return { status: "absent" };
 }

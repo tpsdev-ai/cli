@@ -1367,9 +1367,7 @@ describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)"
   }, 20000);
 
   it("a failure write that throws is ONE attempt with no announcement; the next start resolves the record", async () => {
-    // cli#1063: delivery stamps the record's deadline, so the bound this restart
-    // resolves must be the configured one from the FIRST turn, not a null it
-    // would otherwise arm fresh on restart.
+    // Short deadline so the restarted account settles the record in this fixture.
     process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
     const out = await inFreshHome(
       () => maildirFor("sender-a"),

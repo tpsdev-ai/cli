@@ -1,20 +1,19 @@
 /**
  * obligation-null-deadline.test.ts — cli#1063.
  *
- * A reply obligation carries a bounded outcome. These cases pin the
- * three behaviours the issue names:
- *   (a) a delivered mail whose turn end the plugin never observes still settles
- *       within a bounded time;
- *   (b) a pending record on disk with `deadlineAt: null` is armed when the
- *       plugin starts and then settles; and
- *   (c) a reply the agent sends to the inbound sender during the turn is matched
- *       to that obligation even when the reply carries no inbound id.
+ * A reply obligation carries a bounded outcome:
+ *   (a) a delivered mail whose turn end the plugin did not observe settles
+ *       after its deadline;
+ *   (b) a pending record on disk with `deadlineAt: null`, written after the
+ *       plugin is running, is armed by the periodic sweep and settles; and
+ *   (c) a created obligation persists its deadline at creation, and a restart
+ *       leaves it unchanged.
  *
- * The window is short (200 ms) and every wait is bounded by `pollUntil`, so the
- * file never sleeps for minutes.
+ * Each case sets its own deadline and sweep interval and carries an explicit
+ * timeout.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -32,7 +31,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 import { mailboxReplayStore } from "@tpsdev-ai/agent";
-import pluginModule, { setObligationDeadlineSweepForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, setObligationDeadlineSweepForTests } from "../src/index.js";
 import { createObligation, readObligation } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -137,7 +136,8 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
     return null;
   }
 
-  function startWith(dispatch: "hold" | "settle-without-final", opts: { inbound?: boolean } = {}) {
+  function startWith(dispatch: "hold" | "settle-without-final", opts: { inbound?: boolean } = {}, ctl?: AbortController) {
+    const signal = ctl ?? controller;
     const newDir = resolve(mailDir, AGENT, "new");
     mkdirSync(newDir, { recursive: true });
     mkdirSync(resolve(mailDir, SENDER, "new"), { recursive: true });
@@ -187,7 +187,7 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
         error: (...a: any[]) => logs.push(`ERROR ${a.map(String).join(" ")}`),
       },
       channelRuntime,
-      abortSignal: controller.signal,
+      abortSignal: signal.signal,
     };
     const startPromise = capturedPlugin.gateway.startAccount(ctx);
     return {
@@ -196,12 +196,12 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
       startPromise,
       get dispatched() { return dispatched; },
       settle: () => settleFn?.(),
-      stop: async () => { controller.abort(); try { await startPromise; } catch { /* aborted */ } },
+      stop: async () => { signal.abort(); try { await startPromise; } catch { /* aborted */ } },
     };
   }
 
   // ── (a) ────────────────────────────────────────────────────────────────────
-  it("(a) a turn end the plugin never observes still settles the obligation in bounded time", async () => {
+  it("(a) an obligation settles after its deadline when the turn end is not observed", async () => {
     const h = startWith("hold");
     const got = await pollUntil(() => h.dispatched !== null, 4000);
     expect(got).toBe(true);
@@ -219,8 +219,12 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
   }, 15000);
 
   // ── (b) ────────────────────────────────────────────────────────────────────
-  it("(b) a pending record on disk with deadlineAt: null is armed at startup and settles", async () => {
+  it("(b) a null deadline seeded after startup is armed by the periodic sweep and settles", async () => {
+    const h = startWith("hold", { inbound: false });
     const inboundId = `msg-${randomUUID()}`;
+    const startupDone = await awaitStartupCurSweepForTests("default", inboundId, 10000);
+    expect(startupDone, "startup recovery completes before the record is seeded").toBe(true);
+
     const envelopeJson = signedEnvelopeBody(SENDER, AGENT, "inbound payload", SENDER_SEED);
     const envelope: Envelope = JSON.parse(envelopeJson);
     mkdirSync(resolve(mailDir, AGENT, "cur"), { recursive: true });
@@ -253,9 +257,8 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
       attempts: 1,
     }));
 
-    const h = startWith("hold", { inbound: false });
     const armed = await pollUntil(() => !!obligation(inboundId)?.deadlineAt, 2000);
-    expect(armed, "startup arms the null deadline").toBe(true);
+    expect(armed, "the periodic sweep arms the null deadline").toBe(true);
     const terminal = await pollUntil(() => {
       const state = obligation(inboundId)?.state;
       return state === "acked" || state === "failed" || state === "unconfirmed";
@@ -265,33 +268,28 @@ describe("cli#1063 — reply obligations have bounded outcomes", () => {
   }, 15000);
 
   // ── (c) ────────────────────────────────────────────────────────────────────
-  it("(c) a reply to the inbound sender without the inbound id is matched to the obligation", async () => {
-    const h = startWith("settle-without-final");
-    const got = await pollUntil(() => h.dispatched !== null, 4000);
-    expect(got).toBe(true);
+  it("(c) a created obligation persists its deadline, and a restart leaves it unchanged", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "60000";
+    const sweepPrev = setObligationDeadlineSweepForTests(60_000);
+    try {
+      const h = startWith("hold");
+      const got = await pollUntil(() => h.dispatched !== null, 4000);
+      expect(got).toBe(true);
 
-    // The agent's own reply mail: signed from agent to sender, no
-    // X-TPS-Obligation marker and no replyToId — it does not carry the inbound id.
-    const replyId = `reply-${randomUUID()}`;
-    writeFileSync(
-      resolve(mailDir, SENDER, "new", `2026-05-26T00-00-01-${replyId}.json`),
-      JSON.stringify({
-        id: replyId,
-        from: AGENT,
-        to: SENDER,
-        body: signedEnvelopeBody(AGENT, SENDER, "the answer", AGENT_SEED),
-        timestamp: new Date().toISOString(),
-        accountId: "default",
-        headers: { "X-TPS-Trust": "agent", "X-TPS-Surface": "tps-mail" },
-        deliveryAttempts: 0,
-      }, null, 2),
-      "utf-8",
-    );
+      // Read as soon as the turn starts: no sweep has run at this interval.
+      const firstDeadline = obligation(h.inboundId)?.deadlineAt;
+      expect(typeof firstDeadline).toBe("string");
+      expect(Date.parse(firstDeadline) - Date.now()).toBeGreaterThan(30_000);
+      await h.stop();
 
-    h.settle();
-    const acked = await pollUntil(() => obligation(h.inboundId)?.state === "acked", 3000);
-    expect(acked, "the unmarked reply discharges the obligation").toBe(true);
-    expect(curFile(h.inboundId)?.ackedAt, "and the inbound is acked").toBeDefined();
-    await h.stop();
-  }, 15000);
+      const ctl = new AbortController();
+      const h2 = startWith("hold", { inbound: false }, ctl);
+      const startupDone = await awaitStartupCurSweepForTests("default", h.inboundId, 10000);
+      expect(startupDone, "startup recovery completes after the restart").toBe(true);
+      expect(obligation(h.inboundId)?.deadlineAt).toBe(firstDeadline);
+      await h2.stop();
+    } finally {
+      setObligationDeadlineSweepForTests(sweepPrev);
+    }
+  }, 20000);
 });
