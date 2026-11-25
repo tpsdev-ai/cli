@@ -185,7 +185,7 @@ function keptLaunchStateRoot(home: string): string {
   return join(home, ".tps", "launch", dirs[0]!);
 }
 
-/** The resolving step a survivor line names, as it prints it. */
+/** The command printed after `with:` in a survivor line. */
 function survivorStep(text: string): string {
   const line = text.split("\n").find((entry) => entry.includes("may still be running")) ?? "";
   const at = line.indexOf("with: ");
