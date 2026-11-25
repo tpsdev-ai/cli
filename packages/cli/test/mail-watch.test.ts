@@ -694,7 +694,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("an envelope id stays presented while any listed file carries it, even when the latest file leaves", async () => {
+  it("tracked, eligible verified files keep an id presented, subject to classification after ten consecutive failed per-file attempts", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -755,7 +755,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("a presented id is not dropped in a scan where a listed copy fails to read", async () => {
+  it("before classification after ten consecutive failed per-file attempts, a listed copy failing to read holds a presented id", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -818,7 +818,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("a presented id is not dropped in a scan where a listed copy fails to verify", async () => {
+  it("before classification after ten consecutive failed per-file attempts, a listed copy failing to verify holds a presented id", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -883,7 +883,103 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("an unreadable file is classified after ten failed scans and stops being retried", async () => {
+  it("before classification, a consumed-history failure holds a presented id through recovery", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    let restore = () => {};
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    let envId = "";
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, history lookup fails");
+      envId = env.messageId;
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(() => ids.includes(envId), SCAN_SETTLE_MS);
+
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      rmSync(first);
+      writeRecord({ ...raw, id: "id-copy-b" });
+      const copyB = join(dirname(first), "id-copy-b.json");
+      const ledger = join(getInbox(AGENT).root, "consumed.jsonl");
+      writeFileSync(ledger, "");
+      const injected = failReadsOf("readFileSync", ledger);
+      restore = injected.restore;
+      events.fire(copyB);
+      await waitFor(
+        () => log.lines.some((l) => l.includes(`${envId} not presented`) && l.includes(`${ledger} is unreadable (EACCES)`)),
+        SCAN_SETTLE_MS,
+      );
+      expect(injected.fault.injected).toBe(1);
+
+      injected.fault.armed = false;
+      deliverSigned("history recovery barrier");
+      events.fire(copyB);
+      await waitFor(() => bodies.includes("history recovery barrier"), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === envId)).toHaveLength(1);
+    } finally {
+      watcher.stop();
+      restore();
+      log.restore();
+    }
+  }, 10_000);
+
+  it("classification after ten consecutive failed per-file attempts releases the old id's hold", async () => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    let restore = () => {};
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, classified replacement");
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(() => ids.includes(env.messageId), SCAN_SETTLE_MS);
+
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      rmSync(first);
+      writeRecord({ ...raw, id: "id-copy-b" });
+      const copyB = join(dirname(first), "id-copy-b.json");
+      const injected = failReadsOf("readFileSync", copyB);
+      restore = injected.restore;
+      for (let attempt = 1; attempt <= 10; attempt++) {
+        events.fire(copyB);
+        await waitFor(() => injected.fault.injected === attempt, SCAN_SETTLE_MS);
+      }
+      expect(log.lines.some((l) => l.includes("id-copy-b.json: not presented (read or verification failed on 10 consecutive scans; classified)"))).toBe(true);
+
+      writeRecord({ ...raw, id: "id-copy-c" });
+      events.fire(join(dirname(first), "id-copy-c.json"));
+      await waitFor(() => ids.filter((id) => id === env.messageId).length === 2, SCAN_SETTLE_MS);
+      expect(existsSync(copyB)).toBe(true);
+      expect(injected.fault.injected).toBe(10);
+    } finally {
+      watcher.stop();
+      restore();
+      log.restore();
+    }
+  }, 10_000);
+
+  it("an unreadable file is classified after ten consecutive failed per-file attempts and stops being retried", async () => {
     let polls = 0;
     const log = captureErrors();
     let restore = () => {};
@@ -1372,7 +1468,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       });
       writeFileSync(join(inbox.fresh, `replay-${file}`), bytes);
 
-      // Withheld and logged on more than one scan: never classified, so retried.
+      // Withheld and logged before classification, so retried.
       const withheld = () =>
         log.lines.filter(
           (l) => l.includes(`${env.messageId} not presented`) && l.includes(`${ledger} is unreadable (EACCES)`) && l.includes("Remedy:"),
