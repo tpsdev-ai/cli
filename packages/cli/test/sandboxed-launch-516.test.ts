@@ -3035,8 +3035,8 @@ process.exit(typeof code === "number" ? code : 1);
   }, 30_000);
 
   test("the printed step removes shell-sensitive kept paths and preserves the sentinel and base", async () => {
-    // Space, single quote, `$`, `;` and a leading-dash component in the fixture
-    // path: unquoted, the printed step would split, re-parse or abort.
+    // Space, single quote, `$`, `;` and a `-`-prefixed word after the space in the
+    // fixture path: unquoted, the printed step would split, re-parse or abort.
     const f = stopFixture(
       undefined,
       makeSandbox(sandboxHomeBase(), `space '$; -dash-${randomBytes(3).toString("hex")}`),
