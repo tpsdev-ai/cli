@@ -738,7 +738,7 @@ function verifiedCreatedWorktree(
 }
 
 /** POSIX single-quote a path, including any embedded single quote. */
-function shellQuote(value: string): string {
+export function shellQuote(value: string): string {
   return `'${value.split("'").join(`'\\''`)}'`;
 }
 

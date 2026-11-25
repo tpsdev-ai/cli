@@ -36,7 +36,7 @@
  * process that spawns it — that process already owns it.
  */
 
-import { gitEnv, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
+import { gitEnv, shellQuote, type WorktreeLaunchBinding } from "./agent-lifecycle.js";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createServer, Socket, type Server } from "node:net";
 import { randomBytes, createHash } from "node:crypto";
@@ -384,7 +384,9 @@ export function createPrivateLaunchDir(opts: {
   agentId: string;
   env?: NodeJS.ProcessEnv;
 }): PrivateLaunchDir {
-  const home = opts.home ?? opts.env?.HOME ?? homedir() ?? "/tmp";
+  // Resolve before joining: a relative HOME would otherwise yield a relative
+  // root, and the survivor line promises an absolute path.
+  const home = resolve(opts.home ?? opts.env?.HOME ?? homedir() ?? "/tmp");
   const parent = join(home, ".tps", "launch");
   const label = launchDirLabel(home, opts.agentId, nonce());
   mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -421,6 +423,37 @@ export function removePrivateLaunchDir(dir: Pick<PrivateLaunchDir, "root">): voi
   } catch {
     /* best effort: the dir is 0700 and owned by us */
   }
+}
+
+/** What a stop keeps, with the path of each: the launch state always, and the
+ * caller's worktree when it kept one. */
+interface KeptPaths {
+  launchStateRoot: string;
+  worktree?: { path: string; base?: string };
+}
+
+/** The one survivor line both stop paths print (cli#1064): the signal path and
+ * the refusal path share it, so their wording cannot drift. It names what was
+ * kept, by absolute path — the launch state always, and the caller's worktree
+ * when it kept one — and a shell-quoted removal step for after the named pids
+ * exit, with `git worktree prune` when the base is known (agent-lifecycle's
+ * remedy for a purposefully removed worktree). Prune acts on every stale
+ * registration in that repository; a locked registration is not pruned and
+ * needs inspection and separate recovery. */
+function survivorLine(survivors: readonly number[], kept: KeptPaths): string {
+  // Every operand is POSIX single-quoted: the paths are caller-supplied, so a
+  // space, quote or metacharacter must not change what the pasted step does.
+  const roots = (kept.worktree ? [kept.worktree.path, kept.launchStateRoot] : [kept.launchStateRoot])
+    .map(shellQuote)
+    .join(" ");
+  const what = kept.worktree
+    ? `the worktree ${kept.worktree.path} and the launch state ${kept.launchStateRoot}`
+    : `the launch state ${kept.launchStateRoot}`;
+  const prune = kept.worktree?.base ? ` && git -C ${shellQuote(kept.worktree.base)} worktree prune` : "";
+  return (
+    `❌ pid ${survivors.join(", ")} may still be running; kept ${what}; ` +
+    `once those pids have exited, remove ${kept.worktree ? "them" : "it"} with: rm -rf ${roots}${prune}`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1040,6 +1073,20 @@ export async function launchAttested(
   // handle while it has not exited; the released agent is never signalled, only
   // read back by the identity recorded before its release. A second signal is
   // recorded and ignored: it must not re-enter the stop or cleanup path.
+  // What this stop keeps, with the path of each.
+  const keptPaths: KeptPaths = {
+    launchStateRoot: priv.root,
+    worktree: opts.worktreePath
+      ? {
+          path: opts.worktreePath,
+          base:
+            opts.worktreeBinding && opts.worktreeBinding.kind !== "none"
+              ? opts.worktreeBinding.baseWorkingTree
+              : undefined,
+        }
+      : undefined,
+  };
+
   let stopping = false;
   let interruptDone: Promise<void> | undefined;
   let interruptOutcome: number | undefined;
@@ -1066,8 +1113,7 @@ export async function launchAttested(
         // keep both, name what may still run, and exit with the refusal code
         // (78, or the supervised refusal code when supervised) without
         // re-raising the signal.
-        const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-        console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
+        console.error(survivorLine(stop.survivors, keptPaths));
         keepLaunchState = true;
         for (const sig of INTERRUPT_SIGNALS) process.removeAllListeners(sig);
         interruptOutcome = refusedCode;
@@ -1141,8 +1187,7 @@ export async function launchAttested(
     if (!stop.stopped) {
       // Name the cause first: the survivor line alone does not say why the launch was refused.
       const code = refuse(reason);
-      const kept = opts.worktreePath ? `the worktree ${opts.worktreePath}` : "the launch state";
-      console.error(`❌ pid ${stop.survivors.join(", ")} may still be running; kept ${kept}`);
+      console.error(survivorLine(stop.survivors, keptPaths));
       keepLaunchState = true;
       opts.onRefusalSurvivors?.(stop.survivors);
       return code;

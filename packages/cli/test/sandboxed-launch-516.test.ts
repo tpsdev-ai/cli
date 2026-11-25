@@ -15,11 +15,13 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
+import { pidState } from "@tpsdev-ai/agent";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
 import {
   NONO_MIN_VERSION,
@@ -129,10 +131,15 @@ interface Sandbox {
   nonoBin: string;
 }
 
-function makeSandbox(base: string = sandboxHomeBase()): Sandbox {
+function makeSandbox(base: string = sandboxHomeBase(), nameSuffix?: string): Sandbox {
   // The base must sit outside every fixed launcher grant (cli#558): a HOME inside one
   // makes the launcher's runtime-options gate refuse before the case under test.
-  const root = mkdtempSync(join(base, "tps-516-"));
+  let root = mkdtempSync(join(base, "tps-516-"));
+  if (nameSuffix) {
+    const moved = join(dirname(root), `tps-516-${nameSuffix}`);
+    renameSync(root, moved);
+    root = moved;
+  }
   const home = join(root, "home");
   const run = join(root, "run");
   const tmp = join(root, "tmp");
@@ -169,6 +176,25 @@ function agentYaml(sb: Sandbox, workspace: string): string {
     `memoryPath: ${join(sb.home, ".tps", "agents", "probe", "memory.jsonl")}\n` +
     "llm:\n  provider: ollama\n  model: probe-model\n"
   );
+}
+
+/** The single launch-state directory a kept launch left under `home`. */
+function keptLaunchStateRoot(home: string): string {
+  const dirs = readdirSync(join(home, ".tps", "launch"));
+  expect(dirs).toHaveLength(1);
+  return join(home, ".tps", "launch", dirs[0]!);
+}
+
+/** The command printed after `with:` in a survivor line. */
+function survivorStep(text: string): string {
+  const line = text.split("\n").find((entry) => entry.includes("may still be running")) ?? "";
+  const at = line.indexOf("with: ");
+  return at < 0 ? "" : line.slice(at + "with: ".length).trim();
+}
+
+/** POSIX single-quote, as the survivor line prints an operand. */
+function q(value: string): string {
+  return `'${value.split("'").join(`'\\''`)}'`;
 }
 
 function installFakeNono(sb: Sandbox, extra: string): void {
@@ -2713,7 +2739,7 @@ const code = await launchAttested(
     env: process.env,
     home: process.env.HOME,
     worktreeBinding: binding,
-    worktreePath: ws,
+    worktreePath: process.env.D_NO_WORKTREE_PATH === "1" ? undefined : ws,
     worktreeCleanup: cleanupFacts,
     signalStopTimeoutMs: Number(process.env.D_BOUND ?? "5000"),
     interruptTestHooks: hooks,
@@ -2736,8 +2762,8 @@ const code = await launchAttested(
 process.exit(typeof code === "number" ? code : 1);
 `;
 
-  function stopFixture(gitRemove?: "fail-gone" | "fail-keep" | "fail-leftover"): StopFixture {
-    const sb = makeSandbox();
+  function stopFixture(gitRemove?: "fail-gone" | "fail-keep" | "fail-leftover", sandbox?: Sandbox): StopFixture {
+    const sb = sandbox ?? makeSandbox();
     const base = join(sb.home, "ops", "tps");
     mkdirSync(base, { recursive: true });
     const git = (args: string[]) => {
@@ -2834,13 +2860,11 @@ process.exit(typeof code === "number" ? code : 1);
     return check();
   }
 
+  /** Liveness through the product's own rule (@tpsdev-ai/agent pidState): a pid
+   * whose /proc stat reports state Z has exited. A bare `kill(pid, 0)` probe
+   * keeps reading a killed survivor as alive where nothing reaps it. */
   function alive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch (err) {
-      return (err as NodeJS.ErrnoException).code !== "ESRCH";
-    }
+    return pidState(pid) !== "gone";
   }
 
   function observed(path: string): string[] {
@@ -2918,17 +2942,144 @@ process.exit(typeof code === "number" ? code : 1);
       // Not signal-shaped: a survivor may still be writing to the worktree.
       expect(exit.signal, text()).toBeNull();
       expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
-      expect(text()).toContain(`❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws}`);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text()).toContain(
+        `❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf '${f.sb.ws}' '${root}'`
+      );
+      expect(survivorStep(text())).toBe(`rm -rf ${q(f.sb.ws)} ${q(root)} && git -C ${q(realpathSync(f.base))} worktree prune`);
       // No signal reached the unverifiable pid, and the worktree survives.
       expect(observed(f.observe).some((line) => line.endsWith(" agent"))).toBe(false);
       expect(existsSync(f.sb.ws)).toBe(true);
       expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(`worktree ${f.sb.ws}\n`);
       const result = JSON.parse(readFileSync(f.result, "utf-8"));
       expect(result).toEqual({ stopped: false, survivors: [peerPid] });
+      // After the survivor exits, remove the kept paths and check that the next
+      // launch recreates this unlocked worktree and its registration.
+      const step = survivorStep(text());
+      process.kill(peerPid, "SIGKILL");
+      expect(await waitFor(() => !alive(peerPid!), 5_000), text()).toBe(true);
+      const ran = spawnSync("sh", ["-c", step], { encoding: "utf-8" });
+      expect(ran.status, ran.stderr).toBe(0);
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(existsSync(root)).toBe(false);
+      const again = spawnStopDriver(f, { D_WORKTREE: "1" });
+      try {
+        expect(
+          await waitFor(() => /released under nono session/.test(again.text()), 20_000),
+          again.text(),
+        ).toBe(true);
+        expect(existsSync(f.sb.ws)).toBe(true);
+        const listed = spawnSync(GIT, ["-C", f.base, "worktree", "list", "--porcelain"], { encoding: "utf8" });
+        expect(listed.status, listed.stderr).toBe(0);
+        expect(listed.stdout).toContain(`worktree ${f.sb.ws}\n`);
+      } finally {
+        if (again.launcher.pid && alive(again.launcher.pid)) process.kill(again.launcher.pid, "SIGTERM");
+        await waitFor(() => again.launcher.exitCode !== null || again.launcher.signalCode !== null, 10_000);
+      }
     } finally {
       try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
       rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("without a worktree, a survivor line names the launch-state path and its removal", async () => {
+    const f = stopFixture();
+    const { launcher, text } = spawnStopDriver(f, {
+      D_TOKENS: "null",
+      D_NO_WORKTREE_PATH: "1",
+      FAKE_NONO_KILL_CHILD: "0",
+    });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text()).toContain(
+        `❌ pid ${peerPid} may still be running; kept the launch state ${root}; ` +
+          `once those pids have exited, remove it with: rm -rf '${root}'`
+      );
+      expect(survivorStep(text())).toBe(`rm -rf '${root}'`);
+      // PROVE THE STEP: once the survivor has exited, the printed step removes
+      // the kept launch state and a fresh launch proceeds.
+      const step = survivorStep(text());
+      process.kill(peerPid, "SIGKILL");
+      expect(await waitFor(() => !alive(peerPid!), 5_000), text()).toBe(true);
+      const ran = spawnSync("sh", ["-c", step], { encoding: "utf-8" });
+      expect(ran.status, ran.stderr).toBe(0);
+      expect(existsSync(root)).toBe(false);
+      const again = spawnStopDriver(f, { D_NO_WORKTREE_PATH: "1" });
+      try {
+        expect(
+          await waitFor(() => /released under nono session/.test(again.text()), 20_000),
+          again.text(),
+        ).toBe(true);
+      } finally {
+        if (again.launcher.pid && alive(again.launcher.pid)) process.kill(again.launcher.pid, "SIGTERM");
+        await waitFor(() => again.launcher.exitCode !== null || again.launcher.signalCode !== null, 10_000);
+      }
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("the printed step removes shell-sensitive kept paths and preserves the sentinel and base", async () => {
+    // Space, single quote, `$`, `;` and a `-`-prefixed word after the space in the
+    // fixture path: unquoted, the printed step would split, re-parse or abort.
+    const f = stopFixture(
+      undefined,
+      makeSandbox(sandboxHomeBase(), `space '$; -dash-${randomBytes(3).toString("hex")}`),
+    );
+    const sentinel = join(dirname(f.sb.root), `${basename(f.sb.root)}-sentinel '$ ; -keep`);
+    mkdirSync(sentinel, { recursive: true });
+    const { launcher, text } = spawnStopDriver(f, { D_TOKENS: "null", D_WORKTREE: "1", FAKE_NONO_KILL_CHILD: "0" });
+    let peerPid: number | undefined;
+    try {
+      expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
+      expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
+      peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
+      process.kill(launcher.pid!, "SIGTERM");
+      const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
+        if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
+        launcher.once("exit", (code, signal) => r({ code, signal }));
+      });
+      expect(exit.signal, text()).toBeNull();
+      expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text().split("\n")).toContain(
+        `❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf ${q(f.sb.ws)} ${q(root)} && ` +
+          `git -C ${q(realpathSync(f.base))} worktree prune`,
+      );
+      const step = survivorStep(text());
+      process.kill(peerPid, "SIGKILL");
+      expect(await waitFor(() => !alive(peerPid!), 5_000), text()).toBe(true);
+      const ran = spawnSync("sh", ["-c", step], { encoding: "utf-8" });
+      expect(ran.status, ran.stderr).toBe(0);
+      // The kept paths are removed; the sentinel sibling and base survive.
+      expect(existsSync(f.sb.ws)).toBe(false);
+      expect(existsSync(root)).toBe(false);
+      expect(existsSync(sentinel)).toBe(true);
+      expect(existsSync(f.base)).toBe(true);
+      expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).not.toContain(
+        `worktree ${f.sb.ws}\n`,
+      );
+    } finally {
+      try { if (peerPid) process.kill(peerPid, "SIGKILL"); } catch { /* gone */ }
+      try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+      rmSync(sentinel, { recursive: true, force: true });
     }
   }, 30_000);
 
@@ -3033,7 +3184,11 @@ process.exit(typeof code === "number" ? code : 1);
       expect(observed(f.peerLog)).toEqual([]);
       expect(exit.signal, text()).toBeNull();
       expect(exit.code, text()).toBe(REFUSAL_EXIT_CODE);
-      expect(text()).toContain(`❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws}`);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text()).toContain(
+        `❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf '${f.sb.ws}' '${root}'`
+      );
       expect(alive(peerPid!)).toBe(true);
       expect(existsSync(f.sb.ws)).toBe(true);
       expect(spawnSync(GIT, ["worktree", "list", "--porcelain"], { cwd: f.base, encoding: "utf8" }).stdout).toContain(`worktree ${f.sb.ws}\n`);
@@ -3060,7 +3215,12 @@ process.exit(typeof code === "number" ? code : 1);
       });
       expect(exit.signal, text()).toBeNull();
       expect(exit.code, text()).toBe(SUPERVISED_REFUSAL_EXIT_CODE);
-      expect(text()).toContain(`❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws}`);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text()).toContain(
+        `❌ pid ${peerPid} may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf '${f.sb.ws}' '${root}'`
+      );
+      expect(survivorStep(text())).toBe(`rm -rf ${q(f.sb.ws)} ${q(root)} && git -C ${q(realpathSync(f.base))} worktree prune`);
       expect(alive(peerPid!)).toBe(true);
       expect(existsSync(f.sb.ws)).toBe(true);
       expect(readdirSync(join(f.sb.home, ".tps", "launch")).length).toBeGreaterThan(0);
@@ -3404,7 +3564,12 @@ setInterval(() => {}, 1000);
       const exit = await waitExit(launcher);
       expect(exit.signal, text).toBeNull();
       expect(exit.code, text).toBe(REFUSAL_EXIT_CODE);
-      expect(text).toContain(`may still be running; kept the worktree ${f.sb.ws}`);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text).toContain(
+        `may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf '${f.sb.ws}' '${root}'`
+      );
+      expect(survivorStep(text)).toBe(`rm -rf ${q(f.sb.ws)} ${q(root)} && git -C ${q(realpathSync(f.base))} worktree prune`);
       expect(text).toContain("❌ refusing to launch: ");
       // The child outlived its supervisor and was not signalled.
       expect(processAlive(peerPid!)).toBe(true);
@@ -3458,7 +3623,12 @@ setInterval(() => {}, 1000);
       const exit = await waitExit(launcher);
       expect(exit.signal, text).toBeNull();
       expect(exit.code, text).toBe(SUPERVISED_REFUSAL_EXIT_CODE);
-      expect(text).toContain(`may still be running; kept the worktree ${f.sb.ws}`);
+      const root = keptLaunchStateRoot(f.sb.home);
+      expect(text).toContain(
+        `may still be running; kept the worktree ${f.sb.ws} and the launch state ${root}; ` +
+          `once those pids have exited, remove them with: rm -rf '${f.sb.ws}' '${root}'`
+      );
+      expect(survivorStep(text)).toBe(`rm -rf ${q(f.sb.ws)} ${q(root)} && git -C ${q(realpathSync(f.base))} worktree prune`);
       expect(text).toContain("❌ refusing to launch: ");
       // The child outlived its supervisor and was not signalled.
       expect(processAlive(peerPid!)).toBe(true);

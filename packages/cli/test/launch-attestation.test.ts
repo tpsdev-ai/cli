@@ -43,7 +43,7 @@ import {
 } from "node:fs";
 import { connect } from "node:net";
 import type { WorktreeLaunchBinding } from "../src/utils/agent-lifecycle.js";
-import { join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir, tmpdir } from "node:os";
 import {
   attestConfinement,
@@ -1009,6 +1009,25 @@ describe("4e — the private dir is removed on every path", () => {
       removePrivateLaunchDir(dir);
       expect(existsSync(dir.root)).toBe(false);
     } finally {
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  });
+
+  test("a relative HOME yields an absolute private dir and launch-state root", () => {
+    // Short names: the launcher socket path under this root must fit macOS sun_path (104 bytes).
+    const sb = makeSandbox("rh");
+    const cwd = process.cwd();
+    try {
+      const relative = "rh";
+      process.chdir(sb.root);
+      const dir = createPrivateLaunchDir({ home: relative, agentId: "probe" });
+      expect(isAbsolute(dir.root)).toBe(true);
+      expect(dirname(dir.root)).toBe(join(resolve(relative), ".tps", "launch"));
+      expect(existsSync(dir.root)).toBe(true);
+      removePrivateLaunchDir(dir);
+      expect(existsSync(dir.root)).toBe(false);
+    } finally {
+      process.chdir(cwd);
       rmSync(sb.root, { recursive: true, force: true });
     }
   });
