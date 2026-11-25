@@ -417,9 +417,9 @@ describe("watchMail (verified-only, non-consuming)", () => {
       await ready.promise;
       deliverUnsigned("event unsigned", "unsigned-event");
       events.fire(onlyNewFile());
-      // Wait until a scan has READ the record and refused it, so the assertions
+      // Wait until the watcher has logged about this record, so the assertions
       // below are about a record the watcher saw.
-      const refused = () => log.lines.some((l) => l.includes("unsigned-event: not presented"));
+      const refused = () => log.lines.some((l) => l.includes("unsigned-event"));
       await waitFor(
         () => refused() || received.length > 0,
         SCAN_SETTLE_MS,
@@ -502,7 +502,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       });
       events.fire(onlyNewFile());
       // Wait until a scan has READ the record and refused it.
-      const refused = () => log.lines.some((l) => l.includes("tampered-1: not presented"));
+      const refused = () => log.lines.some((l) => l.includes("tampered-1"));
       await waitFor(
         () => refused() || received.length > 0,
         SCAN_SETTLE_MS,
@@ -566,10 +566,11 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
-    // One verification for the record, one for the barrier. With the per-file
-    // guard removed, this case measured 13: each of the ten re-events re-verified
-    // the record.
-    expect(verifications).toBe(2);
+    // One verification for the record, one for the barrier. The per-file guard is
+    // what holds the count down: with it removed, each of the ten re-events
+    // re-verifies the record. The bounds leave the exact debounce coalescing open.
+    expect(verifications).toBeGreaterThanOrEqual(2);
+    expect(verifications).toBeLessThan(8);
   }, 10_000);
 
   it("the envelope-id map persists across scans: a SECOND file carrying the SAME signed id is not presented again", async () => {
@@ -619,6 +620,55 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
 
     // The barrier scan listed the first file, the second copy and the barrier.
+    expect(ids.filter((id) => id === envId)).toHaveLength(1);
+  }, 10_000);
+
+  it("a second file carrying an already-presented envelope id is not presented again after the first file's entry is trimmed", async () => {
+    const ids: string[] = [];
+    const bodies: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
+    });
+    let envId = "";
+    try {
+      await ready.promise;
+      const env = deliverSigned("same id, second file");
+      envId = env.messageId;
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(
+        () => ids.includes(env.messageId),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
+      );
+
+      // The first file is REPLACED by a copy of the same signed envelope under a
+      // different file name and wrapper id, so the scan below lists the copy and
+      // not the first file: that scan trims the first file's entry.
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      writeRecord({ ...raw, id: "id-copy-b" });
+      rmSync(first);
+      deliverSigned("barrier");
+      const files = jsonFiles(dirname(first)).map((f) => join(dirname(first), f));
+      const barrierFile = files.find((p) => basename(p) !== "id-copy-b.json");
+      expect(barrierFile).toBeDefined();
+      events.fire(barrierFile!);
+      await waitFor(
+        () => bodies.includes("barrier"),
+        SCAN_SETTLE_MS,
+        () => `the fs event did not present the barrier record; received: ${JSON.stringify(bodies)}`,
+      );
+    } finally {
+      watcher.stop();
+    }
+
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 

@@ -1,0 +1,1 @@
+- **mail-watch does not present a second file when it carries an envelope id that was already presented and the first file has left `new/`.** A scan that verifies another file with a presented id re-points the dedup entry at that file, and the trim loop runs after the record loop, so the entry is dropped only when its recorded file is gone from `new/`.
