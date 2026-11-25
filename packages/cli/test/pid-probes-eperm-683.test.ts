@@ -12,6 +12,7 @@ import { processAlive } from "../src/commands/branch.js";
 import { pidAlive } from "../src/utils/launch-attestation.js";
 import { proxyStatus } from "../src/utils/llm-proxy.js";
 import { bridgeStatus } from "../src/utils/mail-bridge.js";
+import * as mod from "../src/utils/mail-relay.js";
 import { readRelayPidFile } from "../src/utils/mail-relay.js";
 
 /** A pid that was live and is now reaped, or null when the spawn failed or
@@ -55,6 +56,10 @@ afterEach(() => {
 });
 
 describe("mail relay pid probe", () => {
+  test("does not export getRelayPid", () => {
+    expect("getRelayPid" in mod).toBe(false);
+  });
+
   // pid 1 always exists, so the probe reports it alive. When kill(1, 0) returns
   // EPERM this exercises the EPERM branch; when it succeeds (the suite runs as
   // root) the result is the same but EPERM is not exercised (cli#692 tracks
