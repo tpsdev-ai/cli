@@ -123,7 +123,7 @@ jobs:
           "$BASH_BIN" --version | head -n1
           if [ "$RUNNER_OS" = macOS ]; then
             v="$("$BASH_BIN" --version | head -n1)"
-            case "$v" in *"version 3.2."*) ;; *) echo "::error::expected the macOS system bash 3.2, got: $v"; exit 1;; esac
+            [[ "$v" == *"version 3.2."* ]] || { echo "::error::expected the macOS system bash 3.2, got: $v"; exit 1; }
           fi
           "$BASH_BIN" ./scripts/test-promote-latest.sh
 

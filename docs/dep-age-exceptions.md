@@ -38,7 +38,8 @@ A step whose effective shell — its own `shell:`, else its job's
 step, shell and source line. For command words selected in workflow steps
 in an unapproved run block, leading assignments and redirections are skipped,
 and words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
-remain accepted. The existing `case` handling remains.
+remain accepted. `case` in command position is refused in unapproved run blocks;
+this best-effort lint does not model compound commands.
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
@@ -56,7 +57,7 @@ and literal invocations, and follows scripts. A run block and a followed script
 differ in their initial state: the install classifier runs on followed shell
 files, and a run block's lines are screened by the physical-line check above.
 A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
-`do`, `!` or the `time` prefix is judged at its next word; `for`, `case` and
+`do`, `!` or the `time` prefix is judged at its next word; `for` and
 `select` headers are not invocations (their command substitutions are scanned
 as usual); any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action

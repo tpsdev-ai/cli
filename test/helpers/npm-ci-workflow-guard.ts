@@ -405,36 +405,15 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
   if (!approved) {
-    // Track `case` patterns separately from command words.
-    let inCase = false;
-    let patternOpen = false;
     for (const entry of logicalShellLines(run)) {
       if (entry.body) continue;
-      for (const clause of clausesWithSeparators(entry.text)) {
-        const words = clause.tokens.filter((token) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text));
-        const head = words.find((token) => !token.quoted && !SHELL_KEYWORDS.has(token.text)) ?? words[0];
-        if (head !== undefined && !head.quoted && head.text === "esac") {
-          inCase = false;
-          patternOpen = false;
-          continue;
-        }
-        if (inCase) {
-          // The operator that ends the separator is the one that opened this
-          // clause: `;;` (or `;&`) starts a pattern, `)` starts a command.
-          if (/(?:;;|;&)$/.test(clause.separator)) patternOpen = true;
-          else if (clause.separator.endsWith(")")) patternOpen = false;
-        }
-        if (head !== undefined && !head.quoted && head.text === "case") {
-          inCase = true;
-          patternOpen = true;
-          continue;
-        }
-        // A `case` pattern list is not a command word, and its alternatives are
-        // separated by `|`, which the clause splitter treats as a pipeline.
-        if (inCase && patternOpen) continue;
-        const word = commandWord(clause.tokens, true);
+      for (const clause of splitClauses(entry.text, true)) {
+        const word = commandWord(clause.tokens, true, true);
         if (word === null) continue;
         const text = word.token.text;
+        if (!word.token.quoted && text === "case") {
+          refuse(entry, "an unapproved run block has a case reserved word in command position");
+        }
         if (text.includes("$'")) {
           refuse(entry, "an unapproved run block has a command word with ANSI-C quoting");
         }
@@ -991,35 +970,12 @@ function logicalShellLines(text: string): LogicalLine[] {
   return lines;
 }
 
-type ClauseWithSeparator = { tokens: ShellToken[]; separator: string };
-
-/** splitClauses, keeping each clause's leading operator run so `case` patterns can be told from commands. */
-function clausesWithSeparators(line: string): ClauseWithSeparator[] {
-  const clauses: ClauseWithSeparator[] = [];
-  let tokens: ShellToken[] = [];
-  let separator = "";
-  for (const token of shellTokens(line, true)) {
-    if (/^(?:;|&|\||\(|\)|\{|\})$/.test(token.text)) {
-      if (tokens.length > 0) {
-        clauses.push({ tokens, separator });
-        tokens = [];
-        separator = "";
-      }
-      separator += token.text;
-      continue;
-    }
-    tokens.push(token);
-  }
-  if (tokens.length > 0) clauses.push({ tokens, separator });
-  return clauses;
-}
-
-function splitClauses(line: string): Clause[] {
+function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
   const clauses: Clause[] = [];
   let current: ShellToken[] = [];
   let piped = false;
   let nextPiped = false;
-  for (const token of shellTokens(line)) {
+  for (const token of shellTokens(line, keepRedirectAmpersand)) {
     if (/^(?:;|&|\||\(|\)|\{|\})$/.test(token.text)) {
       if (current.length > 0) clauses.push({ tokens: current, piped });
       current = [];
@@ -1034,9 +990,9 @@ function splitClauses(line: string): Clause[] {
 /**
  * Skip VAR=val assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
- * header is not an invocation.
+ * header is not an invocation unless `case` is requested for refusal.
  */
-function commandWord(tokens: ShellToken[], skipRedirections = false): { index: number; token: ShellToken } | null {
+function commandWord(tokens: ShellToken[], skipRedirections = false, includeCase = false): { index: number; token: ShellToken } | null {
   let index = 0;
   let sawPrefix = false;
   while (index < tokens.length) {
@@ -1053,6 +1009,7 @@ function commandWord(tokens: ShellToken[], skipRedirections = false): { index: n
         continue;
       }
     }
+    if (includeCase && !token.quoted && text === "case") return { index, token };
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
     if (!token.quoted && PREFIX_COMMANDS.has(text)) {
       // `command -v`/`-V` looks a name up; it runs no command.

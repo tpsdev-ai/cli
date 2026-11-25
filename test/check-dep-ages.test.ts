@@ -1758,9 +1758,25 @@ describe("the workflow guard reads shell: and refuses spelled command words in u
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow("a run block containing npm is refused");
   }, 5_000);
 
-  it("accepts the bracket builtin and the inline case fixture", () => {
+  it.each([
+    "case x in\n  x)\n    $'np\\155' ci\n    ;;\nesac",
+    "case x in\n  x) echo ok;;\n  *) echo ok;;\nesac",
+    'case "$v" in a|*.txt) echo ok;; esac',
+    "if true; then case x in x) echo ok;; esac; fi",
+    "'echo' case\nnp? ci",
+  ])("refuses case or the following glob command: %s", (run) => {
+    const reason = run.startsWith("'echo'") ? "command word with a glob character" : "case reserved word in command position";
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it("accepts the rewritten macOS bash version check", () => {
+    const run = '[[ "$v" == *"version 3.2."* ]] || { echo "::error::expected the macOS system bash 3.2, got: $v"; exit 1; }';
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+
+  it("accepts the bracket builtin", () => {
     expect(assertNpmCiLockfilesRead(stepWithShell("if [ -f x ]; then echo ok; fi"), READ_TRACKED, WORKFLOW)).toBe(0);
-    expect(assertNpmCiLockfilesRead(stepWithShell('case "$v" in a|*.txt) echo ok;; esac'), READ_TRACKED, WORKFLOW)).toBe(0);
   }, 5_000);
 });
 
