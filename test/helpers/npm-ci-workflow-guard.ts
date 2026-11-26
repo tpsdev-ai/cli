@@ -931,7 +931,11 @@ function expansionEnd(line: string, open: number): number {
     }
     if (char === "$" && line[index + 1] === "'") { quote = "ansi"; index++; continue; }
     if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
-    if (/[({\[]/.test(char)) { index = expansionEnd(line, index) - 1; continue; }
+    if (char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+      index = expansionEnd(line, index + 1) - 1;
+      continue;
+    }
+    if (close !== "}" && char === line[open]) { index = expansionEnd(line, index) - 1; continue; }
     if (char === close) return index + 1;
   }
   return line.length;
@@ -957,6 +961,32 @@ function stripWordBoundaryComment(line: string): string {
   return line;
 }
 
+type HereDocument = { delimiter: string; quoted: boolean; stripTabs: boolean; line: number };
+type HereDocumentState = { pending: HereDocument[]; continued: string };
+
+function hereDocumentHeaders(line: string, number: number): HereDocument[] {
+  return [...line.matchAll(/<<(-)?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g)].map((match) => ({
+    delimiter: match[3], quoted: match[2] !== "", stripTabs: match[1] === "-", line: number,
+  }));
+}
+
+/** Both scanners must agree on where command scanning resumes. */
+function hereDocumentLine(state: HereDocumentState, physical: string): "body" | "end" | null {
+  const header = state.pending[0];
+  if (header === undefined) return null;
+  const backslashes = physical.match(/\\+$/)?.[0].length ?? 0;
+  if (!header.quoted && backslashes % 2 === 1) {
+    state.continued += physical.slice(0, -1);
+    return "body";
+  }
+  const joined = state.continued + physical;
+  const candidate = header.stripTabs ? joined.replace(/^\t+/, "") : joined;
+  state.continued = "";
+  if (candidate !== header.delimiter) return "body";
+  state.pending.shift();
+  return "end";
+}
+
 /**
  * Physical-line positions that begin inside a multi-line quote. Command scanning
  * skips these lines: they are string data, not shell words.
@@ -964,14 +994,11 @@ function stripWordBoundaryComment(line: string): string {
 function quoteStartMask(raw: string[]): boolean[] {
   const mask: boolean[] = [];
   let quote = "";
-  let delimiter: string | null = null;
-  let stripTabs = false;
-  for (const rawLine of raw) {
+  const documents: HereDocumentState = { pending: [], continued: "" };
+  for (const [number, rawLine] of raw.entries()) {
     const physical = rawLine.replace(/\r$/, "");
-    if (delimiter !== null) {
-      const candidate = stripTabs ? physical.replace(/^\t+/, "") : physical;
+    if (hereDocumentLine(documents, physical) !== null) {
       mask.push(true);
-      if (candidate === delimiter) delimiter = null;
       continue;
     }
     mask.push(quote !== "");
@@ -996,11 +1023,7 @@ function quoteStartMask(raw: string[]): boolean[] {
     if (quote === "") {
       // Unknown => refuse: a here-document header is matched after the comment
       // is stripped, so `# <<EOF` prose cannot swallow the lines below it.
-      const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
-      if (heredoc !== null) {
-        delimiter = heredoc[3];
-        stripTabs = heredoc[1] === "-";
-      }
+      documents.pending.push(...hereDocumentHeaders(line, number + 1));
     }
   }
   return mask;
@@ -1018,8 +1041,7 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
   let headerPrefix = "";
   let buffer = "";
   let start = 0;
-  let delimiter: string | null = null;
-  let stripTabs = false;
+  const documents: HereDocumentState = { pending: [], continued: "" };
   const flush = (quoteContinued = false, tail = "") => {
     const trimmed = buffer.trim();
     if (trimmed !== "") lines.push({ text: trimmed, line: start, body: false, quoteContinued, tail });
@@ -1027,18 +1049,16 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
   };
   for (let index = 0; index < raw.length; index++) {
     const physical = raw[index].replace(/\r$/, "");
-    if (delimiter !== null) {
-      const candidate = stripTabs ? physical.replace(/^\t+/, "") : physical;
-      if (candidate === delimiter) {
-        delimiter = null;
-        continue;
-      }
+    const body = hereDocumentLine(documents, physical);
+    if (body !== null) {
+      if (body === "end") continue;
       const trimmed = physical.trim();
       if (trimmed !== "") lines.push({ text: trimmed, line: index + 1, body: true });
       continue;
     }
     const physicalStart = headerPrefix.length;
     headerPrefix += physical + "\n";
+    let headerCount = 0;
     if (refuseHeader !== undefined && headerPrefix.includes("<<")) {
       const operators = shellTokens(headerPrefix, true, true);
       const accepted = new Set<number>();
@@ -1055,31 +1075,43 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
         }
       }
       for (let at = headerPrefix.indexOf("<<", physicalStart); at !== -1; at = headerPrefix.indexOf("<<", at + 1)) {
-        if (!accepted.has(at) || !/^<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?=\s|[;&|<>]|$)/.test(headerPrefix.slice(at))) {
+        if (!accepted.has(at) || !/^<<-?[ \t]*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?=[ \t\n]|[;&|<>]|$)/.test(headerPrefix.slice(at))) {
           refuseHeader({ text: physical.trim(), line: index + 1 }, "an unapproved run block has << outside a standalone top-level simple-command here-document redirection");
         }
+        headerCount++;
       }
     }
     if (mask[index]) {
+      if (refuseHeader !== undefined && headerCount > 0) {
+        refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header in a continued quote");
+      }
       buffer = "";
       continue;
     }
     const line = stripWordBoundaryComment(physical);
     if (buffer === "") start = index + 1;
+    const heredocs = hereDocumentHeaders(line, index + 1);
+    if (refuseHeader !== undefined && (headerCount !== heredocs.length ||
+        (headerCount > 0 && hasUnbalancedLineQuotes([{ text: line, line: index + 1 }])))) {
+      refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header");
+    }
+    if (refuseHeader !== undefined && heredocs.length > 0 && (buffer !== "" || /\\$/.test(line))) {
+      refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header continuation");
+    }
     if (/\\$/.test(line)) {
       buffer += line.slice(0, -1);
       continue;
     }
     buffer += line;
-    const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
     flush(
-      heredoc === null && index + 1 < raw.length && mask[index + 1] === true,
+      heredocs.length === 0 && index + 1 < raw.length && mask[index + 1] === true,
       raw.slice(index + 1).join("\n"),
     );
-    if (heredoc !== null) {
-      delimiter = heredoc[3];
-      stripTabs = heredoc[1] === "-";
-    }
+    documents.pending.push(...heredocs);
+  }
+  const unclosed = documents.pending[0];
+  if (refuseHeader !== undefined && unclosed !== undefined) {
+    refuseHeader({ text: raw[unclosed.line - 1].trim(), line: unclosed.line }, "an unclassified here-document body boundary (missing delimiter)");
   }
   flush();
   return lines;

@@ -1754,6 +1754,53 @@ describe("the workflow guard refuses command-position time, coproc, function, in
       expect(check("cat <<'EOF'\n<<\n<<<\nEOF")).toBe(0);
     }, 5_000);
 
+    it.each(["[", "(", "{", "${other:-[}"])(`accepts a parameter default before a heredoc through ${entryPoint}: %s`, (value) => {
+      expect(check(`: "\${prefix:-${value}}" <<'EOF'\nnp? ci\nEOF`)).toBe(0);
+    }, 5_000);
+
+    it.each(["<<EOF", "<<-EOF"])(`resumes commands after a continued unquoted delimiter through ${entryPoint}: %s`, (operator) => {
+      expect(() => check(`: ${operator}\nEO\\\nF\nnp? ci`)).toThrow("a command word with a glob character: np? ci (physical line 4)");
+      expect(check(`: ${operator}\nEO\\\nF\necho ok`)).toBe(0);
+    }, 5_000);
+
+    it.each(["'EOF'", '"EOF"'])(`keeps a quoted delimiter literal through ${entryPoint}: %s`, (delimiter) => {
+      expect(check(`: <<${delimiter}\nEO\\\nF\nnp? ci\nEOF`)).toBe(0);
+    }, 5_000);
+
+    it(`keeps an escaped backslash before an unquoted delimiter through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF\ndata\\\\\nEOF\nnp? ci")).toThrow("a command word with a glob character: np? ci (physical line 4)");
+    }, 5_000);
+
+    it(`queues delimiters in source order through ${entryPoint}`, () => {
+      const run = ": 3<<'FIRST' 4<<'SECOND'\nnp? ci\nFIRST\n<<< data\nSECOND";
+      expect(check(run)).toBe(0);
+      expect(() => check(`${run}\nnp? ci`)).toThrow("a command word with a glob character: np? ci (physical line 6)");
+    }, 5_000);
+
+    it(`refuses a header before a multiline quote through ${entryPoint}`, () => {
+      expect(() => check(': <<EOF "\nargument"\npayload\nEOF')).toThrow(
+        'an unclassified here-document header: : <<EOF " (physical line 1)',
+      );
+    }, 5_000);
+
+    it(`refuses a header after a continued quote through ${entryPoint}`, () => {
+      expect(() => check(': "\nargument" <<EOF\npayload\nEOF')).toThrow(
+        'an unclassified here-document header in a continued quote: argument" <<EOF (physical line 2)',
+      );
+    }, 5_000);
+
+    it(`refuses an unmodelled header continuation through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF \\\n argument\npayload\nEOF")).toThrow(
+        "an unclassified here-document header continuation: : <<EOF \\ (physical line 1)",
+      );
+    }, 5_000);
+
+    it(`refuses a missing body boundary through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF\nnp? ci")).toThrow(
+        "an unclassified here-document body boundary (missing delimiter): : <<EOF (physical line 1)",
+      );
+    }, 5_000);
+
     it.each(["time A=1>/dev/null echo ok", "time -p A=1>/dev/null echo ok", "coproc echo ok", "function f", "in echo ok", "]] echo ok"])(
       `refuses an unmodeled reserved word through ${entryPoint}: %s`, (run) => {
         expect(() => check(run)).toThrow(`a ${run.split(" ")[0]} reserved word in command position`);
@@ -1782,6 +1829,21 @@ describe("the workflow guard refuses command-position time, coproc, function, in
       }
     }, 5_000);
   }
+
+  it.each([
+    [": \"${prefix:-[}\" <<'EOF'\nnp? ci\nEOF\nprintf after", "after"],
+    [": <<EOF\nEO\\\nF\nprintf after", "after"],
+    [": <<'EOF'\nEO\\\nF\nprintf body\nEOF\nprintf after", "after"],
+    [": 3<<'FIRST' 4<<'SECOND'\nnp? ci\nFIRST\n<<< data\nSECOND\nprintf after", "after"],
+    [": <<EOF \\\n argument\npayload\nEOF\nprintf after", "after"],
+    [': <<EOF "\nargument"\npayload\nEOF\nprintf after', "after"],
+    [': "\nargument" <<EOF\npayload\nEOF\nprintf after', "after"],
+  ])("checks heredoc boundaries with real bash: %s", (run, output) => {
+    const result = spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(output);
+    expect(result.stderr).toBe("");
+  }, 5_000);
 
   it("shows real bash executes the time-prefixed assignment", () => {
     const result = spawnSync("bash", ["-c", "echo() { printf ran >&2; }; time A=1>/dev/null echo ok"], { encoding: "utf8", timeout: 5_000 });

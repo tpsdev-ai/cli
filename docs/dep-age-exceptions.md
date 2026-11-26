@@ -66,7 +66,7 @@ in command position is refused (see above). Command substitutions in accepted he
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed. Outside here-document bodies in unapproved run blocks, `<<` requires a standalone top-level simple-command redirection outside quotes, `$(...)`, backticks, `${...}`, `$[...]` and `$((...))`; other occurrences refuse the block. It refuses what it cannot
+a here-document passed to a shell is refused rather than executed. In unapproved run blocks, an unclassified here-document header, delimiter or body boundary refuses the step, naming the physical line. Modelled headers are single-line top-level simple-command `<<`/`<<-` redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
