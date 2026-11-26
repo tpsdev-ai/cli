@@ -849,7 +849,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { readRelayPidFile, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, withRelayPidLock, classifyRelayPidSnapshot } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
       const { homedir } = await import("node:os");
       const mailDir = join(homedir(), ".tps", "mail");
@@ -1132,19 +1132,30 @@ export async function runMail(args: MailArgs): Promise<void> {
           );
         });
         const claimBytes = Buffer.from(claimText, "utf-8");
-        const releaseClaim = (): boolean => {
+        const changedRecord = (raw: Buffer | null): string => raw === null
+          ? `The pid record at ${path} is missing or unreadable; inspect it.`
+          : `The pid record at ${path} changed; inspect it before removing it.`;
+        const claimResult = (liveChildPid?: number): string => {
           try {
-            return withRelayPidLock("release the relay start claim", () => {
+            return withRelayPidLock("update the relay start claim", () => {
               const current = snapshotPidRecord(path);
-              return pidRecordBytesEqual(current.raw, claimBytes) && removeRelayPidFile(path) === "removed";
+              if (!pidRecordBytesEqual(current.raw, claimBytes)) return changedRecord(current.raw);
+              if (liveChildPid !== undefined) {
+                // The starter may exit before the child; classify the claim by the child.
+                writeRelayPidRecordAtomically(path, serializeRelayClaimRecord(liveChildPid, processStartToken(liveChildPid)));
+                return `The claim at ${path} names child pid ${liveChildPid}.`;
+              }
+              if (removeRelayPidFile(path) === "removed") return `The claim at ${path} was released.`;
+              return changedRecord(current.raw);
             });
-          } catch {
-            return false;
+          } catch (error) {
+            if (liveChildPid !== undefined) throw error;
+            const current = snapshotPidRecord(path);
+            return pidRecordBytesEqual(current.raw, claimBytes)
+              ? `The claim was not released; inspect ${path} and remove it if no relay start or daemon is running.`
+              : changedRecord(current.raw);
           }
         };
-        const claimResult = (): string => releaseClaim()
-          ? `The claim at ${path} was released.`
-          : `The claim was not released; inspect ${path} and remove it if no relay start or daemon is running.`;
         // Spawn relay as detached background process
         const { spawn } = await import("node:child_process");
         let daemon: import("node:child_process").ChildProcess;
@@ -1167,8 +1178,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           daemon.on("error", () => {});
           throw new Error(`Failed to spawn the mail relay daemon. ${claimResult()}`);
         }
-        // Keep the claim through startup and the child-exit wait, blocking
-        // concurrent starts while the starter is alive.
+        // Leave the record through the exit wait: the child may still publish.
         const deadline = Date.now() + 5000;
         let started = snapshotRelayPidRecord().state;
         while (Date.now() < deadline) {
@@ -1181,7 +1191,8 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log(`Mail relay started: pid=${started.pid}`);
           break;
         }
-        const exited = await new Promise<boolean>((resolve) => {
+        let signalResult = "SIGTERM not sent (child already exited)";
+        let exited = await new Promise<boolean>((resolve) => {
           if (daemon.exitCode !== null || daemon.signalCode !== null) {
             resolve(true);
             return;
@@ -1196,18 +1207,43 @@ export async function runMail(args: MailArgs): Promise<void> {
           }, 5000);
           daemon.once("exit", onExit);
           try {
-            daemon.kill("SIGTERM");
+            signalResult = daemon.kill("SIGTERM") ? "SIGTERM sent" : "SIGTERM not sent (kill returned false)";
           } catch {
             // Keep waiting for the child's exit event.
+            signalResult = "SIGTERM not sent (kill threw)";
           }
         });
-        if (!exited) {
+        let result: string | undefined;
+        let handoffError: unknown;
+        // Retry the handoff until it succeeds, the child exits, or one lock timeout passes.
+        const handoffDeadline = Date.now() + RELAY_PID_LOCK_TIMEOUT_MS;
+        while (result === undefined) {
+          exited ||= daemon.exitCode !== null || daemon.signalCode !== null;
+          if (exited) {
+            result = claimResult();
+            break;
+          }
+          if (handoffError !== undefined && Date.now() >= handoffDeadline) break;
+          try {
+            result = claimResult(daemonPid);
+          } catch (error) {
+            handoffError = error;
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        if (result === undefined) {
+          const current = snapshotPidRecord(path);
+          const record = pidRecordBytesEqual(current.raw, claimBytes)
+            ? `The claim at ${path} still names the starter pid ${process.pid}.`
+            : changedRecord(current.raw);
+          const reason = handoffError instanceof Error ? handoffError.message : String(handoffError);
           throw new Error(
-            `Mail relay child (pid ${daemonPid}) did not exit; claim kept at ${path}. Stop that child, then inspect and remove ${path} if no relay start or daemon is running.`,
+            `Mail relay start failed: child (pid ${daemonPid}) is still running; ${signalResult}. ${record} Handing the claim to the child did not succeed within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (${reason}). Stop pid ${daemonPid} before starting the relay again.`,
+            { cause: handoffError },
           );
         }
         throw new Error(
-          `Mail relay daemon (pid ${daemonPid}) did not write its pid record; the start failed. ${claimResult()}`,
+          `Mail relay start failed: child (pid ${daemonPid}) ${exited ? "exited" : "exit not confirmed"}; ${signalResult}. ${result}`,
         );
       }
 

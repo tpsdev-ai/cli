@@ -96,7 +96,7 @@ export function deliverPendingMail(mailDir: string): number {
   return delivered;
 }
 
-const RELAY_PID_LOCK_TIMEOUT_MS = 5000;
+export const RELAY_PID_LOCK_TIMEOUT_MS = 5000;
 
 /** The lock root for the relay pid record. The record lock is separate from the
  *  record path so a claim under the record path stays the exclusive create. */
@@ -121,8 +121,8 @@ export function withRelayPidLock<T>(action: string, fn: () => T): T {
   }
 }
 
-/** A claim names the starter. While it is alive, `relay status` reports a
- *  start in progress and `relay stop` signals nothing. */
+/** A claim names the starter or timed-out child. While it is alive,
+ *  `relay status` reports a start in progress and `relay stop` signals nothing. */
 export function serializeRelayClaimRecord(pid: number, startToken: string | null): string {
   return `${JSON.stringify({ pid, startToken, relayClaim: true })}\n`;
 }

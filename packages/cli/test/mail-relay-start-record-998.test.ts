@@ -6,11 +6,12 @@ import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { acquireMailLockSync, pidState, processStartToken, type MailLock } from "@tpsdev-ai/agent";
 import { readPidFile } from "../src/utils/pid-file.js";
-import { readRelayPidFile, relayPidLockRoot } from "../src/utils/mail-relay.js";
+import { RELAY_PID_LOCK_TIMEOUT_MS, readRelayPidFile, relayPidLockRoot } from "../src/utils/mail-relay.js";
 import { relayStartTestHooks, runMail, setRelayPidRemoval } from "../src/commands/mail.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
 const RELAY_MODULE = resolve(import.meta.dir, "../src/utils/mail-relay.ts");
+const MAIL_MODULE = resolve(import.meta.dir, "../src/commands/mail.ts");
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const CASE_TIMEOUT_MS = 30_000;
 const CLI_TIMEOUT_MS = 20_000;
@@ -46,6 +47,8 @@ function spawnSleep(seconds = "60"): Bun.Subprocess {
 }
 
 function killPid(pid: number, signal: NodeJS.Signals = "SIGKILL"): void {
+  // A pid read from an empty or partial file parses as 0 or NaN; 0 and negative pids signal process groups.
+  if (!Number.isInteger(pid) || pid <= 1) return;
   try {
     process.kill(pid, signal);
   } catch {
@@ -89,8 +92,8 @@ function runCli(args: string[], timeout = CLI_TIMEOUT_MS): { status: number; std
   return { status: result.status ?? -1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-async function runCliAsync(args: string[]): Promise<{ status: number; stdout: string; stderr: string }> {
-  const child = Bun.spawn([process.execPath, TPS_BIN, ...args], {
+async function runCliAsync(args: string[], runtimeArgs: string[] = [], timeout = CLI_TIMEOUT_MS): Promise<{ status: number; stdout: string; stderr: string }> {
+  const child = Bun.spawn([process.execPath, ...runtimeArgs, TPS_BIN, ...args], {
     env: { ...process.env, HOME: home },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -101,7 +104,7 @@ async function runCliAsync(args: string[]): Promise<{ status: number; stdout: st
     } catch {
       /* already gone */
     }
-  }, CLI_TIMEOUT_MS);
+  }, timeout);
   try {
     const [stdout, stderr, status] = await Promise.all([
       new Response(child.stdout).text(),
@@ -339,7 +342,7 @@ describe("relay start and the pid record", () => {
     }
   }, CASE_TIMEOUT_MS);
 
-  test("failed start releases its claim under the real record lock", async () => {
+  test("failed start retains its claim under record lock contention", async () => {
     let lock: MailLock | undefined;
     const restore = patchShared(relayStartTestHooks, "spawn", () => {
       lock = holdRecordLock();
@@ -383,22 +386,148 @@ describe("relay start and the pid record", () => {
     }
   }, CASE_TIMEOUT_MS);
 
-  test("startup timeout keeps the claim when the child does not exit", async () => {
+  test("timed-out CLI exits with a child claim that blocks restart until the child exits", async () => {
+    const childPidFile = join(home, "child.pid");
+    const signalled = join(home, "child-signalled");
+    const preload = join(home, "starter-preload.ts");
+    const fixture = `
+      import { writeFileSync } from "node:fs";
+      process.on("SIGTERM", () => writeFileSync(${JSON.stringify(signalled)}, "SIGTERM"));
+      writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `;
+    writeFileSync(preload, `
+      import { spawn } from "node:child_process";
+      import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+      relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
+        { detached: true, env: process.env, stdio: "ignore" });
+    `);
+    let childPid: number | undefined;
+    try {
+      const first = await runCliAsync(["mail", "relay", "start"], ["--preload", preload]);
+      childPid = Number(readFileSync(childPidFile, "utf8"));
+      expect(first.status).toBe(1);
+      expect(first.stderr).toContain(`child (pid ${childPid}) exit not confirmed; SIGTERM sent.`);
+      expect(first.stderr).toContain(`The claim at ${relayPid} names child pid ${childPid}.`);
+      expect(readFileSync(signalled, "utf8")).toBe("SIGTERM");
+      expect(pidState(childPid)).toBe("alive");
+      const claim = readFileSync(relayPid, "utf8");
+
+      const second = runCli(["mail", "relay", "start"]);
+      expect(second.status).not.toBe(0);
+      expect(second.stderr).toContain(`pid=${childPid}, pid file ${relayPid}`);
+      expect(second.stderr).toContain("this command launched no relay");
+      expect(readFileSync(relayPid, "utf8")).toBe(claim);
+      expect(JSON.parse(claim)).toEqual({ pid: childPid, startToken: processStartToken(childPid), relayClaim: true });
+
+      killPid(childPid);
+      await waitGone(childPid);
+      const third = runCli(["mail", "relay", "start"]);
+      expect(third.status).toBe(0);
+      expect(third.stdout).toContain("Mail relay started: pid=");
+    } finally {
+      if (childPid === undefined && existsSync(childPidFile)) childPid = Number(readFileSync(childPidFile, "utf8"));
+      if (childPid !== undefined) killPid(childPid);
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("timed-out CLI stops retrying a failing claim handoff at the deadline and names the live child", async () => {
+    const childPidFile = join(home, "child.pid");
+    const attempts = join(home, "handoff-attempts");
+    const preload = join(home, "starter-preload.ts");
+    const fixture = `
+      import { writeFileSync } from "node:fs";
+      process.on("SIGTERM", () => {});
+      writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `;
+    writeFileSync(preload, `
+      import { appendFileSync } from "node:fs";
+      import { spawn } from "node:child_process";
+      import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+      import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
+      relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
+        { detached: true, env: process.env, stdio: "ignore" });
+      relayWriteTestHooks.afterTempWrite = () => {
+        appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
+        throw new Error("injected handoff write failure");
+      };
+    `);
+    let childPid: number | undefined;
+    try {
+      const first = await runCliAsync(["mail", "relay", "start"], ["--preload", preload], CLI_TIMEOUT_MS + 5000);
+      const returned = Date.now();
+      childPid = Number(readFileSync(childPidFile, "utf8"));
+      const claim = JSON.parse(readFileSync(relayPid, "utf8"));
+      const tried = readFileSync(attempts, "utf8").trim().split("\n").map(Number);
+      expect(first.status).toBe(1);
+      expect(first.stderr).toContain(`child (pid ${childPid}) is still running; SIGTERM sent.`);
+      expect(first.stderr).toContain(`The claim at ${relayPid} still names the starter pid ${claim.pid}.`);
+      expect(first.stderr).toContain(`within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (injected handoff write failure).`);
+      expect(first.stderr).toContain(`Stop pid ${childPid} before starting the relay again.`);
+      expect(claim.relayClaim).toBe(true);
+      expect(claim.pid).not.toBe(childPid);
+      expect(pidState(childPid)).toBe("alive");
+      expect(tried.length).toBeGreaterThan(1);
+      expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
+      expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
+    } finally {
+      if (childPid === undefined) {
+        try {
+          childPid = Number(readFileSync(childPidFile, "utf8"));
+        } catch {
+          /* the child never wrote its pid */
+        }
+      }
+      if (childPid !== undefined && Number.isInteger(childPid) && childPid > 1) killPid(childPid);
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test.each([false, true])("timeout reports a changed record after late publication (child exits: %s)", async (exits) => {
     let child: ReturnType<typeof spawn> | undefined;
     const restore = patchShared(relayStartTestHooks, "spawn", () => {
-      child = spawn(process.execPath, ["--eval", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
-        { env: { ...process.env, HOME: home }, stdio: "ignore" });
+      child = spawn(process.execPath, ["--eval", `
+        process.on("SIGTERM", async () => {
+          const { runRelayDaemon } = await import(${JSON.stringify(RELAY_MODULE)});
+          void runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
+          ${exits ? "process.exit(0);" : ""}
+        });
+        setInterval(() => {}, 1000);
+      `], { env: { ...process.env, HOME: home }, stdio: "ignore" });
       return child;
     });
     try {
       const error = await runMail({ action: "relay", agent: "start" }).then(() => null, (error: Error) => error);
-      expect(error?.message).toBe(
-        `Mail relay child (pid ${child!.pid}) did not exit; claim kept at ${relayPid}. Stop that child, then inspect and remove ${relayPid} if no relay start or daemon is running.`,
-      );
-      expect(pidState(child!.pid!)).toBe("alive");
-      expect(JSON.parse(readFileSync(relayPid, "utf8")).relayClaim).toBe(true);
+      expect(error?.message).toContain(`child (pid ${child!.pid}) ${exits ? "exited" : "exit not confirmed"}; SIGTERM sent.`);
+      expect(error?.message).toContain(`The pid record at ${relayPid} changed; inspect it before removing it.`);
+      expect(error?.message).not.toMatch(/claim/);
+      const published = JSON.parse(readFileSync(relayPid, "utf8"));
+      expect(published.pid).toBe(child!.pid);
+      expect(published.relayClaim).toBeUndefined();
     } finally {
       child?.kill("SIGKILL");
+      restore();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test.each(["false", "throw"])("timeout reports SIGTERM not sent (kill: %s)", async (result) => {
+    let child: ReturnType<typeof spawn> | undefined;
+    const restore = patchShared(relayStartTestHooks, "spawn", () => {
+      child = spawn(process.execPath, ["--eval", 'setTimeout(() => process.exit(0), 5500);'],
+        { env: { ...process.env, HOME: home }, stdio: "ignore" });
+      child.kill = () => {
+        if (result === "throw") throw new Error("injected signal failure");
+        return false;
+      };
+      return child;
+    });
+    try {
+      const error = await runMail({ action: "relay", agent: "start" }).then(() => null, (error: Error) => error);
+      expect(error?.message).toContain(`child (pid ${child!.pid}) exited; SIGTERM not sent (kill ${result === "throw" ? "threw" : "returned false"}).`);
+      expect(error?.message).toContain(`The claim at ${relayPid} was released.`);
+      expect(existsSync(relayPid)).toBe(false);
+    } finally {
+      if (child?.pid) killPid(child.pid);
       restore();
     }
   }, CASE_TIMEOUT_MS);
