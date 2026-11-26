@@ -849,7 +849,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, claimRelayPidRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, claimRelayPidRecord, writeRelayPidRecordAtomically, withRelayPidLock, RelayPidLockDeadlineError, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
       const { homeDir } = await import("../utils/home.js");
       const mailDir = join(homeDir(), ".tps", "mail");
@@ -1249,6 +1249,12 @@ export async function runMail(args: MailArgs): Promise<void> {
           try {
             result = claimResult(daemonPid, { timeoutMs: Math.max(0, remaining), deadline: handoffDeadline });
           } catch (error) {
+            if (error instanceof RelayPidLockDeadlineError) {
+              // The deadline, not another handoff failure, stopped the retries;
+              // keep the last real failure as the reason when one exists.
+              if (handoffError === undefined) handoffError = error;
+              break;
+            }
             handoffError = error;
             await new Promise((r) => setTimeout(r, 25));
           }

@@ -596,9 +596,18 @@ describe("relay start and the pid record", () => {
       import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
       relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
         { detached: true, env: process.env, stdio: "ignore" });
+      let failures = 0;
       relayWriteTestHooks.afterTempWrite = () => {
+        failures += 1;
         appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
         throw new Error("injected handoff write failure");
+      };
+      // Hit the deadline under the lock on an attempt near it, after real
+      // failures, so the stop reason must keep one of those failures.
+      relayWriteTestHooks.beforeDeadlineCheck = (deadline) => {
+        if (failures >= 2 && deadline - Date.now() < 200) {
+          while (Date.now() < deadline) {}
+        }
       };
     `);
     let childPid: number | undefined;
@@ -652,7 +661,7 @@ describe("relay start and the pid record", () => {
         const lock = acquireMailLockSync(relayPidLockRoot(), { timeoutMs: 5000 });
         if (!lock) process.exit(3);
         writeFileSync(${JSON.stringify(heldPidFile)}, String(process.pid));
-        setTimeout(() => { lock.release(); process.exit(0); }, 7000);
+        setTimeout(() => { lock.release(); }, 500);
       }, 50);
       setInterval(() => {}, 1000);
     `;
@@ -665,13 +674,23 @@ describe("relay start and the pid record", () => {
       relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
         { detached: true, env: process.env, stdio: "ignore", cwd: ${JSON.stringify(cliDir)} });
       let first = true;
+      let allowSuccess = false;
       relayWriteTestHooks.afterTempWrite = () => {
         appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
         if (first) {
           first = false;
-          writeFileSync(${JSON.stringify(holdSignal)}, JSON.stringify({ holdAt: Date.now() + ${RELAY_PID_LOCK_TIMEOUT_MS} - 1000 }));
+          writeFileSync(${JSON.stringify(holdSignal)}, JSON.stringify({ holdAt: Date.now() + ${RELAY_PID_LOCK_TIMEOUT_MS} - 2000 }));
         }
+        if (allowSuccess) return;
         throw new Error("injected handoff write failure");
+      };
+      // The lock is free again before the deadline; cross it under the lock so a
+      // late acquisition is refused, not published.
+      relayWriteTestHooks.beforeDeadlineCheck = (deadline) => {
+        if (deadline - Date.now() < 200) {
+          allowSuccess = true;
+          while (Date.now() < deadline + 50) {}
+        }
       };
     `);
     let childPid: number | undefined;

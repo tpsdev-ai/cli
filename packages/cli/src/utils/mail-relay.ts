@@ -102,6 +102,16 @@ export function deliverPendingMail(mailDir: string): number {
 
 export const RELAY_PID_LOCK_TIMEOUT_MS = 5000;
 
+/** A lock acquired after a caller's shared deadline. Callers treat it as a stop
+ *  condition, not another attempt failure, so the last real failure can stay
+ *  the reported reason. */
+export class RelayPidLockDeadlineError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RelayPidLockDeadlineError";
+  }
+}
+
 /** The lock root for the relay pid record. The record lock is separate from the
  *  record path so a claim under the record path stays the exclusive create. */
 export function relayPidLockRoot(path: string = relayPidPath()): string {
@@ -126,10 +136,13 @@ export function withRelayPidLock<T>(
     );
   }
   try {
-    if (budget?.deadline !== undefined && Date.now() >= budget.deadline) {
-      throw new Error(
-        `Mail relay pid record lock ${mailLockPath(root)} was acquired after the handoff deadline; refusing to ${action}.`,
-      );
+    if (budget?.deadline !== undefined) {
+      relayWriteTestHooks.beforeDeadlineCheck?.(budget.deadline);
+      if (Date.now() >= budget.deadline) {
+        throw new RelayPidLockDeadlineError(
+          `Mail relay pid record lock ${mailLockPath(root)} was acquired after the handoff deadline; refusing to ${action}.`,
+        );
+      }
     }
     return fn();
   } finally {
@@ -175,6 +188,7 @@ export function snapshotRelayPidRecord(): { state: RelayPidState; raw: Buffer | 
 export const relayWriteTestHooks: {
   afterTempWrite?: (tmpPath: string, recordPath: string) => void;
   writeRecordBytes?: (path: string, text: string) => void;
+  beforeDeadlineCheck?: (deadline: number) => void;
 } = {};
 
 function writeRecordBytes(path: string, text: string): void {
