@@ -267,7 +267,11 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
                 kept: (kept) => `Bridge (pid ${state.pid}) stopped; ${describeKeptRecord(fresh.path, kept)}`,
               });
             } else {
-              console.log(`Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`);
+              console.log(
+                stopped.get(state.pid) === state.startToken
+                  ? `Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`
+                  : `Recorded bridge process (pid ${state.pid}) is no longer running; pid file ${fresh.path} was kept.`,
+              );
             }
           } else if (fresh.kind === "stale" && fresh.pid === state.pid) {
             failures.push(

@@ -1087,7 +1087,8 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       expect(pidState(stoppedChild.pid)).toBe("gone");
       expect(pidState(otherPid)).toBe("gone");
       expect(existsSync(betaPath)).toBe(true);
-      expect(lines).toContain(`Bridge (pid ${otherPid}) stopped; pid file ${betaPath} is stale.`);
+      expect(lines).toContain(`Recorded bridge process (pid ${otherPid}) is no longer running; pid file ${betaPath} was kept.`);
+      expect(lines).toContain(`Bridge (pid ${stoppedChild.pid}) stopped; pid file removed: ${alphaPath}.`);
     },
     TIMEOUT,
   );
