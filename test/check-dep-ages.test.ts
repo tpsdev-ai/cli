@@ -1632,6 +1632,66 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
   }, 30_000);
 });
 
+describe("here-document discovery in run blocks and followed shell files", () => {
+  for (const asScript of [false, true]) {
+    const check = (text: string, tracked = true) => {
+      const root = makeTreeFixture({
+        "scripts/outer.sh": text,
+        "scripts/child.sh": "npm ci\n",
+        "package-lock.json": "{}\n",
+      });
+      try {
+        return assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/outer.sh" : text, "."),
+          new Set(tracked ? ["package-lock.json"] : []), root, "workflow-heredoc",
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
+
+    it.each(['"<<PHANTOM"', "'<<PHANTOM'", '"<<X"'])(
+      `discovers the child after a header with quoted %s (followed file: ${asScript})`, (quoted) => {
+        const text = `: <<'EOF' ${quoted}\npayload\nEOF\nbash scripts/child.sh`;
+        const report = check(text);
+        expect(report.followed).toContain("scripts/child.sh");
+        expect(report.installs).toBe(1);
+        expect(() => check(text, false)).toThrow(/scripts\/child\.sh.*cannot bind the npm install/);
+      },
+    );
+
+    it(`keeps real redirections in source order around quoted text (followed file: ${asScript})`, () => {
+      const report = check(': 3<<FIRST "<<PHANTOM" 4<<-\'SECOND\'\nSECOND\nFIRST\n\tFIRST\n\tSECOND\nbash scripts/child.sh');
+      expect(report.followed).toContain("scripts/child.sh");
+      expect(report.installs).toBe(1);
+    });
+
+    it(`does not start a body for quoted text (followed file: ${asScript})`, () => {
+      const report = check('echo "<<X"\nbash scripts/child.sh');
+      expect(report.followed).toContain("scripts/child.sh");
+      expect(report.installs).toBe(1);
+    });
+
+    it.each([
+      [": <<EOF-UNKNOWN\npayload\nEOF-UNKNOWN", "standalone"],
+      [": <<EOF \\\n argument\npayload\nEOF", "header continuation"],
+      [': <<EOF "\nargument"\npayload\nEOF', "unclassified here-document header"],
+      [': "\nargument" <<EOF\npayload\nEOF', "header in a continued quote"],
+      [": <<EOF\npayload", "missing delimiter"],
+    ])(`refuses unclassified boundaries (followed file: ${asScript}): %s`, (text, reason) => {
+      expect(() => check(text)).toThrow(reason);
+      if (asScript) expect(() => check(text)).toThrow("job build step 1: script scripts/outer.sh");
+    });
+  }
+
+  it("checks the quoted lookalike with real bash", () => {
+    const result = spawnSync("bash", ["-c", `: <<'EOF' "<<PHANTOM"\npayload\nEOF\nprintf after`], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("after");
+    expect(result.stderr).toBe("");
+  });
+});
+
 describe("the workflow guard checks physical lines containing npm", () => {
   const WORKFLOW = "workflow-a";
   it.each(["npm c\\i", "'npm' ci", '"npm" ci'])(
@@ -1730,7 +1790,6 @@ describe("the workflow guard refuses command-position time, coproc, function, in
 
     it.each([
       ["cat <<<x", "n$'p\\155' ci"],
-      ['echo "<<x"', "np? ci"],
       ["y=$((a<<b))", "np? ci"],
       ["x=$[1<<b]", "n$'p\\155' ci"],
       ["x=${a:-<<b}", "np? ci"],
@@ -1769,6 +1828,12 @@ describe("the workflow guard refuses command-position time, coproc, function, in
 
     it(`keeps an escaped backslash before an unquoted delimiter through ${entryPoint}`, () => {
       expect(() => check(": <<EOF\ndata\\\\\nEOF\nnp? ci")).toThrow("a command word with a glob character: np? ci (physical line 4)");
+    }, 5_000);
+
+    it(`ignores quoted delimiter lookalikes through ${entryPoint}`, () => {
+      expect(check(`: <<'EOF' "<<PHANTOM"\npayload\nEOF\necho ok`)).toBe(0);
+      expect(() => check(`: <<'EOF' "<<PHANTOM"\npayload\nEOF\nnp? ci`)).toThrow("a command word with a glob character");
+      expect(check('echo "<<X"\necho ok')).toBe(0);
     }, 5_000);
 
     it(`queues delimiters in source order through ${entryPoint}`, () => {

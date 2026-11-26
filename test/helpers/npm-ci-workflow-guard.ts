@@ -409,7 +409,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
   if (!approved) {
-    for (const entry of logicalShellLines(run, refuse)) {
+    for (const entry of logicalShellLines(run, refuse, true)) {
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
         for (const token of clause.tokens) {
@@ -616,6 +616,8 @@ export const UNRESOLVED_INVOCATION_ALLOWLIST: readonly UnresolvedInvocationAllow
   { script: "scripts/test-tps-office-supervisor.sh", line: 158, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 166, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 173, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
+  { script: "scripts/test-tps-office-supervisor.sh", line: 1089, token: "-c", target: "scripts/test-tps-office-supervisor.sh", assignment: 'ps_as_agent() { su -s /bin/bash "agent-probe" -c "exec \'$real_nono\' ps --json"; }', reason: "reads the agent's nono session registry; no npm install" },
+  { script: "scripts/test-tps-office-supervisor.sh", line: 1160, token: '"$bare_sup"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -E 's|--profile \\\\?\"\\$NONO_PROFILE\\\\?\"|--profile tps-office|g' \"$sup\" >\"$bare_sup\"", reason: "runs the supervisor copy with its profile argument rewritten" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 197, token: '"$secret_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '/^SECRETS_DIR=/,/^validate_control_values$/p' \"$sup\" | sed \"s|^SECRETS_DIR=.*|SECRETS_DIR=\\\"$secret_fixture/secrets\\\"|\"", reason: "generated supervisor slice written by this test's group from $sup (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 251, token: '"$shutdown_fixture/run.sh"', target: "scripts/test-tps-office-supervisor.sh", assignment: "cat >\"$shutdown_fixture/run.sh\" <<'RUN'", reason: "$shutdown_fixture/run.sh is the generated supervisor fixture written by this script (no npm install)" },
   { script: "docker/tps-office-supervisor.sh", line: 351, token: "-c", target: "docker/tps-office-supervisor.sh", assignment: 'su -s /bin/bash "$user" -c "echo probe > \'$probe_file\'" >/dev/null 2>&1', reason: "inline landlock probe run as another user; no npm install" },
@@ -745,7 +747,7 @@ function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] =
 }
 
 type Invocation = { rel: string } | { dynamic: string; cwdUnknown?: true; missing?: true };
-type ShellToken = { text: string; quoted: boolean; hereDocument?: number };
+type ShellToken = { text: string; quoted: boolean; hereDocument?: number; literalHereDocuments?: number[] };
 type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?: boolean; tail?: string };
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
@@ -770,6 +772,11 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
       index = end === -1 ? line.length : end;
       continue;
     }
+    if (hereDocuments && line.startsWith("<<<", index)) {
+      tokens.push({ text: "<<<", quoted: false });
+      index += 3;
+      continue;
+    }
     if (hereDocuments && line.startsWith("<<", index)) {
       const operator = line.startsWith("<<-", index) ? "<<-" : "<<";
       tokens.push({ text: operator, quoted: false, hereDocument: index });
@@ -783,6 +790,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
     }
     let text = "";
     let quoted = false;
+    const literalHereDocuments: number[] = [];
     while (index < line.length) {
       const next = line[index];
       if (hereDocuments && line.startsWith("<<", index)) break;
@@ -810,7 +818,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
             continue;
           }
           if (hereDocuments && quote === '"' && inner === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
-            const end = expansionEnd(line, index + 1);
+            const end = expansionEnd(line, index + 1, literalHereDocuments);
             text += line.slice(index, end);
             index = end;
             continue;
@@ -829,6 +837,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
             if (index < line.length) text += line[index++];
             continue;
           }
+          if (hereDocuments && line.startsWith("<<", index)) literalHereDocuments.push(index);
           text += inner;
           index++;
           if (inner === quote) break;
@@ -849,6 +858,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
             if (index < line.length) text += line[index++];
             continue;
           }
+          if (hereDocuments && line.startsWith("<<", index)) literalHereDocuments.push(index);
           text += inner;
           index++;
           if (inner === "'") break;
@@ -856,7 +866,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
         continue;
       }
       if (hereDocuments && next === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
-        const end = expansionEnd(line, index + 1);
+        const end = expansionEnd(line, index + 1, literalHereDocuments);
         text += line.slice(index, end);
         index = end;
         continue;
@@ -905,20 +915,20 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
       text += next;
       index++;
     }
-    tokens.push({ text, quoted });
+    tokens.push({ text, quoted, ...(hereDocuments ? { literalHereDocuments } : {}) });
   }
   return tokens;
 }
 
 /** Keep expansion contents opaque when recognizing top-level redirections. */
-function expansionEnd(line: string, open: number): number {
+function expansionEnd(line: string, open: number, literalHereDocuments?: number[]): number {
   const close = ({ "(": ")", "{": "}", "[": "]" } as Record<string, string>)[line[open]];
   let quote = "";
   for (let index = open + 1; index < line.length; index++) {
     const char = line[index];
     if (char === "\\" && quote !== "'") { index++; continue; }
     if (quote === '"' && char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
-      index = expansionEnd(line, index + 1) - 1;
+      index = expansionEnd(line, index + 1, literalHereDocuments) - 1;
       continue;
     }
     if (quote === '"' && char === "`") {
@@ -926,16 +936,17 @@ function expansionEnd(line: string, open: number): number {
       continue;
     }
     if (quote !== "") {
+      if (quote !== "`" && line.startsWith("<<", index)) literalHereDocuments?.push(index);
       if (char === (quote === "ansi" ? "'" : quote)) quote = "";
       continue;
     }
     if (char === "$" && line[index + 1] === "'") { quote = "ansi"; index++; continue; }
     if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
     if (char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
-      index = expansionEnd(line, index + 1) - 1;
+      index = expansionEnd(line, index + 1, literalHereDocuments) - 1;
       continue;
     }
-    if (close !== "}" && char === line[open]) { index = expansionEnd(line, index) - 1; continue; }
+    if (close !== "}" && char === line[open]) { index = expansionEnd(line, index, literalHereDocuments) - 1; continue; }
     if (char === close) return index + 1;
   }
   return line.length;
@@ -965,9 +976,13 @@ type HereDocument = { delimiter: string; quoted: boolean; stripTabs: boolean; li
 type HereDocumentState = { pending: HereDocument[]; continued: string };
 
 function hereDocumentHeaders(line: string, number: number): HereDocument[] {
-  return [...line.matchAll(/<<(-)?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/g)].map((match) => ({
-    delimiter: match[3], quoted: match[2] !== "", stripTabs: match[1] === "-", line: number,
-  }));
+  return shellTokens(line, true, true).flatMap((token) => {
+    if (token.hereDocument === undefined) return [];
+    const match = line.slice(token.hereDocument).match(/^<<(-)?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?=[ \t\n]|[;&|<>]|$)/);
+    return match === null ? [] : [{
+      delimiter: match[3], quoted: match[2] !== "", stripTabs: match[1] === "-", line: number,
+    }];
+  });
 }
 
 /** Both scanners must agree on where command scanning resumes. */
@@ -1034,7 +1049,9 @@ function quoteStartMask(raw: string[]): boolean[] {
  * lines. Bodies are kept for the install classifier (a heredoc fed to a shell
  * runs its text); command scanning ignores body lines.
  */
-function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, reason: string) => never): LogicalLine[] {
+function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, reason: string) => never) | null = (entry, reason) => {
+  throw new Error(`${reason}: ${entry.text} (physical line ${entry.line})`);
+}, strictRunBlock = false): LogicalLine[] {
   const raw = text.split("\n");
   const mask = quoteStartMask(raw);
   const lines: LogicalLine[] = [];
@@ -1057,17 +1074,18 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
       continue;
     }
     const physicalStart = headerPrefix.length;
-    headerPrefix += physical + "\n";
+    headerPrefix += (mask[index] ? physical : stripWordBoundaryComment(physical)) + "\n";
     let headerCount = 0;
-    if (refuseHeader !== undefined && headerPrefix.includes("<<")) {
+    if (refuseHeader !== null && physical.includes("<<")) {
       const operators = shellTokens(headerPrefix, true, true);
+      const literal = new Set(operators.flatMap((token) => token.literalHereDocuments ?? []));
       const accepted = new Set<number>();
       let simple = true;
       let depth = 0;
       for (const token of operators) {
         if (!token.quoted && /^[({]$/.test(token.text)) depth++;
         else if (!token.quoted && /^[)}]$/.test(token.text)) depth--;
-        if (!token.quoted && /^[;&|\n]$/.test(token.text)) simple = depth === 0;
+        if (!token.quoted && /^[;&|\n]$/.test(token.text)) simple = !strictRunBlock || depth === 0;
         else if (!token.quoted && (/^[(){}]$/.test(token.text) || SHELL_HEADERS.has(token.text) || SHELL_KEYWORDS.has(token.text))) simple = false;
         if (simple && token.hereDocument !== undefined &&
             headerPrefix[token.hereDocument - 1] !== "<" && headerPrefix[token.hereDocument + 2] !== "<") {
@@ -1075,14 +1093,15 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
         }
       }
       for (let at = headerPrefix.indexOf("<<", physicalStart); at !== -1; at = headerPrefix.indexOf("<<", at + 1)) {
+        if (literal.has(at) || (!strictRunBlock && (headerPrefix[at - 1] === "<" || headerPrefix[at + 2] === "<"))) continue;
         if (!accepted.has(at) || !/^<<-?[ \t]*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?=[ \t\n]|[;&|<>]|$)/.test(headerPrefix.slice(at))) {
-          refuseHeader({ text: physical.trim(), line: index + 1 }, "an unapproved run block has << outside a standalone top-level simple-command here-document redirection");
+          refuseHeader({ text: physical.trim(), line: index + 1 }, strictRunBlock ? "an unapproved run block has << outside a standalone top-level simple-command here-document redirection" : "an unclassified here-document header outside a standalone simple-command redirection");
         }
         headerCount++;
       }
     }
     if (mask[index]) {
-      if (refuseHeader !== undefined && headerCount > 0) {
+      if (refuseHeader !== null && headerCount > 0) {
         refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header in a continued quote");
       }
       buffer = "";
@@ -1091,11 +1110,11 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
     const line = stripWordBoundaryComment(physical);
     if (buffer === "") start = index + 1;
     const heredocs = hereDocumentHeaders(line, index + 1);
-    if (refuseHeader !== undefined && (headerCount !== heredocs.length ||
+    if (refuseHeader !== null && (headerCount !== heredocs.length ||
         (headerCount > 0 && hasUnbalancedLineQuotes([{ text: line, line: index + 1 }])))) {
       refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header");
     }
-    if (refuseHeader !== undefined && heredocs.length > 0 && (buffer !== "" || /\\$/.test(line))) {
+    if (refuseHeader !== null && heredocs.length > 0 && (buffer !== "" || /\\$/.test(line))) {
       refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header continuation");
     }
     if (/\\$/.test(line)) {
@@ -1110,7 +1129,7 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
     documents.pending.push(...heredocs);
   }
   const unclosed = documents.pending[0];
-  if (refuseHeader !== undefined && unclosed !== undefined) {
+  if (refuseHeader !== null && unclosed !== undefined) {
     refuseHeader({ text: raw[unclosed.line - 1].trim(), line: unclosed.line }, "an unclassified here-document body boundary (missing delimiter)");
   }
   flush();
@@ -1654,6 +1673,7 @@ type ShellState = ShellOrigin & {
   staged: boolean;
   /** Physical line reported for every invocation inside a command substitution. */
   lineOverride?: number;
+  reviewedHeaders?: boolean;
   /** Command-substitution nesting depth. */
   depth: number;
 };
@@ -1841,7 +1861,11 @@ function clauseInvocations(
  */
 function scanShellText(ctx: TreeContext, initial: ShellState, text: string): void {
   const state: ShellState = { ...initial };
-  for (const entry of logicalShellLines(text)) {
+  const reviewed = state.reviewedHeaders || (state.source === "run-block" && EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === text.replace(/\n+$/, "")));
+  const refuseHeader = (entry: PhysicalLine, reason: string): never => {
+    throw new Error(`${lineAt(state, state.lineOverride ?? entry.line)}: ${reason}: ${entry.text} (physical line ${entry.line})`);
+  };
+  for (const entry of logicalShellLines(text, reviewed ? null : refuseHeader, state.source === "run-block")) {
     const number = state.lineOverride ?? entry.line;
     if (entry.body) {
       if (state.classifyInstalls && !state.rule1Exempt && isInstallLine(entry.text)) {
@@ -1978,7 +2002,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       }
     }
     for (const body of substitutions.bodies) {
-      scanShellText(ctx, { ...state, depth: state.depth + 1, classifyInstalls: false, lineOverride: number }, body);
+      scanShellText(ctx, { ...state, depth: state.depth + 1, classifyInstalls: false, lineOverride: number, reviewedHeaders: reviewed }, body);
     }
   }
 }
@@ -2285,6 +2309,12 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
     scanNonShellScript(ctx, rel, content, origin);
     return;
   }
+  let bindings: Map<string, VariableBinding[]>;
+  try {
+    bindings = collectBindings(content);
+  } catch (error) {
+    throw new Error(`${origin.label}: script ${rel}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
   scanShellText(
     ctx,
     {
@@ -2294,7 +2324,7 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
       chain: [...origin.chain, rel],
       file: rel,
       scriptDir: rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "",
-      bindings: collectBindings(content),
+      bindings,
       source: "followed-script",
       classifyInstalls: true,
       rule1Exempt: rel === "scripts/npm-ci-tracked-lock.sh",

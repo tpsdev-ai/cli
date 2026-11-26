@@ -49,7 +49,7 @@ tracks `cd` through one resolution state, scans command substitutions (`$(...)`
 and backtick spans, each with its own `cd` and nested state; one left-to-right
 lexer carries quote state and span nesting together, so a substitution body
 whose own lexing ends inside a quote or an unclosed span on its own logical line
-is refused rather than skipped; a line that ends inside a quote at the end of a
+is refused rather than skipped; without a here-document header, a line that ends inside a quote at the end of a
 run block or script is not refused (bash fails it with a syntax error), and the
 passes that track quotes outside this lexer are a known limit (cli#975); a
 substitution that does not close on its logical line is not followed; a
@@ -66,7 +66,7 @@ in command position is refused (see above). Command substitutions in accepted he
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed. In unapproved run blocks, an unclassified here-document header, delimiter or body boundary refuses the step, naming the physical line. Modelled headers are single-line top-level simple-command `<<`/`<<-` redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
+a here-document passed to a shell is refused rather than executed. In unapproved run blocks and followed shell files, an unclassified here-document header (including a continuation or quote) or body boundary refuses scanning, naming the physical line. Only unquoted `<<`/`<<-` operator tokens start here-documents; quoted `<<` text does not queue a delimiter. Modelled headers are single-line simple-command redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order; run-block headers must be top-level. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
