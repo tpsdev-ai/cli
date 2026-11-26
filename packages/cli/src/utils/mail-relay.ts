@@ -121,9 +121,8 @@ export function withRelayPidLock<T>(action: string, fn: () => T): T {
   }
 }
 
-/** A relay start's record between its exclusive claim and the daemon's own
- *  write. It names the starting process, so `relay status` reports a start in
- *  progress and `relay stop` signals nothing. */
+/** A claim names the starter. While it is alive, `relay status` reports a
+ *  start in progress and `relay stop` signals nothing. */
 export function serializeRelayClaimRecord(pid: number, startToken: string | null): string {
   return `${JSON.stringify({ pid, startToken, relayClaim: true })}\n`;
 }
@@ -176,7 +175,7 @@ export function writeRelayPidRecordAtomically(path: string, text: string): void 
   }
 }
 
-/** The relay's own pid file, best effort at exit. */
+/** Try to remove the relay's matching record on SIGTERM or SIGINT. */
 function removeOwnPidFile(ownRecord: string): void {
   const path = relayPidPath();
   const ownBytes = Buffer.from(ownRecord, "utf-8");

@@ -42,7 +42,7 @@ export function setRelayStopRecordReader(fn: RelayStopRecordReader | null): Rela
   return previous;
 }
 
-/** The pid-file remover for `mail relay stop`; replaceable in tests so the
+/** The relay pid-file remover; replaceable in tests so the
  *  removal-failure branch can be exercised without a filesystem that refuses unlink. */
 type RelayPidRemoval = (path: string) => "removed" | "already gone";
 let removeRelayPidFile: RelayPidRemoval = removePidFile;
@@ -52,6 +52,10 @@ export function setRelayPidRemoval(fn: RelayPidRemoval): RelayPidRemoval {
   removeRelayPidFile = fn;
   return previous;
 }
+
+export const relayStartTestHooks: {
+  spawn?: typeof import("node:child_process").spawn;
+} = {};
 
 /** True when `kill(pid, 0)` was refused with an error pidState calls alive. */
 function relayProbeRefused(pid: number): boolean {
@@ -1079,7 +1083,8 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (relayAction === "start") {
         const path = relayPidPath();
         // Decide and claim under the record lock; the claim itself is an
-        // exclusive create, so a second start finds the first claim and refuses.
+        // exclusive create. A concurrent start finds the claim before publication,
+        // or the daemon record after it.
         const claimText = withRelayPidLock("start the relay", () => {
           for (let attempt = 0; attempt < 5; attempt++) {
             const { state, raw } = snapshotRelayPidRecord();
@@ -1127,19 +1132,24 @@ export async function runMail(args: MailArgs): Promise<void> {
           );
         });
         const claimBytes = Buffer.from(claimText, "utf-8");
-        const releaseClaim = (): void => {
+        const releaseClaim = (): boolean => {
           try {
-            const current = snapshotPidRecord(path);
-            if (pidRecordBytesEqual(current.raw, claimBytes)) removePidFile(path);
+            return withRelayPidLock("release the relay start claim", () => {
+              const current = snapshotPidRecord(path);
+              return pidRecordBytesEqual(current.raw, claimBytes) && removeRelayPidFile(path) === "removed";
+            });
           } catch {
-            /* failure path: the daemon owns the record or it is already gone */
+            return false;
           }
         };
+        const claimResult = (): string => releaseClaim()
+          ? `The claim at ${path} was released.`
+          : `The claim was not released; inspect ${path} and remove it if no relay start or daemon is running.`;
         // Spawn relay as detached background process
         const { spawn } = await import("node:child_process");
         let daemon: import("node:child_process").ChildProcess;
         try {
-          daemon = spawn(
+          daemon = (relayStartTestHooks.spawn ?? spawn)(
             process.execPath,
             [...process.execArgv, process.argv[1]!, "mail", "relay", "_run", mailDir],
             {
@@ -1149,17 +1159,16 @@ export async function runMail(args: MailArgs): Promise<void> {
             },
           );
         } catch (error) {
-          releaseClaim();
-          throw error;
+          throw new Error(`Failed to spawn the mail relay daemon: ${String(error)}. ${claimResult()}`);
         }
         daemon.unref();
         const daemonPid = daemon.pid;
         if (!daemonPid) {
-          releaseClaim();
-          throw new Error(`Failed to spawn the mail relay daemon; the claimed pid file ${path} was released.`);
+          daemon.on("error", () => {});
+          throw new Error(`Failed to spawn the mail relay daemon. ${claimResult()}`);
         }
-        // Hold the claim until the daemon writes its own record, so the record
-        // does not turn stale while the daemon starts.
+        // Keep the claim through startup and the child-exit wait, blocking
+        // concurrent starts while the starter is alive.
         const deadline = Date.now() + 5000;
         let started = snapshotRelayPidRecord().state;
         while (Date.now() < deadline) {
@@ -1172,14 +1181,33 @@ export async function runMail(args: MailArgs): Promise<void> {
           console.log(`Mail relay started: pid=${started.pid}`);
           break;
         }
-        try {
-          process.kill(daemonPid, "SIGTERM");
-        } catch {
-          /* already gone */
+        const exited = await new Promise<boolean>((resolve) => {
+          if (daemon.exitCode !== null || daemon.signalCode !== null) {
+            resolve(true);
+            return;
+          }
+          const onExit = (): void => {
+            clearTimeout(timer);
+            resolve(true);
+          };
+          const timer = setTimeout(() => {
+            daemon.off("exit", onExit);
+            resolve(false);
+          }, 5000);
+          daemon.once("exit", onExit);
+          try {
+            daemon.kill("SIGTERM");
+          } catch {
+            // Keep waiting for the child's exit event.
+          }
+        });
+        if (!exited) {
+          throw new Error(
+            `Mail relay child (pid ${daemonPid}) did not exit; claim kept at ${path}. Stop that child, then inspect and remove ${path} if no relay start or daemon is running.`,
+          );
         }
-        releaseClaim();
         throw new Error(
-          `Mail relay daemon (pid ${daemonPid}) did not write a verifiable pid record at ${path}; the start failed.`,
+          `Mail relay daemon (pid ${daemonPid}) did not write its pid record; the start failed. ${claimResult()}`,
         );
       }
 

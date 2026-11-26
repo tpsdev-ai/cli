@@ -1,19 +1,16 @@
-/**
- * cli#998 / cli#992 — the relay pid record across start, the daemon's write and
- * the daemon's exit. A start refuses a record it cannot parse, replaces a stale
- * one, and claims the path exclusively; the daemon writes atomically and removes
- * the record only while it still holds its own bytes.
- */
-import { spawnSync } from "node:child_process";
+/** cli#998 / cli#992 — relay start, publication and signal cleanup. */
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { pidState, processStartToken } from "@tpsdev-ai/agent";
+import { acquireMailLockSync, pidState, processStartToken, type MailLock } from "@tpsdev-ai/agent";
 import { readPidFile } from "../src/utils/pid-file.js";
-import { readRelayPidFile, relayWriteTestHooks, writeRelayPidRecordAtomically } from "../src/utils/mail-relay.js";
+import { readRelayPidFile, relayPidLockRoot } from "../src/utils/mail-relay.js";
+import { relayStartTestHooks, runMail, setRelayPidRemoval } from "../src/commands/mail.js";
 import { patchShared } from "./helpers/patch-shared.js";
 
+const RELAY_MODULE = resolve(import.meta.dir, "../src/utils/mail-relay.ts");
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
 const CASE_TIMEOUT_MS = 30_000;
 const CLI_TIMEOUT_MS = 20_000;
@@ -23,6 +20,20 @@ let home: string;
 let relayPid: string;
 let savedHome: string | undefined;
 const children: Bun.Subprocess[] = [];
+
+function holdRecordLock(): MailLock {
+  const lock = acquireMailLockSync(relayPidLockRoot(), { timeoutMs: 1000 });
+  if (!lock) throw new Error("could not hold record lock");
+  return lock;
+}
+
+function spawnScript(source: string): Bun.Subprocess {
+  const child = Bun.spawn([process.execPath, "--eval", source], {
+    env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "inherit"],
+  });
+  children.push(child);
+  return child;
+}
 
 function record(pid: number, token: string | null): string {
   return `${JSON.stringify({ pid, startToken: token })}\n`;
@@ -108,7 +119,7 @@ function stopRecordedRelay(): void {
   try {
     const state = readPidFile(relayPid);
     if (state.kind === "running" || state.kind === "unverified" || state.kind === "stale") {
-      killPid(state.pid);
+      if (state.pid !== process.pid) killPid(state.pid);
     }
   } catch {
     /* no record */
@@ -211,7 +222,7 @@ describe("relay start and the pid record", () => {
   );
 
   test(
-    "(d) a real daemon keeps a new record written after its stop signal",
+    "(d) a real daemon keeps a replacement written before SIGTERM",
     async () => {
       const daemon = Bun.spawn([process.execPath, TPS_BIN, "mail", "relay", "_run", join(home, ".tps", "mail")], {
         env: { ...process.env, HOME: home },
@@ -236,34 +247,161 @@ describe("relay start and the pid record", () => {
     CASE_TIMEOUT_MS,
   );
 
-  test(
-    "(e) the daemon's write uses a same-directory temporary and a rename",
-    () => {
-      const oldRecord = record(11111, "proc:1");
-      const newRecord = record(22222, "proc:2");
-      writeFileSync(relayPid, oldRecord);
-      let tempPath = "";
-      let duringWrite = "";
-      const restore = patchShared(relayWriteTestHooks, "afterTempWrite", (tmp, path) => {
-        tempPath = tmp;
-        expect(dirname(tmp)).toBe(dirname(path));
-        expect(tmp).not.toBe(path);
-        expect(readFileSync(tmp, "utf8")).toBe(newRecord);
-        duringWrite = readFileSync(path, "utf8");
-      });
-      try {
-        writeRelayPidRecordAtomically(relayPid, newRecord);
-      } finally {
-        restore();
-      }
+  test("(e) runRelayDaemon publishes the temporary inode over the old record", async () => {
+    const oldRecord = record(11111, "proc:1");
+    writeFileSync(relayPid, oldRecord);
+    const evidence = join(home, "publication.json");
+    const daemon = spawnScript(`
+      import { readFileSync, statSync, writeFileSync } from "node:fs";
+      import { dirname } from "node:path";
+      import { runRelayDaemon, relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
+      let observation = {};
+      relayWriteTestHooks.afterTempWrite = (tmp, path) => {
+        observation = { old: readFileSync(path, "utf8"), tmp: statSync(tmp).ino,
+          sameDirectory: dirname(tmp) === dirname(path), bytes: readFileSync(tmp, "utf8") };
+      };
+      const loop = runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
+      writeFileSync(${JSON.stringify(evidence)}, JSON.stringify({ ...observation,
+        published: statSync(${JSON.stringify(relayPid)}).ino,
+        record: readFileSync(${JSON.stringify(relayPid)}, "utf8") }));
+      process.kill(process.pid, "SIGTERM");
+      await loop;
+    `);
+    expect(await daemon.exited).toBe(0);
+    const observed = JSON.parse(readFileSync(evidence, "utf8"));
+    expect(observed.old).toBe(oldRecord);
+    expect(observed.sameDirectory).toBe(true);
+    expect(observed.tmp).toBeNumber();
+    expect(observed.published).toBe(observed.tmp);
+    expect(observed.record).toBe(observed.bytes);
+    expect(JSON.parse(observed.record).pid).toBe(daemon.pid);
+    expect(readdirSync(dirname(relayPid)).filter((name) => name.includes(".relay.pid.tmp."))).toEqual([]);
+  }, CASE_TIMEOUT_MS);
 
-      expect(tempPath).not.toBe("");
-      expect(duringWrite).toBe(oldRecord);
-      expect(readFileSync(relayPid, "utf8")).toBe(newRecord);
-      expect(readdirSync(dirname(relayPid)).filter((name) => name.includes(".relay.pid.tmp."))).toEqual([]);
-    },
-    CASE_TIMEOUT_MS,
-  );
+  test("start refuses while the real record lock is held", async () => {
+    const lock = holdRecordLock();
+    try {
+      const result = await runCliAsync(["mail", "relay", "start"]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing to start the relay.");
+      expect(existsSync(relayPid)).toBe(false);
+    } finally {
+      lock.release();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("daemon publication refuses while the real record lock is held", async () => {
+    const old = record(11111, "proc:1");
+    writeFileSync(relayPid, old);
+    const lock = holdRecordLock();
+    try {
+      const result = await runCliAsync(["mail", "relay", "_run", join(home, ".tps", "mail")]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("refusing to write the relay pid record.");
+      expect(readFileSync(relayPid, "utf8")).toBe(old);
+    } finally {
+      lock.release();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("daemon signal cleanup keeps its record while the real record lock is held", async () => {
+    const ready = join(home, "ready");
+    const daemon = spawnScript(`
+      import { writeFileSync } from "node:fs";
+      import { runRelayDaemon } from ${JSON.stringify(RELAY_MODULE)};
+      const loop = runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
+      writeFileSync(${JSON.stringify(ready)}, "ready");
+      await loop;
+    `);
+    await waitUntil(() => existsSync(ready), "the signal handlers");
+    const ownRecord = readFileSync(relayPid, "utf8");
+    const lock = holdRecordLock();
+    try {
+      process.kill(daemon.pid, "SIGTERM");
+      expect(await daemon.exited).toBe(0);
+      expect(readFileSync(relayPid, "utf8")).toBe(ownRecord);
+    } finally {
+      lock.release();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("failed claim unlink reports the retained claim and remedy", async () => {
+    const restoreSpawn = patchShared(relayStartTestHooks, "spawn", () => { throw new Error("injected spawn failure"); });
+    const previous = setRelayPidRemoval(() => { throw new Error("injected unlink failure"); });
+    try {
+      await expect(runMail({ action: "relay", agent: "start" })).rejects.toThrow(
+        `The claim was not released; inspect ${relayPid} and remove it if no relay start or daemon is running.`,
+      );
+      expect(JSON.parse(readFileSync(relayPid, "utf8")).relayClaim).toBe(true);
+    } finally {
+      setRelayPidRemoval(previous);
+      restoreSpawn();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("failed start releases its claim under the real record lock", async () => {
+    let lock: MailLock | undefined;
+    const restore = patchShared(relayStartTestHooks, "spawn", () => {
+      lock = holdRecordLock();
+      throw new Error("injected spawn failure");
+    });
+    try {
+      await expect(runMail({ action: "relay", agent: "start" })).rejects.toThrow("The claim was not released;");
+      expect(JSON.parse(readFileSync(relayPid, "utf8")).relayClaim).toBe(true);
+    } finally {
+      lock?.release();
+      restore();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("startup timeout waits for the delayed child to exit before releasing the claim", async () => {
+    const observed = join(home, "claim-before-exit");
+    let child: ReturnType<typeof spawn> | undefined;
+    const restore = patchShared(relayStartTestHooks, "spawn", () => {
+      child = spawn(process.execPath, ["--eval", `
+        import { existsSync, writeFileSync } from "node:fs";
+        process.on("SIGTERM", () => setTimeout(() => {
+          writeFileSync(${JSON.stringify(observed)}, String(existsSync(${JSON.stringify(relayPid)})));
+          process.exit(0);
+        }, 250));
+        setTimeout(async () => {
+          const { runRelayDaemon } = await import(${JSON.stringify(RELAY_MODULE)});
+          await runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
+        }, 6000);
+      `], { env: { ...process.env, HOME: home }, stdio: "ignore" });
+      return child;
+    });
+    try {
+      await expect(runMail({ action: "relay", agent: "start" })).rejects.toThrow(`The claim at ${relayPid} was released.`);
+      expect(child?.exitCode).toBe(0);
+      expect(pidState(child!.pid!)).toBe("gone");
+      expect(readFileSync(observed, "utf8")).toBe("true");
+      expect(existsSync(relayPid)).toBe(false);
+    } finally {
+      child?.kill("SIGKILL");
+      restore();
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("startup timeout keeps the claim when the child does not exit", async () => {
+    let child: ReturnType<typeof spawn> | undefined;
+    const restore = patchShared(relayStartTestHooks, "spawn", () => {
+      child = spawn(process.execPath, ["--eval", 'process.on("SIGTERM", () => {}); setInterval(() => {}, 1000);'],
+        { env: { ...process.env, HOME: home }, stdio: "ignore" });
+      return child;
+    });
+    try {
+      const error = await runMail({ action: "relay", agent: "start" }).then(() => null, (error: Error) => error);
+      expect(error?.message).toBe(
+        `Mail relay child (pid ${child!.pid}) did not exit; claim kept at ${relayPid}. Stop that child, then inspect and remove ${relayPid} if no relay start or daemon is running.`,
+      );
+      expect(pidState(child!.pid!)).toBe("alive");
+      expect(JSON.parse(readFileSync(relayPid, "utf8")).relayClaim).toBe(true);
+    } finally {
+      child?.kill("SIGKILL");
+      restore();
+    }
+  }, CASE_TIMEOUT_MS);
 
   test("relay status reports a live claim as a start in progress", () => {
     const starter = spawnSleep();
