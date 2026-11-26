@@ -6,7 +6,7 @@
  * stand-in watches an owner process instead and exits once that owner is gone.
  *
  * cli#1087 — the owner is an identity, not a pid: the kernel reuses pids, so
- * the watch compares the owner's start token, taken before the stand-in
+ * the watch compares the owner's start token, taken before the watch
  * starts. A pid that now names a different process, an owner that exited but
  * was not reaped (a zombie), and a probe that cannot verify the owner all
  * read as gone.

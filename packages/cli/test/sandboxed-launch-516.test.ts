@@ -2291,8 +2291,8 @@ exit 0
   // -------------------------------------------------------------------------
 
   /** A fake nono that never releases. It has no child to wait on, so it execs
-   *  the owner watch, which keeps it alive and exits 0 on a signal or once its
-   *  owner is gone. */
+   *  the owner watch, which keeps it alive and exits 0 on TERM, INT or HUP, or
+   *  once its owner is gone. */
   const HANGING_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -2310,7 +2310,7 @@ exit 0
   ].join("\n");
 
   /** A fake nono that releases the scripted peer, serves the session report and
-   *  exits when that child ends or a signal arrives. */
+   *  exits when that child ends or on TERM, INT or HUP. */
   const RELEASE_THEN_WAIT_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -2508,7 +2508,7 @@ exit 0
     }
   });
 
-  test("a supervisor whose test owner is killed exits within the bound", async () => {
+  test("a supervisor whose owner is killed exits within the bound", async () => {
     // Nested: the launcher between the test and the supervisor goes with the
     // test, and no signal reaches the supervisor. Its owner watch ends it.
     const f = launchFixture();

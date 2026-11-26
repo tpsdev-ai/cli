@@ -1,7 +1,8 @@
 /**
  * cli#1087 — the owner watch for a shell fixture that has no child of its own
  * to wait on. It keeps the fixture alive and exits once its owner is gone,
- * replaced or unverifiable; a signal exits 0, as the trap it replaces did.
+ * replaced or unverifiable; TERM, INT and HUP exit 0, as the trap it replaces
+ * did.
  * Reads TPS_STAND_IN_OWNER_PID and TPS_STAND_IN_OWNER_START.
  */
 import { STAND_IN_POLL_MS, standInOwnerFromEnv, standInOwnerLost } from "./stand-in.mjs";
