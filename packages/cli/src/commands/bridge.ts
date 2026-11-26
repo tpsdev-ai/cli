@@ -256,15 +256,15 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             // A stale re-read for the pid this stop verified is a completed
             // stop only when the process it verified — this pid with this start
             // token — is gone. The stale classification compares the re-read
-            // record's own token, which a rewrite can change. A record this run
-            // has already stopped, with the planned bytes still in place, is a
-            // duplicate of that stop and is removed. Otherwise the record is
-            // left in place, as relay leaves it: it may belong to a new bridge.
+            // record's own token, which a rewrite can change. A duplicate of
+            // this run's stop with the planned bytes is removed after a matching
+            // final read and successful unlink.
+            // Otherwise it is left in place: it may belong to a new bridge.
             if (stopped.get(state.pid) === state.startToken && pidRecordBytesEqual(decision.raw, planned.raw)) {
               removeVerifiedRecord(decision, {
                 removed: `Bridge (pid ${state.pid}) stopped; duplicate pid file ${fresh.path} removed.`,
                 alreadyGone: `Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} already gone.`,
-                kept: () => `Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`,
+                kept: (kept) => `Bridge (pid ${state.pid}) stopped; ${describeKeptRecord(fresh.path, kept)}`,
               });
             } else {
               console.log(`Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`);

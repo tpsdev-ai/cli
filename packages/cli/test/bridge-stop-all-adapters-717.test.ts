@@ -948,7 +948,57 @@ describe("bridge stop re-read exit status (cli#970)", () => {
   );
 
   test(
-    "an unchanged duplicate record is removed once the first record stops the process",
+    "the final read keeps and names a live replacement of a stale duplicate",
+    async () => {
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      const plannedBytes = record(child.pid, token);
+      writeFileSync(firstPath, plannedBytes);
+      writeFileSync(secondPath, plannedBytes);
+      const replacement = spawnSleep();
+      const replacementBytes = record(replacement.pid, tokenOf(replacement.pid));
+      const signals: number[] = [];
+      const lines: string[] = [];
+      let tookStaleSnapshot = false;
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        const snapshot = snapshotPidRecord(readPath);
+        if (readPath === secondPath) {
+          expect(snapshot.state.kind).toBe("stale");
+          expect(snapshot.raw).toEqual(Buffer.from(plannedBytes));
+          expect(processIsGone(child.pid, token)).toBe(true);
+          tookStaleSnapshot = true;
+          writeFileSync(secondPath, replacementBytes);
+        }
+        return snapshot;
+      });
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+        restore();
+      }
+
+      expect(tookStaleSnapshot).toBe(true);
+      expect(signals).toEqual([child.pid]);
+      expect(readFileSync(secondPath, "utf8")).toBe(replacementBytes);
+      expect(pidState(replacement.pid)).toBe("alive");
+      expect(lines).toContain(
+        `Bridge (pid ${child.pid}) stopped; pid file ${secondPath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a matching final read and successful unlink remove an unchanged duplicate after the first stop",
     async () => {
       const child = spawnSleep();
       const token = tokenOf(child.pid);
@@ -977,7 +1027,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
   );
 
   test(
-    "a duplicate record whose bytes changed after the plan is kept once the first record stops the process",
+    "a duplicate changed before the stale re-read is kept after the first stop",
     async () => {
       const child = spawnSleep();
       const token = tokenOf(child.pid);
@@ -1012,18 +1062,20 @@ describe("bridge stop re-read exit status (cli#970)", () => {
     "a stale record for a pid this run did not stop is left in place",
     async () => {
       const stoppedChild = spawnSleep();
-      const otherChild = spawnSleep();
-      const otherToken = tokenOf(otherChild.pid);
+      // Reaped by its own shell: killAndWaitGone blocks this process, so it
+      // cannot reap a direct child while it waits.
+      const otherPid = await spawnReapableChild();
+      const otherToken = tokenOf(otherPid);
       const alphaPath = join(runDir, "bridge-alpha.pid");
       const betaPath = join(runDir, "bridge-beta.pid");
       writeFileSync(alphaPath, record(stoppedChild.pid, tokenOf(stoppedChild.pid)));
-      writeFileSync(betaPath, record(otherChild.pid, otherToken));
+      writeFileSync(betaPath, record(otherPid, otherToken));
 
       const lines: string[] = [];
       const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
       const previous = setBridgeStopSignal((pid) => {
         process.kill(pid, "SIGKILL");
-        if (pid === stoppedChild.pid) killAndWaitGone(otherChild.pid, otherToken);
+        if (pid === stoppedChild.pid) killAndWaitGone(otherPid, otherToken);
       });
       try {
         await runBridge({ action: "stop" });
@@ -1033,9 +1085,9 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       }
 
       expect(pidState(stoppedChild.pid)).toBe("gone");
-      expect(pidState(otherChild.pid)).toBe("gone");
+      expect(pidState(otherPid)).toBe("gone");
       expect(existsSync(betaPath)).toBe(true);
-      expect(lines).toContain(`Bridge (pid ${otherChild.pid}) stopped; pid file ${betaPath} is stale.`);
+      expect(lines).toContain(`Bridge (pid ${otherPid}) stopped; pid file ${betaPath} is stale.`);
     },
     TIMEOUT,
   );
