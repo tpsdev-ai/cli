@@ -35,7 +35,7 @@ import { buildPlist, type MailWatcher, validateAgentId, watchMail, xmlEscape } f
 import { getInbox, promote, sendMessage, type MailMessage } from "../src/utils/mail.js";
 import {
   buildSignedEnvelope,
-  startStubFlair,
+  installStubFlairFetch,
   writeKeyFile,
   type StubFlair,
 } from "./helpers/stub-flair.js";
@@ -190,7 +190,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-verified-"));
     keysDir = join(tempRoot, "keys");
-    stub = startStubFlair(SEEDS);
+    stub = installStubFlairFetch(SEEDS);
     writeKeyFile(keysDir, AGENT, KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
 
@@ -296,12 +296,13 @@ describe("watchMail (verified-only, non-consuming)", () => {
    * chmod, which does not stop a root reader. `fault.injected` counts the
    * failures thrown.
    */
-  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string, code: "EACCES" | "ENOENT" = "EACCES") {
+  function failReadsOf(fn: "readFileSync" | "readdirSync", target: string, code: "EACCES" | "ENOENT" = "EACCES", observed = target) {
     const real = fs[fn] as (...a: unknown[]) => unknown;
     const syscall = fn === "readdirSync" ? "scandir" : "open";
     const text = code === "EACCES" ? "permission denied" : "no such file or directory";
-    const fault = { armed: true, injected: 0 };
+    const fault = { armed: true, injected: 0, attempts: 0 };
     const spy = spyOn(fs, fn).mockImplementation(((...a: unknown[]) => {
+      if (a[0] === observed) fault.attempts++;
       if (fault.armed && a[0] === target) {
         fault.injected++;
         throw Object.assign(new Error(`${code}: ${text}, ${syscall} '${target}'`), {
@@ -566,11 +567,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
 
     expect(received.filter((b) => b === "once only")).toHaveLength(1);
-    // One verification for the record, one for the barrier. The per-file guard is
-    // what holds the count down: with it removed, the re-events can re-verify
-    // the record. The bounds leave the exact debounce coalescing open.
-    expect(verifications).toBeGreaterThanOrEqual(2);
-    expect(verifications).toBeLessThan(8);
+    // The per-file guard prevents repeated verification of the resident record.
+    expect(verifications).toBe(2);
   }, 10_000);
 
   it("the envelope-id map persists across scans: a SECOND file carrying the SAME signed id is not presented again", async () => {
@@ -808,7 +806,9 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
       // The read works again: the copy verifies, and its id is still presented.
       injected.fault.armed = false;
+      const attempts = injected.fault.attempts;
       await presentBarrier("scan after the read recovers");
+      expect(injected.fault.attempts).toBeGreaterThan(attempts);
     } finally {
       watcher.stop();
       restore();
@@ -824,16 +824,20 @@ describe("watchMail (verified-only, non-consuming)", () => {
     const ready = readySignal();
     const events = capturedFsEvents();
     const log = captureErrors();
+    let failVerification = false;
     const watcher = watchMail({
       agent: AGENT,
       debounceMs: 20,
       pollMs: IDLE_POLL_MS,
       watchImpl: events.watchImpl,
       onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (failVerification) throw new Error("injected verification failure");
+      },
       onMessage: (msg) => { ids.push(msg.id); bodies.push(msg.body); },
     });
     let envId = "";
-    let savedUrl: string | undefined;
+    let restore = () => {};
     try {
       await ready.promise;
       const env = deliverSigned("same id, failing verification");
@@ -846,9 +850,13 @@ describe("watchMail (verified-only, non-consuming)", () => {
         () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
       );
 
-      // A leaves; B (the same signed id) is listed while Flair cannot be reached.
+      // A leaves; B (the same signed id) is listed during a verification error.
       const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
       writeRecord({ ...raw, id: "id-copy-b" });
+      const copyB = join(dirname(first), "id-copy-b.json");
+      const reads = failReadsOf("readFileSync", copyB);
+      reads.fault.armed = false;
+      restore = reads.restore;
       rmSync(first);
       // The barrier record is delivered now; the recovery scan presents it.
       const before = new Set(jsonFiles(getInbox(AGENT).fresh));
@@ -856,27 +864,27 @@ describe("watchMail (verified-only, non-consuming)", () => {
       const barrierName = jsonFiles(getInbox(AGENT).fresh).find((f) => !before.has(f));
       expect(barrierName).toBeDefined();
       const barrierPath = join(getInbox(AGENT).fresh, barrierName!);
-      savedUrl = process.env.FLAIR_URL;
-      process.env.FLAIR_URL = "http://127.0.0.1:1";
+      failVerification = true;
       events.fire(barrierPath);
       await waitFor(
-        () => log.lines.some((l) => l.includes("verification error")),
+        () => log.lines.some((l) => l.includes("id-copy-b: verification error")),
         SCAN_SETTLE_MS,
         () => `the scan did not log a verification error; log: ${JSON.stringify(log.lines)}`,
       );
 
-      // Flair is reachable again: the copy verifies, and its id is still presented.
-      process.env.FLAIR_URL = savedUrl;
+      // Verification recovers: the copy verifies, and its id is still presented.
+      failVerification = false;
+      const attempts = reads.fault.attempts;
       events.fire(barrierPath);
       await waitFor(
         () => bodies.includes("scan after verification recovers"),
         SCAN_SETTLE_MS,
         () => `the recovery scan did not present the barrier record; received: ${JSON.stringify(bodies)}`,
       );
+      expect(reads.fault.attempts).toBeGreaterThan(attempts);
     } finally {
       watcher.stop();
-      if (savedUrl === undefined) delete process.env.FLAIR_URL;
-      else process.env.FLAIR_URL = savedUrl;
+      restore();
       log.restore();
     }
 
@@ -913,24 +921,138 @@ describe("watchMail (verified-only, non-consuming)", () => {
       const copyB = join(dirname(first), "id-copy-b.json");
       const ledger = join(getInbox(AGENT).root, "consumed.jsonl");
       writeFileSync(ledger, "");
-      const injected = failReadsOf("readFileSync", ledger);
+      const injected = failReadsOf("readFileSync", ledger, "EACCES", copyB);
       restore = injected.restore;
       events.fire(copyB);
       await waitFor(
-        () => log.lines.some((l) => l.includes(`${envId} not presented`) && l.includes(`${ledger} is unreadable (EACCES)`)),
+        () => log.lines.some((l) => l.includes(`id-copy-b.json: ${envId} not presented`) && l.includes(`${ledger} is unreadable (EACCES)`)),
         SCAN_SETTLE_MS,
       );
       expect(injected.fault.injected).toBe(1);
 
       injected.fault.armed = false;
+      const attempts = injected.fault.attempts;
       deliverSigned("history recovery barrier");
       events.fire(copyB);
       await waitFor(() => bodies.includes("history recovery barrier"), SCAN_SETTLE_MS);
+      expect(injected.fault.attempts).toBeGreaterThan(attempts);
       expect(ids.filter((id) => id === envId)).toHaveLength(1);
     } finally {
       watcher.stop();
       restore();
       log.restore();
+    }
+  }, 10_000);
+
+  it("trims absent filename associations while an unresolved file holds presented ids", async () => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    let restore = () => {};
+    try {
+      await ready.promise;
+      const original = deliverSigned("original association");
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(() => ids.includes(original.messageId), SCAN_SETTLE_MS);
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      rmSync(first);
+      const unresolved = join(dirname(first), "unresolved.json");
+      writeRecord({ id: "unresolved" });
+      const injected = failReadsOf("readFileSync", unresolved);
+      restore = injected.restore;
+      events.fire(unresolved);
+      await waitFor(() => injected.fault.injected === 1, SCAN_SETTLE_MS);
+
+      const replacement = deliverSigned("current association");
+      const replacementPath = jsonFiles(dirname(first)).find((f) => f !== "unresolved.json")!;
+      renameSync(join(dirname(first), replacementPath), first);
+      events.fire(first);
+      await waitFor(() => ids.includes(replacement.messageId), SCAN_SETTLE_MS);
+      for (let attempt = injected.fault.injected + 1; attempt <= 10; attempt++) {
+        events.fire(unresolved);
+        await waitFor(() => injected.fault.injected === attempt, SCAN_SETTLE_MS);
+      }
+
+      writeRecord({ ...raw, id: "returned-copy" });
+      const returned = join(dirname(first), "returned-copy.json");
+      events.fire(returned);
+      const barrier = deliverSigned("association trim barrier");
+      events.fire(first);
+      await waitFor(() => ids.includes(barrier.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.messageId)).toHaveLength(2);
+    } finally {
+      watcher.stop();
+      restore();
+      log.restore();
+    }
+  }, 10_000);
+
+  it.each([false, true])("preserves a presented id across the trim boundary (listing failure: %s)", async (failListing) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    let restoreListing = () => {};
+    let hold = false;
+    let entered = false;
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (hold) { entered = true; await gate; }
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = deliverSigned("trim-boundary association");
+      const first = onlyNewFile();
+      events.fire(first);
+      await waitFor(() => ids.includes(original.messageId), SCAN_SETTLE_MS);
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      rmSync(first);
+      hold = true;
+      const barrier = deliverSigned("trim-boundary barrier");
+      events.fire(first);
+      await waitFor(() => entered, SCAN_SETTLE_MS);
+      writeRecord({ ...raw, id: "replacement-copy" });
+      const replacement = join(dirname(first), "replacement-copy.json");
+      const reads = failReadsOf("readFileSync", replacement);
+      reads.fault.armed = false;
+      events.fire(replacement);
+      await sleep(40);
+      const listing = failListing ? failReadsOf("readdirSync", dirname(first)) : undefined;
+      if (listing) restoreListing = listing.restore;
+      hold = false;
+      release();
+      if (listing) {
+        await waitFor(() => listing.fault.injected > 0, SCAN_SETTLE_MS);
+        listing.fault.armed = false;
+        events.fire(replacement);
+      }
+      await waitFor(() => reads.fault.attempts > 0 && ids.includes(barrier.messageId), SCAN_SETTLE_MS);
+      const settled = deliverSigned("replacement verification barrier");
+      events.fire(replacement);
+      await waitFor(() => ids.includes(settled.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.messageId)).toHaveLength(1);
+    } finally {
+      release();
+      watcher.stop();
+      restoreListing();
     }
   }, 10_000);
 
@@ -1007,6 +1129,12 @@ describe("watchMail (verified-only, non-consuming)", () => {
       await waitFor(() => polls - startPolls >= 3, 5000);
       expect(injected.fault.injected).toBe(10);
       expect(classified()).toBe(1);
+      expect(log.lines.some((l) => l.includes("file left in new/; this process will not retry it while it remains there. Restart mail-watch to retry it."))).toBe(true);
+
+      watcher.stop();
+      injected.fault.armed = false;
+      watcher = watchMail({ agent: AGENT, watchImpl: NO_FS_EVENTS, pollMs: IDLE_POLL_MS });
+      await waitFor(() => injected.fault.attempts > 10, SCAN_SETTLE_MS);
     } finally {
       watcher?.stop();
       restore();
@@ -1734,7 +1862,7 @@ describe("watchMail concurrency", () => {
   beforeEach(() => {
     tempRoot = mkdtempSync(join(tmpdir(), "mail-watch-conc-"));
     keysDir = join(tempRoot, "keys");
-    stub = startStubFlair(SEEDS);
+    stub = installStubFlairFetch(SEEDS);
     writeKeyFile(keysDir, AGENT, KERN_SEED);
     writeKeyFile(keysDir, "flint", FLINT_SEED);
     savedEnv = {};

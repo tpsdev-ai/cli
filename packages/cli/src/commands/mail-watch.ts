@@ -245,9 +245,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   /** Consecutive failed per-file read, verification or consumed-history attempts before classification. */
   const MAX_UNRESOLVED_ATTEMPTS = 10;
 
-  // Presented ids map to tracked, eligible verified files in `new/`.
+  // Empty filename sets retain presented ids while unresolved files hold them.
   const presented = new Map<string, Set<string>>();
-  // Unresolved reads, verification or consumed-history lookups hold trimming:
+  // Unresolved reads, verification or consumed-history lookups hold presented ids:
   // the file may carry a presented id. MAX_UNRESOLVED_ATTEMPTS consecutive
   // failed per-file attempts bound one file's hold before classification.
   const unresolvedAttempts = new Map<string, number>();
@@ -323,10 +323,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
       const present = new Set(files);
 
-      // Files whose read or verification stayed unresolved this scan. While this
-      // is non-empty, no presented id is dropped: such a file may carry an id
-      // that is still presented, and a failed read or verification is not
-      // evidence that the id left `new/`.
+      // Unresolved files still in `new/` hold presented ids: a failed read or
+      // verification is not evidence that the id left.
       const unresolvedFiles = new Set<string>();
       const noteUnresolved = (file: string) => {
         const attempts = (unresolvedAttempts.get(file) ?? 0) + 1;
@@ -337,7 +335,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         classified.set(file, "unresolved");
         console.error(
-          `[mail-watch] ${file}: not presented (${attempts} consecutive failed per-file attempts; classified)`,
+          `[mail-watch] ${file}: not presented (${attempts} consecutive failed per-file attempts; classified); ` +
+            "file left in new/; this process will not retry it while it remains there. Restart mail-watch to retry it.",
         );
         return false;
       };
@@ -412,7 +411,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         } catch (err) {
           if (!noteUnresolved(file)) continue;
           console.error(
-            `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
+            `[mail-watch] ${opts.agent}: ${file}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
               "the file is left untouched and is retried on the next scan if it remains in new/. " +
               "Remedy: make that path readable by this user.",
           );
@@ -429,7 +428,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         // Add tracked, eligible verified files before trimming so replacements
         // preserve the presented id.
         let filesWithId = presented.get(envId);
-        const alreadyPresented = (filesWithId?.size ?? 0) > 0;
+        const alreadyPresented = presented.has(envId);
         if (filesWithId === undefined) {
           filesWithId = new Set<string>();
           presented.set(envId, filesWithId);
@@ -438,19 +437,28 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         if (alreadyPresented) continue;
         pending.push(projectVerified(result.message));
       }
-      // Before classification, unresolved read, verification or consumed-history
-      // failures drop no id: the file may carry a presented id. Classification
-      // after MAX_UNRESOLVED_ATTEMPTS failed per-file attempts ends its hold.
-      // Failed listings return above and keep the state.
+      // Classification after MAX_UNRESOLVED_ATTEMPTS failed per-file attempts
+      // ends an unresolved file's hold.
       // Trim after tracking eligible verified replacements to preserve their id.
-      if (unresolvedFiles.size === 0) {
-        for (const [envId, filesWithId] of presented) {
-          for (const file of filesWithId) if (!present.has(file)) filesWithId.delete(file);
-          if (filesWithId.size === 0) presented.delete(envId);
-        }
+      // Recheck after awaited verification; unseen replacements need verification
+      // before their id can be released.
+      const atTrim = listNewFiles(inbox.fresh);
+      if (atTrim === null) {
+        console.error("[mail-watch] cannot list new/; keeping the current dedup state");
+        return;
       }
-      for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
-      for (const file of [...unresolvedAttempts.keys()]) if (!present.has(file)) unresolvedAttempts.delete(file);
+      if (atTrim.some((file) => !present.has(file))) {
+        rescan = true;
+        return;
+      }
+      const trimPresent = new Set(atTrim);
+      const held = atTrim.some((file) => unresolvedFiles.has(file));
+      for (const [envId, filesWithId] of presented) {
+        for (const file of filesWithId) if (!trimPresent.has(file)) filesWithId.delete(file);
+        if (filesWithId.size === 0 && !held) presented.delete(envId);
+      }
+      for (const file of [...classified.keys()]) if (!trimPresent.has(file)) classified.delete(file);
+      for (const file of [...unresolvedAttempts.keys()]) if (!trimPresent.has(file)) unresolvedAttempts.delete(file);
     } finally {
       checking = false;
       fireReady();
