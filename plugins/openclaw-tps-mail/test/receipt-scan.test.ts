@@ -2,8 +2,8 @@
  * receipt-scan.test.ts — cli#398 round 2, item 3, extended for cli#389 round 3
  * and cli#429.
  *
- * THREE receipt forms and ONE rule: the receipt must name THIS obligation AND the
- * inbound it answers — and (cli#429) the reply it carries must be a VERIFIED
+ * A receipt binds to this obligation through its obligation ID or the verified
+ * signed inbound thread — and (cli#429) the reply it carries must be a VERIFIED
  * signed reply by the obligated agent for this thread. Every field either form
  * is checked on is pinned here, so the docblock cannot drift from the code
  * again.
@@ -579,10 +579,10 @@ describe("receipt scan — cli#429 signed thread mode (real signatures)", () => 
   });
 });
 
-// ── cli#1063: a NACK marker is never settlement evidence ────────────────────
+// ── cli#1063: a posted mail record with a NACK marker never settles ────────────────────
 
-describe("receipt scan — cli#1063 a NACK record never settles", () => {
-  it("a validly signed record with the matching obligation marker AND a nack marker does not settle", async () => {
+describe("receipt scan — cli#1063 a posted mail record with a NACK marker never settles", () => {
+  it("a validly signed posted mail record with the matching obligation marker AND a nack marker does not settle", async () => {
     const record = reply({ body: replyJson({ replyToId: THREAD }), replyToId: THREAD });
     writeReply(record);
     expect(await posted(THREAD, { threadMode: "signed" }), "without the nack this record is evidence").toBe("found");
@@ -670,7 +670,7 @@ describe("receipt scan — cli#1063 unmarked threaded reply (office local delive
     expect(await unmarked()).toBe("absent");
   });
 
-  it("carries a NACK marker → NOT found (a nack never settles the obligation)", async () => {
+  it("carries a NACK marker → NOT found (a posted NACK mail record never settles the obligation)", async () => {
     writeReply(cliReply({ headers: { "X-TPS-Nack": "yielded-without-resumption" } }));
     expect(await unmarked()).toBe("absent");
   });

@@ -242,7 +242,7 @@ function configuredMailDirValue(cfg: any, accountId: string): string | null {
   const accounts = cfg?.channels?.[CHANNEL_ID]?.accounts ?? {};
   const account = accounts[accountId] ?? accounts.default ?? {};
   const value = account?.mailDir;
-  return typeof value === "string" && value.length > 0 ? value : null;
+  return typeof value === "string" ? value : null;
 }
 
 /** The account's config `mailDir`, expanded, when the config SETS one (never the default). */

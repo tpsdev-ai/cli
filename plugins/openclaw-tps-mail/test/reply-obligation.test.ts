@@ -742,6 +742,15 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(capturedPlugin.config.resolveAccount(absolute, "default").mailDir).toBe(tempMailDir);
   }, 15000);
 
+  it("cli#1063: an empty configured mailDir is refused at config load", () => {
+    const empty = { channels: { "tps-mail": { accounts: { default: { mailDir: "" } } } } };
+    expect(() => capturedPlugin.config.resolveAccount(empty, "default")).toThrow(
+      /mailDir "" is not absolute; use an absolute path or a "~\/" path/,
+    );
+    const absent = { channels: { "tps-mail": { accounts: { default: {} } } } };
+    expect(capturedPlugin.config.resolveAccount(absent, "default").mailDir).toBe(resolve(homedir(), ".tps", "mail"));
+  }, 15000);
+
   /**
    * A reply run as the prompt prints it (`tps mail send <to> --reply-to=<inbound
    * envelope id>`, with the account's mailDir) writes on the OFFICE local route:

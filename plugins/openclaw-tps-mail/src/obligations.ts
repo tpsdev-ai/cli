@@ -1187,8 +1187,8 @@ export interface ReceiptScanOptions {
 }
 
 /**
- * THREE receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
- * it answers, and — when the obligation record knows it — the reply itself;
+ * A receipt binds to this obligation through its obligation ID or the verified
+ * signed inbound thread. It names the reply when the obligation record knows it;
  * and (cli#429) the reply it carries must be a VERIFIED signed reply by the
  * obligated agent, to `recipient` (the inbound's verified sender), for this
  * thread (isVerifiedReceiptReply). Every form below is held to that last rule;
