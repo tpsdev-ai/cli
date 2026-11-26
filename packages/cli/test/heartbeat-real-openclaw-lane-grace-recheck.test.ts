@@ -1,8 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 import { waitForGatewayExit } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
+import { spawnStandIn } from "../../../test/helpers/stand-in.mjs";
 
 const LANE = fileURLToPath(new URL("../../../scripts/heartbeat-real-openclaw-lane.mjs", import.meta.url));
 const GRACE_RECHECK_FIXTURE = fileURLToPath(
@@ -56,9 +57,7 @@ describe("the live case reports a failed heartbeat after the gateway exit", () =
 
 describe("waitForGatewayExit bounds a gateway that stays up", () => {
   test("a live child that does not exit within the window resolves false and removes its exit listener", async () => {
-    const child = spawn(process.env.NODE_BIN ?? "node", ["-e", "setInterval(() => {}, 1000)"], {
-      stdio: "ignore",
-    });
+    const child = spawnStandIn({ command: process.env.NODE_BIN ?? "node" });
     try {
       await once(child, "spawn");
       const listenersBefore = child.listenerCount("exit");

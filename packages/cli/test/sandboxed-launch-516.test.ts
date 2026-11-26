@@ -23,6 +23,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { pidState } from "@tpsdev-ai/agent";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
+import { standInTail } from "../../../test/helpers/stand-in.mjs";
 import {
   NONO_MIN_VERSION,
   REFUSAL_EXIT_CODE,
@@ -2683,7 +2684,7 @@ function attempt() {
       writeFileSync(process.env.PEER_PID_FILE, String(process.pid));
       if (process.env.PEER_EXIT === "1") return setTimeout(() => process.exit(0), 30);
       process.on("SIGTERM", () => { appendFileSync(process.env.PEER_LOG, "TERM\\n"); process.exit(0); });
-      setInterval(() => {}, 1000);
+      ${standInTail(process.pid)}
     }
   });
 }
@@ -3491,7 +3492,7 @@ sock.on("connect", () => {
 sock.on("data", (chunk) => {
   if (String(chunk).includes("CONFINED")) writeFileSync(process.env.PEER_PID_FILE, String(process.pid));
 });
-setInterval(() => {}, 1000);
+${standInTail(process.pid)}
 `;
 
   async function waitUntil(check: () => boolean, timeoutMs: number): Promise<boolean> {
