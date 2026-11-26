@@ -254,9 +254,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // Files already classified this residence, keyed on the filename, with the
   // verdict ("presented", "corrupt", "refused:*", "already-consumed" or
   // "unresolved"), so a later pass does not re-verify or re-log a file still
-  // sitting in `new/`. Like `presented`, an entry is trimmed only when a scan
-  // finds the file gone (the same trim loop below). Pinned by the ONCE counter
-  // case.
+  // sitting in `new/`. The opening listing ends an absent filename's residence
+  // before verification yields.
   const classified = new Map<string, string>();
 
   // Verified records waiting for a free slot. The concurrency cap must hold
@@ -322,6 +321,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         return;
       }
       const present = new Set(files);
+      for (const file of classified.keys()) if (!present.has(file)) classified.delete(file);
+      for (const file of unresolvedAttempts.keys()) if (!present.has(file)) unresolvedAttempts.delete(file);
 
       // Unresolved files still in `new/` hold presented ids: a failed read or
       // verification is not evidence that the id left.
@@ -457,8 +458,6 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         for (const file of filesWithId) if (!trimPresent.has(file)) filesWithId.delete(file);
         if (filesWithId.size === 0 && !held) presented.delete(envId);
       }
-      for (const file of [...classified.keys()]) if (!trimPresent.has(file)) classified.delete(file);
-      for (const file of [...unresolvedAttempts.keys()]) if (!trimPresent.has(file)) unresolvedAttempts.delete(file);
     } finally {
       checking = false;
       fireReady();

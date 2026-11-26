@@ -1056,6 +1056,69 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
+  it.each(["presented", "unresolved"])("resets absent filename residence before verification (%s)", async (state) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const first = join(getInbox(AGENT).fresh, "a.json");
+    const reads = failReadsOf("readFileSync", first);
+    reads.fault.armed = state === "unresolved";
+    let hold = false;
+    let entered = false;
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (hold) { entered = true; await gate; }
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = deliverSigned("previous residence");
+      renameSync(onlyNewFile(), first);
+      if (state === "presented") {
+        events.fire(first);
+        await waitFor(() => ids.includes(original.messageId), SCAN_SETTLE_MS);
+      } else {
+        for (let attempt = 1; attempt <= 9; attempt++) {
+          events.fire(first);
+          await waitFor(() => reads.fault.injected === attempt, SCAN_SETTLE_MS);
+        }
+      }
+      rmSync(first);
+      hold = true;
+      const barrier = deliverSigned("residence barrier");
+      events.fire(first);
+      await waitFor(() => entered, SCAN_SETTLE_MS);
+      const replacement = buildSignedEnvelope("flint", AGENT, "current residence", SEEDS);
+      const record = sendMessage(AGENT, JSON.stringify(replacement), "flint");
+      renameSync(record.filePath, first);
+      hold = false;
+      release();
+      await waitFor(() => ids.includes(barrier.messageId), SCAN_SETTLE_MS);
+      if (state === "unresolved") {
+        await waitFor(() => reads.fault.injected === 10, SCAN_SETTLE_MS);
+        reads.fault.armed = false;
+        events.fire(first);
+      }
+      await waitFor(() => ids.includes(replacement.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === replacement.messageId)).toHaveLength(1);
+      expect(log.lines.some((line) => line.includes("a.json: not presented (10 consecutive"))).toBe(false);
+    } finally {
+      watcher.stop();
+      release();
+      reads.restore();
+      log.restore();
+    }
+  }, 10_000);
+
   it("classification after ten consecutive failed per-file attempts releases the old id's hold", async () => {
     const ids: string[] = [];
     const ready = readySignal();
