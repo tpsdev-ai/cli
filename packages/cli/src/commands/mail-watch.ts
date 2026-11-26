@@ -29,7 +29,7 @@
 
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { execSync, spawn } from "node:child_process";
-import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -121,15 +121,31 @@ export function validateAgentId(agentId: string): void {
 // `verifyRecordForMailbox` — the same policy `promote()` applies — so an
 // unverified record is never handed on.
 
+type NewFile = { file: string; identity: string; fileKey: string };
+
+function fileIdentity(path: string, file: string): string {
+  const stat = statSync(path);
+  return `${file}:${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+}
+
 /**
- * Filenames (`*.json`) directly under `dir`; `[]` when `dir` is absent, and
+ * File identities (`*.json`) directly under `dir`; `[]` when `dir` is absent, and
  * `null` when the LISTING FAILS (a read error). The two are distinct: an absent
  * or empty `new/` means no files, but a failed listing must not be read as
  * "every file left" (see processNew).
  */
-function listNewFiles(dir: string): string[] | null {
+function listNewFiles(dir: string): NewFile[] | null {
   try {
-    return readdirSync(dir).filter(isMailboxMessageFile);
+    const files: NewFile[] = [];
+    for (const file of readdirSync(dir).filter(isMailboxMessageFile)) {
+      try {
+        const identity = fileIdentity(join(dir, file), file);
+        files.push({ file, identity, fileKey: identity.split(":").slice(0, -2).join(":") });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+      }
+    }
+    return files;
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
   }
@@ -242,15 +258,18 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
 
   const inbox = getInbox(opts.agent);
 
-  // Presented records, keyed on the VERIFIED envelope id → the `new/` filename it
-  // came from. Within ONE watcher instance an entry is dropped only when a scan
-  // observes that file absent from `new/` (the trim loop in `processNew`, below);
-  // while the file stays, it is presented once. Nothing else removes an entry.
-  const presented = new Map<string, string>();
-  // Files already classified this residence (presented, or skipped as
-  // unverifiable), keyed on the filename, so a later pass does not re-verify or
-  // re-log a file still sitting in `new/`. Like `presented`, it is trimmed ONLY
-  // when a scan finds the file gone (the same trim loop below).
+  /** Consecutive failed per-file read, verification or consumed-history attempts before classification. */
+  const MAX_UNRESOLVED_ATTEMPTS = 10;
+
+  // File associations survive read and verifier errors; pending gates keep empty sets.
+  // Register associations after the gates; keep history errors pending.
+  // Pending replacements release their hold on refusal or a verified different id.
+  const presented = new Map<string, Set<string>>();
+  const pendingEnvelopeIds = new Map<string, string>();
+  // Attempts belong to the observed identity; replacements retry when it changes.
+  const unresolvedAttempts = new Map<string, number>();
+  // A resident identity's verdict prevents repeated verification and logging.
+  // Clear absent identities before verification yields.
   const classified = new Map<string, string>();
 
   // Verified records waiting for a free slot. The concurrency cap must hold
@@ -315,21 +334,60 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         console.error("[mail-watch] cannot list new/; keeping the current dedup state");
         return;
       }
-      const present = new Set(files);
-      // Forget records whose file has left `new/`. This is the ONLY place either
-      // dedup map is trimmed: a file that is still present keeps its entry, and a
-      // failed listing above returns before this point (state kept).
-      for (const [envId, file] of presented) if (!present.has(file)) presented.delete(envId);
-      for (const file of [...classified.keys()]) if (!present.has(file)) classified.delete(file);
+      const present = new Set(files.map(({ identity }) => identity));
+      const paths = new Set(files.map(({ file }) => file));
+      const fileKeys = new Set(files.map(({ fileKey }) => fileKey));
+      for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file)) pendingEnvelopeIds.delete(file);
+      for (const file of classified.keys()) if (!present.has(file)) classified.delete(file);
+      for (const file of unresolvedAttempts.keys()) if (!present.has(file)) unresolvedAttempts.delete(file);
+      for (const [envId, filesWithId] of presented) {
+        for (const fileKey of filesWithId) {
+          if (fileKeys.has(fileKey)) continue;
+          const file = fileKey.split(":").slice(0, -2).join(":");
+          if (paths.has(file) && !pendingEnvelopeIds.has(file)) {
+            pendingEnvelopeIds.set(file, envId);
+          }
+          filesWithId.delete(fileKey);
+        }
+      }
 
-      for (const file of files) {
-        if (classified.has(file)) continue;
+      const noteUnresolved = (file: string, identity: string) => {
+        const attempts = (unresolvedAttempts.get(identity) ?? 0) + 1;
+        unresolvedAttempts.set(identity, attempts);
+        if (attempts < MAX_UNRESOLVED_ATTEMPTS) {
+          return true;
+        }
+        classified.set(identity, "unresolved");
+        console.error(
+          `[mail-watch] ${file}: not presented (${attempts} consecutive failed per-file attempts; classified); ` +
+            "file left in new/; restart mail-watch to retry it.",
+        );
+        return false;
+      };
+
+      for (const { file, identity, fileKey } of files) {
+        if (classified.has(identity)) continue;
         const path = join(inbox.fresh, file);
         const read = readNewRecord(path);
+        try {
+          if (fileIdentity(path, file) !== identity) {
+            present.delete(identity);
+            rescan = true;
+            continue;
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") continue;
+        }
         // Removed after the listing: nothing to present, and not classified.
-        if (read.kind === "gone") continue;
+        if (read.kind === "gone") {
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          present.delete(identity);
+          continue;
+        }
         if (read.kind === "read-error") {
-          // A read ERROR is not a verdict: withhold it WITHOUT classifying it.
+          // A read error is not a verdict: withhold it for retry before classification.
+          if (!noteUnresolved(file, identity)) continue;
           console.error(
             `[mail-watch] ${opts.agent}: ${file} not presented — cannot read ${path} (${read.detail}); ` +
               "the file is left untouched and is retried on the next scan if it remains in new/. " +
@@ -338,7 +396,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (read.kind === "corrupt") {
-          classified.set(file, "corrupt");
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          classified.set(identity, "corrupt");
           console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
           continue;
         }
@@ -348,62 +408,108 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           if (opts.beforeVerify) await opts.beforeVerify();
           result = await verifyRecordForMailbox(opts.agent, record, mailRootForRecordPath(path));
         } catch (err) {
-          // A verification ERROR — Flair unreachable, or a malformed envelope
-          // structure — is not a verdict. The record is withheld and logged, and
-          // the next pass tries again (do NOT mark it classified).
-          console.error(
-            `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
-          );
+          // Verifier exceptions retry before classification; malformed structure is a terminal invalid result.
+          if (noteUnresolved(file, identity)) {
+            console.error(
+              `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
+            );
+          }
           continue;
         }
         if (!result.ok) {
-          classified.set(file, `refused:${result.class}`);
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          classified.set(identity, `refused:${result.class}`);
           console.error(`[mail-watch] ${record.id}: not presented (${result.class}: ${result.reason})`);
           continue;
         }
         const envId = result.message.envelopeId;
         if (envId === undefined) {
-          classified.set(file, "refused:no-envelope-id");
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          classified.set(identity, "refused:no-envelope-id");
           continue;
+        }
+        if (pendingEnvelopeIds.get(file) !== envId) pendingEnvelopeIds.delete(file);
+        for (const [previousId, filesWithId] of presented) {
+          if (previousId !== envId) filesWithId.delete(fileKey);
         }
         // cli#433 (slice B2-1): honour the SIGNED tier. An arbitrary hook command
         // has no external capability set, so external-tier mail is not presented
         // (the hook does not run), with a named reason.
         const refusal = externalDispatchRefusal(result.message.envelope, result.message.from, result.message.trustTier);
         if (refusal) {
-          classified.set(file, "refused:external-tier");
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          classified.set(identity, "refused:external-tier");
           console.error(`[mail-watch] ${envId}: not presented (${refusal})`);
           continue;
         }
         // Skip a verified record whose id the consumed history holds. When that
-        // history cannot be read, withhold the record WITHOUT classifying it.
+        // history cannot be read, withhold it for retry before classification.
         let consumed: boolean;
         try {
           consumed = isConsumedForMailbox(opts.agent, envId);
         } catch (err) {
+          pendingEnvelopeIds.set(file, envId);
+          if (!noteUnresolved(file, identity)) continue;
           console.error(
-            `[mail-watch] ${opts.agent}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
+            `[mail-watch] ${opts.agent}: ${file}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
               "the file is left untouched and is retried on the next scan if it remains in new/. " +
               "Remedy: make that path readable by this user.",
           );
           continue;
         }
         if (consumed) {
-          classified.set(file, "already-consumed");
+          pendingEnvelopeIds.delete(file);
+          unresolvedAttempts.delete(identity);
+          classified.set(identity, "already-consumed");
           console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
           continue;
         }
-        classified.set(file, "presented");
-        // Dedup on the VERIFIED envelope id.
-        if (presented.has(envId)) continue;
-        presented.set(envId, file);
+        pendingEnvelopeIds.delete(file);
+        classified.set(identity, "presented");
+        unresolvedAttempts.delete(identity);
+        // Add tracked, eligible verified files before trimming so replacements
+        // preserve the presented id.
+        let filesWithId = presented.get(envId);
+        const alreadyPresented = presented.has(envId);
+        if (filesWithId === undefined) {
+          filesWithId = new Set<string>();
+          presented.set(envId, filesWithId);
+        }
+        filesWithId.add(fileKey);
+        if (alreadyPresented) continue;
         pending.push(projectVerified(result.message));
+      }
+      // Trim after tracking eligible verified replacements to preserve their id.
+      // Recheck identities after awaited verification before releasing ids.
+      const atTrim = listNewFiles(inbox.fresh);
+      if (atTrim === null) {
+        console.error("[mail-watch] cannot list new/; keeping the current dedup state");
+        return;
+      }
+      if (atTrim.some(({ identity }) => !present.has(identity))) {
+        rescan = true;
+        return;
+      }
+      const trimPresent = new Set(atTrim.map(({ identity }) => identity));
+      const trimPaths = new Set(atTrim.map(({ file }) => file));
+      for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file)) pendingEnvelopeIds.delete(file);
+      for (const identity of classified.keys()) if (!trimPresent.has(identity)) classified.delete(identity);
+      for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity)) unresolvedAttempts.delete(identity);
+      const held = new Set(pendingEnvelopeIds.values());
+      const trimFileKeys = new Set(atTrim.map(({ fileKey }) => fileKey));
+      for (const [envId, filesWithId] of presented) {
+        for (const fileKey of filesWithId) if (!trimFileKeys.has(fileKey)) filesWithId.delete(fileKey);
+        if (filesWithId.size === 0 && !held.has(envId)) presented.delete(envId);
       }
     } finally {
       checking = false;
       fireReady();
       drain();
-      if (rescan && !stopped) { rescan = false; void processNew(); }
+      // Yield between rescans so a synchronous read failure cannot recurse.
+      if (rescan && !stopped) { rescan = false; setImmediate(() => { void processNew(); }); }
     }
   };
 
