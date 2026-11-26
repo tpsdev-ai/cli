@@ -23,8 +23,8 @@ export function standInOwnerGone(pid) {
 
 /**
  * Program text: stays alive and exits once `ownerPid` is gone. Use it as the
- * whole program of a stand-in, or as the tail of a generated script. No signal
- * handler is installed, so a signal a test sends still ends the process.
+ * whole program of a stand-in, or as the tail of a generated script.
+ * The tail installs no signal handler and preserves the caller’s existing signal behavior.
  */
 export function standInTail(ownerPid) {
   if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
