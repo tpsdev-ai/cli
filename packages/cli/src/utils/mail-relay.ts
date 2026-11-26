@@ -121,7 +121,6 @@ export function withRelayPidLock<T>(action: string, fn: () => T): T {
   }
 }
 
-/** A claim names the starter or timed-out child. */
 export function serializeRelayClaimRecord(pid: number, startToken: string | null): string {
   return `${JSON.stringify({ pid, startToken, relayClaim: true })}\n`;
 }
@@ -143,7 +142,7 @@ export function classifyRelayPidSnapshot(snapshot: PidRecordSnapshot): RelayPidS
     return { kind: "abandoned-claim", path: state.path, pid: state.pid };
   }
   if ((state.kind === "running" || state.kind === "unverified") && isRelayClaim(snapshot.raw)) {
-    return { kind: "claim", path: state.path, pid: state.pid, startToken: state.startToken };
+    return { kind: "claim", path: state.path, pid: state.pid, startToken: state.startToken, identityVerified: state.kind === "running" };
   }
   return state;
 }
@@ -232,7 +231,13 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
 export type RelayPidState =
   | PidFileState
   | { kind: "abandoned-claim"; path: string; pid: number }
-  | { kind: "claim"; path: string; pid: number; startToken: string | null };
+  | { kind: "claim"; path: string; pid: number; startToken: string | null; identityVerified: boolean };
+
+export function describeRelayClaim(state: Extract<RelayPidState, { kind: "claim" }>): string {
+  return state.identityVerified
+    ? `A live process (pid ${state.pid}) holds the start claim; it may or may not have started a relay (pid file ${state.path}).`
+    : `A process with pid ${state.pid} is running; whether it is the claimant could not be verified (pid file ${state.path}).`;
+}
 
 /** Classify the relay pid file. */
 export function readRelayPidFile(): RelayPidState {

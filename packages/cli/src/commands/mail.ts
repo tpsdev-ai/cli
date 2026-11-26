@@ -849,10 +849,10 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { readRelayPidFile, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
-      const mailDir = join(homedir(), ".tps", "mail");
+      const { homeDir } = await import("../utils/home.js");
+      const mailDir = join(homeDir(), ".tps", "mail");
 
       if (relayAction === "status") {
         // Read-only: unverified, stale, invalid and unreadable states name the pid file.
@@ -862,7 +862,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         } else if (state.kind === "abandoned-claim") {
           console.log(`Mail relay: unknown (abandoned start claim ${state.path}, claimant pid=${state.pid}).`);
         } else if (state.kind === "claim") {
-          console.log(`A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown.`);
+          console.log(describeRelayClaim(state));
         } else if (state.kind === "unverified") {
           console.log(`Mail relay unverified: pid=${state.pid}, pid file ${state.path}.`);
         } else if (state.kind === "stale") {
@@ -957,7 +957,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
         if (state.kind === "claim") {
           throw new Error(
-            `A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown. No process was signalled.`,
+            `${describeRelayClaim(state)} No process was signalled.`,
           );
         }
         if (state.kind === "unreadable") {
@@ -1104,7 +1104,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             }
             if (state.kind === "claim") {
               throw new Error(
-                `A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown. This command launched no relay.`,
+                `${describeRelayClaim(state)} This command launched no relay.`,
               );
             }
             if (state.kind === "unverified") {
