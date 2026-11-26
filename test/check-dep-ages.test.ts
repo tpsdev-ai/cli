@@ -1729,20 +1729,33 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
       : assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs;
 
     it.each([
-      ["cat <<<x", "n$'p\\155' ci", "is a here-string"],
-      ['echo "<<x"', "np? ci", "is inside quotes"],
-      ["y=$((a<<b))", "np? ci", "is inside arithmetic expansion"],
-    ])(`refuses a false here-document header through ${entryPoint}: %s`, (header, command, reason) => {
+      ["cat <<<x", "n$'p\\155' ci"],
+      ['echo "<<x"', "np? ci"],
+      ["y=$((a<<b))", "np? ci"],
+      ["x=$[1<<b]", "n$'p\\155' ci"],
+      ["x=${a:-<<b}", "np? ci"],
+      ["echo $(cat <<EOF)", "np? ci"],
+      ["echo `cat <<EOF`", "np? ci"],
+      ["echo \\<<EOF", "np? ci"],
+      ["echo <<", "np? ci"],
+    ])(`refuses << outside the header whitelist through ${entryPoint}: %s`, (header, command) => {
       expect(() => check(`echo ok\n${header}\n${command}`)).toThrow(
-        `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a here-document header match that ${reason}: ${header} (physical line 2)`,
+        `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has << outside a standalone top-level simple-command here-document redirection: ${header} (physical line 2)`,
       );
     }, 5_000);
 
-    it(`preserves a real here-document body through ${entryPoint}`, () => {
-      expect(check("cat <<EOF\nnp? ci\nEOF")).toBe(0);
+    it.each(["echo $(\ncat <<EOF\n)", "echo ${a:-\ncat <<EOF\n}", "echo $[\n1<<b\n]", "echo `\ncat <<EOF\n`"])(
+      `refuses a multiline expansion header through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow("<< outside a standalone top-level simple-command here-document redirection");
+      }, 5_000,
+    );
+
+    it.each(["cat <<EOF", "cat <<-'EOF'"])(`preserves a real here-document body through ${entryPoint}: %s`, (header) => {
+      const body = header.includes("<<-") ? "\tnp? ci\n\tEOF" : "np? ci\nEOF";
+      expect(check(`${header}\n${body}`)).toBe(0);
     }, 5_000);
 
-    it.each(["cat <<<x", 'echo "<<x"', "y=$((a<<b))"])(`preserves a pinned header through ${entryPoint}: %s`, (header) => {
+    it.each(["cat <<<x", 'echo "<<x"', "y=$((a<<b))"])(`preserves a pinned block through ${entryPoint}: %s`, (header) => {
       const entry = EXACT_BLOCK_ALLOWLIST[0];
       const original = entry.text;
       try {
@@ -1753,6 +1766,13 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
       }
     }, 5_000);
   }
+
+  it.each(["x=$[1<<b]", "x=${a:-<<b}"])("checks expansion parsing with real bash: %s", (header) => {
+    const result = spawnSync("bash", ["-c", `${header}\nprintf accepted`], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("accepted");
+    expect(result.stderr).toBe("");
+  }, 5_000);
 
   it("refuses a command word that spells npm with ANSI-C quoting", () => {
     expect(() => assertNpmCiLockfilesRead(stepWithShell("$'np\\155' ci"), READ_TRACKED, WORKFLOW)).toThrow(
@@ -1776,7 +1796,7 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
     "A=x >out B=y 2>&1 </dev/null np? ci", "<<<text npm ci", "{fd}>out npm ci",
     "echo ok; <> /dev/null npm ci", "if true; then 2>&1 npm ci; fi", ">/dev/null",
   ])("refuses a leading redirection: %s", (run) => {
-    const shape = run.startsWith("<<<") ? "a here-document header match that is a here-string" : "a leading redirection";
+    const shape = run.startsWith("<<<") ? "<< outside a standalone top-level simple-command here-document redirection" : "a leading redirection";
     const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has ${shape}: ${run} (physical line 1)`;
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
     expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);

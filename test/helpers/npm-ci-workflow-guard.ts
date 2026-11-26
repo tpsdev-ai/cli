@@ -737,21 +737,37 @@ function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] =
 }
 
 type Invocation = { rel: string } | { dynamic: string; cwdUnknown?: true; missing?: true };
-type ShellToken = { text: string; quoted: boolean };
+type ShellToken = { text: string; quoted: boolean; hereDocument?: number };
 type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?: boolean; tail?: string };
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
 /** Split a line into words, keeping quoted spans whole and honoring escapes and substitutions. */
-function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] {
+function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments = false): ShellToken[] {
   const tokens: ShellToken[] = [];
   let index = 0;
   while (index < line.length) {
     const char = line[index];
+    if (hereDocuments && char === "\n") {
+      tokens.push({ text: "\n", quoted: false });
+      index++;
+      continue;
+    }
     if (/\s/.test(char)) {
       index++;
       continue;
     }
-    if (char === "#") break;
+    if (char === "#") {
+      if (!hereDocuments) break;
+      const end = line.indexOf("\n", index);
+      index = end === -1 ? line.length : end;
+      continue;
+    }
+    if (hereDocuments && line.startsWith("<<", index)) {
+      const operator = line.startsWith("<<-", index) ? "<<-" : "<<";
+      tokens.push({ text: operator, quoted: false, hereDocument: index });
+      index += operator.length;
+      continue;
+    }
     if (/[;&|(){}]/.test(char)) {
       tokens.push({ text: char, quoted: false });
       index++;
@@ -761,6 +777,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
     let quoted = false;
     while (index < line.length) {
       const next = line[index];
+      if (hereDocuments && line.startsWith("<<", index)) break;
       if (/\s/.test(next) || (/[;&|(){}]/.test(next) &&
           !(keepRedirectAmpersand && ((next === "&" && /[<>]$/.test(text)) || (next === "|" && />$/.test(text)))))) break;
       if (next === "\\") {
@@ -776,7 +793,20 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
         index++;
         while (index < line.length) {
           const inner = line[index];
-          // Keep assignment substitutions whole when locating the outer command word.
+          // Keep quoted substitutions whole when locating the outer command word.
+          if (hereDocuments && quote === '"' && inner === "`") {
+            const end = backtickEnd(line, index);
+            const after = end === null ? line.length : end + 1;
+            text += line.slice(index, after);
+            index = after;
+            continue;
+          }
+          if (hereDocuments && quote === '"' && inner === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+            const end = expansionEnd(line, index + 1);
+            text += line.slice(index, end);
+            index = end;
+            continue;
+          }
           if (keepRedirectAmpersand && quote === '"' && isScalarAssignment(text) && inner === "$" && line[index + 1] === "(") {
             const span = parenSpan(line, index + 1);
             if (span !== null && "end" in span) {
@@ -817,6 +847,12 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
         }
         continue;
       }
+      if (hereDocuments && next === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+        const end = expansionEnd(line, index + 1);
+        text += line.slice(index, end);
+        index = end;
+        continue;
+      }
       if (next === "$" && line[index + 1] === "(") {
         text += next;
         index++;
@@ -841,6 +877,13 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
         }
         continue;
       }
+      if (hereDocuments && next === "`") {
+        const end = backtickEnd(line, index);
+        const after = end === null ? line.length : end + 1;
+        text += line.slice(index, after);
+        index = after;
+        continue;
+      }
       if (next === "`") {
         text += next;
         index++;
@@ -857,6 +900,33 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
     tokens.push({ text, quoted });
   }
   return tokens;
+}
+
+/** Keep expansion contents opaque when recognizing top-level redirections. */
+function expansionEnd(line: string, open: number): number {
+  const close = ({ "(": ")", "{": "}", "[": "]" } as Record<string, string>)[line[open]];
+  let quote = "";
+  for (let index = open + 1; index < line.length; index++) {
+    const char = line[index];
+    if (char === "\\" && quote !== "'") { index++; continue; }
+    if (quote === '"' && char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+      index = expansionEnd(line, index + 1) - 1;
+      continue;
+    }
+    if (quote === '"' && char === "`") {
+      index = backtickEnd(line, index) ?? line.length;
+      continue;
+    }
+    if (quote !== "") {
+      if (char === (quote === "ansi" ? "'" : quote)) quote = "";
+      continue;
+    }
+    if (char === "$" && line[index + 1] === "'") { quote = "ansi"; index++; continue; }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (/[({\[]/.test(char)) { index = expansionEnd(line, index) - 1; continue; }
+    if (char === close) return index + 1;
+  }
+  return line.length;
 }
 
 /** Strip a word-boundary comment, preserving `#` inside quoted spans and URLs. */
@@ -937,6 +1007,7 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
   const raw = text.split("\n");
   const mask = quoteStartMask(raw);
   const lines: LogicalLine[] = [];
+  let headerPrefix = "";
   let buffer = "";
   let start = 0;
   let delimiter: string | null = null;
@@ -958,6 +1029,29 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
       if (trimmed !== "") lines.push({ text: trimmed, line: index + 1, body: true });
       continue;
     }
+    const physicalStart = headerPrefix.length;
+    headerPrefix += physical + "\n";
+    if (refuseHeader !== undefined && headerPrefix.includes("<<")) {
+      const operators = shellTokens(headerPrefix, true, true);
+      const accepted = new Set<number>();
+      let simple = true;
+      let depth = 0;
+      for (const token of operators) {
+        if (!token.quoted && /^[({]$/.test(token.text)) depth++;
+        else if (!token.quoted && /^[)}]$/.test(token.text)) depth--;
+        if (!token.quoted && /^[;&|\n]$/.test(token.text)) simple = depth === 0;
+        else if (!token.quoted && (/^[(){}]$/.test(token.text) || SHELL_HEADERS.has(token.text) || SHELL_KEYWORDS.has(token.text))) simple = false;
+        if (simple && token.hereDocument !== undefined &&
+            headerPrefix[token.hereDocument - 1] !== "<" && headerPrefix[token.hereDocument + 2] !== "<") {
+          accepted.add(token.hereDocument);
+        }
+      }
+      for (let at = headerPrefix.indexOf("<<", physicalStart); at !== -1; at = headerPrefix.indexOf("<<", at + 1)) {
+        if (!accepted.has(at) || !/^<<-?\s*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?=\s|[;&|<>]|$)/.test(headerPrefix.slice(at))) {
+          refuseHeader({ text: physical.trim(), line: index + 1 }, "an unapproved run block has << outside a standalone top-level simple-command here-document redirection");
+        }
+      }
+    }
     if (mask[index]) {
       buffer = "";
       continue;
@@ -970,10 +1064,6 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
     }
     buffer += line;
     const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
-    if (heredoc !== null && refuseHeader !== undefined) {
-      const reason = hereDocumentHeaderRefusal(line, heredoc.index!);
-      if (reason !== null) refuseHeader({ text: physical.trim(), line: index + 1 }, `an unapproved run block has a here-document header match that ${reason}`);
-    }
     flush(
       heredoc === null && index + 1 < raw.length && mask[index + 1] === true,
       raw.slice(index + 1).join("\n"),
@@ -985,33 +1075,6 @@ function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, re
   }
   flush();
   return lines;
-}
-
-function hereDocumentHeaderRefusal(line: string, header: number): string | null {
-  if (line[header - 1] === "<" || line[header + 2] === "<") return "is a here-string";
-  let quote = "";
-  let arithmeticDepth = 0;
-  for (let index = 0; index < header; index++) {
-    const char = line[index];
-    if (char === "\\" && quote !== "'") {
-      index++;
-    } else if (quote !== "") {
-      if (quote === "ansi" ? char === "'" : char === quote) quote = "";
-    } else if (char === "$" && line[index + 1] === "'") {
-      quote = "ansi";
-      index++;
-    } else if (char === "'" || char === '"') {
-      quote = char;
-    } else if (line.startsWith("$((", index)) {
-      arithmeticDepth += 2;
-      index += 2;
-    } else if (arithmeticDepth > 0) {
-      if (char === "(") arithmeticDepth++;
-      else if (char === ")") arithmeticDepth--;
-    }
-  }
-  if (quote !== "") return "is inside quotes";
-  return arithmeticDepth > 0 ? "is inside arithmetic expansion" : null;
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {

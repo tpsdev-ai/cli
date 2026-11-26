@@ -62,13 +62,11 @@ A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
 `do`, `!` or the `time` prefix is judged at its next word. In followed shell
 files, `for`, `case` and `select` headers are not invocations; in run blocks,
 `for` and `select` headers are not invocations; in unapproved run blocks, `case`
-in command position is refused (see above). Their command substitutions are scanned as usual. Any other shell reserved word the guard does not model makes the
+in command position is refused (see above). Command substitutions in accepted headers are scanned as usual. Any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed. In unapproved
-run blocks, a header match inside quotes or `$((...))`, or matching a `<<<`
-here-string, is refused. It refuses what it cannot
+a here-document passed to a shell is refused rather than executed. In unapproved run blocks, `<<` is a here-document header only when the tokenizer reads a standalone top-level simple-command redirection outside quotes, `$(...)`, backticks, `${...}`, `$[...]` and `$((...))`; `<<<` and other occurrences refuse the block. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
