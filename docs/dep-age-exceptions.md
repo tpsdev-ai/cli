@@ -35,9 +35,9 @@ best-effort lint: variable or substitution indirection such as `n${x}pm` or
 A step whose effective shell — its own `shell:`, else its job's
 `defaults.run.shell`, else the workflow's — is set to anything other than
 `bash` is refused unless its run block is a pinned entry; the refusal names the
-step, shell and source line. For command words selected in workflow steps
-in an unapproved run block, a redirection before the command word refuses the
-block. Leading assignments are skipped, and words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
+step, shell and source line. In an unapproved workflow run block, a leading
+redirection or an assignment containing `<` or `>` before a command word refuses
+the block. Words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands.
 The guard follows repository scripts a workflow invokes by a literal path,

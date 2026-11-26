@@ -1660,7 +1660,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   }, 5_000);
 });
 
-describe("the workflow guard reads shell: and refuses redirections before command words in unapproved run blocks (#941)", () => {
+describe("the workflow guard reads shell: and refuses a leading redirection or an assignment containing < or > before a command word in unapproved run blocks (#941)", () => {
   const WORKFLOW = "workflow-c";
 
   function runBlock(run: string): string {
@@ -1744,10 +1744,46 @@ describe("the workflow guard reads shell: and refuses redirections before comman
     "> /dev/null np? ci", "</dev/null np? ci", ">>x np? ci",
     "A=x >out B=y 2>&1 </dev/null np? ci", "<<<text npm ci", "{fd}>out npm ci",
     "echo ok; <> /dev/null npm ci", "if true; then 2>&1 npm ci; fi", ">/dev/null",
-  ])("refuses a redirection before the command word: %s", (run) => {
-    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a redirection before the command word: ${run} (physical line 1)`;
+  ])("refuses a leading redirection: %s", (run) => {
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a leading redirection: ${run} (physical line 1)`;
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
     expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    "A=1>/dev/null echo ok", "A=1<>/dev/null n$'p\\155' ci", "A=x>|/dev/null npm ci",
+    'A="1>2" echo ok', 'A="1<2" echo ok', "B=plain A=1>/dev/null echo ok",
+    "A=1>/dev/null command -v echo", "A=1>/dev/null command -V echo",
+    "A=1>/dev/null env", "A=1>/dev/null command",
+  ])("refuses an assignment containing < or > before a command word: %s", (run) => {
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed): ${run} (physical line 1)`;
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    "A=plain echo ok", "A=plain echo ok >/dev/null", 'A="$(printf x 2>/dev/null)"',
+    "A=plain command -v echo", "A=plain command -V echo",
+    "A=plain env", "A=plain command",
+    'A="$(printf x 2>/dev/null)"; echo ok', "A=1>/dev/null", "A=x>|/dev/null",
+  ])("preserves the assignment or trailing-redirection outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+  }, 5_000);
+
+  it.each([
+    ["A=1>/dev/null echo ok", "", "input"],
+    ["A=1<>/dev/null n$'p\\155' ci", "output", ""],
+    ["A=x>|/dev/null npm ci", "", "input"],
+  ])("shows real bash applies the assignment's attached redirection and runs the command: %s", (run, stdout, input) => {
+    const result = spawnSync("bash", ["-c", `echo() { IFS= read -r value; printf output; printf 'ran:%s' "$value" >&2; return 17; }; npm() { echo; }; ${run}`], {
+      encoding: "utf8",
+      input: "input\n",
+      timeout: 5_000,
+    });
+    expect(result.status).toBe(17);
+    expect(result.stdout).toBe(stdout);
+    expect(result.stderr).toBe(`ran:${input}`);
   }, 5_000);
 
   it("preserves redirections after the command word", () => {

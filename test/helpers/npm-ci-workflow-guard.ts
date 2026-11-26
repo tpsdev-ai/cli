@@ -408,11 +408,17 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     for (const entry of logicalShellLines(run)) {
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
+        const commandIndex = clause.tokens.findIndex((token) =>
+          !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
+        if (commandIndex > 0 && clause.tokens.slice(0, commandIndex).some((token) =>
+          /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text) && /[<>]/.test(token.text))) {
+          refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed)");
+        }
         const word = commandWord(clause.tokens, true);
         if (word === null) continue;
         const text = word.token.text;
         if (/^[0-9]*[<>]/.test(text)) {
-          refuse(entry, "an unapproved run block has a redirection before the command word");
+          refuse(entry, "an unapproved run block has a leading redirection");
         }
         if (!word.token.quoted && text === "case") {
           refuse(entry, "an unapproved run block has a case reserved word in command position");
@@ -752,7 +758,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
     while (index < line.length) {
       const next = line[index];
       if (/\s/.test(next) || (/[;&|(){}]/.test(next) &&
-          !(keepRedirectAmpersand && next === "&" && /[<>]$/.test(text)))) break;
+          !(keepRedirectAmpersand && ((next === "&" && /[<>]$/.test(text)) || (next === "|" && />$/.test(text)))))) break;
       if (next === "\\") {
         text += next;
         index++;
