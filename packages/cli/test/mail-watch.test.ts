@@ -816,7 +816,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(2);
   }, 10_000);
 
-  it.each([false, true])("releases a departed id before a valid copy arrives (forged file: %s)", async (forged) => {
+  it.each(["absent", "different-name", "same-name", "corrupt-json"])("releases a departed id before a valid copy arrives (forged replacement: %s)", async (replacement) => {
+    const forged = replacement !== "absent";
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -832,15 +833,15 @@ describe("watchMail (verified-only, non-consuming)", () => {
       writeRecord(original.record);
       events.fire(original.path);
       await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      const forgedSource = join(tempRoot, "forged-source.json");
+      if (forged) writeFileSync(forgedSource, replacement === "corrupt-json" ? "{" : JSON.stringify({ ...original.record, body: JSON.stringify({ ...original.env, signature: Buffer.alloc(64).toString("base64") }) }));
       rmSync(original.path);
-      if (forged) {
-        writeRecord({ ...original.record, id: "forged", body: JSON.stringify({ ...original.env, signature: Buffer.alloc(64).toString("base64") }) });
-      }
+      if (forged) renameSync(forgedSource, (replacement === "same-name" || replacement === "corrupt-json") ? original.path : join(dirname(original.path), "forged.json"));
       const barrier = signedRecord("z", "departed id trim barrier");
       writeRecord(barrier.record);
       events.fire(barrier.path);
       await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
-      if (forged) expect(log.lines.some((line) => line.includes("forged: not presented"))).toBe(true);
+      if (forged) expect(log.lines.some((line) => line.includes("original: not presented") || line.includes("original.json: not presented"))).toBe(true);
       writeRecord({ ...original.record, id: "valid-copy" });
       const settled = signedRecord("zz", "valid copy settled");
       writeRecord(settled.record);
@@ -853,7 +854,54 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it.each(["bad-signature", "missing-fields", "corrupt-json"])("a resident path retains its verified id after %s", async (failure) => {
+  it.each(["external-tier", "already-consumed"])("a signature-valid %s refusal acquires no presented association", async (gate) => {
+    const ids: string[] = [];
+    const events = capturedFsEvents();
+    const ready = readySignal();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("a", "eligible original");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      const refused = buildSignedEnvelope("flint", AGENT, "refused copy", SEEDS, {
+        messageId: original.env.messageId,
+        ...(gate === "external-tier" ? { trust: "external" } : {}),
+      });
+      const ledger = join(getInbox(AGENT).root, "consumed.jsonl");
+      if (gate === "already-consumed") writeFileSync(ledger, `${JSON.stringify({ id: refused.messageId, at: refused.timestamp })}\n`);
+      writeRecord({ ...original.record, id: "b", body: JSON.stringify(refused) });
+      const barrier = signedRecord("z", "refusal settled");
+      writeRecord(barrier.record);
+      events.fire(barrier.path);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      expect(log.lines.some((line) => line.includes(gate === "external-tier" ? "external-tier mail" : "already consumed"))).toBe(true);
+      expect(ids.filter((id) => id === refused.messageId)).toHaveLength(1);
+      rmSync(original.path);
+      const departed = signedRecord("zz", "eligible carrier departed");
+      writeRecord(departed.record);
+      events.fire(departed.path);
+      await waitFor(() => ids.includes(departed.env.messageId), SCAN_SETTLE_MS);
+      if (gate === "already-consumed") writeFileSync(ledger, "");
+      writeRecord({ ...original.record, id: "c" });
+      const settled = signedRecord("zzz", "valid copy settled");
+      writeRecord(settled.record);
+      events.fire(settled.path);
+      await waitFor(() => ids.includes(settled.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(2);
+    } finally {
+      watcher.stop();
+      log.restore();
+    }
+  }, 10_000);
+
+  it.each(["bad-signature", "missing-fields", "corrupt-json"])("an in-place edit retains the file's previous verified id after %s", async (failure) => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -897,7 +945,38 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("a previously verified path holds its id through a verification error", async () => {
+  it("a verified different-id in-place edit releases the previous association", async () => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "previous in-place association");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      const replacement = signedRecord("replacement", "current in-place association");
+      writeFileSync(original.path, JSON.stringify(replacement.record));
+      events.fire(original.path);
+      await waitFor(() => ids.includes(replacement.env.messageId), SCAN_SETTLE_MS);
+      writeRecord({ ...original.record, id: "returned-copy" });
+      const barrier = signedRecord("z", "in-place release settled");
+      writeRecord(barrier.record);
+      events.fire(barrier.path);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(2);
+      expect(ids.filter((id) => id === replacement.env.messageId)).toHaveLength(1);
+    } finally {
+      watcher.stop();
+    }
+  }, 10_000);
+
+  it("a previously eligible file preserves presentation through a verification error", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -929,7 +1008,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
         () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
       );
 
-      // Verify B before A leaves so B has a trusted known id.
+      // Verify B before A leaves so B has a presented association.
       const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
       writeRecord({ ...raw, id: "id-copy-b" });
       const copyB = join(dirname(first), "id-copy-b.json");
@@ -974,7 +1053,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it.each([false, true])("holds a known id through verification failure, read failure and recovery (identity changes: %s)", async (changeIdentity) => {
+  it.each([false, true])("preserves presentation through pending verification/read recovery (identity changes: %s)", async (changeIdentity) => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -991,7 +1070,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     });
     try {
       await ready.promise;
-      const original = signedRecord("original", "known id across failed scans");
+      const original = signedRecord("original", "presentation across failed scans");
       writeRecord(original.record);
       events.fire(original.path);
       await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
@@ -1027,7 +1106,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("before classification, a consumed-history failure holds a presented id through recovery", async () => {
+  it("before classification, a consumed-history error keeps a copy pending through recovery", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -1527,7 +1606,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("classification stops retries while a resident path retains its verified id", async () => {
+  it("classification stops retries while a resident pending copy preserves presentation", async () => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -1564,7 +1643,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
       injected.fault.armed = false;
       writeRecord({ ...raw, id: "id-copy-c" });
-      const barrier = deliverSigned("classified known-id barrier");
+      const barrier = deliverSigned("classified pending-copy barrier");
       events.fire(join(dirname(first), "id-copy-c.json"));
       await waitFor(() => ids.includes(barrier.messageId), SCAN_SETTLE_MS);
       expect(ids.filter((id) => id === env.messageId)).toHaveLength(1);

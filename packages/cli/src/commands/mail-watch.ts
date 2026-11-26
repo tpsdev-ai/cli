@@ -121,7 +121,7 @@ export function validateAgentId(agentId: string): void {
 // `verifyRecordForMailbox` — the same policy `promote()` applies — so an
 // unverified record is never handed on.
 
-type NewFile = { file: string; identity: string };
+type NewFile = { file: string; identity: string; fileKey: string };
 
 function fileIdentity(path: string, file: string): string {
   const stat = statSync(path);
@@ -139,7 +139,8 @@ function listNewFiles(dir: string): NewFile[] | null {
     const files: NewFile[] = [];
     for (const file of readdirSync(dir).filter(isMailboxMessageFile)) {
       try {
-        files.push({ file, identity: fileIdentity(join(dir, file), file) });
+        const identity = fileIdentity(join(dir, file), file);
+        files.push({ file, identity, fileKey: identity.split(":").slice(0, -2).join(":") });
       } catch (err) {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
       }
@@ -260,10 +261,11 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   /** Consecutive failed per-file read, verification or consumed-history attempts before classification. */
   const MAX_UNRESOLVED_ATTEMPTS = 10;
 
-  // Empty identity sets retain presented ids while resident paths hold their known ids.
+  // File associations survive read and verifier errors; pending gates keep empty sets.
+  // Register associations after the gates; keep history errors pending.
+  // Pending replacements release their hold on refusal or a verified different id.
   const presented = new Map<string, Set<string>>();
-  // Failed reads or verification/history errors do not show that a path's known id left.
-  const knownEnvelopeIds = new Map<string, string>();
+  const pendingEnvelopeIds = new Map<string, string>();
   // Attempts belong to the observed identity; replacements retry when it changes.
   const unresolvedAttempts = new Map<string, number>();
   // A resident identity's verdict prevents repeated verification and logging.
@@ -334,11 +336,19 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
       const present = new Set(files.map(({ identity }) => identity));
       const paths = new Set(files.map(({ file }) => file));
-      for (const file of knownEnvelopeIds.keys()) if (!paths.has(file)) knownEnvelopeIds.delete(file);
+      const fileKeys = new Set(files.map(({ fileKey }) => fileKey));
+      for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file)) pendingEnvelopeIds.delete(file);
       for (const file of classified.keys()) if (!present.has(file)) classified.delete(file);
       for (const file of unresolvedAttempts.keys()) if (!present.has(file)) unresolvedAttempts.delete(file);
-      for (const filesWithId of presented.values()) {
-        for (const file of filesWithId) if (!present.has(file)) filesWithId.delete(file);
+      for (const [envId, filesWithId] of presented) {
+        for (const fileKey of filesWithId) {
+          if (fileKeys.has(fileKey)) continue;
+          const file = fileKey.split(":").slice(0, -2).join(":");
+          if (paths.has(file) && !pendingEnvelopeIds.has(file)) {
+            pendingEnvelopeIds.set(file, envId);
+          }
+          filesWithId.delete(fileKey);
+        }
       }
 
       const noteUnresolved = (file: string, identity: string) => {
@@ -355,7 +365,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         return false;
       };
 
-      for (const { file, identity } of files) {
+      for (const { file, identity, fileKey } of files) {
         if (classified.has(identity)) continue;
         const path = join(inbox.fresh, file);
         const read = readNewRecord(path);
@@ -370,6 +380,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         // Removed after the listing: nothing to present, and not classified.
         if (read.kind === "gone") {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           present.delete(identity);
           continue;
@@ -385,6 +396,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (read.kind === "corrupt") {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, "corrupt");
           console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
@@ -405,6 +417,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (!result.ok) {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, `refused:${result.class}`);
           console.error(`[mail-watch] ${record.id}: not presented (${result.class}: ${result.reason})`);
@@ -412,16 +425,21 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         const envId = result.message.envelopeId;
         if (envId === undefined) {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, "refused:no-envelope-id");
           continue;
         }
-        knownEnvelopeIds.set(file, envId);
+        if (pendingEnvelopeIds.get(file) !== envId) pendingEnvelopeIds.delete(file);
+        for (const [previousId, filesWithId] of presented) {
+          if (previousId !== envId) filesWithId.delete(fileKey);
+        }
         // cli#433 (slice B2-1): honour the SIGNED tier. An arbitrary hook command
         // has no external capability set, so external-tier mail is not presented
         // (the hook does not run), with a named reason.
         const refusal = externalDispatchRefusal(result.message.envelope, result.message.from, result.message.trustTier);
         if (refusal) {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, "refused:external-tier");
           console.error(`[mail-watch] ${envId}: not presented (${refusal})`);
@@ -433,6 +451,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         try {
           consumed = isConsumedForMailbox(opts.agent, envId);
         } catch (err) {
+          pendingEnvelopeIds.set(file, envId);
           if (!noteUnresolved(file, identity)) continue;
           console.error(
             `[mail-watch] ${opts.agent}: ${file}: ${envId} not presented — ${err instanceof Error ? err.message : String(err)}; ` +
@@ -442,11 +461,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (consumed) {
+          pendingEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, "already-consumed");
           console.error(`[mail-watch] ${envId}: not presented (already consumed)`);
           continue;
         }
+        pendingEnvelopeIds.delete(file);
         classified.set(identity, "presented");
         unresolvedAttempts.delete(identity);
         // Add tracked, eligible verified files before trimming so replacements
@@ -457,7 +478,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           filesWithId = new Set<string>();
           presented.set(envId, filesWithId);
         }
-        filesWithId.add(identity);
+        filesWithId.add(fileKey);
         if (alreadyPresented) continue;
         pending.push(projectVerified(result.message));
       }
@@ -474,12 +495,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       }
       const trimPresent = new Set(atTrim.map(({ identity }) => identity));
       const trimPaths = new Set(atTrim.map(({ file }) => file));
-      for (const file of knownEnvelopeIds.keys()) if (!trimPaths.has(file)) knownEnvelopeIds.delete(file);
+      for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file)) pendingEnvelopeIds.delete(file);
       for (const identity of classified.keys()) if (!trimPresent.has(identity)) classified.delete(identity);
       for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity)) unresolvedAttempts.delete(identity);
-      const held = new Set(knownEnvelopeIds.values());
+      const held = new Set(pendingEnvelopeIds.values());
+      const trimFileKeys = new Set(atTrim.map(({ fileKey }) => fileKey));
       for (const [envId, filesWithId] of presented) {
-        for (const file of filesWithId) if (!trimPresent.has(file)) filesWithId.delete(file);
+        for (const fileKey of filesWithId) if (!trimFileKeys.has(fileKey)) filesWithId.delete(fileKey);
         if (filesWithId.size === 0 && !held.has(envId)) presented.delete(envId);
       }
     } finally {
