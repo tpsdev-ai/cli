@@ -14,13 +14,16 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { dirname, join } from "node:path";
 import { processStartToken } from "@tpsdev-ai/agent";
 import snooplogg from "snooplogg";
 import { homeDir } from "./home.js";
-import { readPidFile, removePidFile, serializePidRecord, type PidFileState } from "./pid-file.js";
+import { acquireMailLockSync, mailLockPath } from "./mail-lock.js";
+import { pidRecordBytesEqual, removePidFile, serializePidRecord, snapshotPidRecord, type PidFileState, type PidRecordSnapshot } from "./pid-file.js";
 const { log: slog, warn: swarn, error: serror } = snooplogg("tps:mail");
 
 
@@ -93,10 +96,97 @@ export function deliverPendingMail(mailDir: string): number {
   return delivered;
 }
 
-/** The relay's own pid file, best effort at exit. */
-function removeOwnPidFile(): void {
+const RELAY_PID_LOCK_TIMEOUT_MS = 5000;
+
+/** The lock root for the relay pid record. The record lock is separate from the
+ *  record path so a claim under the record path stays the exclusive create. */
+export function relayPidLockRoot(path: string = relayPidPath()): string {
+  return `${path}.lock`;
+}
+
+/** Hold the relay pid record lock across a synchronous critical section. A
+ *  timeout is a refusal, not a proceed. */
+export function withRelayPidLock<T>(action: string, fn: () => T): T {
+  const root = relayPidLockRoot();
+  const lock = acquireMailLockSync(root, { timeoutMs: RELAY_PID_LOCK_TIMEOUT_MS });
+  if (lock === null) {
+    throw new Error(
+      `Mail relay pid record lock ${mailLockPath(root)} could not be acquired within ${RELAY_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}.`,
+    );
+  }
   try {
-    removePidFile(relayPidPath());
+    return fn();
+  } finally {
+    lock.release();
+  }
+}
+
+/** A relay start's record between its exclusive claim and the daemon's own
+ *  write. It names the starting process, so `relay status` reports a start in
+ *  progress and `relay stop` signals nothing. */
+export function serializeRelayClaimRecord(pid: number, startToken: string | null): string {
+  return `${JSON.stringify({ pid, startToken, relayClaim: true })}\n`;
+}
+
+function isRelayClaim(raw: Buffer | null): boolean {
+  if (raw === null) return false;
+  try {
+    const parsed = JSON.parse(raw.toString("utf-8")) as unknown;
+    return typeof parsed === "object" && parsed !== null && (parsed as { relayClaim?: unknown }).relayClaim === true;
+  } catch {
+    return false;
+  }
+}
+
+/** Classify a relay pid record, recognizing a live start claim. A claim whose
+ *  process is gone classifies as the underlying stale record. */
+export function classifyRelayPidSnapshot(snapshot: PidRecordSnapshot): RelayPidState {
+  const state = snapshot.state;
+  if ((state.kind === "running" || state.kind === "unverified") && isRelayClaim(snapshot.raw)) {
+    return { kind: "claim", path: state.path, pid: state.pid, startToken: state.startToken };
+  }
+  return state;
+}
+
+/** Read the relay pid record and keep the bytes the classification used. */
+export function snapshotRelayPidRecord(): { state: RelayPidState; raw: Buffer | null } {
+  const snapshot = snapshotPidRecord(relayPidPath());
+  return { state: classifyRelayPidSnapshot(snapshot), raw: snapshot.raw };
+}
+
+/** A test support hook that observes between the temporary write and the rename. */
+export const relayWriteTestHooks: {
+  afterTempWrite?: (tmpPath: string, recordPath: string) => void;
+} = {};
+
+/** Write the record through a temporary file in the same directory, then rename
+ *  it over the record path, so a reader sees the old record or the new one. */
+export function writeRelayPidRecordAtomically(path: string, text: string): void {
+  const tmp = join(dirname(path), `.relay.pid.tmp.${process.pid}.${randomBytes(6).toString("hex")}`);
+  try {
+    writeFileSync(tmp, text, { encoding: "utf-8", flag: "wx" });
+    relayWriteTestHooks.afterTempWrite?.(tmp, path);
+    renameSync(tmp, path);
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
+
+/** The relay's own pid file, best effort at exit. */
+function removeOwnPidFile(ownRecord: string): void {
+  const path = relayPidPath();
+  const ownBytes = Buffer.from(ownRecord, "utf-8");
+  try {
+    withRelayPidLock("remove the relay pid record", () => {
+      const snapshot = snapshotPidRecord(path);
+      if (snapshot.state.kind === "missing" || snapshot.raw === null) return;
+      if (!pidRecordBytesEqual(snapshot.raw, ownBytes)) return;
+      removePidFile(path);
+    });
   } catch {
     /* exit path: nothing left to report to */
   }
@@ -112,14 +202,15 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
   // null token is never compared — with a live pid the record is unverified, so
   // a stop refuses it.
   mkdirSync(join(homeDir(), ".tps"), { recursive: true });
-  writeFileSync(relayPidPath(), serializePidRecord(process.pid, processStartToken(process.pid)), "utf-8");
+  const ownRecord = serializePidRecord(process.pid, processStartToken(process.pid));
+  withRelayPidLock("write the relay pid record", () => writeRelayPidRecordAtomically(relayPidPath(), ownRecord));
 
   process.on("SIGTERM", () => {
-    removeOwnPidFile();
+    removeOwnPidFile(ownRecord);
     process.exit(0);
   });
   process.on("SIGINT", () => {
-    removeOwnPidFile();
+    removeOwnPidFile(ownRecord);
     process.exit(0);
   });
 
@@ -138,8 +229,12 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
   }
 }
 
+export type RelayPidState =
+  | PidFileState
+  | { kind: "claim"; path: string; pid: number; startToken: string | null };
+
 /** Classify the relay pid file. */
-export function readRelayPidFile(): PidFileState {
-  return readPidFile(relayPidPath());
+export function readRelayPidFile(): RelayPidState {
+  return classifyRelayPidSnapshot(snapshotPidRecord(relayPidPath()));
 }
 
