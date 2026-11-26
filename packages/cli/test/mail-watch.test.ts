@@ -690,7 +690,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("tracked, eligible verified files keep an id presented, subject to classification after ten consecutive failed per-file attempts", async () => {
+  it("tracked, eligible verified files keep an id presented", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -816,7 +816,88 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(2);
   }, 10_000);
 
-  it("before classification after ten consecutive failed per-file attempts, a listed copy failing to verify holds a presented id", async () => {
+  it.each([false, true])("releases a departed id before a valid copy arrives (forged file: %s)", async (forged) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "departed verified id");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      rmSync(original.path);
+      if (forged) {
+        writeRecord({ ...original.record, id: "forged", body: JSON.stringify({ ...original.env, signature: Buffer.alloc(64).toString("base64") }) });
+      }
+      const barrier = signedRecord("z", "departed id trim barrier");
+      writeRecord(barrier.record);
+      events.fire(barrier.path);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      if (forged) expect(log.lines.some((line) => line.includes("forged: not presented"))).toBe(true);
+      writeRecord({ ...original.record, id: "valid-copy" });
+      const settled = signedRecord("zz", "valid copy settled");
+      writeRecord(settled.record);
+      events.fire(settled.path);
+      await waitFor(() => ids.includes(settled.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(2);
+    } finally {
+      watcher.stop();
+      log.restore();
+    }
+  }, 10_000);
+
+  it.each(["bad-signature", "missing-fields", "corrupt-json"])("a resident path retains its verified id after %s", async (failure) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "resident verified id");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      const other = signedRecord("other", "departed second id");
+      writeRecord(other.record);
+      events.fire(other.path);
+      await waitFor(() => ids.includes(other.env.messageId), SCAN_SETTLE_MS);
+      rmSync(other.path);
+      const rejected = failure === "bad-signature"
+        ? { ...other.env, signature: Buffer.alloc(64).toString("base64") }
+        : { messageId: other.env.messageId };
+      writeFileSync(original.path, failure === "corrupt-json" ? "{" : JSON.stringify({ ...original.record, body: JSON.stringify(rejected) }));
+      const barrier = signedRecord("z", "resident refusal barrier");
+      writeRecord(barrier.record);
+      events.fire(barrier.path);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      expect(log.lines.some((line) => line.includes("original: not presented") || line.includes("original.json: not presented"))).toBe(true);
+      writeRecord({ ...original.record, id: "copy" });
+      writeRecord(other.record);
+      const settled = signedRecord("zz", "resident hold settled");
+      writeRecord(settled.record);
+      events.fire(settled.path);
+      await waitFor(() => ids.includes(settled.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(1);
+      expect(ids.filter((id) => id === other.env.messageId)).toHaveLength(2);
+    } finally {
+      watcher.stop();
+      log.restore();
+    }
+  }, 10_000);
+
+  it("a previously verified path holds its id through a verification error", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -848,14 +929,18 @@ describe("watchMail (verified-only, non-consuming)", () => {
         () => `the fs event did not present the first file; received: ${JSON.stringify(ids)}`,
       );
 
-      // A leaves; B (the same signed id) is listed during a verification error.
+      // Verify B before A leaves so B has a trusted known id.
       const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
       writeRecord({ ...raw, id: "id-copy-b" });
       const copyB = join(dirname(first), "id-copy-b.json");
       const reads = failReadsOf("readFileSync", copyB);
       reads.fault.armed = false;
       restore = reads.restore;
+      const verifiedBarrier = deliverSigned("copy verified barrier");
+      events.fire(copyB);
+      await waitFor(() => ids.includes(verifiedBarrier.messageId), SCAN_SETTLE_MS);
       rmSync(first);
+      writeFileSync(copyB, JSON.stringify({ ...raw, id: "id-copy-b", retry: true }));
       // The barrier record is delivered now; the recovery scan presents it.
       const before = new Set(jsonFiles(getInbox(AGENT).fresh));
       deliverSigned("scan after verification recovers");
@@ -911,8 +996,8 @@ describe("watchMail (verified-only, non-consuming)", () => {
       events.fire(original.path);
       await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
 
-      const replacement = join(dirname(original.path), "replacement.json");
-      renameSync(original.path, replacement);
+      const replacement = original.path;
+      writeFileSync(replacement, JSON.stringify({ ...original.record, retry: true }));
       failVerification = true;
       events.fire(replacement);
       await waitFor(() => log.lines.some((line) => line.includes("verification failure before read failure")), SCAN_SETTLE_MS);
@@ -1442,7 +1527,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("classification after ten consecutive failed per-file attempts retains the path's known id", async () => {
+  it("classification stops retries while a resident path retains its verified id", async () => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();

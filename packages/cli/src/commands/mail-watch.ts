@@ -27,7 +27,7 @@
  *   only mail variables this module vouches for.
  */
 
-import { isMailboxMessageFile, parseSignedEnvelope } from "@tpsdev-ai/agent";
+import { isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { execSync, spawn } from "node:child_process";
 import { existsSync, watch as fsWatch, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
@@ -385,27 +385,18 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           continue;
         }
         if (read.kind === "corrupt") {
-          knownEnvelopeIds.delete(file);
           unresolvedAttempts.delete(identity);
           classified.set(identity, "corrupt");
           console.error(`[mail-watch] ${file}: not presented (corrupt record)`);
           continue;
         }
         const record = read.record;
-        let knownId: string | undefined;
-        try {
-          const parsed = parseSignedEnvelope(record.body);
-          if (parsed.ok && typeof parsed.envelope.messageId === "string") knownId = parsed.envelope.messageId;
-        } catch { /* malformed envelopes have no known id */ }
-        if (knownId === undefined) knownEnvelopeIds.delete(file);
-        else knownEnvelopeIds.set(file, knownId);
         let result: VerifyRecordResult;
         try {
           if (opts.beforeVerify) await opts.beforeVerify();
           result = await verifyRecordForMailbox(opts.agent, record, mailRootForRecordPath(path));
         } catch (err) {
-          // A verification error (Flair unreachable or a malformed envelope
-          // structure) is not a verdict: retry before classification.
+          // Verifier exceptions retry before classification; malformed structure is a terminal invalid result.
           if (noteUnresolved(file, identity)) {
             console.error(
               `[mail-watch] ${record.id}: verification error (${err instanceof Error ? err.message : String(err)})`,
@@ -425,6 +416,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
           classified.set(identity, "refused:no-envelope-id");
           continue;
         }
+        knownEnvelopeIds.set(file, envId);
         // cli#433 (slice B2-1): honour the SIGNED tier. An arbitrary hook command
         // has no external capability set, so external-tier mail is not presented
         // (the hook does not run), with a named reason.
