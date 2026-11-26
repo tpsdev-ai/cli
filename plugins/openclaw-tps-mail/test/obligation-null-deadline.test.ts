@@ -384,6 +384,48 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
     }, 15000);
   }
 
+  for (const sibling of ["duplicate", "malformed"] as const) {
+    it(`a later sweep warns and stays unsettled with ${sibling} cur/ entries after an inbound-verification refusal`, async () => {
+      setObligationDeadlineSweepForTests(200);
+      const h = startWith("hold", { inbound: false });
+      const inboundId = `msg-${randomUUID()}`;
+      let attempts = 0;
+      try {
+        expect(await awaitStartupCurSweepForTests("default", inboundId, 10000)).toBe(true);
+        const { record } = seedNullDeadline(inboundId, new Date(Date.now() - 1000).toISOString());
+        const curDir = resolve(mailDir, AGENT, "cur");
+        const path = resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`);
+        const original = readFileSync(path, "utf-8");
+        setBeforeSettleEntryForTests((id) => {
+          if (id !== inboundId) return;
+          attempts++;
+          if (attempts === 1) {
+            writeFileSync(path, JSON.stringify({ ...JSON.parse(original), from: "other-sender" }));
+          }
+        });
+        expect(await pollUntil(() => attempts > 0 && !existsSync(path), 1000)).toBe(true);
+        expect(obligation(inboundId)).toEqual(record);
+        writeFileSync(path, original);
+        const other = resolve(curDir, sibling === "duplicate"
+          ? `2026-05-26T00-00-01-${inboundId}.json` : "zzz-sibling.json");
+        writeFileSync(other, sibling === "duplicate" ? original : "{");
+        const code = sibling === "duplicate" ? "AMBIGUOUS_ID" : "INVALID_JSON";
+        expect(await pollUntil(() => h.logs.some((line) =>
+          line.startsWith("WARN tps-mail: obligation-cur-lookup-failed:") &&
+          line.includes(record.obligationId) && line.includes(code),
+        ), 2000), "the later guarded lookup warns").toBe(true);
+        await new Promise((r) => setTimeout(r, 250));
+        expect(obligation(inboundId)).toEqual(record);
+        const cur = JSON.parse(readFileSync(path, "utf-8"));
+        expect(cur.ackedAt).toBeUndefined();
+        expect(cur.nackedAt).toBeUndefined();
+      } finally {
+        setBeforeSettleEntryForTests(undefined);
+        await h.stop();
+      }
+    }, 15000);
+  }
+
   it("a later sweep settles a due record after the inbound gate refuses settlement", async () => {
     const h = startWith("hold", { inbound: false });
     const inboundId = `msg-${randomUUID()}`;

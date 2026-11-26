@@ -1674,18 +1674,13 @@ async function settleObligation(
 ): Promise<"acked" | "unconfirmed" | "failed" | "none" | "stale" | "retry-scheduled" | "write-failed"> {
   if (!isLiveContext(ctx)) return "none";
   beforeSettleEntryForTests?.(ctx.inboundId);
-  // The missing-cur allowance needs a clean lookup at the decision point: an
-  // inbound that returned since the caller's scan is settled through the normal
-  // gate, and a failed lookup settles nothing.
-  let missingCur = s.missingCur === true;
-  if (missingCur) {
-    const cur = lookupObligationCur(ctx, obligationId);
-    if (cur.status === "error") {
-      reportObligationFailure(ctx, obligationId, `cur/ lookup failed (${cur.code})`);
-      return "retry-scheduled";
-    }
-    if (cur.status === "present") missingCur = false;
+  // Recheck placement at settlement; a context can outlive a refused attempt.
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur.status === "error") {
+    reportObligationFailure(ctx, obligationId, `cur/ lookup failed (${cur.code})`);
+    return "retry-scheduled";
   }
+  const missingCur = s.missingCur === true && cur.status === "missing";
   if (!missingCur && !(await internalInbound(ctx))) return "none";
   if (!isLiveContext(ctx)) return "none";
   beforeSettleReadForTests?.(ctx.inboundId);
@@ -2615,16 +2610,8 @@ function lookupObligationCur(
     return { status: "error", code: faultCode };
   }
   const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
-  // cli#1006 r10: the context carries the inbound's cur/ path when one is
-  // known, and a probe there proves PRESENCE without a directory scan, which a
-  // cur/ holding more names than the scan reads would refuse. A record at that
-  // path for a DIFFERENT id proves nothing, so the scan below decides.
-  if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return { status: "present" };
   let error: string | undefined;
-  // A context with no proven path (the startup pre-scan's retry entry, cli#1059
-  // item E) must keep the pre-scan's positive-presence mode: past the scan limit
-  // a single match still proves PRESENCE, and a miss still reports SCAN_LIMIT
-  // because absence is not provable that way.
+  // Past the scan limit, a match proves presence; a miss cannot prove absence.
   const found = findCurPath(
     ctx.mailDir,
     ctx.agent,
@@ -2643,6 +2630,7 @@ function lookupObligationCur(
     ctx.curPath = found;
     return { status: "present" };
   }
+  ctx.curPath = "";
   return { status: "missing" };
 }
 
