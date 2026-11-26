@@ -1081,12 +1081,19 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
       const literal = new Set(operators.flatMap((token) => token.literalHereDocuments ?? []));
       const accepted = new Set<number>();
       let simple = true;
+      let commandPosition = true;
       let depth = 0;
       for (const token of operators) {
         if (!token.quoted && /^[({]$/.test(token.text)) depth++;
         else if (!token.quoted && /^[)}]$/.test(token.text)) depth--;
-        if (!token.quoted && /^[;&|\n]$/.test(token.text)) simple = !strictRunBlock || depth === 0;
-        else if (!token.quoted && (/^[(){}]$/.test(token.text) || SHELL_HEADERS.has(token.text) || SHELL_KEYWORDS.has(token.text))) simple = false;
+        if (!token.quoted && /^[;&|\n]$/.test(token.text)) {
+          simple = !strictRunBlock || depth === 0;
+          commandPosition = true;
+        } else {
+          if (!token.quoted && (/^[(){}]$/.test(token.text) ||
+              (commandPosition && (SHELL_HEADERS.has(token.text) || SHELL_KEYWORDS.has(token.text))))) simple = false;
+          if (!isScalarAssignment(token.text)) commandPosition = false;
+        }
         if (simple && token.hereDocument !== undefined &&
             headerPrefix[token.hereDocument - 1] !== "<" && headerPrefix[token.hereDocument + 2] !== "<") {
           accepted.add(token.hereDocument);

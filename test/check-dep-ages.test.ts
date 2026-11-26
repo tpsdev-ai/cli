@@ -1878,6 +1878,12 @@ describe("the workflow guard refuses command-position time, coproc, function, in
       expect(() => check("! A=1 npm ci")).toThrow("a run block containing npm is refused");
     }, 5_000);
 
+    it.each(["for", "while", "if", "case", "then", "do", "done", "select", "until", "else", "elif", "fi", "esac", "in", "function", "!", "[[", "]]"])(
+      `accepts a reserved-word argument before a heredoc through ${entryPoint}: %s`, (word) => {
+        expect(check(`echo ${word} <<'EOF'\nnp? ci\nEOF`)).toBe(0);
+      }, 5_000,
+    );
+
     it.each(["cat <<EOF", "cat <<-'EOF'"])(`preserves a real here-document body through ${entryPoint}: %s`, (header) => {
       const body = header.includes("<<-") ? "\tnp? ci\n\tEOF" : "np? ci\nEOF";
       expect(check(`${header}\n${body}`)).toBe(0);
@@ -1896,6 +1902,7 @@ describe("the workflow guard refuses command-position time, coproc, function, in
   }
 
   it.each([
+    ["echo for <<'EOF'\npayload\nEOF", "for\n"],
     [": \"${prefix:-[}\" <<'EOF'\nnp? ci\nEOF\nprintf after", "after"],
     [": <<EOF\nEO\\\nF\nprintf after", "after"],
     [": <<'EOF'\nEO\\\nF\nprintf body\nEOF\nprintf after", "after"],
@@ -1917,8 +1924,8 @@ describe("the workflow guard refuses command-position time, coproc, function, in
     expect(result.stderr).toContain("ran");
   }, 5_000);
 
-  it.each(["x=$[1<<b]", "x=${a:-<<b}"])("checks expansion parsing with real bash: %s", (header) => {
-    const result = spawnSync("bash", ["-c", `${header}\nprintf accepted`], { encoding: "utf8", timeout: 5_000 });
+  it.each(["x=$[1<<2]", "x=${a:-<<b}"])("checks expansion parsing with real bash: %s", (header) => {
+    const result = spawnSync("bash", ["-c", `${header}\nprintf accepted`], { encoding: "utf8", timeout: 5_000, env: { ...process.env, b: "(" } });
     expect(result.status).toBe(0);
     expect(result.stdout).toBe("accepted");
     expect(result.stderr).toBe("");
