@@ -13,10 +13,8 @@
  *    One smoke case runs the real fs.watch: a short poll fallback on macOS
  *    (FSEvents can be seconds late), an idle poll elsewhere, so on Linux the
  *    case proves a real fs event triggers the scan.
- *  - dedup is on the verified envelope id while the file stays in new/ (two
- *    files with the same signed id present once); within one watcher instance a
- *    message is presented again only after a scan observes its file absent from
- *    new/, and a new/ listing error other than ENOENT keeps that state.
+ *  - dedup uses the verified envelope id; a new/ listing error other than
+ *    ENOENT keeps that state.
  *  - concurrency limit: the default is 3 (the case below tests 2)
  *  - xmlEscape / buildPlist / daemon arg validation
  *
@@ -753,7 +751,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
-  it("before classification after ten consecutive failed per-file attempts, a listed copy failing to read holds a presented id", async () => {
+  it("a listed copy with an unknown id retries without holding a presented id", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
     const ready = readySignal();
@@ -804,7 +802,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       expect(injected.fault.injected).toBeGreaterThan(0);
       expect(log.lines.some((l) => l.includes("id-copy-b.json not presented — cannot read"))).toBe(true);
 
-      // The read works again: the copy verifies, and its id is still presented.
+      // The read works again: the copy verifies after the old id was released.
       injected.fault.armed = false;
       const attempts = injected.fault.attempts;
       await presentBarrier("scan after the read recovers");
@@ -815,7 +813,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       log.restore();
     }
 
-    expect(ids.filter((id) => id === envId)).toHaveLength(1);
+    expect(ids.filter((id) => id === envId)).toHaveLength(2);
   }, 10_000);
 
   it("before classification after ten consecutive failed per-file attempts, a listed copy failing to verify holds a presented id", async () => {
@@ -944,7 +942,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("trims absent filename associations while an unresolved file holds presented ids", async () => {
+  it("trims absent identity associations while another file is unresolved", async () => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -1112,7 +1110,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it.each(["presented", "unresolved"])("resets absent filename residence before verification (%s)", async (state) => {
+  it.each(["presented", "unresolved"])("resets absent identity state before verification (%s)", async (state) => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -1175,6 +1173,222 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
+  it("rescans a gone read that is present at trim", async () => {
+    const ids: string[] = [];
+    const events = capturedFsEvents();
+    const ready = readySignal();
+    const fresh = getInbox(AGENT).fresh;
+    const copy = join(fresh, "a.json");
+    const aside = join(tempRoot, "aside.json");
+    let reads = 0;
+    const realRead = fs.readFileSync;
+    const spy = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      if (args[0] === copy && ++reads === 1) {
+        renameSync(copy, aside);
+        throw Object.assign(new Error("gone"), { code: "ENOENT" });
+      }
+      return realRead(...args);
+    }) as typeof fs.readFileSync);
+    const realList = fs.readdirSync;
+    const listingSpy = spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+      if (args[0] === fresh && existsSync(aside)) renameSync(aside, copy);
+      return realList(...args);
+    }) as typeof fs.readdirSync);
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "gone read identity");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      renameSync(original.path, copy);
+      const barrier = signedRecord("z", "gone read barrier");
+      writeRecord(barrier.record);
+      events.fire(copy);
+      await waitFor(() => ids.includes(barrier.env.messageId) && reads >= 2, SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(1);
+    } finally {
+      watcher.stop();
+      spy.mockRestore();
+      listingSpy.mockRestore();
+    }
+  }, 10_000);
+
+  it.each(["verification", "unknown-read"])("unresolved %s holds no unrelated id", async (failure) => {
+    const ids: string[] = [];
+    const events = capturedFsEvents();
+    const ready = readySignal();
+    const log = captureErrors();
+    const unresolved = signedRecord("a", "unrelated unresolved identity");
+    const reads = failReadsOf("readFileSync", unresolved.path);
+    reads.fault.armed = false;
+    let failedAttempts = 0;
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (failure === "verification" && reads.fault.attempts > failedAttempts) {
+          failedAttempts = reads.fault.attempts;
+          throw new Error("unresolved identity");
+        }
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "released unrelated id");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+      rmSync(original.path);
+      writeRecord(unresolved.record);
+      reads.fault.armed = failure === "unknown-read";
+      const barrier = signedRecord("z", "unrelated hold barrier");
+      writeRecord(barrier.record);
+      events.fire(unresolved.path);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      expect(ids).not.toContain(unresolved.env.messageId);
+      writeRecord(original.record);
+      events.fire(original.path);
+      const settled = signedRecord("zz", "unrelated hold settled");
+      writeRecord(settled.record);
+      await waitFor(() => ids.includes(settled.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(2);
+    } finally {
+      watcher.stop();
+      reads.restore();
+      log.restore();
+    }
+  }, 10_000);
+
+  it.each(["presented", "corrupt", "refused", "consumed", "attempts", "classified"].flatMap(
+    (state) => [[state, true] as const, [state, false] as const],
+  ))(
+    "replacement identity resets %s state (trim absence: %s)", async (state, atTrim) => {
+      const ids: string[] = [];
+      const ready = readySignal();
+      const events = capturedFsEvents();
+      const log = captureErrors();
+      const first = signedRecord("a", "previous identity");
+      const reads = failReadsOf("readFileSync", first.path);
+      reads.fault.armed = state === "attempts" || state === "classified";
+      let hold = false;
+      let entered = false;
+      let release = () => {};
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const watcher = watchMail({
+        agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+        watchImpl: events.watchImpl, onReady: ready.onReady,
+        beforeVerify: async () => { if (hold) { entered = true; await gate; } },
+        onMessage: (msg) => { ids.push(msg.id); },
+      });
+      try {
+        await ready.promise;
+        if (state === "consumed") {
+          writeRecord(first.record);
+          expect((await promote(AGENT, first.path)).ok).toBe(true);
+        }
+        if (state === "corrupt") writeFileSync(first.path, "{");
+        else if (state === "refused") writeRecord({ ...first.record, body: "unsigned" });
+        else writeRecord(first.record);
+        const attempts = state === "attempts" ? 9 : state === "classified" ? 10 : 1;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+          events.fire(first.path);
+          if (reads.fault.armed) await waitFor(() => reads.fault.injected === attempt, SCAN_SETTLE_MS);
+          else if (state === "presented") await waitFor(() => ids.includes(first.env.messageId), SCAN_SETTLE_MS);
+          else await waitFor(() => log.lines.some((line) => line.includes("not presented")), SCAN_SETTLE_MS);
+        }
+        if (atTrim) {
+          hold = true;
+          const barrier = signedRecord("z", "trim state barrier");
+          writeRecord(barrier.record);
+          events.fire(barrier.path);
+          await waitFor(() => entered, SCAN_SETTLE_MS);
+          rmSync(first.path);
+          hold = false;
+          release();
+          await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+        } else {
+          rmSync(first.path);
+        }
+        const replacement = signedRecord("a", "current replacement identity");
+        writeRecord(replacement.record);
+        const priorFailures = reads.fault.injected;
+        events.fire(first.path);
+        if (state === "attempts" || state === "classified") {
+          await waitFor(() => reads.fault.injected === priorFailures + 1, SCAN_SETTLE_MS);
+          reads.fault.armed = false;
+          events.fire(first.path);
+        }
+        await waitFor(() => ids.includes(replacement.env.messageId), SCAN_SETTLE_MS);
+        expect(ids.filter((id) => id === replacement.env.messageId)).toHaveLength(1);
+      } finally {
+        watcher.stop();
+        release();
+        reads.restore();
+        log.restore();
+      }
+    }, 10_000,
+  );
+
+  it.each(["overwrite", "rename", "during-read", "during-verify"])("observes a replacement identity by %s", async (mode) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const first = signedRecord("a", "previous bytes");
+    const replacement = signedRecord("b", "different replacement bytes");
+    const replacementSource = join(tempRoot, "replacement.json");
+    const realRead = fs.readFileSync;
+    let replaceDuringRead = false;
+    const spy = spyOn(fs, "readFileSync").mockImplementation(((...args: Parameters<typeof fs.readFileSync>) => {
+      const bytes = realRead(...args);
+      if (replaceDuringRead && args[0] === first.path) {
+        replaceDuringRead = false;
+        renameSync(replacementSource, first.path);
+      }
+      return bytes;
+    }) as typeof fs.readFileSync);
+    let replaceDuringVerify = false;
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (replaceDuringVerify) {
+          replaceDuringVerify = false;
+          renameSync(replacementSource, first.path);
+        }
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      writeRecord(first.record);
+      if (mode === "overwrite" || mode === "rename") {
+        events.fire(first.path);
+        await waitFor(() => ids.includes(first.env.messageId), SCAN_SETTLE_MS);
+      }
+      if (mode === "overwrite") writeFileSync(first.path, JSON.stringify(replacement.record));
+      else {
+        writeRecord(replacement.record);
+        renameSync(replacement.path, replacementSource);
+        if (mode === "rename") renameSync(replacementSource, first.path);
+        replaceDuringRead = mode === "during-read";
+        replaceDuringVerify = mode === "during-verify";
+      }
+      events.fire(first.path);
+      await waitFor(() => ids.includes(replacement.env.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === replacement.env.messageId)).toHaveLength(1);
+      if (mode === "during-read") expect(ids).not.toContain(first.env.messageId);
+    } finally {
+      watcher.stop();
+      spy.mockRestore();
+    }
+  }, 10_000);
+
   it("classification after ten consecutive failed per-file attempts releases the old id's hold", async () => {
     const ids: string[] = [];
     const ready = readySignal();
@@ -1200,7 +1414,9 @@ describe("watchMail (verified-only, non-consuming)", () => {
       rmSync(first);
       writeRecord({ ...raw, id: "id-copy-b" });
       const copyB = join(dirname(first), "id-copy-b.json");
-      const injected = failReadsOf("readFileSync", copyB);
+      const ledger = join(getInbox(AGENT).root, "consumed.jsonl");
+      writeFileSync(ledger, "");
+      const injected = failReadsOf("readFileSync", ledger, "EACCES", copyB);
       restore = injected.restore;
       for (let attempt = 1; attempt <= 10; attempt++) {
         events.fire(copyB);
@@ -1208,6 +1424,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       }
       expect(log.lines.some((l) => l.includes("id-copy-b.json: not presented (10 consecutive failed per-file attempts; classified)"))).toBe(true);
 
+      injected.fault.armed = false;
       writeRecord({ ...raw, id: "id-copy-c" });
       events.fire(join(dirname(first), "id-copy-c.json"));
       await waitFor(() => ids.filter((id) => id === env.messageId).length === 2, SCAN_SETTLE_MS);
@@ -1248,7 +1465,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       await waitFor(() => polls - startPolls >= 3, 5000);
       expect(injected.fault.injected).toBe(10);
       expect(classified()).toBe(1);
-      expect(log.lines.some((l) => l.includes("file left in new/; this process will not retry it while it remains there. Restart mail-watch to retry it."))).toBe(true);
+      expect(log.lines.some((l) => l.includes("file left in new/; restart mail-watch to retry it."))).toBe(true);
 
       watcher.stop();
       injected.fault.armed = false;

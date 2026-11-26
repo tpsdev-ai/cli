@@ -1,1 +1,1 @@
-- **mail-watch deduplicates ids across tracked, eligible verified files in `new/`.** Unresolved files in `new/` hold presented ids until classification after 10 consecutive failed per-file attempts. State is in memory, per watcher process.
+- **mail-watch deduplicates ids across tracked, eligible verified files in `new/`.** Verdicts, retry counts and file associations use observed file identities. Unresolved files hold their known envelope ids until classification after 10 consecutive failed per-file attempts. State is in memory, per watcher process.
