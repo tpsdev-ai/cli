@@ -21,8 +21,9 @@ beforeEach(() => {
   }) as typeof net.createServer);
 });
 afterEach(() => restorePorts());
-import { spawn, type ChildProcess } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { bootOnRetriedPorts, waitForOk } from "./helpers/scratch-flair.js";
+import { spawnStandIn } from "../../../test/helpers/stand-in.mjs";
 
 /** A stand-in child that records its own pid when it is stopped; the signal is ignored. */
 function fakeChild(pid: number, killed: number[]): ChildProcess {
@@ -110,7 +111,7 @@ for (const status of ["bind-error", "exited", "signaled"] as const) {
 }
 
 test("readiness cancellation stops a real scratch child", async () => {
-  const proc = spawn("node", ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  const proc = spawnStandIn({ command: "node" });
   const closed = new Promise<void>((resolve) => proc.once("close", () => resolve()));
   const controller = new AbortController();
   const failure = new Error("boot cancelled");
