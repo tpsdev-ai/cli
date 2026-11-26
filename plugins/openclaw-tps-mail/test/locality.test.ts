@@ -1367,6 +1367,8 @@ describe("cli#408 — obligation-lifecycle coverage (write-ahead, failed write)"
   }, 20000);
 
   it("a failure write that throws is ONE attempt with no announcement; the next start resolves the record", async () => {
+    // Short deadline so the restarted account settles the record in this fixture.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "100";
     const out = await inFreshHome(
       () => maildirFor("sender-a"),
       async () => {
