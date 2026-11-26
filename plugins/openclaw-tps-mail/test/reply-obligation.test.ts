@@ -23,7 +23,7 @@ import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash, randomUUID } from "node:crypto";
 import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
@@ -728,6 +728,18 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     await h.stop();
   }, 15000);
 
+  it("cli#1063: a configured mailDir that is not absolute is refused at config load", () => {
+    const relative = { channels: { "tps-mail": { accounts: { default: { mailDir: "relative/mail" } } } } };
+    expect(() => capturedPlugin.config.resolveAccount(relative, "default")).toThrow(
+      /mailDir "relative\/mail" is not absolute; use an absolute path or a "~\/" path/,
+    );
+    // An absolute path and a `~/` path are both accepted.
+    const homeRelative = { channels: { "tps-mail": { accounts: { default: { mailDir: "~/mail" } } } } };
+    expect(capturedPlugin.config.resolveAccount(homeRelative, "default").mailDir).toBe(resolve(homedir(), "mail"));
+    const absolute = { channels: { "tps-mail": { accounts: { default: { mailDir: tempMailDir } } } } };
+    expect(capturedPlugin.config.resolveAccount(absolute, "default").mailDir).toBe(tempMailDir);
+  }, 15000);
+
   /**
    * A reply run as the prompt prints it (`tps mail send <to> --reply-to <inbound
    * envelope id>`, with the account's mailDir) writes on the OFFICE local route:
@@ -813,11 +825,75 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     }
   }, 40000);
 
-  it("cli#1063: the suggested command, run as printed, lands where the scan looks and settles", async () => {
-    process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+  it("cli#1063: a branch host does not match the marker-less form, even for a bound sender", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    const bindings = [
+      { agentId: "anvil", match: { channel: "tps-mail", accountId: "default" } },
+      // The sender is bound, so routeFor() says `local` on this branch host.
+      { agentId: "flint", match: { channel: "tps-mail", accountId: "default" } },
+    ];
+    const h = await start("anvil", "flint", { localSender: true, branchHost: true, bindings });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    const promptText = h.dispatched.ctx.BodyForAgent as string;
+    expect(promptText).toContain('Reply via: tps mail send flint "<your response>"');
+    expect(promptText).not.toContain("--reply-to");
+    expect(promptText).not.toContain("TPS_MAIL_DIR=");
+
+    const obId = h.obligationId()!;
+    writeAgentReply({ thread: h.inboundEnvelopeId });
+    await pollUntil(() => readdirSafe(resolve(tempMailDir, "flint", "new")).length === 1, 2000);
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+
+    const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 4000);
+    expect(failed, JSON.stringify(obligationFile("anvil", h.inboundId))).toBe(true);
+    expect(obligationFile("anvil", h.inboundId)?.failure).toBe("yielded-without-resumption");
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    await h.stop();
+  }, 20000);
+
+  it("cli#1063: an office host with a remote route does not match the marker-less form", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    mkdirSync(resolve(tempHome, ".tps", "branch-office", "branch-b"), { recursive: true });
+    writeFileSync(
+      resolve(tempHome, ".tps", "gal.json"),
+      JSON.stringify({ version: 1, entries: [{ agentId: "flint", branchId: "branch-b", updatedAt: new Date().toISOString() }] }),
+    );
+    writeFileSync(resolve(tempHome, ".tps", "branch-office", "branch-b", "remote.json"), "{}\n");
+
     const h = await start("anvil", "flint", { localSender: true });
     await pollUntil(() => h.dispatched !== null, 4000);
     const promptText = h.dispatched.ctx.BodyForAgent as string;
+    expect(promptText).toContain('Reply via: tps mail send flint "<your response>"');
+    expect(promptText).not.toContain("--reply-to");
+    expect(promptText).not.toContain("TPS_MAIL_DIR=");
+
+    const obId = h.obligationId()!;
+    writeAgentReply({ thread: h.inboundEnvelopeId });
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+
+    const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 4000);
+    expect(failed, JSON.stringify(obligationFile("anvil", h.inboundId))).toBe(true);
+    expect(obligationFile("anvil", h.inboundId)?.failure).toBe("yielded-without-resumption");
+    expect(curRecord("anvil")?.ackedAt).toBeUndefined();
+    await h.stop();
+  }, 20000);
+
+  it("cli#1063: the suggested command, run as printed, lands where the scan looks and settles", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+    // A configured mailDir with a space and an apostrophe: the prompt's prefix
+    // must survive the shell, and the reply must land in exactly this directory.
+    const specialMailDir = join(tempHome, "mail dir's");
+    const h = await start("anvil", "flint", {
+      localSender: true,
+      mailDir: specialMailDir,
+      accounts: { default: { mailDir: specialMailDir, enabled: true } },
+    });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    const promptText = h.dispatched.ctx.BodyForAgent as string;
+    const quotedDir = `'${specialMailDir.replace(/'/g, "'\\''")}'`;
+    expect(promptText).toContain(`TPS_MAIL_DIR=${quotedDir} tps mail send flint --reply-to ${h.inboundEnvelopeId}`);
     const suggestion = /^Reply via: (.+)$/m.exec(promptText)?.[1];
     expect(suggestion).toBeDefined();
     const command = suggestion!.replace('"<your response>"', '"the real CLI reply"');
@@ -839,17 +915,23 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     });
     expect(run.status, `the printed command failed: ${run.stderr || run.stdout}`).toBe(0);
 
-    const flintNew = resolve(tempMailDir, "flint", "new");
+    const flintNew = resolve(specialMailDir, "flint", "new");
     const landed = await pollUntil(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
     expect(landed, "the reply landed in the inbound sender's maildir").toBe(true);
+    expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(0);
 
     // Drive the post-turn scan: it finds the marker-less reply and acks.
     const obId = h.obligationId()!;
     capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
     h.settle();
-    const acked = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "acked", 4000);
-    expect(acked, JSON.stringify(obligationFile("anvil", h.inboundId))).toBe(true);
-    expect(curRecord("anvil")?.ackedAt).toBeDefined();
+    const obFile = () => {
+      try { return JSON.parse(readFileSync(resolve(specialMailDir, "anvil", ".obligations", `${h.inboundId}.json`), "utf-8")); } catch { return null; }
+    };
+    const acked = await pollUntil(() => obFile()?.state === "acked", 4000);
+    expect(acked, JSON.stringify(obFile())).toBe(true);
+    const curFiles = readdirSafe(resolve(specialMailDir, "anvil", "cur")).filter((f) => f.endsWith(".json"));
+    const cur = curFiles.length > 0 ? JSON.parse(readFileSync(resolve(specialMailDir, "anvil", "cur", curFiles[0]!), "utf-8")) : null;
+    expect(cur?.ackedAt).toBeDefined();
     await h.stop();
   }, 30000);
 

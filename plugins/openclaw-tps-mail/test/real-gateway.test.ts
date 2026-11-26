@@ -62,6 +62,8 @@ type Report = {
   inboundNewFiles: string[];
   readErrors: string[];
   inboundId: string | null;
+  /** The inbound's SIGNED envelope id; differs from the local record id. */
+  inboundEnvelopeId: string | null;
   inboundName: string | null;
   settledRead: boolean;
   stopped: boolean;
@@ -162,8 +164,13 @@ function expectGatewayReport(r: Report): void {
   expect(r.dispatchStarts).toBe(1);
   expect(r.modelTurnTexts).toEqual(["PROGRESS: drafting the answer", "FINAL: the task is complete"]);
   // cli#1063: the inbound prompt hands the agent the reply command threaded on
-  // the inbound's SIGNED envelope id.
-  expect(r.inboundPromptText).toContain(`--reply-to ${r.inboundId}`);
+  // the inbound's SIGNED envelope id, never the local record id.
+  const envelopeId = r.inboundEnvelopeId!;
+  const recordId = r.inboundId!;
+  const promptText = r.inboundPromptText!;
+  expect(envelopeId).not.toBe(recordId);
+  expect(promptText).toContain(`--reply-to ${envelopeId}`);
+  expect(promptText).not.toContain(`--reply-to ${recordId}`);
   expect(r.replyCount).toBe(1);
   expect(r.replyBody).toBe("FINAL: the task is complete");
   expect(r.replyFrom).toBe("agent-a");
@@ -189,7 +196,7 @@ function ackedReport(): Report {
     openclawVersion: "2026.8.1",
     modelCalls: 2,
     modelTurnTexts: ["PROGRESS: drafting the answer", "FINAL: the task is complete"],
-    inboundPromptText: `Reply via: tps mail send agent-b --reply-to msg-one "<your response>"`,
+    inboundPromptText: `Reply via: tps mail send agent-b --reply-to env-one "<your response>"`,
     unexpected: [],
     dispatchStarts: 1,
     replyCount: 1,
@@ -207,6 +214,7 @@ function ackedReport(): Report {
     inboundNewFiles: [],
     readErrors: [],
     inboundId: "msg-one",
+    inboundEnvelopeId: "env-one",
     inboundName: "2026-01-01T00-00-00-000Z-msg-one.json",
     settledRead: true,
     stopped: true,

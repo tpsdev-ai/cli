@@ -55,14 +55,14 @@ import { randomUUID } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, renameSync, statSync, writeFileSync, watch as fsWatch, type FSWatcher } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath, isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
 import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
-import { resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
+import { isBranchHost, resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import {
   MAX_TIMER_DELAY_MS,
   MailAckTimeoutConfigError,
@@ -237,12 +237,30 @@ function resolveMailDir(cfg: any, accountId: string): string {
   return expandHome(account.mailDir ?? DEFAULT_MAIL_DIR);
 }
 
-/** The account's config `mailDir`, when the config SETS one (never the default). */
-function configuredMailDir(cfg: any, accountId: string): string | null {
+/** The account's config `mailDir` as WRITTEN, when the config sets one. */
+function configuredMailDirValue(cfg: any, accountId: string): string | null {
   const accounts = cfg?.channels?.[CHANNEL_ID]?.accounts ?? {};
   const account = accounts[accountId] ?? accounts.default ?? {};
   const value = account?.mailDir;
-  return typeof value === "string" && value.length > 0 ? expandHome(value) : null;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/** The account's config `mailDir`, expanded, when the config SETS one (never the default). */
+function configuredMailDir(cfg: any, accountId: string): string | null {
+  const value = configuredMailDirValue(cfg, accountId);
+  return value === null ? null : expandHome(value);
+}
+
+/** Refuse a configured `mailDir` that is not absolute after `~` expansion. */
+function refuseRelativeMailDir(cfg: any, accountId: string): void {
+  const value = configuredMailDirValue(cfg, accountId);
+  if (value === null) return;
+  if (!isAbsolute(expandHome(value))) {
+    throw new Error(
+      `tps-mail: account "${accountId}" mailDir "${value}" is not absolute; ` +
+        `use an absolute path or a "~/" path`,
+    );
+  }
 }
 
 /** POSIX shell-quote: bare when the value needs no quoting, single-quoted otherwise. */
@@ -745,14 +763,17 @@ function resolveOutboundSender(ctx: ChannelOutboundContext): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-function buildEnvelope(msg: TpsMailBody, mailDir: string | null = null): string {
-  // cli#1063: the reply must thread on the inbound's SIGNED envelope id, never
-  // the local record id shown above — a signed-mode obligation only settles
-  // from a reply that signs that id as `replyToId`.
-  const replyTo = isValidEnvelopeId(msg.envelopeId) ? ` --reply-to ${msg.envelopeId}` : "";
-  // ... and it must write where the scan looks: a CONFIGURED mailDir is passed
-  // to the CLI, shell-quoted.
-  const dirPrefix = mailDir === null ? "" : `TPS_MAIL_DIR=${shellQuote(mailDir)} `;
+function buildEnvelope(msg: TpsMailBody, reply: { mailDir: string | null } | null = null): string {
+  // cli#1063: `reply` is non-null only where the marker-less form is matched
+  // (an office host whose local route delivers to the inbound sender). There
+  // the reply must thread on the inbound's SIGNED envelope id, never the local
+  // record id shown above — a signed-mode obligation only settles from a reply
+  // that signs that id as `replyToId` — and it must write where the scan looks:
+  // a CONFIGURED mailDir is passed to the CLI, shell-quoted. Elsewhere the
+  // plain instruction stays.
+  const threaded = reply !== null && isValidEnvelopeId(msg.envelopeId);
+  const replyTo = threaded && reply !== null ? ` --reply-to ${msg.envelopeId}` : "";
+  const dirPrefix = threaded && reply !== null && reply.mailDir !== null ? `TPS_MAIL_DIR=${shellQuote(reply.mailDir)} ` : "";
   return [
     "[TPS Mail]",
     `From: ${msg.from}`,
@@ -2581,12 +2602,15 @@ function scanObligationReceipt(
   expectedReplyId: string | undefined,
 ): ReturnType<typeof scanForReceipt> {
   const thread = receiptThread(rec);
-  // cli#1063: on the LOCAL route a reply the agent sent itself carries the
-  // thread only inside its signed envelope, with no obligation marker. Enable
-  // the marker-less form for signed-mode obligations only; every other route
+  // cli#1063: a reply the agent sent itself carries the thread only inside its
+  // signed envelope, with no obligation marker. Enable the marker-less form for
+  // signed-mode obligations on an OFFICE host whose route to the inbound sender
+  // is local; a branch host relays a bound sender through the outbox, so the
+  // form is disabled there whatever routeFor returns, and every other route
   // still requires the marker it mints.
   const unmarkedThreaded =
     thread.mode === "signed" &&
+    !isBranchHost() &&
     routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender).kind === "local";
   return scanForReceipt(
     receiptDirs(ctx),
@@ -3095,6 +3119,7 @@ const config: ChannelConfigAdapter<TpsMailAccount> = {
   },
   resolveAccount: (cfg: any, accountId?: string | null): TpsMailAccount => {
     const id = accountId ?? "default";
+    refuseRelativeMailDir(cfg, id);
     const mailDir = resolveMailDir(cfg, id);
     const enabled = cfg?.channels?.[CHANNEL_ID]?.enabled !== false;
     return { accountId: id, mailDir, enabled };
@@ -3435,7 +3460,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         dmScope: "per-channel-peer",
       }) ?? `agent:${recipient}:${CHANNEL_ID}:${account.accountId}:${msg.from}`;
 
-      const envelope = buildEnvelope(msg, configuredMailDir(cfg, account.accountId));
+      const markerlessReply =
+        !isBranchHost() && routeFor(account.mailDir, cfg, account.accountId, msg.from).kind === "local";
+      const envelope = buildEnvelope(
+        msg,
+        markerlessReply ? { mailDir: configuredMailDir(cfg, account.accountId) } : null,
+      );
       const rawMsgCtx: Record<string, any> = {
         BodyForAgent: envelope,
         RawBody: msg.body,
