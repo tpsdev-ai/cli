@@ -412,6 +412,13 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     for (const entry of logicalShellLines(run, refuse)) {
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
+        for (const token of clause.tokens) {
+          if (isScalarAssignment(token.text) || (!token.quoted && SHELL_KEYWORDS.has(token.text))) continue;
+          if (!token.quoted && SHELL_RESERVED.has(token.text) && !RUN_COMPOUND_HEADERS.has(token.text)) {
+            refuse(entry, `an unapproved run block has a ${token.text} reserved word in command position`);
+          }
+          break;
+        }
         const commandIndex = clause.tokens.findIndex((token) =>
           !isScalarAssignment(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
         if (commandIndex > 0 && clause.tokens.slice(0, commandIndex).some((token) =>
@@ -678,6 +685,7 @@ const SHELL_RESERVED = new Set([
   "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
   "function", "if", "in", "select", "then", "time", "until", "while", "{", "}", "[[", "]]",
 ]);
+const RUN_COMPOUND_HEADERS = new Set(["for", "select", "fi", "done", "esac", "{", "}", "[["]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const JS_INTERPRETERS = new Set(["node", "bun", "deno", "tsx"]);
 const INTERPRETERS = new Set([...SHELL_INTERPRETERS, ...JS_INTERPRETERS]);

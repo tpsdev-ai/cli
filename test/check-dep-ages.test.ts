@@ -1660,7 +1660,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   }, 5_000);
 });
 
-describe("the workflow guard reads shell: and refuses leading redirections and variable assignments containing < or > before a command word in unapproved run blocks (#941)", () => {
+describe("the workflow guard refuses command-position time, coproc, function, in and ]] in unapproved run blocks and skips ! before assignment checks (#941)", () => {
   const WORKFLOW = "workflow-c";
 
   function runBlock(run: string): string {
@@ -1750,6 +1750,22 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
       }, 5_000,
     );
 
+    it(`accepts << and <<< body lines through ${entryPoint}`, () => {
+      expect(check("cat <<'EOF'\n<<\n<<<\nEOF")).toBe(0);
+    }, 5_000);
+
+    it.each(["time A=1>/dev/null echo ok", "time -p A=1>/dev/null echo ok", "coproc echo ok", "function f", "in echo ok", "]] echo ok"])(
+      `refuses an unmodeled reserved word through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow(`a ${run.split(" ")[0]} reserved word in command position`);
+      }, 5_000,
+    );
+
+    it(`checks assignments after the workflow-used ! prefix through ${entryPoint}`, () => {
+      expect(check("! A=plain echo ok")).toBe(0);
+      expect(() => check("! A=1>/dev/null echo ok")).toThrow("an assignment containing < or > before a command word");
+      expect(() => check("! A=1 npm ci")).toThrow("a run block containing npm is refused");
+    }, 5_000);
+
     it.each(["cat <<EOF", "cat <<-'EOF'"])(`preserves a real here-document body through ${entryPoint}: %s`, (header) => {
       const body = header.includes("<<-") ? "\tnp? ci\n\tEOF" : "np? ci\nEOF";
       expect(check(`${header}\n${body}`)).toBe(0);
@@ -1766,6 +1782,13 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
       }
     }, 5_000);
   }
+
+  it("shows real bash executes the time-prefixed assignment", () => {
+    const result = spawnSync("bash", ["-c", "echo() { printf ran >&2; }; time A=1>/dev/null echo ok"], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("ran");
+  }, 5_000);
 
   it.each(["x=$[1<<b]", "x=${a:-<<b}"])("checks expansion parsing with real bash: %s", (header) => {
     const result = spawnSync("bash", ["-c", `${header}\nprintf accepted`], { encoding: "utf8", timeout: 5_000 });
@@ -4458,7 +4481,7 @@ describe("the workflow guard judges a reserved-word condition (#820 round 18)", 
         new Set(),
         root,
         "workflow-reserved",
-      )).toThrow(/cannot resolve a dynamic script path|unresolved script invocation/);
+      )).toThrow(asScript ? /cannot resolve a dynamic script path|unresolved script invocation/ : /a coproc reserved word in command position/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

@@ -38,7 +38,7 @@ A step whose effective shell — its own `shell:`, else its job's
 step, shell and source line. In an unapproved workflow run block, the guard refuses
 leading redirections and variable assignments containing `<` or `>` before a command word.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
-remain accepted. `case` in command position is refused in unapproved run blocks;
+remain accepted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands. These checks read a
 run block's top-level clauses only: commands inside `$(...)` or backtick
 substitutions, and text after a quote that spans physical lines, are not checked.
@@ -59,8 +59,8 @@ and literal invocations, and follows scripts. A run block and a followed script
 differ in their initial state: the install classifier runs on followed shell
 files, and a run block's lines are screened by the physical-line check above.
 A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
-`do`, `!` or the `time` prefix is judged at its next word. In followed shell
-files, `for`, `case` and `select` headers are not invocations; in run blocks,
+`do` or `!` is judged at its next word. In followed shell
+files, the `time` prefix is skipped, and `for`, `case` and `select` headers are not invocations; in run blocks,
 `for` and `select` headers are not invocations; in unapproved run blocks, `case`
 in command position is refused (see above). Command substitutions in accepted headers are scanned as usual. Any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action
