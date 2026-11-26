@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { procStat as fixtureProcStat } from "../../../test/fixtures/heartbeat-lane-fixture-teardown.mjs";
+import { standInOwnerStartToken } from "../../../test/helpers/stand-in.mjs";
 
 const FIXTURE = fileURLToPath(new URL("../../../test/fixtures/heartbeat-lane-terminated.mjs", import.meta.url));
 const OWN_EXIT_FIXTURE = fileURLToPath(
@@ -150,7 +151,12 @@ function signalsSentToGroup(log: string, pgid: number): string[] {
 async function terminatedFixture(signal: NodeJS.Signals, expectedStatus: number) {
   const root = mkdtempSync(join(tmpdir(), "heartbeat-terminated-"));
   const fixture = spawn(process.env.NODE_BIN ?? "node", [FIXTURE], {
-    env: { ...process.env, TEARDOWN_DIR: root, TPS_STAND_IN_OWNER_PID: String(process.pid) },
+    env: {
+      ...process.env,
+      TEARDOWN_DIR: root,
+      TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+    },
     stdio: ["ignore", "pipe", "inherit"],
   });
   let gatewayPid: number | null = null;
@@ -210,7 +216,12 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
   test("the own-exit fixture records no group signals and removes teardown handlers", async () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
-      env: { ...process.env, TEARDOWN_DIR: root, TPS_STAND_IN_OWNER_PID: String(process.pid) },
+      env: {
+      ...process.env,
+      TEARDOWN_DIR: root,
+      TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+    },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -237,7 +248,13 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
   test("a normal exit after the group is gone leaves the status unchanged", async () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
-      env: { ...process.env, TEARDOWN_DIR: root, TEARDOWN_EXIT: "normal", TPS_STAND_IN_OWNER_PID: String(process.pid) },
+      env: {
+      ...process.env,
+      TEARDOWN_DIR: root,
+      TEARDOWN_EXIT: "normal",
+      TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+    },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -274,6 +291,7 @@ async function unconfirmedFixture(exit: "signal" | "normal") {
       TEARDOWN_DIR: root,
       TEARDOWN_STUB_SURVIVOR: "1",
       TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
       ...(exit === "normal" ? { TEARDOWN_EXIT: "normal" } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],
