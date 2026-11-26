@@ -1738,7 +1738,7 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
       ["echo `cat <<EOF`", "np? ci"],
       ["echo \\<<EOF", "np? ci"],
       ["echo <<", "np? ci"],
-    ])(`refuses << outside the header whitelist through ${entryPoint}: %s`, (header, command) => {
+    ])(`refuses << outside bodies and accepted headers through ${entryPoint}: %s`, (header, command) => {
       expect(() => check(`echo ok\n${header}\n${command}`)).toThrow(
         `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has << outside a standalone top-level simple-command here-document redirection: ${header} (physical line 2)`,
       );
@@ -1917,9 +1917,18 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
     expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
   }, 5_000);
 
-  it("accepts the rewritten macOS bash version check", () => {
-    const run = '[[ "$v" == *"version 3.2."* ]] || { echo "::error::expected the macOS system bash 3.2, got: $v"; exit 1; }';
-    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+  it("accepts the workflow macOS bash version check and rejects a nonmatching version", () => {
+    const workflow = parseWorkflow(readFileSync(join(REPO, ".github/workflows/test.yml"), "utf8"));
+    const run = workflow.jobs["promote-latest-fixtures"].steps.find((step) => typeof step.run === "string")?.run ?? "";
+    const checks = run.split("\n").filter((line) => line.includes("::error::expected the macOS system bash"));
+    expect(checks).toHaveLength(1);
+    const check = checks[0].trim();
+    expect(assertNpmCiLockfilesRead(stepWithShell(check), READ_TRACKED, WORKFLOW)).toBe(0);
+    for (const [version, status] of [["GNU bash, version 3.2.57(1)-release", 0], ["GNU bash, version 5.2.37(1)-release", 1]] as const) {
+      const result = spawnSync("bash", ["-c", 'v="$1"; ' + check, "bash-version-check", version], { encoding: "utf8", timeout: 5_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(status);
+    }
   }, 5_000);
 
   it("accepts the bracket builtin", () => {
@@ -3580,6 +3589,29 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
         root,
         "workflow-wrapped-script",
       )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 3\) token scripts\/inst\.sh/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["for", false, 'for item in "$(bash scripts/install.sh)"; do echo ok; done'],
+    ["select", false, 'select item in "$(bash scripts/install.sh)"; do break; done'],
+    ["for", true, 'for item in "$(bash scripts/install.sh)"; do echo ok; done'],
+    ["select", true, 'select item in "$(bash scripts/install.sh)"; do break; done'],
+    ["case", true, 'case "$(bash scripts/install.sh)" in x) echo ok;; esac'],
+  ] as const)("scans substitutions in accepted %s headers (followed script: %s)", (_header, asScript, text) => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${text}\n`,
+      "scripts/install.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/outer.sh" : text, "."),
+        new Set(),
+        root,
+        "workflow-header-substitution",
+      )).toThrow(/scripts\/install\.sh.*cannot bind the npm install to a tracked lockfile/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
