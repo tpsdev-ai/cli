@@ -197,7 +197,7 @@ function tempRecordPath(path: string): string {
 
 /** Create the record at a free path; EEXIST means another claimant won. The
  *  record bytes are complete before the hard link publishes them, and the
- *  temporary file is removed on every path. */
+ *  temporary file is removed in a finally block. */
 export function claimRelayPidRecord(path: string, text: string): void {
   const tmp = tempRecordPath(path);
   try {
