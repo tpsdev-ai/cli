@@ -323,6 +323,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const present = new Set(files);
       for (const file of classified.keys()) if (!present.has(file)) classified.delete(file);
       for (const file of unresolvedAttempts.keys()) if (!present.has(file)) unresolvedAttempts.delete(file);
+      for (const filesWithId of presented.values()) {
+        for (const file of filesWithId) if (!present.has(file)) filesWithId.delete(file);
+      }
 
       // Unresolved files still in `new/` hold presented ids: a failed read or
       // verification is not evidence that the id left.

@@ -997,6 +997,62 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
+  it("releases an absent filename's previous id after verifying its replacement", async () => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const first = join(getInbox(AGENT).fresh, "a.json");
+    let hold = false;
+    let entered = false;
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const watcher = watchMail({
+      agent: AGENT,
+      debounceMs: 20,
+      pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl,
+      onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (hold) { entered = true; await gate; }
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = deliverSigned("previous association");
+      renameSync(onlyNewFile(), first);
+      events.fire(first);
+      await waitFor(() => ids.includes(original.messageId), SCAN_SETTLE_MS);
+      const raw = JSON.parse(readFileSync(first, "utf8")) as Record<string, unknown>;
+      rmSync(first);
+
+      hold = true;
+      const barrier = deliverSigned("awaited verification");
+      events.fire(first);
+      await waitFor(() => entered, SCAN_SETTLE_MS);
+      const arriving = deliverSigned("arriving during verification");
+      const replacement = buildSignedEnvelope("flint", AGENT, "current association", SEEDS);
+      const record = sendMessage(AGENT, JSON.stringify(replacement), "flint");
+      renameSync(record.filePath, first);
+      hold = false;
+      release();
+      await waitFor(
+        () => [barrier, arriving, replacement].every((env) => ids.includes(env.messageId)),
+        SCAN_SETTLE_MS,
+      );
+
+      writeRecord({ ...raw, id: "returned-copy" });
+      const settled = deliverSigned("return scan barrier");
+      events.fire(first);
+      await waitFor(() => ids.includes(settled.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === original.messageId)).toHaveLength(2);
+      expect(ids.filter((id) => id === replacement.messageId)).toHaveLength(1);
+    } finally {
+      watcher.stop();
+      release();
+    }
+  }, 10_000);
+
   it.each([false, true])("preserves a presented id across the trim boundary (listing failure: %s)", async (failListing) => {
     const ids: string[] = [];
     const ready = readySignal();
