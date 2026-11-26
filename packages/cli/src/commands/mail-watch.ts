@@ -337,7 +337,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         }
         classified.set(file, "unresolved");
         console.error(
-          `[mail-watch] ${file}: not presented (read or verification failed on ${attempts} consecutive scans; classified)`,
+          `[mail-watch] ${file}: not presented (${attempts} consecutive failed per-file attempts; classified)`,
         );
         return false;
       };

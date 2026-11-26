@@ -965,7 +965,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
         events.fire(copyB);
         await waitFor(() => injected.fault.injected === attempt, SCAN_SETTLE_MS);
       }
-      expect(log.lines.some((l) => l.includes("id-copy-b.json: not presented (read or verification failed on 10 consecutive scans; classified)"))).toBe(true);
+      expect(log.lines.some((l) => l.includes("id-copy-b.json: not presented (10 consecutive failed per-file attempts; classified)"))).toBe(true);
 
       writeRecord({ ...raw, id: "id-copy-c" });
       events.fire(join(dirname(first), "id-copy-c.json"));
@@ -998,7 +998,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
       restore = injected.restore;
       writeRecord({ id: "stuck", from: "flint", to: AGENT, body: "stuck", timestamp: new Date().toISOString(), read: false });
       const classified = () =>
-        log.lines.filter((l) => l.includes("stuck.json: not presented (read or verification failed on 10 consecutive scans; classified)")).length;
+        log.lines.filter((l) => l.includes("stuck.json: not presented (10 consecutive failed per-file attempts; classified)")).length;
       await waitFor(() => classified() > 0, 5000);
       expect(injected.fault.injected).toBe(10);
 
