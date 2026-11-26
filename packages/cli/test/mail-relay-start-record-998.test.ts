@@ -283,17 +283,17 @@ describe("relay start and the pid record", () => {
     CASE_TIMEOUT_MS,
   );
 
-  test("(e) runRelayDaemon publishes the temporary inode over the old record", async () => {
+  test.each([true, false])("(e) runRelayDaemon publishes the temporary inode (existing record: %s)", async (existing) => {
     const oldRecord = record(11111, "proc:1");
-    writeFileSync(relayPid, oldRecord);
+    if (existing) writeFileSync(relayPid, oldRecord);
     const evidence = join(home, "publication.json");
     const daemon = spawnScript(`
-      import { readFileSync, statSync, writeFileSync } from "node:fs";
+      import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
       import { dirname } from "node:path";
       import { runRelayDaemon, relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
       let observation = {};
       relayWriteTestHooks.afterTempWrite = (tmp, path) => {
-        observation = { old: readFileSync(path, "utf8"), tmp: statSync(tmp).ino,
+        observation = { old: existsSync(path) ? readFileSync(path, "utf8") : null, tmp: statSync(tmp).ino,
           sameDirectory: dirname(tmp) === dirname(path), bytes: readFileSync(tmp, "utf8") };
       };
       const loop = runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
@@ -305,7 +305,7 @@ describe("relay start and the pid record", () => {
     `);
     expect(await daemon.exited).toBe(0);
     const observed = JSON.parse(readFileSync(evidence, "utf8"));
-    expect(observed.old).toBe(oldRecord);
+    expect(observed.old).toBe(existing ? oldRecord : null);
     expect(observed.sameDirectory).toBe(true);
     expect(observed.tmp).toBeNumber();
     expect(observed.published).toBe(observed.tmp);
@@ -637,7 +637,8 @@ describe("relay start and the pid record", () => {
     expect(error!.message).not.toContain(join(homedir(), ".tps", "mail"));
   }, CASE_TIMEOUT_MS);
 
-  test.each([true, false])("claim messages distinguish verified identity (%s)", async (verified) => {
+  test.each(["matching token", "null token", "probe error"])("claim messages describe the recorded pid (%s)", async (scenario) => {
+    const verified = scenario === "matching token";
     stageProcStartTokens();
     const starter = spawnSleep();
     const token = processStartToken(starter.pid);
@@ -645,10 +646,29 @@ describe("relay start and the pid record", () => {
     const claim = `${JSON.stringify({ pid: starter.pid, startToken: verified ? token : null, relayClaim: true })}\n`;
     writeFileSync(relayPid, claim);
     expect(readRelayPidFile()).toMatchObject({ kind: "claim", identityVerified: verified });
-    const verifiedMessage = `A live process (pid ${starter.pid}) holds the start claim; it may or may not have started a relay (pid file ${relayPid}).`;
-    const unverifiedMessage = `A process with pid ${starter.pid} is running; whether it is the claimant could not be verified (pid file ${relayPid}).`;
+    const verifiedMessage = `The start claim names a live process (pid ${starter.pid}) whose start token matches the claim; it may or may not have started a relay (pid file ${relayPid}).`;
+    const unverifiedMessage = `The start claim names pid ${starter.pid}, which could not be shown to have exited; whether it is the claimant could not be verified (pid file ${relayPid}).`;
+    const runtimeArgs = ["--preload", PROC_START_TOKENS_PRELOAD];
+    const probed = join(home, "probe-error-observed");
+    if (scenario === "probe error") {
+      const preload = join(home, "probe-error.ts");
+      writeFileSync(preload, `
+        import { writeFileSync } from "node:fs";
+        const kill = process.kill.bind(process);
+        process.kill = (pid, signal) => {
+          if (pid === ${starter.pid} && signal === 0) {
+            writeFileSync(${JSON.stringify(probed)}, "EIO");
+            throw Object.assign(new Error("injected probe error"), { code: "EIO" });
+          }
+          return kill(pid, signal);
+        };
+      `);
+      runtimeArgs.push("--preload", preload);
+    }
     for (const action of ["status", "start", "stop"]) {
-      const result = await runCliAsync(["mail", "relay", action], ["--preload", PROC_START_TOKENS_PRELOAD]);
+      rmSync(probed, { force: true });
+      const result = await runCliAsync(["mail", "relay", action], runtimeArgs);
+      if (scenario === "probe error") expect(readFileSync(probed, "utf8")).toBe("EIO");
       expect(result.status).toBe(action === "status" ? 0 : 1);
       const message = action === "status" ? result.stdout : result.stderr;
       expect(message).toContain(verified ? verifiedMessage : unverifiedMessage);

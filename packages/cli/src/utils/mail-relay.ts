@@ -158,8 +158,8 @@ export const relayWriteTestHooks: {
   afterTempWrite?: (tmpPath: string, recordPath: string) => void;
 } = {};
 
-/** Write the record through a temporary file in the same directory, then rename
- *  it over the record path, so a reader sees the old record or the new one. */
+/** Rename a same-directory temporary file over an existing record without
+ *  exposing partial bytes; an absent path stays absent until the rename. */
 export function writeRelayPidRecordAtomically(path: string, text: string): void {
   const tmp = join(dirname(path), `.relay.pid.tmp.${process.pid}.${randomBytes(6).toString("hex")}`);
   try {
@@ -235,8 +235,8 @@ export type RelayPidState =
 
 export function describeRelayClaim(state: Extract<RelayPidState, { kind: "claim" }>): string {
   return state.identityVerified
-    ? `A live process (pid ${state.pid}) holds the start claim; it may or may not have started a relay (pid file ${state.path}).`
-    : `A process with pid ${state.pid} is running; whether it is the claimant could not be verified (pid file ${state.path}).`;
+    ? `The start claim names a live process (pid ${state.pid}) whose start token matches the claim; it may or may not have started a relay (pid file ${state.path}).`
+    : `The start claim names pid ${state.pid}, which could not be shown to have exited; whether it is the claimant could not be verified (pid file ${state.path}).`;
 }
 
 /** Classify the relay pid file. */
