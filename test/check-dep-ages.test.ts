@@ -1660,7 +1660,7 @@ describe("the workflow guard checks physical lines containing npm", () => {
   }, 5_000);
 });
 
-describe("the workflow guard reads shell: and refuses a leading redirection or an assignment containing < or > before a command word in unapproved run blocks (#941)", () => {
+describe("the workflow guard reads shell: and refuses leading redirections and variable assignments containing < or > before a command word in unapproved run blocks (#941)", () => {
   const WORKFLOW = "workflow-c";
 
   function runBlock(run: string): string {
@@ -1762,6 +1762,29 @@ describe("the workflow guard reads shell: and refuses a leading redirection or a
   }, 5_000);
 
   it.each([
+    "A+=1>/dev/null echo ok", "A+=1<>/dev/null n$'p\\155' ci", "A+=x>|/dev/null n$'p\\155' ci",
+  ])("refuses an append assignment containing an attached redirection before a command word: %s", (run) => {
+    const reason = "an unapproved run block has an assignment containing < or > before a command word";
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    ["A+=plain n$'p\\155' ci", "command word with ANSI-C quoting"],
+    ['A+="plain value" np? ci', "command word with a glob character"],
+  ])("refuses a restricted command word after an append assignment: %s", (run, reason) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    'A+="plain value" echo ok', 'A+="plain value"', "A+=1>/dev/null", "A+=1<>/dev/null", "A+=x>|/dev/null",
+  ])("preserves the quoted-value or assignment-only append outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+  }, 5_000);
+
+  it.each([
     "A=plain echo ok", "A=plain echo ok >/dev/null", 'A="$(printf x 2>/dev/null)"',
     "A=plain command -v echo", "A=plain command -V echo",
     "A=plain env", "A=plain command",
@@ -1775,6 +1798,9 @@ describe("the workflow guard reads shell: and refuses a leading redirection or a
     ["A=1>/dev/null echo ok", "", "input"],
     ["A=1<>/dev/null n$'p\\155' ci", "output", ""],
     ["A=x>|/dev/null npm ci", "", "input"],
+    ["A+=1>/dev/null echo ok", "", "input"],
+    ["A+=1<>/dev/null n$'p\\155' ci", "output", ""],
+    ["A+=x>|/dev/null n$'p\\155' ci", "", "input"],
   ])("shows real bash applies the assignment's attached redirection and runs the command: %s", (run, stdout, input) => {
     const result = spawnSync("bash", ["-c", `echo() { IFS= read -r value; printf output; printf 'ran:%s' "$value" >&2; return 17; }; npm() { echo; }; ${run}`], {
       encoding: "utf8",

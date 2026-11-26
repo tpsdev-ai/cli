@@ -396,6 +396,10 @@ function hasUnbalancedLineQuotes(lines: PhysicalLine[]): boolean {
   return false;
 }
 
+function isScalarAssignment(text: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(text);
+}
+
 /** Check physical run-step lines containing npm against approved blocks and shapes. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = physicalLines(run);
@@ -409,9 +413,9 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
         const commandIndex = clause.tokens.findIndex((token) =>
-          !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
+          !isScalarAssignment(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
         if (commandIndex > 0 && clause.tokens.slice(0, commandIndex).some((token) =>
-          /^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text) && /[<>]/.test(token.text))) {
+          isScalarAssignment(token.text) && /[<>]/.test(token.text))) {
           refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed)");
         }
         const word = commandWord(clause.tokens, true);
@@ -773,7 +777,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false): ShellToken[] 
         while (index < line.length) {
           const inner = line[index];
           // Keep assignment substitutions whole when locating the outer command word.
-          if (keepRedirectAmpersand && quote === '"' && /^[A-Za-z_][A-Za-z0-9_]*=/.test(text) && inner === "$" && line[index + 1] === "(") {
+          if (keepRedirectAmpersand && quote === '"' && isScalarAssignment(text) && inner === "$" && line[index + 1] === "(") {
             const span = parenSpan(line, index + 1);
             if (span !== null && "end" in span) {
               text += line.slice(index, span.end + 1);
@@ -997,7 +1001,7 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
 }
 
 /**
- * Skip VAR=val assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
+ * Skip variable assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
  * header is not an invocation unless `case` is requested for refusal.
  */
@@ -1007,7 +1011,7 @@ function commandWord(tokens: ShellToken[], includeCase = false): { index: number
   while (index < tokens.length) {
     const token = tokens[index];
     const text = stripOuterQuotes(token.text);
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
+    if (isScalarAssignment(token.text)) {
       index++;
       continue;
     }
