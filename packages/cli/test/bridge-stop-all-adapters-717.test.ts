@@ -946,6 +946,99 @@ describe("bridge stop re-read exit status (cli#970)", () => {
     },
     TIMEOUT,
   );
+
+  test(
+    "an unchanged duplicate record is removed once the first record stops the process",
+    async () => {
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(firstPath, record(child.pid, token));
+      writeFileSync(secondPath, record(child.pid, token));
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(pidState(child.pid)).toBe("gone");
+      expect(existsSync(secondPath)).toBe(false);
+      expect(lines).toContain(`Bridge (pid ${child.pid}) stopped; duplicate pid file ${secondPath} removed.`);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a duplicate record whose bytes changed after the plan is kept once the first record stops the process",
+    async () => {
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(firstPath, record(child.pid, token));
+      writeFileSync(secondPath, record(child.pid, token));
+      const changedBytes = `${JSON.stringify({ pid: child.pid, startToken: token, note: "changed" })}\n`;
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        // The duplicate changes after the up-front plan, before its re-read.
+        writeFileSync(secondPath, changedBytes);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(pidState(child.pid)).toBe("gone");
+      expect(readFileSync(secondPath, "utf8")).toBe(changedBytes);
+      expect(lines).toContain(`Bridge (pid ${child.pid}) stopped; pid file ${secondPath} is stale.`);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a stale record for a pid this run did not stop is left in place",
+    async () => {
+      const stoppedChild = spawnSleep();
+      const otherChild = spawnSleep();
+      const otherToken = tokenOf(otherChild.pid);
+      const alphaPath = join(runDir, "bridge-alpha.pid");
+      const betaPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(alphaPath, record(stoppedChild.pid, tokenOf(stoppedChild.pid)));
+      writeFileSync(betaPath, record(otherChild.pid, otherToken));
+
+      const lines: string[] = [];
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const previous = setBridgeStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+        if (pid === stoppedChild.pid) killAndWaitGone(otherChild.pid, otherToken);
+      });
+      try {
+        await runBridge({ action: "stop" });
+      } finally {
+        setBridgeStopSignal(previous);
+        restore();
+      }
+
+      expect(pidState(stoppedChild.pid)).toBe("gone");
+      expect(pidState(otherChild.pid)).toBe("gone");
+      expect(existsSync(betaPath)).toBe(true);
+      expect(lines).toContain(`Bridge (pid ${otherChild.pid}) stopped; pid file ${betaPath} is stale.`);
+    },
+    TIMEOUT,
+  );
 });
 
 describe("bridge stop timeout", () => {

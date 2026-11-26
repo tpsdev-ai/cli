@@ -975,7 +975,7 @@ describe("bridge stop identity", () => {
   );
 
   test(
-    "two records naming the same verified process send one signal, remove the first record, and leave the second stale record",
+    "two records naming the same verified process send one signal and remove both records",
     async () => {
       const child = spawnChild();
       const token = processStartToken(child.pid);
@@ -995,9 +995,9 @@ describe("bridge stop identity", () => {
 
       expect(signals).toEqual([child.pid]);
       expect(existsSync(bridgePid)).toBe(false);
-      // The second record's re-read is stale for the pid this stop verified, so
-      // it is left in place, as relay leaves its record.
-      expect(existsSync(legacyBridgePid)).toBe(true);
+      // The second record's re-read is stale for the pid this stop verified,
+      // and its bytes are unchanged from the plan, so the duplicate is removed.
+      expect(existsSync(legacyBridgePid)).toBe(false);
     },
     TIMEOUT,
   );

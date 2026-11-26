@@ -1,0 +1,1 @@
+- **`tps bridge stop` removes an unchanged duplicate record after it stops the process.** A second record for the same pid whose bytes match the plan is removed through the final byte check; a record whose bytes changed is kept.
