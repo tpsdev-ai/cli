@@ -594,7 +594,7 @@ describe("receipt scan — cli#1063 a NACK record never settles", () => {
 // ── cli#1063: a threaded reply with NO obligation marker (local route) ──────
 
 describe("receipt scan — cli#1063 unmarked threaded reply (office local delivery)", () => {
-  /** A reply run as `tps mail send <to> --reply-to <id>` on an OFFICE host
+  /** A reply run as `tps mail send <to> --reply-to=<id>` on an OFFICE host
    *  writes it: the thread rides inside the signed envelope; there is no marker
    *  and no wrapper thread. A branch host relays a bound recipient through the
    *  outbox, where this marker-less form is not enabled; that route is not

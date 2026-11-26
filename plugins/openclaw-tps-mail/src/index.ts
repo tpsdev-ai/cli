@@ -772,7 +772,9 @@ function buildEnvelope(msg: TpsMailBody, reply: { mailDir: string | null } | nul
   // a CONFIGURED mailDir is passed to the CLI, shell-quoted. Elsewhere the
   // plain instruction stays.
   const threaded = reply !== null && isValidEnvelopeId(msg.envelopeId);
-  const replyTo = threaded && reply !== null ? ` --reply-to ${msg.envelopeId}` : "";
+  // The `=` form is required: an envelope id may begin with `-`, and the CLI
+  // flag reader takes a following `-`-prefixed token as a missing value.
+  const replyTo = threaded && reply !== null ? ` --reply-to=${msg.envelopeId}` : "";
   const dirPrefix = threaded && reply !== null && reply.mailDir !== null ? `TPS_MAIL_DIR=${shellQuote(reply.mailDir)} ` : "";
   return [
     "[TPS Mail]",

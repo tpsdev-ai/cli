@@ -1241,7 +1241,7 @@ export interface ReceiptScanOptions {
  *       when it does not.
  *
  *   (3) UNMARKED THREADED REPLY (cli#1063, OFFICE local delivery only) — a
- *       reply the agent sent itself (`tps mail send --reply-to <inbound
+ *       reply the agent sent itself (`tps mail send --reply-to=<inbound
  *       envelope id>`) is a committed record in the inbound sender's maildir
  *       with no marker and no wrapper thread: its thread rides only INSIDE the
  *       signed envelope. A signed-mode scan the caller enables

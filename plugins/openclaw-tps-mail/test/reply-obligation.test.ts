@@ -51,14 +51,14 @@ const mockApi: any = {
 };
 pluginModule.register(mockApi);
 
-function buildSignedBody(from: string, to: string, body: string, seed: Buffer): string {
+function buildSignedBody(from: string, to: string, body: string, seed: Buffer, messageId?: string): string {
   const now = new Date().toISOString();
   const chain: ChainEntry[] = [
     { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
     { agent: from, kind: "agent", timestamp: now, rationale: `agent ${from} dispatches`, signature: null },
   ];
   const env = signEnvelope(
-    { v: 1, from, to, body, messageId: `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain },
+    { v: 1, from, to, body, messageId: messageId ?? `env-${Math.random().toString(36).slice(2, 10)}`, timestamp: now, delegationChain: chain },
     { [from]: seed },
   );
   return JSON.stringify(env);
@@ -188,6 +188,8 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       /** Make the runtime's inbound-context finalizer throw, so a startup intake
        *  rejects after promotion. */
       finalizeContextThrows?: boolean;
+      /** The inbound's signed envelope id (default: a generated `env-` id). */
+      envelopeId?: string;
     } = {},
   ) {
     if (abortController.signal.aborted) abortController = new AbortController();
@@ -220,7 +222,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
     const bodyFrom = opts.bodyFrom ?? sender;
     const seed = opts.bodySeed ?? FLINT_SEED;
-    const signedBody = buildSignedBody(bodyFrom, agentId, "inbound payload", seed);
+    const signedBody = buildSignedBody(bodyFrom, agentId, "inbound payload", seed, opts.envelopeId);
     const inboundId = `msg-${Math.random().toString(36).slice(2, 10)}`;
     const inbound = {
       id: inboundId,
@@ -720,11 +722,11 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     // The plugin's account config sets a mailDir, so the command passes it to
     // the CLI: the reply must land where this account's receipt scan reads.
     expect(envelopeText).toContain(
-      `Reply via: TPS_MAIL_DIR=${tempMailDir} tps mail send flint --reply-to ${h.inboundEnvelopeId} "<your response>"`,
+      `Reply via: TPS_MAIL_DIR=${tempMailDir} tps mail send flint --reply-to=${h.inboundEnvelopeId} "<your response>"`,
     );
     // The local record id rides on the ID line, not as the reply thread.
     expect(envelopeText).toContain(`ID: ${h.inboundId}`);
-    expect(envelopeText).not.toContain(`--reply-to ${h.inboundId}`);
+    expect(envelopeText).not.toContain(`--reply-to=${h.inboundId}`);
     await h.stop();
   }, 15000);
 
@@ -741,7 +743,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
   }, 15000);
 
   /**
-   * A reply run as the prompt prints it (`tps mail send <to> --reply-to <inbound
+   * A reply run as the prompt prints it (`tps mail send <to> --reply-to=<inbound
    * envelope id>`, with the account's mailDir) writes on the OFFICE local route:
    * the signed envelope is the body, with no obligation marker and no wrapper
    * thread. A branch host relays a bound recipient through the outbox, where
@@ -893,7 +895,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     await pollUntil(() => h.dispatched !== null, 4000);
     const promptText = h.dispatched.ctx.BodyForAgent as string;
     const quotedDir = `'${specialMailDir.replace(/'/g, "'\\''")}'`;
-    expect(promptText).toContain(`TPS_MAIL_DIR=${quotedDir} tps mail send flint --reply-to ${h.inboundEnvelopeId}`);
+    expect(promptText).toContain(`TPS_MAIL_DIR=${quotedDir} tps mail send flint --reply-to=${h.inboundEnvelopeId}`);
     const suggestion = /^Reply via: (.+)$/m.exec(promptText)?.[1];
     expect(suggestion).toBeDefined();
     const command = suggestion!.replace('"<your response>"', '"the real CLI reply"');
@@ -931,6 +933,72 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(acked, JSON.stringify(obFile())).toBe(true);
     const curFiles = readdirSafe(resolve(specialMailDir, "anvil", "cur")).filter((f) => f.endsWith(".json"));
     const cur = curFiles.length > 0 ? JSON.parse(readFileSync(resolve(specialMailDir, "anvil", "cur", curFiles[0]!), "utf-8")) : null;
+    expect(cur?.ackedAt).toBeDefined();
+    await h.stop();
+  }, 30000);
+
+  it("cli#1063: an inbound envelope id that begins with `-` survives the printed command", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+    // ENVELOPE_ID_SHAPE allows a leading hyphen. A `--reply-to <id>` print
+    // cannot carry such an id: the CLI flag reader takes a `-`-prefixed value
+    // as missing. The printed command therefore uses `--reply-to=<id>`, and
+    // this test runs that command through the real CLI.
+    const hyphenId = "-env-1063-leading-hyphen";
+    const hyphenMailDir = join(tempHome, "mail for hyphen");
+    const h = await start("anvil", "flint", {
+      localSender: true,
+      mailDir: hyphenMailDir,
+      accounts: { default: { mailDir: hyphenMailDir, enabled: true } },
+      envelopeId: hyphenId,
+    });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    expect(h.inboundEnvelopeId).toBe(hyphenId);
+    const promptText = h.dispatched.ctx.BodyForAgent as string;
+    expect(promptText).toContain(`tps mail send flint --reply-to=${hyphenId} "<your response>"`);
+    expect(promptText).not.toContain(`--reply-to ${hyphenId}`);
+
+    const suggestion = /^Reply via: (.+)$/m.exec(promptText)?.[1];
+    expect(suggestion).toBeDefined();
+    const command = suggestion!.replace('"<your response>"', '"a hyphen-threaded reply"');
+
+    // Run the command EXACTLY as printed: a `tps` shim on PATH runs the real
+    // CLI from this worktree, and the agent's environment supplies its id and
+    // its key.
+    const shimDir = join(tempHome, "shim-bin");
+    mkdirSync(shimDir, { recursive: true });
+    const cliBin = resolve(import.meta.dir, "../../../packages/cli/bin/tps.ts");
+    const quotedCli = `'${cliBin.replace(/'/g, "'\\''")}'`;
+    writeFileSync(join(shimDir, "tps"), `#!/bin/sh\nexec bun ${quotedCli} "$@"\n`, { mode: 0o755 });
+    const run = spawnSync("/bin/sh", ["-c", command], {
+      cwd: tempHome,
+      env: { ...process.env, TPS_AGENT_ID: "anvil", PATH: `${shimDir}:${process.env.PATH ?? ""}` },
+      encoding: "utf-8",
+      timeout: 20000,
+    });
+    expect(run.status, `the printed command failed: ${run.stderr || run.stdout}`).toBe(0);
+
+    const flintNew = resolve(hyphenMailDir, "flint", "new");
+    const landed = await pollUntil(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 3000);
+    expect(landed, "the reply landed in the inbound sender's maildir").toBe(true);
+    const record = JSON.parse(readFileSync(resolve(flintNew, readdirSafe(flintNew).find((f) => f.endsWith(".json"))!), "utf-8"));
+    const env: Envelope = JSON.parse(record.body);
+    expect(env.replyToId).toBe(hyphenId);
+    const anvilKeys = { async getAgent(n: string) { return n === "anvil" ? { publicKey: pubkeyFromSeed(ANVIL_SEED) } : null; } };
+    expect(await verifyEnvelope(env, anvilKeys)).toEqual({ ok: true });
+
+    // Drive the post-turn scan: the signed thread settles the obligation.
+    const obId = h.obligationId()!;
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+    const obFile = () => {
+      try { return JSON.parse(readFileSync(resolve(hyphenMailDir, "anvil", ".obligations", `${h.inboundId}.json`), "utf-8")); } catch { return null; }
+    };
+    const acked = await pollUntil(() => obFile()?.state === "acked", 4000);
+    expect(acked, JSON.stringify(obFile())).toBe(true);
+    const cur = readdirSafe(resolve(hyphenMailDir, "anvil", "cur"))
+      .filter((f) => f.endsWith(".json"))
+      .map((f) => JSON.parse(readFileSync(resolve(hyphenMailDir, "anvil", "cur", f), "utf-8")))
+      .find((r) => r.id === h.inboundId);
     expect(cur?.ackedAt).toBeDefined();
     await h.stop();
   }, 30000);
