@@ -22,8 +22,8 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 import { mailboxReplayStore } from "@tpsdev-ai/agent";
-import pluginModule, { awaitStartupCurSweepForTests, setObligationDeadlineSweepForTests } from "../src/index.js";
-import { createObligation, readObligation } from "../src/obligations.js";
+import pluginModule, { awaitStartupCurSweepForTests, setObligationDeadlineSweepForTests, setObligationNowForTests, setObligationRetryDelaysForTests } from "../src/index.js";
+import { createObligation, readObligation, setBeforeTransitionForTests } from "../src/obligations.js";
 
 let capturedPlugin: any;
 const mockApi: any = {
@@ -114,6 +114,40 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
 
   function obligation(inboundId: string): any | null {
     return readObligation(mailDir, AGENT, inboundId);
+  }
+
+  function seedNullDeadline(inboundId: string) {
+    const envelopeJson = signedEnvelopeBody(SENDER, AGENT, "inbound payload", SENDER_SEED);
+    const envelope: Envelope = JSON.parse(envelopeJson);
+    mkdirSync(resolve(mailDir, AGENT, "cur"), { recursive: true });
+    mkdirSync(resolve(mailDir, AGENT, ".obligations"), { recursive: true });
+    writeFileSync(
+      resolve(mailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
+      JSON.stringify({
+        id: inboundId,
+        from: SENDER,
+        to: AGENT,
+        body: envelope.body,
+        timestamp: envelope.timestamp,
+        read: false,
+        envelopeId: envelope.messageId,
+        envelope,
+      }, null, 2),
+      "utf-8",
+    );
+    mailboxReplayStore(resolve(mailDir, AGENT)).recordConsumed(envelope.messageId);
+    return createObligation(mailDir, AGENT, () => ({
+      obligationId: randomUUID(),
+      inboundId,
+      inboundEnvelopeId: envelope.messageId,
+      inboundTimestamp: envelope.timestamp,
+      from: SENDER,
+      to: AGENT,
+      accountId: "default",
+      state: "pending",
+      deadlineAt: null,
+      attempts: 1,
+    }));
   }
 
   function curFile(inboundId: string): any | null {
@@ -216,37 +250,7 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
     const startupDone = await awaitStartupCurSweepForTests("default", inboundId, 10000);
     expect(startupDone, "startup recovery completes before the record is seeded").toBe(true);
 
-    const envelopeJson = signedEnvelopeBody(SENDER, AGENT, "inbound payload", SENDER_SEED);
-    const envelope: Envelope = JSON.parse(envelopeJson);
-    mkdirSync(resolve(mailDir, AGENT, "cur"), { recursive: true });
-    mkdirSync(resolve(mailDir, AGENT, ".obligations"), { recursive: true });
-    writeFileSync(
-      resolve(mailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`),
-      JSON.stringify({
-        id: inboundId,
-        from: SENDER,
-        to: AGENT,
-        body: envelope.body,
-        timestamp: envelope.timestamp,
-        read: false,
-        envelopeId: envelope.messageId,
-        envelope,
-      }, null, 2),
-      "utf-8",
-    );
-    mailboxReplayStore(resolve(mailDir, AGENT)).recordConsumed(envelope.messageId);
-    createObligation(mailDir, AGENT, () => ({
-      obligationId: randomUUID(),
-      inboundId,
-      inboundEnvelopeId: envelope.messageId,
-      inboundTimestamp: envelope.timestamp,
-      from: SENDER,
-      to: AGENT,
-      accountId: "default",
-      state: "pending",
-      deadlineAt: null,
-      attempts: 1,
-    }));
+    seedNullDeadline(inboundId);
 
     const armed = await pollUntil(() => !!obligation(inboundId)?.deadlineAt, 2000);
     expect(armed, "the periodic sweep arms the null deadline").toBe(true);
@@ -283,4 +287,71 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
       setObligationDeadlineSweepForTests(sweepPrev);
     }
   }, 20000);
+
+  it("(d) the sweep skips a deadline owned by an armed timer", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "60000";
+    const h = startWith("hold", { inbound: false });
+    const inboundId = `msg-${randomUUID()}`;
+    try {
+      expect(await awaitStartupCurSweepForTests("default", inboundId, 10000)).toBe(true);
+      seedNullDeadline(inboundId);
+      expect(await pollUntil(() => typeof obligation(inboundId)?.deadlineAt === "string", 2000)).toBe(true);
+      expect(obligation(inboundId)?.state).toBe("yielded");
+      setObligationNowForTests(() => Date.now() + 120_000);
+      await new Promise((r) => setTimeout(r, 250));
+      expect(obligation(inboundId)?.state).toBe("yielded");
+    } finally {
+      setObligationNowForTests(undefined);
+      await h.stop();
+    }
+  }, 15000);
+
+  it("(e) the sweep warns with the path of an invalid obligation file", async () => {
+    const h = startWith("hold", { inbound: false });
+    try {
+      expect(await awaitStartupCurSweepForTests("default", h.inboundId, 10000)).toBe(true);
+      const dir = resolve(mailDir, AGENT, ".obligations");
+      mkdirSync(dir, { recursive: true });
+      const path = resolve(dir, `bad-${randomUUID()}.json`);
+      writeFileSync(path, "{");
+      expect(await pollUntil(() => h.logs.some((line) =>
+        line.startsWith("WARN tps-mail: obligation-deadline-sweep-unreadable:") && line.includes(path),
+      ), 1000)).toBe(true);
+    } finally {
+      await h.stop();
+    }
+  }, 15000);
+
+  it("(f) a sweep arm write failure exhausts its retry and stays skipped", async () => {
+    const h = startWith("hold", { inbound: false });
+    const inboundId = `msg-${randomUUID()}`;
+    const retryPrev = setObligationRetryDelaysForTests([10, 20, 30]);
+    let armWrites = 0;
+    try {
+      expect(await awaitStartupCurSweepForTests("default", inboundId, 10000)).toBe(true);
+      setBeforeTransitionForTests((id, next) => {
+        if (id === inboundId && next === "yielded") {
+          armWrites++;
+          throw new Error("injected sweep arm write failure");
+        }
+      });
+      const { record } = seedNullDeadline(inboundId);
+      const warnings = () => h.logs.filter((line) =>
+        line.startsWith("WARN tps-mail: obligation-retry-exhausted:") && line.includes(record.obligationId),
+      );
+      expect(await pollUntil(() => warnings().length > 0, 1000)).toBe(true);
+      expect(warnings()).toHaveLength(1);
+      expect(armWrites).toBeGreaterThan(1);
+      const exhaustedWrites = armWrites;
+      await new Promise((r) => setTimeout(r, 250));
+      expect(armWrites).toBe(exhaustedWrites);
+      expect(warnings()).toHaveLength(1);
+      expect(obligation(inboundId)?.state).toBe("pending");
+      expect(obligation(inboundId)?.deadlineAt).toBeNull();
+    } finally {
+      setBeforeTransitionForTests(undefined);
+      setObligationRetryDelaysForTests(retryPrev);
+      await h.stop();
+    }
+  }, 15000);
 });
