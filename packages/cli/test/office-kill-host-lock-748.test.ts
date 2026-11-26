@@ -18,6 +18,7 @@ import {
   type HostConnectionState,
 } from "../src/utils/connection-state.js";
 import { mailLockPath } from "../src/utils/mail-lock.js";
+import { standInTail } from "../../../test/helpers/stand-in.mjs";
 
 /** Read the on-disk record, so the assertions pin what office kill and
  *  writeHostState leave behind. */
@@ -234,7 +235,7 @@ describe("host state record lock", () => {
           writeHostState(state);
           writeFileSync(written, "");
           process.on("SIGTERM", () => {});
-          setInterval(() => {}, 1000);
+          ${standInTail(process.pid)}
         `,
         "utf8",
       );
