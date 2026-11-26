@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
+import { standInOwnerPidFromEnv, standInTail } from "../helpers/stand-in.mjs";
 
 const root = mkdtempSync(join(tmpdir(), "heartbeat-post-rpc-"));
 const binDir = join(root, "bin");
 mkdirSync(binDir);
 writeFileSync(join(binDir, "openclaw"), `#!/usr/bin/env node
-setInterval(() => {}, 1000);
+${standInTail(standInOwnerPidFromEnv())}
 setTimeout(() => process.exit(0), 10_000);
 `, { mode: 0o755 });
 const heartbeat = join(root, "heartbeat.mjs");

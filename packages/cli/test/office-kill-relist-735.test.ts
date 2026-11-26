@@ -13,6 +13,7 @@ import { join, resolve } from "node:path";
 import { pidState, processStartToken } from "@tpsdev-ai/agent";
 import { hostStatePath } from "../src/utils/connection-state.js";
 import { serializePidRecord } from "../src/utils/pid-file.js";
+import { standInTail } from "../../../test/helpers/stand-in.mjs";
 
 const TEST_TIMEOUT = 120_000;
 const HOOK_TIMEOUT = 60_000;
@@ -299,7 +300,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(${JSON.stringify(readyFile)}, "");
-          setInterval(() => {}, 1000);
+          ${standInTail(process.pid)}
         `,
         "utf8",
       );
@@ -375,7 +376,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(ready(index), "");
-          setInterval(() => {}, 1000);
+          ${standInTail(process.pid)}
         `,
         "utf8",
       );
@@ -466,7 +467,7 @@ describe("office kill re-lists host records", () => {
               process.exit(0);
             });
             writeFileSync(ready("predecessor"), "");
-            setInterval(() => {}, 1000);
+            ${standInTail(process.pid)}
           } else if (role === "launcher") {
             waitForAbsent(record, 30000);
             // Write the successor record while the kill command is held at its
@@ -484,7 +485,7 @@ describe("office kill re-lists host records", () => {
               process.exit(0);
             });
             writeFileSync(ready("successor"), "");
-            setInterval(() => {}, 1000);
+            ${standInTail(process.pid)}
           }
         `,
         "utf8",
@@ -549,7 +550,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(${JSON.stringify(readyFile)}, "");
-          setInterval(() => {}, 1000);
+          ${standInTail(process.pid)}
         `,
         "utf8",
       );
@@ -624,7 +625,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(join(dir, "ready-" + index), "");
-          setInterval(() => {}, 1000);
+          ${standInTail(process.pid)}
         `,
         "utf8",
       );

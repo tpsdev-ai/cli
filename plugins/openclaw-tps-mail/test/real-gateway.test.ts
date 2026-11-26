@@ -29,6 +29,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { isMailboxMessageFile } from "@tpsdev-ai/agent";
+import { standInTail } from "../../../test/helpers/stand-in.mjs";
 import { ACK_DEADLINE_MS, CUR_MOVE_DEADLINE_MS, DRIVER_SUPERVISOR_TIMEOUT_MS, DRIVER_TEST_TIMEOUT_MS, GATEWAY_BOOT_DEADLINE_MS, NAMED_WAIT_BUDGET_MS, REPLY_DEADLINE_MS, SIGKILL_REAP_BUDGET_MS, SIGTERM_BUDGET_MS, SUPERVISOR_CLEANUP_MS, SUPERVISOR_MARGIN_MS, decideSettledRead, finalizeGatewayRun, namedWaitBudgetMs, readSettledState, stopGateway } from "./real-gateway-driver.mjs";
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -251,11 +252,11 @@ function settledListing(files: Array<{ name: string; body: string }>): SettledFi
  */
 async function startGracefulStub(
   node: string,
-  script = 'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+  script = 'process.on("SIGTERM", () => process.exit(0)); process.stdout.write("ready\\n");',
   timeoutMs = 5_000,
   onSpawn?: (stub: ReturnType<typeof spawn>) => void,
 ): Promise<ReturnType<typeof spawn>> {
-  const stub = spawn(node, ["--input-type=module", "-e", script], { stdio: ["ignore", "pipe", "pipe"] });
+  const stub = spawn(node, ["--input-type=module", "-e", `${script}\n${standInTail(process.pid)}`], { stdio: ["ignore", "pipe", "pipe"] });
   try {
     onSpawn?.(stub);
     await new Promise<void>((resolve, reject) => {
@@ -288,7 +289,7 @@ it("stops a stub that times out before readiness", async () => {
   let stub: ReturnType<typeof spawn> | undefined;
   try {
     await expect(
-      startGracefulStub(node, "setInterval(() => {}, 1000);", 500, (child) => {
+      startGracefulStub(node, "", 500, (child) => {
         stub = child;
       }),
     ).rejects.toThrow("stub gateway never booted");
@@ -681,7 +682,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
         [
           "--input-type=module",
           "-e",
-          'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); setInterval(() => {}, 1000);',
+          'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); ' + standInTail(process.pid),
         ],
         { stdio: ["ignore", "pipe", "pipe"] },
       );
@@ -929,7 +930,7 @@ describe("cli#1034 — a gateway that exits on its first SIGTERM is reported as 
     let stub: ReturnType<typeof spawn> | null = null;
     try {
       // No SIGTERM handler: the child is terminated by the first signal.
-      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n");');
 
       const mailDir = join(root, "mail");
       for (const dir of [
@@ -1133,7 +1134,7 @@ describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", ()
     try {
       stub = await startGracefulStub(
         node,
-        'process.on("SIGTERM", () => process.kill(process.pid, "SIGHUP")); process.stdout.write("ready\\n"); setInterval(() => {}, 1000);',
+        'process.on("SIGTERM", () => process.kill(process.pid, "SIGHUP")); process.stdout.write("ready\\n");',
       );
       const report = { readErrors: [] as string[], ackLanded: true, ackTimedOut: false };
       const reportPath = join(root, "report.json");
@@ -1175,7 +1176,7 @@ describe("cli#1058 — only the SIGTERM stopGateway sent is a graceful stop", ()
     let stub: ReturnType<typeof spawn> | null = null;
     try {
       // No SIGTERM handler: the default disposition ends the process on SIGTERM.
-      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n"); setInterval(() => {}, 1000);');
+      stub = await startGracefulStub(node, 'process.stdout.write("ready\\n");');
       stub.kill("SIGTERM");
       await new Promise((resolve) => stub!.once("exit", resolve));
       expect(stub.signalCode).toBe("SIGTERM");
@@ -1427,7 +1428,7 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
       const descendantScript = `
         import { writeFileSync } from "node:fs";
         writeFileSync(process.argv[1], String(process.pid));
-        setInterval(() => {}, 1000);
+${standInTail(process.pid)}
         process.send("ready");
       `;
       const script = `
@@ -1466,9 +1467,9 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
       const script = `
         import { spawn } from "node:child_process";
         import { writeFileSync } from "node:fs";
-        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", "setInterval(() => {}, 1000);"], { stdio: ["ignore", "inherit", "inherit"] });
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(standInTail(process.pid))}], { stdio: ["ignore", "inherit", "inherit"] });
         writeFileSync(process.argv[1], String(grandchild.pid));
-        setInterval(() => {}, 1000);
+${standInTail(process.pid)}
       `;
       const runPromise = supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
       // Read the PID beside the run: cleanup needs it even if `supervise` does not return.
