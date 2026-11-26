@@ -9,13 +9,17 @@
  */
 
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
+  linkSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmSync,
-  writeFileSync,
+  writeSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -105,16 +109,28 @@ export function relayPidLockRoot(path: string = relayPidPath()): string {
 }
 
 /** Hold the relay pid record lock across a synchronous critical section. A
- *  timeout is a refusal, not a proceed. */
-export function withRelayPidLock<T>(action: string, fn: () => T): T {
+ *  timeout is a refusal, not a proceed. A caller with a shared budget passes
+ *  the remaining time and the deadline; the deadline is re-checked under the
+ *  lock so a late acquisition cannot start another critical section. */
+export function withRelayPidLock<T>(
+  action: string,
+  fn: () => T,
+  budget?: { timeoutMs?: number; deadline?: number },
+): T {
   const root = relayPidLockRoot();
-  const lock = acquireMailLockSync(root, { timeoutMs: RELAY_PID_LOCK_TIMEOUT_MS });
+  const timeoutMs = budget?.timeoutMs ?? RELAY_PID_LOCK_TIMEOUT_MS;
+  const lock = acquireMailLockSync(root, { timeoutMs });
   if (lock === null) {
     throw new Error(
-      `Mail relay pid record lock ${mailLockPath(root)} could not be acquired within ${RELAY_PID_LOCK_TIMEOUT_MS} ms; refusing to ${action}.`,
+      `Mail relay pid record lock ${mailLockPath(root)} could not be acquired within ${timeoutMs} ms; refusing to ${action}.`,
     );
   }
   try {
+    if (budget?.deadline !== undefined && Date.now() >= budget.deadline) {
+      throw new Error(
+        `Mail relay pid record lock ${mailLockPath(root)} was acquired after the handoff deadline; refusing to ${action}.`,
+      );
+    }
     return fn();
   } finally {
     lock.release();
@@ -153,17 +169,55 @@ export function snapshotRelayPidRecord(): { state: RelayPidState; raw: Buffer | 
   return { state: classifyRelayPidSnapshot(snapshot), raw: snapshot.raw };
 }
 
-/** A test support hook that observes between the temporary write and the rename. */
+/** Test hooks: `writeRecordBytes` replaces the exclusive create-and-fill step
+ *  (so a failure can be injected at the write), and `afterTempWrite` observes
+ *  between the temporary write and its publication. */
 export const relayWriteTestHooks: {
   afterTempWrite?: (tmpPath: string, recordPath: string) => void;
+  writeRecordBytes?: (path: string, text: string) => void;
 } = {};
+
+function writeRecordBytes(path: string, text: string): void {
+  if (relayWriteTestHooks.writeRecordBytes) {
+    relayWriteTestHooks.writeRecordBytes(path, text);
+    return;
+  }
+  const fd = openSync(path, "wx", 0o600);
+  try {
+    writeSync(fd, text);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function tempRecordPath(path: string): string {
+  return join(dirname(path), `.relay.pid.tmp.${process.pid}.${randomBytes(6).toString("hex")}`);
+}
+
+/** Create the record at a free path; EEXIST means another claimant won. The
+ *  record bytes are complete before the hard link publishes them, and the
+ *  temporary file is removed on every path. */
+export function claimRelayPidRecord(path: string, text: string): void {
+  const tmp = tempRecordPath(path);
+  try {
+    writeRecordBytes(tmp, text);
+    linkSync(tmp, path);
+  } finally {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+}
 
 /** Rename a same-directory temporary file over an existing record without
  *  exposing partial bytes; an absent path stays absent until the rename. */
 export function writeRelayPidRecordAtomically(path: string, text: string): void {
-  const tmp = join(dirname(path), `.relay.pid.tmp.${process.pid}.${randomBytes(6).toString("hex")}`);
+  const tmp = tempRecordPath(path);
   try {
-    writeFileSync(tmp, text, { encoding: "utf-8", flag: "wx" });
+    writeRecordBytes(tmp, text);
     relayWriteTestHooks.afterTempWrite?.(tmp, path);
     renameSync(tmp, path);
   } finally {

@@ -849,7 +849,7 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, claimRelayPidRecord, writeRelayPidRecordAtomically, withRelayPidLock, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
       const { homeDir } = await import("../utils/home.js");
       const mailDir = join(homeDir(), ".tps", "mail");
@@ -1142,7 +1142,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             }
             const text = serializeRelayClaimRecord(process.pid, processStartToken(process.pid));
             try {
-              writeFileSync(path, text, { encoding: "utf-8", flag: "wx" });
+              claimRelayPidRecord(path, text);
               return text;
             } catch (error) {
               if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
@@ -1156,7 +1156,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         const changedRecord = (raw: Buffer | null): string => raw === null
           ? `The pid record at ${path} is missing or unreadable; inspect it.`
           : `The pid record at ${path} changed; inspect it before removing it.`;
-        const claimResult = (liveChildPid?: number): string => {
+        const claimResult = (liveChildPid?: number, budget?: { timeoutMs: number; deadline: number }): string => {
           try {
             return withRelayPidLock("update the relay start claim", () => {
               const current = snapshotPidRecord(path);
@@ -1168,7 +1168,7 @@ export async function runMail(args: MailArgs): Promise<void> {
               }
               if (removeRelayPidFile(path) === "removed") return `The claim at ${path} was released.`;
               return changedRecord(current.raw);
-            });
+            }, budget);
           } catch (error) {
             if (liveChildPid !== undefined) throw error;
             const current = snapshotPidRecord(path);
@@ -1236,7 +1236,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         });
         let result: string | undefined;
         let handoffError: unknown;
-        // Retry the handoff until it succeeds, the child exits, or one lock timeout passes.
+        // Retry the handoff until it succeeds, the child exits, or one lock budget passes.
         const handoffDeadline = Date.now() + RELAY_PID_LOCK_TIMEOUT_MS;
         while (result === undefined) {
           exited ||= daemon.exitCode !== null || daemon.signalCode !== null;
@@ -1244,9 +1244,10 @@ export async function runMail(args: MailArgs): Promise<void> {
             result = claimResult();
             break;
           }
-          if (handoffError !== undefined && Date.now() >= handoffDeadline) break;
+          const remaining = handoffDeadline - Date.now();
+          if (handoffError !== undefined && remaining <= 0) break;
           try {
-            result = claimResult(daemonPid);
+            result = claimResult(daemonPid, { timeoutMs: Math.max(0, remaining), deadline: handoffDeadline });
           } catch (error) {
             handoffError = error;
             await new Promise((r) => setTimeout(r, 25));

@@ -236,11 +236,38 @@ describe("relay start and the pid record", () => {
   test(
     "(c) two concurrent starts launch one relay and the loser exits non-zero",
     async () => {
+      const launches = join(home, "launches");
+      const ready = join(home, "claim-ready");
+      const preload = join(home, "count-launches.ts");
+      writeFileSync(preload, `
+        import { appendFileSync, closeSync, fsyncSync, openSync, readFileSync, writeSync } from "node:fs";
+        import { spawn } from "node:child_process";
+        import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+        import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
+        const realSpawn = spawn;
+        relayStartTestHooks.spawn = (...args) => {
+          appendFileSync(${JSON.stringify(launches)}, process.pid + "\\n");
+          return realSpawn(...args);
+        };
+        relayWriteTestHooks.writeRecordBytes = (path, text) => {
+          appendFileSync(${JSON.stringify(ready)}, process.pid + "\\n");
+          const deadline = Date.now() + 5000;
+          while (Date.now() < deadline) {
+            try {
+              if (readFileSync(${JSON.stringify(ready)}, "utf8").trim().split("\\n").filter(Boolean).length >= 2) break;
+            } catch {}
+          }
+          const fd = openSync(path, "wx", 0o600);
+          try { writeSync(fd, text); fsyncSync(fd); } finally { closeSync(fd); }
+        };
+      `);
       const [first, second] = await Promise.all([
-        runCliAsync(["mail", "relay", "start"]),
-        runCliAsync(["mail", "relay", "start"]),
+        runCliAsync(["mail", "relay", "start"], ["--preload", preload]),
+        runCliAsync(["mail", "relay", "start"], ["--preload", preload]),
       ]);
 
+      const launched = readFileSync(launches, "utf8").trim().split("\n").filter(Boolean);
+      expect(launched).toHaveLength(1);
       expect([first.status, second.status].filter((status) => status === 0)).toHaveLength(1);
       const loser = first.status === 0 ? second : first;
       expect(loser.status).not.toBe(0);
@@ -258,7 +285,7 @@ describe("relay start and the pid record", () => {
   );
 
   test(
-    "(d) a real daemon keeps a replacement written before SIGTERM",
+    "(d) a real daemon keeps a replacement written after SIGTERM under the record lock",
     async () => {
       const daemon = Bun.spawn([process.execPath, TPS_BIN, "mail", "relay", "_run", join(home, ".tps", "mail")], {
         env: { ...process.env, HOME: home },
@@ -272,8 +299,13 @@ describe("relay start and the pid record", () => {
 
       const replacement = spawnSleep();
       const newRecord = record(replacement.pid, processStartToken(replacement.pid));
-      writeFileSync(relayPid, newRecord);
-      process.kill(daemon.pid, "SIGTERM");
+      const lock = holdRecordLock();
+      try {
+        process.kill(daemon.pid, "SIGTERM");
+        writeFileSync(relayPid, newRecord);
+      } finally {
+        lock.release();
+      }
       await daemon.exited;
 
       expect(existsSync(relayPid)).toBe(true);
@@ -446,6 +478,28 @@ describe("relay start and the pid record", () => {
     }
   }, CASE_TIMEOUT_MS);
 
+  test("a failed claim write leaves no record or temporary file, and a retry starts normally", async () => {
+    const preload = join(home, "short-write.ts");
+    writeFileSync(preload, `
+      import { writeFileSync } from "node:fs";
+      import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
+      relayWriteTestHooks.writeRecordBytes = (path, text) => {
+        writeFileSync(path, text.slice(0, 5), { flag: "wx", mode: 0o600 });
+        throw new Error("injected short record write");
+      };
+    `);
+    const failed = await runCliAsync(["mail", "relay", "start"], ["--preload", preload]);
+    expect(failed.status).not.toBe(0);
+    expect(failed.stderr).toContain("injected short record write");
+    expect(existsSync(relayPid)).toBe(false);
+    expect(readdirSync(dirname(relayPid)).filter((name) => name.includes(".relay.pid.tmp."))).toEqual([]);
+
+    const retried = runCli(["mail", "relay", "start"]);
+    expect(retried.status).toBe(0);
+    expect(retried.stdout).toContain("Mail relay started: pid=");
+    expect(existsSync(relayPid)).toBe(true);
+  }, CASE_TIMEOUT_MS);
+
   test("startup timeout waits for the delayed child to exit before releasing the claim", async () => {
     const observed = join(home, "claim-before-exit");
     let child: ReturnType<typeof spawn> | undefined;
@@ -566,6 +620,73 @@ describe("relay start and the pid record", () => {
       expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
       expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
       await expectAbandonedClaimRefusal(claim.pid);
+    } finally {
+      if (childPid === undefined) {
+        try {
+          childPid = Number(readFileSync(childPidFile, "utf8"));
+        } catch {
+          /* pid unavailable */
+        }
+      }
+      if (childPid !== undefined && Number.isInteger(childPid) && childPid > 1) killPid(childPid);
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("the handoff keeps one lock budget across retries under contention", async () => {
+    const childPidFile = join(home, "child.pid");
+    const heldPidFile = join(home, "holder.pid");
+    const holdSignal = join(home, "hold-at.json");
+    const attempts = join(home, "handoff-attempts");
+    const cliDir = resolve(import.meta.dir, "..");
+    const fixture = `
+      import { readFileSync, writeFileSync } from "node:fs";
+      import { acquireMailLockSync } from "@tpsdev-ai/agent";
+      import { relayPidLockRoot } from ${JSON.stringify(RELAY_MODULE)};
+      writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));
+      process.on("SIGTERM", () => {});
+      const poll = setInterval(() => {
+        let holdAt;
+        try { holdAt = JSON.parse(readFileSync(${JSON.stringify(holdSignal)}, "utf8")).holdAt; } catch { return; }
+        if (Date.now() < holdAt) return;
+        clearInterval(poll);
+        const lock = acquireMailLockSync(relayPidLockRoot(), { timeoutMs: 5000 });
+        if (!lock) process.exit(3);
+        writeFileSync(${JSON.stringify(heldPidFile)}, String(process.pid));
+        setTimeout(() => { lock.release(); process.exit(0); }, 7000);
+      }, 50);
+      setInterval(() => {}, 1000);
+    `;
+    const preload = join(home, "starter-preload.ts");
+    writeFileSync(preload, `
+      import { appendFileSync, writeFileSync } from "node:fs";
+      import { spawn } from "node:child_process";
+      import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+      import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
+      relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
+        { detached: true, env: process.env, stdio: "ignore", cwd: ${JSON.stringify(cliDir)} });
+      let first = true;
+      relayWriteTestHooks.afterTempWrite = () => {
+        appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
+        if (first) {
+          first = false;
+          writeFileSync(${JSON.stringify(holdSignal)}, JSON.stringify({ holdAt: Date.now() + ${RELAY_PID_LOCK_TIMEOUT_MS} - 1000 }));
+        }
+        throw new Error("injected handoff write failure");
+      };
+    `);
+    let childPid: number | undefined;
+    try {
+      const first = await runCliAsync(["mail", "relay", "start"], ["--preload", preload], CLI_TIMEOUT_MS + 5000);
+      const returned = Date.now();
+      childPid = Number(readFileSync(childPidFile, "utf8"));
+      const tried = readFileSync(attempts, "utf8").trim().split("\n").map(Number);
+      expect(first.status).toBe(1);
+      expect(first.stderr).toContain(`within ${RELAY_PID_LOCK_TIMEOUT_MS} ms`);
+      expect(existsSync(heldPidFile)).toBe(true);
+      expect(pidState(childPid)).toBe("alive");
+      expect(tried.length).toBeGreaterThan(1);
+      expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
+      expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
     } finally {
       if (childPid === undefined) {
         try {
