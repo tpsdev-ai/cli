@@ -3209,8 +3209,7 @@ function sweepObligationDeadlines(
     if (deadline !== null && Date.parse(deadline) > obligationNow()) continue;
     let ctx = yieldContexts.get(rec.obligationId);
     if (!ctx) {
-      const curPath = findCurPath(mailDir, agent, rec.inboundId) ?? "";
-      ctx = makeYieldCtx(mailDir, agent, rec.from, accountId, curPath, rec.inboundId, cfg, log, incarnation, rec.inboundEnvelopeId);
+      ctx = makeYieldCtx(mailDir, agent, rec.from, accountId, "", rec.inboundId, cfg, log, incarnation, rec.inboundEnvelopeId);
       yieldContexts.set(rec.obligationId, ctx);
     }
     if (deadline === null) {

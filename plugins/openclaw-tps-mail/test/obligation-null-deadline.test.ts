@@ -4,7 +4,7 @@
  * Fixtures cover creation deadlines, restart preservation and deadline sweeps.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
-import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, symlinkSync, existsSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -22,7 +22,7 @@ function pubkeyFromSeed(seed: Buffer): Buffer {
 }
 
 import { mailboxReplayStore } from "@tpsdev-ai/agent";
-import pluginModule, { awaitStartupCurSweepForTests, setObligationDeadlineSweepForTests, setObligationNowForTests, setObligationRetryDelaysForTests } from "../src/index.js";
+import pluginModule, { awaitStartupCurSweepForTests, setObligationDeadlineSweepForTests, setObligationNowForTests, setObligationRetryDelaysForTests, setBeforeSettleEntryForTests } from "../src/index.js";
 import { createObligation, readObligation, setBeforeTransitionForTests } from "../src/obligations.js";
 
 let capturedPlugin: any;
@@ -116,7 +116,7 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
     return readObligation(mailDir, AGENT, inboundId);
   }
 
-  function seedNullDeadline(inboundId: string) {
+  function seedNullDeadline(inboundId: string, deadlineAt: string | null = null) {
     const envelopeJson = signedEnvelopeBody(SENDER, AGENT, "inbound payload", SENDER_SEED);
     const envelope: Envelope = JSON.parse(envelopeJson);
     mkdirSync(resolve(mailDir, AGENT, "cur"), { recursive: true });
@@ -145,7 +145,7 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
       to: AGENT,
       accountId: "default",
       state: "pending",
-      deadlineAt: null,
+      deadlineAt,
       attempts: 1,
     }));
   }
@@ -351,6 +351,65 @@ describe("cli#1063 — obligation creation and deadline sweeps", () => {
     } finally {
       setBeforeTransitionForTests(undefined);
       setObligationRetryDelaysForTests(retryPrev);
+      await h.stop();
+    }
+  }, 15000);
+
+  for (const sibling of ["duplicate", "malformed", "unreadable"] as const) {
+    it(`a due record seeded after startup stays unsettled with ${sibling} cur/ entries`, async () => {
+      const h = startWith("hold", { inbound: false });
+      const inboundId = `msg-${randomUUID()}`;
+      try {
+        expect(await awaitStartupCurSweepForTests("default", inboundId, 10000)).toBe(true);
+        const { record } = seedNullDeadline(inboundId, new Date(Date.now() - 1000).toISOString());
+        const curDir = resolve(mailDir, AGENT, "cur");
+        const path = resolve(curDir, `2026-05-26T00-00-00-${inboundId}.json`);
+        const other = resolve(curDir, sibling === "duplicate"
+          ? `2026-05-26T00-00-01-${inboundId}.json` : "zzz-sibling.json");
+        if (sibling === "duplicate") writeFileSync(other, readFileSync(path));
+        else if (sibling === "malformed") writeFileSync(other, "{");
+        else symlinkSync(resolve(curDir, "missing-target"), other);
+        const code = sibling === "duplicate" ? "AMBIGUOUS_ID" : sibling === "malformed" ? "INVALID_JSON" : "ENOENT";
+        expect(await pollUntil(() => h.logs.some((line) =>
+          line.startsWith("WARN tps-mail: obligation-cur-lookup-failed:") &&
+          line.includes(record.obligationId) && line.includes(code),
+        ), 1000), "the guarded sweep lookup warns").toBe(true);
+        expect(obligation(inboundId)).toEqual(record);
+        const cur = JSON.parse(readFileSync(path, "utf-8"));
+        expect(cur.ackedAt).toBeUndefined();
+        expect(cur.nackedAt).toBeUndefined();
+      } finally {
+        await h.stop();
+      }
+    }, 15000);
+  }
+
+  it("a later sweep settles a due record after the inbound gate refuses settlement", async () => {
+    const h = startWith("hold", { inbound: false });
+    const inboundId = `msg-${randomUUID()}`;
+    let attempts = 0;
+    try {
+      expect(await awaitStartupCurSweepForTests("default", inboundId, 10000)).toBe(true);
+      const { record } = seedNullDeadline(inboundId, new Date(Date.now() - 1000).toISOString());
+      const path = resolve(mailDir, AGENT, "cur", `2026-05-26T00-00-00-${inboundId}.json`);
+      const original = readFileSync(path, "utf-8");
+      setBeforeSettleEntryForTests((id) => {
+        if (id !== inboundId) return;
+        attempts++;
+        if (attempts === 1) {
+          writeFileSync(path, JSON.stringify({ ...JSON.parse(original), from: "other-sender" }));
+        }
+      });
+      expect(await pollUntil(() => attempts > 0 && !existsSync(path), 1000),
+        "the inbound gate rejects the changed cur/ record").toBe(true);
+      expect(obligation(inboundId)).toEqual(record);
+      writeFileSync(path, original);
+      expect(await pollUntil(() => obligation(inboundId)?.state === "failed", 2000),
+        "a later sweep settles the restored inbound").toBe(true);
+      expect(attempts).toBeGreaterThan(1);
+      expect(curFile(inboundId)?.nackedAt).toBeDefined();
+    } finally {
+      setBeforeSettleEntryForTests(undefined);
       await h.stop();
     }
   }, 15000);
