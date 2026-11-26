@@ -859,6 +859,8 @@ export async function runMail(args: MailArgs): Promise<void> {
         const state = readRelayPidFile();
         if (state.kind === "running") {
           console.log(`Mail relay running: pid=${state.pid}`);
+        } else if (state.kind === "abandoned-claim") {
+          console.log(`Mail relay: unknown (abandoned start claim ${state.path}, claimant pid=${state.pid}).`);
         } else if (state.kind === "claim") {
           console.log(`Mail relay start in progress: pid=${state.pid}, pid file ${state.path}.`);
         } else if (state.kind === "unverified") {
@@ -947,6 +949,11 @@ export async function runMail(args: MailArgs): Promise<void> {
         if (state.kind === "missing") {
           console.log("Mail relay is not running.");
           break;
+        }
+        if (state.kind === "abandoned-claim") {
+          throw new Error(
+            `Mail relay stop kept abandoned start claim ${state.path}: claimant pid ${state.pid} is gone; no process was signalled. Confirm no relay for this mailbox is running (tps mail relay status), then remove ${state.path}.`,
+          );
         }
         if (state.kind === "claim") {
           throw new Error(
@@ -1083,13 +1090,17 @@ export async function runMail(args: MailArgs): Promise<void> {
       if (relayAction === "start") {
         const path = relayPidPath();
         // Decide and claim under the record lock; the claim itself is an
-        // exclusive create. A concurrent start finds the claim before publication,
-        // or the daemon record after it.
+        // exclusive create.
         const claimText = withRelayPidLock("start the relay", () => {
           for (let attempt = 0; attempt < 5; attempt++) {
             const { state, raw } = snapshotRelayPidRecord();
             if (state.kind === "running") {
               throw new Error(`Mail relay already running (pid=${state.pid}); pid file ${state.path}.`);
+            }
+            if (state.kind === "abandoned-claim") {
+              throw new Error(
+                `Mail relay start refused: abandoned start claim ${state.path} names dead claimant pid ${state.pid}; this command launched no relay. Confirm no relay for this mailbox is running (tps mail relay status), then remove ${state.path}.`,
+              );
             }
             if (state.kind === "claim") {
               throw new Error(
@@ -1238,7 +1249,7 @@ export async function runMail(args: MailArgs): Promise<void> {
             : changedRecord(current.raw);
           const reason = handoffError instanceof Error ? handoffError.message : String(handoffError);
           throw new Error(
-            `Mail relay start failed: child (pid ${daemonPid}) is still running; ${signalResult}. ${record} Handing the claim to the child did not succeed within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (${reason}). Stop pid ${daemonPid} before starting the relay again.`,
+            `Mail relay start failed: child (pid ${daemonPid}) exit not confirmed; ${signalResult}. ${record} Handing the claim to the child did not succeed within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (${reason}). Stop pid ${daemonPid} before starting the relay again.`,
             { cause: handoffError },
           );
         }

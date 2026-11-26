@@ -47,7 +47,7 @@ function spawnSleep(seconds = "60"): Bun.Subprocess {
 }
 
 function killPid(pid: number, signal: NodeJS.Signals = "SIGKILL"): void {
-  // A pid read from an empty or partial file parses as 0 or NaN; 0 and negative pids signal process groups.
+  // A pid read from an empty or malformed file parses as 0 or NaN; 0 and negative pids signal process groups.
   if (!Number.isInteger(pid) || pid <= 1) return;
   try {
     process.kill(pid, signal);
@@ -115,6 +115,27 @@ async function runCliAsync(args: string[], runtimeArgs: string[] = [], timeout =
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function expectAbandonedClaimRefusal(claimantPid: number): Promise<void> {
+  const claim = readFileSync(relayPid, "utf8");
+  const launched = join(home, "restart-launched");
+  const preload = join(home, "restart-preload.ts");
+  writeFileSync(preload, `
+    import { writeFileSync } from "node:fs";
+    import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+    relayStartTestHooks.spawn = () => {
+      writeFileSync(${JSON.stringify(launched)}, "spawn called");
+      throw new Error("unexpected restart spawn");
+    };
+  `);
+  const result = await runCliAsync(["mail", "relay", "start"], ["--preload", preload]);
+  expect(result.status).not.toBe(0);
+  expect(result.stderr).toContain(`Mail relay start refused: abandoned start claim ${relayPid} names dead claimant pid ${claimantPid}`);
+  expect(result.stderr).toContain("this command launched no relay");
+  expect(result.stderr).toContain(`Confirm no relay for this mailbox is running (tps mail relay status), then remove ${relayPid}.`);
+  expect(readFileSync(relayPid, "utf8")).toBe(claim);
+  expect(existsSync(launched)).toBe(false);
 }
 
 /** Kill a relay recorded at the path, by that recorded pid. */
@@ -386,7 +407,7 @@ describe("relay start and the pid record", () => {
     }
   }, CASE_TIMEOUT_MS);
 
-  test("timed-out CLI exits with a child claim that blocks restart until the child exits", async () => {
+  test("timed-out CLI exits with a child claim that requires claim removal after child exit", async () => {
     const childPidFile = join(home, "child.pid");
     const signalled = join(home, "child-signalled");
     const preload = join(home, "starter-preload.ts");
@@ -423,15 +444,19 @@ describe("relay start and the pid record", () => {
       killPid(childPid);
       await waitGone(childPid);
       const third = runCli(["mail", "relay", "start"]);
-      expect(third.status).toBe(0);
-      expect(third.stdout).toContain("Mail relay started: pid=");
+      expect(third.status).not.toBe(0);
+      expect(readFileSync(relayPid, "utf8")).toBe(claim);
+      rmSync(relayPid);
+      const fourth = runCli(["mail", "relay", "start"]);
+      expect(fourth.status).toBe(0);
+      expect(fourth.stdout).toContain("Mail relay started: pid=");
     } finally {
       if (childPid === undefined && existsSync(childPidFile)) childPid = Number(readFileSync(childPidFile, "utf8"));
       if (childPid !== undefined) killPid(childPid);
     }
   }, CASE_TIMEOUT_MS);
 
-  test("timed-out CLI stops retrying a failing claim handoff at the deadline and names the live child", async () => {
+  test("timed-out CLI stops retrying a failing claim handoff at the deadline and reports unconfirmed child exit", async () => {
     const childPidFile = join(home, "child.pid");
     const attempts = join(home, "handoff-attempts");
     const preload = join(home, "starter-preload.ts");
@@ -461,7 +486,7 @@ describe("relay start and the pid record", () => {
       const claim = JSON.parse(readFileSync(relayPid, "utf8"));
       const tried = readFileSync(attempts, "utf8").trim().split("\n").map(Number);
       expect(first.status).toBe(1);
-      expect(first.stderr).toContain(`child (pid ${childPid}) is still running; SIGTERM sent.`);
+      expect(first.stderr).toContain(`child (pid ${childPid}) exit not confirmed; SIGTERM sent.`);
       expect(first.stderr).toContain(`The claim at ${relayPid} still names the starter pid ${claim.pid}.`);
       expect(first.stderr).toContain(`within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (injected handoff write failure).`);
       expect(first.stderr).toContain(`Stop pid ${childPid} before starting the relay again.`);
@@ -471,15 +496,58 @@ describe("relay start and the pid record", () => {
       expect(tried.length).toBeGreaterThan(1);
       expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
       expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
+      await expectAbandonedClaimRefusal(claim.pid);
     } finally {
       if (childPid === undefined) {
         try {
           childPid = Number(readFileSync(childPidFile, "utf8"));
         } catch {
-          /* the child never wrote its pid */
+          /* pid unavailable */
         }
       }
       if (childPid !== undefined && Number.isInteger(childPid) && childPid > 1) killPid(childPid);
+    }
+  }, CASE_TIMEOUT_MS);
+
+  test("killed CLI starter leaves a claim requiring manual resolution before restart", async () => {
+    const childPidFile = join(home, "child.pid");
+    const preload = join(home, "starter-preload.ts");
+    const fixture = `
+      import { writeFileSync } from "node:fs";
+      writeFileSync(${JSON.stringify(childPidFile)}, String(process.pid));
+      setInterval(() => {}, 1000);
+    `;
+    writeFileSync(preload, `
+      import { spawn } from "node:child_process";
+      import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
+      relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
+        { detached: true, env: process.env, stdio: "ignore" });
+    `);
+    const starter = Bun.spawn([process.execPath, "--preload", preload, TPS_BIN, "mail", "relay", "start"], {
+      env: { ...process.env, HOME: home }, stdio: ["ignore", "ignore", "ignore"],
+    });
+    children.push(starter);
+    let childPid: number | undefined;
+    try {
+      await waitUntil(() => existsSync(childPidFile) && Number(readFileSync(childPidFile, "utf8")) > 1, "the child pid");
+      childPid = Number(readFileSync(childPidFile, "utf8"));
+      expect(JSON.parse(readFileSync(relayPid, "utf8")).pid).toBe(starter.pid);
+      killPid(starter.pid);
+      await starter.exited;
+      expect(pidState(childPid)).toBe("alive");
+      await expectAbandonedClaimRefusal(starter.pid);
+
+      killPid(childPid);
+      await waitGone(childPid);
+      rmSync(relayPid);
+      const restarted = runCli(["mail", "relay", "start"]);
+      expect(restarted.status).toBe(0);
+      expect(restarted.stdout).toContain("Mail relay started: pid=");
+    } finally {
+      killPid(starter.pid);
+      if (childPid === undefined && existsSync(childPidFile)) childPid = Number(readFileSync(childPidFile, "utf8"));
+      if (childPid !== undefined) killPid(childPid);
+      stopRecordedRelay();
     }
   }, CASE_TIMEOUT_MS);
 

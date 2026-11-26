@@ -137,10 +137,12 @@ function isRelayClaim(raw: Buffer | null): boolean {
   }
 }
 
-/** Classify a relay pid record, recognizing a live start claim. A claim whose
- *  process is gone classifies as the underlying stale record. */
+/** Keep abandoned start claims: their children may still be running. */
 export function classifyRelayPidSnapshot(snapshot: PidRecordSnapshot): RelayPidState {
   const state = snapshot.state;
+  if (state.kind === "stale" && isRelayClaim(snapshot.raw)) {
+    return { kind: "abandoned-claim", path: state.path, pid: state.pid };
+  }
   if ((state.kind === "running" || state.kind === "unverified") && isRelayClaim(snapshot.raw)) {
     return { kind: "claim", path: state.path, pid: state.pid, startToken: state.startToken };
   }
@@ -230,6 +232,7 @@ export async function runRelayDaemon(mailDir: string): Promise<void> {
 
 export type RelayPidState =
   | PidFileState
+  | { kind: "abandoned-claim"; path: string; pid: number }
   | { kind: "claim"; path: string; pid: number; startToken: string | null };
 
 /** Classify the relay pid file. */
