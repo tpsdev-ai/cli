@@ -37,7 +37,7 @@ A step whose effective shell — its own `shell:`, else its job's
 `bash` is refused unless its run block is a pinned entry; the refusal names the
 step, shell and source line. In an unapproved workflow run block, the guard refuses
 leading redirections and variable assignments containing `<` or `>` before a command word.
-Words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
+Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands.
 The guard follows repository scripts a workflow invokes by a literal path,
