@@ -1,16 +1,7 @@
 /**
  * obligation-null-deadline.test.ts — cli#1063.
  *
- * A reply obligation carries a bounded outcome:
- *   (a) a delivered mail whose turn end the plugin did not observe settles
- *       after its deadline;
- *   (b) a pending record on disk with `deadlineAt: null`, written after the
- *       plugin is running, is armed by the periodic sweep and settles; and
- *   (c) a created obligation persists its deadline at creation, and a restart
- *       leaves it unchanged.
- *
- * Each case sets its own deadline and sweep interval and carries an explicit
- * timeout.
+ * Fixtures cover creation deadlines, restart preservation and deadline sweeps.
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
@@ -80,7 +71,7 @@ async function pollUntil(pred: () => boolean, ms = 3000): Promise<boolean> {
   return pred();
 }
 
-describe("cli#1063 — reply obligations have bounded outcomes", () => {
+describe("cli#1063 — obligation creation and deadline sweeps", () => {
   let mailDir: string;
   let keysDir: string;
   let controller: AbortController;

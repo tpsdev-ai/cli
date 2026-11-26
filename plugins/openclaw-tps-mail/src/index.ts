@@ -3176,9 +3176,7 @@ const outbound: ChannelOutboundAdapter = {
 };
 
 export const NEW_DIR_RESCAN_MS = 30_000;
-/** cli#1063: how often a live account checks open obligations. Each tick arms
- *  a pending obligation that has no usable deadline and settles one whose
- *  deadline is due and that no timer or retry owns. */
+/** cli#1063: how often a live account checks open obligations. */
 export const OBLIGATION_DEADLINE_SWEEP_MS = 60_000;
 export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 /** cli#922 item 1: the cap on the rescan-tick backoff between watcher re-arm attempts. */
@@ -3192,10 +3190,8 @@ export function rearmBackoffTicks(failures: number): number {
   return Math.min(2 ** (failures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
 }
 
-/** cli#1063: arms a pending obligation that has no usable deadline and settles
- *  a due one that no timer or retry owns, so a turn whose end the plugin did
- *  not observe settles at its deadline. A record the store cannot read or write
- *  is reported, not settled. */
+/** cli#1063: attempt to arm records without a usable deadline or settle due
+ *  records, skipping records a timer or retry owns. */
 function sweepObligationDeadlines(
   mailDir: string,
   agent: string,
@@ -3481,9 +3477,8 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             to: recipient,
             accountId: account.accountId,
             state: "pending",
-            // cli#1063: stamp the deadline at creation, so a pending obligation
-            // has a durable bound even when no arm lands; the periodic sweep
-            // settles it at that deadline.
+            // cli#1063: persist the deadline at creation so a later sweep can
+            // attempt settlement at or after it when no timer is armed.
             deadlineAt: new Date(obligationNow() + obligationDeadlineMs()).toISOString(),
             attempts: 1,
           }),
