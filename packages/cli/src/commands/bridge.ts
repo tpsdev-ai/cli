@@ -165,7 +165,9 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
       // Classify every record up front for planning and reporting, then handle
       // each one independently: one failure must not skip a later record.
       const failures: string[] = [];
-      const stopped = new Set<number>();
+      // pid → start token of each record this run stopped, so a later record
+      // for the same pid can prove it is a duplicate of that stop.
+      const stopped = new Map<number, string>();
       // A removal failure keeps that file, reports the path and the error code,
       // and leaves the remaining records to run.
       const remove = (path: string): "removed" | "already gone" | "kept" => {
@@ -254,9 +256,23 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
             // A stale re-read for the pid this stop verified is a completed
             // stop only when the process it verified — this pid with this start
             // token — is gone. The stale classification compares the re-read
-            // record's own token, which a rewrite can change. The record is
-            // left in place, as relay leaves it: it may belong to a new bridge.
-            console.log(`Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`);
+            // record's own token, which a rewrite can change. A duplicate of
+            // this run's stop with the planned bytes is removed after a matching
+            // final read and successful unlink.
+            // Otherwise it is left in place: it may belong to a new bridge.
+            if (stopped.get(state.pid) === state.startToken && pidRecordBytesEqual(decision.raw, planned.raw)) {
+              removeVerifiedRecord(decision, {
+                removed: `Bridge (pid ${state.pid}) stopped; duplicate pid file ${fresh.path} removed.`,
+                alreadyGone: `Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} already gone.`,
+                kept: (kept) => `Bridge (pid ${state.pid}) stopped; ${describeKeptRecord(fresh.path, kept)}`,
+              });
+            } else {
+              console.log(
+                stopped.get(state.pid) === state.startToken
+                  ? `Bridge (pid ${state.pid}) stopped; pid file ${fresh.path} is stale.`
+                  : `Recorded bridge process (pid ${state.pid}) is no longer running; pid file ${fresh.path} was kept.`,
+              );
+            }
           } else if (fresh.kind === "stale" && fresh.pid === state.pid) {
             failures.push(
               `Bridge pid file ${fresh.path} holds a stale record for pid ${fresh.pid}, but it does not prove the process this stop verified is gone; it was not signalled and the pid file was kept. ${unproven}`,
@@ -328,7 +344,7 @@ export async function runBridge(args: BridgeArgs): Promise<void> {
           failures.push(`Bridge could not be stopped (pid ${state.pid}); pid file kept at ${state.path}.`);
           continue;
         }
-        stopped.add(state.pid);
+        stopped.set(state.pid, state.startToken);
         removeVerifiedRecord(decision, {
           removed: `Bridge (pid ${state.pid}) stopped; pid file removed: ${state.path}.`,
           alreadyGone: `Bridge (pid ${state.pid}) stopped; pid file already gone: ${state.path}.`,
