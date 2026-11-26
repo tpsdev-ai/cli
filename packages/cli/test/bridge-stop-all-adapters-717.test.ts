@@ -4,7 +4,8 @@
  * real child processes, so the stop path exercises the same identity check and
  * per-record reporting as the openclaw record.
  */
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -297,6 +298,8 @@ beforeEach(() => {
   stdioPid = join(runDir, "bridge-stdio.pid");
   legacyPid = join(runDir, "mail-bridge.pid");
 });
+
+afterEach(() => mock.restore());
 
 afterEach(() => {
   if (savedHome === undefined) delete process.env.HOME;
@@ -993,6 +996,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       expect(lines).toContain(
         `Bridge (pid ${child.pid}) stopped; pid file ${secondPath} now belongs to a different process (pid ${replacement.pid}) and was kept.`,
       );
+      expect(lines).not.toContain(`Bridge (pid ${child.pid}) stopped; duplicate pid file ${secondPath} removed.`);
     },
     TIMEOUT,
   );
@@ -1022,6 +1026,58 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       expect(pidState(child.pid)).toBe("gone");
       expect(existsSync(secondPath)).toBe(false);
       expect(lines).toContain(`Bridge (pid ${child.pid}) stopped; duplicate pid file ${secondPath} removed.`);
+    },
+    TIMEOUT,
+  );
+
+  test(
+    "a failed unlink keeps the duplicate path and reports failure without reporting removal",
+    async () => {
+      stageProcStartTokens();
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      writeFileSync(firstPath, record(child.pid, token));
+      writeFileSync(secondPath, record(child.pid, token));
+
+      const lines: string[] = [];
+      const restoreLog = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const restoreError = patchShared(console, "error", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const unlink = fs.unlinkSync;
+      let attemptedUnlink = false;
+      const unlinkSpy = spyOn(fs, "unlinkSync").mockImplementation((path) => {
+        if (path === secondPath) {
+          attemptedUnlink = true;
+          rmSync(secondPath);
+          mkdirSync(secondPath);
+        }
+        return unlink(path);
+      });
+      const previous = setBridgeStopSignal((pid) => {
+        process.kill(pid, "SIGKILL");
+      });
+      let error: Error | null = null;
+      try {
+        error = await runBridge({ action: "stop" }).then(
+          () => null,
+          (thrown: Error) => thrown,
+        );
+      } finally {
+        setBridgeStopSignal(previous);
+        unlinkSpy.mockRestore();
+        restoreError();
+        restoreLog();
+      }
+
+      expect(attemptedUnlink).toBe(true);
+      expect(existsSync(secondPath)).toBe(true);
+      expect(error?.message).toMatch(/EISDIR|EPERM/);
+      expect(error?.message).toContain(`Bridge pid file ${secondPath} could not be removed`);
+      expect(error?.message).toContain("the pid file was kept.");
+      expect(lines).toContain(error?.message!);
+      expect(lines).not.toContain(`Bridge (pid ${child.pid}) stopped; duplicate pid file ${secondPath} removed.`);
+      expect(lines).not.toContain(`Bridge (pid ${child.pid}) stopped; pid file ${secondPath} already gone.`);
     },
     TIMEOUT,
   );

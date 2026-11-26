@@ -1130,6 +1130,8 @@ describe("bridge stop identity", () => {
       expect(result.signals.length).toBe(1);
       expect(result.message).toMatch(/EISDIR|EPERM/);
       expect(result.logs.join("\n")).not.toMatch(/already gone/i);
+      expect(result.logs).not.toContain(`Pid file removed: ${legacyBridgePid}.`);
+      expect(result.logs).toContain(`Bridge pid file ${legacyBridgePid} could not be removed (EISDIR); the pid file was kept.`);
       expect(result.message).not.toMatch(/\n\s+at /);
     },
     TIMEOUT,
