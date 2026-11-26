@@ -862,7 +862,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         } else if (state.kind === "abandoned-claim") {
           console.log(`Mail relay: unknown (abandoned start claim ${state.path}, claimant pid=${state.pid}).`);
         } else if (state.kind === "claim") {
-          console.log(`Mail relay start in progress: pid=${state.pid}, pid file ${state.path}.`);
+          console.log(`A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown.`);
         } else if (state.kind === "unverified") {
           console.log(`Mail relay unverified: pid=${state.pid}, pid file ${state.path}.`);
         } else if (state.kind === "stale") {
@@ -952,12 +952,12 @@ export async function runMail(args: MailArgs): Promise<void> {
         }
         if (state.kind === "abandoned-claim") {
           throw new Error(
-            `Mail relay stop kept abandoned start claim ${state.path}: claimant pid ${state.pid} is gone; no process was signalled. Confirm no relay for this mailbox is running (tps mail relay status), then remove ${state.path}.`,
+            `Mail relay stop kept abandoned start claim ${state.path}: the recorded claimant process is no longer running (pid ${state.pid}); no process was signalled. Inspect ps -p ${state.pid} -o pid=,command= and ps -eo pid=,command= for tps mail relay _run ${mailDir} processes. Stop any relay or start process found for this mailbox by its pid, then remove ${state.path}.`,
           );
         }
         if (state.kind === "claim") {
           throw new Error(
-            `Mail relay start is in progress (pid=${state.pid}, pid file ${state.path}); no process was signalled. Wait for the start to finish, then retry.`,
+            `A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown. No process was signalled.`,
           );
         }
         if (state.kind === "unreadable") {
@@ -1099,12 +1099,12 @@ export async function runMail(args: MailArgs): Promise<void> {
             }
             if (state.kind === "abandoned-claim") {
               throw new Error(
-                `Mail relay start refused: abandoned start claim ${state.path} names dead claimant pid ${state.pid}; this command launched no relay. Confirm no relay for this mailbox is running (tps mail relay status), then remove ${state.path}.`,
+                `Mail relay start refused: abandoned start claim ${state.path}: the recorded claimant process is no longer running (pid ${state.pid}); this command launched no relay. Inspect ps -p ${state.pid} -o pid=,command= and ps -eo pid=,command= for tps mail relay _run ${mailDir} processes. Stop any relay or start process found for this mailbox by its pid, then remove ${state.path}.`,
               );
             }
             if (state.kind === "claim") {
               throw new Error(
-                `Mail relay start is already in progress (pid=${state.pid}, pid file ${state.path}); this command launched no relay. Wait for it to finish, or remove ${state.path} if no start is running.`,
+                `A live process holds the mail relay start claim (pid ${state.pid}, pid file ${state.path}); relay state is unknown. This command launched no relay.`,
               );
             }
             if (state.kind === "unverified") {

@@ -9,6 +9,7 @@ import { readPidFile } from "../src/utils/pid-file.js";
 import { RELAY_PID_LOCK_TIMEOUT_MS, readRelayPidFile, relayPidLockRoot } from "../src/utils/mail-relay.js";
 import { relayStartTestHooks, runMail, setRelayPidRemoval } from "../src/commands/mail.js";
 import { patchShared } from "./helpers/patch-shared.js";
+import { PROC_START_TOKENS_PRELOAD, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
 
 const RELAY_MODULE = resolve(import.meta.dir, "../src/utils/mail-relay.ts");
 const MAIL_MODULE = resolve(import.meta.dir, "../src/commands/mail.ts");
@@ -117,7 +118,7 @@ async function runCliAsync(args: string[], runtimeArgs: string[] = [], timeout =
   }
 }
 
-async function expectAbandonedClaimRefusal(claimantPid: number): Promise<void> {
+async function expectAbandonedClaimRefusal(claimantPid: number, runtimeArgs: string[] = []): Promise<void> {
   const claim = readFileSync(relayPid, "utf8");
   const launched = join(home, "restart-launched");
   const preload = join(home, "restart-preload.ts");
@@ -129,13 +130,24 @@ async function expectAbandonedClaimRefusal(claimantPid: number): Promise<void> {
       throw new Error("unexpected restart spawn");
     };
   `);
-  const result = await runCliAsync(["mail", "relay", "start"], ["--preload", preload]);
+  const result = await runCliAsync(["mail", "relay", "start"], [...runtimeArgs, "--preload", preload]);
   expect(result.status).not.toBe(0);
-  expect(result.stderr).toContain(`Mail relay start refused: abandoned start claim ${relayPid} names dead claimant pid ${claimantPid}`);
+  expect(result.stderr).toContain(`Mail relay start refused: abandoned start claim ${relayPid}: the recorded claimant process is no longer running (pid ${claimantPid})`);
   expect(result.stderr).toContain("this command launched no relay");
-  expect(result.stderr).toContain(`Confirm no relay for this mailbox is running (tps mail relay status), then remove ${relayPid}.`);
+  expectClaimRemedy(result.stderr, claimantPid);
+  const stopped = await runCliAsync(["mail", "relay", "stop"], runtimeArgs);
+  expect(stopped.status).not.toBe(0);
+  expect(stopped.stderr).toContain(`the recorded claimant process is no longer running (pid ${claimantPid})`);
+  expect(stopped.stderr).toContain("no process was signalled");
+  expectClaimRemedy(stopped.stderr, claimantPid);
   expect(readFileSync(relayPid, "utf8")).toBe(claim);
   expect(existsSync(launched)).toBe(false);
+}
+
+function expectClaimRemedy(message: string, claimantPid: number): void {
+  expect(message).toContain(`Inspect ps -p ${claimantPid} -o pid=,command= and ps -eo pid=,command= for tps mail relay _run ${join(home, ".tps", "mail")} processes.`);
+  expect(message).toContain(`Stop any relay or start process found for this mailbox by its pid, then remove ${relayPid}.`);
+  expect(message).not.toContain("tps mail relay status");
 }
 
 /** Kill a relay recorded at the path, by that recorded pid. */
@@ -436,8 +448,8 @@ describe("relay start and the pid record", () => {
 
       const second = runCli(["mail", "relay", "start"]);
       expect(second.status).not.toBe(0);
-      expect(second.stderr).toContain(`pid=${childPid}, pid file ${relayPid}`);
-      expect(second.stderr).toContain("this command launched no relay");
+      expect(second.stderr).toContain(`pid ${childPid}, pid file ${relayPid}`);
+      expect(second.stderr).toContain("This command launched no relay");
       expect(readFileSync(relayPid, "utf8")).toBe(claim);
       expect(JSON.parse(claim)).toEqual({ pid: childPid, startToken: processStartToken(childPid), relayClaim: true });
 
@@ -600,7 +612,19 @@ describe("relay start and the pid record", () => {
     }
   }, CASE_TIMEOUT_MS);
 
-  test("relay status reports a live claim as a start in progress", () => {
+  test("an abandoned claim with a reused live pid reports the recorded process and remedy", async () => {
+    stageProcStartTokens();
+    const claimant = spawnSleep();
+    const token = processStartToken(claimant.pid);
+    expect(token).toMatch(/^proc:\d+$/);
+    const differentToken = token === "proc:1" ? "proc:2" : "proc:1";
+    writeFileSync(relayPid, `${JSON.stringify({ pid: claimant.pid, startToken: differentToken, relayClaim: true })}\n`);
+    expect(readRelayPidFile().kind).toBe("abandoned-claim");
+    await expectAbandonedClaimRefusal(claimant.pid, ["--preload", PROC_START_TOKENS_PRELOAD]);
+    expect(pidState(claimant.pid)).toBe("alive");
+  }, CASE_TIMEOUT_MS);
+
+  test("relay status reports a live claim and unknown relay state", () => {
     const starter = spawnSleep();
     writeFileSync(
       relayPid,
@@ -609,7 +633,7 @@ describe("relay start and the pid record", () => {
     expect(readRelayPidFile().kind).toBe("claim");
     const result = runCli(["mail", "relay", "status"]);
     expect(result.status).toBe(0);
-    expect(result.stdout).toMatch(/start in progress/i);
+    expect(result.stdout).toContain(`A live process holds the mail relay start claim (pid ${starter.pid}, pid file ${relayPid}); relay state is unknown.`);
     expect(result.stdout).not.toMatch(/invalid/i);
   }, CASE_TIMEOUT_MS);
 
@@ -624,7 +648,7 @@ describe("relay start and the pid record", () => {
 
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(relayPid);
-      expect(result.stderr).toMatch(/start is in progress/);
+      expect(result.stderr).toContain(`A live process holds the mail relay start claim (pid ${starter.pid}, pid file ${relayPid}); relay state is unknown.`);
       expect(readFileSync(relayPid, "utf8")).toBe(claim);
       expect(pidState(starter.pid)).toBe("alive");
     },

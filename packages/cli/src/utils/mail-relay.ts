@@ -121,8 +121,7 @@ export function withRelayPidLock<T>(action: string, fn: () => T): T {
   }
 }
 
-/** A claim names the starter or timed-out child. While it is alive,
- *  `relay status` reports a start in progress and `relay stop` signals nothing. */
+/** A claim names the starter or timed-out child. */
 export function serializeRelayClaimRecord(pid: number, startToken: string | null): string {
   return `${JSON.stringify({ pid, startToken, relayClaim: true })}\n`;
 }
