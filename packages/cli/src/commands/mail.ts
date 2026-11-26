@@ -981,10 +981,23 @@ export async function runMail(args: MailArgs): Promise<void> {
             `Mail relay pid file names pid ${state.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${state.path} if the relay is not running.`,
           );
         }
-        // The classification above is the plan, not the decision. This one
-        // read is the pre-signal snapshot: it decides whether to signal and
-        // its bytes are the ones the removal below compares against.
-        const decision = readStopRecord();
+        // Hold the lock through the byte comparison and signal to exclude cooperating writers.
+        let signalFailure: { error: unknown } | undefined;
+        const decision = withRelayPidLock("stop the relay", () => {
+          const snapshot = readStopRecord();
+          if (!pidRecordBytesEqual(snapshot.raw, classification.raw)) {
+            throw new Error(`Mail relay pid file ${state.path}: record changed before it was signalled; this command signalled no process. The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`);
+          }
+          const current = classifyRelayPidSnapshot(snapshot);
+          if (current.kind === "running" && current.pid === state.pid && current.startToken === state.startToken) {
+            try {
+              sendRelayStopSignal(state.pid);
+            } catch (error) {
+              signalFailure = { error };
+            }
+          }
+          return snapshot;
+        });
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
           const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
@@ -1029,10 +1042,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           }
           break;
         }
-        // cli#970: compare the record's bytes before removing it, as
-        // `office kill` does. Relay pid records are written without a lock,
-        // so a record written between this compare and the unlink can still
-        // be removed.
+        // cli#970: compare and unlink under the record lock to keep replacements.
         const stopPid = state.pid;
         const stopStartToken = state.startToken;
         const removeStopRecord = (
@@ -1053,7 +1063,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           return removeRelayPid(path);
           });
         try {
-          sendRelayStopSignal(state.pid);
+          if (signalFailure) throw signalFailure.error;
         } catch (error) {
           // Only a probe that classifies the pid "gone" proves the process is
           // gone: remove the file in that case. EPERM ("alive") and any other

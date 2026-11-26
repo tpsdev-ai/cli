@@ -283,6 +283,60 @@ describe("relay start and the pid record", () => {
     CASE_TIMEOUT_MS,
   );
 
+  test.each(["claim", "whitespace"])("stop refuses a same-pid same-token %s replacement", async (replacementKind) => {
+    stageProcStartTokens();
+    const child = spawnSleep();
+    const token = processStartToken(child.pid);
+    expect(token).not.toBeNull();
+    writeFileSync(relayPid, record(child.pid, token));
+    const replacement = replacementKind === "claim"
+      ? `${JSON.stringify({ pid: child.pid, startToken: token, relayClaim: true })}\n`
+      : `${record(child.pid, token)} `;
+    const firstState = join(home, "first-state");
+    const preload = join(home, "stop-reread.ts");
+    writeFileSync(preload, `
+      import { writeFileSync } from "node:fs";
+      import { setRelayStopRecordReader } from ${JSON.stringify(MAIL_MODULE)};
+      import { snapshotPidRecord } from ${JSON.stringify(resolve(import.meta.dir, "../src/utils/pid-file.ts"))};
+      let reads = 0;
+      setRelayStopRecordReader(() => {
+        const snapshot = snapshotPidRecord(${JSON.stringify(relayPid)});
+        if (++reads === 1) {
+          writeFileSync(${JSON.stringify(firstState)}, snapshot.state.kind);
+          writeFileSync(${JSON.stringify(relayPid)}, ${JSON.stringify(replacement)});
+        }
+        return snapshot;
+      });
+    `);
+    const result = await runCliAsync(["mail", "relay", "stop"], ["--preload", PROC_START_TOKENS_PRELOAD, "--preload", preload]);
+    expect(readFileSync(firstState, "utf8")).toBe("running");
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("record changed before it was signalled");
+    expect(readFileSync(relayPid, "utf8")).toBe(replacement);
+    expect(pidState(child.pid)).toBe("alive");
+  }, CASE_TIMEOUT_MS);
+
+  test.each([false, true])("SIGINT cleanup (replacement: %s)", async (replace) => {
+    const ready = join(home, "sigint-ready");
+    const daemon = spawnScript(`
+      import { writeFileSync } from "node:fs";
+      import { runRelayDaemon } from ${JSON.stringify(RELAY_MODULE)};
+      const loop = runRelayDaemon(${JSON.stringify(join(home, ".tps", "mail"))});
+      writeFileSync(${JSON.stringify(ready)}, "ready");
+      await loop;
+    `);
+    await waitUntil(() => existsSync(ready), "the daemon's signal handlers");
+    expect(JSON.parse(readFileSync(relayPid, "utf8")).pid).toBe(daemon.pid);
+    const replacement = spawnSleep();
+    const newRecord = record(replacement.pid, processStartToken(replacement.pid));
+    if (replace) writeFileSync(relayPid, newRecord);
+    process.kill(daemon.pid, "SIGINT");
+    await daemon.exited;
+    expect(existsSync(relayPid)).toBe(replace);
+    if (replace) expect(readFileSync(relayPid, "utf8")).toBe(newRecord);
+    expect(pidState(replacement.pid)).toBe("alive");
+  }, CASE_TIMEOUT_MS);
+
   test.each([true, false])("(e) runRelayDaemon publishes the temporary inode (existing record: %s)", async (existing) => {
     const oldRecord = record(11111, "proc:1");
     if (existing) writeFileSync(relayPid, oldRecord);

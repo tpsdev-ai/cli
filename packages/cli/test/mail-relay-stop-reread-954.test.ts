@@ -1,8 +1,6 @@
 /**
  * cli#954 — `mail relay stop` re-reads the pid record immediately before
- * signalling and signals only the same pid with the same start token; a record
- * that changed between the first read and the signal is reported and sends
- * nothing.
+ * signalling under the record lock; changed bytes refuse the signal.
  */
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -218,7 +216,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
         setRelayStopRecordReader(previousReader);
       }
 
-      expect(error?.message).toContain(`holds a stale record for pid ${child.pid}, but it does not prove the process this command verified is gone`);
+      expect(error?.message).toContain("record changed before it was signalled");
       expect(error?.message).toContain(guidance(child.pid));
       expect(reads).toBe(2);
       expect(signals).toEqual([]);
@@ -288,7 +286,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
         setRelayStopRecordReader(previousReader);
       }
 
-      expect(error?.message).toContain(`Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`);
+      expect(error?.message).toContain("record changed before it was signalled");
       expect(error?.message).toContain(guidance(planned.pid));
       expect(error?.message).not.toContain(`ps -p ${replacement.pid}`);
       expect(reads).toBe(2);
@@ -352,7 +350,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
         reader.restore();
       }
 
-      expect(error?.message).toContain(`Mail relay pid file ${relayPid} could not be re-read`);
+      expect(error?.message).toContain("record changed before it was signalled");
       expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
@@ -380,7 +378,7 @@ describe("mail relay stop re-reads the record before signalling", () => {
         reader.restore();
       }
 
-      expect(error?.message).toContain("disappeared before it was signalled");
+      expect(error?.message).toContain("record changed before it was signalled");
       expect(error?.message).toContain(guidance(child.pid));
       expect(reader.reads()).toBe(2);
       expect(signalling.signals).toEqual([]);
