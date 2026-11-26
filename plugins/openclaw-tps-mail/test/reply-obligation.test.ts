@@ -710,6 +710,101 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     await h.stop();
   }, 15000);
 
+  // ── cli#1063 ─────────────────────────────────────────────────────────────────
+  it("cli#1063: the delivery prompt's reply command threads on the SIGNED envelope id", async () => {
+    const h = await start("anvil", "flint", { localSender: true });
+    // start() can return once cur/ is populated; wait for the dispatch itself.
+    await pollUntil(() => h.dispatched !== null, 4000);
+    const envelopeText = h.dispatched.ctx.BodyForAgent as string;
+    expect(envelopeText).toContain(`Reply via: tps mail send flint --reply-to ${h.inboundEnvelopeId} "<your response>"`);
+    // The local record id rides on the ID line, not as the reply thread.
+    expect(envelopeText).toContain(`ID: ${h.inboundId}`);
+    expect(envelopeText).not.toContain(`--reply-to ${h.inboundId}`);
+    await h.stop();
+  }, 15000);
+
+  /**
+   * A reply as `tps mail send <to> --reply-to <inbound envelope id>` writes it
+   * on the LOCAL route: the signed envelope is the body, with no obligation
+   * marker and no wrapper thread.
+   */
+  function writeAgentReply(opts: {
+    thread?: string;
+    seed?: Buffer;
+    signer?: string;
+    tamperThread?: string;
+  } = {}): void {
+    const signer = opts.signer ?? "anvil";
+    const seed = opts.seed ?? ANVIL_SEED;
+    const now = new Date().toISOString();
+    const chain: ChainEntry[] = [
+      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
+      { agent: signer, kind: "agent", timestamp: now, rationale: `agent ${signer} replies`, signature: null },
+    ];
+    const envelope: any = { v: 1, from: signer, to: "flint", body: "the agent's own reply", messageId: randomUUID(), timestamp: now, delegationChain: chain };
+    if (opts.thread !== undefined) envelope.replyToId = opts.thread;
+    let signed = JSON.stringify(signEnvelope(envelope, { [signer]: seed }));
+    if (opts.tamperThread !== undefined) {
+      const parsed = JSON.parse(signed);
+      parsed.replyToId = opts.tamperThread;
+      signed = JSON.stringify(parsed);
+    }
+    const record = {
+      id: randomUUID(),
+      from: signer,
+      to: "flint",
+      body: signed,
+      timestamp: now,
+      read: false,
+      headers: { "X-TPS-Trust": "user", "X-TPS-Sender": signer },
+    };
+    const dir = resolve(tempMailDir, "flint", "new");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(resolve(dir, `2026-05-26T00-00-00-${record.id}.json`), JSON.stringify(record, null, 2), "utf-8");
+  }
+
+  it("cli#1063: a correctly threaded reply WITHOUT a marker acks a yielded obligation", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    const h = await start("anvil", "flint", { localSender: true });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    const obId = h.obligationId()!;
+    // The agent's own reply, sent during the turn: signed thread, no marker.
+    writeAgentReply({ thread: h.inboundEnvelopeId });
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+
+    const acked = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "acked", 4000);
+    expect(acked).toBe(true);
+    expect(curRecord("anvil")?.ackedAt).toBeDefined();
+    expect(curRecord("anvil")?.nackedAt).toBeUndefined();
+    await h.stop();
+  }, 20000);
+
+  it("cli#1063: a missing, different, tampered or wrongly signed thread does NOT settle", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
+    const cases: Array<[string, (thread: string) => void]> = [
+      ["missing", () => writeAgentReply({})],
+      ["different", () => writeAgentReply({ thread: randomUUID() })],
+      // Sign a DIFFERENT thread, then present the real one: the signature no longer verifies.
+      ["tampered", (thread) => writeAgentReply({ thread: randomUUID(), tamperThread: thread })],
+      ["wrongly signed", (thread) => writeAgentReply({ thread, seed: FLINT_SEED })],
+    ];
+    for (const [label, write] of cases) {
+      const h = await start("anvil", "flint", { localSender: true });
+      await pollUntil(() => h.dispatched !== null, 4000);
+      const obId = h.obligationId()!;
+      write(h.inboundEnvelopeId);
+      capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+      h.settle();
+      const failed = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "failed", 4000);
+      expect(failed, `${label}: ${JSON.stringify(obligationFile("anvil", h.inboundId))}`).toBe(true);
+      expect(obligationFile("anvil", h.inboundId)?.failure, label).toBe("yielded-without-resumption");
+      expect(curRecord("anvil")?.nackedAt, label).toBeDefined();
+      expect(curRecord("anvil")?.ackedAt, label).toBeUndefined();
+      await h.stop();
+    }
+  }, 40000);
+
   // ── F-S2j ──────────────────────────────────────────────────────────────────
   it("F-S2j: a remote recipient's marker is found in the outbox; a cross-account match is rejected", async () => {
     // (a) remote happy path: the reply lands in the outbox and the ack proceeds.

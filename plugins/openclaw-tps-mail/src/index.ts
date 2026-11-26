@@ -733,6 +733,10 @@ function resolveOutboundSender(ctx: ChannelOutboundContext): string | null {
 }
 
 function buildEnvelope(msg: TpsMailBody): string {
+  // cli#1063: the reply must thread on the inbound's SIGNED envelope id, never
+  // the local record id shown above — a signed-mode obligation only settles
+  // from a reply that signs that id as `replyToId`.
+  const replyTo = isValidEnvelopeId(msg.envelopeId) ? ` --reply-to ${msg.envelopeId}` : "";
   return [
     "[TPS Mail]",
     `From: ${msg.from}`,
@@ -743,7 +747,7 @@ function buildEnvelope(msg: TpsMailBody): string {
     msg.body,
     "",
     "---",
-    `Reply via: tps mail send ${msg.from} "<your response>"`,
+    `Reply via: tps mail send ${msg.from}${replyTo} "<your response>"`,
   ].join("\n");
 }
 
@@ -2561,6 +2565,13 @@ function scanObligationReceipt(
   expectedReplyId: string | undefined,
 ): ReturnType<typeof scanForReceipt> {
   const thread = receiptThread(rec);
+  // cli#1063: on the LOCAL route a reply the agent sent itself carries the
+  // thread only inside its signed envelope, with no obligation marker. Enable
+  // the marker-less form for signed-mode obligations only; every other route
+  // still requires the marker it mints.
+  const unmarkedThreaded =
+    thread.mode === "signed" &&
+    routeFor(ctx.mailDir, ctx.cfg, ctx.accountId, ctx.sender).kind === "local";
   return scanForReceipt(
     receiptDirs(ctx),
     obligationId,
@@ -2571,7 +2582,7 @@ function scanObligationReceipt(
     // envelope must be addressed to it (cli#429).
     ctx.sender,
     receiptSignatureCheck(ctx),
-    { expectedReplyId, threadMode: thread.mode },
+    { expectedReplyId, threadMode: thread.mode, unmarkedThreaded },
   );
 }
 

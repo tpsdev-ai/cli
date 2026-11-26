@@ -1181,6 +1181,9 @@ export interface ReceiptScanOptions {
   fs?: ReceiptScanFs;
   /** How the thread is checked (receiptThread). Default `legacy`. */
   threadMode?: ReceiptThreadMode;
+  /** cli#1063, local delivery only: also accept a posted reply that carries
+   *  no obligation marker but signs this thread (see form (3)). */
+  unmarkedThreaded?: boolean;
 }
 
 /**
@@ -1237,6 +1240,18 @@ export interface ReceiptScanOptions {
  *       three forms are pinned when the record knows a reply id, and none is
  *       when it does not.
  *
+ *   (3) UNMARKED THREADED REPLY (cli#1063, LOCAL delivery only) — a reply the
+ *       agent sent itself (`tps mail send --reply-to <inbound envelope id>`) is
+ *       a committed record in the sender's maildir with no marker and no wrapper
+ *       thread: its thread rides only INSIDE the signed envelope. A signed-mode
+ *       scan the caller enables `unmarkedThreaded` for accepts such a record
+ *       when it verifies as this agent's reply to `recipient` whose signed
+ *       `replyToId` is this obligation's thread. A record carrying another
+ *       obligation marker or a nack marker, a contradictory wrapper field
+ *       (`from`, `to`, `accountId`, `replyToId`), or a reply that does not
+ *       verify is never evidence. The signed thread names the obligation;
+ *       sender and time window are not match keys.
+ *
  * WHAT THE SIGNATURE CHECK PROVES, AND WHAT IT DOES NOT: it proves the record
  * carries a reply signed by the obligated agent's key (the key Flair holds for
  * it) that threads on this inbound — an unsigned record, a forged signature or
@@ -1271,7 +1286,7 @@ export async function scanForReceipt(
   checkSignature: ReceiptSignatureCheck,
   opts: ReceiptScanOptions = {},
 ): Promise<ReceiptScan> {
-  const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
+  const { expectedReplyId, fs = realFs, threadMode = "legacy", unmarkedThreaded = false } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
   const verified = (envelope: Envelope | null): Promise<boolean> =>
     isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
@@ -1353,6 +1368,24 @@ export async function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
+        (await verified(recordReceiptEnvelope(record)))
+      ) {
+        return { status: "found", path };
+      }
+      // (3) UNMARKED THREADED REPLY (cli#1063, LOCAL delivery only): a reply the
+      //      agent sent itself with `--reply-to` signs the thread inside its
+      //      envelope but carries no obligation marker. The signed thread names
+      //      the obligation; a marker or nack for another purpose, a
+      //      contradictory wrapper, or a reply that does not verify never settles.
+      if (
+        unmarkedThreaded &&
+        record?.headers?.["X-TPS-Obligation"] === undefined &&
+        record?.headers?.["X-TPS-Nack"] === undefined &&
+        (record?.accountId === undefined || record.accountId === accountId) &&
+        record?.from === agent &&
+        record?.to === recipient &&
+        (record?.replyToId === undefined || record.replyToId === replyToId) &&
+        (expectedReplyId === undefined || record?.id === expectedReplyId) &&
         (await verified(recordReceiptEnvelope(record)))
       ) {
         return { status: "found", path };

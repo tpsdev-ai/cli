@@ -574,3 +574,103 @@ describe("receipt scan — cli#429 signed thread mode (real signatures)", () => 
     expect(receiptThread({ inboundId: INBOUND })).toEqual({ threadId: INBOUND, mode: "legacy" });
   });
 });
+
+// ── cli#1063: a threaded reply with NO obligation marker (local route) ──────
+
+describe("receipt scan — cli#1063 unmarked threaded reply (local delivery)", () => {
+  /** A reply as `tps mail send <to> --reply-to <id>` writes it: the thread rides
+   *  inside the signed envelope; there is no marker and no wrapper thread. */
+  function cliReply(over: {
+    from?: string;
+    to?: string;
+    body?: string;
+    accountId?: string;
+    replyToId?: string;
+    headers?: Record<string, string>;
+  } = {}): any {
+    return {
+      id: "reply-1",
+      from: over.from ?? AGENT,
+      to: over.to ?? RECIPIENT,
+      body: over.body ?? replyJson({ replyToId: THREAD }),
+      timestamp: new Date().toISOString(),
+      read: false,
+      headers: { "X-TPS-Trust": "user", "X-TPS-Sender": AGENT, ...(over.headers ?? {}) },
+      ...(over.accountId !== undefined ? { accountId: over.accountId } : {}),
+      ...(over.replyToId !== undefined ? { replyToId: over.replyToId } : {}),
+    };
+  }
+  const unmarked = (opts: ReceiptScanOptions = {}) =>
+    posted(THREAD, { threadMode: "signed", unmarkedThreaded: true, ...opts });
+
+  it("a signed reply that threads this inbound, with no marker → found (positive control)", async () => {
+    writeReply(cliReply());
+    expect(await unmarked()).toBe("found");
+  });
+
+  it("the same record is NOT evidence without unmarkedThreaded (legacy and default scans unchanged)", async () => {
+    writeReply(cliReply());
+    expect(await posted(THREAD, { threadMode: "signed" })).toBe("absent");
+    expect(await posted(THREAD, { threadMode: "legacy" })).toBe("absent");
+  });
+
+  it("no signed replyToId (the reply was sent without --reply-to) → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson() }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a signed replyToId for a DIFFERENT inbound → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson({ replyToId: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1" }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("the signed thread CHANGED after signing (signature broken) → NOT found", async () => {
+    const env = JSON.parse(replyJson({ replyToId: "a-different-thread" }));
+    env.replyToId = THREAD;
+    writeReply(cliReply({ body: JSON.stringify(env) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("signed by ANOTHER key while claiming the obligated agent → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson({ replyToId: THREAD, seed: OTHER_SEED }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a genuine reply signed by ANOTHER agent → NOT found", async () => {
+    writeReply(cliReply({ from: "someone-else", body: replyJson({ replyToId: THREAD, from: "someone-else", seed: OTHER_SEED }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("addressed to someone other than the inbound sender → NOT found", async () => {
+    writeReply(cliReply({ to: "mallory", body: replyJson({ replyToId: THREAD, to: "mallory" }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("carries ANOTHER obligation's marker → NOT found", async () => {
+    writeReply(cliReply({ headers: { "X-TPS-Obligation": "ob-2" } }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("carries a NACK marker → NOT found (a nack never settles the obligation)", async () => {
+    writeReply(cliReply({ headers: { "X-TPS-Nack": "yielded-without-resumption" } }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a wrapper replyToId that contradicts the signed thread → NOT found", async () => {
+    writeReply(cliReply({ replyToId: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1" }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a wrapper accountId/from that contradicts the signed reply → NOT found", async () => {
+    writeReply(cliReply({ accountId: "some-other-account" }));
+    expect(await unmarked()).toBe("absent");
+    writeReply(cliReply({ from: "mallory" }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("the obligation record knows the reply: a record with another id is not evidence", async () => {
+    writeReply(cliReply());
+    expect(await unmarked({ expectedReplyId: "reply-1" })).toBe("found");
+    expect(await unmarked({ expectedReplyId: "reply-2" })).toBe("absent");
+  });
+});
