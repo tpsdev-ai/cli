@@ -1031,6 +1031,59 @@ describe("bridge stop re-read exit status (cli#970)", () => {
   );
 
   test(
+    "a duplicate removed after the stale snapshot is reported already gone",
+    async () => {
+      stageProcStartTokens();
+      const child = spawnSleep();
+      const token = tokenOf(child.pid);
+      const firstPath = join(runDir, "bridge-alpha.pid");
+      const secondPath = join(runDir, "bridge-beta.pid");
+      const plannedBytes = record(child.pid, token);
+      writeFileSync(firstPath, plannedBytes);
+      writeFileSync(secondPath, plannedBytes);
+
+      const signals: number[] = [];
+      const lines: string[] = [];
+      let tookStaleSnapshot = false;
+      const restore = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
+      const unlinkSpy = spyOn(fs, "unlinkSync");
+      const previousReader = setBridgeStopRecordReader((readPath) => {
+        const snapshot = snapshotPidRecord(readPath);
+        if (readPath === secondPath) {
+          expect(snapshot.state.kind).toBe("stale");
+          expect(snapshot.raw).toEqual(Buffer.from(plannedBytes));
+          expect(processIsGone(child.pid, token)).toBe(true);
+          tookStaleSnapshot = true;
+          rmSync(secondPath);
+        }
+        return snapshot;
+      });
+      const previous = setBridgeStopSignal((pid) => {
+        signals.push(pid);
+        process.kill(pid, "SIGKILL");
+      });
+      let unlinkedPaths: unknown[] = [];
+      try {
+        await runBridge({ action: "stop" });
+        unlinkedPaths = unlinkSpy.mock.calls.map(([path]) => path);
+      } finally {
+        setBridgeStopSignal(previous);
+        setBridgeStopRecordReader(previousReader);
+        unlinkSpy.mockRestore();
+        restore();
+      }
+
+      expect(tookStaleSnapshot).toBe(true);
+      expect(signals).toEqual([child.pid]);
+      expect(existsSync(secondPath)).toBe(false);
+      expect(unlinkedPaths).not.toContain(secondPath);
+      expect(lines).toContain(`Bridge (pid ${child.pid}) stopped; pid file ${secondPath} already gone.`);
+      expect(lines).not.toContain(`Bridge (pid ${child.pid}) stopped; duplicate pid file ${secondPath} removed.`);
+    },
+    TIMEOUT,
+  );
+
+  test(
     "a failed unlink keeps the duplicate path and reports failure without reporting removal",
     async () => {
       stageProcStartTokens();
@@ -1038,8 +1091,9 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       const token = tokenOf(child.pid);
       const firstPath = join(runDir, "bridge-alpha.pid");
       const secondPath = join(runDir, "bridge-beta.pid");
-      writeFileSync(firstPath, record(child.pid, token));
-      writeFileSync(secondPath, record(child.pid, token));
+      const originalBytes = record(child.pid, token);
+      writeFileSync(firstPath, originalBytes);
+      writeFileSync(secondPath, originalBytes);
 
       const lines: string[] = [];
       const restoreLog = patchShared(console, "log", (...args: unknown[]) => lines.push(args.map(String).join(" ")));
@@ -1049,8 +1103,7 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       const unlinkSpy = spyOn(fs, "unlinkSync").mockImplementation((path) => {
         if (path === secondPath) {
           attemptedUnlink = true;
-          rmSync(secondPath);
-          mkdirSync(secondPath);
+          throw Object.assign(new Error("unlink EACCES"), { code: "EACCES" });
         }
         return unlink(path);
       });
@@ -1071,8 +1124,8 @@ describe("bridge stop re-read exit status (cli#970)", () => {
       }
 
       expect(attemptedUnlink).toBe(true);
-      expect(existsSync(secondPath)).toBe(true);
-      expect(error?.message).toMatch(/EISDIR|EPERM/);
+      expect(readFileSync(secondPath, "utf8")).toBe(originalBytes);
+      expect(error?.message).toContain("EACCES");
       expect(error?.message).toContain(`Bridge pid file ${secondPath} could not be removed`);
       expect(error?.message).toContain("the pid file was kept.");
       expect(lines).toContain(error?.message!);
