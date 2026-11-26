@@ -7,9 +7,11 @@ import { spawn } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
+import { standInOwnerPidFromEnv, standInTail, stayAliveUntilOwnerGone } from "../helpers/stand-in.mjs";
 
 const root = process.env.TEARDOWN_DIR;
 if (!root) throw new Error("TEARDOWN_DIR is not set");
+const ownerPid = standInOwnerPidFromEnv();
 mkdirSync(root, { recursive: true });
 const portFile = join(root, "gateway.port");
 const childPidFile = join(root, "gateway-child.pid");
@@ -17,11 +19,11 @@ const childPidFile = join(root, "gateway-child.pid");
 const stubSource = `import net from "node:net";
 import { spawn } from "node:child_process";
 import { writeFileSync } from "node:fs";
-const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+const child = spawn(process.execPath, ["-e", ${JSON.stringify(standInTail(ownerPid))}], { stdio: "ignore" });
 writeFileSync(process.env.STUB_CHILD_PID_FILE, String(child.pid));
 const server = net.createServer((socket) => socket.end("ready"));
 server.listen(0, "127.0.0.1", () => writeFileSync(process.env.STUB_PORT_FILE, String(server.address().port)));
-setInterval(() => {}, 1000);`;
+${standInTail(ownerPid)}`;
 
 const gateway = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: "ignore",
@@ -36,5 +38,5 @@ console.log("TEARDOWN_FIXTURE_READY");
 if (process.env.TEARDOWN_EXIT === "normal") {
   process.stdin.once("data", () => process.exit(0));
 } else {
-  setInterval(() => {}, 1000);
+  stayAliveUntilOwnerGone(ownerPid);
 }

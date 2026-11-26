@@ -9,6 +9,7 @@ function runCase(status: number, heartbeatStatus = 0) {
   const result = spawnSync(process.env.NODE_BIN ?? "node", [FIXTURE, LANE, String(status), String(heartbeatStatus)], {
     encoding: "utf-8",
     timeout: 15_000,
+    env: { ...process.env, TPS_STAND_IN_OWNER_PID: String(process.pid) },
   });
   expect(result.error).toBeUndefined();
   expect(result.status).toBe(0);

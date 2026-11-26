@@ -1168,6 +1168,18 @@ function obligationNow(): number {
   return obligationNowForTests?.() ?? Date.now();
 }
 
+/** cli#1063: shorten the deadline sweep in a test. Undefined uses the
+ *  production interval. */
+let obligationDeadlineSweepMsForTests: number | undefined;
+export function setObligationDeadlineSweepForTests(ms: number | undefined): number | undefined {
+  const prev = obligationDeadlineSweepMsForTests;
+  obligationDeadlineSweepMsForTests = ms;
+  return prev;
+}
+function obligationDeadlineSweepMs(): number {
+  return obligationDeadlineSweepMsForTests ?? OBLIGATION_DEADLINE_SWEEP_MS;
+}
+
 let beforeReceiptScanForTests: ((inboundId: string) => void) | undefined;
 export function setBeforeReceiptScanForTests(hook: typeof beforeReceiptScanForTests): void {
   beforeReceiptScanForTests = hook;
@@ -1662,18 +1674,13 @@ async function settleObligation(
 ): Promise<"acked" | "unconfirmed" | "failed" | "none" | "stale" | "retry-scheduled" | "write-failed"> {
   if (!isLiveContext(ctx)) return "none";
   beforeSettleEntryForTests?.(ctx.inboundId);
-  // The missing-cur allowance needs a clean lookup at the decision point: an
-  // inbound that returned since the caller's scan is settled through the normal
-  // gate, and a failed lookup settles nothing.
-  let missingCur = s.missingCur === true;
-  if (missingCur) {
-    const cur = lookupObligationCur(ctx, obligationId);
-    if (cur.status === "error") {
-      reportObligationFailure(ctx, obligationId, `cur/ lookup failed (${cur.code})`);
-      return "retry-scheduled";
-    }
-    if (cur.status === "present") missingCur = false;
+  // Recheck placement at settlement; a context can outlive a refused attempt.
+  const cur = lookupObligationCur(ctx, obligationId);
+  if (cur.status === "error") {
+    reportObligationFailure(ctx, obligationId, `cur/ lookup failed (${cur.code})`);
+    return "retry-scheduled";
   }
+  const missingCur = s.missingCur === true && cur.status === "missing";
   if (!missingCur && !(await internalInbound(ctx))) return "none";
   if (!isLiveContext(ctx)) return "none";
   beforeSettleReadForTests?.(ctx.inboundId);
@@ -2603,16 +2610,8 @@ function lookupObligationCur(
     return { status: "error", code: faultCode };
   }
   const curDir = resolve(ctx.mailDir, ctx.agent, "cur");
-  // cli#1006 r10: the context carries the inbound's cur/ path when one is
-  // known, and a probe there proves PRESENCE without a directory scan, which a
-  // cur/ holding more names than the scan reads would refuse. A record at that
-  // path for a DIFFERENT id proves nothing, so the scan below decides.
-  if (ctx.curPath && readMailFile(ctx.curPath)?.id === ctx.inboundId) return { status: "present" };
   let error: string | undefined;
-  // A context with no proven path (the startup pre-scan's retry entry, cli#1059
-  // item E) must keep the pre-scan's positive-presence mode: past the scan limit
-  // a single match still proves PRESENCE, and a miss still reports SCAN_LIMIT
-  // because absence is not provable that way.
+  // Past the scan limit, a match proves presence; a miss cannot prove absence.
   const found = findCurPath(
     ctx.mailDir,
     ctx.agent,
@@ -2631,6 +2630,7 @@ function lookupObligationCur(
     ctx.curPath = found;
     return { status: "present" };
   }
+  ctx.curPath = "";
   return { status: "missing" };
 }
 
@@ -3164,6 +3164,8 @@ const outbound: ChannelOutboundAdapter = {
 };
 
 export const NEW_DIR_RESCAN_MS = 30_000;
+/** cli#1063: how often a live account checks open obligations. */
+export const OBLIGATION_DEADLINE_SWEEP_MS = 60_000;
 export const MAX_NEW_FILE_TRANSIENT_FAILURES = 3;
 /** cli#922 item 1: the cap on the rescan-tick backoff between watcher re-arm attempts. */
 export const MAX_WATCHER_REARM_BACKOFF_TICKS = 32;
@@ -3174,6 +3176,38 @@ export const MAX_WATCHER_REARM_BACKOFF_TICKS = 32;
  */
 export function rearmBackoffTicks(failures: number): number {
   return Math.min(2 ** (failures - 1), MAX_WATCHER_REARM_BACKOFF_TICKS);
+}
+
+/** cli#1063: attempt to arm records without a usable deadline or settle due
+ *  records, skipping records a timer or retry owns. */
+function sweepObligationDeadlines(
+  mailDir: string,
+  agent: string,
+  accountId: string,
+  cfg: any,
+  log: any,
+  incarnation: symbol,
+): void {
+  for (const rec of listObligations(mailDir, agent, (path, code) => {
+    log?.warn?.(`tps-mail: obligation-deadline-sweep-unreadable: ${path}: ${code ?? "invalid"}`);
+  })) {
+    if (TERMINAL_STATES.has(rec.state)) continue;
+    if (armedDeadlines.has(rec.obligationId) || obligationRetries.has(rec.obligationId)) continue;
+    const deadline = usableDeadline(rec.deadlineAt);
+    if (deadline !== null && Date.parse(deadline) > obligationNow()) continue;
+    let ctx = yieldContexts.get(rec.obligationId);
+    if (!ctx) {
+      ctx = makeYieldCtx(mailDir, agent, rec.from, accountId, "", rec.inboundId, cfg, log, incarnation, rec.inboundEnvelopeId);
+      yieldContexts.set(rec.obligationId, ctx);
+    }
+    if (deadline === null) {
+      retryAfterArmFailure(ctx, rec.obligationId, armDeadline(ctx, rec.obligationId, rec.deadlineAt));
+    } else {
+      void onDeadline(ctx, rec.obligationId).catch((err: any) => {
+        log?.warn?.(`tps-mail: obligation-deadline-sweep-failed: ${rec.obligationId}: ${err?.message ?? err}`);
+      });
+    }
+  }
 }
 
 const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
@@ -3430,7 +3464,9 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
             to: recipient,
             accountId: account.accountId,
             state: "pending",
-            deadlineAt: null,
+            // cli#1063: persist the deadline at creation so a later sweep can
+            // attempt settlement at or after it when no timer is armed.
+            deadlineAt: new Date(obligationNow() + obligationDeadlineMs()).toISOString(),
             attempts: 1,
           }),
           log,
@@ -3914,6 +3950,12 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
       };
       const rescanInterval = setInterval(() => { void rescan(); }, NEW_DIR_RESCAN_MS);
       lifetime.intervals.add(rescanInterval);
+      const deadlineSweep = setInterval(() => {
+        if (!isLive()) return;
+        sweepObligationDeadlines(account.mailDir, agentId, account.accountId, cfg, log, incarnation);
+      }, obligationDeadlineSweepMs());
+      lifetime.intervals.add(deadlineSweep);
+      if (typeof (deadlineSweep as any).unref === "function") (deadlineSweep as any).unref();
 
       try {
         try {

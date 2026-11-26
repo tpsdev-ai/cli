@@ -15,6 +15,7 @@ import {
   pidIsRunning,
   waitForPidGone,
 } from "./helpers/live-process.js";
+import { standInTail } from "./helpers/stand-in.mjs";
 
 /** Operational allowance for a process to act on its owner's death. */
 const EXIT_BOUND_MS = 10_000;
@@ -34,7 +35,7 @@ import { spawnWatchedWorker } from ${JSON.stringify(HELPER_URL)};
 const root = process.argv[2];
 const child = spawnWatchedWorker(${JSON.stringify(worker)}, [root]);
 writeFileSync(join(root, "worker.pid"), String(child.pid));
-setInterval(() => {}, 1000);
+${standInTail(process.pid)}
 `,
   );
   return path;
