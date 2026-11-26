@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { chmodSync, closeSync, cpSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import net from "node:net";
@@ -8,6 +8,7 @@ import { join, resolve, isAbsolute, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 import { assertOpenClawVersion, assertPortClosed, finishWithCleanup, installOpenClaw, makeCase, OPENCLAW_VERSION, runLane, stopGateway, stopGatewayAndCloseLog, waitForRpc } from "../../../scripts/heartbeat-real-openclaw-lane.mjs";
 import { withPortRetry } from "./helpers/port.js";
+import { spawnStandIn } from "../../../test/helpers/stand-in.mjs";
 
 const REPO = resolve(fileURLToPath(new URL("../../../", import.meta.url)));
 
@@ -118,7 +119,7 @@ describe("the readiness deadline bounds each probe", () => {
   });
 
   test("a real child's SIGTERM exit rejects readiness before probing", async () => {
-    const child = spawn("node", ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const child = spawnStandIn({ command: "node" });
     try {
       await once(child, "spawn");
       const exited = once(child, "exit");
