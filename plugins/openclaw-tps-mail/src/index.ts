@@ -237,6 +237,19 @@ function resolveMailDir(cfg: any, accountId: string): string {
   return expandHome(account.mailDir ?? DEFAULT_MAIL_DIR);
 }
 
+/** The account's config `mailDir`, when the config SETS one (never the default). */
+function configuredMailDir(cfg: any, accountId: string): string | null {
+  const accounts = cfg?.channels?.[CHANNEL_ID]?.accounts ?? {};
+  const account = accounts[accountId] ?? accounts.default ?? {};
+  const value = account?.mailDir;
+  return typeof value === "string" && value.length > 0 ? expandHome(value) : null;
+}
+
+/** POSIX shell-quote: bare when the value needs no quoting, single-quoted otherwise. */
+function shellQuote(value: string): string {
+  return /^[A-Za-z0-9_./:@%+-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
+}
+
 /**
  * STARTUP GUARD: two accounts resolving to the same mailDir would let one
  * account's receipt scan satisfy another's obligation (and one account's
@@ -732,11 +745,14 @@ function resolveOutboundSender(ctx: ChannelOutboundContext): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-function buildEnvelope(msg: TpsMailBody): string {
+function buildEnvelope(msg: TpsMailBody, mailDir: string | null = null): string {
   // cli#1063: the reply must thread on the inbound's SIGNED envelope id, never
   // the local record id shown above — a signed-mode obligation only settles
   // from a reply that signs that id as `replyToId`.
   const replyTo = isValidEnvelopeId(msg.envelopeId) ? ` --reply-to ${msg.envelopeId}` : "";
+  // ... and it must write where the scan looks: a CONFIGURED mailDir is passed
+  // to the CLI, shell-quoted.
+  const dirPrefix = mailDir === null ? "" : `TPS_MAIL_DIR=${shellQuote(mailDir)} `;
   return [
     "[TPS Mail]",
     `From: ${msg.from}`,
@@ -747,7 +763,7 @@ function buildEnvelope(msg: TpsMailBody): string {
     msg.body,
     "",
     "---",
-    `Reply via: tps mail send ${msg.from}${replyTo} "<your response>"`,
+    `Reply via: ${dirPrefix}tps mail send ${msg.from}${replyTo} "<your response>"`,
   ].join("\n");
 }
 
@@ -3419,7 +3435,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         dmScope: "per-channel-peer",
       }) ?? `agent:${recipient}:${CHANNEL_ID}:${account.accountId}:${msg.from}`;
 
-      const envelope = buildEnvelope(msg);
+      const envelope = buildEnvelope(msg, configuredMailDir(cfg, account.accountId));
       const rawMsgCtx: Record<string, any> = {
         BodyForAgent: envelope,
         RawBody: msg.body,

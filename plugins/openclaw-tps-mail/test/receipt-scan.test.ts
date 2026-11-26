@@ -2,7 +2,7 @@
  * receipt-scan.test.ts — cli#398 round 2, item 3, extended for cli#389 round 3
  * and cli#429.
  *
- * TWO receipt forms and ONE rule: the receipt must name THIS obligation AND the
+ * THREE receipt forms and ONE rule: the receipt must name THIS obligation AND the
  * inbound it answers — and (cli#429) the reply it carries must be a VERIFIED
  * signed reply by the obligated agent for this thread. Every field either form
  * is checked on is pinned here, so the docblock cannot drift from the code
@@ -17,6 +17,10 @@
  * (2) POSTED FILE: matched on the obligation marker, the accountId, the record
  *     `from` and `replyToId` — OR (cli#389 round 5, item 2) on the obligation ids
  *     `deliverToSandbox` writes into its reduced record and the record `from`.
+ * (3) UNMARKED THREADED REPLY (cli#1063, local delivery on an office host): a
+ *     reply the agent sent itself with `--reply-to` carries the thread inside the
+ *     signed envelope and no marker. A record carrying a `X-TPS-Nack` marker is
+ *     never evidence in any posted form.
  *
  * Every form is then held to the SIGNATURE rule (cli#429): a candidate whose
  * reply is unsigned, whose signature does not verify, that another agent
@@ -575,11 +579,26 @@ describe("receipt scan — cli#429 signed thread mode (real signatures)", () => 
   });
 });
 
+// ── cli#1063: a NACK marker is never settlement evidence ────────────────────
+
+describe("receipt scan — cli#1063 a NACK record never settles", () => {
+  it("a validly signed record with the matching obligation marker AND a nack marker does not settle", async () => {
+    const record = reply({ body: replyJson({ replyToId: THREAD }), replyToId: THREAD });
+    writeReply(record);
+    expect(await posted(THREAD, { threadMode: "signed" }), "without the nack this record is evidence").toBe("found");
+    writeReply({ ...record, headers: { ...record.headers, "X-TPS-Nack": "yielded-without-resumption" } });
+    expect(await posted(THREAD, { threadMode: "signed" })).toBe("absent");
+  });
+});
+
 // ── cli#1063: a threaded reply with NO obligation marker (local route) ──────
 
-describe("receipt scan — cli#1063 unmarked threaded reply (local delivery)", () => {
-  /** A reply as `tps mail send <to> --reply-to <id>` writes it: the thread rides
-   *  inside the signed envelope; there is no marker and no wrapper thread. */
+describe("receipt scan — cli#1063 unmarked threaded reply (office local delivery)", () => {
+  /** A reply run as `tps mail send <to> --reply-to <id>` on an OFFICE host
+   *  writes it: the thread rides inside the signed envelope; there is no marker
+   *  and no wrapper thread. A branch host relays a bound recipient through the
+   *  outbox, where this marker-less form is not enabled; that route is not
+   *  matched by this change. */
   function cliReply(over: {
     from?: string;
     to?: string;

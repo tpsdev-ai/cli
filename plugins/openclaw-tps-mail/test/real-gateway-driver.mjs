@@ -269,6 +269,7 @@ async function main() {
     openclawVersion: null,
     modelCalls: 0,
     modelTurnTexts: [],
+    inboundPromptText: null,
     unexpected: [],
     dispatchStarts: 0,
     replyCount: 0,
@@ -379,6 +380,15 @@ async function main() {
       modelCalls += 1;
       const input = Array.isArray(parsed?.input) ? parsed.input : [];
       const sawToolOutput = input.some((item) => item?.type === "function_call_output");
+      const inputText = (item) =>
+        typeof item?.text === "string"
+          ? item.text
+          : Array.isArray(item?.content)
+            ? item.content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("\n")
+            : "";
+      if (!sawToolOutput && report.inboundPromptText === null) {
+        report.inboundPromptText = input.map(inputText).join("\n\n");
+      }
       const messages = sawToolOutput
         ? [{ id: "msg_2", text: "FINAL: the task is complete", phase: "final_answer" }]
         : [{ id: "msg_1", text: "PROGRESS: drafting the answer", phase: "final_answer" }];

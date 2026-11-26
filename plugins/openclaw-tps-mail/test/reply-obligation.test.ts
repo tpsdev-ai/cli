@@ -21,6 +21,7 @@ import { MailClient, mailboxReplayStore, acquireMailLockSync } from "@tpsdev-ai/
  */
 import { describe, expect, it, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readdirSync, readFileSync, existsSync, statSync, chmodSync, symlinkSync, renameSync, rmdirSync, unlinkSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
@@ -711,12 +712,16 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
   }, 15000);
 
   // ── cli#1063 ─────────────────────────────────────────────────────────────────
-  it("cli#1063: the delivery prompt's reply command threads on the SIGNED envelope id", async () => {
+  it("cli#1063: the delivery prompt's reply command threads on the SIGNED envelope id and names the configured maildir", async () => {
     const h = await start("anvil", "flint", { localSender: true });
     // start() can return once cur/ is populated; wait for the dispatch itself.
     await pollUntil(() => h.dispatched !== null, 4000);
     const envelopeText = h.dispatched.ctx.BodyForAgent as string;
-    expect(envelopeText).toContain(`Reply via: tps mail send flint --reply-to ${h.inboundEnvelopeId} "<your response>"`);
+    // The plugin's account config sets a mailDir, so the command passes it to
+    // the CLI: the reply must land where this account's receipt scan reads.
+    expect(envelopeText).toContain(
+      `Reply via: TPS_MAIL_DIR=${tempMailDir} tps mail send flint --reply-to ${h.inboundEnvelopeId} "<your response>"`,
+    );
     // The local record id rides on the ID line, not as the reply thread.
     expect(envelopeText).toContain(`ID: ${h.inboundId}`);
     expect(envelopeText).not.toContain(`--reply-to ${h.inboundId}`);
@@ -724,9 +729,12 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
   }, 15000);
 
   /**
-   * A reply as `tps mail send <to> --reply-to <inbound envelope id>` writes it
-   * on the LOCAL route: the signed envelope is the body, with no obligation
-   * marker and no wrapper thread.
+   * A reply run as the prompt prints it (`tps mail send <to> --reply-to <inbound
+   * envelope id>`, with the account's mailDir) writes on the OFFICE local route:
+   * the signed envelope is the body, with no obligation marker and no wrapper
+   * thread. A branch host relays a bound recipient through the outbox, where
+   * this marker-less form is not enabled; that route is not matched by this
+   * change.
    */
   function writeAgentReply(opts: {
     thread?: string;
@@ -804,6 +812,46 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       await h.stop();
     }
   }, 40000);
+
+  it("cli#1063: the suggested command, run as printed, lands where the scan looks and settles", async () => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
+    const h = await start("anvil", "flint", { localSender: true });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    const promptText = h.dispatched.ctx.BodyForAgent as string;
+    const suggestion = /^Reply via: (.+)$/m.exec(promptText)?.[1];
+    expect(suggestion).toBeDefined();
+    const command = suggestion!.replace('"<your response>"', '"the real CLI reply"');
+
+    // Run the command EXACTLY as printed: a `tps` shim on PATH runs the real
+    // CLI from this worktree, and the agent's environment supplies its id and
+    // its key. The prompt's TPS_MAIL_DIR prefix is what puts the reply in the
+    // maildir this account's scan reads.
+    const shimDir = join(tempHome, "shim-bin");
+    mkdirSync(shimDir, { recursive: true });
+    const cliBin = resolve(import.meta.dir, "../../../packages/cli/bin/tps.ts");
+    const quotedCli = `'${cliBin.replace(/'/g, "'\\''")}'`;
+    writeFileSync(join(shimDir, "tps"), `#!/bin/sh\nexec bun ${quotedCli} "$@"\n`, { mode: 0o755 });
+    const run = spawnSync("/bin/sh", ["-c", command], {
+      cwd: tempHome,
+      env: { ...process.env, TPS_AGENT_ID: "anvil", PATH: `${shimDir}:${process.env.PATH ?? ""}` },
+      encoding: "utf-8",
+      timeout: 20000,
+    });
+    expect(run.status, `the printed command failed: ${run.stderr || run.stdout}`).toBe(0);
+
+    const flintNew = resolve(tempMailDir, "flint", "new");
+    const landed = await pollUntil(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
+    expect(landed, "the reply landed in the inbound sender's maildir").toBe(true);
+
+    // Drive the post-turn scan: it finds the marker-less reply and acks.
+    const obId = h.obligationId()!;
+    capturedSubscription.handle({ runId: obId, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+    const acked = await pollUntil(() => obligationFile("anvil", h.inboundId)?.state === "acked", 4000);
+    expect(acked, JSON.stringify(obligationFile("anvil", h.inboundId))).toBe(true);
+    expect(curRecord("anvil")?.ackedAt).toBeDefined();
+    await h.stop();
+  }, 30000);
 
   // ── F-S2j ──────────────────────────────────────────────────────────────────
   it("F-S2j: a remote recipient's marker is found in the outbox; a cross-account match is rejected", async () => {
