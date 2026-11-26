@@ -889,6 +889,59 @@ describe("watchMail (verified-only, non-consuming)", () => {
     expect(ids.filter((id) => id === envId)).toHaveLength(1);
   }, 10_000);
 
+  it.each([false, true])("holds a known id through verification failure, read failure and recovery (identity changes: %s)", async (changeIdentity) => {
+    const ids: string[] = [];
+    const ready = readySignal();
+    const events = capturedFsEvents();
+    const log = captureErrors();
+    let failVerification = false;
+    let restore = () => {};
+    const watcher = watchMail({
+      agent: AGENT, debounceMs: 1, pollMs: IDLE_POLL_MS,
+      watchImpl: events.watchImpl, onReady: ready.onReady,
+      beforeVerify: async () => {
+        if (failVerification) throw new Error("verification failure before read failure");
+      },
+      onMessage: (msg) => { ids.push(msg.id); },
+    });
+    try {
+      await ready.promise;
+      const original = signedRecord("original", "known id across failed scans");
+      writeRecord(original.record);
+      events.fire(original.path);
+      await waitFor(() => ids.includes(original.env.messageId), SCAN_SETTLE_MS);
+
+      const replacement = join(dirname(original.path), "replacement.json");
+      renameSync(original.path, replacement);
+      failVerification = true;
+      events.fire(replacement);
+      await waitFor(() => log.lines.some((line) => line.includes("verification failure before read failure")), SCAN_SETTLE_MS);
+
+      if (changeIdentity) {
+        const source = join(tempRoot, "replacement-source.json");
+        writeFileSync(source, JSON.stringify(original.record));
+        renameSync(source, replacement);
+      }
+      const reads = failReadsOf("readFileSync", replacement);
+      restore = reads.restore;
+      failVerification = false;
+      events.fire(replacement);
+      await waitFor(() => reads.fault.injected === 1, SCAN_SETTLE_MS);
+
+      reads.fault.armed = false;
+      const barrier = signedRecord("z", "read recovery barrier");
+      writeRecord(barrier.record);
+      events.fire(replacement);
+      await waitFor(() => ids.includes(barrier.env.messageId), SCAN_SETTLE_MS);
+      expect(reads.fault.attempts).toBeGreaterThan(1);
+      expect(ids.filter((id) => id === original.env.messageId)).toHaveLength(1);
+    } finally {
+      watcher.stop();
+      restore();
+      log.restore();
+    }
+  }, 10_000);
+
   it("before classification, a consumed-history failure holds a presented id through recovery", async () => {
     const ids: string[] = [];
     const bodies: string[] = [];
@@ -1389,7 +1442,7 @@ describe("watchMail (verified-only, non-consuming)", () => {
     }
   }, 10_000);
 
-  it("classification after ten consecutive failed per-file attempts releases the old id's hold", async () => {
+  it("classification after ten consecutive failed per-file attempts retains the path's known id", async () => {
     const ids: string[] = [];
     const ready = readySignal();
     const events = capturedFsEvents();
@@ -1426,8 +1479,10 @@ describe("watchMail (verified-only, non-consuming)", () => {
 
       injected.fault.armed = false;
       writeRecord({ ...raw, id: "id-copy-c" });
+      const barrier = deliverSigned("classified known-id barrier");
       events.fire(join(dirname(first), "id-copy-c.json"));
-      await waitFor(() => ids.filter((id) => id === env.messageId).length === 2, SCAN_SETTLE_MS);
+      await waitFor(() => ids.includes(barrier.messageId), SCAN_SETTLE_MS);
+      expect(ids.filter((id) => id === env.messageId)).toHaveLength(1);
       expect(existsSync(copyB)).toBe(true);
       expect(injected.fault.injected).toBe(10);
     } finally {
