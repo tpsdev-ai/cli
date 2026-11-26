@@ -1723,6 +1723,37 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
     expect(assertNpmCiLockfilesRead(stepWithShell(approved, "sh"), READ_TRACKED, WORKFLOW)).toBe(0);
   }, 5_000);
 
+  for (const entryPoint of ["lockfiles", "tree"] as const) {
+    const check = (run: string) => entryPoint === "lockfiles"
+      ? assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)
+      : assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs;
+
+    it.each([
+      ["cat <<<x", "n$'p\\155' ci", "is a here-string"],
+      ['echo "<<x"', "np? ci", "is inside quotes"],
+      ["y=$((a<<b))", "np? ci", "is inside arithmetic expansion"],
+    ])(`refuses a false here-document header through ${entryPoint}: %s`, (header, command, reason) => {
+      expect(() => check(`echo ok\n${header}\n${command}`)).toThrow(
+        `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a here-document header match that ${reason}: ${header} (physical line 2)`,
+      );
+    }, 5_000);
+
+    it(`preserves a real here-document body through ${entryPoint}`, () => {
+      expect(check("cat <<EOF\nnp? ci\nEOF")).toBe(0);
+    }, 5_000);
+
+    it.each(["cat <<<x", 'echo "<<x"', "y=$((a<<b))"])(`preserves a pinned header through ${entryPoint}: %s`, (header) => {
+      const entry = EXACT_BLOCK_ALLOWLIST[0];
+      const original = entry.text;
+      try {
+        entry.text = `${header}\necho ok`;
+        expect(check(entry.text)).toBe(0);
+      } finally {
+        entry.text = original;
+      }
+    }, 5_000);
+  }
+
   it("refuses a command word that spells npm with ANSI-C quoting", () => {
     expect(() => assertNpmCiLockfilesRead(stepWithShell("$'np\\155' ci"), READ_TRACKED, WORKFLOW)).toThrow(
       `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with ANSI-C quoting: $'np\\155' ci (physical line 1)`,
@@ -1745,7 +1776,8 @@ describe("the workflow guard reads shell: and refuses leading redirections and v
     "A=x >out B=y 2>&1 </dev/null np? ci", "<<<text npm ci", "{fd}>out npm ci",
     "echo ok; <> /dev/null npm ci", "if true; then 2>&1 npm ci; fi", ">/dev/null",
   ])("refuses a leading redirection: %s", (run) => {
-    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a leading redirection: ${run} (physical line 1)`;
+    const shape = run.startsWith("<<<") ? "a here-document header match that is a here-string" : "a leading redirection";
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has ${shape}: ${run} (physical line 1)`;
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
     expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
   }, 5_000);

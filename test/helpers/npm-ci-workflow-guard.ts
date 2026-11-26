@@ -409,7 +409,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
   if (!approved) {
-    for (const entry of logicalShellLines(run)) {
+    for (const entry of logicalShellLines(run, refuse)) {
       if (entry.body) continue;
       for (const clause of splitClauses(entry.text, true)) {
         const commandIndex = clause.tokens.findIndex((token) =>
@@ -933,7 +933,7 @@ function quoteStartMask(raw: string[]): boolean[] {
  * lines. Bodies are kept for the install classifier (a heredoc fed to a shell
  * runs its text); command scanning ignores body lines.
  */
-function logicalShellLines(text: string): LogicalLine[] {
+function logicalShellLines(text: string, refuseHeader?: (entry: PhysicalLine, reason: string) => never): LogicalLine[] {
   const raw = text.split("\n");
   const mask = quoteStartMask(raw);
   const lines: LogicalLine[] = [];
@@ -970,6 +970,10 @@ function logicalShellLines(text: string): LogicalLine[] {
     }
     buffer += line;
     const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
+    if (heredoc !== null && refuseHeader !== undefined) {
+      const reason = hereDocumentHeaderRefusal(line, heredoc.index!);
+      if (reason !== null) refuseHeader({ text: physical.trim(), line: index + 1 }, `an unapproved run block has a here-document header match that ${reason}`);
+    }
     flush(
       heredoc === null && index + 1 < raw.length && mask[index + 1] === true,
       raw.slice(index + 1).join("\n"),
@@ -981,6 +985,33 @@ function logicalShellLines(text: string): LogicalLine[] {
   }
   flush();
   return lines;
+}
+
+function hereDocumentHeaderRefusal(line: string, header: number): string | null {
+  if (line[header - 1] === "<" || line[header + 2] === "<") return "is a here-string";
+  let quote = "";
+  let arithmeticDepth = 0;
+  for (let index = 0; index < header; index++) {
+    const char = line[index];
+    if (char === "\\" && quote !== "'") {
+      index++;
+    } else if (quote !== "") {
+      if (quote === "ansi" ? char === "'" : char === quote) quote = "";
+    } else if (char === "$" && line[index + 1] === "'") {
+      quote = "ansi";
+      index++;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+    } else if (line.startsWith("$((", index)) {
+      arithmeticDepth += 2;
+      index += 2;
+    } else if (arithmeticDepth > 0) {
+      if (char === "(") arithmeticDepth++;
+      else if (char === ")") arithmeticDepth--;
+    }
+  }
+  if (quote !== "") return "is inside quotes";
+  return arithmeticDepth > 0 ? "is inside arithmetic expansion" : null;
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
