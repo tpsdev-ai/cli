@@ -986,7 +986,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         const decision = withRelayPidLock("stop the relay", () => {
           const snapshot = readStopRecord();
           if (!pidRecordBytesEqual(snapshot.raw, classification.raw)) {
-            throw new Error(`Mail relay pid file ${state.path}: record changed before it was signalled; this command signalled no process. The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`);
+            throw new Error(`Mail relay pid file ${state.path}: record changed before it was signalled; this command signalled no process. The process named by the original record (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`);
           }
           const current = classifyRelayPidSnapshot(snapshot);
           if (current.kind === "running" && current.pid === state.pid && current.startToken === state.startToken) {
@@ -1000,7 +1000,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         });
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
-          const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
+          const unproven = `The process named by the original record (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
           if (current.kind === "stale" && current.pid === state.pid && processIsGone(state.pid, state.startToken)) {
             // A stale re-read for the pid this command verified is a completed
             // stop only when the process that read verified — this pid with
@@ -1042,7 +1042,7 @@ export async function runMail(args: MailArgs): Promise<void> {
           }
           break;
         }
-        // cli#970: compare and unlink under the record lock to keep replacements.
+        // cli#970: compare and unlink under the record lock; a replacement whose bytes differ at the final check is kept.
         const stopPid = state.pid;
         const stopStartToken = state.startToken;
         const removeStopRecord = (

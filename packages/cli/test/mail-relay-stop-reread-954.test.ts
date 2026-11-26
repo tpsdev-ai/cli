@@ -73,7 +73,7 @@ function record(pid: number, token: string | null): string {
 /** The refusal guidance every re-read branch appends, naming the pid the first
  *  read planned to stop. */
 function guidance(pid: number): string {
-  return `The relay process (pid ${pid}) may still be running; check it with ps -p ${pid} and stop it yourself.`;
+  return `The process named by the original record (pid ${pid}) may still be running; check it with ps -p ${pid} and stop it yourself.`;
 }
 
 function staleRecord(child: Bun.Subprocess): string {

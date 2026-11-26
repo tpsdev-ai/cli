@@ -312,6 +312,8 @@ describe("relay start and the pid record", () => {
     expect(readFileSync(firstState, "utf8")).toBe("running");
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("record changed before it was signalled");
+    expect(result.stderr).toContain(`The process named by the original record (pid ${child.pid})`);
+    expect(result.stderr).not.toContain("The relay process (pid");
     expect(readFileSync(relayPid, "utf8")).toBe(replacement);
     expect(pidState(child.pid)).toBe("alive");
   }, CASE_TIMEOUT_MS);
