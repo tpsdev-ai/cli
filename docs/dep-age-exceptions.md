@@ -39,7 +39,9 @@ step, shell and source line. In an unapproved workflow run block, the guard refu
 leading redirections and variable assignments containing `<` or `>` before a command word.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. `case` in command position is refused in unapproved run blocks;
-this best-effort lint does not model compound commands.
+this best-effort lint does not model compound commands. These checks read a
+run block's top-level clauses only: commands inside `$(...)` or backtick
+substitutions, and text after a quote that spans physical lines, are not checked.
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
@@ -57,9 +59,10 @@ and literal invocations, and follows scripts. A run block and a followed script
 differ in their initial state: the install classifier runs on followed shell
 files, and a run block's lines are screened by the physical-line check above.
 A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
-`do`, `!` or the `time` prefix is judged at its next word; `for` and
-`select` headers are not invocations (their command substitutions are scanned
-as usual); any other shell reserved word the guard does not model makes the
+`do`, `!` or the `time` prefix is judged at its next word. In followed shell
+files, `for`, `case` and `select` headers are not invocations; in run blocks,
+`for` and `select` headers are not invocations and `case` in command position is
+refused (see above). Their command substitutions are scanned as usual. Any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
