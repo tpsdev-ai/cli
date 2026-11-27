@@ -183,11 +183,13 @@ export function snapshotRelayPidRecord(): { state: RelayPidState; raw: Buffer | 
 }
 
 /** Test hooks: `writeRecordBytes` replaces the exclusive create-and-fill step
- *  (so a failure can be injected at the write), and `afterTempWrite` observes
+ *  (so a failure can be injected at the write), `writeSync` replaces the raw
+ *  byte write (so a short write can be injected), and `afterTempWrite` observes
  *  between the temporary write and its publication. */
 export const relayWriteTestHooks: {
   afterTempWrite?: (tmpPath: string, recordPath: string) => void;
   writeRecordBytes?: (path: string, text: string) => void;
+  writeSync?: (fd: number, buffer: Buffer, offset: number, length: number) => number;
   beforeDeadlineCheck?: (deadline: number) => void;
 } = {};
 
@@ -198,7 +200,16 @@ function writeRecordBytes(path: string, text: string): void {
   }
   const fd = openSync(path, "wx", 0o600);
   try {
-    writeSync(fd, text);
+    const buffer = Buffer.from(text, "utf-8");
+    const write = relayWriteTestHooks.writeSync ?? writeSync;
+    let offset = 0;
+    while (offset < buffer.length) {
+      const written = write(fd, buffer, offset, buffer.length - offset);
+      if (!Number.isInteger(written) || written <= 0) {
+        throw new Error(`Failed to write the relay pid record to ${path}: write returned ${String(written)}.`);
+      }
+      offset += written;
+    }
     fsyncSync(fd);
   } finally {
     closeSync(fd);
@@ -210,8 +221,8 @@ function tempRecordPath(path: string): string {
 }
 
 /** Create the record at a free path; EEXIST means another claimant won. The
- *  record bytes are complete before the hard link publishes them, and the
- *  temporary file is removed in a finally block. */
+ *  record bytes are complete before the hard link publishes them, and cleanup
+ *  of the temporary file is attempted in a finally block. */
 export function claimRelayPidRecord(path: string, text: string): void {
   const tmp = tempRecordPath(path);
   try {

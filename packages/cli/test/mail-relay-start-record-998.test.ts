@@ -1,12 +1,20 @@
 /** cli#998 / cli#992 — relay start, publication and signal cleanup. */
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync, writeSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { acquireMailLockSync, pidState, processStartToken, type MailLock } from "@tpsdev-ai/agent";
 import { readPidFile } from "../src/utils/pid-file.js";
-import { RELAY_PID_LOCK_TIMEOUT_MS, readRelayPidFile, relayPidLockRoot } from "../src/utils/mail-relay.js";
+import {
+  RELAY_PID_LOCK_TIMEOUT_MS,
+  claimRelayPidRecord,
+  readRelayPidFile,
+  relayPidLockRoot,
+  relayWriteTestHooks,
+  serializeRelayClaimRecord,
+  writeRelayPidRecordAtomically,
+} from "../src/utils/mail-relay.js";
 import { relayStartTestHooks, runMail, setRelayPidRemoval } from "../src/commands/mail.js";
 import { patchShared } from "./helpers/patch-shared.js";
 import { PROC_START_TOKENS_PRELOAD, stageProcStartTokens } from "../../../test/helpers/start-token-source-test.js";
@@ -500,6 +508,40 @@ describe("relay start and the pid record", () => {
     expect(existsSync(relayPid)).toBe(true);
   }, CASE_TIMEOUT_MS);
 
+  test("a short write publishes the complete record on both publication paths", () => {
+    const claimPath = join(home, "claim.pid");
+    const renamePath = join(home, "rename.pid");
+    const text = serializeRelayClaimRecord(4321, null);
+    let shortWrites = 0;
+    const restore = patchShared(relayWriteTestHooks, "writeSync", (fd, buffer, offset, length) => {
+      shortWrites += 1;
+      return writeSync(fd, buffer, offset, Math.max(1, Math.floor(length / 2)));
+    });
+    try {
+      claimRelayPidRecord(claimPath, text);
+      writeRelayPidRecordAtomically(renamePath, text);
+    } finally {
+      restore();
+    }
+    expect(readFileSync(claimPath, "utf8")).toBe(text);
+    expect(readFileSync(renamePath, "utf8")).toBe(text);
+    expect(shortWrites).toBeGreaterThanOrEqual(4);
+  });
+
+  test("a zero-byte write refuses the claim and publishes nothing", () => {
+    const claimPath = join(home, "zero.pid");
+    const restore = patchShared(relayWriteTestHooks, "writeSync", () => 0);
+    try {
+      expect(() => claimRelayPidRecord(claimPath, serializeRelayClaimRecord(4321, null))).toThrow(
+        /write returned 0/,
+      );
+    } finally {
+      restore();
+    }
+    expect(existsSync(claimPath)).toBe(false);
+    expect(readdirSync(home).filter((name) => name.includes(".relay.pid.tmp."))).toEqual([]);
+  });
+
   test("startup timeout waits for the delayed child to exit before releasing the claim", async () => {
     const observed = join(home, "claim-before-exit");
     let child: ReturnType<typeof spawn> | undefined;
@@ -582,6 +624,7 @@ describe("relay start and the pid record", () => {
   test("timed-out CLI stops retrying a failing claim handoff at the deadline and reports unconfirmed child exit", async () => {
     const childPidFile = join(home, "child.pid");
     const attempts = join(home, "handoff-attempts");
+    const crossed = join(home, "deadline-crossed");
     const preload = join(home, "starter-preload.ts");
     const fixture = `
       import { writeFileSync } from "node:fs";
@@ -602,12 +645,12 @@ describe("relay start and the pid record", () => {
         appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
         throw new Error("injected handoff write failure");
       };
-      // Hit the deadline under the lock on an attempt near it, after real
+      // Cross the deadline under the lock on the third attempt, after two real
       // failures, so the stop reason must keep one of those failures.
       relayWriteTestHooks.beforeDeadlineCheck = (deadline) => {
-        if (failures >= 2 && deadline - Date.now() < 200) {
-          while (Date.now() < deadline) {}
-        }
+        if (failures < 2) return;
+        while (Date.now() < deadline) {}
+        appendFileSync(${JSON.stringify(crossed)}, JSON.stringify({ deadline, crossedAt: Date.now() }) + "\\n");
       };
     `);
     let childPid: number | undefined;
@@ -617,6 +660,7 @@ describe("relay start and the pid record", () => {
       childPid = Number(readFileSync(childPidFile, "utf8"));
       const claim = JSON.parse(readFileSync(relayPid, "utf8"));
       const tried = readFileSync(attempts, "utf8").trim().split("\n").map(Number);
+      const crossing = JSON.parse(readFileSync(crossed, "utf8"));
       expect(first.status).toBe(1);
       expect(first.stderr).toContain(`child (pid ${childPid}) exit not confirmed; SIGTERM sent.`);
       expect(first.stderr).toContain(`The claim at ${relayPid} still names the starter pid ${claim.pid}.`);
@@ -626,7 +670,7 @@ describe("relay start and the pid record", () => {
       expect(claim.pid).not.toBe(childPid);
       expect(pidState(childPid)).toBe("alive");
       expect(tried.length).toBeGreaterThan(1);
-      expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
+      expect(crossing.crossedAt).toBeGreaterThanOrEqual(crossing.deadline);
       expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
       await expectAbandonedClaimRefusal(claim.pid);
     } finally {
@@ -646,6 +690,7 @@ describe("relay start and the pid record", () => {
     const heldPidFile = join(home, "holder.pid");
     const holdSignal = join(home, "hold-at.json");
     const attempts = join(home, "handoff-attempts");
+    const crossed = join(home, "deadline-crossed");
     const cliDir = resolve(import.meta.dir, "..");
     const fixture = `
       import { readFileSync, writeFileSync } from "node:fs";
@@ -667,30 +712,27 @@ describe("relay start and the pid record", () => {
     `;
     const preload = join(home, "starter-preload.ts");
     writeFileSync(preload, `
-      import { appendFileSync, writeFileSync } from "node:fs";
+      import { appendFileSync, existsSync, writeFileSync } from "node:fs";
       import { spawn } from "node:child_process";
       import { relayStartTestHooks } from ${JSON.stringify(MAIL_MODULE)};
       import { relayWriteTestHooks } from ${JSON.stringify(RELAY_MODULE)};
       relayStartTestHooks.spawn = () => spawn(process.execPath, ["--eval", ${JSON.stringify(fixture)}],
         { detached: true, env: process.env, stdio: "ignore", cwd: ${JSON.stringify(cliDir)} });
       let first = true;
-      let allowSuccess = false;
       relayWriteTestHooks.afterTempWrite = () => {
         appendFileSync(${JSON.stringify(attempts)}, Date.now() + "\\n");
         if (first) {
           first = false;
           writeFileSync(${JSON.stringify(holdSignal)}, JSON.stringify({ holdAt: Date.now() + ${RELAY_PID_LOCK_TIMEOUT_MS} - 2000 }));
         }
-        if (allowSuccess) return;
         throw new Error("injected handoff write failure");
       };
-      // The lock is free again before the deadline; cross it under the lock so a
-      // late acquisition is refused, not published.
+      // The holder has used the lock and released it; cross the deadline under
+      // the lock on the next acquisition so a late one is refused, not published.
       relayWriteTestHooks.beforeDeadlineCheck = (deadline) => {
-        if (deadline - Date.now() < 200) {
-          allowSuccess = true;
-          while (Date.now() < deadline + 50) {}
-        }
+        if (!existsSync(${JSON.stringify(heldPidFile)})) return;
+        while (Date.now() < deadline) {}
+        appendFileSync(${JSON.stringify(crossed)}, JSON.stringify({ deadline, crossedAt: Date.now() }) + "\\n");
       };
     `);
     let childPid: number | undefined;
@@ -699,11 +741,13 @@ describe("relay start and the pid record", () => {
       const returned = Date.now();
       childPid = Number(readFileSync(childPidFile, "utf8"));
       const tried = readFileSync(attempts, "utf8").trim().split("\n").map(Number);
+      const crossing = JSON.parse(readFileSync(crossed, "utf8"));
       expect(first.status).toBe(1);
       expect(first.stderr).toContain(`within ${RELAY_PID_LOCK_TIMEOUT_MS} ms`);
       expect(existsSync(heldPidFile)).toBe(true);
       expect(pidState(childPid)).toBe("alive");
       expect(tried.length).toBeGreaterThan(1);
+      expect(crossing.crossedAt).toBeGreaterThanOrEqual(crossing.deadline);
       expect(tried[tried.length - 1]! - tried[0]!).toBeGreaterThanOrEqual(RELAY_PID_LOCK_TIMEOUT_MS / 2);
       expect(returned - tried[0]!).toBeLessThan(RELAY_PID_LOCK_TIMEOUT_MS + 3000);
     } finally {
