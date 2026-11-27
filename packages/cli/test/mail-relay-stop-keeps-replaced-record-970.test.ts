@@ -346,7 +346,7 @@ describe("mail relay stop keeps a record replaced before removal", () => {
       const previousSignal = setRelayStopSignal((pid) => signals.push(pid));
       try {
         await expect(runMail({ action: "relay", agent: "stop" })).rejects.toThrow(
-          `Mail relay pid file ${relayPid} now names pid ${replacement.pid}, not the pid ${planned.pid} that was read`,
+          `Mail relay pid file ${relayPid}: record changed before it was signalled`,
         );
       } finally {
         setRelayStopSignal(previousSignal);

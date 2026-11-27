@@ -5,8 +5,8 @@ import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
 import { join } from "node:path";
 import { homedir } from "node:os";
-import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch } from "node:fs";
-import { pidState, pidStateFromProbeError, processIsGone } from "@tpsdev-ai/agent";
+import { existsSync, readdirSync, readFileSync, renameSync, statSync, watch, writeFileSync } from "node:fs";
+import { pidState, pidStateFromProbeError, processIsGone, processStartToken } from "@tpsdev-ai/agent";
 import { loadHostIdentityId } from "../utils/identity.js";
 import { queueOutboxMessage } from "../utils/outbox.js";
 import { resolveMailRoute } from "../utils/mail-routing.js";
@@ -42,7 +42,7 @@ export function setRelayStopRecordReader(fn: RelayStopRecordReader | null): Rela
   return previous;
 }
 
-/** The pid-file remover for `mail relay stop`; replaceable in tests so the
+/** The relay pid-file remover; replaceable in tests so the
  *  removal-failure branch can be exercised without a filesystem that refuses unlink. */
 type RelayPidRemoval = (path: string) => "removed" | "already gone";
 let removeRelayPidFile: RelayPidRemoval = removePidFile;
@@ -52,6 +52,10 @@ export function setRelayPidRemoval(fn: RelayPidRemoval): RelayPidRemoval {
   removeRelayPidFile = fn;
   return previous;
 }
+
+export const relayStartTestHooks: {
+  spawn?: typeof import("node:child_process").spawn;
+} = {};
 
 /** True when `kill(pid, 0)` was refused with an error pidState calls alive. */
 function relayProbeRefused(pid: number): boolean {
@@ -845,16 +849,20 @@ export async function runMail(args: MailArgs): Promise<void> {
 
     case "relay": {
       const relayAction = args.agent ?? "status"; // relay start|stop|status
-      const { readRelayPidFile, relayPidPath, runRelayDaemon } = await import("../utils/mail-relay.js");
+      const { readRelayPidFile, describeRelayClaim, relayPidPath, runRelayDaemon, snapshotRelayPidRecord, serializeRelayClaimRecord, claimRelayPidRecord, writeRelayPidRecordAtomically, withRelayPidLock, RelayPidLockDeadlineError, classifyRelayPidSnapshot, RELAY_PID_LOCK_TIMEOUT_MS } = await import("../utils/mail-relay.js");
       const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
-      const mailDir = join(homedir(), ".tps", "mail");
+      const { homeDir } = await import("../utils/home.js");
+      const mailDir = join(homeDir(), ".tps", "mail");
 
       if (relayAction === "status") {
         // Read-only: unverified, stale, invalid and unreadable states name the pid file.
         const state = readRelayPidFile();
         if (state.kind === "running") {
           console.log(`Mail relay running: pid=${state.pid}`);
+        } else if (state.kind === "abandoned-claim") {
+          console.log(`Mail relay: unknown (abandoned start claim ${state.path}, claimant pid=${state.pid}).`);
+        } else if (state.kind === "claim") {
+          console.log(describeRelayClaim(state));
         } else if (state.kind === "unverified") {
           console.log(`Mail relay unverified: pid=${state.pid}, pid file ${state.path}.`);
         } else if (state.kind === "stale") {
@@ -873,7 +881,7 @@ export async function runMail(args: MailArgs): Promise<void> {
         const readStopRecord = (): PidRecordSnapshot =>
           relayStopRecordReader?.() ?? snapshotPidRecord(relayPidPath());
         const classification = readStopRecord();
-        const state = classification.state;
+        const state = classifyRelayPidSnapshot(classification);
         // A removal failure keeps the relay pid file, reports the path and the
         // error code, and exits non-zero.
         const removeRelayPid = (path: string): "removed" | "already gone" => {
@@ -899,7 +907,8 @@ export async function runMail(args: MailArgs): Promise<void> {
         // checked the pid and start token): describe the record, remove it when
         // the re-read still holds the same bytes, and leave state unknown. A
         // record replaced in between is kept.
-        const reportBadRecord = (snapshot: PidRecordSnapshot): void => {
+        const reportBadRecord = (snapshot: PidRecordSnapshot): void =>
+          withRelayPidLock("remove a stale relay pid record", () => {
           const state = snapshot.state;
           if (state.kind !== "stale") return;
           const { kind, path } = state;
@@ -936,10 +945,20 @@ export async function runMail(args: MailArgs): Promise<void> {
               ? `Mail relay pid file ${path} was ${kind} and was removed; this command signalled no process, and the relay's state is unknown.`
               : `Mail relay pid file ${path} was ${kind} and is already gone; this command signalled no process, and the relay's state is unknown.`,
           );
-        };
+          });
         if (state.kind === "missing") {
           console.log("Mail relay is not running.");
           break;
+        }
+        if (state.kind === "abandoned-claim") {
+          throw new Error(
+            `Mail relay stop kept abandoned start claim ${state.path}: the recorded claimant process is no longer running (pid ${state.pid}); no process was signalled. Inspect ps -p ${state.pid} -o pid=,command= and ps -eo pid=,command= for tps mail relay _run ${mailDir} processes. Stop any relay or start process found for this mailbox by its pid, then remove ${state.path}.`,
+          );
+        }
+        if (state.kind === "claim") {
+          throw new Error(
+            `${describeRelayClaim(state)} No process was signalled.`,
+          );
         }
         if (state.kind === "unreadable") {
           throw new Error(
@@ -962,13 +981,26 @@ export async function runMail(args: MailArgs): Promise<void> {
             `Mail relay pid file names pid ${state.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${state.path} if the relay is not running.`,
           );
         }
-        // The classification above is the plan, not the decision. This one
-        // read is the pre-signal snapshot: it decides whether to signal and
-        // its bytes are the ones the removal below compares against.
-        const decision = readStopRecord();
+        // Hold the lock through the byte comparison and signal to exclude cooperating writers.
+        let signalFailure: { error: unknown } | undefined;
+        const decision = withRelayPidLock("stop the relay", () => {
+          const snapshot = readStopRecord();
+          if (!pidRecordBytesEqual(snapshot.raw, classification.raw)) {
+            throw new Error(`Mail relay pid file ${state.path}: record changed before it was signalled; this command signalled no process. The process named by the original record (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`);
+          }
+          const current = classifyRelayPidSnapshot(snapshot);
+          if (current.kind === "running" && current.pid === state.pid && current.startToken === state.startToken) {
+            try {
+              sendRelayStopSignal(state.pid);
+            } catch (error) {
+              signalFailure = { error };
+            }
+          }
+          return snapshot;
+        });
         const current = decision.state;
         if (current.kind !== "running" || current.pid !== state.pid || current.startToken !== state.startToken) {
-          const unproven = `The relay process (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
+          const unproven = `The process named by the original record (pid ${state.pid}) may still be running; check it with ps -p ${state.pid} and stop it yourself.`;
           if (current.kind === "stale" && current.pid === state.pid && processIsGone(state.pid, state.startToken)) {
             // A stale re-read for the pid this command verified is a completed
             // stop only when the process that read verified — this pid with
@@ -1010,16 +1042,14 @@ export async function runMail(args: MailArgs): Promise<void> {
           }
           break;
         }
-        // cli#970: compare the record's bytes before removing it, as
-        // `office kill` does. Relay pid records are written without a lock,
-        // so a record written between this compare and the unlink can still
-        // be removed.
+        // cli#970: compare and unlink under the record lock; a replacement whose bytes differ at the final check is kept.
         const stopPid = state.pid;
         const stopStartToken = state.startToken;
         const removeStopRecord = (
           path: string,
           snapshot: PidRecordSnapshot,
-        ): "removed" | "already gone" | { kept: PidFileState } => {
+        ): "removed" | "already gone" | { kept: PidFileState } =>
+          withRelayPidLock("remove the relay pid record", () => {
           const current = snapshotPidRecord(path);
           if (current.state.kind === "missing") return "already gone";
           if (current.state.kind === "unreadable") {
@@ -1031,9 +1061,9 @@ export async function runMail(args: MailArgs): Promise<void> {
             return { kept: current.state };
           }
           return removeRelayPid(path);
-        };
+          });
         try {
-          sendRelayStopSignal(state.pid);
+          if (signalFailure) throw signalFailure.error;
         } catch (error) {
           // Only a probe that classifies the pid "gone" proves the process is
           // gone: remove the file in that case. EPERM ("alive") and any other
@@ -1068,41 +1098,181 @@ export async function runMail(args: MailArgs): Promise<void> {
       }
 
       if (relayAction === "start") {
-        const existing = readRelayPidFile();
-        if (existing.kind === "running") {
-          throw new Error(`Mail relay already running (pid=${existing.pid}).`);
-        }
-        if (existing.kind === "unverified") {
+        const path = relayPidPath();
+        // Decide and claim under the record lock; the claim itself is an
+        // exclusive create.
+        const claimText = withRelayPidLock("start the relay", () => {
+          for (let attempt = 0; attempt < 5; attempt++) {
+            const { state, raw } = snapshotRelayPidRecord();
+            if (state.kind === "running") {
+              throw new Error(`Mail relay already running (pid=${state.pid}); pid file ${state.path}.`);
+            }
+            if (state.kind === "abandoned-claim") {
+              throw new Error(
+                `Mail relay start refused: abandoned start claim ${state.path}: the recorded claimant process is no longer running (pid ${state.pid}); this command launched no relay. Inspect ps -p ${state.pid} -o pid=,command= and ps -eo pid=,command= for tps mail relay _run ${mailDir} processes. Stop any relay or start process found for this mailbox by its pid, then remove ${state.path}.`,
+              );
+            }
+            if (state.kind === "claim") {
+              throw new Error(
+                `${describeRelayClaim(state)} This command launched no relay.`,
+              );
+            }
+            if (state.kind === "unverified") {
+              throw new Error(
+                `Mail relay pid file ${state.path} names pid ${state.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${state.path} if the relay is not running.`,
+              );
+            }
+            if (state.kind === "unreadable") {
+              throw new Error(
+                `Mail relay pid file ${state.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${state.path} if the relay is not running.`,
+              );
+            }
+            if (state.kind === "invalid") {
+              // An invalid record may be a torn write from a live relay. Keep it
+              // and refuse, as `relay stop` does.
+              throw new Error(
+                `Mail relay pid file ${state.path} is invalid (${state.reason}), so the relay's process identity cannot be verified. Check whether a relay is running, and remove ${state.path} by hand only if none is.`,
+              );
+            }
+            if (state.kind === "stale") {
+              const current = snapshotPidRecord(path);
+              if (!pidRecordBytesEqual(current.raw, raw)) continue;
+              removePidFile(path);
+              continue;
+            }
+            const text = serializeRelayClaimRecord(process.pid, processStartToken(process.pid));
+            try {
+              claimRelayPidRecord(path, text);
+              return text;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+            }
+          }
           throw new Error(
-            `Mail relay pid file ${existing.path} names pid ${existing.pid}, but that process's identity cannot be verified. Check that pid and stop it yourself, or remove ${existing.path} if the relay is not running.`,
+            `Mail relay pid file ${path} is busy; this command launched no relay. Retry when no other relay start is running.`,
           );
-        }
-        if (existing.kind === "unreadable") {
-          throw new Error(
-            `Mail relay pid file ${existing.path} could not be read, so its process identity cannot be verified. Check that process and stop it yourself, or remove ${existing.path} if the relay is not running.`,
-          );
-        }
-        if (existing.kind === "invalid" || existing.kind === "stale") {
-          removePidFile(existing.path);
-        }
+        });
+        const claimBytes = Buffer.from(claimText, "utf-8");
+        const changedRecord = (raw: Buffer | null): string => raw === null
+          ? `The pid record at ${path} is missing or unreadable; inspect it.`
+          : `The pid record at ${path} changed; inspect it before removing it.`;
+        const claimResult = (liveChildPid?: number, budget?: { timeoutMs: number; deadline: number }): string => {
+          try {
+            return withRelayPidLock("update the relay start claim", () => {
+              const current = snapshotPidRecord(path);
+              if (!pidRecordBytesEqual(current.raw, claimBytes)) return changedRecord(current.raw);
+              if (liveChildPid !== undefined) {
+                // The starter may exit before the child; classify the claim by the child.
+                writeRelayPidRecordAtomically(path, serializeRelayClaimRecord(liveChildPid, processStartToken(liveChildPid)));
+                return `The claim at ${path} names child pid ${liveChildPid}.`;
+              }
+              if (removeRelayPidFile(path) === "removed") return `The claim at ${path} was released.`;
+              return changedRecord(current.raw);
+            }, budget);
+          } catch (error) {
+            if (liveChildPid !== undefined) throw error;
+            const current = snapshotPidRecord(path);
+            return pidRecordBytesEqual(current.raw, claimBytes)
+              ? `The claim was not released; inspect ${path} and remove it if no relay start or daemon is running.`
+              : changedRecord(current.raw);
+          }
+        };
         // Spawn relay as detached background process
         const { spawn } = await import("node:child_process");
-        const daemon = spawn(
-          process.execPath,
-          [...process.execArgv, process.argv[1]!, "mail", "relay", "_run", mailDir],
-          {
-            detached: true,
-            stdio: ["ignore", "ignore", "ignore"],
-            env: process.env as NodeJS.ProcessEnv,
-          },
-        );
+        let daemon: import("node:child_process").ChildProcess;
+        try {
+          daemon = (relayStartTestHooks.spawn ?? spawn)(
+            process.execPath,
+            [...process.execArgv, process.argv[1]!, "mail", "relay", "_run", mailDir],
+            {
+              detached: true,
+              stdio: ["ignore", "ignore", "ignore"],
+              env: process.env as NodeJS.ProcessEnv,
+            },
+          );
+        } catch (error) {
+          throw new Error(`Failed to spawn the mail relay daemon: ${String(error)}. ${claimResult()}`);
+        }
         daemon.unref();
-        await new Promise((r) => setTimeout(r, 500));
-        const started = readRelayPidFile();
-        const newPid =
-          started.kind === "running" || started.kind === "unverified" ? started.pid : null;
-        console.log(newPid ? `Mail relay started: pid=${newPid}` : "Mail relay started (pid pending).");
-        break;
+        const daemonPid = daemon.pid;
+        if (!daemonPid) {
+          daemon.on("error", () => {});
+          throw new Error(`Failed to spawn the mail relay daemon. ${claimResult()}`);
+        }
+        // Leave the record through the exit wait: the child may still publish.
+        const deadline = Date.now() + 5000;
+        let started = snapshotRelayPidRecord().state;
+        while (Date.now() < deadline) {
+          started = snapshotRelayPidRecord().state;
+          if ((started.kind === "running" || started.kind === "unverified") && started.pid === daemonPid) break;
+          if (started.kind === "invalid" || started.kind === "unreadable") break;
+          await new Promise((r) => setTimeout(r, 25));
+        }
+        if ((started.kind === "running" || started.kind === "unverified") && started.pid === daemonPid) {
+          console.log(`Mail relay started: pid=${started.pid}`);
+          break;
+        }
+        let signalResult = "SIGTERM not sent (child already exited)";
+        let exited = await new Promise<boolean>((resolve) => {
+          if (daemon.exitCode !== null || daemon.signalCode !== null) {
+            resolve(true);
+            return;
+          }
+          const onExit = (): void => {
+            clearTimeout(timer);
+            resolve(true);
+          };
+          const timer = setTimeout(() => {
+            daemon.off("exit", onExit);
+            resolve(false);
+          }, 5000);
+          daemon.once("exit", onExit);
+          try {
+            signalResult = daemon.kill("SIGTERM") ? "SIGTERM sent" : "SIGTERM not sent (kill returned false)";
+          } catch {
+            // Keep waiting for the child's exit event.
+            signalResult = "SIGTERM not sent (kill threw)";
+          }
+        });
+        let result: string | undefined;
+        let handoffError: unknown;
+        // Retry the handoff until it succeeds, the child exits, or one lock budget passes.
+        const handoffDeadline = Date.now() + RELAY_PID_LOCK_TIMEOUT_MS;
+        while (result === undefined) {
+          exited ||= daemon.exitCode !== null || daemon.signalCode !== null;
+          if (exited) {
+            result = claimResult();
+            break;
+          }
+          const remaining = handoffDeadline - Date.now();
+          if (handoffError !== undefined && remaining <= 0) break;
+          try {
+            result = claimResult(daemonPid, { timeoutMs: Math.max(0, remaining), deadline: handoffDeadline });
+          } catch (error) {
+            if (error instanceof RelayPidLockDeadlineError) {
+              // The deadline, not another handoff failure, stopped the retries;
+              // keep the last real failure as the reason when one exists.
+              if (handoffError === undefined) handoffError = error;
+              break;
+            }
+            handoffError = error;
+            await new Promise((r) => setTimeout(r, 25));
+          }
+        }
+        if (result === undefined) {
+          const current = snapshotPidRecord(path);
+          const record = pidRecordBytesEqual(current.raw, claimBytes)
+            ? `The claim at ${path} still names the starter pid ${process.pid}.`
+            : changedRecord(current.raw);
+          const reason = handoffError instanceof Error ? handoffError.message : String(handoffError);
+          throw new Error(
+            `Mail relay start failed: child (pid ${daemonPid}) exit not confirmed; ${signalResult}. ${record} Handing the claim to the child did not succeed within ${RELAY_PID_LOCK_TIMEOUT_MS} ms (${reason}). Stop pid ${daemonPid} before starting the relay again.`,
+            { cause: handoffError },
+          );
+        }
+        throw new Error(
+          `Mail relay start failed: child (pid ${daemonPid}) ${exited ? "exited" : "exit not confirmed"}; ${signalResult}. ${result}`,
+        );
       }
 
       if (relayAction === "_run") {
