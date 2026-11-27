@@ -1783,6 +1783,18 @@ describe("the workflow guard refuses command-position time, coproc, function, in
     expect(assertNpmCiLockfilesRead(stepWithShell(approved, "sh"), READ_TRACKED, WORKFLOW)).toBe(0);
   }, 5_000);
 
+  const SEPARATOR_COMPOUND_HEADERS = [
+    "echo ok; if true; then cat <<'EOF'\npayload\nEOF\nfi",
+    "echo ok & while false; do cat <<'EOF'\npayload\nEOF\ndone",
+    "echo ok | while read -r x; do cat <<'EOF'\npayload\nEOF\ndone",
+  ];
+
+  it.each(SEPARATOR_COMPOUND_HEADERS)("the separator compound fixtures are valid bash: %s", (run) => {
+    const result = spawnSync("bash", ["-n", "-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  }, 5_000);
+
   for (const entryPoint of ["lockfiles", "tree"] as const) {
     const check = (run: string) => entryPoint === "lockfiles"
       ? assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)
@@ -1805,6 +1817,12 @@ describe("the workflow guard refuses command-position time, coproc, function, in
 
     it.each(["echo $(\ncat <<EOF\n)", "echo ${a:-\ncat <<EOF\n}", "echo $[\n1<<b\n]", "echo `\ncat <<EOF\n`"])(
       `refuses a multiline expansion header through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow("<< outside a standalone top-level simple-command here-document redirection");
+      }, 5_000,
+    );
+
+    it.each(SEPARATOR_COMPOUND_HEADERS)(
+      `refuses a compound here-document header after a separator through ${entryPoint}: %s`, (run) => {
         expect(() => check(run)).toThrow("<< outside a standalone top-level simple-command here-document redirection");
       }, 5_000,
     );
