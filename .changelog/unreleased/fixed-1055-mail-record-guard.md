@@ -1,1 +1,0 @@
-- **Mail record updates require a regular file in the locked mailbox's `new/`, `cur/` or `dlq/` directory at check time.** [#1050](https://github.com/tpsdev-ai/cli/pull/1050), [#1056](https://github.com/tpsdev-ai/cli/pull/1056).

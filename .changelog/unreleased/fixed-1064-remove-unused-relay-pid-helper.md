@@ -1,1 +1,0 @@
-- **The unused relay pid helper is removed.** `readRelayPidFile` classifies the relay pid file without removing it; the mail command callers own its cleanup. [#1080](https://github.com/tpsdev-ai/cli/pull/1080).
