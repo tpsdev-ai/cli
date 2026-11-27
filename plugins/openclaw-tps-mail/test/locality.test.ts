@@ -1580,7 +1580,8 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
     return { curPath: promoted.path, id: rec.id };
   }
 
-  /** The recipient's REAL ack: the CLI deletes the record from cur/. */
+  /** The recipient's REAL ack, which stamps and keeps the cur/ record (cli#1098); the
+   *  record is then removed, as the recipient's mail gc later removes it. */
   function recipientAcks(recipient: string, id: string, curPath: string): void {
     const prev = process.env.TPS_MAIL_DIR;
     process.env.TPS_MAIL_DIR = mailDir; // the CLI resolves the mailbox from the env, like the recipient's own shell
@@ -1590,7 +1591,8 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
       if (prev === undefined) delete process.env.TPS_MAIL_DIR;
       else process.env.TPS_MAIL_DIR = prev;
     }
-    expect(existsSync(curPath), "the recipient's ack deleted the reply").toBe(false);
+    expect(JSON.parse(readFileSync(curPath, "utf-8")).ackedAt, "the recipient's ack stamped the reply").toEqual(expect.any(String));
+    rmSync(curPath);
   }
 
   for (const r of ROUTES) {
@@ -1622,7 +1624,7 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
       expect(out.o.nack).toBeNull();
     }, 25000);
 
-    it(`${r.route}: the recipient PROMOTES and ACKS (deletes) the reply → the RESTART scan still finds this obligation's receipt → acked`, async () => {
+    it(`${r.route}: the recipient PROMOTES and ACKS the reply and it is then removed → the RESTART scan still finds this obligation's receipt → acked`, async () => {
       // CONTROL (local): before round 7 the recipient's maildir record was the
       // ONLY local evidence, so once the recipient acked (deleted) it, a later
       // scan found nothing and the committed reply ended `unconfirmed`.
@@ -1639,7 +1641,7 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
       expect(out.o.nack).toBeNull();
     }, 20000);
 
-    it(`${r.route}: the recipient PROMOTES and ACKS the reply → the DEADLINE scan still finds this obligation's receipt → acked`, async () => {
+    it(`${r.route}: the recipient PROMOTES and ACKS the reply and it is then removed → the DEADLINE scan still finds this obligation's receipt → acked`, async () => {
       process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
       const out = await inFreshHome(r.setup, async () => {
         const o = await deliverWithOpenObligation(r.recipient, r.route, true);
