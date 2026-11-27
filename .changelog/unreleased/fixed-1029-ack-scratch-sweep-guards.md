@@ -1,5 +1,1 @@
-- **The ack-scratch sweep checks the directory's real path and scratch age.**
-  Before listing, it checks that the directory's real path is a direct child of
-  the locked mailbox root; replacement or retargeting during the sweep is not detected.
-  The sweep removes regular scratch files at least a minute old, reports skipped
-  non-regular or recent entries, and retries a failed listing on the next ack.
+- **Ack cleanup retains scratch outside the locked mailbox at the directory check.** The sweep removes regular ack scratch files at least a minute old and retains non-regular or recent entries. Failed scratch cleanup reports the path and error. A refused sweep or failed listing is retried on the next ack; a successful listing defers the next sweep for ten minutes. [#1024](https://github.com/tpsdev-ai/cli/pull/1024), [#1031](https://github.com/tpsdev-ai/cli/pull/1031), [#1056](https://github.com/tpsdev-ai/cli/pull/1056).

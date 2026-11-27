@@ -1,1 +1,0 @@
-- **`tps bridge stop` checks duplicate records for removal.** After this run stops a process, a later record matching its pid, start token and planned bytes is removed after a matching final read and successful unlink; changed bytes observed by that read are kept.
