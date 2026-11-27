@@ -1,1 +1,0 @@
-- **The unused relay pid helper that could return an unverified pid is removed.** `readRelayPidFile` classifies the relay pid file without removing it; the mail command callers own its cleanup.

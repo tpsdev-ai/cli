@@ -1,1 +1,0 @@
-- **Test keep-alive stand-ins exit on their own once the test process that owns them is gone (Closes #1016).** One shared helper (`test/helpers/stand-in.mjs`) spawns them and provides the owner watch embedded in the generated scripts and lane fixtures. The converted stand-ins poll the owning test runner’s PID and exit when a poll reports ESRCH.

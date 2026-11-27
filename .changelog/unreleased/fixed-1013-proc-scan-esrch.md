@@ -1,1 +1,0 @@
-- **A pid that exits while the heartbeat-lane fixture scans `/proc` is gone, not a teardown failure.** The fixture's stat read now treats ESRCH like ENOENT, so an unrelated process exiting during the scan no longer makes a signal handler exit 1 instead of with the signal's status.

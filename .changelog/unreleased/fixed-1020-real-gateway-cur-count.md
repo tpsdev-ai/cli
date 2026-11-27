@@ -1,1 +1,0 @@
-- **The real-gateway cur/ check counts the settled cur/ entries with no name filter.** When the count is wrong the message names every entry with its size, so a hidden scratch left by the ack's atomic record replace fails instead of being filtered out.

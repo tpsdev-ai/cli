@@ -1181,11 +1181,14 @@ export interface ReceiptScanOptions {
   fs?: ReceiptScanFs;
   /** How the thread is checked (receiptThread). Default `legacy`. */
   threadMode?: ReceiptThreadMode;
+  /** cli#1063, local delivery only: also accept a posted reply that carries
+   *  no obligation marker but signs this thread (see form (3)). */
+  unmarkedThreaded?: boolean;
 }
 
 /**
- * TWO receipt forms, ONE rule: a receipt must name THIS obligation, the inbound
- * it answers, and — when the obligation record knows it — the reply itself;
+ * A receipt binds to this obligation through its obligation ID or the verified
+ * signed inbound thread. It names the reply when the obligation record knows it;
  * and (cli#429) the reply it carries must be a VERIFIED signed reply by the
  * obligated agent, to `recipient` (the inbound's verified sender), for this
  * thread (isVerifiedReceiptReply). Every form below is held to that last rule;
@@ -1237,6 +1240,22 @@ export interface ReceiptScanOptions {
  *       three forms are pinned when the record knows a reply id, and none is
  *       when it does not.
  *
+ *   (3) UNMARKED THREADED REPLY (cli#1063, OFFICE local delivery only) — a
+ *       reply the agent sent itself (`tps mail send --reply-to=<inbound
+ *       envelope id>`) is a committed record in the inbound sender's maildir
+ *       with no marker and no wrapper thread: its thread rides only INSIDE the
+ *       signed envelope. A signed-mode scan the caller enables
+ *       `unmarkedThreaded` for accepts such a record when it verifies as this
+ *       agent's reply to `recipient` whose signed `replyToId` is this
+ *       obligation's thread. The record's `from`, its `to` and the verified
+ *       envelope's `from`/`to` are checked as identities; a contradictory
+ *       wrapper field (`from`, `to`, `accountId`, `replyToId`), an obligation
+ *       marker for another purpose, or a reply that does not verify is never
+ *       evidence. There is no reply-age window.
+ *
+ *   A record carrying an `X-TPS-Nack` marker is never evidence in any posted
+ *   form: it is rejected before a form is evaluated.
+ *
  * WHAT THE SIGNATURE CHECK PROVES, AND WHAT IT DOES NOT: it proves the record
  * carries a reply signed by the obligated agent's key (the key Flair holds for
  * it) that threads on this inbound — an unsigned record, a forged signature or
@@ -1271,7 +1290,7 @@ export async function scanForReceipt(
   checkSignature: ReceiptSignatureCheck,
   opts: ReceiptScanOptions = {},
 ): Promise<ReceiptScan> {
-  const { expectedReplyId, fs = realFs, threadMode = "legacy" } = opts;
+  const { expectedReplyId, fs = realFs, threadMode = "legacy", unmarkedThreaded = false } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
   const verified = (envelope: Envelope | null): Promise<boolean> =>
     isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
@@ -1332,6 +1351,9 @@ export async function scanForReceipt(
       } catch {
         continue; // unparseable but not quarantined yet; not a receipt
       }
+      // A NACK is never settlement evidence in ANY posted form (marked, bridge
+      // or unmarked): reject it before a form is evaluated.
+      if (record?.headers?.["X-TPS-Nack"] !== undefined) continue;
       if (record?.headers?.["X-TPS-Obligation"] === obligationId) {
         if (record?.accountId !== accountId) continue;
         if (record?.from !== agent) continue;
@@ -1353,6 +1375,23 @@ export async function scanForReceipt(
         record.replyId.length > 0 &&
         (expectedReplyId === undefined || record.replyId === expectedReplyId) &&
         record?.from === agent &&
+        (await verified(recordReceiptEnvelope(record)))
+      ) {
+        return { status: "found", path };
+      }
+      // (3) UNMARKED THREADED REPLY (cli#1063, OFFICE local delivery only): a
+      //      reply the agent sent itself with `--reply-to` signs the thread inside
+      //      its envelope but carries no obligation marker. The signed thread
+      //      names the obligation; a marker for another purpose, a contradictory
+      //      wrapper, or a reply that does not verify never settles.
+      if (
+        unmarkedThreaded &&
+        record?.headers?.["X-TPS-Obligation"] === undefined &&
+        (record?.accountId === undefined || record.accountId === accountId) &&
+        record?.from === agent &&
+        record?.to === recipient &&
+        (record?.replyToId === undefined || record.replyToId === replyToId) &&
+        (expectedReplyId === undefined || record?.id === expectedReplyId) &&
         (await verified(recordReceiptEnvelope(record)))
       ) {
         return { status: "found", path };
