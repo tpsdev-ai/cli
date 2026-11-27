@@ -84,7 +84,8 @@ export function sendRuntimeMail(cfg: RuntimeMailConfig, to: string, body: string
  * AND any auto-commit has finished. A failed reply send is logged and the ack
  * is still attempted: the task already ran, and re-running it to retry the reply
  * would repeat its side effects. NOT acking leaves the record to be
- * re-presented (and the task re-run) every lease period forever.
+ * re-presented (and the task re-run) every lease period until gcMessages
+ * removes it at its hard age cutoff.
  *
  * Acking stamps the `cur/` record, which stays until gcMessages ages it out
  * (cli#1098); re-presentation is what ack prevents.

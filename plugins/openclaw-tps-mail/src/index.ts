@@ -389,12 +389,12 @@ function writeOutboxFile(message: TpsMailBody): string {
  * SCOPE: every route whose delivered record this agent cannot keep. The wire
  * and the bridge leave none (or one the sandbox agent consumes). A LOCAL reply
  * does leave one — in the RECIPIENT's maildir, which the recipient consumes:
- * its promote() rewrites and moves it, its ack of an unpromoted record DELETES
- * it, its gc purges it —
- * so once the recipient has acked, a later scan (the deadline's, or restart
- * recovery's) found no evidence and a committed reply ended `unconfirmed`
- * (cli#429 round 7). The local route therefore gets the same receipt; its
- * posted record is still scanned too. The OUTBOX route does NOT: its record
+ * its promote() rewrites and moves it, and its ack or gc can remove it. Before
+ * cli#1098 its ack DELETED a promoted record too, so once the recipient had
+ * acked, a later scan (the deadline's, or restart recovery's) found no
+ * evidence and a committed reply ended `unconfirmed` (cli#429 round 7); an ack
+ * of a promoted cur/ record now leaves it for the scan. The local route gets
+ * the same receipt; its posted record is still scanned too. The OUTBOX route does NOT: its record
  * stays in this host's outbox (new/ → sent/, never consumed here), and the
  * drain QUARANTINING that record is a definitive non-delivery verdict the scan
  * must see (cli#398 T4) — an always-readable receipt beside it would mask it.

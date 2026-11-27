@@ -520,6 +520,12 @@ export function updateExistingRecord<T extends object>(
      * `envelopeId`) and refuse with `withheld` instead of mutating.
      */
     withholdPlacement?: boolean;
+    /**
+     * Delete the record instead of rewriting it: `mutate` still runs and its
+     * result is returned as `updated`, nothing is written first, and a failed
+     * delete throws.
+     */
+    remove?: boolean;
   },
 ): UpdateExistingResult<T> {
   path = resolve(path);
@@ -603,6 +609,15 @@ export function updateExistingRecord<T extends object>(
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
+    if (options.remove) {
+      try {
+        unlinkSync(path);
+      } catch (err: any) {
+        if (err?.code === "ENOENT") return { status: "gone" };
+        throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
+      }
+      return { status: "updated", record: updated };
+    }
     fd = openSync(scratchPath, "wx", 0o600);
     writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
     fsyncSync(fd);
@@ -2236,6 +2251,13 @@ export function setBridgeSentAtPath(path: string, sentAt: string, mailboxRoot: s
 }
 
 export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage {
+  // cli#1098: an acked cur/ record is kept, stamped, as the openclaw-tps-mail
+  // ack keeps it, so a reply obligation's receipt scan still finds a delivered
+  // reply after the recipient acks it; gcMessages ages it out. A new/ or dlq/
+  // record is deleted instead, with nothing written to it first (a later check
+  // could promote or re-drive it, and promote() clears a stamp); a failed
+  // delete fails the ack.
+  const inCur = basename(dirname(path)) === "cur";
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
     msg.ackedAt = new Date().toISOString();
@@ -2246,15 +2268,7 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { mailboxRoot, afterWrite: () => {
-    // cli#1098: an acked cur/ record is kept, stamped, as the openclaw-tps-mail
-    // ack keeps it, so a reply obligation's receipt scan still finds a delivered
-    // reply after the recipient acks it; gcMessages ages it out. A record acked
-    // in new/ or dlq/ is removed, as before: a later check could promote or
-    // re-drive it.
-    if (basename(dirname(path)) === "cur") return;
-    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
-  }, withholdPlacement: true });
+  }, { mailboxRoot, remove: !inCur, withholdPlacement: true });
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;

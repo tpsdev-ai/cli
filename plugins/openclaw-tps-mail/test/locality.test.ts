@@ -1580,8 +1580,8 @@ describe("cli#429 — a reply the recipient has PROMOTED or ACKED is still this 
     return { curPath: promoted.path, id: rec.id };
   }
 
-  /** The recipient's REAL ack, which stamps and keeps the cur/ record (cli#1098); the
-   *  record is then removed, as the recipient's mail gc later removes it. */
+  /** The recipient's REAL ack, which stamps and keeps the cur/ record (cli#1098); this
+   *  helper then deletes the record itself with rmSync. */
   function recipientAcks(recipient: string, id: string, curPath: string): void {
     const prev = process.env.TPS_MAIL_DIR;
     process.env.TPS_MAIL_DIR = mailDir; // the CLI resolves the mailbox from the env, like the recipient's own shell
