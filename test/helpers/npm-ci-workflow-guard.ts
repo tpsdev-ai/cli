@@ -426,6 +426,9 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   if (!approved) {
     for (const entry of logicalShellLines(run, refuse, true)) {
       if (entry.body) continue;
+      if (hasBraceExpansionCommandWord(entry.text)) {
+        refuse(entry, "an unapproved run block has a word beginning with an unquoted brace expansion");
+      }
       for (const clause of splitClauses(entry.text, true)) {
         for (const token of clause.tokens) {
           if (isScalarAssignment(token.text) || (!token.quoted && SHELL_KEYWORDS.has(token.text))) continue;
@@ -1278,7 +1281,13 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
       refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header continuation");
     }
     if (/\\$/.test(line)) {
-      buffer += line.slice(0, -1);
+      const joined = line.slice(0, -1);
+      const next = index + 1 < raw.length ? raw[index + 1].replace(/\r$/, "") : "";
+      if (refuseHeader !== null && strictRunBlock && joined !== "" && !/\s$/.test(joined) &&
+          next !== "" && !/^\s/.test(next)) {
+        refuseHeader({ text: physical.trim(), line: index + 1 }, "an unapproved run block has a backslash-newline continuation inside a word");
+      }
+      buffer += joined;
       continue;
     }
     buffer += line;
@@ -1294,6 +1303,73 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
   }
   flush();
   return lines;
+}
+
+/**
+ * An unquoted `{` that begins a command-position word and is not a standalone
+ * `{` token is a brace expansion the guard cannot read statically. A
+ * `{`-delimited descriptor followed by a redirection (`{fd}>out`) is not a
+ * command word and is left to the leading-redirection check.
+ */
+function hasBraceExpansionCommandWord(text: string): boolean {
+  const PREFIX_COMMANDS = new Set([
+    "env", "command", "exec", "sudo", "xargs", "nohup", "time", "nice", "stdbuf",
+    "setsid", "chroot", "ionice", "chrt", "taskset", "flock", "unbuffer", "script",
+    "watch", "builtin", "hash",
+  ]);
+  const KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!"]);
+  const tokens: { text: string; end: number }[] = [];
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (/\s/.test(char)) continue;
+    if (/[;|&()<>]/.test(char)) {
+      tokens.push({ text: char, end: index + 1 });
+      continue;
+    }
+    const start = index;
+    let quote = "";
+    while (index < text.length) {
+      const next = text[index];
+      if (quote === "'") {
+        if (next === "'") quote = "";
+        index++;
+      } else if (quote === '"') {
+        if (next === "\\") index += 2;
+        else {
+          if (next === '"') quote = "";
+          index++;
+        }
+      } else if (next === "\\") {
+        index += 2;
+      } else if (next === "$" && text[index + 1] === "'") {
+        quote = "ansi";
+        index += 2;
+      } else if (quote === "ansi") {
+        if (next === "'") quote = "";
+        index++;
+      } else if (next === "'" || next === '"') {
+        quote = next;
+        index++;
+      } else if (/\s/.test(next) || /[;|&()<>]/.test(next)) break;
+      else index++;
+    }
+    tokens.push({ text: text.slice(start, index), end: index });
+  }
+  let command = true;
+  for (const token of tokens) {
+    if (/^[;|&(){}]$/.test(token.text)) {
+      command = true;
+      continue;
+    }
+    if (/^[<>]$/.test(token.text)) continue;
+    if (command && token.text.startsWith("{") && token.text.length > 1 &&
+        !/[<>]/.test(text[token.end] ?? "")) return true;
+    if (command) {
+      command = /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(token.text) ||
+        PREFIX_COMMANDS.has(token.text) || KEYWORDS.has(token.text);
+    }
+  }
+  return false;
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
@@ -2125,6 +2201,9 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
         handleInstall(ctx, state.file, entry.text, entry.text, number, lineAt(state, number), state.cwd, state.cwdUnknown, state.staged);
       }
       continue;
+    }
+    if (state.source === "run-block" && !reviewed && hasBraceExpansionCommandWord(entry.text)) {
+      throw new Error(`${lineAt(state, number)}: an unapproved run block has a word beginning with an unquoted brace expansion: ${entry.text}`);
     }
     if (state.classifyInstalls) {
       if (/^(?:cp|mv|ln|install|rsync|tee)\s/.test(entry.text) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(entry.text)) state.staged = true;

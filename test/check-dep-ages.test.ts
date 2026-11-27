@@ -2293,6 +2293,80 @@ it.each([
   expect(runWithStubNpm(run).at(-1)).toBe(argument);
 }, 15_000);
 
+describe("the run-block guard refuses split-word continuations and command-word brace expansion (#941)", () => {
+  const WORKFLOW = "workflow-941";
+  const read = (run: string) => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW);
+  const tree = (run: string) => assertNpmCiWorkflowTree(workflowStep(run), READ_TRACKED, REPO, WORKFLOW);
+
+  /** Run bash with a stub npm that records its argv; returns argv or null when npm did not run. */
+  function bashWithStubNpm(script: string): string | null {
+    const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+    try {
+      const argvFile = join(stubDir, "argv");
+      writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
+      const result = spawnSync("bash", ["-c", script], {
+        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      expect(result.error).toBeUndefined();
+      return readFileSync(argvFile, "utf8");
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }
+
+  it("refuses a continuation that joins two halves of one word, naming the physical line", () => {
+    const run = "n\\\npm ci";
+    const reason = "an unapproved run block has a backslash-newline continuation inside a word: n\\ (physical line 1)";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStubNpm(run)).toBe("ci");
+  }, 15_000);
+
+  it.each([
+    ["npm ci \\\n  --ignore-scripts", "run block containing npm is refused unless"],
+    ["echo a \\\n  b", ""],
+  ])("keeps a word-boundary continuation classified as before: %s", (run, reason) => {
+    if (reason === "") {
+      expect(read(run)).toBe(0);
+      expect(tree(run).installs).toBe(0);
+      expect(spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 }).stdout).toBe("a b\n");
+    } else {
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(runWithStubNpm(run)).toEqual(["ci", "--ignore-scripts"]);
+    }
+  }, 15_000);
+
+  it("refuses a command word that begins with brace expansion", () => {
+    const run = "{n,}pm ci";
+    const reason = "an unapproved run block has a word beginning with an unquoted brace expansion: {n,}pm ci (physical line 1)";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    // Bash expands the leading brace into the command word and its first argument.
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it("preserves mid-word brace expansion and a standalone brace group", () => {
+    const midWord = "mkdir -p dir/{a,b}";
+    const group = "{ echo ok; }";
+    for (const run of [midWord, group]) {
+      expect(read(run)).toBe(0);
+      expect(tree(run).installs).toBe(0);
+    }
+    const cwd = mkdtempSync(join(tmpdir(), "brace-words-"));
+    try {
+      const result = spawnSync("bash", ["-c", midWord], { cwd, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(existsSync(join(cwd, "dir", "a")) && existsSync(join(cwd, "dir", "b"))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    expect(spawnSync("bash", ["-c", group], { encoding: "utf8", timeout: 5_000 }).stdout).toBe("ok\n");
+  }, 15_000);
+});
+
 describe("the workflow guard bounds global tool versions", () => {
   const WORKFLOW = "workflow-v";
   const refused = [
