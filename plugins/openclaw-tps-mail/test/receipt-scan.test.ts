@@ -2,8 +2,8 @@
  * receipt-scan.test.ts — cli#398 round 2, item 3, extended for cli#389 round 3
  * and cli#429.
  *
- * TWO receipt forms and ONE rule: the receipt must name THIS obligation AND the
- * inbound it answers — and (cli#429) the reply it carries must be a VERIFIED
+ * A receipt binds to this obligation through its obligation ID or the verified
+ * signed inbound thread — and (cli#429) the reply it carries must be a VERIFIED
  * signed reply by the obligated agent for this thread. Every field either form
  * is checked on is pinned here, so the docblock cannot drift from the code
  * again.
@@ -17,6 +17,10 @@
  * (2) POSTED FILE: matched on the obligation marker, the accountId, the record
  *     `from` and `replyToId` — OR (cli#389 round 5, item 2) on the obligation ids
  *     `deliverToSandbox` writes into its reduced record and the record `from`.
+ * (3) UNMARKED THREADED REPLY (cli#1063, local delivery on an office host): a
+ *     reply the agent sent itself with `--reply-to` carries the thread inside the
+ *     signed envelope and no marker. A record carrying a `X-TPS-Nack` marker is
+ *     never evidence in any posted form.
  *
  * Every form is then held to the SIGNATURE rule (cli#429): a candidate whose
  * reply is unsigned, whose signature does not verify, that another agent
@@ -572,5 +576,120 @@ describe("receipt scan — cli#429 signed thread mode (real signatures)", () => 
   it("receiptThread: a current record threads on its SIGNED envelope id; a pre-cli#429 record on its record id", () => {
     expect(receiptThread({ inboundId: INBOUND, inboundEnvelopeId: THREAD })).toEqual({ threadId: THREAD, mode: "signed" });
     expect(receiptThread({ inboundId: INBOUND })).toEqual({ threadId: INBOUND, mode: "legacy" });
+  });
+});
+
+// ── cli#1063: a posted mail record with a NACK marker never settles ────────────────────
+
+describe("receipt scan — cli#1063 a posted mail record with a NACK marker never settles", () => {
+  it("a validly signed posted mail record with the matching obligation marker AND a nack marker does not settle", async () => {
+    const record = reply({ body: replyJson({ replyToId: THREAD }), replyToId: THREAD });
+    writeReply(record);
+    expect(await posted(THREAD, { threadMode: "signed" }), "without the nack this record is evidence").toBe("found");
+    writeReply({ ...record, headers: { ...record.headers, "X-TPS-Nack": "yielded-without-resumption" } });
+    expect(await posted(THREAD, { threadMode: "signed" })).toBe("absent");
+  });
+});
+
+// ── cli#1063: a threaded reply with NO obligation marker (local route) ──────
+
+describe("receipt scan — cli#1063 unmarked threaded reply (office local delivery)", () => {
+  /** A reply run as `tps mail send <to> --reply-to=<id>` on an OFFICE host
+   *  writes it: the thread rides inside the signed envelope; there is no marker
+   *  and no wrapper thread. A branch host relays a bound recipient through the
+   *  outbox, where this marker-less form is not enabled; that route is not
+   *  matched by this change. */
+  function cliReply(over: {
+    from?: string;
+    to?: string;
+    body?: string;
+    accountId?: string;
+    replyToId?: string;
+    headers?: Record<string, string>;
+  } = {}): any {
+    return {
+      id: "reply-1",
+      from: over.from ?? AGENT,
+      to: over.to ?? RECIPIENT,
+      body: over.body ?? replyJson({ replyToId: THREAD }),
+      timestamp: new Date().toISOString(),
+      read: false,
+      headers: { "X-TPS-Trust": "user", "X-TPS-Sender": AGENT, ...(over.headers ?? {}) },
+      ...(over.accountId !== undefined ? { accountId: over.accountId } : {}),
+      ...(over.replyToId !== undefined ? { replyToId: over.replyToId } : {}),
+    };
+  }
+  const unmarked = (opts: ReceiptScanOptions = {}) =>
+    posted(THREAD, { threadMode: "signed", unmarkedThreaded: true, ...opts });
+
+  it("a signed reply that threads this inbound, with no marker → found (positive control)", async () => {
+    writeReply(cliReply());
+    expect(await unmarked()).toBe("found");
+  });
+
+  it("the same record is NOT evidence without unmarkedThreaded (legacy and default scans unchanged)", async () => {
+    writeReply(cliReply());
+    expect(await posted(THREAD, { threadMode: "signed" })).toBe("absent");
+    expect(await posted(THREAD, { threadMode: "legacy" })).toBe("absent");
+  });
+
+  it("no signed replyToId (the reply was sent without --reply-to) → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson() }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a signed replyToId for a DIFFERENT inbound → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson({ replyToId: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1" }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("the signed thread CHANGED after signing (signature broken) → NOT found", async () => {
+    const env = JSON.parse(replyJson({ replyToId: "a-different-thread" }));
+    env.replyToId = THREAD;
+    writeReply(cliReply({ body: JSON.stringify(env) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("signed by ANOTHER key while claiming the obligated agent → NOT found", async () => {
+    writeReply(cliReply({ body: replyJson({ replyToId: THREAD, seed: OTHER_SEED }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a genuine reply signed by ANOTHER agent → NOT found", async () => {
+    writeReply(cliReply({ from: "someone-else", body: replyJson({ replyToId: THREAD, from: "someone-else", seed: OTHER_SEED }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("addressed to someone other than the inbound sender → NOT found", async () => {
+    writeReply(cliReply({ to: "mallory", body: replyJson({ replyToId: THREAD, to: "mallory" }) }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("carries ANOTHER obligation's marker → NOT found", async () => {
+    writeReply(cliReply({ headers: { "X-TPS-Obligation": "ob-2" } }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("carries a NACK marker → NOT found (a posted NACK mail record never settles the obligation)", async () => {
+    writeReply(cliReply({ headers: { "X-TPS-Nack": "yielded-without-resumption" } }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a wrapper replyToId that contradicts the signed thread → NOT found", async () => {
+    writeReply(cliReply({ replyToId: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f1" }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("a wrapper accountId/from that contradicts the signed reply → NOT found", async () => {
+    writeReply(cliReply({ accountId: "some-other-account" }));
+    expect(await unmarked()).toBe("absent");
+    writeReply(cliReply({ from: "mallory" }));
+    expect(await unmarked()).toBe("absent");
+  });
+
+  it("the obligation record knows the reply: a record with another id is not evidence", async () => {
+    writeReply(cliReply());
+    expect(await unmarked({ expectedReplyId: "reply-1" })).toBe("found");
+    expect(await unmarked({ expectedReplyId: "reply-2" })).toBe("absent");
   });
 });
