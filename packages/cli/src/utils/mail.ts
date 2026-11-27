@@ -522,8 +522,8 @@ export function updateExistingRecord<T extends object>(
     withholdPlacement?: boolean;
     /**
      * Delete the record instead of rewriting it: `mutate` still runs and its
-     * result is returned as `updated`, nothing is written first, and a failed
-     * delete throws.
+     * result is returned as `updated`; nothing is written first. A delete that
+     * finds the record gone returns `gone`; any other failed delete throws.
      */
     remove?: boolean;
   },

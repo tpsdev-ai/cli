@@ -390,7 +390,7 @@ function writeOutboxFile(message: TpsMailBody): string {
  * and the bridge leave none (or one the sandbox agent consumes). A LOCAL reply
  * does leave one — in the RECIPIENT's maildir, which the recipient consumes:
  * its promote() rewrites and moves it, and its ack or gc can remove it. Before
- * cli#1098 its ack DELETED a promoted record too, so once the recipient had
+ * cli#1098 the CLI's ack DELETED a promoted record too, so once the recipient had
  * acked, a later scan (the deadline's, or restart recovery's) found no
  * evidence and a committed reply ended `unconfirmed` (cli#429 round 7); an ack
  * of a promoted cur/ record now leaves it for the scan. The local route gets
