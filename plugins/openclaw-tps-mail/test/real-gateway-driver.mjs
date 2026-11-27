@@ -269,6 +269,7 @@ async function main() {
     openclawVersion: null,
     modelCalls: 0,
     modelTurnTexts: [],
+    inboundPromptText: null,
     unexpected: [],
     dispatchStarts: 0,
     replyCount: 0,
@@ -284,6 +285,7 @@ async function main() {
     inboundNewFiles: [],
     readErrors: [],
     inboundId: null,
+    inboundEnvelopeId: null,
     inboundName: null,
     settledRead: false,
     stopped: false,
@@ -379,6 +381,15 @@ async function main() {
       modelCalls += 1;
       const input = Array.isArray(parsed?.input) ? parsed.input : [];
       const sawToolOutput = input.some((item) => item?.type === "function_call_output");
+      const inputText = (item) =>
+        typeof item?.text === "string"
+          ? item.text
+          : Array.isArray(item?.content)
+            ? item.content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("\n")
+            : "";
+      if (!sawToolOutput && report.inboundPromptText === null) {
+        report.inboundPromptText = input.map(inputText).join("\n\n");
+      }
       const messages = sawToolOutput
         ? [{ id: "msg_2", text: "FINAL: the task is complete", phase: "final_answer" }]
         : [{ id: "msg_1", text: "PROGRESS: drafting the answer", phase: "final_answer" }];
@@ -548,7 +559,8 @@ async function main() {
     const { hashes } = await import(pathToFileURL(noblePath).href);
     hashes.sha512 = (message) => new Uint8Array(createHash("sha512").update(message).digest());
 
-    const inboundId = `msg-${Date.now()}`;
+    const recordId = `rec-${Date.now()}`;
+    const inboundEnvelopeId = `msg-${Date.now()}`;
     const timestamp = new Date().toISOString();
     const envelope = signEnvelope(
       {
@@ -556,7 +568,7 @@ async function main() {
         from: "agent-b",
         to: "agent-a",
         body: "please handle this",
-        messageId: inboundId,
+        messageId: inboundEnvelopeId,
         timestamp,
         delegationChain: [
           { agent: "system", kind: "human", timestamp, rationale: "originates", signature: null },
@@ -565,16 +577,17 @@ async function main() {
       },
       { "agent-b": seedB },
     );
-    report.inboundId = inboundId;
+    report.inboundId = recordId;
+    report.inboundEnvelopeId = inboundEnvelopeId;
     // Stage in the maildir's tmp/ and rename into new/: the plugin reads new/
     // synchronously at start, and rename(2) within one filesystem is atomic, so it
     // never sees a half-written record.
-    const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${inboundId}.json`;
+    const inboundName = `${timestamp.replace(/[:.]/g, "-")}-${recordId}.json`;
     report.inboundName = inboundName;
     const inboundTmp = join(MAIL, "agent-a", "tmp", inboundName);
     writeFileSync(
       inboundTmp,
-      JSON.stringify({ id: inboundId, from: "agent-b", to: "agent-a", body: JSON.stringify(envelope), timestamp, read: false }, null, 2),
+      JSON.stringify({ id: recordId, from: "agent-b", to: "agent-a", body: JSON.stringify(envelope), timestamp, read: false }, null, 2),
     );
     renameSync(inboundTmp, join(MAIL, "agent-a", "new", inboundName));
 
