@@ -786,9 +786,9 @@ function staticWordValue(text: string): string | null {
 }
 
 /**
- * A plain variable word: `$NAME`, `${NAME}` or one with a literal suffix. The
- * tree scanner already classifies variable words, so a command word of this
- * shape is not refused here.
+ * A plain variable word: `$NAME`, `${NAME}` or one with a literal suffix. It is
+ * an accepted dynamic form here; the tree scanner resolves such words where it
+ * can.
  */
 function isVariableWord(text: string): boolean {
   return /^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}?)(?:\/\S*)?$/.test(stripOuterQuotes(text));
@@ -1274,8 +1274,8 @@ function consumePrefixOptions(
   while (index < tokens.length) {
     const token = tokens[index];
     const text = staticWordValue(token.text);
-    // A word with no static value cannot be an option: it is the command word,
-    // which the caller judges (rule check order is shared with the run block).
+    // A word with no static value cannot be an option, so it is treated as the
+    // command word, which the caller judges.
     if (text === null) return index;
     if (!text.startsWith("-") || text === "-") return index;
     if (text === "--") return index + 1;
