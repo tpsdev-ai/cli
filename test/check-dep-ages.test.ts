@@ -2293,7 +2293,7 @@ it.each([
   expect(runWithStubNpm(run).at(-1)).toBe(argument);
 }, 15_000);
 
-describe("the run-block guard refuses split-word continuations and command-word brace expansion (#941)", () => {
+describe("the run-block guard refuses split-word continuations and command words that begin with an unquoted brace (#941)", () => {
   const WORKFLOW = "workflow-941";
   const read = (run: string) => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW);
   const tree = (run: string) => assertNpmCiWorkflowTree(workflowStep(run), READ_TRACKED, REPO, WORKFLOW);
@@ -2351,6 +2351,31 @@ describe("the run-block guard refuses split-word continuations and command-word 
     expect(() => tree(run)).toThrow(reason);
     // Bash expands the leading brace into the command word and its first argument.
     expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it.each(["echo ok; {n,}pm ci", "echo ok && {n,}pm ci"])(
+    "refuses a brace command word that starts a clause after a separator: %s", (run) => {
+      const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(bashWithStubNpm(run)).toBe("pm ci");
+    }, 15_000,
+  );
+
+  it.each(["''{n,}pm ci", "env ''{n,}pm ci"])(
+    "refuses a brace command word after empty quotes: %s", (run) => {
+      const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(bashWithStubNpm(run)).toBe("pm ci");
+    }, 15_000,
+  );
+
+  it("accepts a wholly quoted brace command word", () => {
+    const run = "'{n,}pm' ci";
+    expect(read(run)).toBe(0);
+    expect(tree(run).installs).toBe(0);
+    expect(bashWithStub("{n,}pm", run)).toBe("ci");
   }, 15_000);
 
   it.each([

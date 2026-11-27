@@ -426,9 +426,6 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   if (!approved) {
     for (const entry of logicalShellLines(run, refuse, true)) {
       if (entry.body) continue;
-      if (hasBraceExpansionCommandWord(entry.text)) {
-        refuse(entry, "an unapproved run block conservatively refuses a command word beginning with an unquoted {");
-      }
       for (const clause of splitClauses(entry.text, true)) {
         for (const token of clause.tokens) {
           if (isScalarAssignment(token.text) || (!token.quoted && SHELL_KEYWORDS.has(token.text))) continue;
@@ -446,7 +443,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         const word = commandWord(clause.tokens, true, (reason) => refuse(entry, reason));
         if (word === null) continue;
         const text = word.token.text;
-        if (/^[0-9]*[<>]/.test(text)) {
+        if (/^(?:[0-9]*[<>]|\{[A-Za-z_][A-Za-z0-9_]*\}[<>])/.test(text)) {
           refuse(entry, "an unapproved run block has a leading redirection");
         }
         if (!word.token.quoted && text === "case") {
@@ -908,6 +905,15 @@ type WordToken = { text: string; quoted: boolean; end?: number };
 type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?: boolean; tail?: string };
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
+/**
+ * A brace is a shell operator only as a standalone word: `{n,}pm` and
+ * `dir/{a,b}` are one word, `{ echo ok; }` is a group.
+ */
+function standaloneBrace(line: string, index: number): boolean {
+  const separates = (char: string | undefined): boolean => char === undefined || /[\s;&|()<>]/.test(char);
+  return separates(line[index - 1]) && separates(line[index + 1]);
+}
+
 /** Split a line into words, keeping quoted spans whole and honoring escapes and substitutions. */
 function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments = false): ShellToken[] {
   const tokens: ShellToken[] = [];
@@ -940,7 +946,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
       index += operator.length;
       continue;
     }
-    if (/[;&|(){}]/.test(char)) {
+    if (/[;&|()]/.test(char) || ((char === "{" || char === "}") && standaloneBrace(line, index))) {
       tokens.push({ text: char, quoted: false });
       index++;
       continue;
@@ -951,7 +957,7 @@ function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments 
     while (index < line.length) {
       const next = line[index];
       if (hereDocuments && line.startsWith("<<", index)) break;
-      if (/\s/.test(next) || (/[;&|(){}]/.test(next) &&
+      if (/\s/.test(next) || (/[;&|()]/.test(next) &&
           !(keepRedirectAmpersand && ((next === "&" && /[<>]$/.test(text)) || (next === "|" && />$/.test(text)))))) break;
       if (next === "\\") {
         text += next;
@@ -1307,80 +1313,49 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
 }
 
 /**
- * A command word that begins with an unquoted `{` and is not a standalone `{`
- * token is refused conservatively: the guard does not read brace expansion
- * statically, and bash can run a different word than the text spells. Bash may
- * also leave the word literal (`{foo}bar`). A `{`-delimited descriptor followed
- * by a redirection (`{fd}>out`) is not a command word and is left to the
- * leading-redirection check.
+ * The first character a word decodes to, and whether a quote produced it, so a
+ * brace after empty quotes (`''{n,}pm`) is still an unquoted brace. Null when
+ * the word decodes to nothing but quotes.
  */
-function hasBraceExpansionCommandWord(text: string): boolean {
-  for (const clause of braceClauses(braceWords(text))) {
-    const word = walkCommandWord(clause, false, true, undefined, text);
-    if (word !== null && word.token.text.startsWith("{") && word.token.text.length > 1 && !word.token.quoted &&
-        !/[<>]/.test(text[word.token.end ?? -1] ?? "")) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/** Split a line into words with braces kept inside words, so a brace word is one token. */
-function braceWords(text: string): WordToken[] {
-  const tokens: WordToken[] = [];
+function leadingDecodedChar(text: string): { char: string; quoted: boolean } | null {
+  let quote: "" | "'" | '"' = "";
   for (let index = 0; index < text.length; index++) {
     const char = text[index];
-    if (/\s/.test(char)) continue;
-    if (/[;|&()<>]/.test(char)) {
-      tokens.push({ text: char, quoted: false, end: index + 1 });
-      continue;
+    if (quote === "'") {
+      if (char === "'") { quote = ""; continue; }
+      return { char, quoted: true };
     }
-    const start = index;
-    let quote = "";
-    let quoted = false;
-    while (index < text.length) {
-      const next = text[index];
-      if (quote === "'") {
-        if (next === "'") quote = "";
-        index++;
-      } else if (quote === '"') {
-        if (next === "\\") index += 2;
-        else {
-          if (next === '"') quote = "";
-          index++;
-        }
-      } else if (next === "\\") {
-        index += 2;
-      } else if (next === "$" && text[index + 1] === "'") {
-        quote = "ansi";
-        quoted = true;
-        index += 2;
-      } else if (quote === "ansi") {
-        if (next === "'") quote = "";
-        index++;
-      } else if (next === "'" || next === '"') {
-        quoted = true;
-        quote = next;
-        index++;
-      } else if (/\s/.test(next) || /[;|&()<>]/.test(next)) break;
-      else index++;
+    if (quote === '"') {
+      if (char === '"') { quote = ""; continue; }
+      if (char === "\\") {
+        const next = text[index + 1];
+        if (next === "$" || next === "`" || next === '"' || next === "\\") return { char: next, quoted: true };
+        if (next === "\n") { index++; continue; }
+        return { char: "\\", quoted: true };
+      }
+      return { char, quoted: true };
     }
-    tokens.push({ text: text.slice(start, index), quoted, end: index });
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "\\") {
+      const next = text[index + 1];
+      return next === undefined ? null : { char: next, quoted: true };
+    }
+    return { char, quoted: false };
   }
-  return tokens;
+  return null;
 }
 
-function braceClauses(tokens: WordToken[]): WordToken[][] {
-  const clauses: WordToken[][] = [];
-  let current: WordToken[] = [];
-  for (const token of tokens) {
-    if (!token.quoted && /^[;|&(){}]$/.test(token.text)) {
-      if (current.length > 0) clauses.push(current);
-      current = [];
-    } else current.push(token);
-  }
-  if (current.length > 0) clauses.push(current);
-  return clauses;
+/**
+ * The command-word walk refuses a word whose first decoded character is an
+ * unquoted `{`, so `''{n,}pm` counts and `'{n,}pm'` does not: the guard does not
+ * read brace expansion statically, and bash can run a different word than the
+ * text spells. A `{`-delimited descriptor followed by a redirection (`{fd}>out`)
+ * is left to the leading-redirection check.
+ */
+function isBraceCommandWord(text: string): boolean {
+  const lead = leadingDecodedChar(text);
+  return lead !== null && lead.char === "{" && !lead.quoted &&
+    !/^\{[A-Za-z_][A-Za-z0-9_]*\}[<>]/.test(text);
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
@@ -1476,28 +1451,24 @@ function consumePrefixOptionWords(
  * reserved words are recognised by their decoded static value in decoded mode,
  * so a statically quoted prefix or option matches like an unquoted one. A
  * `refuse` callback turns the strict run-block checks on; listed wrappers are
- * refused outright. A `braceSource` line also returns a command word that
- * begins with an unquoted `{`.
+ * refused outright. `braceRefuse` is called for a word whose first decoded
+ * character is an unquoted `{`.
  */
 function walkCommandWord(
   tokens: readonly WordToken[],
   includeCase: boolean,
   decoded: boolean,
   refuse?: (reason: string) => never,
-  braceSource?: string,
+  braceRefuse?: (reason: string) => never,
 ): { index: number; token: WordToken } | null {
   let index = 0;
   let sawPrefix = false;
   let prefix = "";
+  const onBrace = braceRefuse ?? refuse;
   while (index < tokens.length) {
     const token = tokens[index];
-    if (braceSource !== undefined && token.text.startsWith("{") && token.text.length > 1 && !token.quoted &&
-        !/[<>]/.test(braceSource[token.end ?? -1] ?? "")) {
-      return { index, token };
-    }
-    if (braceSource !== undefined && /^[<>]$/.test(token.text)) {
-      index++;
-      continue;
+    if (onBrace !== undefined && isBraceCommandWord(token.text)) {
+      onBrace("an unapproved run block conservatively refuses a command word beginning with an unquoted {");
     }
     const value = decoded ? staticWordValue(token.text) : null;
     // After a prefix every word up to and including the command word must be
@@ -1558,8 +1529,9 @@ function commandWord(
   tokens: ShellToken[],
   includeCase = false,
   refuse?: (reason: string) => never,
+  braceRefuse?: (reason: string) => never,
 ): { index: number; token: ShellToken } | null {
-  return walkCommandWord(tokens, includeCase, refuse !== undefined, refuse);
+  return walkCommandWord(tokens, includeCase, refuse !== undefined, refuse, braceRefuse);
 }
 
 function firstNonFlag(tokens: ShellToken[]): ShellToken | undefined {
@@ -2242,9 +2214,6 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       }
       continue;
     }
-    if (state.source === "run-block" && !reviewed && hasBraceExpansionCommandWord(entry.text)) {
-      throw new Error(`${lineAt(state, number)}: an unapproved run block conservatively refuses a command word beginning with an unquoted {: ${entry.text}`);
-    }
     if (state.classifyInstalls) {
       if (/^(?:cp|mv|ln|install|rsync|tee)\s/.test(entry.text) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(entry.text)) state.staged = true;
       if (/^(?:sed\s+-i|perl\s+-i)/.test(entry.text) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(entry.text)) state.staged = true;
@@ -2279,7 +2248,10 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     let clauseInstall = false;
     const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
-      const word = commandWord(clause.tokens);
+      const word = commandWord(clause.tokens, false, undefined,
+        state.source === "run-block" && !reviewed
+          ? (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); }
+          : undefined);
       if (word !== null) {
         const command = stripOuterQuotes(word.token.text);
         if (!word.token.quoted && command === "cd") {
