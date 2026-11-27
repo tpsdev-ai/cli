@@ -16,15 +16,19 @@
  * started it, so the test passes its pid and start token down to the fixture.
  */
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 
 /** How often a watch probes the owner. */
 export const STAND_IN_POLL_MS = 1000;
+
+/** `require` for this module: Node gives an ES module no `require`. */
+const standInRequire = createRequire(import.meta.url);
 
 /** A builtin module: `process.getBuiltinModule` when available, otherwise
  *  `require`. */
 function standInBuiltin(name) {
   if (typeof process.getBuiltinModule === "function") return process.getBuiltinModule(name);
-  return require(name);
+  return standInRequire(name);
 }
 
 /** `standInBuiltin`'s source for the generated program. Written out rather than

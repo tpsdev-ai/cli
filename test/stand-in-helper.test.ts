@@ -140,6 +140,20 @@ test("a stand-in exits when its owner is killed and not reaped", async () => {
   }
 }, 15_000);
 
+test("the helper loads its builtins without process.getBuiltinModule", () => {
+  // Node 22.0-22.2 have no process.getBuiltinModule, and Node gives an ES module no require.
+  const helperUrl = new URL("./helpers/stand-in.mjs", import.meta.url).href;
+  const program = [
+    "delete process.getBuiltinModule;",
+    `const { standInOwnerStartToken } = await import(${JSON.stringify(helperUrl)});`,
+    "process.stdout.write(standInOwnerStartToken(process.pid));",
+  ].join("\n");
+  const run = spawnSync(process.env.NODE_BIN ?? "node", ["--input-type=module", "-e", program], { encoding: "utf8" });
+  expect(run.stderr).toBe("");
+  expect(run.status).toBe(0);
+  expect(run.stdout).toMatch(/^(linux|ps):/);
+});
+
 const FIXTURE_BOUND_MS = 10_000;
 
 /** A pid's state from /proc on Linux, from `ps -o stat=` elsewhere. Null when
