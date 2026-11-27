@@ -2298,12 +2298,12 @@ describe("the run-block guard refuses split-word continuations and command-word 
   const read = (run: string) => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW);
   const tree = (run: string) => assertNpmCiWorkflowTree(workflowStep(run), READ_TRACKED, REPO, WORKFLOW);
 
-  /** Run bash with a stub npm that records its argv and return that argv; throws when npm did not run. */
-  function bashWithStubNpm(script: string): string {
+  /** Run bash with a stub command on PATH that records its argv; return that argv. */
+  function bashWithStub(command: string, script: string): string {
     const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
     try {
       const argvFile = join(stubDir, "argv");
-      writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
+      writeFileSync(join(stubDir, command), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
       const result = spawnSync("bash", ["-c", script], {
         env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
         encoding: "utf8",
@@ -2314,6 +2314,11 @@ describe("the run-block guard refuses split-word continuations and command-word 
     } finally {
       rmSync(stubDir, { recursive: true, force: true });
     }
+  }
+
+  /** Run bash with a stub npm that records its argv and return that argv; throws when npm did not run. */
+  function bashWithStubNpm(script: string): string {
+    return bashWithStub("npm", script);
   }
 
   it("refuses a continuation that joins two halves of one word, naming the physical line", () => {
@@ -2356,6 +2361,25 @@ describe("the run-block guard refuses split-word continuations and command-word 
     expect(() => read(run)).toThrow(reason);
     expect(() => tree(run)).toThrow(reason);
     expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it.each([
+    '"env" -u FOO {n,}pm ci',
+    "\\env -u FOO {n,}pm ci",
+    'env "-u" FOO {n,}pm ci',
+  ])("refuses a brace-leading command word after a statically quoted or escaped prefix or quoted prefix option: %s", (run) => {
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it("refuses a literal brace word as the command word after a prefix", () => {
+    const run = "env -u FOO {foo}bar one";
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStub("{foo}bar", run)).toBe("one");
   }, 15_000);
 
   it("preserves mid-word brace expansion and a standalone brace group", () => {
@@ -5533,7 +5557,7 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
   it.each([
     'timeout 5 "n${{ matrix.rest }}" ci',
     'timeout 5 x "n${{ matrix.rest }}" ci',
-  ])("refuses a listed wrapper without reading its arguments: %s", (run) => {
+  ])("refuses a listed wrapper regardless of its arguments: %s", (run) => {
     expectRefused(run, /listed exec wrapper: timeout/);
     expect(bashArgv(run)).toBeNull();
   }, 10_000);

@@ -904,6 +904,7 @@ function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] =
 
 type Invocation = { rel: string } | { dynamic: string; cwdUnknown?: true; missing?: true };
 type ShellToken = { text: string; quoted: boolean; hereDocument?: number; literalHereDocuments?: number[] };
+type WordToken = { text: string; quoted: boolean; end?: number };
 type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?: boolean; tail?: string };
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
@@ -1314,22 +1315,29 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
  * leading-redirection check.
  */
 function hasBraceExpansionCommandWord(text: string): boolean {
-  const PREFIX_COMMANDS = new Set([
-    "env", "command", "exec", "sudo", "xargs", "nohup", "time", "nice", "stdbuf",
-    "setsid", "chroot", "ionice", "chrt", "taskset", "flock", "unbuffer", "script",
-    "watch", "builtin", "hash",
-  ]);
-  const KEYWORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!"]);
-  const tokens: { text: string; end: number }[] = [];
+  for (const clause of braceClauses(braceWords(text))) {
+    const word = walkCommandWord(clause, false, true, undefined, text);
+    if (word !== null && word.token.text.startsWith("{") && word.token.text.length > 1 && !word.token.quoted &&
+        !/[<>]/.test(text[word.token.end ?? -1] ?? "")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Split a line into words with braces kept inside words, so a brace word is one token. */
+function braceWords(text: string): WordToken[] {
+  const tokens: WordToken[] = [];
   for (let index = 0; index < text.length; index++) {
     const char = text[index];
     if (/\s/.test(char)) continue;
     if (/[;|&()<>]/.test(char)) {
-      tokens.push({ text: char, end: index + 1 });
+      tokens.push({ text: char, quoted: false, end: index + 1 });
       continue;
     }
     const start = index;
     let quote = "";
+    let quoted = false;
     while (index < text.length) {
       const next = text[index];
       if (quote === "'") {
@@ -1345,83 +1353,34 @@ function hasBraceExpansionCommandWord(text: string): boolean {
         index += 2;
       } else if (next === "$" && text[index + 1] === "'") {
         quote = "ansi";
+        quoted = true;
         index += 2;
       } else if (quote === "ansi") {
         if (next === "'") quote = "";
         index++;
       } else if (next === "'" || next === '"') {
+        quoted = true;
         quote = next;
         index++;
       } else if (/\s/.test(next) || /[;|&()<>]/.test(next)) break;
       else index++;
     }
-    tokens.push({ text: text.slice(start, index), end: index });
+    tokens.push({ text: text.slice(start, index), quoted, end: index });
   }
-  let command = true;
-  for (let index = 0; index < tokens.length; index++) {
-    const token = tokens[index];
-    if (/^[;|&(){}]$/.test(token.text)) {
-      command = true;
-      continue;
-    }
-    if (/^[<>]$/.test(token.text)) continue;
-    if (command && token.text.startsWith("{") && token.text.length > 1 &&
-        !/[<>]/.test(text[token.end] ?? "")) return true;
-    if (!command) continue;
-    if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(token.text) || KEYWORDS.has(token.text)) continue;
-    if (PREFIX_COMMANDS.has(token.text)) {
-      const grammar = PREFIX_OPTION_GRAMMAR[token.text];
-      // Consume the prefix's option words with the prefix parser's own grammar,
-      // so an option value is never read as the command word.
-      if (grammar !== undefined) index = skipPrefixOptionWords(grammar, tokens, index + 1) - 1;
-      continue;
-    }
-    command = false;
-  }
-  return false;
+  return tokens;
 }
 
-/** The index after a modelled prefix's options: the next word is the command word. */
-function skipPrefixOptionWords(
-  grammar: PrefixOptionGrammar,
-  tokens: { text: string }[],
-  index: number,
-): number {
-  while (index < tokens.length) {
-    const text = tokens[index].text;
-    if (!text.startsWith("-") || text === "-") return index;
-    if (text === "--") return index + 1;
-    if (text.startsWith("--")) {
-      const equals = text.indexOf("=");
-      const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
-      if (grammar.longValue.has(name)) {
-        index += equals === -1 ? 2 : 1;
-        continue;
-      }
-      if (grammar.longFlag.has(name)) {
-        index++;
-        continue;
-      }
-      return index;
-    }
-    const letters = text.slice(1);
-    let takesNext = false;
-    let known = true;
-    for (let letter = 0; letter < letters.length; letter++) {
-      const flag = letters[letter];
-      if (grammar.shortValue.has(flag)) {
-        takesNext = letter === letters.length - 1;
-        break;
-      }
-      if (!grammar.shortFlag.has(flag)) {
-        known = false;
-        break;
-      }
-    }
-    if (!known) return index;
-    index += takesNext ? 2 : 1;
+function braceClauses(tokens: WordToken[]): WordToken[][] {
+  const clauses: WordToken[][] = [];
+  let current: WordToken[] = [];
+  for (const token of tokens) {
+    if (!token.quoted && /^[;|&(){}]$/.test(token.text)) {
+      if (current.length > 0) clauses.push(current);
+      current = [];
+    } else current.push(token);
   }
-  return index;
+  if (current.length > 0) clauses.push(current);
+  return clauses;
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
@@ -1442,20 +1401,20 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
 }
 
 /**
- * Consume a prefix command's options so the word after them is the command
- * word. An option the grammar does not list refuses the step.
+ * Consume a prefix command's options and return the index of the first token
+ * after them, which may be an assignment. An option the grammar does not list
+ * refuses the step in strict mode; without a refusal the walk stops there.
  */
-function consumePrefixOptions(
+function consumePrefixOptionWords(
   command: string,
-  tokens: ShellToken[],
+  grammar: PrefixOptionGrammar,
+  tokens: readonly WordToken[],
   index: number,
-  refuse: (reason: string) => never,
+  refuse?: (reason: string) => never,
 ): number {
-  const grammar = PREFIX_OPTION_GRAMMAR[command];
-  const requireStatic = (token: ShellToken): void => {
-    if (staticWordValue(token.text) === null) {
-      refuse(`an unapproved run block cannot establish the command word: ${token.text}`);
-    }
+  const stop = (reason: string): number => {
+    if (refuse !== undefined) refuse(reason);
+    return index;
   };
   while (index < tokens.length) {
     const token = tokens[index];
@@ -1473,8 +1432,10 @@ function consumePrefixOptions(
           index++;
           continue;
         }
-        if (index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
-        requireStatic(tokens[index + 1]);
+        if (index + 1 >= tokens.length) return stop(`an unapproved run block has a ${command} option without a value`);
+        if (staticWordValue(tokens[index + 1].text) === null) {
+          return stop(`an unapproved run block cannot establish the command word: ${tokens[index + 1].text}`);
+        }
         index += 2;
         continue;
       }
@@ -1482,7 +1443,7 @@ function consumePrefixOptions(
         index++;
         continue;
       }
-      refuse(`an unapproved run block has an unrecognised ${command} option`);
+      return stop(`an unapproved run block has an unrecognised ${command} option`);
     }
     const letters = text.slice(1);
     let takesNext = false;
@@ -1498,14 +1459,92 @@ function consumePrefixOptions(
         break;
       }
     }
-    if (!known) refuse(`an unapproved run block has an unrecognised ${command} option`);
+    if (!known) return stop(`an unapproved run block has an unrecognised ${command} option`);
     if (takesNext) {
-      if (index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
-      requireStatic(tokens[index + 1]);
+      if (index + 1 >= tokens.length) return stop(`an unapproved run block has a ${command} option without a value`);
+      if (staticWordValue(tokens[index + 1].text) === null) {
+        return stop(`an unapproved run block cannot establish the command word: ${tokens[index + 1].text}`);
+      }
     }
     index += takesNext ? 2 : 1;
   }
   return index;
+}
+
+/**
+ * Walk a clause's words and return its command word. Prefixes, options and
+ * reserved words are recognised by their decoded static value in decoded mode,
+ * so a statically quoted prefix or option matches like an unquoted one. A
+ * `refuse` callback turns the strict run-block checks on; listed wrappers are
+ * refused outright. A `braceSource` line also returns a command word that
+ * begins with an unquoted `{`.
+ */
+function walkCommandWord(
+  tokens: readonly WordToken[],
+  includeCase: boolean,
+  decoded: boolean,
+  refuse?: (reason: string) => never,
+  braceSource?: string,
+): { index: number; token: WordToken } | null {
+  let index = 0;
+  let sawPrefix = false;
+  let prefix = "";
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (braceSource !== undefined && token.text.startsWith("{") && token.text.length > 1 && !token.quoted &&
+        !/[<>]/.test(braceSource[token.end ?? -1] ?? "")) {
+      return { index, token };
+    }
+    if (braceSource !== undefined && /^[<>]$/.test(token.text)) {
+      index++;
+      continue;
+    }
+    const value = decoded ? staticWordValue(token.text) : null;
+    // After a prefix every word up to and including the command word must be
+    // static; the plain-variable command word is accepted only without one.
+    if (decoded && sawPrefix && value === null) {
+      if (refuse !== undefined) refuse(`an unapproved run block has a word without a static value after ${prefix}: ${token.text}`);
+      return { index, token };
+    }
+    if (isScalarAssignment(token.text)) {
+      index++;
+      continue;
+    }
+    const text = value ?? stripOuterQuotes(token.text);
+    if (includeCase && !token.quoted && text === "case") return { index, token };
+    if (!token.quoted && SHELL_HEADERS.has(text)) return null;
+    if ((decoded || !token.quoted) && PREFIX_COMMANDS.has(text)) {
+      // `command -v`/`-V` looks a name up; it runs no command.
+      if (text === "command") {
+        const next = tokens[index + 1];
+        const nextText = next === undefined ? null : decoded ? staticWordValue(next.text) : next.quoted ? null : next.text;
+        if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
+      }
+      sawPrefix = true;
+      prefix = text;
+      index++;
+      const grammar = PREFIX_OPTION_GRAMMAR[text];
+      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse);
+      continue;
+    }
+    if ((decoded || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
+      // Listed wrappers are refused without inspecting their arguments.
+      if (refuse !== undefined) {
+        refuse(`an unapproved run block has a listed exec wrapper: ${text}`);
+      }
+      return { index, token };
+    }
+    if (!token.quoted && SHELL_KEYWORDS.has(text)) {
+      index++;
+      continue;
+    }
+    if (sawPrefix && (decoded || !token.quoted) && text.startsWith("-") && text !== "-") {
+      index++;
+      continue;
+    }
+    return { index, token };
+  }
+  return null;
 }
 
 /**
@@ -1520,58 +1559,7 @@ function commandWord(
   includeCase = false,
   refuse?: (reason: string) => never,
 ): { index: number; token: ShellToken } | null {
-  const strict = refuse !== undefined;
-  let index = 0;
-  let sawPrefix = false;
-  let prefix = "";
-  while (index < tokens.length) {
-    const token = tokens[index];
-    const value = strict ? staticWordValue(token.text) : null;
-    // After a prefix every word up to and including the command word must be
-    // static; the plain-variable command word is accepted only without one.
-    if (strict && sawPrefix && value === null) {
-      refuse(`an unapproved run block has a word without a static value after ${prefix}: ${token.text}`);
-    }
-    if (isScalarAssignment(token.text)) {
-      index++;
-      continue;
-    }
-    const text = value ?? stripOuterQuotes(token.text);
-    if (includeCase && !token.quoted && text === "case") return { index, token };
-    if (!token.quoted && SHELL_HEADERS.has(text)) return null;
-    if ((strict || !token.quoted) && PREFIX_COMMANDS.has(text)) {
-      // `command -v`/`-V` looks a name up; it runs no command.
-      if (text === "command") {
-        const next = tokens[index + 1];
-        const nextText = next === undefined ? null : strict ? staticWordValue(next.text) : next.quoted ? null : next.text;
-        if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
-      }
-      sawPrefix = true;
-      prefix = text;
-      index++;
-      if (refuse !== undefined && PREFIX_OPTION_GRAMMAR[text] !== undefined) {
-        index = consumePrefixOptions(text, tokens, index, refuse);
-      }
-      continue;
-    }
-    if ((strict || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
-      // Listed wrappers are refused without inspecting their arguments.
-      if (refuse !== undefined) {
-        refuse(`an unapproved run block has a listed exec wrapper: ${text}`);
-      }
-      return { index, token };
-    }
-    if (!token.quoted && SHELL_KEYWORDS.has(text)) {
-      index++;
-      continue;
-    }
-    if (sawPrefix && (strict || !token.quoted) && text.startsWith("-") && text !== "-") {
-      index++;
-      continue;
-    }
-    return { index, token };
-  }
-  return null;
+  return walkCommandWord(tokens, includeCase, refuse !== undefined, refuse);
 }
 
 function firstNonFlag(tokens: ShellToken[]): ShellToken | undefined {
