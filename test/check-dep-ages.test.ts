@@ -5353,6 +5353,10 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     expectRefused(run, /unrecognised env option/);
   }, 5_000);
 
+  it.each(["env A=~ echo ok", "env A=x:~/y echo ok"])("refuses a word after env whose unquoted tilde bash expands: %s", (run) => {
+    expectRefused(run, /static value|cannot establish|no static/);
+  }, 5_000);
+
   it.each(["-s", "-i", "--shell", "--login"])("refuses the sudo shell option %s", (option) => {
     expectRefused(`sudo ${option} 'npm ci'`, /unrecognised sudo option/);
   }, 5_000);
@@ -5501,6 +5505,8 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     String.raw`'$HOME'`,
     String.raw`a\ b`,
     "'a`b'",
+    '"A=~"',
+    "'~'",
   ];
   it.each(bashWords)("decodes %s as bash splits it", (word) => {
     const result = spawnSync("bash", ["-c", `printf '%s\\n' ${word}`], { encoding: "utf8", timeout: 5_000 });
@@ -5508,8 +5514,14 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     expect(staticWordValue(word)).toBe(result.stdout.replace(/\n$/, ""));
   }, 5_000);
 
-  it.each([String.raw`$HOME`, '"${HOME}"', "`printf x`", 'n${{ matrix.rest }}', "a*", "~", "n{pm,}", "{1..9}", "$[1+2]"
+  it.each([String.raw`$HOME`, '"${HOME}"', "`printf x`", 'n${{ matrix.rest }}', "a*", "~", "n{pm,}", "{1..9}", "$[1+2]", "A=~", "A=x:~/y"
   ])("has no static value for an expanding or globbing word: %s", (word) => {
     expect(staticWordValue(word)).toBeNull();
   });
+
+  it.each(["A=~", "A=x:~/y"])("bash expands an unquoted tilde in the assignment value %s", (word) => {
+    const result = spawnSync("bash", ["-c", `${word}; printf '%s' "$A"`], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("~");
+  }, 5_000);
 });

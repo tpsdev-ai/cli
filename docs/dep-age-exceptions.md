@@ -41,7 +41,7 @@ Before any prefix, option, wrapper or command-word matching, the guard computes 
 word's static value with bash's quoting rules: inside single quotes every character
 is literal, a backslash included; inside double quotes a backslash escapes only
 `$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
-next character. A word that would expand, or an unquoted glob, has no static value.
+next character. A word containing a parameter, command, arithmetic or brace expansion, an unescaped backquote, an unquoted `~` or an unquoted glob has no static value.
 Prefix, option and wrapper matching read the static value, so a statically quoted
 spelling matches like an unquoted one. A word with no static value in command
 position is refused, naming it, except a plain variable command word with no

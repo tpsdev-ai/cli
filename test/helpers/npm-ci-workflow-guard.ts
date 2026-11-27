@@ -774,10 +774,11 @@ function stripOuterQuotes(value: string): string {
 
 /**
  * A word's static value, decoded with bash's quoting rules. Null when the word
- * would expand (parameter, command, arithmetic or brace expansion, an unescaped
- * backquote, a leading unquoted tilde, or an unquoted glob): the shell may run a
- * different word than the text spells, so the guard cannot establish it
- * statically. The guard never evaluates an expansion.
+ * contains a parameter, command, arithmetic or brace expansion, an unescaped
+ * backquote, an unquoted `~` anywhere (bash also expands one after `=` or `:` in
+ * an assignment value), or an unquoted glob: the shell may run a different word
+ * than the text spells, so the guard cannot establish it statically. The guard
+ * never evaluates an expansion.
  */
 export function staticWordValue(text: string): string | null {
   const expansionAt = (index: number, doubleQuoted: boolean): boolean => {
@@ -847,7 +848,7 @@ export function staticWordValue(text: string): string | null {
       continue;
     }
     if (char === "?" || char === "[") return null;
-    if (char === "~" && value === "") return null;
+    if (char === "~") return null;
     value += char;
   }
   return value;
