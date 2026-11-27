@@ -1,5 +1,5 @@
 import { isMailboxMessageFile, type FlairClient } from "@tpsdev-ai/agent";
-import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, writeThreadReceipt, type MailMessage } from "../utils/mail.js";
+import { mailRootForRecordPath, verifyMailAction, ackMessage, assertValidBody, checkMessages, countInboxMessages, gcMessages, getInbox, isPresentableCurRecord, LEASE_TIMEOUT_MS, listMessages, MAX_INBOX_MESSAGES, nackMessage, sendMessage, withholdUnverified, type MailMessage } from "../utils/mail.js";
 import { deliverToSandbox, deliverToRemoteBranch, EXIT_DELIVERY_UNCONFIRMED, MailDeliveryUnconfirmedError, parseMailAckTimeoutMs, resolveMailAckTimeoutMs } from "../utils/relay.js";
 import { sanitizeIdentifier } from "../schema/sanitizer.js";
 import { queryArchive } from "../utils/archive.js";
@@ -620,17 +620,6 @@ export async function runMail(args: MailArgs): Promise<void> {
       // fallback for an office recipient with no maildir yet.
       await storeExplicitForRoute();
       const msg = sendMessage(to, args.message, from);
-      // cli#1098: record a threaded reply in the sender's own store
-      // (writeThreadReceipt), where the recipient's ack does not remove it. The
-      // send has already committed, so a failed receipt write is reported and
-      // the send succeeds.
-      if (args.replyTo !== undefined) {
-        try {
-          writeThreadReceipt(mailRoot, from, { replyId: msg.id, replyToId: args.replyTo, to, signedReply: msg.body });
-        } catch (err) {
-          console.error(`warning: message sent, but its thread receipt was not written: ${(err as Error).message}`);
-        }
-      }
       if (args.json) {
         // Metadata only (cli#429): `sendMessage` returns the whole record, whose
         // body is the signed envelope carrying the plaintext — never print it.

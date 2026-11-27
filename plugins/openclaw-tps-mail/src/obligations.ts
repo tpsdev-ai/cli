@@ -1184,9 +1184,6 @@ export interface ReceiptScanOptions {
   /** cli#1063, local delivery only: also accept a posted reply that carries
    *  no obligation marker but signs this thread (see form (3)). */
   unmarkedThreaded?: boolean;
-  /** cli#1098, with `unmarkedThreaded` in `signed` mode: the path of the
-   *  replying agent's own thread receipt (see form (4)). */
-  threadReceipt?: string;
 }
 
 /**
@@ -1256,13 +1253,6 @@ export interface ReceiptScanOptions {
  *       marker for another purpose, or a reply that does not verify is never
  *       evidence. There is no reply-age window.
  *
- *   (4) THREAD RECEIPT (cli#1098, with (3) in `signed` mode) — the receipt
- *       `tps mail send --reply-to` writes into the replying agent's own store
- *       for the same reply, read by its direct path (`threadReceipt`), so the
- *       recipient's ack of its copy does not remove the evidence. It counts
- *       only when (g) holds for its `replyId` and its `signedReply` verifies
- *       as this agent's reply to `recipient` that signs this thread.
- *
  *   A record carrying an `X-TPS-Nack` marker is never evidence in any posted
  *   form: it is rejected before a form is evaluated.
  *
@@ -1300,7 +1290,7 @@ export async function scanForReceipt(
   checkSignature: ReceiptSignatureCheck,
   opts: ReceiptScanOptions = {},
 ): Promise<ReceiptScan> {
-  const { expectedReplyId, fs = realFs, threadMode = "legacy", unmarkedThreaded = false, threadReceipt } = opts;
+  const { expectedReplyId, fs = realFs, threadMode = "legacy", unmarkedThreaded = false } = opts;
   let malformed: { path: string; ownRecord: boolean } | null = null;
   const verified = (envelope: Envelope | null): Promise<boolean> =>
     isVerifiedReceiptReply(envelope, agent, recipient, replyToId, threadMode, checkSignature);
@@ -1326,22 +1316,6 @@ export async function scanForReceipt(
       (await verified(receiptEnvelope(rec.signedReply)))
     ) {
       return { status: "found", path: direct };
-    }
-  }
-  // (4) THREAD RECEIPT: one direct path; absent or unreadable is not evidence.
-  if (unmarkedThreaded && threadMode === "signed" && threadReceipt !== undefined) {
-    let rec: any = null;
-    try {
-      rec = JSON.parse(fs.readFileSync(threadReceipt, "utf-8"));
-    } catch {
-      rec = null;
-    }
-    if (
-      typeof rec?.replyId === "string" &&
-      (expectedReplyId === undefined || rec.replyId === expectedReplyId) &&
-      (await verified(receiptEnvelope(rec.signedReply)))
-    ) {
-      return { status: "found", path: threadReceipt };
     }
   }
   // (2) POSTED FILE: the marker names no path, so THESE dirs — and only these —

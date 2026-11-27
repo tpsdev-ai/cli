@@ -130,8 +130,7 @@ NOT sent — there is no unsigned fallback: a reply becomes a named failure
 and stays owed (`nackPending`) for the next start.
 
 **A receipt is evidence only when its reply VERIFIES (cli#429).** Every receipt
-form — the posted record, the bridge sandbox record, the metadata receipt, the
-CLI's thread receipt — is
+form — the posted record, the bridge sandbox record, the metadata receipt — is
 accepted only when the reply it carries is a signed envelope whose sender is the
 obligated agent, whose recipient is the inbound's verified sender, whose
 signatures verify against the key Flair holds for that agent (the same
@@ -241,7 +240,8 @@ plugin sweeps the store:
 A reply delivered over a route whose delivered record this agent **cannot
 keep** — the wire to a remote branch, the branch-office bridge, and (cli#429
 round 7) a **local** reply, whose record lives in the recipient's maildir where
-the recipient's `promote()` moves it, its ack deletes it and its gc purges it —
+the recipient's `promote()` moves it, its ack of an unpromoted record deletes it
+and its gc purges it —
 is receipted so the obligation loop can see that it committed, even after the
 recipient has consumed the reply. An outbox reply is not: its record stays in
 this host's outbox (`new/` → `sent/`), and the drain quarantining it is a
@@ -271,14 +271,6 @@ evidence; its obligation resolves at its deadline.
   as the obligated agent's reply for this thread (above). Where agents share one
   OS user, another agent can read the signing keys, so no in-band check
   separates them — only an OS-level boundary does (tracked separately).
-- **A reply sent with `tps mail send --reply-to` leaves a thread receipt
-  (cli#1098).** On the local route, when `<mailDir>/<agent>` exists, the CLI
-  also writes the signed reply to
-  `<mailDir>/<agent>/.obligations/thread-receipts/<hash>.json` (0600), so the
-  recipient acking its copy does not remove the evidence. The scan reads it by
-  that path wherever it accepts a marker-less threaded reply, under the rule
-  above. When the CLI writes a thread receipt, it first tries to remove those
-  older than seven days.
 - **A bridge delivery is readable in the sandbox too.** The bridge's reduced
   sandbox record carries the obligation, inbound and reply ids when an
   obligation supplies them, so that delivery stays locally readable evidence

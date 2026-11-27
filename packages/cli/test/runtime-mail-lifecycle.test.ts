@@ -111,7 +111,7 @@ describe("runtime promote() lifecycle (cli#380 PR 1)", () => {
     expect(msgs[0]!.envelopeId).toBe(env.messageId);
   });
 
-  // ── 3. Ack removes the record; it is not re-presented ──────────────────────
+  // ── 3. Ack stamps the record; it is not re-presented ───────────────────────
   test("completeRuntimeMail acks so the record is not re-presented (no infinite re-dispatch)", async () => {
     const env = buildSignedEnvelope("flint", "kern", "ack me", { flint: FLINT_SEED });
     sendMessage("kern", JSON.stringify(env), "flint");
@@ -121,7 +121,8 @@ describe("runtime promote() lifecycle (cli#380 PR 1)", () => {
     expect(first.length).toBe(1);
     completeRuntimeMail(kernCfg(), first[0]!.id);
 
-    expect(files(inbox.cur).length).toBe(0); // ack removed the cur/ record
+    // The ack stamped the cur/ record and kept it (cli#1098).
+    expect(files(inbox.cur).map((f) => JSON.parse(readFileSync(join(inbox.cur, f), "utf-8")).ackedAt)).toEqual([expect.any(String)]);
 
     // Even with an expired lease, an acked record never comes back.
     const again = await pollRuntimeMail(kernCfg());
@@ -148,7 +149,8 @@ describe("runtime promote() lifecycle (cli#380 PR 1)", () => {
     expect(rePresented.length).toBe(1); // re-presented because it was never acked
 
     completeRuntimeMail(kernCfg(), rePresented[0]!.id);
-    expect(files(inbox.cur).length).toBe(0);
+    expect(JSON.parse(readFileSync(curPath, "utf-8")).ackedAt).toEqual(expect.any(String));
+    expect(await pollRuntimeMail(kernCfg())).toEqual([]);
   });
 
   // ── 5. Retryable dlq self-heals on a later poll (requirement 2) ────────────
@@ -214,8 +216,9 @@ describe("runtime promote() lifecycle (cli#380 PR 1)", () => {
     expect(files(join(getMailDir(), "kern", "cur")).length).toBe(0);
 
     completeRuntimeMail(kernCfg(), msgs[0]!.id);
-    // Ack resolved the same mailbox and removed the record there.
-    expect(files(join(branchRoot, "cur")).length).toBe(0);
+    // Ack resolved the same mailbox and stamped the record there.
+    const [branchFile] = files(join(branchRoot, "cur"));
+    expect(JSON.parse(readFileSync(join(branchRoot, "cur", branchFile!), "utf-8")).ackedAt).toEqual(expect.any(String));
   });
 
   // ── 8. Boot preflight: loud on failure, true when up ───────────────────────

@@ -246,8 +246,10 @@ describe("ack and nack re-check the intent under their own lock", () => {
     const nacked = await promotedRecord();
     expect(nackMessage("kern", nacked.id, "retry later")?.nackedAt).toBeDefined();
     const acked = await promotedRecord();
-    expect(ackMessage("kern", acked.id)?.ackedAt).toBeDefined();
-    expect(existsSync(acked.path)).toBe(false);
+    const stamp = ackMessage("kern", acked.id)?.ackedAt;
+    expect(stamp).toBeDefined();
+    // The acked cur/ record is kept, stamped (cli#1098).
+    expect(JSON.parse(readFileSync(acked.path, "utf8")).ackedAt).toBe(stamp);
   });
 });
 
@@ -317,7 +319,8 @@ describe("tps mail ack / nack (the command)", () => {
       expect(JSON.parse(readFileSync(nacked.path, "utf8")).nackedAt).toBeDefined();
       const acked = await promotedRecord();
       await runMail({ action: "ack", agent: "kern", messageId: acked.id } as never);
-      expect(existsSync(acked.path)).toBe(false);
+      // The acked cur/ record is kept, stamped (cli#1098).
+      expect(JSON.parse(readFileSync(acked.path, "utf8")).ackedAt).toEqual(expect.any(String));
     } finally { restore(); }
   });
 });

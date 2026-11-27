@@ -27,7 +27,7 @@ import { homedir, tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash, randomUUID } from "node:crypto";
 import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
-import { ackMessageAtPath as ackMessageAtPathCli, promote as promoteCli, threadReceiptPath } from "@tpsdev-ai/cli/utils/mail";
+import { ackMessage as ackMessageCli, checkMessages as checkMessagesCli, verifyMailAction as verifyMailActionCli } from "@tpsdev-ai/cli/utils/mail";
 
 import { hashes } from "@noble/ed25519";
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
@@ -1017,12 +1017,13 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
   // ── cli#1098 ─────────────────────────────────────────────────────────────────
   // agent-a owes the reply; agent-b sent the inbound. The reply is sent with the
-  // delivery prompt's own command through the real CLI; where a case consumes
-  // agent-b's copy, it uses the CLI's promote and ack.
+  // delivery prompt's own command through the real CLI. Where a case consumes
+  // agent-b's copy, it calls what `tps mail check` and `tps mail ack` call: the
+  // CLI's checkMessages, then verifyMailAction and ackMessage.
   const AGENT_A = "agent-a";
   const AGENT_B = "agent-b";
 
-  async function startForReceipt(): Promise<Awaited<ReturnType<typeof start>>> {
+  async function startForReply(): Promise<Awaited<ReturnType<typeof start>>> {
     writeFileSync(join(tempKeysDir, `${AGENT_A}.key`), ANVIL_SEED);
     const h = await start(AGENT_A, AGENT_B, { localSender: true });
     await pollUntil(() => h.dispatched !== null, 4000);
@@ -1045,17 +1046,21 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(run.status, run.stderr || run.stdout).toBe(0);
   }
 
-  /** agent-b promotes its copy of the reply (new/ → cur/) and, with `ack`, acks it (deletes it). */
+  /** agent-b checks its mail (the reply moves new/ → cur/) and, with `ack`, acks the reply. */
   async function recipientConsumes(ack: boolean): Promise<void> {
-    const fresh = resolve(tempMailDir, AGENT_B, "new");
-    const files = readdirSafe(fresh).filter((f) => f.endsWith(".json"));
-    expect(files.length).toBe(1);
-    const promoted = await promoteCli(AGENT_B, resolve(fresh, files[0]!), {});
-    expect(promoted.ok, JSON.stringify(promoted)).toBe(true);
-    if (!promoted.ok) return;
-    if (ack) ackMessageAtPathCli(promoted.path, resolve(tempMailDir, AGENT_B));
-    const left = [...newFiles(AGENT_B), ...curFiles(AGENT_B)];
-    expect(left.length).toBe(ack ? 0 : 1);
+    const prevMailDir = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = tempMailDir;
+    try {
+      const checked = await checkMessagesCli(AGENT_B);
+      expect(checked.map((m) => m.from)).toEqual([AGENT_A]);
+      if (ack) {
+        await verifyMailActionCli(AGENT_B, checked[0]!.id);
+        expect(ackMessageCli(AGENT_B, checked[0]!.id)?.ackedAt).toEqual(expect.any(String));
+      }
+    } finally {
+      if (prevMailDir === undefined) delete process.env.TPS_MAIL_DIR; else process.env.TPS_MAIL_DIR = prevMailDir;
+    }
+    expect(newFiles(AGENT_B)).toEqual([]);
   }
 
   function yieldAndSettle(h: { obligationId: () => string | null; settle: () => void }): void {
@@ -1072,13 +1077,11 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(nackMailsIn(resolve(tempMailDir, AGENT_B, "new"))).toEqual([]);
   }
 
-  it.each([["acked", true], ["promoted, not acked", false]] as const)("cli#1098: post-turn scan: a CLI reply the recipient consumed before settlement acks the obligation (recipient's copy %s)", async (_copy, ack) => {
+  it.each([["acked", true], ["checked, not acked", false]] as const)("cli#1098: post-turn scan: a CLI reply the recipient consumed before settlement acks the obligation (recipient's copy %s)", async (_copy, ack) => {
     // The deadline falls after this test's polls: the post-turn scan settles it.
     process.env.TPS_OBLIGATION_DEADLINE_MS = "60000";
-    const h = await startForReceipt();
+    const h = await startForReply();
     sendPrintedReply(h);
-    const receipt = JSON.parse(readFileSync(threadReceiptPath(tempMailDir, AGENT_A, AGENT_B, h.inboundEnvelopeId), "utf-8"));
-    expect(JSON.parse(receipt.signedReply).replyToId).toBe(h.inboundEnvelopeId);
     await recipientConsumes(ack);
     yieldAndSettle(h);
     await pollUntil(() => settled(h.inboundId), 4000);
@@ -1088,9 +1091,9 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
 
   it.each([["acked", true], ["not consumed", false]] as const)("cli#1098: deadline scan: a CLI reply sent after the post-turn scan acks the obligation (recipient's copy %s)", async (_copy, ack) => {
     process.env.TPS_OBLIGATION_DEADLINE_MS = "4000";
-    const h = await startForReceipt();
+    const h = await startForReply();
     // The run yields with nothing sent: the post-turn scan finds nothing and
-    // arms the deadline. The reply is sent only once that arm has begun.
+    // arms the deadline. The reply is sent once that arm has begun.
     let scanned = false;
     let armedAfterScan = false;
     setBeforeReceiptScanForTests((id) => { if (id === h.inboundId) scanned = true; });
@@ -1108,59 +1111,6 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(obligationFile(AGENT_A, h.inboundId)?.state).toBe("yielded");
     await pollUntil(() => settled(h.inboundId), 10000);
     expectAckedWithoutNack(h.inboundId);
-    await h.stop();
-  }, 40000);
-
-  /** A reply envelope from agent-a to agent-b that signs `thread` with `seed`. */
-  function replyEnvelope(thread: string, seed: Buffer): any {
-    const now = new Date().toISOString();
-    const chain: ChainEntry[] = [
-      { agent: "system", kind: "human", timestamp: now, rationale: "originates", signature: null },
-      { agent: AGENT_A, kind: "agent", timestamp: now, rationale: `agent ${AGENT_A} replies`, signature: null },
-    ];
-    return signEnvelope(
-      { v: 1, from: AGENT_A, to: AGENT_B, body: "a reply", messageId: randomUUID(), timestamp: now, delegationChain: chain, replyToId: thread },
-      { [AGENT_A]: seed },
-    );
-  }
-
-  const receiptCases: Array<[string, "acked" | "failed", (thread: string) => string | null]> = [
-    // Control: the same construction, correctly signed for this thread, is evidence.
-    ["signed by agent-a for this thread", "acked", (thread) => JSON.stringify(replyEnvelope(thread, ANVIL_SEED))],
-    ["signed by another key", "failed", (thread) => JSON.stringify(replyEnvelope(thread, FLINT_SEED))],
-    ["unsigned", "failed", (thread) => {
-      const { signature: _drop, ...unsigned } = replyEnvelope(thread, ANVIL_SEED);
-      return JSON.stringify(unsigned);
-    }],
-    ["for another thread", "failed", () => JSON.stringify(replyEnvelope(randomUUID(), ANVIL_SEED))],
-    // null: the receipt path holds a directory, so the read fails.
-    ["that cannot be read", "failed", () => null],
-  ];
-  it.each(receiptCases)("cli#1098: a thread receipt %s, after the recipient acked its copy: %s", async (_label, outcome, signedReply) => {
-    process.env.TPS_OBLIGATION_DEADLINE_MS = "600";
-    const h = await startForReceipt();
-    sendPrintedReply(h);
-    await recipientConsumes(true);
-    const path = threadReceiptPath(tempMailDir, AGENT_A, AGENT_B, h.inboundEnvelopeId);
-    const receipt = JSON.parse(readFileSync(path, "utf-8"));
-    const replaced = signedReply(h.inboundEnvelopeId);
-    if (replaced === null) {
-      rmSync(path);
-      mkdirSync(path);
-    } else {
-      writeFileSync(path, JSON.stringify({ ...receipt, signedReply: replaced }), { mode: 0o600 });
-    }
-    yieldAndSettle(h);
-    await pollUntil(() => settled(h.inboundId), 4000);
-    if (outcome === "acked") {
-      expectAckedWithoutNack(h.inboundId);
-    } else {
-      // As with no receipt: the yielded run fails at the deadline and nacks.
-      expect(obligationFile(AGENT_A, h.inboundId)?.state, JSON.stringify(obligationFile(AGENT_A, h.inboundId))).toBe("failed");
-      expect(obligationFile(AGENT_A, h.inboundId)?.failure).toBe("yielded-without-resumption");
-      expect(curRecord(AGENT_A)?.nackedAt).toBeDefined();
-      expect(nackMailsIn(resolve(tempMailDir, AGENT_B, "new")).length).toBe(1);
-    }
     await h.stop();
   }, 40000);
 

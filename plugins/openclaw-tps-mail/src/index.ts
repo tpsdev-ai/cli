@@ -60,7 +60,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath, isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch, threadReceiptPath } from "@tpsdev-ai/cli/utils/mail";
+import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { isBranchHost, resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import {
@@ -389,7 +389,8 @@ function writeOutboxFile(message: TpsMailBody): string {
  * SCOPE: every route whose delivered record this agent cannot keep. The wire
  * and the bridge leave none (or one the sandbox agent consumes). A LOCAL reply
  * does leave one — in the RECIPIENT's maildir, which the recipient consumes:
- * its promote() rewrites and moves it, its ack DELETES it, its gc purges it —
+ * its promote() rewrites and moves it, its ack of an unpromoted record DELETES
+ * it, its gc purges it —
  * so once the recipient has acked, a later scan (the deadline's, or restart
  * recovery's) found no evidence and a committed reply ended `unconfirmed`
  * (cli#429 round 7). The local route therefore gets the same receipt; its
@@ -2618,13 +2619,7 @@ function scanObligationReceipt(
     // envelope must be addressed to it (cli#429).
     ctx.sender,
     receiptSignatureCheck(ctx),
-    {
-      expectedReplyId,
-      threadMode: thread.mode,
-      unmarkedThreaded,
-      // cli#1098: the receipt `tps mail send --reply-to` leaves in this agent's own store.
-      ...(unmarkedThreaded ? { threadReceipt: threadReceiptPath(ctx.mailDir, ctx.agent, ctx.sender, thread.threadId) } : {}),
-    },
+    { expectedReplyId, threadMode: thread.mode, unmarkedThreaded },
   );
 }
 

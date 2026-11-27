@@ -9,7 +9,7 @@
  * RED without the fix: the forged record below is forwarded and lands in `cur/`.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { createHash, randomUUID } from "node:crypto";
@@ -35,6 +35,10 @@ let savedFlairEnv: Record<string, string | undefined>;
 const inbox = (d: "new" | "cur" | "dlq") => join(root, BRIDGE, d);
 const files = (d: "new" | "cur" | "dlq") =>
   existsSync(inbox(d)) ? readdirSync(inbox(d)).filter((f) => f.endsWith(".json")) : [];
+/** The bridge's ack stamps the cur/ record and keeps it (cli#1098). */
+const ackedInCur = (file: string) => {
+  try { return JSON.parse(readFileSync(join(inbox("cur"), file), "utf8")).ackedAt !== undefined; } catch { return false; }
+};
 
 beforeAll(() => {
   root = join(tmpdir(), `tps-bridge-mail-${randomUUID()}`);
@@ -116,7 +120,7 @@ describe("the channel bridge promotes before forwarding (cli#380)", () => {
     await waitFor(() => sent.length === 1);
 
     expect(sent[0]!.content).toBe("hello from the agent");
-    await waitFor(() => !files("cur").includes("ok.json"));
+    await waitFor(() => ackedInCur("ok.json"));
     expect(files("new")).not.toContain("ok.json");
   });
 
@@ -147,7 +151,7 @@ describe("the channel bridge promotes before forwarding (cli#380)", () => {
 
     await waitFor(() => sent.length === 1);
     expect(sent[0]!.content).toBe("after the outage");
-    await waitFor(() => !files("cur").includes("outage.json"));
+    await waitFor(() => ackedInCur("outage.json"));
     expect(files("dlq")).not.toContain("outage.json");
   });
 });
