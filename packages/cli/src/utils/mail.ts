@@ -1185,9 +1185,9 @@ export function threadReceiptPath(mailRoot: string, agent: string, to: string, t
 /**
  * Write the receipt of a committed local threaded reply into `from`'s own
  * obligation store (threadReceiptPath): a temp file renamed into place, 0600.
- * Receipts older than THREAD_RECEIPT_TTL_MS are removed first. Returns null
- * and writes nothing when `<mailRoot>/<from>` does not exist: creating it would
- * make `from` a local recipient (resolveMailRoute).
+ * Receipts older than THREAD_RECEIPT_TTL_MS are removed first, best effort.
+ * Returns null and writes nothing when `<mailRoot>/<from>` does not exist:
+ * creating it would make `from` a local recipient (resolveMailRoute).
  */
 export function writeThreadReceipt(mailRoot: string, from: string, receipt: ThreadReceipt): string | null {
   assertValidAgentId(from);

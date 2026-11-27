@@ -620,9 +620,10 @@ export async function runMail(args: MailArgs): Promise<void> {
       // fallback for an office recipient with no maildir yet.
       await storeExplicitForRoute();
       const msg = sendMessage(to, args.message, from);
-      // cli#1098: a threaded reply also leaves a receipt in the sender's own
-      // store, which the recipient's ack does not remove. The send has already
-      // committed, so a failed receipt write is reported and the send succeeds.
+      // cli#1098: record a threaded reply in the sender's own store
+      // (writeThreadReceipt), where the recipient's ack does not remove it. The
+      // send has already committed, so a failed receipt write is reported and
+      // the send succeeds.
       if (args.replyTo !== undefined) {
         try {
           writeThreadReceipt(mailRoot, from, { replyId: msg.id, replyToId: args.replyTo, to, signedReply: msg.body });

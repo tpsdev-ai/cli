@@ -277,8 +277,8 @@ evidence; its obligation resolves at its deadline.
   `<mailDir>/<agent>/.obligations/thread-receipts/<hash>.json` (0600), so the
   recipient acking its copy does not remove the evidence. The scan reads it by
   that path wherever it accepts a marker-less threaded reply, under the rule
-  above. The CLI removes thread receipts older than seven days when it writes
-  the next one.
+  above. When the CLI writes a thread receipt, it first tries to remove those
+  older than seven days.
 - **A bridge delivery is readable in the sandbox too.** The bridge's reduced
   sandbox record carries the obligation, inbound and reply ids when an
   obligation supplies them, so that delivery stays locally readable evidence
