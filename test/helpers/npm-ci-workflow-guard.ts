@@ -1222,6 +1222,14 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
   let buffer = "";
   let start = 0;
   const documents: HereDocumentState = { pending: [], continued: "" };
+  // A trailing backslash continues the line only when it is unescaped: an even
+  // run of backslashes ends in a literal backslash, so `echo ok \\` is a
+  // complete command and bash starts a new line after it.
+  const endsWithContinuation = (value: string): boolean => {
+    let backslashes = 0;
+    for (let at = value.length - 1; at >= 0 && value[at] === "\\"; at--) backslashes++;
+    return backslashes % 2 === 1;
+  };
   const flush = (quoteContinued = false, tail = "") => {
     const trimmed = buffer.trim();
     if (trimmed !== "") lines.push({ text: trimmed, line: start, body: false, quoteContinued, tail });
@@ -1284,10 +1292,10 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
         (headerCount > 0 && hasUnbalancedLineQuotes([{ text: line, line: index + 1 }])))) {
       refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header");
     }
-    if (refuseHeader !== null && heredocs.length > 0 && (buffer !== "" || /\\$/.test(line))) {
+    if (refuseHeader !== null && heredocs.length > 0 && (buffer !== "" || endsWithContinuation(line))) {
       refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header continuation");
     }
-    if (/\\$/.test(line)) {
+    if (endsWithContinuation(line)) {
       const joined = line.slice(0, -1);
       const next = index + 1 < raw.length ? raw[index + 1].replace(/\r$/, "") : "";
       if (refuseHeader !== null && strictRunBlock && joined !== "" && !/\s$/.test(joined) &&
@@ -1402,6 +1410,9 @@ function consumePrefixOptionWords(
     if (text.startsWith("--")) {
       const equals = text.indexOf("=");
       const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
+      if (command === "env" && name === "chdir") {
+        throw new Error("env --chdir changes the working directory and is refused");
+      }
       if (grammar.longValue.has(name)) {
         if (equals !== -1) {
           index++;
@@ -1425,6 +1436,9 @@ function consumePrefixOptionWords(
     let known = true;
     for (let letter = 0; letter < letters.length; letter++) {
       const flag = letters[letter];
+      if (command === "env" && flag === "C") {
+        throw new Error("env -C changes the working directory and is refused");
+      }
       if (grammar.shortValue.has(flag)) {
         takesNext = letter === letters.length - 1;
         break;
@@ -2117,17 +2131,17 @@ function clauseInvocations(
   clause: Clause,
   entryText: string,
   number: number,
+  word: { index: number; token: WordToken } | null,
 ): ClauseInvocation[] {
   const at = state.source === "run-block" ? `${state.label}: ${entryText}` : lineAt(state, number);
   const found: ClauseInvocation[] = [];
   const embedded = (): ClauseInvocation[] => {
-    for (const invocation of embeddedInvocations(clause)) {
+    for (const invocation of embeddedInvocations(clause, word)) {
       const token = "rel" in invocation ? { text: invocation.rel, quoted: false } : { text: invocation.dynamic, quoted: false };
       found.push({ invocation: resolveInvocation(ctx, state, token, at), embedded: true });
     }
     return found;
   };
-  const word = commandWord(clause.tokens);
   if (word === null) return embedded();
   const quote = word.token.text[0];
   if ((quote === "'" || quote === '"') && !word.token.text.endsWith(quote)) return embedded();
@@ -2248,7 +2262,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     let clauseInstall = false;
     const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
-      const word = commandWord(clause.tokens, false, undefined,
+      const word = walkCommandWord(clause.tokens, false, true, undefined,
         state.source === "run-block" && !reviewed
           ? (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); }
           : undefined);
@@ -2313,7 +2327,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
         );
       }
       if (!assignmentSubstitution && !assignmentClause) {
-        for (const item of clauseInvocations(ctx, state, clause, entry.text, number)) {
+        for (const item of clauseInvocations(ctx, state, clause, entry.text, number, word)) {
           if (item.embedded && reviewedWrapped) continue;
           followInvocation(ctx, state, item.invocation, entry.text, number);
         }
@@ -2576,9 +2590,8 @@ function handleInstall(
   ctx.installs++;
 }
 
-function embeddedInvocations(clause: Clause): Invocation[] {
+function embeddedInvocations(clause: Clause, word: { index: number; token: WordToken } | null): Invocation[] {
   const tokens = clause.tokens;
-  const word = commandWord(tokens);
   const wordIndex = word === null ? -1 : word.index;
   const found: Invocation[] = [];
   const base = word === null ? "" : (stripOuterQuotes(word.token.text).split("/").pop() ?? "");

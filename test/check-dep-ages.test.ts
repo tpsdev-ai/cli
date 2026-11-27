@@ -2424,6 +2424,85 @@ describe("the run-block guard refuses split-word continuations and command words
     }
     expect(spawnSync("bash", ["-c", group], { encoding: "utf8", timeout: 5_000 }).stdout).toBe("ok\n");
   }, 15_000);
+
+  it("accepts a line ending in an escaped backslash, and bash runs two commands", () => {
+    const run = "echo ok \\\\\necho done";
+    expect(read(run)).toBe(0);
+    expect(tree(run).installs).toBe(0);
+    const result = spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("ok \\\ndone\n");
+  }, 15_000);
+});
+
+describe("the workflow guard follows a script through a statically quoted prefix or option (#941)", () => {
+  const WORKFLOW = "workflow-941-decoded-walk";
+  const tracked = new Set(["package-lock.json"]);
+  const prefixed = [
+    '"env" -u FOO bash scripts/check.sh',
+    "\\env -u FOO bash scripts/check.sh",
+    'env "-u" FOO bash scripts/check.sh',
+  ];
+  const install = /does not read the lockfile and is refused/;
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const run of prefixed) {
+    it(`follows ${run} in a run block`, () => {
+      expect(assertNpmCiLockfilesRead(workflowStep(run), tracked, WORKFLOW)).toBe(0);
+      withTree({ "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+
+    it(`follows ${run} from a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+  }
+});
+
+describe("the workflow guard refuses env working-directory options (#941)", () => {
+  const WORKFLOW = "workflow-941-env-chdir";
+  const tracked = new Set(["package-lock.json"]);
+  const options = [
+    ["env -C sub bash check.sh", /env -C changes the working directory and is refused/],
+    ["env -Csub bash check.sh", /env -C changes the working directory and is refused/],
+    ["env -iC sub bash check.sh", /env -C changes the working directory and is refused/],
+    ["env --chdir sub bash check.sh", /env --chdir changes the working directory and is refused/],
+    ["env --chdir=sub bash check.sh", /env --chdir changes the working directory and is refused/],
+  ] as [string, RegExp][];
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const [run, reason] of options) {
+    it(`refuses ${run} in a run block`, () => {
+      withTree({ "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(reason);
+      });
+    }, 10_000);
+
+    it(`refuses ${run} in a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(reason);
+      });
+    }, 10_000);
+  }
 });
 
 describe("the workflow guard bounds global tool versions", () => {
@@ -5429,7 +5508,6 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     "setsid n$'p\\155' ci",
     "chroot / n$'p\\155' ci",
     "env -u FOO n$'p\\155' ci",
-    "env -C . n$'p\\155' ci",
     "sudo -u runner n$'p\\155' ci",
     "sudo -g group n$'p\\155' ci",
     "exec -a x n$'p\\155' ci",
@@ -5526,17 +5604,21 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
   }, 5_000);
 
   /** Run the row under real bash with a stub npm on PATH; return the argv npm received, or null. */
-  function bashArgv(run: string): string | null {
+  function bashArgv(run: string, timeout = 5_000): string | null {
     const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
     try {
       const argvFile = join(stubDir, "argv");
       writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
-      spawnSync("bash", ["-c", run], {
+      const result = spawnSync("bash", ["-c", run], {
         cwd: stubDir,
         env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
         encoding: "utf8",
-        timeout: 5_000,
+        timeout,
       });
+      // A timeout or a signal is a harness failure, not a missing argv: a
+      // non-zero exit is still allowed because the row may legitimately fail.
+      if (result.error !== undefined) throw result.error;
+      if (result.signal !== null) throw new Error(`bash was killed by ${result.signal}`);
       try {
         return readFileSync(argvFile, "utf8");
       } catch {
@@ -5546,6 +5628,10 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
       rmSync(stubDir, { recursive: true, force: true });
     }
   }
+
+  it("fails the real-bash helper when the control does not finish", () => {
+    expect(() => bashArgv("while :; do :; done", 250)).toThrow(/timed out|ETIMEDOUT|killed|SIGTERM/);
+  }, 5_000);
 
   const statics: { run: string; reason: RegExp; argv: string | null }[] = [
     // Statically quoted prefix, wrapper and command spellings real bash runs.
