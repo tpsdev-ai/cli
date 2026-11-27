@@ -5360,4 +5360,58 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
   ])("still refuses the control: %s", (run) => {
     expectRefused(run, /command word with ANSI-C quoting/);
   }, 5_000);
+
+  /** Run the row under real bash with a stub npm on PATH; return the argv npm received, or null. */
+  function bashArgv(run: string): string | null {
+    const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+    try {
+      const argvFile = join(stubDir, "argv");
+      writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
+      spawnSync("bash", ["-c", run], {
+        cwd: stubDir,
+        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      try {
+        return readFileSync(argvFile, "utf8");
+      } catch {
+        return null;
+      }
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }
+
+  const statics: { run: string; reason: RegExp; argv: string | null }[] = [
+    // Statically quoted prefix, wrapper and command spellings real bash runs.
+    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /command word with ANSI-C quoting/, argv: "ci" },
+    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /command word with ANSI-C quoting/, argv: "ci" },
+    { run: '"timeout" 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
+    { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
+    { run: '"${{ matrix.cmd }}" ci', reason: /runner expression in command position/, argv: null },
+
+    // An unknown short or long option on each modelled prefix.
+    { run: "env -Z npm ci", reason: /unrecognised env option/, argv: null },
+    { run: "env --bogus npm ci", reason: /unrecognised env option/, argv: null },
+    { run: "sudo -Z npm ci", reason: /unrecognised sudo option/, argv: null },
+    { run: "sudo --bogus npm ci", reason: /unrecognised sudo option/, argv: null },
+    { run: "exec -Z npm ci", reason: /unrecognised exec option/, argv: null },
+    { run: "exec --bogus npm ci", reason: /unrecognised exec option/, argv: null },
+    { run: "xargs -Z npm ci", reason: /unrecognised xargs option/, argv: null },
+    { run: "xargs --bogus npm ci", reason: /unrecognised xargs option/, argv: null },
+
+    // A modelled option whose value is missing at the end of the line.
+    { run: "env -u", reason: /env option without a value/, argv: null },
+    { run: "sudo -u", reason: /sudo option without a value/, argv: null },
+    { run: "exec -a", reason: /exec option without a value/, argv: null },
+    { run: "xargs -n", reason: /xargs option without a value/, argv: null },
+  ];
+
+  for (const row of statics) {
+    it(`refuses ${row.run} with a real-bash control`, () => {
+      expectRefused(row.run, row.reason);
+      expect(bashArgv(row.run)).toBe(row.argv);
+    }, 10_000);
+  }
 });

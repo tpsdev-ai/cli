@@ -408,6 +408,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   };
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
+  let unestablished: { entry: PhysicalLine; text: string } | null = null;
   if (!approved) {
     for (const entry of logicalShellLines(run, refuse, true)) {
       if (entry.body) continue;
@@ -434,7 +435,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         if (!word.token.quoted && text === "case") {
           refuse(entry, "an unapproved run block has a case reserved word in command position");
         }
-        if (text.startsWith("${{")) {
+        if (text.includes("${{")) {
           refuse(entry, "an unapproved run block has a runner expression in command position");
         }
         if (text.includes("$'")) {
@@ -443,12 +444,19 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         if (text !== "[" && text !== "[[" && /[*?\[]/.test(text)) {
           refuse(entry, "an unapproved run block has a command word with a glob character");
         }
+        if (text !== "[" && text !== "[[" && staticWordValue(text) === null && !isVariableWord(text) &&
+            unestablished === null) {
+          unestablished = { entry, text };
+        }
       }
     }
   }
   if (!approved && flagged.length > 0 &&
       (run.includes("`") || run.includes("$(") || hasUnbalancedLineQuotes(lines))) {
     refuse(lines.find((entry) => entry.text.includes("$(")) ?? flagged[0], "unapproved run block has a shell wrapper");
+  }
+  if (!approved && unestablished !== null) {
+    refuse(unestablished.entry, `an unapproved run block cannot establish the command word: ${unestablished.text}`);
   }
   const helpers: PhysicalLine[] = [];
   for (const entry of lines) {
@@ -754,6 +762,36 @@ function stripOuterQuotes(value: string): string {
 /** The literal word a token spells once quotes are dropped and escapes removed. */
 function literalWord(text: string): string {
   return text.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
+}
+
+/**
+ * A word's static value: its static quotes and backslash escapes removed. Null
+ * when what remains still needs an expansion ($, a backquote, `${{`) or names a
+ * glob: the shell may run a different word than the text spells, so the guard
+ * cannot establish it statically. The guard never evaluates an expansion.
+ */
+function staticWordValue(text: string): string | null {
+  let value = "";
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (char === "\\" && index + 1 < text.length) {
+      value += text[++index];
+      continue;
+    }
+    if (char === "'" || char === '"') continue;
+    value += char;
+  }
+  if (/[$`]/.test(value) || /[*?\[]/.test(value)) return null;
+  return value;
+}
+
+/**
+ * A plain variable word: `$NAME`, `${NAME}` or one with a literal suffix. The
+ * tree scanner already classifies variable words, so a command word of this
+ * shape is not refused here.
+ */
+function isVariableWord(text: string): boolean {
+  return /^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}?)(?:\/\S*)?$/.test(stripOuterQuotes(text));
 }
 
 function isShellScript(rel: string, content: string): boolean {
@@ -1228,10 +1266,18 @@ function consumePrefixOptions(
   refuse: (reason: string) => never,
 ): number {
   const grammar = PREFIX_OPTION_GRAMMAR[command];
+  const requireStatic = (token: ShellToken): void => {
+    if (staticWordValue(token.text) === null) {
+      refuse(`an unapproved run block cannot establish the command word: ${token.text}`);
+    }
+  };
   while (index < tokens.length) {
     const token = tokens[index];
-    const text = stripOuterQuotes(token.text);
-    if (token.quoted || !text.startsWith("-") || text === "-") return index;
+    const text = staticWordValue(token.text);
+    // A word with no static value cannot be an option: it is the command word,
+    // which the caller judges (rule check order is shared with the run block).
+    if (text === null) return index;
+    if (!text.startsWith("-") || text === "-") return index;
     if (text === "--") return index + 1;
     if (text.startsWith("--")) {
       const equals = text.indexOf("=");
@@ -1242,6 +1288,7 @@ function consumePrefixOptions(
           continue;
         }
         if (index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
+        requireStatic(tokens[index + 1]);
         index += 2;
         continue;
       }
@@ -1266,7 +1313,10 @@ function consumePrefixOptions(
       }
     }
     if (!known) refuse(`an unapproved run block has an unrecognised ${command} option`);
-    if (takesNext && index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
+    if (takesNext) {
+      if (index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
+      requireStatic(tokens[index + 1]);
+    }
     index += takesNext ? 2 : 1;
   }
   return index;
@@ -1284,22 +1334,25 @@ function commandWord(
   includeCase = false,
   refuse?: (reason: string) => never,
 ): { index: number; token: ShellToken } | null {
+  const strict = refuse !== undefined;
   let index = 0;
   let sawPrefix = false;
   while (index < tokens.length) {
     const token = tokens[index];
-    const text = stripOuterQuotes(token.text);
     if (isScalarAssignment(token.text)) {
       index++;
       continue;
     }
+    const value = strict ? staticWordValue(token.text) : null;
+    const text = value ?? stripOuterQuotes(token.text);
     if (includeCase && !token.quoted && text === "case") return { index, token };
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
-    if (!token.quoted && PREFIX_COMMANDS.has(text)) {
+    if ((strict || !token.quoted) && PREFIX_COMMANDS.has(text)) {
       // `command -v`/`-V` looks a name up; it runs no command.
       if (text === "command") {
         const next = tokens[index + 1];
-        if (next !== undefined && !next.quoted && /^-[vV]$/.test(next.text)) return null;
+        const nextText = next === undefined ? null : strict ? staticWordValue(next.text) : next.quoted ? null : next.text;
+        if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
       }
       sawPrefix = true;
       index++;
@@ -1308,7 +1361,7 @@ function commandWord(
       }
       continue;
     }
-    if (!token.quoted && UNMODELLED_WRAPPERS.has(text)) {
+    if ((strict || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
       if (refuse !== undefined && hasRefusedSpelling(tokens, index + 1)) {
         refuse(`an unapproved run block has an exec wrapper it does not model: ${text}`);
       }
@@ -1318,7 +1371,7 @@ function commandWord(
       index++;
       continue;
     }
-    if (sawPrefix && !token.quoted && text.startsWith("-") && text !== "-") {
+    if (sawPrefix && (strict || !token.quoted) && text.startsWith("-") && text !== "-") {
       index++;
       continue;
     }
