@@ -1,10 +1,1 @@
-- **The root manifest declares `js-yaml`, `@noble/ed25519` and the workspace
-  agent package that root tests and scripts import.** A root `bun install`
-  now provides them directly instead of relying on the hoisted workspace
-  tree, and `test/root-imports-declared.test.ts` fails when a `.ts`, `.tsx`, `.js`,
-  `.jsx`, `.mjs` or `.cjs` file under `test/` or `scripts/` imports an
-  undeclared package by a literal specifier, or loads one by a literal argument
-  through `require`, a `createRequire(...)` result, `module.require` or
-  `process.mainModule.require`. The header of
-  `scripts/lib/root-imports-declared.mjs` states the exact rule: the loader
-  forms the check reads, and that any other form is not checked.
+- **The root manifest declares dependencies used by root tests and scripts.** `js-yaml`, `@noble/ed25519` and the workspace agent package are direct development dependencies. The root-imports check recognizes the literal loader forms documented in `scripts/lib/root-imports-declared.mjs` and skips `file:` and `data:` specifiers. [#984](https://github.com/tpsdev-ai/cli/pull/984), [#1012](https://github.com/tpsdev-ai/cli/pull/1012).
