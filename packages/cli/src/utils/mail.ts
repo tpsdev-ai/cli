@@ -1158,6 +1158,62 @@ export function sendMessage(to: string, body: string, from?: string, relayDelive
   return { ...message, filePath: newPath };
 }
 
+/** How long a thread receipt is kept, in milliseconds (cli#1098). */
+export const THREAD_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** What `tps mail send --reply-to` records for a committed local reply (cli#1098). */
+export interface ThreadReceipt {
+  /** The delivered record's id. */
+  replyId: string;
+  /** The thread the reply signs. */
+  replyToId: string;
+  to: string;
+  /** The signed reply envelope (JSON) the delivered record carries. */
+  signedReply: string;
+}
+
+/**
+ * cli#1098: where a local threaded reply's receipt lives, in the replying
+ * agent's own obligation store, keyed by a hash of the recipient and the
+ * thread. The openclaw-tps-mail receipt scan reads this path.
+ */
+export function threadReceiptPath(mailRoot: string, agent: string, to: string, threadId: string): string {
+  const key = createHash("sha256").update(JSON.stringify([to, threadId]), "utf8").digest("hex");
+  return join(mailRoot, agent, ".obligations", "thread-receipts", `${key}.json`);
+}
+
+/**
+ * Write the receipt of a committed local threaded reply into `from`'s own
+ * obligation store (threadReceiptPath): a temp file renamed into place, 0600.
+ * Receipts older than THREAD_RECEIPT_TTL_MS are removed first. Returns null
+ * and writes nothing when `<mailRoot>/<from>` does not exist: creating it would
+ * make `from` a local recipient (resolveMailRoute).
+ */
+export function writeThreadReceipt(mailRoot: string, from: string, receipt: ThreadReceipt): string | null {
+  assertValidAgentId(from);
+  try {
+    statSync(join(mailRoot, from));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw err;
+  }
+  const path = threadReceiptPath(mailRoot, from, receipt.to, receipt.replyToId);
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const cutoff = Date.now() - THREAD_RECEIPT_TTL_MS;
+  for (const name of readdirSync(dir)) {
+    try {
+      if (lstatSync(join(dir, name)).mtimeMs < cutoff) unlinkSync(join(dir, name));
+    } catch {
+      /* already removed, or not readable: left in place */
+    }
+  }
+  const tmp = join(dir, `.${randomUUID()}.tmp`);
+  writeFileSync(tmp, JSON.stringify(receipt, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
+  renameSync(tmp, path);
+  return path;
+}
+
 // ─── Promotion: the ONE enforcement point (new/ → cur/) ──────────────────────
 //
 // `new/` is never mail; only `cur/` is presentable. Verification is NOT

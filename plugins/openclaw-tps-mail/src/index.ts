@@ -60,7 +60,7 @@ import type { Envelope, ChainEntry } from "@tpsdev-ai/agent";
 import { signEnvelope, verifyEnvelope, verifiedMailTier, mailLockPath, isMailboxMessageFile } from "@tpsdev-ai/agent";
 import { readAgentPrivateKey } from "@tpsdev-ai/cli/utils/agent-keys";
 import { signForDelivery } from "@tpsdev-ai/cli/utils/mail-producer";
-import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch } from "@tpsdev-ai/cli/utils/mail";
+import { curPlacementRefusal, isValidEnvelopeId, mailRootForRecordPath, updateExistingRecord, promote, recoverPromoted, verifyRecordForMailbox, sweepStrandedPromoteScratch, threadReceiptPath } from "@tpsdev-ai/cli/utils/mail";
 import { createMailVerifyClient } from "@tpsdev-ai/cli/utils/mail-verify";
 import { isBranchHost, resolveMailRoute, type MailRoute } from "@tpsdev-ai/cli/utils/mail-routing";
 import {
@@ -2618,7 +2618,13 @@ function scanObligationReceipt(
     // envelope must be addressed to it (cli#429).
     ctx.sender,
     receiptSignatureCheck(ctx),
-    { expectedReplyId, threadMode: thread.mode, unmarkedThreaded },
+    {
+      expectedReplyId,
+      threadMode: thread.mode,
+      unmarkedThreaded,
+      // cli#1098: the receipt `tps mail send --reply-to` leaves in this agent's own store.
+      ...(unmarkedThreaded ? { threadReceipt: threadReceiptPath(ctx.mailDir, ctx.agent, ctx.sender, thread.threadId) } : {}),
+    },
   );
 }
 
