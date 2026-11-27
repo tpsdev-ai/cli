@@ -1,7 +1,8 @@
 /**
- * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails with an error
- * other than ENOENT is that entry's problem. The watcher names it once per
- * continuous failure and still presents the readable records beside it.
+ * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails in the scan's
+ * listing with an error other than ENOENT is that entry's problem. The watcher
+ * names it once per continuous failure and still presents the readable records
+ * beside it.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
@@ -166,6 +167,60 @@ describe("watchMail: an unstat-able new/ entry", () => {
       }
     }, 10_000);
   }
+
+  it("names an entry again when a listing stat failure stops and recurs, and does not name a dangling symlink", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+        onPoll: () => { polls++; },
+      });
+      await sleep(60);
+
+      const fresh = getInbox(AGENT).fresh;
+      const env = buildSignedEnvelope(SENDER, AGENT, "readable beside the failing entries", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      writeFileSync(join(fresh, "blocked.json"), JSON.stringify(env));
+      await waitFor(() => received.length > 0, 5000);
+
+      // A dangling symlink is listed; its stat returns ENOENT, so it is dropped
+      // without a warning and the readable record beside it is still presented.
+      symlinkSync("missing-target.json", join(fresh, "dangling.json"));
+      const beside = buildSignedEnvelope(SENDER, AGENT, "readable beside the dangling entry", SEEDS);
+      sendMessage(AGENT, JSON.stringify(beside), SENDER);
+      await waitFor(() => received.includes(beside.messageId), 5000, () => `log: ${lines.join(" | ")}`);
+
+      const named = () => lines.filter((l) => l.includes("blocked.json ") && l.includes("(ELOOP)"));
+      const real = makeUnstatable(fresh, "blocked.json");
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+
+      // Statable for observed scans: this clears the one-warning state.
+      restoreStatable(fresh, "blocked.json", real);
+      const restoredAt = polls;
+      await waitFor(() => polls - restoredAt >= 3, 5000);
+
+      // The same name fails again: a second warning.
+      makeUnstatable(fresh, "blocked.json");
+      await waitFor(() => named().length === 2, 5000, () => `log: ${lines.join(" | ")}`);
+
+      expect(received).toContain(env.messageId);
+      expect(received).toContain(beside.messageId);
+      expect(lines.filter((l) => l.includes("dangling.json"))).toHaveLength(0);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
+    }
+  }, 15_000);
 
   it("keeps a presented filename's dedup state while it is unstatable and after it is restored", async () => {
     const received: string[] = [];
