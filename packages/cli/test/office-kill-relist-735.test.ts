@@ -300,7 +300,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(${JSON.stringify(readyFile)}, "");
-          ${standInTail(process.pid)}
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );
@@ -376,7 +376,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(ready(index), "");
-          ${standInTail(process.pid)}
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );
@@ -467,7 +467,6 @@ describe("office kill re-lists host records", () => {
               process.exit(0);
             });
             writeFileSync(ready("predecessor"), "");
-            ${standInTail(process.pid)}
           } else if (role === "launcher") {
             waitForAbsent(record, 30000);
             // Write the successor record while the kill command is held at its
@@ -485,8 +484,8 @@ describe("office kill re-lists host records", () => {
               process.exit(0);
             });
             writeFileSync(ready("successor"), "");
-            ${standInTail(process.pid)}
           }
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );
@@ -550,7 +549,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(${JSON.stringify(readyFile)}, "");
-          ${standInTail(process.pid)}
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );
@@ -625,7 +624,7 @@ describe("office kill re-lists host records", () => {
             process.exit(0);
           });
           writeFileSync(join(dir, "ready-" + index), "");
-          ${standInTail(process.pid)}
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );

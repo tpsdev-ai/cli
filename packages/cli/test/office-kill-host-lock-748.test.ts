@@ -235,7 +235,7 @@ describe("host state record lock", () => {
           writeHostState(state);
           writeFileSync(written, "");
           process.on("SIGTERM", () => {});
-          ${standInTail(process.pid)}
+          ${standInTail(process.pid, undefined, undefined, "esm")}
         `,
         "utf8",
       );
