@@ -2298,8 +2298,8 @@ describe("the run-block guard refuses split-word continuations and command-word 
   const read = (run: string) => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW);
   const tree = (run: string) => assertNpmCiWorkflowTree(workflowStep(run), READ_TRACKED, REPO, WORKFLOW);
 
-  /** Run bash with a stub npm that records its argv; returns argv or null when npm did not run. */
-  function bashWithStubNpm(script: string): string | null {
+  /** Run bash with a stub npm that records its argv and return that argv; throws when npm did not run. */
+  function bashWithStubNpm(script: string): string {
     const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
     try {
       const argvFile = join(stubDir, "argv");
@@ -2339,12 +2339,22 @@ describe("the run-block guard refuses split-word continuations and command-word 
     }
   }, 15_000);
 
-  it("refuses a command word that begins with brace expansion", () => {
+  it("conservatively refuses a command word that begins with an unquoted brace", () => {
     const run = "{n,}pm ci";
-    const reason = "an unapproved run block has a word beginning with an unquoted brace expansion: {n,}pm ci (physical line 1)";
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
     expect(() => read(run)).toThrow(reason);
     expect(() => tree(run)).toThrow(reason);
     // Bash expands the leading brace into the command word and its first argument.
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it.each([
+    "env -u FOO {n,}pm ci",
+    "exec -a x {n,}pm ci",
+  ])("refuses a brace-leading command word after a modelled prefix's option value: %s", (run) => {
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
     expect(bashWithStubNpm(run)).toBe("pm ci");
   }, 15_000);
 

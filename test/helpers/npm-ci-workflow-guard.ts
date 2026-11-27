@@ -427,7 +427,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
     for (const entry of logicalShellLines(run, refuse, true)) {
       if (entry.body) continue;
       if (hasBraceExpansionCommandWord(entry.text)) {
-        refuse(entry, "an unapproved run block has a word beginning with an unquoted brace expansion");
+        refuse(entry, "an unapproved run block conservatively refuses a command word beginning with an unquoted {");
       }
       for (const clause of splitClauses(entry.text, true)) {
         for (const token of clause.tokens) {
@@ -1306,10 +1306,12 @@ function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, re
 }
 
 /**
- * An unquoted `{` that begins a command-position word and is not a standalone
- * `{` token is a brace expansion the guard cannot read statically. A
- * `{`-delimited descriptor followed by a redirection (`{fd}>out`) is not a
- * command word and is left to the leading-redirection check.
+ * A command word that begins with an unquoted `{` and is not a standalone `{`
+ * token is refused conservatively: the guard does not read brace expansion
+ * statically, and bash can run a different word than the text spells. Bash may
+ * also leave the word literal (`{foo}bar`). A `{`-delimited descriptor followed
+ * by a redirection (`{fd}>out`) is not a command word and is left to the
+ * leading-redirection check.
  */
 function hasBraceExpansionCommandWord(text: string): boolean {
   const PREFIX_COMMANDS = new Set([
@@ -1356,7 +1358,8 @@ function hasBraceExpansionCommandWord(text: string): boolean {
     tokens.push({ text: text.slice(start, index), end: index });
   }
   let command = true;
-  for (const token of tokens) {
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
     if (/^[;|&(){}]$/.test(token.text)) {
       command = true;
       continue;
@@ -1364,12 +1367,61 @@ function hasBraceExpansionCommandWord(text: string): boolean {
     if (/^[<>]$/.test(token.text)) continue;
     if (command && token.text.startsWith("{") && token.text.length > 1 &&
         !/[<>]/.test(text[token.end] ?? "")) return true;
-    if (command) {
-      command = /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(token.text) ||
-        PREFIX_COMMANDS.has(token.text) || KEYWORDS.has(token.text);
+    if (!command) continue;
+    if (/^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(token.text) || KEYWORDS.has(token.text)) continue;
+    if (PREFIX_COMMANDS.has(token.text)) {
+      const grammar = PREFIX_OPTION_GRAMMAR[token.text];
+      // Consume the prefix's option words with the prefix parser's own grammar,
+      // so an option value is never read as the command word.
+      if (grammar !== undefined) index = skipPrefixOptionWords(grammar, tokens, index + 1) - 1;
+      continue;
     }
+    command = false;
   }
   return false;
+}
+
+/** The index after a modelled prefix's options: the next word is the command word. */
+function skipPrefixOptionWords(
+  grammar: PrefixOptionGrammar,
+  tokens: { text: string }[],
+  index: number,
+): number {
+  while (index < tokens.length) {
+    const text = tokens[index].text;
+    if (!text.startsWith("-") || text === "-") return index;
+    if (text === "--") return index + 1;
+    if (text.startsWith("--")) {
+      const equals = text.indexOf("=");
+      const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
+      if (grammar.longValue.has(name)) {
+        index += equals === -1 ? 2 : 1;
+        continue;
+      }
+      if (grammar.longFlag.has(name)) {
+        index++;
+        continue;
+      }
+      return index;
+    }
+    const letters = text.slice(1);
+    let takesNext = false;
+    let known = true;
+    for (let letter = 0; letter < letters.length; letter++) {
+      const flag = letters[letter];
+      if (grammar.shortValue.has(flag)) {
+        takesNext = letter === letters.length - 1;
+        break;
+      }
+      if (!grammar.shortFlag.has(flag)) {
+        known = false;
+        break;
+      }
+    }
+    if (!known) return index;
+    index += takesNext ? 2 : 1;
+  }
+  return index;
 }
 
 function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
@@ -2203,7 +2255,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       continue;
     }
     if (state.source === "run-block" && !reviewed && hasBraceExpansionCommandWord(entry.text)) {
-      throw new Error(`${lineAt(state, number)}: an unapproved run block has a word beginning with an unquoted brace expansion: ${entry.text}`);
+      throw new Error(`${lineAt(state, number)}: an unapproved run block conservatively refuses a command word beginning with an unquoted {: ${entry.text}`);
     }
     if (state.classifyInstalls) {
       if (/^(?:cp|mv|ln|install|rsync|tee)\s/.test(entry.text) && /(?:package-lock\.json|npm-shrinkwrap\.json)/.test(entry.text)) state.staged = true;

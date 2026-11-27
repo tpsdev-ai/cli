@@ -48,7 +48,8 @@ position is refused, naming it, except a plain variable command word with no
 prefix before it. In unapproved run blocks, a backslash-newline continuation
 inside a word is refused, naming the physical line; so is a command-position
 word whose first
-character is an unquoted `{` unless the `{` stands alone. After `env`, `sudo`, `exec` or `xargs`, every word up to and
+character is an unquoted `{` unless the `{` stands alone, including after a
+modelled prefix's option value. After `env`, `sudo`, `exec` or `xargs`, every word up to and
 including the command word must have a static value; a word without one is refused.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. The guard consumes the `env`, `sudo`, `exec` and `xargs` options
