@@ -139,9 +139,11 @@ type NewListing = NewFile[] & { unstatable: Map<string, string> };
 function listNewFiles(dir: string): NewListing | null {
   try {
     const files = [] as unknown as NewListing;
-    // A per-entry stat failure (a stray symlink, ELOOP, ENOTDIR, ...) is that
-    // ENTRY's problem, not the listing's: skip it, name it once, and keep its
-    // dedup state (processNew treats its name as present).
+    // A per-entry stat failure other than ENOENT (a symlink loop, a symlink
+    // through a regular file) is that ENTRY's problem, not the listing's: skip
+    // it and keep its dedup state (processNew treats its name as present). An
+    // entry that vanished (ENOENT) keeps today's behaviour and is dropped
+    // silently.
     files.unstatable = new Map();
     for (const file of readdirSync(dir).filter(isMailboxMessageFile)) {
       try {
@@ -289,7 +291,8 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // A resident identity's verdict prevents repeated verification and logging.
   // Clear absent identities before verification yields.
   const classified = new Map<string, string>();
-  // new/ entries already reported as unstat-able (logged once each).
+  // new/ entries already reported as unstat-able. The warning is logged once
+  // per continuous failure: it is logged again if the failure stops and recurs.
   const warnedUnstatable = new Set<string>();
 
   // Verified records waiting for a free slot. The concurrency cap must hold

@@ -1,11 +1,11 @@
 /**
- * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails (ELOOP, ENOTDIR)
- * is that entry's problem. The watcher logs it once by name and still presents
- * the readable records beside it.
+ * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails with an error
+ * other than ENOENT is that entry's problem. The watcher names it once per
+ * continuous failure and still presents the readable records beside it.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { linkSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { watchMail, type MailWatcher } from "../src/commands/mail-watch.js";
@@ -62,6 +62,32 @@ const CASES = [
     },
   },
 ];
+
+/** The one `*.json` name in new/: the record a case delivered. */
+function onlyNewFileName(): string {
+  const names = readdirSync(getInbox(AGENT).fresh).filter((f) => f.endsWith(".json"));
+  expect(names).toHaveLength(1);
+  return names[0]!;
+}
+
+/**
+ * Make new/<name> unstatable without removing its inode: hard-link the record
+ * aside, then atomically replace the name with a symlink that resolves to
+ * itself (ELOOP). The name is never absent, so no scan can see a deletion.
+ */
+function makeUnstatable(fresh: string, name: string): string {
+  const real = join(fresh, `${name}.real`);
+  linkSync(join(fresh, name), real);
+  const loop = join(fresh, `${name}.loop`);
+  symlinkSync(name, loop);
+  renameSync(loop, join(fresh, name));
+  return real;
+}
+
+/** Put the original inode back over the self-symlink in one rename. */
+function restoreStatable(fresh: string, name: string, real: string): void {
+  renameSync(real, join(fresh, name));
+}
 
 describe("watchMail: an unstat-able new/ entry", () => {
   let tempRoot = "";
@@ -140,4 +166,81 @@ describe("watchMail: an unstat-able new/ entry", () => {
       }
     }, 10_000);
   }
+
+  it("keeps a presented filename's dedup state while it is unstatable and after it is restored", async () => {
+    const received: string[] = [];
+    let polls = 0;
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "presented before the stat failure", SEEDS);
+      const fresh = getInbox(AGENT).fresh;
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      const name = onlyNewFileName();
+      await waitFor(() => received.length > 0, 5000);
+
+      // The SAME filename is unstatable across several scans, then restored.
+      const real = makeUnstatable(fresh, name);
+      const unstatableAt = polls;
+      await waitFor(() => polls - unstatableAt >= 4, 5000);
+      restoreStatable(fresh, name, real);
+      const restoredAt = polls;
+      await waitFor(() => polls - restoredAt >= 4, 5000);
+
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+    }
+  }, 15_000);
+
+  it("keeps a presented filename's dedup state when it turns unstatable before the trim listing", async () => {
+    const received: string[] = [];
+    let polls = 0;
+    let fresh = "";
+    let name = "";
+    let real = "";
+    let mutated = false;
+    let watcher: MailWatcher | undefined;
+    try {
+      fresh = getInbox(AGENT).fresh;
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        beforeVerify: async () => {
+          if (mutated) return;
+          mutated = true;
+          real = makeUnstatable(fresh, name);
+        },
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "unstatable before the trim listing", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      name = onlyNewFileName();
+
+      // Presented, while the same scan's trim listing could not stat the name.
+      await waitFor(() => received.length > 0, 5000);
+      expect(real).not.toBe("");
+      restoreStatable(fresh, name, real);
+      const restoredAt = polls;
+      await waitFor(() => polls - restoredAt >= 4, 5000);
+
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+    }
+  }, 15_000);
 });
