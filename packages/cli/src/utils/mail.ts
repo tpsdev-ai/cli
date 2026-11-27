@@ -1197,8 +1197,8 @@ export function writeThreadReceipt(mailRoot: string, from: string, receipt: Thre
     if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw err;
   }
-  const path = threadReceiptPath(mailRoot, from, receipt.to, receipt.replyToId);
-  const dir = dirname(path);
+  const receiptFile = threadReceiptPath(mailRoot, from, receipt.to, receipt.replyToId);
+  const dir = dirname(receiptFile);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const cutoff = Date.now() - THREAD_RECEIPT_TTL_MS;
   for (const name of readdirSync(dir)) {
@@ -1210,8 +1210,8 @@ export function writeThreadReceipt(mailRoot: string, from: string, receipt: Thre
   }
   const tmp = join(dir, `.${randomUUID()}.tmp`);
   writeFileSync(tmp, JSON.stringify(receipt, null, 2), { encoding: "utf-8", mode: 0o600, flag: "wx" });
-  renameSync(tmp, path);
-  return path;
+  renameSync(tmp, receiptFile);
+  return receiptFile;
 }
 
 // ─── Promotion: the ONE enforcement point (new/ → cur/) ──────────────────────
