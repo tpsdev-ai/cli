@@ -1983,7 +1983,7 @@ describe("the workflow guard refuses command-position time, coproc, function, in
     "A=1>/dev/null command -v echo", "A=1>/dev/null command -V echo",
     "A=1>/dev/null env", "A=1>/dev/null command",
   ])("refuses an assignment containing < or > before a command word: %s", (run) => {
-    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed): ${run} (physical line 1)`;
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values): ${run} (physical line 1)`;
     expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
     expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
   }, 5_000);
@@ -3589,7 +3589,7 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
         new Set(["package-lock.json"]),
         root,
         "workflow-embedded",
-      )).toThrow(/exec wrapper it does not model: timeout/);
+      )).toThrow(/listed exec wrapper: timeout/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -5286,7 +5286,7 @@ describe("the workflow guard's known limits from review round 21 (cli#975)", () 
   );
 });
 
-describe("the workflow guard refuses prefix options, unmodelled wrappers and runner expressions in command position (#941)", () => {
+describe("the workflow guard refuses unknown options, listed wrappers and runner expressions in command position (#941)", () => {
   const WORKFLOW = "workflow-wrapper";
 
   const shapes = [
@@ -5334,6 +5334,40 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
   }
 
   it.each([
+    "timeout", "nice", "stdbuf", "setsid", "chroot", "hash",
+    "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch", "builtin",
+  ])("refuses the listed wrapper %s outright", (wrapper) => {
+    expectRefused(`${wrapper} true`, new RegExp(`listed exec wrapper: ${wrapper}`));
+  }, 5_000);
+
+  const splitStrings = [
+    'export x=p; env -S \'bash -c "n${x}m ci"\'',
+    "env -S 'npm ci'",
+  ];
+  it.each([
+    ...splitStrings,
+    "env -S'npm ci'",
+    "env --split-string 'npm ci'",
+    "env --split-string='npm ci'",
+  ])("refuses the env split-string option: %s", (run) => {
+    expectRefused(run, /unrecognised env option/);
+  }, 5_000);
+
+  it.each(["-s", "-i", "--shell", "--login"])("refuses the sudo shell option %s", (option) => {
+    expectRefused(`sudo ${option} 'npm ci'`, /unrecognised sudo option/);
+  }, 5_000);
+
+  const splitProbe = spawnSync("env", ["-S", "true"], { encoding: "utf8", timeout: 5_000 });
+  const envLacksSplitString = splitProbe.status !== 0 && /(?:illegal|invalid|unrecognized|unrecognised|unknown) option/.test(splitProbe.stderr ?? "");
+  if (envLacksSplitString) {
+    console.warn(`SKIP real env -S controls: env lacks -S (${splitProbe.error?.message ?? splitProbe.stderr.trim()})`);
+  }
+  it.skipIf(envLacksSplitString).each(splitStrings)("real env -S reparses its command string: %s", (run) => {
+    expect(splitProbe.status).toBe(0);
+    expect(bashArgv(run)).toBe("ci");
+  }, 10_000);
+
+  it.each([
     "${{ matrix.cmd }} ci",
     "${{ env.CMD }} ci",
     "${{ github.event.inputs.cmd }} ci",
@@ -5341,9 +5375,9 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
     expectRefused(run, /runner expression in command position/);
   }, 5_000);
 
-  it("names the unmodelled wrapper it refuses", () => {
+  it("names the listed wrapper it refuses", () => {
     expect(() => assertNpmCiLockfilesRead(workflowStep("timeout 5 n$'p\\155' ci"), READ_TRACKED, WORKFLOW))
-      .toThrow(/exec wrapper it does not model: timeout/);
+      .toThrow(/listed exec wrapper: timeout/);
   }, 5_000);
 
   it.each([
@@ -5380,8 +5414,8 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
     // Statically quoted prefix, wrapper and command spellings real bash runs.
     { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
     { run: '"env" -u FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
-    { run: '"timeout" 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
-    { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
+    { run: '"timeout" 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
+    { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
     { run: '"${{ matrix.cmd }}" ci', reason: /runner expression in command position/, argv: null },
 
     // An unknown short or long option on each modelled prefix.
@@ -5411,8 +5445,8 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
   it.each([
     'timeout 5 "n${{ matrix.rest }}" ci',
     'timeout 5 x "n${{ matrix.rest }}" ci',
-  ])("refuses an unmodelled wrapper without reading its arguments: %s", (run) => {
-    expectRefused(run, /exec wrapper it does not model: timeout/);
+  ])("refuses a listed wrapper without reading its arguments: %s", (run) => {
+    expectRefused(run, /listed exec wrapper: timeout/);
     expect(bashArgv(run)).toBeNull();
   }, 10_000);
 

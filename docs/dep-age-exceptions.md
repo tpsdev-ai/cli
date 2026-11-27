@@ -49,9 +49,10 @@ prefix before it. After `env`, `sudo`, `exec` or `xargs`, every word up to and
 including the command word must have a static value; a word without one is refused.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. The guard consumes the `env`, `sudo`, `exec` and `xargs` options
-that take a separate value and refuses an option it does not know. A leading exec
-wrapper it does not model is refused outright, naming the wrapper, without reading
-its arguments; a `${{ ... }}` runner
+from a finite grammar and refuses unmodelled options, including
+`env -S`/`--split-string` and `sudo -s`/`-i`/`--shell`/`--login`. In unapproved run blocks, the listed wrappers
+(`timeout`, `nice`, `stdbuf`, `setsid`, `chroot`, `ionice`, `chrt`, `taskset`, `flock`,
+`unbuffer`, `script`, `watch`, `builtin` and `hash`) are refused outright; a `${{ ... }}` runner
 expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands. These checks read a
 run block's top-level clauses only: commands inside `$(...)` or backtick

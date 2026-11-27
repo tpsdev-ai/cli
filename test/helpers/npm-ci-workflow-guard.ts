@@ -438,7 +438,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
           !isScalarAssignment(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
         if (commandIndex > 0 && clause.tokens.slice(0, commandIndex).some((token) =>
           isScalarAssignment(token.text) && /[<>]/.test(token.text))) {
-          refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed)");
+          refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values)");
         }
         const word = commandWord(clause.tokens, true, (reason) => refuse(entry, reason));
         if (word === null) continue;
@@ -723,9 +723,9 @@ const DENO_SUBCOMMANDS = new Set(["run", "test", "task", "install", "cache", "ch
 const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"]);
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
 
-// Prefix commands whose options are modelled so the word after them is the
-// command word. An option outside these sets refuses the step: guessing an
-// option's arity is how a separate value becomes the "command word".
+// Finite prefix-option grammars for unapproved run blocks. Unlisted options
+// refuse the step: guessing an option's arity can turn its value into the
+// command word.
 type PrefixOptionGrammar = {
   shortValue: Set<string>;
   shortFlag: Set<string>;
@@ -734,16 +734,16 @@ type PrefixOptionGrammar = {
 };
 const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
   env: {
-    shortValue: new Set(["u", "C", "S"]),
+    shortValue: new Set(["u", "C"]),
     shortFlag: new Set(["i", "0", "v"]),
-    longValue: new Set(["unset", "chdir", "split-string"]),
+    longValue: new Set(["unset", "chdir"]),
     longFlag: new Set(["ignore-environment", "null", "debug", "help", "version"]),
   },
   sudo: {
     shortValue: new Set(["u", "g", "C", "D", "h", "p", "r", "t", "U"]),
-    shortFlag: new Set(["A", "B", "b", "E", "e", "H", "i", "K", "k", "l", "n", "P", "S", "s", "V", "v"]),
+    shortFlag: new Set(["A", "B", "b", "E", "e", "H", "K", "k", "l", "n", "P", "S", "V", "v"]),
     longValue: new Set(["user", "group", "close-from", "chdir", "host", "prompt", "role", "type", "other-user"]),
-    longFlag: new Set(["askpass", "background", "bell", "preserve-env", "edit", "set-home", "login", "remove-timestamp", "reset-timestamp", "list", "non-interactive", "no-update", "preserve-groups", "stdin", "shell", "version", "validate"]),
+    longFlag: new Set(["askpass", "background", "bell", "preserve-env", "edit", "set-home", "remove-timestamp", "reset-timestamp", "list", "non-interactive", "no-update", "preserve-groups", "stdin", "version", "validate"]),
   },
   exec: {
     shortValue: new Set(["a"]),
@@ -759,8 +759,7 @@ const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
   },
 };
 
-// Exec wrappers the guard does not model. A clause that leads with one is
-// refused when any of its arguments carries a refused command-word spelling.
+// Listed exec wrappers are refused outright in unapproved run blocks.
 const UNMODELLED_WRAPPERS = new Set([
   "timeout", "nice", "stdbuf", "setsid", "chroot", "ionice", "chrt",
   "taskset", "flock", "unbuffer", "script", "watch", "builtin", "hash",
@@ -1315,7 +1314,7 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
 
 /**
  * Consume a prefix command's options so the word after them is the command
- * word. An option the grammar does not list refuses the step (fail closed).
+ * word. An option the grammar does not list refuses the step.
  */
 function consumePrefixOptions(
   command: string,
@@ -1332,8 +1331,8 @@ function consumePrefixOptions(
   while (index < tokens.length) {
     const token = tokens[index];
     const text = staticWordValue(token.text);
-    // A word with no static value cannot be an option, so it is treated as the
-    // command word, which the caller judges.
+    // A nonstatic word may expand to an option; the caller refuses it after
+    // a prefix.
     if (text === null) return index;
     if (!text.startsWith("-") || text === "-") return index;
     if (text === "--") return index + 1;
@@ -1385,7 +1384,7 @@ function consumePrefixOptions(
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
  * header is not an invocation unless `case` is requested for refusal. A
  * `refuse` callback turns the strict run-block checks on: prefix options are
- * consumed, and an unmodelled wrapper around a refused spelling is refused.
+ * consumed from the finite grammar, and listed wrappers are refused outright.
  */
 function commandWord(
   tokens: ShellToken[],
@@ -1427,10 +1426,9 @@ function commandWord(
       continue;
     }
     if ((strict || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
-      // An exec wrapper the guard does not model is refused outright: its
-      // arguments are never inspected to decide whether the step is safe.
+      // Listed wrappers are refused without inspecting their arguments.
       if (refuse !== undefined) {
-        refuse(`an unapproved run block has an exec wrapper it does not model: ${text}`);
+        refuse(`an unapproved run block has a listed exec wrapper: ${text}`);
       }
       return { index, token };
     }
