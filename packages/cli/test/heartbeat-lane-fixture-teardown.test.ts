@@ -217,11 +217,11 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
       env: {
-      ...process.env,
-      TEARDOWN_DIR: root,
-      TPS_STAND_IN_OWNER_PID: String(process.pid),
-      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
-    },
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+      },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -249,12 +249,12 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
       env: {
-      ...process.env,
-      TEARDOWN_DIR: root,
-      TEARDOWN_EXIT: "normal",
-      TPS_STAND_IN_OWNER_PID: String(process.pid),
-      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
-    },
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TEARDOWN_EXIT: "normal",
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+      },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -271,6 +271,33 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
       expect(code).toBe(0);
       expect(signalsSentToGroup(readText(join(root, "kill.log")) ?? "", gatewayPid)).toEqual([]);
       expect(readListeners(root)).toEqual({ SIGTERM: 0, SIGINT: 0, exit: 1 });
+    } finally {
+      await stopFixture(fixture);
+      if (gatewayPid !== null) killRecordedGroup(gatewayPid);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
+  test("a live owner pid with a saved token that does not match makes the fixture exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
+    // The pid is this live test process; only the saved start token is stale,
+    // as after a pid reuse. The fixture must act on the saved identity, not
+    // re-read the pid's current token.
+    const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
+      env: {
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: "linux:0",
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let gatewayPid: number | null = null;
+    try {
+      gatewayPid = Number(await waitFor(() => readText(join(root, "gateway.pid")), "the gateway pid"));
+      await waitFor(() => readText(join(root, "gateway-exited")), "the gateway to exit");
+      await waitFor(() => (fixture.exitCode !== null ? true : null), "the fixture to exit");
+      expect(fixture.exitCode).toBe(0);
+      expect(fixture.signalCode).toBeNull();
     } finally {
       await stopFixture(fixture);
       if (gatewayPid !== null) killRecordedGroup(gatewayPid);

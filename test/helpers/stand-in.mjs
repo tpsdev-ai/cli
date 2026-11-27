@@ -20,8 +20,8 @@ import { spawn } from "node:child_process";
 /** How often a watch probes the owner. */
 export const STAND_IN_POLL_MS = 1000;
 
-/** A builtin module, from `require` where the program has one (CJS, bun) and
- *  from `process.getBuiltinModule` where it does not (ESM). */
+/** A builtin module: `process.getBuiltinModule` when available, otherwise
+ *  `require`. */
 function standInBuiltin(name) {
   if (typeof process.getBuiltinModule === "function") return process.getBuiltinModule(name);
   return require(name);

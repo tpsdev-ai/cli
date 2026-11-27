@@ -7,10 +7,11 @@ import { spawn } from "node:child_process";
 import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { installGatewayTeardown } from "./heartbeat-lane-fixture-teardown.mjs";
-import { stayAliveUntilOwnerGone } from "../helpers/stand-in.mjs";
+import { standInOwnerFromEnv, stayAliveUntilOwnerGone } from "../helpers/stand-in.mjs";
 
 const root = process.env.TEARDOWN_DIR;
 if (!root) throw new Error("TEARDOWN_DIR is not set");
+const owner = standInOwnerFromEnv();
 mkdirSync(root, { recursive: true });
 
 const killLog = join(root, "kill.log");
@@ -47,4 +48,4 @@ process.on("exit", () => {
 });
 
 console.log("TEARDOWN_FIXTURE_READY");
-stayAliveUntilOwnerGone();
+stayAliveUntilOwnerGone(owner.pid, owner.start);

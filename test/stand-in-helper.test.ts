@@ -7,7 +7,7 @@
  * probe cannot verify all count as gone.
  */
 import { expect, test } from "bun:test";
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -128,9 +128,9 @@ test("a stand-in exits when its owner is killed and not reaped", async () => {
     // Captured while the owner is alive, before the stand-in starts.
     const ownerStart = standInOwnerStartToken(zombiePid);
     writeFileSync(join(root, "kill"), "1");
-    await waitFor(() => procStat(zombiePid)?.state === "Z", "the owner to exit unreaped");
+    await waitFor(() => processState(zombiePid)?.startsWith("Z") === true, "the owner to exit unreaped");
     // A bare pid probe still finds it: only the identity check can tell.
-    expect(procStat(zombiePid)?.state).toBe("Z");
+    expect(processState(zombiePid)?.startsWith("Z")).toBe(true);
     standIn = spawnStandIn({ ownerPid: zombiePid, ownerStart });
     expect(await exited(standIn, EXIT_BOUND_MS)).toBe(true);
   } finally {
@@ -141,6 +141,40 @@ test("a stand-in exits when its owner is killed and not reaped", async () => {
 }, 15_000);
 
 const FIXTURE_BOUND_MS = 10_000;
+
+/** A pid's state from /proc on Linux, from `ps -o stat=` elsewhere. Null when
+ *  the pid has no entry. */
+function processState(pid: number): string | null {
+  if (process.platform === "linux") return procStat(pid)?.state ?? null;
+  const ps = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" });
+  if (ps.error) throw ps.error;
+  const out = (ps.stdout ?? "").trim();
+  return out === "" ? null : out.split(/\s+/)[0];
+}
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"] as const) {
+  test(`the owner watch exits 0 on ${signal}`, async () => {
+    const watchPath = fileURLToPath(new URL("./helpers/stand-in-owner-watch.mjs", import.meta.url));
+    const watch = spawn(process.env.NODE_BIN ?? "node", [watchPath], {
+      env: {
+        ...process.env,
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+      },
+      stdio: "ignore",
+    });
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(watch.exitCode).toBeNull();
+      watch.kill(signal);
+      expect(await exited(watch, EXIT_BOUND_MS)).toBe(true);
+      expect(watch.exitCode).toBe(0);
+      expect(watch.signalCode).toBeNull();
+    } finally {
+      await stop(watch);
+    }
+  }, 15_000);
+}
 
 function alive(pid: number): boolean {
   if (process.platform === "linux") {

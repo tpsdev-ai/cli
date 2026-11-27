@@ -2509,8 +2509,9 @@ exit 0
   });
 
   test("a supervisor whose owner is killed exits within the bound", async () => {
-    // Nested: the launcher between the test and the supervisor goes with the
-    // test, and no signal reaches the supervisor. Its owner watch ends it.
+    // The watched owner is a separate sibling process: the test kills it while
+    // the launcher stays alive, and no signal reaches the supervisor. Its owner
+    // watch ends it.
     const f = launchFixture();
     writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
     chmodSync(f.sb.nonoBin, 0o755);
@@ -2536,6 +2537,37 @@ exit 0
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("a released child that exits on its own ends its RELEASE_THEN_WAIT supervisor", async () => {
+    const sb = makeSandbox();
+    const fake = join(sb.root, "release-then-wait-nono");
+    writeFileSync(fake, RELEASE_THEN_WAIT_FAKE_NONO);
+    chmodSync(fake, 0o755);
+    const peer = join(sb.root, "short-peer.cjs");
+    writeFileSync(peer, "setTimeout(() => process.exit(0), 300);\n");
+    const psFile = join(sb.root, "ps.json");
+    // No signal is sent: the child ends and the supervisor's wait returns.
+    const supervisor = spawn(fake, ["run", "--profile", "probe", "--", "true"], {
+      env: {
+        ...process.env,
+        NONO_ARGV_LOG: join(sb.root, "argv.log"),
+        NONO_PID_FILE: join(sb.root, "nono.pid"),
+        FAKE_NONO_PS_JSON: psFile,
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+      },
+      stdio: "ignore",
+    });
+    try {
+      expect(await waitUntil(() => existsSync(psFile), 5_000)).toBe(true);
+      expect(await waitUntil(() => supervisor.exitCode !== null || supervisor.signalCode !== null, 5_000)).toBe(true);
+      expect(supervisor.exitCode).toBe(0);
+      expect(supervisor.signalCode).toBeNull();
+    } finally {
+      try { if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill("SIGKILL"); } catch { /* gone */ }
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3685,4 +3717,34 @@ ${standInTail(process.pid)}
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("a released child that exits on its own ends its RECHECK supervisor", async () => {
+    const sb = makeSandbox();
+    const fake = join(sb.root, "recheck-nono");
+    writeFileSync(fake, RECHECK_FAILURE_FAKE_NONO);
+    chmodSync(fake, 0o755);
+    const peer = join(sb.root, "short-peer.cjs");
+    writeFileSync(peer, "setTimeout(() => process.exit(0), 300);\n");
+    const psFile = join(sb.root, "ps.json");
+    // No signal is sent: the child ends and the supervisor's wait returns.
+    const supervisor = spawn(fake, ["run", "--profile", "probe", "--", "true"], {
+      env: {
+        ...process.env,
+        FAKE_NONO_PS_JSON: psFile,
+        FAKE_NONO_PS_COUNT: join(sb.root, "ps-count"),
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+      },
+      stdio: "ignore",
+    });
+    try {
+      expect(await waitUntil(() => existsSync(psFile), 5_000)).toBe(true);
+      expect(await waitUntil(() => supervisor.exitCode !== null || supervisor.signalCode !== null, 5_000)).toBe(true);
+      expect(supervisor.exitCode).toBe(0);
+      expect(supervisor.signalCode).toBeNull();
+    } finally {
+      try { if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill("SIGKILL"); } catch { /* gone */ }
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
