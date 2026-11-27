@@ -1,1 +1,0 @@
-- **Listener startup rejects bind errors.** This covers the WebSocket transport and join/host listeners, branch service proxies, OpenClaw bridge adapter and mock LLM listener. The mock LLM and branch service proxies report their actual bound ports, including when started on port 0. Converted listener tests share port helpers. [#1026](https://github.com/tpsdev-ai/cli/pull/1026).

@@ -1,1 +1,0 @@
-- **Unverifiable process owners are retained by mail locks, pid-file checks, host-state checks and launch cleanup.** [#1047](https://github.com/tpsdev-ai/cli/pull/1047), [#1057](https://github.com/tpsdev-ai/cli/pull/1057), [#1072](https://github.com/tpsdev-ai/cli/pull/1072).

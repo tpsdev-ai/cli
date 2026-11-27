@@ -20,6 +20,76 @@ node scripts/changelog-fragments.mjs check    # what CI checks
 below this one and deletes them as part of a version cut. **Do not add anything to this section by
 hand**: `check` and `promote` refuse while it holds anything but this note.
 
+## [0.10.0] — 2026-11-27
+
+### Changed
+
+- **The tps-mail plugin tests signed mail through the pinned real OpenClaw gateway.** The test checks one dispatch, the final reply text, one reply after ack and gateway shutdown, an empty inbound `new/`, and an acknowledged `cur/` record and obligation. The settled `cur/` check includes hidden entries and reports their names and sizes. A separate rescan test checks the retry cap when dead-lettering a rejected message fails. [#985](https://github.com/tpsdev-ai/cli/pull/985), [#1021](https://github.com/tpsdev-ai/cli/pull/1021).
+
+### Fixed
+
+- **Recovery attempts to settle or re-arm open reply obligations whose inbound record is absent.** A verified receipt can acknowledge the obligation; otherwise recovery preserves a future deadline or attempts the due outcome. Lookup errors leave the obligation untouched by that attempt. The archiver retains `cur/` records while their obligations remain open. [#1043](https://github.com/tpsdev-ai/cli/pull/1043).
+
+- **A pid that exits while the heartbeat-lane fixture scans `/proc` is gone, not a teardown failure.** The fixture's stat read now treats ESRCH like ENOENT, so an unrelated process exiting during the scan no longer makes a signal handler exit 1 instead of with the signal's status. [#1015](https://github.com/tpsdev-ai/cli/pull/1015).
+
+- **Test keep-alive stand-ins exit on their own once the test process that owns them is gone (Closes #1016).** One shared helper (`test/helpers/stand-in.mjs`) spawns them and provides the owner watch embedded in the generated scripts and lane fixtures. The converted stand-ins poll the owning test runner’s PID and exit when a poll reports ESRCH. [#1085](https://github.com/tpsdev-ai/cli/pull/1085).
+
+- **A pid-claim test whose daemon dies before its pause point fails fast and says why.** Once the daemon's own pid is gone, the pause wait stops instead of waiting out its 20 s timeout, and its error carries the exit code or signal and up to the last 4 KB of the stderr read from the daemon. A port-in-use failure the start reports still wins over that error, so the start still retries on a new port. [#1019](https://github.com/tpsdev-ai/cli/pull/1019).
+
+- **Relay reconnects preserve invalid, unreadable or unverifiable connection records after the first claim attempt.** They can reclaim an absent record, a record verified as their own, or one whose owner is proven gone. [#1032](https://github.com/tpsdev-ai/cli/pull/1032).
+
+- **Listener startup rejects bind errors.** This covers the WebSocket transport and join/host listeners, branch service proxies, OpenClaw bridge adapter and mock LLM listener. The mock LLM and branch service proxies report their actual bound ports, including when started on port 0. Converted listener tests share port helpers. [#1026](https://github.com/tpsdev-ai/cli/pull/1026).
+
+- **Ack cleanup retains scratch outside the locked mailbox at the directory check.** The sweep removes regular ack scratch files at least a minute old and retains non-regular or recent entries. Failed scratch cleanup reports the path and error. A refused sweep or failed listing is retried on the next ack; a successful listing defers the next sweep for ten minutes. [#1024](https://github.com/tpsdev-ai/cli/pull/1024), [#1031](https://github.com/tpsdev-ai/cli/pull/1031), [#1056](https://github.com/tpsdev-ai/cli/pull/1056).
+
+- **Unverifiable process owners are retained by mail locks, pid-file checks, host-state checks and launch cleanup.** [#1047](https://github.com/tpsdev-ai/cli/pull/1047), [#1057](https://github.com/tpsdev-ai/cli/pull/1057), [#1072](https://github.com/tpsdev-ai/cli/pull/1072).
+
+- **Mail record updates require a regular file in the locked mailbox's `new/`, `cur/` or `dlq/` directory at check time.** [#1050](https://github.com/tpsdev-ai/cli/pull/1050), [#1056](https://github.com/tpsdev-ai/cli/pull/1056).
+
+- **Reply-obligation recovery retries lookup failures in process and checks revisions before decision writes.** Startup pre-scan and deadline lookup errors, retryable re-arm failures and retry record-read errors share a bounded retry schedule. Exhaustion warns and leaves a live record unchanged without sending a nack. Unchanged transitions do not write. Posted reply evidence must match the obligation's reply identity when known. Startup retries can prove presence beyond the `cur/` scan limit; a miss still reports `SCAN_LIMIT`. [#1060](https://github.com/tpsdev-ai/cli/pull/1060), [#1068](https://github.com/tpsdev-ai/cli/pull/1068), [#1075](https://github.com/tpsdev-ai/cli/pull/1075).
+
+- **Stamp newly created reply obligations with a deadline; periodically attempt
+  to arm records without a usable deadline or settle due records.** [#1083](https://github.com/tpsdev-ai/cli/pull/1083).
+
+- **Locally routed office replies can settle their obligations with `--reply-to`.** There the prompt suggests `tps mail send <to> --reply-to=<inbound envelope id>`, with a shell-quoted `TPS_MAIL_DIR=<resolved mailDir>`, so the reply lands where the scan reads. A verified local reply can settle without an obligation marker; a posted mail record carrying `X-TPS-Nack` never settles. Branch hosts and remote/bridge routes are not matched by this change. A configured `mailDir` that is not absolute after `~` expansion is refused at plugin config load. [#1089](https://github.com/tpsdev-ai/cli/pull/1089).
+
+- **The unused relay pid helper is removed.** `readRelayPidFile` classifies the relay pid file without removing it; the mail command callers own its cleanup. [#1080](https://github.com/tpsdev-ai/cli/pull/1080).
+
+- **A kept launch names the path it kept and the step that removes it.** When a
+  stop leaves a survivor, the message now prints the absolute launch-state
+  directory, and the worktree when one was kept, plus the removal command (every
+  path shell-quoted) to run once the named pids have exited. [#1076](https://github.com/tpsdev-ai/cli/pull/1076).
+
+- **Relay cleanup retains its connection record path.** Relay cleanup uses the captured path and connection ID, and a connection refreshes a record only while it still owns it. [#1002](https://github.com/tpsdev-ai/cli/pull/1002).
+
+- **The root manifest declares dependencies used by root tests and scripts.** `js-yaml`, `@noble/ed25519` and the workspace agent package are direct development dependencies. The root-imports check recognizes the literal loader forms documented in `scripts/lib/root-imports-declared.mjs` and skips `file:` and `data:` specifiers. [#984](https://github.com/tpsdev-ai/cli/pull/984), [#1012](https://github.com/tpsdev-ai/cli/pull/1012).
+
+- **`tps mail send` reports a missing remote ACK as delivery unconfirmed, not failure.**
+  A remote send waits 30 s for the branch's delivery ACK by default; set the wait
+  with `--ack-timeout <ms>` or `TPS_MAIL_ACK_TIMEOUT_MS`. If no ACK arrives in
+  that window the command prints the message id and exits 75 (EX_TEMPFAIL). A
+  refused delivery keeps its current error and exit status. A re-send with the
+  same `--message-id` reuses the signed envelope stored for that id (same id,
+  timestamp and payload) only when it still verifies with the sender's current
+  key and both the inbound delegation chain and `--reply-to` match; an existing
+  stored entry that fails those checks is refused by name and nothing is sent.
+  A stored entry that is missing is signed again under that id and sent, and one
+  older than 7 days is signed again when it can be cleared, otherwise the
+  re-send is refused. While the first copy is still in the branch's inbox, a
+  re-send with the same id adds no second copy, and if the branch's inbox still
+  holds a different payload under that id, it refuses this one as a same-id
+  conflict. A remote send that generated its id stores that signed envelope
+  too. A connection the branch closes before the ACK reports delivery
+  unconfirmed as well. [#980](https://github.com/tpsdev-ai/cli/pull/980).
+
+- **mail-watch deduplicates ids across tracked, eligible verified files in `new/`.** Verdicts and retry counts use observed device, inode, size and modification time; replacements retry when that identity changes. Presented associations use path, device and inode and survive read and verifier errors. Pending entries retain existing presentation until resolved or absent. Consecutive failed per-file attempts stop retries at classification. State is in memory, per watcher process. [#1082](https://github.com/tpsdev-ai/cli/pull/1082).
+
+- **Breaking: relay and bridge stops refuse invalid or unverifiable records at the initial or pre-signal read.** Both commands retain those records and exit non-zero. A changed record at the final cleanup read is retained without necessarily failing the stop. An unchanged stale record can be removed. After stopping a bridge process, the same stop can also remove an unchanged duplicate record for that process. [#990](https://github.com/tpsdev-ai/cli/pull/990), [#1086](https://github.com/tpsdev-ai/cli/pull/1086).
+
+- **Workflow dependency installs require tracked lockfiles, bounded global versions or reviewed exceptions in the shell forms the guard checks.** The guard follows invoked scripts and local composite actions. Dependency installs inside JavaScript/TypeScript bodies, inline Node payloads and package-script targets are not inspected. [#933](https://github.com/tpsdev-ai/cli/pull/933).
+
+- **The heartbeat real-OpenClaw lane preserves its failure when cleanup also fails and installs its fallback from the committed fixture lockfile.** Without `OPENCLAW_BIN_DIR`, it uses `scripts/npm-ci-tracked-lock.sh`; its `sfw` lookup uses the install helper's bash, working directory and environment. The fallback-install test checks that the returned bin directory contains `openclaw`. [#1003](https://github.com/tpsdev-ai/cli/pull/1003), [#1035](https://github.com/tpsdev-ai/cli/pull/1035).
+
 ## [0.9.0] — 2026-11-11
 
 ### Added

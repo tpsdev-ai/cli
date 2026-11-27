@@ -1,1 +1,0 @@
-- **Relay reconnects preserve invalid, unreadable or unverifiable connection records after the first claim attempt.** They can reclaim an absent record, a record verified as their own, or one whose owner is proven gone. [#1032](https://github.com/tpsdev-ai/cli/pull/1032).
