@@ -1,1 +1,1 @@
-- **Relay cleanup retains its connection record path** Relay cleanup uses the captured path and connection ID, and a connection refreshes a record only while it still owns it.
+- **Relay cleanup retains its connection record path.** Relay cleanup uses the captured path and connection ID, and a connection refreshes a record only while it still owns it. [#1002](https://github.com/tpsdev-ai/cli/pull/1002).
