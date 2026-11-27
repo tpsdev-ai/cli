@@ -175,7 +175,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
       noInbound?: boolean;
       /** With noInbound: a cur/ file left in its raw form (not rewritten to the promoted shape). */
       keepRawCur?: string;
-      accounts?: Record<string, { mailDir: string }>;
+      accounts?: Record<string, { mailDir?: string; enabled?: boolean }>;
       /** Account this start runs for (default: "default"). */
       accountId?: string;
       /** Maildir this account watches (default: the test's tempMailDir). */
@@ -891,20 +891,21 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     await h.stop();
   }, 20000);
 
-  it("cli#1063: the suggested command, run as printed, lands where the scan looks and settles", async () => {
+  it.each([true, false])("cli#1063: the printed command overrides inherited TPS_MAIL_DIR and settles (configured mailDir: %s)", async (configured) => {
     process.env.TPS_OBLIGATION_DEADLINE_MS = "5000";
-    // A configured mailDir with a space and an apostrophe: the prompt's prefix
+    // The configured case uses a space and an apostrophe: the prompt's prefix
     // must survive the shell, and the reply must land in exactly this directory.
-    const specialMailDir = join(tempHome, "mail dir's");
+    const accounts = { default: configured ? { mailDir: join(tempHome, "mail dir's"), enabled: true } : { enabled: true } };
+    const specialMailDir = capturedPlugin.config.resolveAccount({ channels: { "tps-mail": { accounts } } }, "default").mailDir;
+    mkdirSync(resolve(tempMailDir, "flint", "new"), { recursive: true });
     const h = await start("anvil", "flint", {
       localSender: true,
       mailDir: specialMailDir,
-      accounts: { default: { mailDir: specialMailDir, enabled: true } },
+      accounts,
     });
     await pollUntil(() => h.dispatched !== null, 4000);
     const promptText = h.dispatched.ctx.BodyForAgent as string;
     const quotedDir = `'${specialMailDir.replace(/'/g, "'\\''")}'`;
-    expect(promptText).toContain(`TPS_MAIL_DIR=${quotedDir} tps mail send flint --reply-to=${h.inboundEnvelopeId}`);
     const suggestion = /^Reply via: (.+)$/m.exec(promptText)?.[1];
     expect(suggestion).toBeDefined();
     const command = suggestion!.replace('"<your response>"', '"the real CLI reply"');
@@ -920,7 +921,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     writeFileSync(join(shimDir, "tps"), `#!/bin/sh\nexec bun ${quotedCli} "$@"\n`, { mode: 0o755 });
     const run = spawnSync("/bin/sh", ["-c", command], {
       cwd: tempHome,
-      env: { ...process.env, TPS_AGENT_ID: "anvil", PATH: `${shimDir}:${process.env.PATH ?? ""}` },
+      env: { ...process.env, TPS_MAIL_DIR: tempMailDir, TPS_AGENT_ID: "anvil", PATH: `${shimDir}:${process.env.PATH ?? ""}` },
       encoding: "utf-8",
       timeout: 20000,
     });
@@ -929,6 +930,7 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     const flintNew = resolve(specialMailDir, "flint", "new");
     const landed = await pollUntil(() => readdirSafe(flintNew).filter((f) => f.endsWith(".json")).length === 1, 2000);
     expect(landed, "the reply landed in the inbound sender's maildir").toBe(true);
+    if (configured) expect(promptText).toContain(`TPS_MAIL_DIR=${quotedDir} tps mail send flint --reply-to=${h.inboundEnvelopeId}`);
     expect(readdirSafe(resolve(tempMailDir, "flint", "new")).filter((f) => f.endsWith(".json")).length).toBe(0);
 
     // Drive the post-turn scan: it finds the marker-less reply and acks.

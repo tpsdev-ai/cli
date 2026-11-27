@@ -245,12 +245,6 @@ function configuredMailDirValue(cfg: any, accountId: string): string | null {
   return typeof value === "string" ? value : null;
 }
 
-/** The account's config `mailDir`, expanded, when the config SETS one (never the default). */
-function configuredMailDir(cfg: any, accountId: string): string | null {
-  const value = configuredMailDirValue(cfg, accountId);
-  return value === null ? null : expandHome(value);
-}
-
 /** Refuse a configured `mailDir` that is not absolute after `~` expansion. */
 function refuseRelativeMailDir(cfg: any, accountId: string): void {
   const value = configuredMailDirValue(cfg, accountId);
@@ -763,19 +757,19 @@ function resolveOutboundSender(ctx: ChannelOutboundContext): string | null {
   return typeof id === "string" && id.length > 0 ? id : null;
 }
 
-function buildEnvelope(msg: TpsMailBody, reply: { mailDir: string | null } | null = null): string {
+function buildEnvelope(msg: TpsMailBody, reply: { mailDir: string } | null = null): string {
   // cli#1063: `reply` is non-null only where the marker-less form is matched
   // (an office host whose local route delivers to the inbound sender). There
   // the reply must thread on the inbound's SIGNED envelope id, never the local
   // record id shown above — a signed-mode obligation only settles from a reply
   // that signs that id as `replyToId` — and it must write where the scan looks:
-  // a CONFIGURED mailDir is passed to the CLI, shell-quoted. Elsewhere the
+  // the resolved mailDir is passed to the CLI, shell-quoted. Elsewhere the
   // plain instruction stays.
   const threaded = reply !== null && isValidEnvelopeId(msg.envelopeId);
   // The `=` form is required: an envelope id may begin with `-`, and the CLI
   // flag reader takes a following `-`-prefixed token as a missing value.
   const replyTo = threaded && reply !== null ? ` --reply-to=${msg.envelopeId}` : "";
-  const dirPrefix = threaded && reply !== null && reply.mailDir !== null ? `TPS_MAIL_DIR=${shellQuote(reply.mailDir)} ` : "";
+  const dirPrefix = threaded && reply !== null ? `TPS_MAIL_DIR=${shellQuote(reply.mailDir)} ` : "";
   return [
     "[TPS Mail]",
     `From: ${msg.from}`,
@@ -3466,7 +3460,7 @@ const gateway: ChannelGatewayAdapter<TpsMailAccount> = {
         !isBranchHost() && routeFor(account.mailDir, cfg, account.accountId, msg.from).kind === "local";
       const envelope = buildEnvelope(
         msg,
-        markerlessReply ? { mailDir: configuredMailDir(cfg, account.accountId) } : null,
+        markerlessReply ? { mailDir: account.mailDir } : null,
       );
       const rawMsgCtx: Record<string, any> = {
         BodyForAgent: envelope,
