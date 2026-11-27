@@ -23,7 +23,7 @@ import {
 import { spawn, spawnSync } from "node:child_process";
 import { pidState } from "@tpsdev-ai/agent";
 import { resolveNonoBinary } from "../src/utils/launch-attestation.js";
-import { standInTail } from "../../../test/helpers/stand-in.mjs";
+import { spawnStandIn, standInOwnerStartToken, standInTail } from "../../../test/helpers/stand-in.mjs";
 import {
   NONO_MIN_VERSION,
   REFUSAL_EXIT_CODE,
@@ -2290,7 +2290,9 @@ exit 0
   // a pre-existing worktree is never removed
   // -------------------------------------------------------------------------
 
-  /** A fake nono that never releases and stays alive until a signal arrives. */
+  /** A fake nono that never releases. It has no child to wait on, so it execs
+   *  the owner watch, which keeps it alive and exits 0 on TERM, INT or HUP, or
+   *  once its owner is gone. */
   const HANGING_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -2301,14 +2303,14 @@ exit 0
     '  echo "ARGV $*" >> "${NONO_ARGV_LOG:?}"',
     '  echo $$ > "${NONO_PID_FILE:?}"',
     '  trap "exit 0" TERM INT HUP',
-    "  while :; do sleep 0.1; done",
+    '  exec "${STAND_IN_WATCH_NODE:?}" "${STAND_IN_WATCH:?}"',
     "fi",
     "exit 0",
     "",
   ].join("\n");
 
-  /** A fake nono that releases the scripted peer, then keeps the session alive
-   *  until a signal arrives. */
+  /** A fake nono that releases the scripted peer, serves the session report and
+   *  exits when that child ends or on TERM, INT or HUP. */
   const RELEASE_THEN_WAIT_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -2331,7 +2333,7 @@ exit 0
     '  for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
     '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
     '  trap \'kill -TERM "$child" 2>/dev/null || true; wait "$child" 2>/dev/null || true; exit 0\' TERM INT HUP',
-    "  while :; do sleep 0.1; done",
+    '  wait "$child"',
     "fi",
     "exit 0",
     "",
@@ -2371,6 +2373,17 @@ exit 0
     return new Promise((resolveExit) => child.once("exit", (code, signal) => resolveExit({ code, signal })));
   }
 
+  /** Env for a fake supervisor with no child of its own: the owner watch it
+   *  runs in place of a loop, tied to `ownerPid` (this test by default). */
+  function ownerWatchEnv(ownerPid = process.pid): Record<string, string> {
+    return {
+      TPS_STAND_IN_OWNER_PID: String(ownerPid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(ownerPid),
+      STAND_IN_WATCH_NODE: NODE,
+      STAND_IN_WATCH: resolve(import.meta.dir, "../../../test/helpers/stand-in-owner-watch.mjs"),
+    };
+  }
+
   function spawnLauncher(f: LaunchFixture, extra: Record<string, string | undefined>) {
     return spawn(NODE, [TPS_BIN, "agent", "start", "--id", "probe", "--runtime", "codex", SANDBOX_REQUIRED], {
       cwd: f.sb.run,
@@ -2387,7 +2400,7 @@ exit 0
     writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
     chmodSync(f.sb.nonoBin, 0o755);
     const nonoPidFile = join(f.sb.root, "nono.pid");
-    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000" });
+    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000", ...ownerWatchEnv() });
     let text = "";
     launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
     launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
@@ -2472,7 +2485,7 @@ exit 0
     writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
     chmodSync(f.sb.nonoBin, 0o755);
     const nonoPidFile = join(f.sb.root, "nono.pid");
-    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000" });
+    const launcher = spawnLauncher(f, { NONO_PID_FILE: nonoPidFile, TPS_LAUNCH_TIMEOUT_MS: "20000", ...ownerWatchEnv() });
     let text = "";
     launcher.stdout?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
     launcher.stderr?.on("data", (chunk) => { text += chunk.toString("utf-8"); });
@@ -2494,6 +2507,67 @@ exit 0
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   });
+
+  test("a supervisor whose owner is killed exits within the bound", async () => {
+    // The watched owner is a separate sibling process: the test kills it while
+    // the launcher stays alive, and no signal reaches the supervisor. Its owner
+    // watch ends it.
+    const f = launchFixture();
+    writeFileSync(f.sb.nonoBin, HANGING_FAKE_NONO);
+    chmodSync(f.sb.nonoBin, 0o755);
+    const nonoPidFile = join(f.sb.root, "nono.pid");
+    const owner = spawnStandIn();
+    const launcher = spawnLauncher(f, {
+      NONO_PID_FILE: nonoPidFile,
+      TPS_LAUNCH_TIMEOUT_MS: "20000",
+      ...ownerWatchEnv(owner.pid),
+    });
+    let supervisorPid: number | undefined;
+    try {
+      expect(await waitUntil(() => pidFromFile(nonoPidFile) !== undefined, 10_000)).toBe(true);
+      supervisorPid = pidFromFile(nonoPidFile);
+      expect(supervisorPid).toBeDefined();
+      expect(processAlive(supervisorPid!)).toBe(true);
+      owner.kill("SIGKILL");
+      expect(await waitUntil(() => !processAlive(supervisorPid!), 5_000)).toBe(true);
+    } finally {
+      try { if (launcher.pid && processAlive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
+      try { if (supervisorPid && processAlive(supervisorPid)) process.kill(supervisorPid, "SIGKILL"); } catch { /* gone */ }
+      try { owner.kill("SIGKILL"); } catch { /* gone */ }
+      rmSync(f.sb.root, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test("a released child that exits on its own ends its RELEASE_THEN_WAIT supervisor", async () => {
+    const sb = makeSandbox();
+    const fake = join(sb.root, "release-then-wait-nono");
+    writeFileSync(fake, RELEASE_THEN_WAIT_FAKE_NONO);
+    chmodSync(fake, 0o755);
+    const peer = join(sb.root, "short-peer.cjs");
+    writeFileSync(peer, "setTimeout(() => process.exit(0), 300);\n");
+    const psFile = join(sb.root, "ps.json");
+    // No signal is sent: the child ends and the supervisor's wait returns.
+    const supervisor = spawn(fake, ["run", "--profile", "probe", "--", "true"], {
+      env: {
+        ...process.env,
+        NONO_ARGV_LOG: join(sb.root, "argv.log"),
+        NONO_PID_FILE: join(sb.root, "nono.pid"),
+        FAKE_NONO_PS_JSON: psFile,
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+      },
+      stdio: "ignore",
+    });
+    try {
+      expect(await waitUntil(() => existsSync(psFile), 5_000)).toBe(true);
+      expect(await waitUntil(() => supervisor.exitCode !== null || supervisor.signalCode !== null, 5_000)).toBe(true);
+      expect(supervisor.exitCode).toBe(0);
+      expect(supervisor.signalCode).toBeNull();
+    } finally {
+      try { if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill("SIGKILL"); } catch { /* gone */ }
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });
 
 // ---------------------------------------------------------------------------
@@ -2636,7 +2710,8 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
   }
 
   /** Fake nono: answers the probes, publishes the real pids, and leaves its
-   * wrapped command running. Its TERM trap exits after FAKE_NONO_DELAY_MS. */
+   * wrapped command running. Its TERM trap exits after FAKE_NONO_DELAY_MS; it
+   * exits when that command ends. */
   const STOP_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -2652,7 +2727,7 @@ describe("cli#668 round 2 — a signal stops by identity and cleans up only when
     '  prof=""; args=("$@"); for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
     '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
     '  trap \'if [ "${FAKE_NONO_KILL_CHILD:-1}" = 1 ]; then kill "$child" 2>/dev/null; wait "$child" 2>/dev/null; fi; if [ -n "${FAKE_NONO_HOLD_EXIT:-}" ]; then i=0; while [ ! -f "${FAKE_NONO_HOLD_EXIT}" ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; fi; sleep "${FAKE_NONO_DELAY_MS:-0}"; exit 0\' TERM INT HUP',
-    "  while :; do sleep 0.05; done",
+    '  wait "$child"',
     "fi",
     "exit 0",
     "",
@@ -2872,28 +2947,24 @@ process.exit(typeof code === "number" ? code : 1);
     return readFileSync(path, "utf-8").split("\n").filter(Boolean);
   }
 
-  test("a supervisor that exited before escalation is not signalled, and neither is the gone agent", async () => {
+  test("a released child that exits ends its supervisor and the launcher, with nothing signalled", async () => {
     const f = stopFixture();
     const { launcher, text } = spawnStopDriver(f, { PEER_EXIT: "1" });
     try {
       expect(await waitFor(() => /released under nono session/.test(text()), 20_000), text()).toBe(true);
       expect(await waitFor(() => existsSync(f.peerPid), 5_000), text()).toBe(true);
-      // The released child exits on its own; the supervisor must exit before
-      // the launcher's escalation when TERM reaches it.
+      // The released child exits on its own, the supervisor exits with it, and
+      // the launcher, waiting on that supervisor, ends without a signal.
       const peerPid = Number(readFileSync(f.peerPid, "utf-8").trim());
-      expect(await waitFor(() => !alive(peerPid), 5_000)).toBe(true);
-      process.kill(launcher.pid!, "SIGTERM");
+      expect(await waitFor(() => !alive(peerPid), 5_000), text()).toBe(true);
+      const psJson = JSON.parse(readFileSync(join(f.sb.root, "ps.json"), "utf-8"));
+      expect(await waitFor(() => !alive(Number(psJson[0].supervisor_pid)), 5_000), text()).toBe(true);
       const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((r) => {
         if (launcher.exitCode !== null || launcher.signalCode !== null) return r({ code: launcher.exitCode, signal: launcher.signalCode });
         launcher.once("exit", (code, signal) => r({ code, signal }));
       });
-      expect(exit.signal, text()).toBe("SIGTERM");
-      const lines = observed(f.observe);
-      // One TERM to the supervisor, through its handle. No agent signal: its
-      // pid is gone. No SIGKILL: the supervisor had exited before escalation.
-      expect(lines.filter((line) => line.includes(" SIGTERM supervisor"))).toHaveLength(1);
-      expect(lines.filter((line) => line.includes("SIGKILL"))).toEqual([]);
-      expect(lines.some((line) => line.endsWith(" agent"))).toBe(false);
+      expect(exit).toEqual({ code: 0, signal: null });
+      expect(observed(f.observe)).toEqual([]);
     } finally {
       try { if (launcher.pid && alive(launcher.pid)) process.kill(launcher.pid, "SIGKILL"); } catch { /* gone */ }
       rmSync(f.sb.root, { recursive: true, force: true });
@@ -3444,7 +3515,7 @@ describe("cli#668 round 4 — a refusal after release keeps a surviving agent's 
 
   /** Fake nono: the first `ps` call reports the bound session; every later one
    * reports none, so the post-release recheck refuses. Its TERM trap exits
-   * without stopping the child. */
+   * without stopping the child; it exits when that child ends. */
   const RECHECK_FAILURE_FAKE_NONO = [
     "#!/usr/bin/env bash",
     "set -u",
@@ -3470,14 +3541,15 @@ describe("cli#668 round 4 — a refusal after release keeps a surviving agent's 
     '  for ((i=0; i<${#args[@]}; i++)); do [ "${args[$i]}" = "--profile" ] && prof="${args[$((i+1))]}"; done',
     '  printf \'[{"session_id":"fixture","supervisor_pid":%s,"child_pid":%s,"status":"running","profile":"%s"}]\\n\' "$$" "$child" "$prof" > "${FAKE_NONO_PS_JSON:?}"',
     '  trap "exit 0" TERM INT HUP',
-    "  while :; do sleep 0.05; done",
+    '  wait "$child"',
     "fi",
     "exit 0",
     "",
   ].join("\n");
 
-  /** The released child: it stays alive when its supervisor exits; it exits
-   * only on a socket error. */
+  /** The released child: it stays alive when its supervisor exits. It exits on
+   *  a socket error, or once its owner (the test process) is gone; the owner
+   *  watch is the stand-in tail at the end of the program. */
   const SURVIVOR_PEER = `const { connect } = require("node:net");
 const { readFileSync, writeFileSync } = require("node:fs");
 const { dirname, join } = require("node:path");
@@ -3645,4 +3717,34 @@ ${standInTail(process.pid)}
       rmSync(f.sb.root, { recursive: true, force: true });
     }
   }, 30_000);
+
+  test("a released child that exits on its own ends its RECHECK supervisor", async () => {
+    const sb = makeSandbox();
+    const fake = join(sb.root, "recheck-nono");
+    writeFileSync(fake, RECHECK_FAILURE_FAKE_NONO);
+    chmodSync(fake, 0o755);
+    const peer = join(sb.root, "short-peer.cjs");
+    writeFileSync(peer, "setTimeout(() => process.exit(0), 300);\n");
+    const psFile = join(sb.root, "ps.json");
+    // No signal is sent: the child ends and the supervisor's wait returns.
+    const supervisor = spawn(fake, ["run", "--profile", "probe", "--", "true"], {
+      env: {
+        ...process.env,
+        FAKE_NONO_PS_JSON: psFile,
+        FAKE_NONO_PS_COUNT: join(sb.root, "ps-count"),
+        RELEASE_PEER_NODE: NODE,
+        RELEASE_PEER: peer,
+      },
+      stdio: "ignore",
+    });
+    try {
+      expect(await waitUntil(() => existsSync(psFile), 5_000)).toBe(true);
+      expect(await waitUntil(() => supervisor.exitCode !== null || supervisor.signalCode !== null, 5_000)).toBe(true);
+      expect(supervisor.exitCode).toBe(0);
+      expect(supervisor.signalCode).toBeNull();
+    } finally {
+      try { if (supervisor.exitCode === null && supervisor.signalCode === null) supervisor.kill("SIGKILL"); } catch { /* gone */ }
+      rmSync(sb.root, { recursive: true, force: true });
+    }
+  }, 15_000);
 });

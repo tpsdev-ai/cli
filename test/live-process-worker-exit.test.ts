@@ -35,7 +35,7 @@ import { spawnWatchedWorker } from ${JSON.stringify(HELPER_URL)};
 const root = process.argv[2];
 const child = spawnWatchedWorker(${JSON.stringify(worker)}, [root]);
 writeFileSync(join(root, "worker.pid"), String(child.pid));
-${standInTail(process.pid)}
+${standInTail(process.pid, undefined, undefined, "esm")}
 `,
   );
   return path;

@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { procStat as fixtureProcStat } from "../../../test/fixtures/heartbeat-lane-fixture-teardown.mjs";
+import { standInOwnerStartToken } from "../../../test/helpers/stand-in.mjs";
 
 const FIXTURE = fileURLToPath(new URL("../../../test/fixtures/heartbeat-lane-terminated.mjs", import.meta.url));
 const OWN_EXIT_FIXTURE = fileURLToPath(
@@ -150,7 +151,12 @@ function signalsSentToGroup(log: string, pgid: number): string[] {
 async function terminatedFixture(signal: NodeJS.Signals, expectedStatus: number) {
   const root = mkdtempSync(join(tmpdir(), "heartbeat-terminated-"));
   const fixture = spawn(process.env.NODE_BIN ?? "node", [FIXTURE], {
-    env: { ...process.env, TEARDOWN_DIR: root, TPS_STAND_IN_OWNER_PID: String(process.pid) },
+    env: {
+      ...process.env,
+      TEARDOWN_DIR: root,
+      TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+    },
     stdio: ["ignore", "pipe", "inherit"],
   });
   let gatewayPid: number | null = null;
@@ -210,7 +216,12 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
   test("the own-exit fixture records no group signals and removes teardown handlers", async () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
-      env: { ...process.env, TEARDOWN_DIR: root, TPS_STAND_IN_OWNER_PID: String(process.pid) },
+      env: {
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+      },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -237,7 +248,13 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
   test("a normal exit after the group is gone leaves the status unchanged", async () => {
     const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
     const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
-      env: { ...process.env, TEARDOWN_DIR: root, TEARDOWN_EXIT: "normal", TPS_STAND_IN_OWNER_PID: String(process.pid) },
+      env: {
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TEARDOWN_EXIT: "normal",
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+      },
       stdio: ["ignore", "pipe", "inherit"],
     });
     let gatewayPid: number | null = null;
@@ -260,6 +277,33 @@ describe("a heartbeat-lane fixture checks the group before signalling", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 30_000);
+  test("a live owner pid with a saved token that does not match makes the fixture exit", async () => {
+    const root = mkdtempSync(join(tmpdir(), "heartbeat-own-exit-"));
+    // The pid is this live test process; only the saved start token is stale,
+    // as after a pid reuse. The fixture must act on the saved identity, not
+    // re-read the pid's current token.
+    const fixture = spawn(process.env.NODE_BIN ?? "node", [OWN_EXIT_FIXTURE], {
+      env: {
+        ...process.env,
+        TEARDOWN_DIR: root,
+        TPS_STAND_IN_OWNER_PID: String(process.pid),
+        TPS_STAND_IN_OWNER_START: "linux:0",
+      },
+      stdio: ["ignore", "pipe", "inherit"],
+    });
+    let gatewayPid: number | null = null;
+    try {
+      gatewayPid = Number(await waitFor(() => readText(join(root, "gateway.pid")), "the gateway pid"));
+      await waitFor(() => readText(join(root, "gateway-exited")), "the gateway to exit");
+      await waitFor(() => (fixture.exitCode !== null ? true : null), "the fixture to exit");
+      expect(fixture.exitCode).toBe(0);
+      expect(fixture.signalCode).toBeNull();
+    } finally {
+      await stopFixture(fixture);
+      if (gatewayPid !== null) killRecordedGroup(gatewayPid);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 30_000);
 });
 
 function readListeners(root: string): unknown {
@@ -274,6 +318,7 @@ async function unconfirmedFixture(exit: "signal" | "normal") {
       TEARDOWN_DIR: root,
       TEARDOWN_STUB_SURVIVOR: "1",
       TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
       ...(exit === "normal" ? { TEARDOWN_EXIT: "normal" } : {}),
     },
     stdio: ["pipe", "pipe", "pipe"],

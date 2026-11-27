@@ -1,0 +1,1 @@
+- **Test stand-ins compare saved owner start tokens.** RELEASE_THEN_WAIT, STOP and RECHECK replace their unconditional loops with waits for their children; their existing signal traps remain.

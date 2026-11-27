@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { standInOwnerStartToken } from "../../../test/helpers/stand-in.mjs";
 
 const LANE = fileURLToPath(new URL("../../../scripts/heartbeat-real-openclaw-lane.mjs", import.meta.url));
 const FIXTURE = fileURLToPath(new URL("../../../test/fixtures/heartbeat-lane-post-heartbeat-rpc.mjs", import.meta.url));
@@ -9,7 +10,11 @@ function runCase(status: number, heartbeatStatus = 0) {
   const result = spawnSync(process.env.NODE_BIN ?? "node", [FIXTURE, LANE, String(status), String(heartbeatStatus)], {
     encoding: "utf-8",
     timeout: 15_000,
-    env: { ...process.env, TPS_STAND_IN_OWNER_PID: String(process.pid) },
+    env: {
+      ...process.env,
+      TPS_STAND_IN_OWNER_PID: String(process.pid),
+      TPS_STAND_IN_OWNER_START: standInOwnerStartToken(process.pid),
+    },
   });
   expect(result.error).toBeUndefined();
   expect(result.status).toBe(0);

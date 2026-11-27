@@ -271,7 +271,7 @@ async function startGracefulStub(
   timeoutMs = 5_000,
   onSpawn?: (stub: ReturnType<typeof spawn>) => void,
 ): Promise<ReturnType<typeof spawn>> {
-  const stub = spawn(node, ["--input-type=module", "-e", `${script}\n${standInTail(process.pid)}`], { stdio: ["ignore", "pipe", "pipe"] });
+  const stub = spawn(node, ["--input-type=module", "-e", `${script}\n${standInTail(process.pid, undefined, undefined, "esm")}`], { stdio: ["ignore", "pipe", "pipe"] });
   try {
     onSpawn?.(stub);
     await new Promise<void>((resolve, reject) => {
@@ -697,7 +697,7 @@ describe("cli#1027 — a killed gateway is reported as not stopped gracefully", 
         [
           "--input-type=module",
           "-e",
-          'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); ' + standInTail(process.pid),
+          'process.on("SIGTERM", () => {}); process.stdout.write("watching 1 agent inbox\\n"); ' + standInTail(process.pid, undefined, undefined, "esm"),
         ],
         { stdio: ["ignore", "pipe", "pipe"] },
       );
@@ -1443,7 +1443,7 @@ describe("cli#1061 — the supervisor budget follows the named waits", () => {
       const descendantScript = `
         import { writeFileSync } from "node:fs";
         writeFileSync(process.argv[1], String(process.pid));
-${standInTail(process.pid)}
+${standInTail(process.pid, undefined, undefined, "esm")}
         process.send("ready");
       `;
       const script = `
@@ -1482,9 +1482,9 @@ ${standInTail(process.pid)}
       const script = `
         import { spawn } from "node:child_process";
         import { writeFileSync } from "node:fs";
-        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(standInTail(process.pid))}], { stdio: ["ignore", "inherit", "inherit"] });
+        const grandchild = spawn(process.execPath, ["--input-type=module", "-e", ${JSON.stringify(standInTail(process.pid, undefined, undefined, "esm"))}], { stdio: ["ignore", "inherit", "inherit"] });
         writeFileSync(process.argv[1], String(grandchild.pid));
-${standInTail(process.pid)}
+${standInTail(process.pid, undefined, undefined, "esm")}
       `;
       const runPromise = supervise(node, ["--input-type=module", "-e", script, pidFile], { timeoutMs: 1_500 });
       // Read the PID beside the run: cleanup needs it even if `supervise` does not return.
