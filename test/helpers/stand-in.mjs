@@ -33,11 +33,22 @@ function standInBuiltin(name) {
 
 /** `standInBuiltin`'s source for the generated program. Written out rather than
  *  taken from `toString`: a bundler may fold the guard for its own runtime and
- *  emit a program the other one cannot run. */
+ *  emit a program the other one cannot run. The fallback takes the program's
+ *  module kind: a CommonJS program has `require`, an ES module does not, so the
+ *  ESM text gets `createRequire` through a hoisted import declaration. */
 const STAND_IN_BUILTIN_SOURCE = [
   "function standInBuiltin(name) {",
   '  if (typeof process.getBuiltinModule === "function") return process.getBuiltinModule(name);',
   "  return require(name);",
+  "}",
+].join("\n");
+
+const STAND_IN_BUILTIN_SOURCE_ESM = [
+  'import { createRequire } from "node:module";',
+  "const standInRequire = createRequire(import.meta.url);",
+  "function standInBuiltin(name) {",
+  '  if (typeof process.getBuiltinModule === "function") return process.getBuiltinModule(name);',
+  "  return standInRequire(name);",
   "}",
 ].join("\n");
 
@@ -84,13 +95,19 @@ export function standInOwnerLost(ownerPid, startToken, probe = standInOwnerStart
  * unverifiable. `ownerStart` defaults to the owner's token now, which is
  * before the stand-in starts if the caller builds the text before spawning.
  * `probe` replaces the owner probe, for tests of an unverifiable one.
+ * `format` is the module kind of the program that runs the tail: `"cjs"` for a
+ * CommonJS program, `"esm"` for `--input-type=module` and `.mjs` programs.
  * The tail installs no signal handler and preserves the caller’s existing signal behavior.
  */
-export function standInTail(ownerPid, ownerStart = standInOwnerStartToken(ownerPid), probe = standInOwnerStartToken) {
+export function standInTail(ownerPid, ownerStart = standInOwnerStartToken(ownerPid), probe = standInOwnerStartToken, format = "cjs") {
   if (!Number.isInteger(ownerPid) || ownerPid <= 0) {
     throw new TypeError("standInTail needs the owner's pid: the test process's pid");
   }
-  return `${STAND_IN_BUILTIN_SOURCE}
+  if (format !== "cjs" && format !== "esm") {
+    throw new TypeError('standInTail format must be "cjs" or "esm"');
+  }
+  const builtinSource = format === "esm" ? STAND_IN_BUILTIN_SOURCE_ESM : STAND_IN_BUILTIN_SOURCE;
+  return `${builtinSource}
 ${standInOwnerStartToken.toString()}
 ${standInOwnerLost.toString()}
 const standInOwnerPid = ${ownerPid};

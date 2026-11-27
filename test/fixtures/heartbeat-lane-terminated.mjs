@@ -23,7 +23,7 @@ const child = spawn(process.execPath, ["-e", ${JSON.stringify(standInTail(owner.
 writeFileSync(process.env.STUB_CHILD_PID_FILE, String(child.pid));
 const server = net.createServer((socket) => socket.end("ready"));
 server.listen(0, "127.0.0.1", () => writeFileSync(process.env.STUB_PORT_FILE, String(server.address().port)));
-${standInTail(owner.pid, owner.start)}`;
+${standInTail(owner.pid, owner.start, undefined, "esm")}`;
 
 const gateway = spawn(process.execPath, ["--input-type=module", "-e", stubSource], {
   stdio: "ignore",

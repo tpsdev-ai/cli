@@ -154,6 +154,32 @@ test("the helper loads its builtins without process.getBuiltinModule", () => {
   expect(run.stdout).toMatch(/^(linux|ps):/);
 });
 
+for (const format of ["esm", "cjs"] as const) {
+  test(`the generated ${format} tail stays up while its owner lives and exits once it is killed`, async () => {
+    const owner = spawn(process.env.NODE_BIN ?? "node", ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+    const ownerPid = owner.pid;
+    let program: ChildProcess | undefined;
+    try {
+      if (ownerPid === undefined) throw new Error("the owner did not start");
+      const source = [
+        // Node 22.0-22.2 have no process.getBuiltinModule.
+        "delete process.getBuiltinModule;",
+        standInTail(ownerPid, standInOwnerStartToken(ownerPid), undefined, format),
+      ].join("\n");
+      const args = format === "esm" ? ["--input-type=module", "-e", source] : ["-e", source];
+      program = spawn(process.env.NODE_BIN ?? "node", args, { stdio: "ignore" });
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      expect(program.exitCode).toBeNull();
+      expect(program.signalCode).toBeNull();
+      owner.kill("SIGKILL");
+      expect(await exited(program, EXIT_BOUND_MS)).toBe(true);
+    } finally {
+      await stop(program);
+      await stop(owner);
+    }
+  }, 15_000);
+}
+
 const FIXTURE_BOUND_MS = 10_000;
 
 /** A pid's state from /proc on Linux, from `ps -o stat=` elsewhere. Null when
@@ -231,7 +257,7 @@ const fixture = spawn(process.execPath, [${JSON.stringify(fixturePath)}], {
   stdio: ["ignore", "inherit", "inherit"],
 });
 writeFileSync(${JSON.stringify(join(root, "fixture.pid"))}, String(fixture.pid));
-${standInTail(process.pid)}
+${standInTail(process.pid, undefined, undefined, "esm")}
 `;
   const owner = spawn(process.env.NODE_BIN ?? "node", ["--input-type=module", "-e", ownerSource], {
     stdio: ["ignore", "pipe", "inherit"],
