@@ -38,17 +38,20 @@ A step whose effective shell — its own `shell:`, else its job's
 step, shell and source line. In an unapproved workflow run block, the guard refuses
 leading redirections and variable assignments containing `<` or `>` before a command word.
 Before any prefix, option, wrapper or command-word matching, the guard computes each
-word's static value: static quotes and backslash escapes removed. A word that still
-contains an expansion or a glob has none. A word with no static value in prefix,
-option-value or command position is refused, naming it, except a plain variable
-command word. Prefix, option and wrapper matching read the static value, so a
-statically quoted spelling matches like an unquoted one; a modelled option's value
-word must have a static value.
+word's static value with bash's quoting rules: inside single quotes every character
+is literal, a backslash included; inside double quotes a backslash escapes only
+`$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
+next character. A word that would expand, or an unquoted glob, has no static value.
+Prefix, option and wrapper matching read the static value, so a statically quoted
+spelling matches like an unquoted one. A word with no static value in command
+position is refused, naming it, except a plain variable command word with no
+prefix before it. After `env`, `sudo`, `exec` or `xargs`, every word up to and
+including the command word must have a static value; a word without one is refused.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
 remain accepted. The guard consumes the `env`, `sudo`, `exec` and `xargs` options
 that take a separate value and refuses an option it does not know. A leading exec
-wrapper it does not model is refused when the wrapper's arguments contain a
-refused command-word spelling, naming the wrapper; a `${{ ... }}` runner
+wrapper it does not model is refused outright, naming the wrapper, without reading
+its arguments; a `${{ ... }}` runner
 expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands. These checks read a
 run block's top-level clauses only: commands inside `$(...)` or backtick

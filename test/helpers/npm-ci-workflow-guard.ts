@@ -128,11 +128,25 @@ const HELPER_CALL = new RegExp(
 type AllowlistEntry = { text: string; reason: string };
 
 /**
- * Approved complete run blocks containing npm. Text is pinned here, independent
- * of workflow input. Variable or substitution indirection such as n${x}pm and
+ * Approved complete run blocks. Text is pinned here, independent of workflow
+ * input. Variable or substitution indirection such as n${x}pm and
  * $(printf n)pm is outside the spelling check.
  */
 export const EXACT_BLOCK_ALLOWLIST: readonly AllowlistEntry[] = [
+  {
+    text: [
+      'export HOME=$(mktemp -d)',
+      'export TPS_VAULT_KEY="ci-release-smoke"',
+      'timeout 15 /tmp/tps-release-smoke branch init --name release-smoke 2>&1 | tee /tmp/tps-branch.log || true',
+      'if grep -qE "Branch identity created|Listening on" /tmp/tps-branch.log; then',
+      '  echo "✅ Noise handshake OK"',
+      'else',
+      '  echo "❌ Noise handshake failed"',
+      '  exit 1',
+      'fi',
+    ].join("\n"),
+    reason: "release smoke test bounds one branch binary with timeout; it runs no npm or npx",
+  },
   {
     text: "bun --no-install scripts/check-npm-pin-release-age.mjs",
     reason: "release npm pin age gate block",
@@ -759,29 +773,84 @@ function stripOuterQuotes(value: string): string {
   return value;
 }
 
-/** The literal word a token spells once quotes are dropped and escapes removed. */
-function literalWord(text: string): string {
-  return text.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
-}
-
 /**
- * A word's static value: its static quotes and backslash escapes removed. Null
- * when what remains still needs an expansion ($, a backquote, `${{`) or names a
- * glob: the shell may run a different word than the text spells, so the guard
- * cannot establish it statically. The guard never evaluates an expansion.
+ * A word's static value, decoded with bash's quoting rules. Null when the word
+ * would expand (parameter, command, arithmetic or brace expansion, an unescaped
+ * backquote, a leading unquoted tilde, or an unquoted glob): the shell may run a
+ * different word than the text spells, so the guard cannot establish it
+ * statically. The guard never evaluates an expansion.
  */
-function staticWordValue(text: string): string | null {
+export function staticWordValue(text: string): string | null {
+  const expansionAt = (index: number, doubleQuoted: boolean): boolean => {
+    const next = text[index + 1];
+    if (next === undefined) return false;
+    if (next === "(" || next === "{" || next === "[") return true;
+    return /[A-Za-z0-9_@*#?$!-]/.test(next) || (!doubleQuoted && (next === "'" || next === '"'));
+  };
+  const braces: boolean[] = [];
   let value = "";
+  let quote: "" | "'" | '"' = "";
   for (let index = 0; index < text.length; index++) {
     const char = text[index];
-    if (char === "\\" && index + 1 < text.length) {
-      value += text[++index];
+    if (quote === "'") {
+      // Inside single quotes every character is literal, a backslash included.
+      if (char === "'") quote = "";
+      else value += char;
       continue;
     }
-    if (char === "'" || char === '"') continue;
+    if (quote === '"') {
+      if (char === '"') {
+        quote = "";
+        continue;
+      }
+      if (char === "\\") {
+        const next = text[index + 1];
+        if (next === "$" || next === "`" || next === '"' || next === "\\") {
+          value += next;
+          index++;
+        } else if (next === "\n") index++;
+        else value += "\\";
+        continue;
+      }
+      if (char === "`" || (char === "$" && expansionAt(index, true))) return null;
+      value += char;
+      continue;
+    }
+    if (char === "'") {
+      quote = "'";
+      continue;
+    }
+    if (char === '"') {
+      quote = '"';
+      continue;
+    }
+    if (char === "\\") {
+      const next = text[index + 1];
+      if (next === "\n") index++;
+      else if (next === undefined) value += "\\";
+      else {
+        value += next;
+        index++;
+      }
+      continue;
+    }
+    if (char === "`" || (char === "$" && expansionAt(index, false))) return null;
+    if (char === "*") return null;
+    if (braces.length > 0 && (char === "," || (char === "." && text[index + 1] === "."))) braces[braces.length - 1] = true;
+    if (char === "{") {
+      braces.push(false);
+      value += char;
+      continue;
+    }
+    if (char === "}") {
+      if (braces.pop() === true) return null;
+      value += char;
+      continue;
+    }
+    if (char === "?" || char === "[") return null;
+    if (char === "~" && value === "") return null;
     value += char;
   }
-  if (/[$`]/.test(value) || /[*?\[]/.test(value)) return null;
   return value;
 }
 
@@ -1244,17 +1313,6 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
   return clauses;
 }
 
-/** A spelling the command-word checks refuse, wherever it appears in a clause. */
-function hasRefusedSpelling(tokens: ShellToken[], from: number): boolean {
-  for (let index = from; index < tokens.length; index++) {
-    const text = tokens[index].text;
-    if (text.includes("$'")) return true;
-    if (text !== "[" && text !== "[[" && /[*?\[]/.test(text)) return true;
-    if (stripOuterQuotes(text).startsWith("${{")) return true;
-  }
-  return false;
-}
-
 /**
  * Consume a prefix command's options so the word after them is the command
  * word. An option the grammar does not list refuses the step (fail closed).
@@ -1337,13 +1395,19 @@ function commandWord(
   const strict = refuse !== undefined;
   let index = 0;
   let sawPrefix = false;
+  let prefix = "";
   while (index < tokens.length) {
     const token = tokens[index];
+    const value = strict ? staticWordValue(token.text) : null;
+    // After a prefix every word up to and including the command word must be
+    // static; the plain-variable command word is accepted only without one.
+    if (strict && sawPrefix && value === null) {
+      refuse(`an unapproved run block has a word without a static value after ${prefix}: ${token.text}`);
+    }
     if (isScalarAssignment(token.text)) {
       index++;
       continue;
     }
-    const value = strict ? staticWordValue(token.text) : null;
     const text = value ?? stripOuterQuotes(token.text);
     if (includeCase && !token.quoted && text === "case") return { index, token };
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
@@ -1355,6 +1419,7 @@ function commandWord(
         if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
       }
       sawPrefix = true;
+      prefix = text;
       index++;
       if (refuse !== undefined && PREFIX_OPTION_GRAMMAR[text] !== undefined) {
         index = consumePrefixOptions(text, tokens, index, refuse);
@@ -1362,7 +1427,9 @@ function commandWord(
       continue;
     }
     if ((strict || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
-      if (refuse !== undefined && hasRefusedSpelling(tokens, index + 1)) {
+      // An exec wrapper the guard does not model is refused outright: its
+      // arguments are never inspected to decide whether the step is safe.
+      if (refuse !== undefined) {
         refuse(`an unapproved run block has an exec wrapper it does not model: ${text}`);
       }
       return { index, token };
@@ -2312,7 +2379,7 @@ function npmTokens(line: string): { command: string; args: string[] } | null {
     // A quoted or backslash-escaped command word is still a literal `npm` when
     // its shell value is exactly `npm`/`npx`; anything else (e.g. `$NPM`) is not
     // a shape this scanner can read, and handleInstall refuses it.
-    const text = literalWord(tokens[index].text);
+    const text = staticWordValue(tokens[index].text);
     if (text !== "npm" && text !== "npx") continue;
     return { command: text, args: tokens.slice(index + 1).map((token) => stripOuterQuotes(token.text)) };
   }

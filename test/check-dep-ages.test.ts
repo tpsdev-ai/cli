@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow, UNRESOLVED_INVOCATION_ALLOWLIST } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow, staticWordValue, UNRESOLVED_INVOCATION_ALLOWLIST } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -3578,7 +3578,7 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
     }
   });
 
-  it("refuses a wrapped interpreter after an unknown cd in a run block", () => {
+  it("refuses a wrapped interpreter in a run block outright", () => {
     const root = makeTreeFixture({
       "scripts/install.sh": "npm ci\n",
       "package-lock.json": "{}\n",
@@ -3589,7 +3589,7 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
         new Set(["package-lock.json"]),
         root,
         "workflow-embedded",
-      )).toThrow(/cannot resolve a script invocation after a non-literal directory change/);
+      )).toThrow(/exec wrapper it does not model: timeout/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -3653,13 +3653,6 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
       files: { "scripts/noop.sh": "echo clean\n" },
       tracked: new Set(),
       installs: null,
-    },
-    {
-      label: "wrapped interpreter",
-      text: "timeout 5 bash scripts/inst.sh",
-      files: { "scripts/inst.sh": "npm ci\n" },
-      tracked: new Set(["package-lock.json"]),
-      installs: 1,
     },
     {
       label: "substitution",
@@ -5354,11 +5347,11 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
   }, 5_000);
 
   it.each([
-    "env n$'p\\155' ci",
-    "sudo n$'p\\155' ci",
-    "n$'p\\155' ci",
-  ])("still refuses the control: %s", (run) => {
-    expectRefused(run, /command word with ANSI-C quoting/);
+    ["env n$'p\\155' ci", /word without a static value after env/],
+    ["sudo n$'p\\155' ci", /word without a static value after sudo/],
+    ["n$'p\\155' ci", /command word with ANSI-C quoting/],
+  ])("still refuses the control: %s", (run, reason) => {
+    expectRefused(run, reason);
   }, 5_000);
 
   /** Run the row under real bash with a stub npm on PATH; return the argv npm received, or null. */
@@ -5385,8 +5378,8 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
 
   const statics: { run: string; reason: RegExp; argv: string | null }[] = [
     // Statically quoted prefix, wrapper and command spellings real bash runs.
-    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /command word with ANSI-C quoting/, argv: "ci" },
-    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /command word with ANSI-C quoting/, argv: "ci" },
+    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
+    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
     { run: '"timeout" 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
     { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /exec wrapper it does not model: timeout/, argv: "ci" },
     { run: '"${{ matrix.cmd }}" ci', reason: /runner expression in command position/, argv: null },
@@ -5414,4 +5407,75 @@ describe("the workflow guard refuses prefix options, unmodelled wrappers and run
       expect(bashArgv(row.run)).toBe(row.argv);
     }, 10_000);
   }
+
+  it.each([
+    'timeout 5 "n${{ matrix.rest }}" ci',
+    'timeout 5 x "n${{ matrix.rest }}" ci',
+  ])("refuses an unmodelled wrapper without reading its arguments: %s", (run) => {
+    expectRefused(run, /exec wrapper it does not model: timeout/);
+    expect(bashArgv(run)).toBeNull();
+  }, 10_000);
+
+  it("refuses a dynamic word after a modelled prefix: env -${OPT} --version", () => {
+    expectRefused("env -${OPT} --version", /word without a static value after env/);
+    expect(bashArgv("env -${OPT} --version")).toBeNull();
+  }, 10_000);
+
+  it("keeps a backslash inside single quotes literal, so 'en\\v' is not env", () => {
+    const run = "'en\\v' -u FOO n$'p\\155' ci";
+    expect(assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    const root = makeTreeFixture({ "package-lock.json": "{}\n" });
+    try {
+      expect(assertNpmCiWorkflowTree(workflowStep(run), new Set(["package-lock.json"]), root, WORKFLOW).installs).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(bashArgv(run)).toBeNull();
+  }, 10_000);
+
+  const hasXargs = spawnSync("bash", ["-c", "command -v xargs >/dev/null 2>&1"], { encoding: "utf8", timeout: 5_000 }).status === 0;
+  const dynamicWords: { run: string; argv: string | null }[] = [
+    { run: 'CMD=npm\nenv "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNVAL=FOO\nenv -u "$DYNVAL" "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNOPT=u\nenv -"$DYNOPT" FOO "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nexec "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNVAL=x\nexec -a "$DYNVAL" "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNOPT=a\nexec -"$DYNOPT" x "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nsudo -u nobody "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nDYNVAL=nobody\nsudo -u "$DYNVAL" "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nDYNOPT=u\nsudo -"$DYNOPT" nobody "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nxargs "$CMD" ci', argv: hasXargs ? "ci" : null },
+    { run: 'CMD=npm\nDYNVAL=1\nxargs -n "$DYNVAL" "$CMD" ci', argv: hasXargs ? "ci" : null },
+    { run: 'CMD=npm\nDYNOPT=n\nxargs -"$DYNOPT" 1 "$CMD" ci', argv: hasXargs ? "ci" : null },
+  ];
+  for (const row of dynamicWords) {
+    it(`refuses a dynamic word in each position after a modelled prefix: ${row.run.split("\n").pop()}`, () => {
+      expectRefused(row.run, /cannot establish the npm ci directory/);
+      expect(bashArgv(row.run)).toBe(row.argv);
+    }, 10_000);
+  }
+
+  const bashWords = [
+    String.raw`'en\v'`,
+    String.raw`"en\v"`,
+    String.raw`en\v`,
+    String.raw`"a\$b"`,
+    String.raw`a\$b`,
+    String.raw`"a\\b"`,
+    String.raw`a\\b`,
+    String.raw`'a\*'`,
+    String.raw`'$HOME'`,
+    String.raw`a\ b`,
+    "'a`b'",
+  ];
+  it.each(bashWords)("decodes %s as bash splits it", (word) => {
+    const result = spawnSync("bash", ["-c", `printf '%s\\n' ${word}`], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(staticWordValue(word)).toBe(result.stdout.replace(/\n$/, ""));
+  }, 5_000);
+
+  it.each([String.raw`$HOME`, '"${HOME}"', "`printf x`", 'n${{ matrix.rest }}', "a*", "~", "n{pm,}", "{1..9}", "$[1+2]"
+  ])("has no static value for an expanding or globbing word: %s", (word) => {
+    expect(staticWordValue(word)).toBeNull();
+  });
 });
