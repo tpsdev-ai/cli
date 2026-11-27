@@ -130,7 +130,8 @@ NOT sent — there is no unsigned fallback: a reply becomes a named failure
 and stays owed (`nackPending`) for the next start.
 
 **A receipt is evidence only when its reply VERIFIES (cli#429).** Every receipt
-form — the posted record, the bridge sandbox record, the metadata receipt — is
+form — the posted record, the bridge sandbox record, the metadata receipt, the
+CLI's thread receipt — is
 accepted only when the reply it carries is a signed envelope whose sender is the
 obligated agent, whose recipient is the inbound's verified sender, whose
 signatures verify against the key Flair holds for that agent (the same
@@ -270,6 +271,14 @@ evidence; its obligation resolves at its deadline.
   as the obligated agent's reply for this thread (above). Where agents share one
   OS user, another agent can read the signing keys, so no in-band check
   separates them — only an OS-level boundary does (tracked separately).
+- **A reply sent with `tps mail send --reply-to` leaves a thread receipt
+  (cli#1098).** On the local route, when `<mailDir>/<agent>` exists, the CLI
+  also writes the signed reply to
+  `<mailDir>/<agent>/.obligations/thread-receipts/<hash>.json` (0600), so the
+  recipient acking its copy does not remove the evidence. The scan reads it by
+  that path wherever it accepts a marker-less threaded reply, under the rule
+  above. The CLI removes thread receipts older than seven days when it writes
+  the next one.
 - **A bridge delivery is readable in the sandbox too.** The bridge's reduced
   sandbox record carries the obligation, inbound and reply ids when an
   obligation supplies them, so that delivery stays locally readable evidence
