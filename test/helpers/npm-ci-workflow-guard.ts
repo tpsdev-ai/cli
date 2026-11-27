@@ -425,7 +425,7 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
           isScalarAssignment(token.text) && /[<>]/.test(token.text))) {
           refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values; fail closed)");
         }
-        const word = commandWord(clause.tokens, true);
+        const word = commandWord(clause.tokens, true, (reason) => refuse(entry, reason));
         if (word === null) continue;
         const text = word.token.text;
         if (/^[0-9]*[<>]/.test(text)) {
@@ -433,6 +433,9 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         }
         if (!word.token.quoted && text === "case") {
           refuse(entry, "an unapproved run block has a case reserved word in command position");
+        }
+        if (text.startsWith("${{")) {
+          refuse(entry, "an unapproved run block has a runner expression in command position");
         }
         if (text.includes("$'")) {
           refuse(entry, "an unapproved run block has a command word with ANSI-C quoting");
@@ -697,6 +700,49 @@ const BUN_SUBCOMMANDS = new Set(["run", "test", "install", "i", "add", "remove",
 const DENO_SUBCOMMANDS = new Set(["run", "test", "task", "install", "cache", "check", "lint", "fmt", "bench", "doc", "info", "eval", "repl", "publish", "compile", "coverage"]);
 const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"]);
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
+
+// Prefix commands whose options are modelled so the word after them is the
+// command word. An option outside these sets refuses the step: guessing an
+// option's arity is how a separate value becomes the "command word".
+type PrefixOptionGrammar = {
+  shortValue: Set<string>;
+  shortFlag: Set<string>;
+  longValue: Set<string>;
+  longFlag: Set<string>;
+};
+const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
+  env: {
+    shortValue: new Set(["u", "C", "S"]),
+    shortFlag: new Set(["i", "0", "v"]),
+    longValue: new Set(["unset", "chdir", "split-string"]),
+    longFlag: new Set(["ignore-environment", "null", "debug", "help", "version"]),
+  },
+  sudo: {
+    shortValue: new Set(["u", "g", "C", "D", "h", "p", "r", "t", "U"]),
+    shortFlag: new Set(["A", "B", "b", "E", "e", "H", "i", "K", "k", "l", "n", "P", "S", "s", "V", "v"]),
+    longValue: new Set(["user", "group", "close-from", "chdir", "host", "prompt", "role", "type", "other-user"]),
+    longFlag: new Set(["askpass", "background", "bell", "preserve-env", "edit", "set-home", "login", "remove-timestamp", "reset-timestamp", "list", "non-interactive", "no-update", "preserve-groups", "stdin", "shell", "version", "validate"]),
+  },
+  exec: {
+    shortValue: new Set(["a"]),
+    shortFlag: new Set(["c", "l"]),
+    longValue: new Set(["argv0"]),
+    longFlag: new Set(["clear", "login", "help", "version"]),
+  },
+  xargs: {
+    shortValue: new Set(["a", "d", "E", "I", "L", "n", "P", "s"]),
+    shortFlag: new Set(["0", "o", "p", "r", "t", "x", "e", "i"]),
+    longValue: new Set(["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars"]),
+    longFlag: new Set(["null", "open-tty", "interactive", "no-run-if-empty", "verbose", "exit", "show-limits", "help", "version"]),
+  },
+};
+
+// Exec wrappers the guard does not model. A clause that leads with one is
+// refused when any of its arguments carries a refused command-word spelling.
+const UNMODELLED_WRAPPERS = new Set([
+  "timeout", "nice", "stdbuf", "setsid", "chroot", "ionice", "chrt",
+  "taskset", "flock", "unbuffer", "script", "watch", "builtin", "hash",
+]);
 
 function stripOuterQuotes(value: string): string {
   if (value.length >= 2 && ((value[0] === '"' && value[value.length - 1] === '"') || (value[0] === "'" && value[value.length - 1] === "'"))) {
@@ -1160,12 +1206,84 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
   return clauses;
 }
 
+/** A spelling the command-word checks refuse, wherever it appears in a clause. */
+function hasRefusedSpelling(tokens: ShellToken[], from: number): boolean {
+  for (let index = from; index < tokens.length; index++) {
+    const text = tokens[index].text;
+    if (text.includes("$'")) return true;
+    if (text !== "[" && text !== "[[" && /[*?\[]/.test(text)) return true;
+    if (stripOuterQuotes(text).startsWith("${{")) return true;
+  }
+  return false;
+}
+
+/**
+ * Consume a prefix command's options so the word after them is the command
+ * word. An option the grammar does not list refuses the step (fail closed).
+ */
+function consumePrefixOptions(
+  command: string,
+  tokens: ShellToken[],
+  index: number,
+  refuse: (reason: string) => never,
+): number {
+  const grammar = PREFIX_OPTION_GRAMMAR[command];
+  while (index < tokens.length) {
+    const token = tokens[index];
+    const text = stripOuterQuotes(token.text);
+    if (token.quoted || !text.startsWith("-") || text === "-") return index;
+    if (text === "--") return index + 1;
+    if (text.startsWith("--")) {
+      const equals = text.indexOf("=");
+      const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
+      if (grammar.longValue.has(name)) {
+        if (equals !== -1) {
+          index++;
+          continue;
+        }
+        if (index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
+        index += 2;
+        continue;
+      }
+      if (grammar.longFlag.has(name)) {
+        index++;
+        continue;
+      }
+      refuse(`an unapproved run block has an unrecognised ${command} option`);
+    }
+    const letters = text.slice(1);
+    let takesNext = false;
+    let known = true;
+    for (let letter = 0; letter < letters.length; letter++) {
+      const flag = letters[letter];
+      if (grammar.shortValue.has(flag)) {
+        takesNext = letter === letters.length - 1;
+        break;
+      }
+      if (!grammar.shortFlag.has(flag)) {
+        known = false;
+        break;
+      }
+    }
+    if (!known) refuse(`an unapproved run block has an unrecognised ${command} option`);
+    if (takesNext && index + 1 >= tokens.length) refuse(`an unapproved run block has a ${command} option without a value`);
+    index += takesNext ? 2 : 1;
+  }
+  return index;
+}
+
 /**
  * Skip variable assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
- * header is not an invocation unless `case` is requested for refusal.
+ * header is not an invocation unless `case` is requested for refusal. A
+ * `refuse` callback turns the strict run-block checks on: prefix options are
+ * consumed, and an unmodelled wrapper around a refused spelling is refused.
  */
-function commandWord(tokens: ShellToken[], includeCase = false): { index: number; token: ShellToken } | null {
+function commandWord(
+  tokens: ShellToken[],
+  includeCase = false,
+  refuse?: (reason: string) => never,
+): { index: number; token: ShellToken } | null {
   let index = 0;
   let sawPrefix = false;
   while (index < tokens.length) {
@@ -1185,7 +1303,16 @@ function commandWord(tokens: ShellToken[], includeCase = false): { index: number
       }
       sawPrefix = true;
       index++;
+      if (refuse !== undefined && PREFIX_OPTION_GRAMMAR[text] !== undefined) {
+        index = consumePrefixOptions(text, tokens, index, refuse);
+      }
       continue;
+    }
+    if (!token.quoted && UNMODELLED_WRAPPERS.has(text)) {
+      if (refuse !== undefined && hasRefusedSpelling(tokens, index + 1)) {
+        refuse(`an unapproved run block has an exec wrapper it does not model: ${text}`);
+      }
+      return { index, token };
     }
     if (!token.quoted && SHELL_KEYWORDS.has(text)) {
       index++;

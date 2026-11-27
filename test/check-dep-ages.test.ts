@@ -5292,3 +5292,72 @@ describe("the workflow guard's known limits from review round 21 (cli#975)", () 
     },
   );
 });
+
+describe("the workflow guard refuses prefix options, unmodelled wrappers and runner expressions in command position (#941)", () => {
+  const WORKFLOW = "workflow-wrapper";
+
+  const shapes = [
+    "timeout 5 n$'p\\155' ci",
+    "nice -n 5 n$'p\\155' ci",
+    "stdbuf -oL n$'p\\155' ci",
+    "setsid n$'p\\155' ci",
+    "chroot / n$'p\\155' ci",
+    "env -u FOO n$'p\\155' ci",
+    "env -C . n$'p\\155' ci",
+    "sudo -u runner n$'p\\155' ci",
+    "sudo -g group n$'p\\155' ci",
+    "exec -a x n$'p\\155' ci",
+    "xargs -n 1 n$'p\\155' ci",
+    "timeout 5 np? ci",
+    "hash -p /tmp/x$'\\155' zz && zz ci",
+  ];
+  const placements = [
+    (line: string) => line,
+    (line: string) => `true && ${line}`,
+    (line: string) => `if true; then ${line}; fi`,
+  ];
+
+  function expectRefused(run: string, pattern: RegExp) {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(pattern);
+    const root = makeTreeFixture({ "package-lock.json": "{}\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(run, "."),
+        new Set(["package-lock.json"]),
+        root,
+        WORKFLOW,
+      )).toThrow(pattern);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  for (const shape of shapes) {
+    for (const place of placements) {
+      it(`refuses ${place(shape)}`, () => {
+        expectRefused(place(shape), /cannot establish the npm ci directory/);
+      }, 5_000);
+    }
+  }
+
+  it.each([
+    "${{ matrix.cmd }} ci",
+    "${{ env.CMD }} ci",
+    "${{ github.event.inputs.cmd }} ci",
+  ])("refuses a runner expression in command position: %s", (run) => {
+    expectRefused(run, /runner expression in command position/);
+  }, 5_000);
+
+  it("names the unmodelled wrapper it refuses", () => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep("timeout 5 n$'p\\155' ci"), READ_TRACKED, WORKFLOW))
+      .toThrow(/exec wrapper it does not model: timeout/);
+  }, 5_000);
+
+  it.each([
+    "env n$'p\\155' ci",
+    "sudo n$'p\\155' ci",
+    "n$'p\\155' ci",
+  ])("still refuses the control: %s", (run) => {
+    expectRefused(run, /command word with ANSI-C quoting/);
+  }, 5_000);
+});

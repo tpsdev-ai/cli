@@ -38,7 +38,11 @@ A step whose effective shell — its own `shell:`, else its job's
 step, shell and source line. In an unapproved workflow run block, the guard refuses
 leading redirections and variable assignments containing `<` or `>` before a command word.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
-remain accepted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
+remain accepted. The guard consumes the `env`, `sudo`, `exec` and `xargs` options
+that take a separate value and refuses an option it does not know. A leading exec
+wrapper it does not model is refused when the wrapper's arguments contain a
+refused command-word spelling, naming the wrapper; a `${{ ... }}` runner
+expression in command position is refused. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands. These checks read a
 run block's top-level clauses only: commands inside `$(...)` or backtick
 substitutions, and text after a quote that spans physical lines, are not checked.
