@@ -5,6 +5,7 @@ import { basename, dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
 import {
+  ackMessageAtPath,
   MailRecordFileTypeError,
   MailRecordLayoutError,
   MailRecordLockRootError,
@@ -822,4 +823,43 @@ test("the node rerun refuses a build that is missing or older than the source", 
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("an ack on a mailbox whose new/ is one directory with cur/ is refused and leaves the record unchanged", () => {
+  const inbox = getInbox("mailbox-a");
+  fs.rmSync(inbox.fresh, { recursive: true });
+  fs.symlinkSync(inbox.cur, inbox.fresh, "dir");
+  const target = join(inbox.fresh, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(join(inbox.cur, "record.json"), "utf8");
+
+  expect(() => ackMessageAtPath(target, inbox.root)).toThrow(MailRecordLayoutError);
+
+  expect(fs.readFileSync(join(inbox.cur, "record.json"), "utf8")).toBe(before);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("an ack on a mailbox whose dlq/ is one directory with cur/ is refused and leaves the record unchanged", () => {
+  const inbox = getInbox("mailbox-a");
+  fs.rmSync(inbox.dlq, { recursive: true });
+  fs.symlinkSync(inbox.cur, inbox.dlq, "dir");
+  const target = join(inbox.dlq, "record.json");
+  plantRecord(target, "record-id");
+  const before = fs.readFileSync(join(inbox.cur, "record.json"), "utf8");
+
+  expect(() => ackMessageAtPath(target, inbox.root)).toThrow(MailRecordLayoutError);
+
+  expect(fs.readFileSync(join(inbox.cur, "record.json"), "utf8")).toBe(before);
+  expect(fs.readdirSync(inbox.cur).filter((name) => name.startsWith(".ack-"))).toEqual([]);
+});
+
+test("an ack on a normal layout still succeeds", () => {
+  const inbox = getInbox("mailbox-a");
+  const target = join(inbox.cur, "record.json");
+  plantRecord(target, "record-id");
+
+  const record = ackMessageAtPath(target, inbox.root);
+
+  expect(record.read).toBe(true);
+  expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
 });
