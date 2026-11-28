@@ -336,7 +336,7 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
   });
 
-  test("an ack of a dlq/ record without a reason sidecar succeeds and prints nothing", async () => {
+  test("an ack of a dlq/ record without a reason sidecar succeeds with empty stderr", async () => {
     const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
     const parked = await parkInDlq();
     unlinkSync(`${parked}.reason`);
@@ -348,6 +348,61 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(ack.stdout).toContain(`Acked ${sent.id}`);
     expect(ack.stderr).toBe("");
     expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
+  });
+
+  test("an ack whose reason sidecar cannot be removed still acks and names the sidecar", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    unlinkSync(`${parked}.reason`);
+    // A non-empty directory at the sidecar path fails unlink for every uid,
+    // so this case does not depend on a chmod that root ignores.
+    mkdirSync(`${parked}.reason`);
+    writeFileSync(join(`${parked}.reason`, "keep"), "kept\n", "utf-8");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(ack.stderr).toContain(`${parked}.reason`);
+    expect(readdirSync(getInbox(OWNER).dlq).filter((f) => f.endsWith(".json"))).toEqual([]);
+    expect(readdirSync(`${parked}.reason`)).toEqual(["keep"]);
+  });
+
+  test("an ack removes only the target's reason sidecar, leaving a neighbour and new/ files", async () => {
+    const target = sendMessage(OWNER, signedBody("target"), SENDER);
+    const neighbour = sendMessage(OWNER, signedBody("neighbour"), SENDER);
+    process.env.FLAIR_URL = "http://127.0.0.1:1";
+    try {
+      expect(await checkMessages(OWNER)).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = stub.url;
+    }
+    const inbox = getInbox(OWNER);
+    const dlqRecords = readdirSync(inbox.dlq).filter((f) => f.endsWith(".json"));
+    expect(dlqRecords).toHaveLength(2);
+    const pathById = new Map(
+      dlqRecords.map((f) => [JSON.parse(readFileSync(join(inbox.dlq, f), "utf-8")).id as string, join(inbox.dlq, f)]),
+    );
+    const targetPath = pathById.get(target.id);
+    const neighbourPath = pathById.get(neighbour.id);
+    expect(targetPath).toBeDefined();
+    expect(neighbourPath).toBeDefined();
+    expect(readFileSync(`${neighbourPath!}.reason`, "utf-8")).toContain("class: verify-unavailable");
+
+    // A record in new/ beside a `.reason` file of the same name must survive.
+    const newcomer = JSON.parse(readFileSync(targetPath!, "utf-8"));
+    newcomer.id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const newcomerName = basename(targetPath!);
+    writeFileSync(join(inbox.fresh, newcomerName), JSON.stringify(newcomer, null, 2), "utf-8");
+    writeFileSync(join(inbox.fresh, `${newcomerName}.reason`), "class: unrelated\n", "utf-8");
+
+    const ack = await runCli(["mail", "ack", target.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${target.id}`);
+
+    expect(readdirSync(inbox.dlq).sort()).toEqual([basename(neighbourPath!), `${basename(neighbourPath!)}.reason`].sort());
+    expect(readFileSync(`${neighbourPath!}.reason`, "utf-8")).toContain("class: verify-unavailable");
+    expect(readdirSync(inbox.fresh).sort()).toEqual([newcomerName, `${newcomerName}.reason`].sort());
+    expect(readFileSync(join(inbox.fresh, `${newcomerName}.reason`), "utf-8")).toBe("class: unrelated\n");
   });
 
   test("human output marks a re-delivery once and --json carries the field", async () => {

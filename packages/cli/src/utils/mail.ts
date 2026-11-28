@@ -536,8 +536,8 @@ export function updateExistingRecord<T extends object>(
      */
     removeUnlessIn?: string;
     /**
-     * cli#1104: with a removal, also unlink the `<record>.reason` sidecar a
-     * dlq/ record carries. A missing sidecar is not an error; any other
+     * cli#1104: with a removal, also unlink a `dlq/` record's `<record>.reason`
+     * sidecar, when it has one. A missing sidecar is not an error; any other
      * failure is reported on stderr and does not fail the removal.
      */
     removeReasonSidecar?: boolean;
