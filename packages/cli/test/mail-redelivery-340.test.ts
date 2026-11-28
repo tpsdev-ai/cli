@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
+import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage, updateExistingRecord } from "../src/utils/mail.js";
 import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -176,6 +176,15 @@ describe("mail check re-delivery reason (cli#340)", () => {
     // Kept and stamped in cur/, as a literal cur/ path would be; not deleted.
     expect(existsSync(real)).toBe(true);
     expect(JSON.parse(readFileSync(real, "utf-8")).ackedAt).toBe(acked.ackedAt);
+  });
+
+  test("an explicit remove takes precedence over removeUnlessIn for a cur/ record", async () => {
+    sendMessage(OWNER, signedBody("remove wins"), SENDER);
+    expect((await checkMessages(OWNER)).length).toBe(1);
+    const real = curPath();
+    const result = updateExistingRecord(real, (record: object) => record, { mailboxRoot: dirname(dirname(real)), remove: true, removeUnlessIn: "cur" });
+    expect(result.status).toBe("updated");
+    expect(existsSync(real)).toBe(false);
   });
 
   test("mail check archives an old acked cur/ record before GC can delete it", async () => {

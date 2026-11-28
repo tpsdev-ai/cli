@@ -530,7 +530,8 @@ export function updateExistingRecord<T extends object>(
      * cli#1098: delete the record unless its PHYSICAL directory (resolved under
      * the lock, as the identity check below does) is `<root>/<name>`; keep and
      * rewrite it there. Chosen by identity, not by the path's spelling, so an
-     * aliased path to `cur/` keeps the record.
+     * aliased path to `cur/` keeps the record. An explicit `remove` takes
+     * precedence over this option.
      */
     removeUnlessIn?: string;
   },
