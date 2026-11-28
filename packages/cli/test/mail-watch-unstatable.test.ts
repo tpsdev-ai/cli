@@ -1,8 +1,9 @@
 /**
  * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails in either
  * listing (the scan's or the trim's) with an error other than ENOENT is that
- * entry's problem. The watcher names it once per continuous failure and still
- * presents the readable records beside it.
+ * entry's problem. Every successful listing of new/ (the scan and the trim)
+ * names its unstatable entries; a name is warned once per continuous failure
+ * and the readable records beside it are still presented.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
@@ -398,6 +399,119 @@ describe("watchMail: an unstat-able new/ entry", () => {
       expect(received).toEqual([env.messageId]);
     } finally {
       watcher?.stop();
+    }
+  }, 15_000);
+
+  it("names a trim-listing failure once when a new readable record arrives before the rescan", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let fresh = "";
+    const name = "other.json";
+    let real = "";
+    let restored = false;
+    let arrived: ReturnType<typeof buildSignedEnvelope> | undefined;
+    let watcher: MailWatcher | undefined;
+    try {
+      fresh = getInbox(AGENT).fresh;
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        beforeVerify: async () => {
+          if (arrived !== undefined) return;
+          // Another entry, unstatable only at this pass's trim listing.
+          const other = buildSignedEnvelope(SENDER, AGENT, "entry seen only at the trim listing", SEEDS);
+          writeFileSync(join(fresh, name), JSON.stringify(other));
+          real = makeUnstatable(fresh, name);
+          // A readable record arrives during the awaited verification.
+          arrived = buildSignedEnvelope(SENDER, AGENT, "readable record that triggers the rescan", SEEDS);
+          sendMessage(AGENT, JSON.stringify(arrived), SENDER);
+        },
+        onMessage: (msg) => {
+          received.push(msg.id);
+          // After the trim listing, before the rescan: the other entry stats again.
+          if (!restored && real !== "") { restored = true; restoreStatable(fresh, name, real); }
+        },
+      });
+      await sleep(60);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "anchor verified while the other entry fails at trim", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      await waitFor(() => restored, 5000, () => `log: ${lines.join(" | ")}`);
+
+      const named = () => lines.filter((l) => l.includes(`${name} `) && l.includes("(ELOOP)"));
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+      const warnedAt = polls;
+      await waitFor(() => polls - warnedAt >= 4, 5000);
+      expect(named()).toHaveLength(1);
+      expect(received).toContain(env.messageId);
+      expect(received).toContain(arrived!.messageId);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it("warns again when a warned name stats at trim, a new identity returns, then it fails before the rescan", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let fresh = "";
+    const name = "other.json";
+    let real = "";
+    let restored = false;
+    let rebroken = false;
+    let watcher: MailWatcher | undefined;
+    try {
+      fresh = getInbox(AGENT).fresh;
+      const other = buildSignedEnvelope(SENDER, AGENT, "entry that fails again before the rescan", SEEDS);
+      writeFileSync(join(fresh, name), JSON.stringify(other));
+      real = makeUnstatable(fresh, name);
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        beforeVerify: async () => {
+          if (restored) return;
+          // This pass's trim listing stats the name again.
+          restoreStatable(fresh, name, real);
+          restored = true;
+          const arrived = buildSignedEnvelope(SENDER, AGENT, "new identity during verification", SEEDS);
+          sendMessage(AGENT, JSON.stringify(arrived), SENDER);
+        },
+        onMessage: (msg) => {
+          received.push(msg.id);
+          // After the trim listing, before the rescan: the name fails again.
+          if (restored && !rebroken) { rebroken = true; real = makeUnstatable(fresh, name); }
+        },
+      });
+      await sleep(60);
+
+      const named = () => lines.filter((l) => l.includes(`${name} `) && l.includes("(ELOOP)"));
+      // First warning: the name fails in a scan listing.
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "anchor verified while the other entry stats at trim", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      await waitFor(() => named().length === 2, 5000, () => `log: ${lines.join(" | ")}`);
+      const warnedAt = polls;
+      await waitFor(() => polls - warnedAt >= 4, 5000);
+      expect(named()).toHaveLength(2);
+      expect(received).toContain(env.messageId);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
     }
   }, 15_000);
 });

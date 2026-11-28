@@ -296,9 +296,9 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   const warnedUnstatable = new Set<string>();
 
   // Name each entry a listing could not stat and keep one warning per
-  // continuous failure; a file this listing stats again leaves the set. Both
-  // listings report through it, so a failure that persists into the next scan
-  // is not named twice.
+  // continuous failure; a file this listing stats again leaves the set. Every
+  // successful listing of new/ (the scan and the trim) reports through it, so a
+  // failure that persists into the next scan is not named twice.
   const reportUnstatable = (entries: Map<string, string>) => {
     for (const [file, code] of entries) {
       if (warnedUnstatable.has(file)) continue;
@@ -527,6 +527,10 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         console.error("[mail-watch] cannot list new/; keeping the current dedup state");
         return;
       }
+      // Report and clear before the rescan decision: this listing succeeded, so
+      // its names must be warned (and a recovered name cleared) even when a new
+      // identity sends us into the rescan.
+      reportUnstatable(atTrim.unstatable);
       if (atTrim.some(({ identity }) => !present.has(identity))) {
         rescan = true;
         return;
@@ -534,7 +538,6 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const trimPresent = new Set(atTrim.map(({ identity }) => identity));
       const trimPaths = new Set(atTrim.map(({ file }) => file));
       const trimKept = new Set([...kept.keys(), ...atTrim.unstatable.keys()]);
-      reportUnstatable(atTrim.unstatable);
       for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file) && !trimKept.has(file)) pendingEnvelopeIds.delete(file);
       for (const identity of classified.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) classified.delete(identity);
       for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) unresolvedAttempts.delete(identity);
