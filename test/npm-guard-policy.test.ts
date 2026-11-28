@@ -25,6 +25,133 @@ import { formatRefusal, redactArgs, sanitizeText } from "../scripts/npm-guard/re
 const JOBS = [...new Set(TABLE.map((entry) => entry.job))];
 const SPEC_VALUE = "@scope-a/package-a@1.2.3";
 const NPM_VERSION_VALUE = "npm@11.21.1";
+const REGISTRY_URL = "https://registry.npmjs.org";
+const REPO_ROOT = join(import.meta.dir, "..");
+
+// The reviewed callers, written independently of TABLE. Each cited line is read
+// from the repository and must carry this command's npm text.
+const EXPECTED = [
+  {
+    job: "test",
+    argv: ["run", "build"],
+    callers: [
+      { at: "test.yml:194", text: "npm run build" },
+      { at: "test.yml:203", text: "npm run build" },
+    ],
+  },
+  {
+    job: "test",
+    argv: ["run", "typecheck:test"],
+    callers: [{ at: "test.yml:204", text: "npm run typecheck:test" }],
+  },
+  {
+    job: "node-plugin-load",
+    argv: ["run", "build"],
+    callers: [{ at: "test.yml:261", text: "npm run build" }],
+  },
+  {
+    job: "github-review-gateway-boundary",
+    argv: ["run", "build"],
+    callers: [{ at: "test.yml:367", text: "npm run build" }],
+  },
+  {
+    job: "github-review-gateway-boundary",
+    argv: ["run", "typecheck:test"],
+    callers: [{ at: "test.yml:368", text: "npm run typecheck:test" }],
+  },
+  {
+    job: "promote-latest-fixtures",
+    argv: ["view", SPEC_VALUE, "version", "--registry", REGISTRY_URL],
+    callers: [
+      {
+        at: "promote-latest.sh:361",
+        text: 'run_npm view "${names[i]}@${version}" version --registry "$NPM_REGISTRY"',
+      },
+    ],
+  },
+  {
+    job: "promote-latest-fixtures",
+    argv: ["view", SPEC_VALUE, "dist-tags.latest", "--registry", REGISTRY_URL],
+    callers: [
+      {
+        at: "promote-latest.sh:399",
+        text: 'run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY"',
+      },
+      {
+        at: "promote-latest.sh:562",
+        text: 'run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY"',
+      },
+      {
+        at: "promote-latest.sh:711",
+        text: 'run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY"',
+      },
+      {
+        at: "promote-latest.sh:730",
+        text: 'run_npm view "${names[i]}" dist-tags.latest --registry "$NPM_REGISTRY"',
+      },
+    ],
+  },
+  {
+    job: "promote-latest-fixtures",
+    argv: ["dist-tag", "add", SPEC_VALUE, "latest", "--registry", REGISTRY_URL],
+    callers: [
+      {
+        at: "promote-latest.sh:547",
+        text: 'run_npm dist-tag add "${names[i]}@${prev_latest[i]}" latest --registry "$NPM_REGISTRY"',
+      },
+      {
+        at: "promote-latest.sh:699",
+        text: 'run_npm dist-tag add "${names[i]}@${version}" latest --registry "$NPM_REGISTRY"',
+      },
+    ],
+  },
+  {
+    job: "meta",
+    argv: ["view", SPEC_VALUE, "version"],
+    callers: [
+      { at: "docker-image-tags.sh:59", text: 'npm view "${PKG}@${V}" version' },
+    ],
+  },
+  {
+    job: "meta",
+    argv: ["view", SPEC_VALUE, "dist-tags.latest"],
+    callers: [
+      { at: "docker-image-tags.sh:86", text: 'npm view "$PKG" dist-tags.latest' },
+    ],
+  },
+  {
+    job: "publish-packages",
+    argv: ["install", "-g", NPM_VERSION_VALUE, `--registry=${REGISTRY_URL}`],
+    callers: [
+      {
+        at: "release.yml:256",
+        text: "npm install -g npm@11.21.1 --registry=https://registry.npmjs.org",
+      },
+    ],
+  },
+  {
+    job: "publish-packages",
+    argv: ["stage", "publish", "--tag", "staged", "--access", "public"],
+    callers: [
+      {
+        at: "release.yml:414",
+        text: "npm stage publish --tag staged --access public",
+      },
+    ],
+  },
+  {
+    job: "publish-packages",
+    argv: ["view", SPEC_VALUE, "version"],
+    callers: [{ at: "release.yml:421", text: 'npm view "$nm@$VERSION" version' }],
+  },
+];
+
+const CALLER_FILES = {
+  "test.yml": join(REPO_ROOT, ".github/workflows/test.yml"),
+  "release.yml": join(REPO_ROOT, ".github/workflows/release.yml"),
+  "promote-latest.sh": join(REPO_ROOT, "scripts/promote-latest.sh"),
+  "docker-image-tags.sh": join(REPO_ROOT, ".github/scripts/docker-image-tags.sh"),
+};
 
 const roots = [];
 function makeRoot() {
@@ -47,26 +174,39 @@ function materialize(pattern) {
 }
 
 describe("policy table", () => {
-  for (const entry of TABLE) {
-    const args = materialize(entry.argv);
-    test(`${entry.job}: npm ${args.join(" ")} (${entry.callers.join(", ")})`, () => {
-      const decision = decide("npm", args, entry.job);
-      expect(decision.allow).toBe(true);
-      if (!decision.allow) return;
-      expect(decision.argv.slice(0, args.length)).toEqual(args);
+  test("every reviewed caller is allowed in its job", () => {
+    for (const entry of EXPECTED) {
+      expect(decide("npm", entry.argv, entry.job).allow).toBe(true);
+      expect(decide("npm", entry.argv, undefined).allow).toBe(false);
+      expect(decide("npm", entry.argv, "no-such-job").allow).toBe(false);
+    }
+  });
 
-      const otherJob = JOBS.find(
-        (job) => job !== entry.job && !decide("npm", args, job).allow,
-      );
-      expect(otherJob).toBeDefined();
-      expect(decide("npm", args, otherJob).allow).toBe(false);
-      expect(decide("npm", args, undefined).allow).toBe(false);
-      expect(decide("npm", args, "no-such-job").allow).toBe(false);
-    });
-  }
+  test("the table matches the reviewed callers exactly", () => {
+    const table = TABLE.map((entry) => ({
+      job: entry.job,
+      argv: materialize(entry.argv),
+      callers: entry.callers.map((at) => at),
+    }));
+    const expected = EXPECTED.map((entry) => ({
+      job: entry.job,
+      argv: entry.argv,
+      callers: entry.callers.map((caller) => caller.at),
+    }));
+    expect(table.length).toBe(expected.length);
+    expect(table).toEqual(expected);
+  });
 
-  test("the table has 13 shapes", () => {
-    expect(TABLE.length).toBe(13);
+  test("every cited caller line carries the command's npm text", () => {
+    for (const entry of EXPECTED) {
+      for (const caller of entry.callers) {
+        const [file, lineNumber] = caller.at.split(":");
+        const path = CALLER_FILES[file];
+        if (!path) throw new Error(`no file for ${caller.at}`);
+        const lines = readFileSync(path, "utf8").split("\n");
+        expect(lines[Number(lineNumber) - 1]).toContain(caller.text);
+      }
+    }
   });
 
   test("the meta job allows the dist-tags read and refuses it in another job", () => {
@@ -453,5 +593,59 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
     });
     expect(result.status).toBe(0);
     expect(result.stdout.split(":")[0]).toBe(GUARD_DIR);
+  });
+
+  test("a redacted secret leaves no fragment on stdout or stderr", () => {
+    const separators = ["\n", " ", "\t", "\u009b"];
+    const forms = [
+      (secret) => [`--otp=${secret}`],
+      (secret) => [`--password=${secret}`],
+      (secret) => ["--otp", secret],
+      (secret) => ["--password", secret],
+      (secret) => [`--//registry.npmjs.org/:_authToken=${secret}`],
+    ];
+    for (const [formIndex, form] of forms.entries()) {
+      for (const [sepIndex, separator] of separators.entries()) {
+        const head = `HEAD-${formIndex}-${sepIndex}`;
+        const tail = `TAIL-${formIndex}-${sepIndex}`;
+        const secret = `${head}${separator}${tail}`;
+        const { root, logPath } = makeGuardRoot();
+        const result = runShim("npm", ["ci", ...form(secret)], {
+          GITHUB_JOB: "test",
+          [ROOT_ENV]: root,
+          FAKE_NPM_LOG: logPath,
+        });
+        expect(result.status).not.toBe(0);
+        for (const output of [result.stdout, result.stderr]) {
+          expect(output).not.toContain(head);
+          expect(output).not.toContain(tail);
+          expect(output).not.toContain(secret);
+        }
+        expect(result.stderr).toContain("[REDACTED]");
+        expect(existsSync(logPath)).toBe(false);
+      }
+    }
+  });
+
+  test("a secret-bearing argv is not echoed by the shim", () => {
+    const secret = "guardleak-7f3a9c";
+    const refused = makeGuardRoot();
+    const refusedResult = runShim("npm", ["ci", `--otp=${secret}`], {
+      GITHUB_JOB: "test",
+      [ROOT_ENV]: refused.root,
+      FAKE_NPM_LOG: refused.logPath,
+    });
+    const allowed = makeGuardRoot();
+    const allowedResult = runShim("npm", ["view", secret, "version"], {
+      GITHUB_JOB: "meta",
+      [ROOT_ENV]: allowed.root,
+      FAKE_NPM_LOG: allowed.logPath,
+    });
+    expect(allowedResult.status).toBe(0);
+    expect(loggedCalls(allowed.logPath)).toEqual([["view", secret, "version"]]);
+    for (const result of [refusedResult, allowedResult]) {
+      expect(result.stdout).not.toContain(secret);
+      expect(result.stderr).not.toContain(secret);
+    }
   });
 });

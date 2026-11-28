@@ -1,6 +1,7 @@
 // The npm guard's path root (cli#948 design v3 N4): the one module that defines
-// the production root. Under GITHUB_ACTIONS only that root is accepted; a
-// per-test root is accepted only when GITHUB_ACTIONS is not `true`.
+// the production root. Under GITHUB_ACTIONS=true every root override is refused,
+// including one naming the production root; an override is accepted only when
+// GITHUB_ACTIONS is not `true`.
 
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";

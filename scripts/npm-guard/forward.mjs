@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-// The npm/npx shim forwarder (cli#948): decide first; refuse without spawning
-// anything; otherwise exec the recorded real npm with the decided argv.
+// The npm/npx shim forwarder (cli#948): decide first; refuse before spawning the
+// recorded npm or starting an installation; otherwise spawn the recorded npm
+// with the decided argv.
 
 import { spawnSync } from "node:child_process";
 import { accessSync, constants, readFileSync } from "node:fs";

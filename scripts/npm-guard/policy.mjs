@@ -27,7 +27,9 @@ const SPEC_RE =
 const NPM_VERSION_RE = /^npm@(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
 const SHELL_METACHAR_RE = /[$`'"';&|<>(){}]|\\/;
 
-// Every shape a CI job runs today, with the caller it was built from.
+// The reviewed direct npm calls CI makes today, excluding tracked-lock helper
+// calls and local-registry fixture overrides, with the caller each was built
+// from.
 export const TABLE = [
   // test.yml `test` job.
   { job: "test", argv: ["run", "build"], callers: ["test.yml:194", "test.yml:203"] },
@@ -105,8 +107,9 @@ function shapeMatches(pattern, argv) {
   return true;
 }
 
-// cli#948 design v2 item 5: the run family gets the guard's `--script-shell`
-// appended, so package and lifecycle scripts reach the shims.
+// cli#948 design v2 item 5: accepted `run` shapes and the accepted `stage
+// publish` shape receive `--script-shell`; the other verbs in that list would
+// receive it only if a later table entry allowed them.
 export function needsScriptShell(argv) {
   const verb = argv[0];
   if (verb === "stage") return argv[1] === "publish";

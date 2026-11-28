@@ -1,6 +1,6 @@
 #!/bin/sh
-# npx guard shim (cli#948): npx has an empty allowlist, so every call is
-# refused before anything is spawned. No `set -x` here.
+# npx guard shim (cli#948): npx has an empty allowlist, so every call is refused
+# before spawning the recorded npm or starting an installation. No `set -x` here.
 self=$0
 case $self in
   */*) ;;

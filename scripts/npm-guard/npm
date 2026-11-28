@@ -1,5 +1,5 @@
 #!/bin/sh
-# npm guard shim (cli#948): decide first, then exec the recorded real npm.
+# npm guard shim (cli#948): decide first, then spawn the recorded npm.
 # No `set -x`: a command line may carry a registry credential.
 self=$0
 case $self in

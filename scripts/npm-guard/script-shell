@@ -1,6 +1,6 @@
 #!/bin/sh
-# The guard's script shell (cli#948 design v2 item 5): package and lifecycle
-# scripts get the guard's directory first on PATH, then run under /bin/sh.
+# The guard's script shell (cli#948 design v2 item 5): it puts the guard's
+# directory first on PATH, then execs /bin/sh.
 self=$0
 case $self in
   */*) ;;

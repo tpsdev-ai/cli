@@ -3,15 +3,15 @@
 
 export const SUPPORTED_INSTALL_PATH = "scripts/npm-ci-tracked-lock.sh";
 
-// Blank `--otp`/`--password` values in both spellings and any `_authToken`
-// value, then collapse `scheme://userinfo@host` to `scheme://host`.
+// Blank the whole value of `--otp`/`--password` in both spellings and of any
+// argument containing `_authToken` before sanitizing, then collapse
+// `scheme://userinfo@host` to `scheme://host`.
 export function redactArgs(argv) {
   const redacted = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = String(argv[i]);
-    const assigned = /^--(otp|password)=(.*)$/.exec(arg);
-    if (assigned) {
-      redacted.push(`--${assigned[1]}=[REDACTED]`);
+    if (arg.startsWith("--otp=") || arg.startsWith("--password=")) {
+      redacted.push(`${arg.slice(0, arg.indexOf("=") + 1)}[REDACTED]`);
       continue;
     }
     if (arg === "--otp" || arg === "--password") {
@@ -22,11 +22,14 @@ export function redactArgs(argv) {
       }
       continue;
     }
-    redacted.push(
-      arg
-        .replace(/(_authToken=)[^\s]*/gi, "$1[REDACTED]")
-        .replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]*@/g, "$1"),
-    );
+    const tokenAt = arg.indexOf("_authToken");
+    if (tokenAt !== -1) {
+      const equalsAt = arg.indexOf("=", tokenAt);
+      const kept = equalsAt === -1 ? tokenAt + "_authToken".length : equalsAt + 1;
+      redacted.push(`${arg.slice(0, kept)}[REDACTED]`);
+      continue;
+    }
+    redacted.push(arg.replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@\s]*@/g, "$1"));
   }
   return redacted;
 }
