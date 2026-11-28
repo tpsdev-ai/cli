@@ -4,21 +4,13 @@ import { join } from "node:path";
 
 const DOCKERFILE = join(import.meta.dir, "..", "Dockerfile.test");
 
-test("every install command in Dockerfile.test is frozen and has no fallback", () => {
-  // This reads Dockerfile.test as text: it cannot see installs run through
-  // another script, a base image, or a file it does not copy.
-  const lines = readFileSync(DOCKERFILE, "utf8").split("\n");
-  const installLines = lines
-    .map((line, index) => ({ line: line.trim(), number: index + 1 }))
-    .filter(({ line }) => /^RUN\b/.test(line))
-    .filter(({ line }) => /\b(bun install|npm install|npm ci)\b/.test(line));
+test("Dockerfile.test installs with exactly RUN bun install --frozen-lockfile, and names bun install nowhere else", () => {
+  // This pins the text of Dockerfile.test's one dependency install. It does not detect other install spellings (`bun i`, `bun add`, npm) or installs outside this file; the runtime guard in #948 is the enforcement.
+  const content = readFileSync(DOCKERFILE, "utf8");
+  const lines = content.split("\n").map((line) => line.trim());
 
-  expect(installLines.length).toBeGreaterThan(0);
-  for (const { line, number } of installLines) {
-    expect(line, `Dockerfile.test:${number} has a || fallback`).not.toContain("||");
-    const frozen = /\bbun install\b/.test(line)
-      ? /\bbun install\b.*--frozen-lockfile\b/.test(line)
-      : /\bnpm ci\b/.test(line);
-    expect(frozen, `Dockerfile.test:${number} is not a frozen install`).toBe(true);
-  }
+  const installLines = lines.filter((line) => line === "RUN bun install --frozen-lockfile");
+  expect(installLines.length).toBe(1);
+
+  expect(content.split("bun install").length - 1).toBe(1);
 });
