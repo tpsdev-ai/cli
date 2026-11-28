@@ -552,3 +552,33 @@ test("an ack in new/ succeeds without a dlq/ directory and preserves its sidecar
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("an ack whose dlq/ check fails keeps the record and its sidecar", () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-ack-dlq-check-"));
+  try {
+    const fresh = join(root, "new");
+    mkdirSync(fresh);
+    mkdirSync(join(root, "cur"));
+    // A self-referencing symlink makes stat of dlq/ fail with a code other
+    // than ENOENT for every uid, including root.
+    const dlq = join(root, "dlq");
+    symlinkSync("dlq", dlq);
+    const path = join(fresh, "message.json");
+    const reasonPath = `${path}.reason`;
+    const original = JSON.stringify({ id: "message", read: false });
+    writeFileSync(path, original, "utf-8");
+    writeFileSync(reasonPath, "keep\n", "utf-8");
+
+    expect(() => ackMessageAtPath(path, root)).toThrow();
+    expect(readFileSync(path, "utf-8")).toBe(original);
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+
+    unlinkSync(dlq);
+    mkdirSync(dlq);
+    expect(ackMessageAtPath(path, root).ackedAt).toEqual(expect.any(String));
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+    expect(existsSync(path)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -538,7 +538,7 @@ export function updateExistingRecord<T extends object>(
     /**
      * cli#1104: with a removal, also unlink a `dlq/` record's `<record>.reason`
      * sidecar, when it has one. A missing sidecar is not an error; any other
-     * failure is reported on stderr and does not fail the removal.
+     * failure to unlink it is reported on stderr and does not fail the removal.
      */
     removeReasonSidecar?: boolean;
   },
@@ -627,12 +627,7 @@ export function updateExistingRecord<T extends object>(
     if (updated === null) return { status: "changed" };
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     if (remove) {
-      try {
-        unlinkSync(path);
-      } catch (err: any) {
-        if (err?.code === "ENOENT") return { status: "gone" };
-        throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
-      }
+      // Before the record's unlink, so an error rethrown here leaves the record.
       let inDlq = false;
       if (options.removeReasonSidecar) {
         try {
@@ -640,6 +635,12 @@ export function updateExistingRecord<T extends object>(
         } catch (err: any) {
           if (err?.code !== "ENOENT" || err?.path !== join(realRoot, "dlq")) throw err;
         }
+      }
+      try {
+        unlinkSync(path);
+      } catch (err: any) {
+        if (err?.code === "ENOENT") return { status: "gone" };
+        throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
       }
       if (inDlq) {
         const sidecar = `${path}.reason`;
