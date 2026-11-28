@@ -24,7 +24,7 @@ const NPM_VERSION = { slot: "npm-version" };
 const SPEC_RE =
   /^(?:@[A-Za-z0-9][A-Za-z0-9._-]*\/)?[A-Za-z0-9][A-Za-z0-9._-]*(?:@[A-Za-z0-9][A-Za-z0-9._-]*)?$/;
 // The same exact-version shape the static global-install lint accepts.
-const NPM_VERSION_RE = /^npm@(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
+const NPM_VERSION_RE = /^npm@(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})\.(?:0|[1-9][0-9]{0,8})$/;
 const SHELL_METACHAR_RE = /[$`'"';&|<>(){}]|\\/;
 
 // The reviewed direct npm calls CI makes today, excluding tracked-lock helper

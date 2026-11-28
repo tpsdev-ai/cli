@@ -3,9 +3,9 @@
 
 export const SUPPORTED_INSTALL_PATH = "scripts/npm-ci-tracked-lock.sh";
 
-// Blank the whole value of `--otp`/`--password` in both spellings and of any
-// argument containing `_authToken` before sanitizing, then drop everything up to
-// the last `@` of any URL authority, whitespace and control bytes included.
+// Drop everything up to the last `@` of every URL authority in an argument
+// (whitespace and control bytes included), then blank the whole value of
+// `--otp`/`--password` in both spellings and everything after `_authToken`.
 export function redactArgs(argv) {
   const redacted = [];
   for (let i = 0; i < argv.length; i += 1) {
@@ -22,19 +22,20 @@ export function redactArgs(argv) {
       }
       continue;
     }
-    const tokenAt = arg.indexOf("_authToken");
-    if (tokenAt !== -1) {
-      const tokenEnd = tokenAt + "_authToken".length;
-      const kept = arg[tokenEnd] === "=" ? tokenEnd + 1 : tokenEnd;
-      redacted.push(`${arg.slice(0, kept)}[REDACTED]`);
-      continue;
-    }
-    redacted.push(
-      arg.replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#]*/g, (match, scheme) => {
+    let cleaned = arg.replace(
+      /([A-Za-z][A-Za-z0-9+.-]*:\/\/)(?:(?![A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#])*/g,
+      (match, scheme) => {
         const at = match.lastIndexOf("@");
         return at === -1 ? match : scheme + match.slice(at + 1);
-      }),
+      },
     );
+    const tokenAt = cleaned.indexOf("_authToken");
+    if (tokenAt !== -1) {
+      const tokenEnd = tokenAt + "_authToken".length;
+      const kept = cleaned[tokenEnd] === "=" ? tokenEnd + 1 : tokenEnd;
+      cleaned = `${cleaned.slice(0, kept)}[REDACTED]`;
+    }
+    redacted.push(cleaned);
   }
   return redacted;
 }

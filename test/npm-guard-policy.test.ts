@@ -2,9 +2,10 @@
  * cli#948 slice 1a — the npm guard policy, refusal formatter, path module and
  * shims. Nothing here is wired into a CI job yet.
  *
- * The shim tests run `sh` on the committed shims against a fake recorded npm (a
- * small node script that logs its argv), in a per-test root with
- * GITHUB_ACTIONS unset, so this test file needs no real npm.
+ * Most shim tests run `sh` on the committed shims against a fake recorded npm
+ * (a small node script that logs its argv) in a per-test root; the root-refusal
+ * case sets GITHUB_ACTIONS=true, and the script-shell case uses no root and no
+ * fake npm. This test file needs no real npm.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -313,6 +314,34 @@ describe("refused verbs and shapes", () => {
   test("an unlisted flag on an allowed shape is refused", () => {
     expect(decide("npm", ["view", SPEC_VALUE, "version", "--json"], "meta").allow).toBe(false);
     expect(decide("npm", ["run", "build", "--silent"], "test").allow).toBe(false);
+  });
+
+  test("the npm-version slot accepts only a bounded npm@x.y.z", () => {
+    for (const value of [
+      "other@11.21.1",
+      "npm@latest",
+      "npm@01.2.3",
+      "npm@1234567890.0.0",
+      "--global-style",
+    ]) {
+      expect(
+        decide("npm", ["install", "-g", value, `--registry=${REGISTRY_URL}`], "publish-packages")
+          .allow,
+      ).toBe(false);
+    }
+  });
+
+  test("the spec slot accepts only a package name, not a flag, a word, or a URL", () => {
+    for (const value of ["--json", "pkg name", "pkg;id", "https://evil.example/x.tgz"]) {
+      expect(decide("npm", ["view", value, "version"], "meta").allow).toBe(false);
+      expect(
+        decide(
+          "npm",
+          ["view", value, "dist-tags.latest", "--registry", REGISTRY_URL],
+          "promote-latest-fixtures",
+        ).allow,
+      ).toBe(false);
+    }
   });
 
   test("a flag before the verb is refused", () => {
@@ -726,6 +755,44 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
       }
     }
     expect(result.stderr).toContain("https://registry.example/y");
+  });
+
+  test("_authToken beside URL userinfo leaves no fragment on either stream", () => {
+    for (const url of [
+      "https://alice:TOP@SECRET@registry.example/?_authToken=tok",
+      "https://alice:_authToken=SECRET@registry.example/x",
+    ]) {
+      const { root, logPath } = makeGuardRoot();
+      const result = runShim("npm", ["ci", url], {
+        GITHUB_JOB: "test",
+        [ROOT_ENV]: root,
+        FAKE_NPM_LOG: logPath,
+      });
+      expect(result.status).not.toBe(0);
+      for (const output of [result.stdout, result.stderr]) {
+        for (const fragment of ["alice", "TOP", "SECRET", "tok"]) {
+          expect(output).not.toContain(fragment);
+        }
+      }
+      expect(existsSync(logPath)).toBe(false);
+    }
+  });
+
+  test("two URLs in one argument both lose their userinfo", () => {
+    const { root, logPath } = makeGuardRoot();
+    const result = runShim("npm", ["ci", "https://a.example https://alice:SECRET@b.example/x"], {
+      GITHUB_JOB: "test",
+      [ROOT_ENV]: root,
+      FAKE_NPM_LOG: logPath,
+    });
+    expect(result.status).not.toBe(0);
+    for (const output of [result.stdout, result.stderr]) {
+      for (const fragment of ["alice", "SECRET"]) {
+        expect(output).not.toContain(fragment);
+      }
+    }
+    expect(result.stderr).toContain("https://a.example https://b.example/x");
+    expect(existsSync(logPath)).toBe(false);
   });
 
   test("an @ in the path after a clean authority survives", () => {
