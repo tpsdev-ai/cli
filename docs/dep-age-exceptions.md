@@ -30,42 +30,13 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
 
 Refusals name the workflow, job, step and physical line.
 
-A step whose effective shell — its own `shell:`, else its job's
-`defaults.run.shell`, else the workflow's — is set to anything other than
-`bash` is refused unless its run block is a pinned entry; the refusal names the
-step, shell and source line. In an unapproved workflow run block, the guard refuses
-leading redirections and variable assignments containing `<` or `>` before a command word.
-For prefix, option, wrapper and command-name matching, the guard computes each
-word's static value with bash's quoting rules: inside single quotes every character
-is literal, a backslash included; inside double quotes a backslash escapes only
-`$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
-next character. A word containing a parameter, command, arithmetic or brace expansion, an unescaped backquote, an unquoted `~` or an unquoted glob has no static value.
-Command-name matching reads the static value. The run-block glob refusal reads the raw word. In an unapproved run block, a word with no
-static value in command position is refused, naming it, except a plain variable
-command word with no prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
-a backslash-newline continuation
-inside a word is refused, naming the physical line. The same command-word walk
-refuses a command word whose first decoded character is an unquoted `{`:
-`''{n,}pm` counts, `'{n,}pm'` does not. A standalone `{` is a group, and
-`{fd}>out` is refused as a leading redirection. In unapproved run blocks, after
-`env`, `sudo`, `exec` or `xargs` every word up to and including the command word
-must have a static value; a word without one is refused. In followed shell files
-the walk may skip such a word without recording it.
-In unapproved run blocks, command words containing `*`, `?`, `[` or `$'` are
-refused; `[` and `[[` themselves remain accepted. The guard follows `env` through
-leading `NAME=value` assignments, and refuses a leading `env`
-option unless it is a lone `-`. The guard consumes the `sudo`,
-`exec` and `xargs` options from a finite grammar and refuses unmodelled options,
-including `sudo -s`/`-i`/`--shell`/`--login`. These refusals apply in run blocks
-and followed shell files. In unapproved run blocks, the listed wrappers
-(`timeout`, `nice`, `stdbuf`, `setsid`, `chroot`, `ionice`, `chrt`, `taskset`, `flock`,
-`unbuffer`, `script` and `watch`) are refused outright; `builtin` and `hash` are
-refused as unrecognised command words in run blocks and followed shell files. A
-`${{ ... }}` runner expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
-this best-effort lint does not model compound commands. Substitution bodies are
-scanned in their own state, where the command-word and prefix-option refusals
-apply but the run-block glob refusal does not; text after a quote that spans
-physical lines is not checked.
+A step whose effective shell (its own `shell:`, else its job's
+`defaults.run.shell`, else the workflow's) is not `bash` is refused unless its
+run block is a pinned entry. In unapproved run blocks and the shell files they
+follow, the guard refuses further command-word shapes. The shapes it refuses are
+the `#941` cases in `test/check-dep-ages.test.ts`; this page does not restate
+them. It is a best-effort lint over reviewed changes and does not model compound
+commands, so a shape those tests do not name may pass (see Limits below).
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
@@ -106,9 +77,10 @@ escapes the next character and `$(` and a backtick are literal.
 Limits: variable or substitution indirection such as `n${x}pm` or
 `$(printf n)pm`, and composite-action shells (cli#948), are not covered; the
 parser limits are cited above (cli#975). A quoted or escaped `env` assignment
-and `env -` are not followed and not refused. Behaviour for a leading `env` `NAME+=value` assignment, an escaped unknown command word and a plain `builtin` is not claimed; no test pins it. A followed shell file gets the
-command-word and prefix-option refusals but not the run-block glob refusal, and
-may skip a nonstatic prefixed word without recording it.
+and `env -` are not followed and not refused. Behaviour for a leading `env` `NAME+=value` assignment, an escaped unknown command word and a plain `builtin` is not claimed; no test pins it. A followed shell file does not get the run-block
+glob refusal, and may skip a nonstatic prefixed word without recording it.
+Options of a prefix without a modelled option grammar (for example `command`
+or `nohup`) are not checked.
 
 In a followed shell script, a logical line (continuations joined, word-boundary
 comments stripped, here-document headers matched after comment stripping,

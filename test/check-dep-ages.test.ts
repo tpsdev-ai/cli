@@ -5554,7 +5554,7 @@ describe("the workflow guard's known limits from review round 21 (cli#975)", () 
   );
 });
 
-describe("the workflow guard refuses unknown options, listed wrappers and runner expressions in command position (#941)", () => {
+describe("the workflow guard refuses unmodelled env, sudo, exec and xargs options, listed wrappers and runner expressions in command position (#941)", () => {
   const WORKFLOW = "workflow-wrapper";
 
   const shapes = [

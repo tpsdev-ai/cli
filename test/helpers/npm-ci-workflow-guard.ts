@@ -778,8 +778,9 @@ const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
   },
 };
 
-// Command words the guard knows but refuses: `builtin` runs another builtin and
-// `hash` changes command lookup, so neither is handled.
+// Command words the guard refuses rather than models: `builtin` runs another
+// builtin and `hash` changes command lookup. The tests pin `hash` and a quoted
+// `builtin`.
 const UNRECOGNISED_COMMAND_WORDS = new Set(["builtin", "hash"]);
 
 // A listed exec wrapper is refused outright in unapproved run blocks.
@@ -1497,11 +1498,11 @@ function decodedWords(tokens: readonly WordToken[]): WordToken[] {
 }
 
 /**
- * Walk a clause's words and return its command word. Prefixes, options,
- * reserved words and command names are recognised by their decoded static
- * value. `refuse` is required:
- * an option a prefix does not model, a leading `env` option other than a lone
- * `-`, `builtin` or `hash`, or a command word beginning with an unquoted `{`
+ * Walk a clause's words and return its command word. Prefixes, options and
+ * command names are recognised by their decoded static value. `refuse` is
+ * required:
+ * an option outside the modelled `env`, `sudo`, `exec` or `xargs` grammar, a leading `env` option other than a lone
+ * `-`, a word in `UNRECOGNISED_COMMAND_WORDS`, or a command word beginning with an unquoted `{`
  * is refused. `env` follows leading `NAME=value` and `NAME+=value`
  * assignments; a quoted or escaped assignment and `env -` are not followed. A
  * word after a prefix with no static value is returned with a null value, so
