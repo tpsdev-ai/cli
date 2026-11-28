@@ -3089,6 +3089,37 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     },
   );
 
+  it.each(["node -", "node"])(
+    "refuses a piped stdin program for %s with a heredoc on fd 2, as real Node runs the piped program", (interpreter) => {
+      const piped = `printf 'process.stdout.write("ran")\\n' | ${interpreter} 2<<'X'\nignored\nX`;
+      const root = makeTreeFixture({ "scripts/stdin.sh": `${piped}\n` });
+      const env = { ...process.env };
+      delete env.BASH_ENV;
+      delete env.ENV;
+      try {
+        const result = spawnSync("bash", ["-c", piped], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("ran");
+        expect(() => assertNpmCiWorkflowTree(workflowStep(piped, "."), new Set(), root, "workflow-stdin")).toThrow(/: stdin \(physical line/);
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/stdin.sh", "."), new Set(), root, "workflow-stdin")).toThrow(
+          /unresolved script invocation in scripts\/stdin\.sh \(line 1\) token stdin:/,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not follow a JS program read from a heredoc on fd 0", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("node - 0<<'X'\nconsole.log(1)\nX", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it.each([
     ["a JS interpreter", "node -"],
     ["a piped JS interpreter", "printf x | node -"],

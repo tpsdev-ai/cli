@@ -2256,12 +2256,12 @@ function clauseInvocations(
     // For an interpreter in command position (a listed wrapper's payload is
     // judged by embeddedInvocations instead), a real script operand takes
     // precedence over stdin redirection. A heredoc or here-string is a word
-    // that begins, as written, with an unquoted `<<` (after an optional fd
-    // number); a quoted or escaped `<<` is an ordinary argument. Shell program
-    // heredocs are refused; JS program heredocs are not followed, like `-e`.
-    // Without a heredoc, the checks below judge a `-` operand.
+    // that begins, as written, with an unquoted `<<` or `0<<`; a quoted or
+    // escaped `<<` is an ordinary argument. Shell program heredocs are refused;
+    // a JS program supplied by a heredoc on stdin is not followed, like `-e`.
+    // Without such a heredoc, the checks below judge a `-` operand.
     const stdinProgram = argument === undefined || stripOuterQuotes(argument.text) === "-";
-    const heredocAt = stdinProgram ? word.rawArgs.findIndex((token) => /^\d*<</.test(token.text)) : -1;
+    const heredocAt = stdinProgram ? word.rawArgs.findIndex((token) => /^0?<</.test(token.text)) : -1;
     if (heredocAt !== -1) {
       const heredoc = stripOuterQuotes(args[heredocAt].text);
       return SHELL_INTERPRETERS.has(base) ? [{ invocation: { dynamic: heredoc }, embedded: false }] : [];
