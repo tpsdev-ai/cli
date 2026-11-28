@@ -2984,6 +2984,26 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     },
   );
 
+  it.each([
+    ["Node", "node", "scripts/marker.js", 'process.stdout.write("marker")\n', 'process.stdout.write("stdin")'],
+    ["Bash", "bash", "scripts/marker.sh", "printf marker\n", "printf stdin"],
+  ])("checks with real %s that a script operand after a heredoc runs the script", (_label, interpreter, script, content, program) => {
+    const run = `${interpreter} <<MARKER ${script}\n${program}\nMARKER`;
+    const root = makeTreeFixture({ [script]: content });
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["-c", run], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("marker");
+      const report = assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-options");
+      expect(report.followed).toContain(script);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("checks with real Bash that -O consumes its value", () => {
     const root = makeTreeFixture({ "scripts/marker.sh": "printf marker\n" });
     const env = { ...process.env };
@@ -3033,6 +3053,41 @@ describe("the install classifier in a followed shell script refuses wrapper shap
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  it("does not follow a JS stdin heredoc program in a followed shell file", () => {
+    const root = makeTreeFixture({ "scripts/check.sh": "node - \"$f\" <<'X'\nconsole.log(1)\nX\n" });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("bash scripts/check.sh", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual(["scripts/check.sh"]);
+      expect(report.unresolved).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([["single", "'"], ["double", '"']])(
+    "refuses a stdin program whose %s-quoted << argument is not a heredoc, as real Node runs its stdin", (_label, quote) => {
+      const argument = `${quote}<<x${quote}`;
+      const piped = `printf 'process.stdout.write("ran")\\n' | node - ${argument}`;
+      const root = makeTreeFixture({ "scripts/stdin.sh": `node - ${argument}\n` });
+      const env = { ...process.env };
+      delete env.BASH_ENV;
+      delete env.ENV;
+      try {
+        const result = spawnSync("bash", ["-c", piped], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("ran");
+        for (const run of [piped, `node - ${argument}`]) {
+          expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-stdin")).toThrow(/: stdin \(physical line/);
+        }
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/stdin.sh", "."), new Set(), root, "workflow-stdin")).toThrow(
+          /unresolved script invocation in scripts\/stdin\.sh \(line 1\) token stdin:/,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it.each([
     ["a JS interpreter", "node -"],

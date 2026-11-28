@@ -1487,6 +1487,8 @@ type WalkedWord = {
   prefix: string | null;
   /** The words after the command word, each decoded when it has a static value. */
   args: WordToken[];
+  /** The same words as written, with their quotes and escapes. */
+  rawArgs: readonly WordToken[];
 };
 
 /** Decode each word that has a static value, keeping the raw word otherwise. */
@@ -1524,7 +1526,7 @@ function walkCommandWord(
   let prefix = "";
   const onBrace = braceRefuse ?? refuse;
   const walked = (at: number, token: WordToken, value: string | null): WalkedWord =>
-    ({ index: at, token, value, prefixed: sawPrefix, prefix: sawPrefix ? prefix : null, args: decodedWords(tokens.slice(at + 1)) });
+    ({ index: at, token, value, prefixed: sawPrefix, prefix: sawPrefix ? prefix : null, args: decodedWords(tokens.slice(at + 1)), rawArgs: tokens.slice(at + 1) });
   while (index < tokens.length) {
     const token = tokens[index];
     if (isBraceCommandWord(token.text)) {
@@ -2251,12 +2253,17 @@ function clauseInvocations(
       argument = args[index];
       break;
     }
-    // A real script operand takes precedence over stdin redirection. A `-`
-    // operand without a heredoc is refused. Shell program heredocs are refused;
-    // JS program heredocs are not followed, like `-e`.
+    // For an interpreter in command position (a listed wrapper's payload is
+    // judged by embeddedInvocations instead), a real script operand takes
+    // precedence over stdin redirection. A heredoc or here-string is a word
+    // that begins, as written, with an unquoted `<<` (after an optional fd
+    // number); a quoted or escaped `<<` is an ordinary argument. Shell program
+    // heredocs are refused; JS program heredocs are not followed, like `-e`.
+    // Without a heredoc, the checks below judge a `-` operand.
     const stdinProgram = argument === undefined || stripOuterQuotes(argument.text) === "-";
-    const heredoc = stdinProgram ? args.map((token) => stripOuterQuotes(token.text)).find((text) => text.includes("<<")) : undefined;
-    if (heredoc !== undefined) {
+    const heredocAt = stdinProgram ? word.rawArgs.findIndex((token) => /^\d*<</.test(token.text)) : -1;
+    if (heredocAt !== -1) {
+      const heredoc = stripOuterQuotes(args[heredocAt].text);
       return SHELL_INTERPRETERS.has(base) ? [{ invocation: { dynamic: heredoc }, embedded: false }] : [];
     }
     const inline = options.find((text) => text === "-c" || text === "-s");
@@ -2714,8 +2721,10 @@ function embeddedInvocations(word: WalkedWord | null): Invocation[] {
     const text = stripOuterQuotes(token.text);
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
     const argument = word.args[index + 1];
-    // Unknown => refuse: a wrapped interpreter whose payload is absent,
-    // `-c`/`-s`, or a program-supplying here-document cannot be resolved to one repository file.
+    // Unknown => refuse: a wrapped interpreter whose payload is absent or
+    // `-c`/`-s`, or a wrapped shell whose next word holds `<<`, cannot be
+    // resolved to one repository file. The direct interpreter's `-` and
+    // heredoc rules are not applied here (cli#975).
     if (argument === undefined) {
       found.push({ dynamic: `${text} stdin` });
       continue;
