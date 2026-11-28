@@ -341,7 +341,9 @@ describe("mail check re-delivery reason (cli#340)", () => {
     const parked = await parkInDlq();
     unlinkSync(`${parked}.reason`);
 
-    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    // --quiet-nono-check: a host without nono (CI) gets the CLI's availability
+    // warning on stderr; this case asserts the ack adds nothing there.
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
     expect(ack.status, ack.stderr).toBe(0);
     expect(ack.stdout).toContain(`Acked ${sent.id}`);
     expect(ack.stderr).toBe("");
