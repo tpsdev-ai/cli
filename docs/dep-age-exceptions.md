@@ -61,7 +61,7 @@ in command position is refused (see above). Command substitutions in accepted he
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed. In unapproved run blocks and followed shell files, an unclassified here-document header (including a continuation or quote) or body boundary refuses scanning, naming the physical line. Only unquoted `<<`/`<<-` operator tokens start here-documents; quoted `<<` text does not queue a delimiter. Modelled headers are single-line simple-command redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order; run-block headers must be top-level. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
+a here-document used as a shell's program (without a script operand or with `-`) is refused. In unapproved run blocks and followed shell files, an unclassified here-document header (including a continuation or quote) or body boundary refuses scanning, naming the physical line. Only unquoted `<<`/`<<-` operator tokens start here-documents; quoted `<<` text does not queue a delimiter. Modelled headers are single-line simple-command redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order; run-block headers must be top-level. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
@@ -112,7 +112,7 @@ form is resolved without the single-assignment check and without an unknown-cwd
 refusal. In a run block, whose scan has no bindings, the suffix is matched to a
 repository file without proving the executed path: `BASE=/tmp` then
 `bash "$BASE/scripts/entry.sh"` follows the repository's `scripts/entry.sh` even
-though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or here-document-to-shell
+though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or shell-program here-document
 invocation is refused unless it is on the reviewed allowlist, as is a wrapped
 interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
 non-literal. A clause whose first word is an assignment whose value holds a
@@ -140,7 +140,7 @@ computed token whose literal suffix names an existing repository file (see
 above).
 
 Installs inside followed JavaScript or TypeScript scripts, node `-e`/`-p` or
-node here-document payloads, and `npm run`/`bun run` targets in `package.json`
+JavaScript stdin here-document programs, and `npm run`/`bun run` targets in `package.json`
 are not inspected; here-document bodies are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including

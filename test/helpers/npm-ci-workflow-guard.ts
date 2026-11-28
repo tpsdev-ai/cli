@@ -1233,8 +1233,8 @@ function quoteStartMask(raw: string[]): boolean[] {
 
 /**
  * Join continuations, strip word-boundary comments and mark here-document body
- * lines. Bodies are kept for the install classifier (a heredoc fed to a shell
- * runs its text); command scanning ignores body lines.
+ * lines. Bodies are kept for the install classifier; command scanning ignores
+ * body lines.
  */
 function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, reason: string) => never) | null = (entry, reason) => {
   throw new Error(`${reason}: ${entry.text} (physical line ${entry.line})`);
@@ -2251,9 +2251,11 @@ function clauseInvocations(
       argument = args[index];
       break;
     }
-    // A heredoc is a redirection, not an option: it supplies the program only when the program comes from stdin.
+    // A real script operand takes precedence over stdin redirection. A `-`
+    // operand without a heredoc is refused. Shell program heredocs are refused;
+    // JS program heredocs are not followed, like `-e`.
     const stdinProgram = argument === undefined || stripOuterQuotes(argument.text) === "-";
-    const heredoc = (stdinProgram ? args.map((token) => stripOuterQuotes(token.text)) : options).find((text) => text.includes("<<"));
+    const heredoc = stdinProgram ? args.map((token) => stripOuterQuotes(token.text)).find((text) => text.includes("<<")) : undefined;
     if (heredoc !== undefined) {
       return SHELL_INTERPRETERS.has(base) ? [{ invocation: { dynamic: heredoc }, embedded: false }] : [];
     }
@@ -2713,7 +2715,7 @@ function embeddedInvocations(word: WalkedWord | null): Invocation[] {
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
     const argument = word.args[index + 1];
     // Unknown => refuse: a wrapped interpreter whose payload is absent,
-    // `-c`/`-s`, or a here-document cannot be resolved to one repository file.
+    // `-c`/`-s`, or a program-supplying here-document cannot be resolved to one repository file.
     if (argument === undefined) {
       found.push({ dynamic: `${text} stdin` });
       continue;

@@ -2978,6 +2978,42 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     expectFollowedInstall(run);
   });
 
+  it.each(["node <<JS scripts/install.sh\nconsole.log(1)\nJS", "bash <<SH scripts/install.sh\nprintf data\nSH"])(
+    "follows a script operand after a heredoc: %s", (run) => {
+      expectFollowedInstall(run);
+    },
+  );
+
+  it("checks with real Bash that -O consumes its value", () => {
+    const root = makeTreeFixture({ "scripts/marker.sh": "printf marker\n" });
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["-O", "extglob", "scripts/marker.sh"], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("marker");
+      expectFollowedInstall("bash -O extglob scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an operand after --, as real Bash does not show its version", () => {
+    const root = makeTreeFixture({});
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["--", "--version"], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).not.toContain("GNU bash, version");
+      expect(() => assertNpmCiWorkflowTree(workflowStep("bash -- --version", "."), new Set(), root, "workflow-options")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not follow a script for a standalone bash version request", () => {
     const root = makeTreeFixture({});
     try {
