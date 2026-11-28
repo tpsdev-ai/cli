@@ -526,6 +526,13 @@ export function updateExistingRecord<T extends object>(
      * finds the record gone returns `gone`; any other failed delete throws.
      */
     remove?: boolean;
+    /**
+     * cli#1098: delete the record unless its PHYSICAL directory (resolved under
+     * the lock, as the identity check below does) is `<root>/<name>`; keep and
+     * rewrite it there. Chosen by identity, not by the path's spelling, so an
+     * aliased path to `cur/` keeps the record.
+     */
+    removeUnlessIn?: string;
   },
 ): UpdateExistingResult<T> {
   path = resolve(path);
@@ -602,14 +609,16 @@ export function updateExistingRecord<T extends object>(
       }
     }
     if (options.snapshot && JSON.stringify(fresh) !== JSON.stringify(options.snapshot)) return { status: "changed" };
-    if (options.withholdPlacement && basename(dirname(path)) === "cur") {
+    const physicallyIn = (name: string): boolean => sameDirectory(realRecordDir, join(realRoot, name));
+    const remove = options.remove ?? (options.removeUnlessIn !== undefined && !physicallyIn(options.removeUnlessIn));
+    if (options.withholdPlacement && physicallyIn("cur")) {
       const reason = placementRefusal(mailboxReplayStore(root), basename(path), (fresh as { envelopeId?: unknown }).envelopeId);
       if (reason !== null) return { status: "withheld", reason };
     }
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
-    if (options.remove) {
+    if (remove) {
       try {
         unlinkSync(path);
       } catch (err: any) {
@@ -2257,7 +2266,6 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
   // or archived outside GC's scan. A new/ or dlq/ record is deleted instead,
   // with nothing written to it first (a later check could promote or re-drive
   // it, and promote() clears a stamp); a failed delete fails the ack.
-  const inCur = basename(dirname(path)) === "cur";
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
     msg.ackedAt = new Date().toISOString();
@@ -2268,7 +2276,7 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { mailboxRoot, remove: !inCur, withholdPlacement: true });
+  }, { mailboxRoot, removeUnlessIn: "cur", withholdPlacement: true });
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;

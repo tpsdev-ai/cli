@@ -4,10 +4,10 @@
  * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { ackMessage, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
+import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
 import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -163,6 +163,19 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(check.stdout).toContain("No new messages.");
     expect(await checkMessages(OWNER)).toEqual([]);
     expect(JSON.parse(readFileSync(curPath(), "utf-8"))).toEqual(acked);
+  });
+
+  test("an ack through an aliased path to cur/ keeps the record, chosen by its physical directory", async () => {
+    sendMessage(OWNER, signedBody("ack me through an alias"), SENDER);
+    expect((await checkMessages(OWNER)).length).toBe(1);
+    const real = curPath();
+    const root = dirname(dirname(real));
+    symlinkSync(dirname(real), join(root, "cur-alias"));
+    const acked = ackMessageAtPath(join(root, "cur-alias", basename(real)), root);
+    expect(acked.ackedAt).toEqual(expect.any(String));
+    // Kept and stamped in cur/, as a literal cur/ path would be; not deleted.
+    expect(existsSync(real)).toBe(true);
+    expect(JSON.parse(readFileSync(real, "utf-8")).ackedAt).toBe(acked.ackedAt);
   });
 
   test("mail check archives an old acked cur/ record before GC can delete it", async () => {
