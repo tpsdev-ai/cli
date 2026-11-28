@@ -24,8 +24,8 @@ export function redactArgs(argv) {
     }
     const tokenAt = arg.indexOf("_authToken");
     if (tokenAt !== -1) {
-      const equalsAt = arg.indexOf("=", tokenAt);
-      const kept = equalsAt === -1 ? tokenAt + "_authToken".length : equalsAt + 1;
+      const tokenEnd = tokenAt + "_authToken".length;
+      const kept = arg[tokenEnd] === "=" ? tokenEnd + 1 : tokenEnd;
       redacted.push(`${arg.slice(0, kept)}[REDACTED]`);
       continue;
     }
