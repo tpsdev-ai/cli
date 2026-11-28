@@ -879,9 +879,9 @@ export function staticWordValue(text: string): string | null {
 }
 
 /**
- * A plain variable word: `$NAME`, `${NAME}` or one with a literal suffix. It is
- * an accepted dynamic form here; the tree scanner resolves such words where it
- * can.
+ * A variable word: `$NAME` or `${NAME}` (optionally indexed), optionally followed
+ * by `/` and any non-space text, which may itself expand. It is an accepted
+ * dynamic form here; the tree scanner resolves such words where it can.
  */
 function isVariableWord(text: string): boolean {
   return /^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}?)(?:\/\S*)?$/.test(stripOuterQuotes(text));
@@ -1423,8 +1423,9 @@ function consumePrefixOptionWords(
   while (index < tokens.length) {
     const token = tokens[index];
     const text = staticWordValue(token.text);
-    // A nonstatic word may expand to an option; the caller refuses it after
-    // a prefix.
+    // A nonstatic word may expand to an option; it is returned to the caller,
+    // which refuses it in a run block (a followed script may skip it without
+    // recording it).
     if (text === null) return index;
     if (!text.startsWith("-") || text === "-") return index;
     if (text === "--") return index + 1;
