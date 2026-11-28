@@ -5,7 +5,7 @@ import { join } from "node:path";
 const DOCKERFILE = join(import.meta.dir, "..", "Dockerfile.test");
 
 test("Dockerfile.test installs with exactly RUN bun install --frozen-lockfile, and names bun install nowhere else", () => {
-  // This pins the text of Dockerfile.test's one dependency install. It does not detect other install spellings (`bun i`, `bun add`, npm) or installs outside this file; runtime enforcement is tracked in #948.
+  // This pins the text of Dockerfile.test's one dependency install. It does not detect other install spellings (`bun i`, `bun add`, npm) or installs outside this file. Runtime enforcement: #948 covers npm and npx in CI jobs; Bun installs and image builds are #1108.
   const content = readFileSync(DOCKERFILE, "utf8");
   const lines = content.split("\n").map((line) => line.trim());
 
