@@ -88,6 +88,13 @@ function makeUnstatable(fresh: string, name: string): string {
   return real;
 }
 
+/** Replace an absent or free name with a self-symlink, with no stat-able window. */
+function makeUnstatableName(fresh: string, name: string): void {
+  const loop = join(fresh, `${name}.loop`);
+  symlinkSync(name, loop);
+  renameSync(loop, join(fresh, name));
+}
+
 /** Put the original inode back over the self-symlink in one rename. */
 function restoreStatable(fresh: string, name: string, real: string): void {
   renameSync(real, join(fresh, name));
@@ -219,6 +226,56 @@ describe("watchMail: an unstat-able new/ entry", () => {
       expect(received).toContain(env.messageId);
       expect(received).toContain(beside.messageId);
       expect(lines.filter((l) => l.includes("dangling.json"))).toHaveLength(0);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it("names an entry again when a successful listing sees it absent, and not while it keeps failing", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let watcher: MailWatcher | undefined;
+    try {
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onMessage: (msg) => { received.push(msg.id); },
+        onPoll: () => { polls++; },
+      });
+      await sleep(60);
+
+      const fresh = getInbox(AGENT).fresh;
+      const env = buildSignedEnvelope(SENDER, AGENT, "readable beside the recurring entry", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      await waitFor(() => received.includes(env.messageId), 5000);
+
+      writeFileSync(join(fresh, "blocked.json"), JSON.stringify(env));
+      const named = () => lines.filter((l) => l.includes("blocked.json ") && l.includes("(ELOOP)"));
+      const real = makeUnstatable(fresh, "blocked.json");
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+
+      // The name is gone entirely: the next successful listing sees it absent,
+      // which ends the continuous failure even though no stat succeeded.
+      rmSync(join(fresh, "blocked.json"));
+      rmSync(real);
+      const absentAt = polls;
+      await waitFor(() => polls - absentAt >= 3, 5000);
+
+      // The same name fails again: a second warning.
+      makeUnstatableName(fresh, "blocked.json");
+      await waitFor(() => named().length === 2, 5000, () => `log: ${lines.join(" | ")}`);
+
+      // The failure persists across further listings: no third warning.
+      const failingAt = polls;
+      await waitFor(() => polls - failingAt >= 4, 5000);
+      expect(named()).toHaveLength(2);
     } finally {
       watcher?.stop();
       logSpy.mockRestore();
