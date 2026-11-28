@@ -3,8 +3,9 @@
  * listing (the scan's or the trim's) with an error other than ENOENT is that
  * entry's problem. Every successful listing of new/ (the scan and the trim)
  * updates the shared warning state; a name is warned once per continuous
- * observed failure, and again only after it stats successfully on a listing and
- * then fails again. The readable records beside it are still presented.
+ * observed failure, and again only after it is absent from, or stats
+ * successfully on, a successful listing and then fails again. The readable
+ * records beside it are still presented.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
