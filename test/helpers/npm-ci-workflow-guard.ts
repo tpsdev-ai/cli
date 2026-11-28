@@ -727,11 +727,11 @@ const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"])
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
 // Command words the guard handles by decoded value: it follows the word,
 // validates its invocation shape, or knows it runs no repository script. A
-// name-shaped quoted or escaped command word whose decoded value is absent is
-// refused. `env` is here for its leading-assignment form: the guard follows
-// leading `NAME=value` and `NAME+=value` assignments and refuses a leading
-// option except a lone `-`; a quoted or escaped assignment, and `env -`, are
-// not followed and not refused, and `builtin` and `hash` are not handled.
+// name-shaped quoted command word whose decoded value is absent is refused.
+// `env` is here for its leading-assignment form: the guard follows leading
+// `NAME=value` assignments and refuses a leading option other than a lone `-`;
+// see the docs' Limits for the `env` forms that are not followed or refused.
+// `builtin` and `hash` are not handled.
 const HANDLED_COMMAND_WORDS = new Set([
   "source", ".", "eval",
   "cd", "pushd", "popd",
@@ -1503,8 +1503,8 @@ function decodedWords(tokens: readonly WordToken[]): WordToken[] {
  * required:
  * an option outside the modelled `env`, `sudo`, `exec` or `xargs` grammar, a leading `env` option other than a lone
  * `-`, a word in `UNRECOGNISED_COMMAND_WORDS`, or a command word beginning with an unquoted `{`
- * is refused. `env` follows leading `NAME=value` and `NAME+=value`
- * assignments; a quoted or escaped assignment and `env -` are not followed. A
+ * is refused. `env` follows leading `NAME=value` assignments; a quoted or
+ * escaped assignment and `env -` are not followed. A
  * word after a prefix with no static value is returned with a null value, so
  * the caller judges it (a run block refuses it; a followed script may skip it
  * without recording it). `refuseWrapper` is supplied only by run-block
@@ -1552,7 +1552,8 @@ function walkCommandWord(
       prefix = text;
       index++;
       if (text === "env") {
-        // Leading NAME=value or NAME+=value assignments, or a lone `-`, then the command.
+        // Leading NAME=value assignments, then the command word. A lone `-` is returned
+        // as the command word, so `env -` stops payload discovery (see the docs' Limits).
         while (index < tokens.length) {
           const word = tokens[index];
           const decoded = staticWordValue(word.text);
@@ -1603,8 +1604,9 @@ function walkCommandWord(
  * Skip variable assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
  * header is not an invocation unless `case` is requested for refusal. Prefix
- * options are consumed from the finite grammar and unmodelled options are
- * refused; this entry point is run-block validation, so a listed wrapper is
+ * options of `env`, `sudo`, `exec` and `xargs` are consumed from their finite
+ * grammars and their unmodelled options are refused; other prefixes' options are
+ * not checked. This entry point is run-block validation, so a listed wrapper is
  * refused too.
  */
 function commandWord(
