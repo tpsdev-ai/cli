@@ -4,7 +4,7 @@
  * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage, updateExistingRecord } from "../src/utils/mail.js";
@@ -213,9 +213,14 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(JSON.parse(readFileSync(archived, "utf-8")).ackedAt).toBe(oldIso);
   });
 
-  test("an ack of a record still in new/ removes it, so a later check presents nothing", async () => {
+  test("an ack of a record still in new/ removes it and leaves a .reason file beside it, so a later check presents nothing", async () => {
     const sent = sendMessage(OWNER, signedBody("acked unread"), SENDER);
+    const reasonPath = `${sent.filePath}.reason`;
+    const reasonBytes = "parked because the relay refused\n";
+    writeFileSync(reasonPath, reasonBytes, "utf-8");
     expect(ackMessage(OWNER, sent.id)?.ackedAt).toEqual(expect.any(String));
+    expect(existsSync(sent.filePath)).toBe(false);
+    expect(readFileSync(reasonPath, "utf-8")).toBe(reasonBytes);
     const inbox = getInbox(OWNER);
     expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json"))).toEqual([]);
     expect(await checkMessages(OWNER)).toEqual([]);
@@ -309,6 +314,100 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(check.stdout).toContain("No new messages.");
     expect(records(inbox.cur)).toEqual([]);
     expect(records(inbox.dlq)).toEqual([]);
+  });
+
+  /** Park the one sent record in dlq/ with its `.reason` sidecar; return the record's path. */
+  async function parkInDlq(): Promise<string> {
+    process.env.FLAIR_URL = "http://127.0.0.1:1";
+    try {
+      expect(await checkMessages(OWNER)).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = stub.url;
+    }
+    const inbox = getInbox(OWNER);
+    const [file] = readdirSync(inbox.dlq).filter((f) => f.endsWith(".json"));
+    expect(file).toBeDefined();
+    return join(inbox.dlq, file!);
+  }
+
+  test("an ack of a dlq/ record also removes its reason sidecar", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    expect(readFileSync(`${parked}.reason`, "utf-8")).toContain("class: verify-unavailable");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
+  });
+
+  test("an ack of a dlq/ record without a reason sidecar succeeds with empty stderr", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    unlinkSync(`${parked}.reason`);
+
+    // --quiet-nono-check: a host without nono (CI) gets the CLI's availability
+    // warning on stderr; this case asserts the ack adds nothing there.
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(ack.stderr).toBe("");
+    expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
+  });
+
+  test("an ack whose reason sidecar cannot be removed still acks and names the sidecar", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    unlinkSync(`${parked}.reason`);
+    // A non-empty directory at the sidecar path fails unlink for every uid,
+    // so this case does not depend on a chmod that root ignores.
+    mkdirSync(`${parked}.reason`);
+    writeFileSync(join(`${parked}.reason`, "keep"), "kept\n", "utf-8");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(ack.stderr).toContain(`${parked}.reason`);
+    expect(readdirSync(getInbox(OWNER).dlq).filter((f) => f.endsWith(".json"))).toEqual([]);
+    expect(readdirSync(`${parked}.reason`)).toEqual(["keep"]);
+  });
+
+  test("an ack removes only the target's reason sidecar, leaving a neighbour and new/ files", async () => {
+    const target = sendMessage(OWNER, signedBody("target"), SENDER);
+    const neighbour = sendMessage(OWNER, signedBody("neighbour"), SENDER);
+    process.env.FLAIR_URL = "http://127.0.0.1:1";
+    try {
+      expect(await checkMessages(OWNER)).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = stub.url;
+    }
+    const inbox = getInbox(OWNER);
+    const dlqRecords = readdirSync(inbox.dlq).filter((f) => f.endsWith(".json"));
+    expect(dlqRecords).toHaveLength(2);
+    const pathById = new Map(
+      dlqRecords.map((f) => [JSON.parse(readFileSync(join(inbox.dlq, f), "utf-8")).id as string, join(inbox.dlq, f)]),
+    );
+    const targetPath = pathById.get(target.id);
+    const neighbourPath = pathById.get(neighbour.id);
+    expect(targetPath).toBeDefined();
+    expect(neighbourPath).toBeDefined();
+    expect(readFileSync(`${neighbourPath!}.reason`, "utf-8")).toContain("class: verify-unavailable");
+
+    // A record in new/ beside a `.reason` file of the same name must survive.
+    const newcomer = JSON.parse(readFileSync(targetPath!, "utf-8"));
+    newcomer.id = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+    const newcomerName = basename(targetPath!);
+    writeFileSync(join(inbox.fresh, newcomerName), JSON.stringify(newcomer, null, 2), "utf-8");
+    writeFileSync(join(inbox.fresh, `${newcomerName}.reason`), "class: unrelated\n", "utf-8");
+
+    const ack = await runCli(["mail", "ack", target.id, "--agent", OWNER, "--quiet-nono-check"], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${target.id}`);
+
+    expect(readdirSync(inbox.dlq).sort()).toEqual([basename(neighbourPath!), `${basename(neighbourPath!)}.reason`].sort());
+    expect(readFileSync(`${neighbourPath!}.reason`, "utf-8")).toContain("class: verify-unavailable");
+    expect(readdirSync(inbox.fresh).sort()).toEqual([newcomerName, `${newcomerName}.reason`].sort());
+    expect(readFileSync(join(inbox.fresh, `${newcomerName}.reason`), "utf-8")).toBe("class: unrelated\n");
   });
 
   test("human output marks a re-delivery once and --json carries the field", async () => {
@@ -426,4 +525,60 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(ack.status).not.toBe(0);
     expect(ack.stderr).toContain("external-tier mail cannot be acknowledged");
   });
+});
+
+test("an ack in new/ succeeds without a dlq/ directory and preserves its sidecar", () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-ack-no-dlq-"));
+  try {
+    const fresh = join(root, "new");
+    mkdirSync(fresh);
+    mkdirSync(join(root, "cur"));
+    const path = join(fresh, "message.json");
+    const reasonPath = `${path}.reason`;
+    const original = JSON.stringify({ id: "message", read: false });
+    writeFileSync(path, original, "utf-8");
+    writeFileSync(reasonPath, "keep\n", "utf-8");
+
+    const withoutDlq = ackMessageAtPath(path, root);
+    expect(withoutDlq.ackedAt).toEqual(expect.any(String));
+    expect(existsSync(path)).toBe(false);
+
+    mkdirSync(join(root, "dlq"));
+    writeFileSync(path, original, "utf-8");
+    expect(ackMessageAtPath(path, root)).toEqual({ ...withoutDlq, ackedAt: expect.any(String) });
+    expect(existsSync(path)).toBe(false);
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("an ack whose dlq/ check fails keeps the record and its sidecar", () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-ack-dlq-check-"));
+  try {
+    const fresh = join(root, "new");
+    mkdirSync(fresh);
+    mkdirSync(join(root, "cur"));
+    // A self-referencing symlink makes stat of dlq/ fail with a code other
+    // than ENOENT for every uid, including root.
+    const dlq = join(root, "dlq");
+    symlinkSync("dlq", dlq);
+    const path = join(fresh, "message.json");
+    const reasonPath = `${path}.reason`;
+    const original = JSON.stringify({ id: "message", read: false });
+    writeFileSync(path, original, "utf-8");
+    writeFileSync(reasonPath, "keep\n", "utf-8");
+
+    expect(() => ackMessageAtPath(path, root)).toThrow();
+    expect(readFileSync(path, "utf-8")).toBe(original);
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+
+    unlinkSync(dlq);
+    mkdirSync(dlq);
+    expect(ackMessageAtPath(path, root).ackedAt).toEqual(expect.any(String));
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+    expect(existsSync(path)).toBe(false);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

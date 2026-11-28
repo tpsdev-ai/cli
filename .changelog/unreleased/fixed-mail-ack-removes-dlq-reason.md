@@ -1,0 +1,1 @@
+- **Acking a `dlq/` record also removes its `<file>.reason` sidecar, when it has one.** The ack unlinks the sidecar together with the record. A missing sidecar is not an error, and any other failure to unlink it is reported on stderr with the sidecar's path while the ack still succeeds.
