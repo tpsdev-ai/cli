@@ -62,9 +62,14 @@ export const TABLE = [
     argv: ["dist-tag", "add", SPEC, "latest", "--registry", REGISTRY],
     callers: ["promote-latest.sh:547", "promote-latest.sh:699"],
   },
-  // docker.yml `meta` job runs .github/scripts/docker-image-tags.sh, whose only
-  // npm call takes the default registry and no flag.
+  // docker.yml `meta` job runs .github/scripts/docker-image-tags.sh, whose npm
+  // reads take the default registry and no flag.
   { job: "meta", argv: ["view", SPEC, "version"], callers: ["docker-image-tags.sh:59"] },
+  {
+    job: "meta",
+    argv: ["view", SPEC, "dist-tags.latest"],
+    callers: ["docker-image-tags.sh:86"],
+  },
   // release.yml `publish-packages` job.
   {
     job: "publish-packages",

@@ -65,8 +65,14 @@ describe("policy table", () => {
     });
   }
 
-  test("the table has 12 shapes", () => {
-    expect(TABLE.length).toBe(12);
+  test("the table has 13 shapes", () => {
+    expect(TABLE.length).toBe(13);
+  });
+
+  test("the meta job allows the dist-tags read and refuses it in another job", () => {
+    expect(decide("npm", ["view", SPEC_VALUE, "version"], "meta").allow).toBe(true);
+    expect(decide("npm", ["view", SPEC_VALUE, "dist-tags.latest"], "meta").allow).toBe(true);
+    expect(decide("npm", ["view", SPEC_VALUE, "dist-tags.latest"], "test").allow).toBe(false);
   });
 
   test("a job not in the table allows only the probe", () => {
