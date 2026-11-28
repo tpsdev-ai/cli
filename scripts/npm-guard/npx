@@ -1,0 +1,11 @@
+#!/bin/sh
+# npx guard shim (cli#948): npx has an empty allowlist, so every call is
+# refused before anything is spawned. No `set -x` here.
+self=$0
+case $self in
+  */*) ;;
+  *) self=$(command -v "$self") ;;
+esac
+[ -n "$self" ] || exit 1
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P) || exit 1
+exec node "$dir/forward.mjs" npx "$@"
