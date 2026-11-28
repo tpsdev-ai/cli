@@ -4,8 +4,8 @@
  * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ackMessage, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
 import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
@@ -163,6 +163,32 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(check.stdout).toContain("No new messages.");
     expect(await checkMessages(OWNER)).toEqual([]);
     expect(JSON.parse(readFileSync(curPath(), "utf-8"))).toEqual(acked);
+  });
+
+  test("mail check archives an old acked cur/ record before GC can delete it", async () => {
+    const sent = sendMessage(OWNER, signedBody("archive before GC"), SENDER);
+    expect(await checkMessages(OWNER)).toHaveLength(1);
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+
+    const path = curPath();
+    const record = JSON.parse(readFileSync(path, "utf-8"));
+    expect(record.ackedAt).toEqual(expect.any(String));
+    const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+    const oldIso = old.toISOString();
+    record.timestamp = oldIso;
+    record.receivedAt = oldIso;
+    record.ackedAt = oldIso;
+    writeFileSync(path, JSON.stringify(record, null, 2), "utf-8");
+    utimesSync(path, old, old);
+
+    const check = await runCheck([OWNER]);
+    expect(check.status, check.stderr).toBe(0);
+    const inbox = getInbox(OWNER);
+    expect(readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))).toEqual([]);
+    const archived = join(inbox.root, "archive", oldIso.slice(0, 7), basename(path));
+    expect(existsSync(archived)).toBe(true);
+    expect(JSON.parse(readFileSync(archived, "utf-8")).ackedAt).toBe(oldIso);
   });
 
   test("an ack of a record still in new/ removes it, so a later check presents nothing", async () => {
