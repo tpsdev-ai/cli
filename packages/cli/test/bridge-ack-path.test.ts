@@ -29,6 +29,10 @@ let stops: Array<() => void>;
 let faults: Array<ReturnType<typeof spyOn>>;
 const path = (dir: string, file = "record.json") => join(root, BRIDGE, dir, file);
 const record = () => JSON.parse(fs.readFileSync(path("cur"), "utf8"));
+/** The bridge's ack stamps the cur/ record and keeps it (cli#1098). */
+const ackedInCur = () => {
+  try { return record().ackedAt !== undefined; } catch { return false; }
+};
 
 beforeEach(() => {
   root = fs.mkdtempSync(join(tmpdir(), "bridge-ack-"));
@@ -92,7 +96,7 @@ for (const [name, queued] of [
     await waitFor(() => running.logs.length > 0);
     expect(running.sent).toHaveLength(1);
     expect(fs.readFileSync(path("new", "pending.json"), "utf8")).toBe(queued!);
-    expect(fs.existsSync(path("cur"))).toBe(false);
+    expect(record().ackedAt).toEqual(expect.any(String));
     expect(running.logs.some((line) => line.includes("Delivery failed"))).toBe(false);
   });
 }
@@ -102,7 +106,7 @@ test("an invalid wrapper id does not interfere with acknowledgement", async () =
   const running = start();
   await waitFor(() => running.logs.length > 0);
   expect(running.sent).toHaveLength(1);
-  expect(fs.existsSync(path("cur"))).toBe(false);
+  expect(record().ackedAt).toEqual(expect.any(String));
 });
 
 test("a partial acknowledgement write failure preserves the sent record on restart", async () => {
@@ -129,22 +133,16 @@ test("a partial acknowledgement write failure preserves the sent record on resta
   expect(running.logs.some((line) => line.includes("Delivery failed"))).toBe(false);
 });
 
-test("a cleanup failure leaves an acknowledged record that is not resent (cli#487)", async () => {
+test("an acknowledged record stays in cur/, and a restart neither resends nor re-claims it (cli#487)", async () => {
   plant();
-  const unlink = fs.unlinkSync;
-  const running = start(() => {
-    running.stop();
-    faults.push(spyOn(fs, "unlinkSync").mockImplementation((file) => {
-      if (file === path("cur")) throw new Error("cleanup fault");
-      return unlink(file);
-    }));
-  });
+  const running = start(() => running.stop());
   await waitFor(() => running.logs.length > 0);
-  expect(record().bridgeSentAt).toEqual(expect.any(String));
-  expect(record().read).toBe(true);
-  expect(record().ackedAt).toEqual(expect.any(String));
-  for (const fault of faults.splice(0)) fault.mockRestore();
+  const acked = record();
+  expect(acked.bridgeSentAt).toEqual(expect.any(String));
+  expect(acked.read).toBe(true);
+  expect(acked.ackedAt).toEqual(expect.any(String));
   await restartWithoutResend();
+  expect(record()).toEqual(acked);
 });
 
 test("a reported send failure can be retried on restart", async () => {
@@ -153,7 +151,7 @@ test("a reported send failure can be retried on restart", async () => {
   await waitFor(() => running.logs.some((line) => line.includes("Delivery failed")));
   expect(record().bridgeSentAt).toBeUndefined();
   const restarted = start();
-  await waitFor(() => !fs.existsSync(path("cur")));
+  await waitFor(ackedInCur);
   expect(restarted.sent).toHaveLength(1);
 });
 
@@ -166,7 +164,7 @@ test("pending wrapper lifecycle fields cannot suppress first delivery", async ()
   pending.bridgeSentAt = "forged";
   fs.writeFileSync(path("new"), JSON.stringify(pending));
   const running = start();
-  await waitFor(() => !fs.existsSync(path("cur")) && running.sent.length === 1);
+  await waitFor(() => ackedInCur() && running.sent.length === 1);
   expect(running.sent).toHaveLength(1);
 });
 
@@ -217,7 +215,7 @@ test("a sent-marker write failure after successful send allows a duplicate on re
   expect(record().bridgeSentAt).toBeUndefined();
   fault.mockRestore();
   const restarted = start();
-  await waitFor(() => !fs.existsSync(path("cur")));
+  await waitFor(ackedInCur);
   expect(restarted.sent).toHaveLength(1);
 });
 
@@ -229,7 +227,7 @@ test("a crash after a legacy start marker but before send delivers on restart", 
   unsent.bridgeSendStartedAt = new Date().toISOString();
   fs.writeFileSync(path("cur"), JSON.stringify(unsent));
   const restarted = start();
-  await waitFor(() => !fs.existsSync(path("cur")));
+  await waitFor(ackedInCur);
   expect(restarted.sent.map((envelope) => envelope.content)).toEqual(["record.json"]);
 });
 
@@ -237,7 +235,7 @@ test("the persisted sent marker is absent until adapter send succeeds", async ()
   plant();
   let duringSend: Record<string, unknown> | undefined;
   const running = start(() => { duringSend = record(); });
-  await waitFor(() => !fs.existsSync(path("cur")) && running.sent.length === 1);
+  await waitFor(() => ackedInCur() && running.sent.length === 1);
   expect(duringSend).toBeDefined();
   expect(duringSend!.bridgeSendStartedAt).toBeUndefined();
   expect(duringSend!.bridgeSentAt).toBeUndefined();
@@ -288,8 +286,9 @@ test("ack holds the shared mail lock while checking for the existing record", ()
 });
 
 
-test("concurrent acknowledgements never recreate the removed cur record", async () => {
-  const target = path("cur");
+test("concurrent acknowledgements never recreate a removed new/ record", async () => {
+  // An ack removes a record only from new/ or dlq/; a cur/ record is kept.
+  const target = path("new");
   fs.writeFileSync(target, JSON.stringify({ id: "wrapper-id", read: false, bridgeSentAt: "sent" }));
   const worker = join(root, "ack-worker.ts");
   fs.writeFileSync(worker, `

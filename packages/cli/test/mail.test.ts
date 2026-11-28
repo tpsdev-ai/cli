@@ -155,7 +155,7 @@ describe("mail utils", () => {
     expect(inboxExists("")).toBe(false);
   });
 
-  test("ackMessage removes the file from cur/", async () => {
+  test("ackMessage stamps the cur/ record and keeps it", async () => {
     const m = sendMessage("kern", signedBody("flint", "kern", "ack-test"), "flint");
     expect(m.to).toBe("kern");
     const inbox = getInbox("kern");
@@ -166,12 +166,15 @@ describe("mail utils", () => {
     const curFilesBefore = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
     expect(curFilesBefore.length).toBe(1);
 
-    // Ack removes it — the wrapper id, which is what ackMessage matches on.
+    // Ack stamps it — the wrapper id, which is what ackMessage matches on.
     const acked = ackMessage("kern", m.id);
     expect(acked).not.toBeNull();
 
     const curFilesAfter = readdirSync(inbox.cur).filter((f) => f.endsWith(".json"));
-    expect(curFilesAfter.length).toBe(0);
+    expect(curFilesAfter).toEqual(curFilesBefore);
+    const kept = JSON.parse(readFileSync(join(inbox.cur, curFilesAfter[0]!), "utf-8"));
+    expect(kept.ackedAt).toBe(acked!.ackedAt);
+    expect(kept.read).toBe(true);
   });
 
   test("countInboxMessages counts new/ only — drops after check (semantic change 2026-05-19)", async () => {
