@@ -1497,9 +1497,9 @@ function decodedWords(tokens: readonly WordToken[]): WordToken[] {
 }
 
 /**
- * Walk a clause's words and return its command word. Prefixes, options and
- * reserved words are recognised by their decoded static value; a quoted or
- * escaped command word matches its plain spelling. `refuse` is required:
+ * Walk a clause's words and return its command word. Prefixes, options,
+ * reserved words and command names are recognised by their decoded static
+ * value. `refuse` is required:
  * an option a prefix does not model, a leading `env` option other than a lone
  * `-`, `builtin` or `hash`, or a command word beginning with an unquoted `{`
  * is refused. `env` follows leading `NAME=value` and `NAME+=value`
@@ -1551,7 +1551,7 @@ function walkCommandWord(
       prefix = text;
       index++;
       if (text === "env") {
-        // Only leading NAME=value assignments, then the command.
+        // Leading NAME=value or NAME+=value assignments, or a lone `-`, then the command.
         while (index < tokens.length) {
           const word = tokens[index];
           const decoded = staticWordValue(word.text);

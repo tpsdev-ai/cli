@@ -35,13 +35,12 @@ A step whose effective shell — its own `shell:`, else its job's
 `bash` is refused unless its run block is a pinned entry; the refusal names the
 step, shell and source line. In an unapproved workflow run block, the guard refuses
 leading redirections and variable assignments containing `<` or `>` before a command word.
-Before any prefix, option, wrapper or command-word matching, the guard computes each
+For prefix, option, wrapper and command-name matching, the guard computes each
 word's static value with bash's quoting rules: inside single quotes every character
 is literal, a backslash included; inside double quotes a backslash escapes only
 `$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
 next character. A word containing a parameter, command, arithmetic or brace expansion, an unescaped backquote, an unquoted `~` or an unquoted glob has no static value.
-Command-word matching reads the static value, so a quoted or escaped command word
-matches its plain spelling. In an unapproved run block, a word with no
+Command-name matching reads the static value. The run-block glob refusal reads the raw word. In an unapproved run block, a word with no
 static value in command position is refused, naming it, except a plain variable
 command word with no prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
 a backslash-newline continuation
@@ -107,7 +106,7 @@ escapes the next character and `$(` and a backtick are literal.
 Limits: variable or substitution indirection such as `n${x}pm` or
 `$(printf n)pm`, and composite-action shells (cli#948), are not covered; the
 parser limits are cited above (cli#975). A quoted or escaped `env` assignment
-and `env -` are not followed and not refused. A followed shell file gets the
+and `env -` are not followed and not refused. Behaviour for a leading `env` `NAME+=value` assignment, an escaped unknown command word and a plain `builtin` is not claimed; no test pins it. A followed shell file gets the
 command-word and prefix-option refusals but not the run-block glob refusal, and
 may skip a nonstatic prefixed word without recording it.
 
