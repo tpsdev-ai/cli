@@ -2,8 +2,9 @@
  * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails in either
  * listing (the scan's or the trim's) with an error other than ENOENT is that
  * entry's problem. Every successful listing of new/ (the scan and the trim)
- * names its unstatable entries; a name is warned once per continuous failure
- * and the readable records beside it are still presented.
+ * updates the shared warning state; a name is warned once per continuous
+ * observed failure, and again only after it stats successfully on a listing and
+ * then fails again. The readable records beside it are still presented.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
