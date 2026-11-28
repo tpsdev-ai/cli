@@ -531,9 +531,16 @@ export function updateExistingRecord<T extends object>(
      * the lock, as the identity check below does) is `<root>/<name>`; keep and
      * rewrite it there. Chosen by identity, not by the path's spelling, so an
      * aliased path to `cur/` keeps the record. An explicit `remove` takes
-     * precedence over this option.
+     * precedence over this option; the mail-redelivery test "an explicit remove
+     * takes precedence over removeUnlessIn for a cur/ record" pins it.
      */
     removeUnlessIn?: string;
+    /**
+     * cli#1104: with a removal, also unlink the `<record>.reason` sidecar a
+     * dlq/ record carries. A missing sidecar is not an error; any other
+     * failure is reported on stderr and does not fail the removal.
+     */
+    removeReasonSidecar?: boolean;
   },
 ): UpdateExistingResult<T> {
   path = resolve(path);
@@ -625,6 +632,16 @@ export function updateExistingRecord<T extends object>(
       } catch (err: any) {
         if (err?.code === "ENOENT") return { status: "gone" };
         throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
+      }
+      if (options.removeReasonSidecar && physicallyIn("dlq")) {
+        const sidecar = `${path}.reason`;
+        try {
+          unlinkSync(sidecar);
+        } catch (err: any) {
+          if (err?.code !== "ENOENT") {
+            console.error(`[mail] could not remove ${sidecar}: ${err?.message ?? String(err)}`);
+          }
+        }
       }
       return { status: "updated", record: updated };
     }
@@ -2277,7 +2294,7 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { mailboxRoot, removeUnlessIn: "cur", withholdPlacement: true });
+  }, { mailboxRoot, removeUnlessIn: "cur", removeReasonSidecar: true, withholdPlacement: true });
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;

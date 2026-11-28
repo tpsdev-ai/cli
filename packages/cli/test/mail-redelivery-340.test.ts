@@ -4,7 +4,7 @@
  * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage, updateExistingRecord } from "../src/utils/mail.js";
@@ -309,6 +309,43 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(check.stdout).toContain("No new messages.");
     expect(records(inbox.cur)).toEqual([]);
     expect(records(inbox.dlq)).toEqual([]);
+  });
+
+  /** Park the one sent record in dlq/ with its `.reason` sidecar; return the record's path. */
+  async function parkInDlq(): Promise<string> {
+    process.env.FLAIR_URL = "http://127.0.0.1:1";
+    try {
+      expect(await checkMessages(OWNER)).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = stub.url;
+    }
+    const inbox = getInbox(OWNER);
+    const [file] = readdirSync(inbox.dlq).filter((f) => f.endsWith(".json"));
+    expect(file).toBeDefined();
+    return join(inbox.dlq, file!);
+  }
+
+  test("an ack of a dlq/ record also removes its reason sidecar", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    expect(readFileSync(`${parked}.reason`, "utf-8")).toContain("class: verify-unavailable");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
+  });
+
+  test("an ack of a dlq/ record without a reason sidecar succeeds and prints nothing", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    const parked = await parkInDlq();
+    unlinkSync(`${parked}.reason`);
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(ack.stderr).toBe("");
+    expect(readdirSync(getInbox(OWNER).dlq)).toEqual([]);
   });
 
   test("human output marks a re-delivery once and --json carries the field", async () => {

@@ -240,7 +240,8 @@ plugin sweeps the store:
 A reply delivered over a route whose delivered record this agent **cannot
 keep** — the wire to a remote branch, the branch-office bridge, and (cli#429
 round 7) a **local** reply, whose record lives in the recipient's maildir where
-the recipient's `promote()` moves it and its ack or gc can remove it —
+the recipient's `promote()` moves it, its ack of an unpromoted record or its gc
+can remove it, and an ack of a promoted `cur/` record leaves it for the scan —
 is receipted so that, when the receipt write succeeds, the obligation loop can
 see that it committed, even after the recipient has consumed the reply. An outbox reply is not: its record stays in
 this host's outbox (`new/` → `sent/`), and the drain quarantining it is a
