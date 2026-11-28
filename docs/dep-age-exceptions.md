@@ -45,7 +45,8 @@ next character. A word containing a parameter, command, arithmetic or brace expa
 Prefix, option and wrapper matching read the static value, so a statically quoted
 spelling matches like an unquoted one. A word with no static value in command
 position is refused, naming it, except a plain variable command word with no
-prefix before it. In unapproved run blocks, a backslash-newline continuation
+prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
+a backslash-newline continuation
 inside a word is refused, naming the physical line. The same command-word walk
 refuses a command word whose first decoded character is an unquoted `{`:
 `''{n,}pm` counts, `'{n,}pm'` does not. A standalone `{` is a group, and

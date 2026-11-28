@@ -5787,3 +5787,74 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     expect(result.stdout).not.toContain("~");
   }, 5_000);
 });
+
+describe("the workflow guard matches command words by decoded value (#941)", () => {
+  const fixture = {
+    "package-lock.json": "{}\n",
+    "scripts/package-lock.json": "{}\n",
+    "scripts/inst.sh": "npm ci\n",
+  };
+
+  function expectTreeRefused(line: string, run: string, tracked: string[], pattern: RegExp) {
+    const root = makeTreeFixture({ ...fixture, ...(run.startsWith("bash scripts/inner.sh") ? { "scripts/inner.sh": `${line}\n` } : {}) });
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(tracked), root, "workflow-command-words")).toThrow(pattern);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const sourced = [
+    ["quoted source", "'source'"],
+    ["escaped source", "sour\\ce"],
+    ["quoted .", "'.'"],
+    ["escaped .", "\\."],
+  ];
+  for (const [label, word] of sourced) {
+    const line = `${word} "scripts/inst.sh"`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`follows ${label} in ${place} and refuses its install`, () => {
+        expectTreeRefused(line, run, [], /cannot bind the npm install to a tracked lockfile/);
+      }, 5_000);
+    }
+  }
+
+  const evaluated = [
+    ["quoted eval", "'eval'"],
+    ["escaped eval", "ev\\al"],
+  ];
+  for (const [label, word] of evaluated) {
+    const line = `${word} 'bash scripts/inst.sh'`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`refuses ${label} in ${place}`, () => {
+        const pattern = place === "a run block"
+          ? /cannot resolve a dynamic script path to one repository file: eval/
+          : /not on UNRESOLVED_INVOCATION_ALLOWLIST/;
+        expectTreeRefused(line, run, [], pattern);
+      }, 5_000);
+    }
+  }
+
+  const changed = [
+    ["quoted cd", "'cd'", /scripts\/package-lock\.json is not a lockfile the gate reads/, /scripts\/package-lock\.json is not a lockfile the gate reads/],
+    ["escaped cd", "c\\d", /scripts\/package-lock\.json is not a lockfile the gate reads/, /scripts\/package-lock\.json is not a lockfile the gate reads/],
+    ["quoted pushd", "'pushd'", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["escaped pushd", "pu\\shd", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["quoted popd", "'popd'", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["escaped popd", "po\\pd", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+  ] as const;
+  for (const [label, word, runPattern, followedPattern] of changed) {
+    const line = `${word} scripts\nbash inst.sh`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`applies ${label} in ${place}`, () => {
+        expectTreeRefused(line, run, ["package-lock.json"], place === "a run block" ? runPattern : followedPattern);
+      }, 5_000);
+    }
+  }
+
+  for (const [place, run] of [["a run block", "'made-up-command' --status"], ["a followed script", "bash scripts/inner.sh"]] as const) {
+    it(`refuses an unknown quoted command word in ${place}`, () => {
+      expectTreeRefused("'made-up-command' --status", run, [], /unrecognised quoted or escaped command word/);
+    }, 5_000);
+  }
+});

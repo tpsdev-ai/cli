@@ -722,6 +722,25 @@ const BUN_SUBCOMMANDS = new Set(["run", "test", "install", "i", "add", "remove",
 const DENO_SUBCOMMANDS = new Set(["run", "test", "task", "install", "cache", "check", "lint", "fmt", "bench", "doc", "info", "eval", "repl", "publish", "compile", "coverage"]);
 const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"]);
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
+// Command words the guard handles by decoded value: it follows the word,
+// validates its invocation shape, or knows it runs no repository script. A
+// name-shaped quoted or escaped spelling whose decoded value is absent is
+// refused.
+const HANDLED_COMMAND_WORDS = new Set([
+  "source", ".", "eval",
+  "cd", "pushd", "popd",
+  "bash", "sh", "zsh", "dash", "ksh", "node", "bun", "deno", "tsx",
+  "npm", "npx", "su",
+  "env", "command", "exec", "sudo", "xargs", "nohup", "time",
+  "[", "[[",
+  "docker", "setsid", "timeout", "nice", "chroot", "stdbuf",
+  "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch", "builtin", "hash",
+]);
+
+/** The decoded static command word the guard compares, or null when it has none. */
+function decodedCommandWord(word: WalkedWord): string | null {
+  return word.value;
+}
 
 // Finite prefix-option grammars for unapproved run blocks. Unlisted options
 // refuse the step: guessing an option's arity can turn its value into the
@@ -2176,21 +2195,21 @@ function clauseInvocations(
   if (word === null) return embedded();
   const quote = word.token.text[0];
   if ((quote === "'" || quote === '"') && !word.token.text.endsWith(quote)) return embedded();
-  const command = word.value ?? stripOuterQuotes(word.token.text);
-  const base = command.split("/").pop() ?? command;
+  const command = decodedCommandWord(word);
+  const base = command === null ? "" : command.split("/").pop() ?? command;
   // A reserved word the guard does not model is never a command it can judge.
-  if (!word.token.quoted && SHELL_RESERVED.has(command)) {
+  if (command !== null && SHELL_RESERVED.has(command)) {
     return [{ invocation: { dynamic: command }, embedded: false }];
   }
-  if (!word.token.quoted && (command === "source" || command === ".")) {
+  if (command === "source" || command === ".") {
     const argument = firstNonFlag(word.args);
     found.push({ invocation: argument === undefined ? { dynamic: command } : resolveInvocation(ctx, state, argument, at), embedded: false });
     return found;
   }
-  if (!word.token.quoted && command === "eval") return [{ invocation: { dynamic: "eval" }, embedded: false }];
-  if (!word.token.quoted && (command === "cd" || command === "pushd" || command === "popd")) return [];
-  if (!word.token.quoted && (base === "npm" || base === "npx")) return [];
-  if (!word.token.quoted && command === "su") {
+  if (command === "eval") return [{ invocation: { dynamic: "eval" }, embedded: false }];
+  if (command === "cd" || command === "pushd" || command === "popd") return [];
+  if (base === "npm" || base === "npx") return [];
+  if (command === "su") {
     const args = word.args.map((token) => stripOuterQuotes(token.text));
     return args.includes("-c") ? [{ invocation: { dynamic: "-c" }, embedded: false }] : [];
   }
@@ -2231,8 +2250,9 @@ function clauseInvocations(
     if (argument === undefined) return [{ invocation: { dynamic: "stdin" }, embedded: false }];
     return [{ invocation: resolveInvocation(ctx, state, argument, at), embedded: false }];
   }
-  if (SCRIPT_EXTENSION.test(command)) {
-    return [{ invocation: resolveInvocation(ctx, state, { ...word.token, text: command }, at), embedded: false }];
+  const spelled = command ?? stripOuterQuotes(word.token.text);
+  if (SCRIPT_EXTENSION.test(spelled)) {
+    return [{ invocation: resolveInvocation(ctx, state, { ...word.token, text: spelled }, at), embedded: false }];
   }
   return embedded();
 }
@@ -2309,9 +2329,14 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
         }
         throw new Error(`${lineAt(state, number)}: cannot establish the command word: ${word.token.text}: ${entry.text}`);
       }
+      if (word !== null && word.value !== null && /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(word.value) &&
+          word.value !== word.token.text && !HANDLED_COMMAND_WORDS.has(word.value) &&
+          !SCRIPT_EXTENSION.test(word.value)) {
+        throw new Error(`${lineAt(state, number)}: unrecognised quoted or escaped command word: ${word.token.text}: ${entry.text}`);
+      }
       if (word !== null) {
-        const command = word.value ?? stripOuterQuotes(word.token.text);
-        if (!word.token.quoted && command === "cd") {
+        const command = decodedCommandWord(word);
+        if (command === "cd") {
           const argument = firstNonFlag(word.args);
           const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
           const at = state.source === "run-block" ? `${state.label}: ${entry.text}` : lineAt(state, number);
@@ -2327,7 +2352,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
           }
           continue;
         }
-        if (!word.token.quoted && (command === "pushd" || command === "popd")) {
+        if (command === "pushd" || command === "popd") {
           state.cwdUnknown = true;
           continue;
         }
@@ -2343,9 +2368,8 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       // substitution. With more words after it the clause is a prefix
       // environment assignment plus a command, and the value cannot be
       // evaluated, so the clause is refused: a run block throws and a followed
-      // script records an unresolved entry. An unquoted `cd`, `pushd` or
-      // `popd` clause is handled above and continues before this check, so it
-      // is not refused
+      // script records an unresolved entry. A `cd`, `pushd` or `popd` clause is
+      // handled above and continues before this check, so it is not refused
       // (cli#975). An assignment-only clause is judged
       // by that substitution's own scan below. A value the lexer cannot close
       // (nested quotes, cli#975) keeps the earlier skip: its clause words are
@@ -2770,8 +2794,15 @@ function invocationsIn(line: string, found: Invocation[] = [], seen = new Set<st
   };
   const tokens = shellTokens(line);
   const scriptFile = new RegExp(String.raw`^${SCRIPT_FILE}$`);
-  const isCommandWord = (token: ShellToken) => !token.quoted && /^(?:bash|sh|node|bun)$/.test(token.text);
-  const isScriptWord = (token: ShellToken | undefined) => token !== undefined && !token.quoted && scriptFile.test(token.text);
+  const isCommandWord = (token: ShellToken) => {
+    const value = staticWordValue(token.text);
+    return value !== null && /^(?:bash|sh|node|bun)$/.test(value);
+  };
+  const isScriptWord = (token: ShellToken | undefined) => {
+    if (token === undefined) return false;
+    const value = staticWordValue(token.text);
+    return value !== null && scriptFile.test(value);
+  };
   const isCommandPosition = (index: number): boolean => {
     if (index === 0) return true;
     const previous = tokens[index - 1].text;
@@ -2790,18 +2821,19 @@ function invocationsIn(line: string, found: Invocation[] = [], seen = new Set<st
           found.push({ dynamic: argument.text });
         }
       } else if (isScriptWord(argument)) {
-        add(argument.text);
+        add(staticWordValue(argument.text)!);
       }
       continue;
     }
     if (!isCommandPosition(index)) continue;
-    if (!token.quoted && (token.text === "source" || token.text === ".")) {
+    const value = staticWordValue(token.text);
+    if (value === "source" || value === ".") {
       const argument = tokens[index + 1];
-      if (isScriptWord(argument)) add(argument.text);
+      if (isScriptWord(argument)) add(staticWordValue(argument!.text)!);
       continue;
     }
-    if (!token.quoted && token.text.startsWith("./") && scriptFile.test(token.text)) {
-      add(token.text);
+    if (value !== null && value.startsWith("./") && scriptFile.test(value)) {
+      add(value);
       continue;
     }
     if ((token.quoted || /^\$/.test(token.text)) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
