@@ -381,11 +381,15 @@ export class MailRecordLayoutError extends Error {
 const RECORD_DIR_NAMES = ["new", "cur", "dlq"] as const;
 
 /**
- * Whether `recordDir` is the same directory (device and inode) as one of
- * `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
- * spelled through a symlink or a different letter case valid.
+ * Whether `recordDir` is the same directory (device and inode) as EXACTLY ONE
+ * of `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
+ * spelled through a symlink or a different letter case valid. A directory
+ * that matches more than one of the reserved names is refused: the ack's
+ * keep-or-delete choice depends on which reserved name the record sits
+ * under, so an ambiguous layout must not be updated.
  */
 function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
+  let matches = 0;
   for (const name of RECORD_DIR_NAMES) {
     let candidate: string;
     try {
@@ -393,9 +397,9 @@ function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
     } catch {
       continue;
     }
-    if (sameDirectory(recordDir, candidate)) return true;
+    if (sameDirectory(recordDir, candidate)) matches++;
   }
-  return false;
+  return matches === 1;
 }
 
 /** The exact name updateExistingRecord writes beside a record it replaces. */
@@ -531,9 +535,16 @@ export function updateExistingRecord<T extends object>(
      * the lock, as the identity check below does) is `<root>/<name>`; keep and
      * rewrite it there. Chosen by identity, not by the path's spelling, so an
      * aliased path to `cur/` keeps the record. An explicit `remove` takes
-     * precedence over this option.
+     * precedence over this option; the mail-redelivery test "an explicit remove
+     * takes precedence over removeUnlessIn for a cur/ record" pins it.
      */
     removeUnlessIn?: string;
+    /**
+     * cli#1104: with a removal, also unlink a `dlq/` record's `<record>.reason`
+     * sidecar, when it has one. A missing sidecar is not an error; any other
+     * failure to unlink it is reported on stderr and does not fail the removal.
+     */
+    removeReasonSidecar?: boolean;
   },
 ): UpdateExistingResult<T> {
   path = resolve(path);
@@ -620,11 +631,30 @@ export function updateExistingRecord<T extends object>(
     if (updated === null) return { status: "changed" };
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
     if (remove) {
+      // Before the record's unlink, so an error rethrown here leaves the record.
+      let inDlq = false;
+      if (options.removeReasonSidecar) {
+        try {
+          inDlq = physicallyIn("dlq");
+        } catch (err: any) {
+          if (err?.code !== "ENOENT" || err?.path !== join(realRoot, "dlq")) throw err;
+        }
+      }
       try {
         unlinkSync(path);
       } catch (err: any) {
         if (err?.code === "ENOENT") return { status: "gone" };
         throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
+      }
+      if (inDlq) {
+        const sidecar = `${path}.reason`;
+        try {
+          unlinkSync(sidecar);
+        } catch (err: any) {
+          if (err?.code !== "ENOENT") {
+            console.error(`[mail] could not remove ${sidecar}: ${err?.message ?? String(err)}`);
+          }
+        }
       }
       return { status: "updated", record: updated };
     }
@@ -2277,7 +2307,7 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { mailboxRoot, removeUnlessIn: "cur", withholdPlacement: true });
+  }, { mailboxRoot, removeUnlessIn: "cur", removeReasonSidecar: true, withholdPlacement: true });
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;

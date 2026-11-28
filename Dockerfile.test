@@ -47,8 +47,14 @@ COPY package.json bun.lock* tsconfig*.json ./
 COPY packages/cli/package.json packages/cli/tsconfig.json ./packages/cli/
 COPY packages/cli/scripts/ ./packages/cli/scripts/
 COPY packages/agent/package.json packages/agent/tsconfig.json ./packages/agent/
+# cli#1102: bun.lock lists the cli-<platform> packages as workspaces; their
+# manifests must be on disk or the frozen install fails.
+COPY packages/cli-darwin-arm64/package.json ./packages/cli-darwin-arm64/
+COPY packages/cli-darwin-x64/package.json ./packages/cli-darwin-x64/
+COPY packages/cli-linux-arm64/package.json ./packages/cli-linux-arm64/
+COPY packages/cli-linux-x64/package.json ./packages/cli-linux-x64/
 
-RUN bun install --frozen-lockfile 2>/dev/null || bun install
+RUN bun install --frozen-lockfile
 
 # Copy all source
 COPY . .
