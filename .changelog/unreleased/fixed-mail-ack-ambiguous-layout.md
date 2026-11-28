@@ -1,0 +1,1 @@
+- **An ack refuses a record whose directory is more than one reserved maildir directory.** When `new/`, `cur/` or `dlq/` is the same directory as another of them, acking a record there fails with the mailbox layout error instead of reporting success, and the record is left untouched. ([#1109](https://github.com/tpsdev-ai/cli/issues/1109))

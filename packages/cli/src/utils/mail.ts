@@ -381,11 +381,15 @@ export class MailRecordLayoutError extends Error {
 const RECORD_DIR_NAMES = ["new", "cur", "dlq"] as const;
 
 /**
- * Whether `recordDir` is the same directory (device and inode) as one of
- * `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
- * spelled through a symlink or a different letter case valid.
+ * Whether `recordDir` is the same directory (device and inode) as EXACTLY ONE
+ * of `root`'s `new/`, `cur/` and `dlq/` directories. Identity keeps an alias
+ * spelled through a symlink or a different letter case valid. A directory
+ * that matches more than one of the reserved names is refused: the ack's
+ * keep-or-delete choice depends on which reserved name the record sits
+ * under, so an ambiguous layout must not be updated.
  */
 function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
+  let matches = 0;
   for (const name of RECORD_DIR_NAMES) {
     let candidate: string;
     try {
@@ -393,9 +397,9 @@ function isMaildirRecordDirectory(recordDir: string, root: string): boolean {
     } catch {
       continue;
     }
-    if (sameDirectory(recordDir, candidate)) return true;
+    if (sameDirectory(recordDir, candidate)) matches++;
   }
-  return false;
+  return matches === 1;
 }
 
 /** The exact name updateExistingRecord writes beside a record it replaces. */
