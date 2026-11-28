@@ -27,6 +27,7 @@ import { homedir, tmpdir } from "node:os";
 import * as ed from "@noble/ed25519";
 import { createHash, randomUUID } from "node:crypto";
 import { signEnvelope, verifyEnvelope, type Envelope, type ChainEntry } from "@tpsdev-ai/agent";
+import { ackMessage as ackMessageCli, checkMessages as checkMessagesCli, verifyMailAction as verifyMailActionCli } from "@tpsdev-ai/cli/utils/mail";
 
 import { hashes } from "@noble/ed25519";
 hashes.sha512 = (message: Uint8Array) => new Uint8Array(createHash("sha512").update(message).digest());
@@ -1013,6 +1014,105 @@ describe("openclaw-tps-mail: reply OBLIGATION (slice S2)", () => {
     expect(cur?.ackedAt).toBeDefined();
     await h.stop();
   }, 30000);
+
+  // ── cli#1098 ─────────────────────────────────────────────────────────────────
+  // agent-a owes the reply; agent-b sent the inbound. The reply is sent with the
+  // delivery prompt's own command through the real CLI. Where a case consumes
+  // agent-b's copy, it calls what `tps mail check` and `tps mail ack` call: the
+  // CLI's checkMessages, then verifyMailAction and ackMessage.
+  const AGENT_A = "agent-a";
+  const AGENT_B = "agent-b";
+
+  async function startForReply(): Promise<Awaited<ReturnType<typeof start>>> {
+    writeFileSync(join(tempKeysDir, `${AGENT_A}.key`), ANVIL_SEED);
+    const h = await start(AGENT_A, AGENT_B, { localSender: true });
+    await pollUntil(() => h.dispatched !== null, 4000);
+    return h;
+  }
+
+  function sendPrintedReply(h: { dispatched: any }): void {
+    const suggestion = /^Reply via: (.+)$/m.exec(h.dispatched.ctx.BodyForAgent as string)?.[1];
+    expect(suggestion).toContain("--reply-to=");
+    const shimDir = join(tempHome, "shim-bin");
+    mkdirSync(shimDir, { recursive: true });
+    const cliBin = resolve(import.meta.dir, "../../../packages/cli/bin/tps.ts");
+    writeFileSync(join(shimDir, "tps"), `#!/bin/sh\nexec bun '${cliBin.replace(/'/g, "'\\''")}' "$@"\n`, { mode: 0o755 });
+    const run = spawnSync("/bin/sh", ["-c", suggestion!.replace('"<your response>"', '"a CLI reply"')], {
+      cwd: tempHome,
+      env: { ...process.env, TPS_AGENT_ID: AGENT_A, PATH: `${shimDir}:${process.env.PATH ?? ""}` },
+      encoding: "utf-8",
+      timeout: 20000,
+    });
+    expect(run.status, run.stderr || run.stdout).toBe(0);
+  }
+
+  /** agent-b checks its mail (the reply moves new/ → cur/) and, with `ack`, acks the reply. */
+  async function recipientConsumes(ack: boolean): Promise<void> {
+    const prevMailDir = process.env.TPS_MAIL_DIR;
+    process.env.TPS_MAIL_DIR = tempMailDir;
+    try {
+      const checked = await checkMessagesCli(AGENT_B);
+      expect(checked.map((m) => m.from)).toEqual([AGENT_A]);
+      if (ack) {
+        await verifyMailActionCli(AGENT_B, checked[0]!.id);
+        expect(ackMessageCli(AGENT_B, checked[0]!.id)?.ackedAt).toEqual(expect.any(String));
+      }
+    } finally {
+      if (prevMailDir === undefined) delete process.env.TPS_MAIL_DIR; else process.env.TPS_MAIL_DIR = prevMailDir;
+    }
+    expect(newFiles(AGENT_B)).toEqual([]);
+  }
+
+  function yieldAndSettle(h: { obligationId: () => string | null; settle: () => void }): void {
+    capturedSubscription.handle({ runId: h.obligationId()!, seq: 1, stream: "lifecycle", ts: Date.now(), data: { yielded: true }, sessionKey: "s" });
+    h.settle();
+  }
+
+  const settled = (inboundId: string) => ["acked", "failed", "unconfirmed"].includes(obligationFile(AGENT_A, inboundId)?.state);
+
+  function expectAckedWithoutNack(inboundId: string): void {
+    expect(obligationFile(AGENT_A, inboundId)?.state, JSON.stringify(obligationFile(AGENT_A, inboundId))).toBe("acked");
+    expect(curRecord(AGENT_A)?.ackedAt).toBeDefined();
+    expect(curRecord(AGENT_A)?.nackedAt).toBeUndefined();
+    expect(nackMailsIn(resolve(tempMailDir, AGENT_B, "new"))).toEqual([]);
+  }
+
+  it.each([["acked", true], ["checked, not acked", false]] as const)("cli#1098: post-turn scan: a CLI reply the recipient consumed before settlement acks the obligation (recipient's copy %s)", async (_copy, ack) => {
+    // The deadline falls after this test's polls: the post-turn scan settles it.
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "60000";
+    const h = await startForReply();
+    sendPrintedReply(h);
+    await recipientConsumes(ack);
+    yieldAndSettle(h);
+    await pollUntil(() => settled(h.inboundId), 4000);
+    expectAckedWithoutNack(h.inboundId);
+    await h.stop();
+  }, 40000);
+
+  it.each([["acked", true], ["not consumed", false]] as const)("cli#1098: deadline scan: a CLI reply sent after the post-turn scan acks the obligation (recipient's copy %s)", async (_copy, ack) => {
+    process.env.TPS_OBLIGATION_DEADLINE_MS = "4000";
+    const h = await startForReply();
+    // The run yields with nothing sent: the post-turn scan finds nothing and
+    // arms the deadline. The reply is sent once that arm has begun.
+    let scanned = false;
+    let armedAfterScan = false;
+    setBeforeReceiptScanForTests((id) => { if (id === h.inboundId) scanned = true; });
+    setBeforeArmReadForTests((id) => { if (id === h.inboundId && scanned) armedAfterScan = true; });
+    try {
+      yieldAndSettle(h);
+      expect(await pollUntil(() => armedAfterScan, 4000)).toBe(true);
+    } finally {
+      setBeforeReceiptScanForTests(undefined);
+      setBeforeArmReadForTests(undefined);
+    }
+    expect(obligationFile(AGENT_A, h.inboundId)?.state).toBe("yielded");
+    sendPrintedReply(h);
+    if (ack) await recipientConsumes(true);
+    expect(obligationFile(AGENT_A, h.inboundId)?.state).toBe("yielded");
+    await pollUntil(() => settled(h.inboundId), 10000);
+    expectAckedWithoutNack(h.inboundId);
+    await h.stop();
+  }, 40000);
 
   // ── F-S2j ──────────────────────────────────────────────────────────────────
   it("F-S2j: a remote recipient's marker is found in the outbox; a cross-account match is rejected", async () => {

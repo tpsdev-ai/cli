@@ -145,7 +145,9 @@ test("helper returns gone without invoking mutate or writing", () => {
   expect(fs.readdirSync(mail.getInbox(agent).cur)).toEqual([]);
 });
 
-test("nack and ack interleaving never recreates the removed record", async () => {
+test("nack and ack interleaving never recreates a removed new/ record", async () => {
+  // An ack removes a record only from new/ or dlq/; a cur/ record is kept (cli#1098).
+  const target = join(mail.getInbox(agent).fresh, "record.json");
   fs.writeFileSync(target, JSON.stringify({ id: "record-id", body: "hello", read: false }));
   const worker = join(root, "worker.ts");
   fs.writeFileSync(worker, `

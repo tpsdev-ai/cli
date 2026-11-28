@@ -93,7 +93,12 @@ test("bridge outbound dispatch and cur recovery refuse external mail before adap
     await core.start();
     await sleep(200);
     expect(delivered).toEqual(["fresh-internal"]);
-    expect(readdirSync(inbox.cur).filter((f) => f.endsWith(".json")).sort()).toEqual(["fresh-external.json", "recover-external.json"]);
+    // The forwarded internal record stays in cur/, stamped by the ack (cli#1098); the external ones are not acked.
+    expect(readdirSync(inbox.cur).filter((f) => f.endsWith(".json")).sort()).toEqual(["fresh-external.json", "fresh-internal.json", "recover-external.json"]);
+    const ackedAt = (file: string) => JSON.parse(readFileSync(join(inbox.cur, file), "utf8")).ackedAt;
+    expect(ackedAt("fresh-internal.json")).toEqual(expect.any(String));
+    expect(ackedAt("fresh-external.json")).toBeUndefined();
+    expect(ackedAt("recover-external.json")).toBeUndefined();
   } finally {
     await core?.stop(); stub.stop(); process.env = saved; rmSync(root, { recursive: true, force: true });
   }

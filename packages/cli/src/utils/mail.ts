@@ -520,6 +520,20 @@ export function updateExistingRecord<T extends object>(
      * `envelopeId`) and refuse with `withheld` instead of mutating.
      */
     withholdPlacement?: boolean;
+    /**
+     * Delete the record instead of rewriting it: `mutate` still runs and its
+     * result is returned as `updated`; nothing is written first. A delete that
+     * finds the record gone returns `gone`; any other failed delete throws.
+     */
+    remove?: boolean;
+    /**
+     * cli#1098: delete the record unless its PHYSICAL directory (resolved under
+     * the lock, as the identity check below does) is `<root>/<name>`; keep and
+     * rewrite it there. Chosen by identity, not by the path's spelling, so an
+     * aliased path to `cur/` keeps the record. An explicit `remove` takes
+     * precedence over this option.
+     */
+    removeUnlessIn?: string;
   },
 ): UpdateExistingResult<T> {
   path = resolve(path);
@@ -596,13 +610,24 @@ export function updateExistingRecord<T extends object>(
       }
     }
     if (options.snapshot && JSON.stringify(fresh) !== JSON.stringify(options.snapshot)) return { status: "changed" };
-    if (options.withholdPlacement && basename(dirname(path)) === "cur") {
+    const physicallyIn = (name: string): boolean => sameDirectory(realRecordDir, join(realRoot, name));
+    const remove = options.remove ?? (options.removeUnlessIn !== undefined && !physicallyIn(options.removeUnlessIn));
+    if (options.withholdPlacement && physicallyIn("cur")) {
       const reason = placementRefusal(mailboxReplayStore(root), basename(path), (fresh as { envelopeId?: unknown }).envelopeId);
       if (reason !== null) return { status: "withheld", reason };
     }
     const updated = mutate(fresh);
     if (updated === null) return { status: "changed" };
     if (!lstatSync(path).isFile()) throw new MailRecordFileTypeError(path);
+    if (remove) {
+      try {
+        unlinkSync(path);
+      } catch (err: any) {
+        if (err?.code === "ENOENT") return { status: "gone" };
+        throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
+      }
+      return { status: "updated", record: updated };
+    }
     fd = openSync(scratchPath, "wx", 0o600);
     writeFileSync(fd, JSON.stringify(updated, null, 2), "utf-8");
     fsyncSync(fd);
@@ -2236,6 +2261,12 @@ export function setBridgeSentAtPath(path: string, sentAt: string, mailboxRoot: s
 }
 
 export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage {
+  // cli#1098: an acked cur/ record is kept, stamped, as the openclaw-tps-mail
+  // ack keeps it, so a reply obligation's receipt scan still finds a delivered
+  // reply after the recipient acks it; the record can later be removed by GC
+  // or archived outside GC's scan. A new/ or dlq/ record is deleted instead,
+  // with nothing written to it first (a later check could promote or re-drive
+  // it, and promote() clears a stamp); a failed delete fails the ack.
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
     msg.ackedAt = new Date().toISOString();
@@ -2246,18 +2277,7 @@ export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage
     delete msg.checkedOutBy;
     delete msg.retryAfter;
     return msg;
-  }, { mailboxRoot, afterWrite: () => {
-    // Remove the file from cur/ now that it's acked. There is NO ack audit trail
-    // behind this: `logEvent()` writes to the mailbox `archive.db` (archive.ts),
-    // whose event set is only "sent" | "read" | "listed" — there is no "ack"
-    // event. No durable ack audit trail is guaranteed (if the unlink below fails,
-    // the ackedAt marker written above stays in the file), and nothing binds an archive row to the record's
-    // verification verdict or `envelopeId`. (Logging an event before the unlink
-    // would be better, but it would not be an ack trail without an ack event type
-    // and that binding — so the comment says what is true rather than claiming a
-    // trail we do not have.)
-    try { unlinkSync(path); } catch { /* best effort — don't fail ack if cleanup fails */ }
-  }, withholdPlacement: true });
+  }, { mailboxRoot, removeUnlessIn: "cur", withholdPlacement: true });
   if (result.status === "withheld") throw new Error(`mail action refused: ${result.reason}; not acked`);
   if (result.status !== "updated") throw new Error(`ENOENT: mail record gone: ${path}`);
   return result.record;
