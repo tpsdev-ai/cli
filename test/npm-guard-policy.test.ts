@@ -532,6 +532,7 @@ describe("shims", () => {
 const fs = require("node:fs");
 const log = process.env.FAKE_NPM_LOG;
 if (log) fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.env.FAKE_NPM_OUT) { process.stdout.write(process.env.FAKE_NPM_OUT); process.stderr.write(process.env.FAKE_NPM_OUT + "-err"); }
 process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
 `;
 
@@ -593,6 +594,20 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
     });
     expect(result.status).toBe(7);
     expect(loggedCalls(logPath)).toEqual([["--version"]]);
+  });
+
+  test("the recorded npm's stdout and stderr reach the shim's own streams", () => {
+    const { root, logPath } = makeGuardRoot();
+    const result = runShim("npm", ["view", SPEC_VALUE, "version"], {
+      GITHUB_JOB: "meta",
+      [ROOT_ENV]: root,
+      FAKE_NPM_LOG: logPath,
+      FAKE_NPM_OUT: "1.2.3",
+    });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("1.2.3");
+    expect(result.stderr).toContain("1.2.3-err");
+    expect(loggedCalls(logPath)).toEqual([["view", SPEC_VALUE, "version"]]);
   });
 
   test("a refused shape exits nonzero and the fake npm never runs", () => {
