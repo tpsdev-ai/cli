@@ -28,8 +28,15 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
   `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
   a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
 
-Refusals name the workflow, job, step and physical line. Variable or substitution
-indirection such as `n${x}pm` and `$(printf n)pm` is outside this spelling check.
+Refusals name the workflow, job, step and physical line.
+
+A step whose effective shell (its own `shell:`, else its job's
+`defaults.run.shell`, else the workflow's) is not `bash` is refused unless its
+run block is a pinned entry. In unapproved run blocks and the shell files they
+follow, the guard refuses further command-word shapes. The shapes it refuses are
+the `#941` cases in `test/check-dep-ages.test.ts`; this page does not restate
+them. It is a best-effort lint over reviewed changes and does not model compound
+commands, so a shape those tests do not name may pass (see Limits below).
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
@@ -37,7 +44,7 @@ tracks `cd` through one resolution state, scans command substitutions (`$(...)`
 and backtick spans, each with its own `cd` and nested state; one left-to-right
 lexer carries quote state and span nesting together, so a substitution body
 whose own lexing ends inside a quote or an unclosed span on its own logical line
-is refused rather than skipped; a line that ends inside a quote at the end of a
+is refused rather than skipped; without a here-document header, a line that ends inside a quote at the end of a
 run block or script is not refused (bash fails it with a syntax error), and the
 passes that track quotes outside this lexer are a known limit (cli#975); a
 substitution that does not close on its logical line is not followed; a
@@ -47,26 +54,33 @@ and literal invocations, and follows scripts. A run block and a followed script
 differ in their initial state: the install classifier runs on followed shell
 files, and a run block's lines are screened by the physical-line check above.
 A clause whose first word is `if`, `while`, `until`, `then`, `elif`, `else`,
-`do`, `!` or the `time` prefix is judged at its next word; `for`, `case` and
-`select` headers are not invocations (their command substitutions are scanned
-as usual); any other shell reserved word the guard does not model makes the
+`do` or `!` is judged at its next word. In followed shell
+files, the `time` prefix is skipped, and `for`, `case` and `select` headers are not invocations; in run blocks,
+`for` and `select` headers are not invocations; in unapproved run blocks, `case`
+in command position is refused (see above). Command substitutions in accepted headers are scanned as usual. Any other shell reserved word the guard does not model makes the
 clause unresolved. An `npx` invocation in a workflow or composite-action
 `run:` block is not classified by either pass. Here-document bodies are
 install-screened;
-a here-document passed to a shell is refused rather than executed; a `<<<`
-here-string and a `<<` inside `$((...))` also match the header pattern, so the
-lines below them are treated as a here-document body (cli#975). It refuses what it cannot
+for a shell in command position (in a run block or a followed script), a here-document used as its program (without a script operand or with `-`) is refused; a wrapped shell inside a followed script is not modelled for this (cli#975). In unapproved run blocks and followed shell files, an unclassified here-document header (including a continuation or quote) or body boundary refuses scanning, naming the physical line. Only unquoted `<<`/`<<-` operator tokens start here-documents; quoted `<<` text does not queue a delimiter. Modelled headers are single-line simple-command redirections with bare, single-quoted or double-quoted `[A-Za-z_][A-Za-z0-9_]*` delimiters, queued in source order; run-block headers must be top-level. Unquoted bodies join backslash-newline before delimiter comparison; quoted bodies compare literally; `<<-` strips leading tabs. Literal brackets in `${...}` defaults do not hide a following header; nested expansions stay opaque. It refuses what it cannot
 resolve in the shapes it parses; a prefix assignment whose value the lexer
 cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
 it cannot resolve is refused unless a reviewed allowlist entry names it; an
-unresolved-invocation refusal names the step and the invocation path. It is not a boundary
-against an author who deliberately evades it; review is, and a runtime npm
-guard in CI is the structural fix, tracked separately (cli#948). Installs inside
+unresolved-invocation refusal names the step and the invocation path. It is a fail-closed lint over reviewed workflow changes, not a boundary against
+an author who deliberately evades it; runtime enforcement of every install is
+cli#948. Installs inside
 followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
 `package.json` are not inspected. A `$'...'` span is a quote in which a backslash
 escapes the next character and `$(` and a backtick are literal.
+
+Limits: variable or substitution indirection such as `n${x}pm` or
+`$(printf n)pm`, and composite-action shells (cli#948), are not covered; the
+parser limits are cited above (cli#975). A quoted or escaped `env` assignment
+and `env -` are not followed and not refused. Behaviour for a leading `env` `NAME+=value` assignment, an escaped unknown command word and a plain `builtin` is not claimed; no test pins it. A followed shell file does not get the run-block
+glob refusal, and may skip a nonstatic prefixed word without recording it.
+Options of a prefix without a modelled option grammar (for example `command`
+or `nohup`) are not checked.
 
 In a followed shell script, a logical line (continuations joined, word-boundary
 comments stripped, here-document headers matched after comment stripping,
@@ -98,7 +112,7 @@ form is resolved without the single-assignment check and without an unknown-cwd
 refusal. In a run block, whose scan has no bindings, the suffix is matched to a
 repository file without proving the executed path: `BASE=/tmp` then
 `bash "$BASE/scripts/entry.sh"` follows the repository's `scripts/entry.sh` even
-though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or here-document-to-shell
+though the shell runs `/tmp/scripts/entry.sh` (cli#975). Any other computed, external, `-c`/`-s` or shell-program here-document
 invocation is refused unless it is on the reviewed allowlist, as is a wrapped
 interpreter (`timeout`, `docker`, `su`, ...) whose payload is absent or
 non-literal. A clause whose first word is an assignment whose value holds a
@@ -126,7 +140,7 @@ computed token whose literal suffix names an existing repository file (see
 above).
 
 Installs inside followed JavaScript or TypeScript scripts, node `-e`/`-p` or
-node here-document payloads, and `npm run`/`bun run` targets in `package.json`
+JavaScript stdin here-document programs, and `npm run`/`bun run` targets in `package.json`
 are not inspected; here-document bodies are still install-screened. Helper
 steps allow
 `set -euo pipefail`, allowlisted quoted assignments with lowercase names (including

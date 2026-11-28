@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { load } from "js-yaml";
-import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow, UNRESOLVED_INVOCATION_ALLOWLIST } from "./helpers/npm-ci-workflow-guard";
+import { assertNpmCiLockfilesRead, assertNpmCiWorkflowTree, EXACT_BLOCK_ALLOWLIST, parseWorkflow, staticWordValue, UNRESOLVED_INVOCATION_ALLOWLIST } from "./helpers/npm-ci-workflow-guard";
 import {
   auditExcludes,
   collectNpmLockDeps,
@@ -1632,6 +1632,66 @@ describe("the workflow guard checks lines containing npm and helper calls", () =
   }, 30_000);
 });
 
+describe("here-document discovery in run blocks and followed shell files", () => {
+  for (const asScript of [false, true]) {
+    const check = (text: string, tracked = true) => {
+      const root = makeTreeFixture({
+        "scripts/outer.sh": text,
+        "scripts/child.sh": "npm ci\n",
+        "package-lock.json": "{}\n",
+      });
+      try {
+        return assertNpmCiWorkflowTree(
+          workflowStep(asScript ? "bash scripts/outer.sh" : text, "."),
+          new Set(tracked ? ["package-lock.json"] : []), root, "workflow-heredoc",
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    };
+
+    it.each(['"<<PHANTOM"', "'<<PHANTOM'", '"<<X"'])(
+      `discovers the child after a header with quoted %s (followed file: ${asScript})`, (quoted) => {
+        const text = `: <<'EOF' ${quoted}\npayload\nEOF\nbash scripts/child.sh`;
+        const report = check(text);
+        expect(report.followed).toContain("scripts/child.sh");
+        expect(report.installs).toBe(1);
+        expect(() => check(text, false)).toThrow(/scripts\/child\.sh.*cannot bind the npm install/);
+      },
+    );
+
+    it(`keeps real redirections in source order around quoted text (followed file: ${asScript})`, () => {
+      const report = check(': 3<<FIRST "<<PHANTOM" 4<<-\'SECOND\'\nSECOND\nFIRST\n\tFIRST\n\tSECOND\nbash scripts/child.sh');
+      expect(report.followed).toContain("scripts/child.sh");
+      expect(report.installs).toBe(1);
+    });
+
+    it(`does not start a body for quoted text (followed file: ${asScript})`, () => {
+      const report = check('echo "<<X"\nbash scripts/child.sh');
+      expect(report.followed).toContain("scripts/child.sh");
+      expect(report.installs).toBe(1);
+    });
+
+    it.each([
+      [": <<EOF-UNKNOWN\npayload\nEOF-UNKNOWN", "standalone"],
+      [": <<EOF \\\n argument\npayload\nEOF", "header continuation"],
+      [': <<EOF "\nargument"\npayload\nEOF', "unclassified here-document header"],
+      [': "\nargument" <<EOF\npayload\nEOF', "header in a continued quote"],
+      [": <<EOF\npayload", "missing delimiter"],
+    ])(`refuses unclassified boundaries (followed file: ${asScript}): %s`, (text, reason) => {
+      expect(() => check(text)).toThrow(reason);
+      if (asScript) expect(() => check(text)).toThrow("job build step 1: script scripts/outer.sh");
+    });
+  }
+
+  it("checks the quoted lookalike with real bash", () => {
+    const result = spawnSync("bash", ["-c", `: <<'EOF' "<<PHANTOM"\npayload\nEOF\nprintf after`], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("after");
+    expect(result.stderr).toBe("");
+  });
+});
+
 describe("the workflow guard checks physical lines containing npm", () => {
   const WORKFLOW = "workflow-a";
   it.each(["npm c\\i", "'npm' ci", '"npm" ci'])(
@@ -1657,6 +1717,397 @@ describe("the workflow guard checks physical lines containing npm", () => {
   it("accepts a line without the characters npm", () => {
     expect(assertNpmCiLockfilesRead(workflowStep('"$TOOL" ci'), READ_TRACKED, WORKFLOW)).toBe(0);
     expect(assertNpmCiLockfilesRead(workflowStep('"$TOOL" "$SUB"'), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+});
+
+describe("the workflow guard refuses command-position time, coproc, function, in and ]] in unapproved run blocks and skips ! before assignment checks (#941)", () => {
+  const WORKFLOW = "workflow-c";
+
+  function runBlock(run: string): string {
+    return run.split("\n").map((line) => `          ${line}`).join("\n");
+  }
+
+  function stepWithShell(run: string, shell?: string): string {
+    const shellLine = shell === undefined ? "" : `        shell: ${shell}\n`;
+    return `jobs:\n  build:\n    steps:\n      - name: install step\n${shellLine}        run: |\n${runBlock(run)}\n`;
+  }
+
+  function jobDefaultsShell(run: string, shell: string): string {
+    return `jobs:\n  build:\n    defaults:\n      run:\n        shell: ${shell}\n    steps:\n      - name: install step\n        run: |\n${runBlock(run)}\n`;
+  }
+
+  function workflowDefaultsShell(run: string, shell: string): string {
+    return `defaults:\n  run:\n    shell: ${shell}\njobs:\n  build:\n    steps:\n      - name: install step\n        run: |\n${runBlock(run)}\n`;
+  }
+
+  it.each([
+    ["workflow-level", (run: string) => workflowDefaultsShell(run, "sh"), 3],
+    ["job-level", (run: string) => jobDefaultsShell(run, "sh"), 5],
+    ["step-level", (run: string) => stepWithShell(run, "sh"), 5],
+  ] as const)("refuses an unapproved run block under a %s shell, naming its source line", (_where, build, line) => {
+    expect(() => assertNpmCiLockfilesRead(build("echo hi"), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: the step's effective shell is sh, not the default bash (physical line ${line})`,
+    );
+  }, 5_000);
+
+  it.each([
+    ["bash", "sh", "sh", true, 10],
+    ["sh", "bash", "bash", false, 10],
+    [undefined, "bash", "sh", true, 8],
+    [undefined, "sh", "bash", false, 8],
+  ] as const)("selects step %s over job %s over workflow %s", (step, job, workflow, accepted, line) => {
+    const source = `defaults:\n  run:\n    shell: ${workflow}\njobs:\n  build:\n    defaults:\n      run:\n        shell: ${job}\n    steps:\n      - ${step === undefined ? "" : `shell: ${step}\n        `}run: echo ok\n`;
+    if (accepted) expect(assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toBe(0);
+    else expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: the step's effective shell is sh, not the default bash (physical line ${line})`,
+    );
+  }, 5_000);
+
+  it("locates a quoted shell key in a flow mapping", () => {
+    const source = 'jobs:\n  build:\n    steps:\n      - {"shell": sh, run: echo ok}\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 4)");
+  }, 5_000);
+
+  it("locates the shell supplied by a YAML merge", () => {
+    const source = 'settings: &shell\n  shell: sh\njobs:\n  build:\n    steps:\n      - <<: *shell\n        run: echo ok\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 2)");
+  }, 5_000);
+
+  it("locates the shell when a step inherits its run block too", () => {
+    const source = 'settings: &step\n  shell: sh\n  run: echo ok\njobs:\n  build:\n    steps:\n      - <<: *step\n';
+    expect(() => assertNpmCiLockfilesRead(source, READ_TRACKED, WORKFLOW)).toThrow("(physical line 2)");
+  }, 5_000);
+
+  it("accepts an approved run block under another shell", () => {
+    const approved = EXACT_BLOCK_ALLOWLIST[0].text;
+    expect(assertNpmCiLockfilesRead(stepWithShell(approved, "sh"), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+
+  const SEPARATOR_COMPOUND_HEADERS = [
+    "echo ok; if true; then cat <<'EOF'\npayload\nEOF\nfi",
+    "echo ok & while false; do cat <<'EOF'\npayload\nEOF\ndone",
+    "echo ok | while read -r x; do cat <<'EOF'\npayload\nEOF\ndone",
+  ];
+
+  it.each(SEPARATOR_COMPOUND_HEADERS)("the separator compound fixtures are valid bash: %s", (run) => {
+    const result = spawnSync("bash", ["-n", "-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stderr).toBe("");
+  }, 5_000);
+
+  for (const entryPoint of ["lockfiles", "tree"] as const) {
+    const check = (run: string) => entryPoint === "lockfiles"
+      ? assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)
+      : assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs;
+
+    it.each([
+      ["cat <<<x", "n$'p\\155' ci"],
+      ["y=$((a<<b))", "np? ci"],
+      ["x=$[1<<b]", "n$'p\\155' ci"],
+      ["x=${a:-<<b}", "np? ci"],
+      ["echo $(cat <<EOF)", "np? ci"],
+      ["echo `cat <<EOF`", "np? ci"],
+      ["echo \\<<EOF", "np? ci"],
+      ["echo <<", "np? ci"],
+    ])(`refuses << outside bodies and accepted headers through ${entryPoint}: %s`, (header, command) => {
+      expect(() => check(`echo ok\n${header}\n${command}`)).toThrow(
+        `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has << outside a standalone top-level simple-command here-document redirection: ${header} (physical line 2)`,
+      );
+    }, 5_000);
+
+    it.each(["echo $(\ncat <<EOF\n)", "echo ${a:-\ncat <<EOF\n}", "echo $[\n1<<b\n]", "echo `\ncat <<EOF\n`"])(
+      `refuses a multiline expansion header through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow("<< outside a standalone top-level simple-command here-document redirection");
+      }, 5_000,
+    );
+
+    it.each(SEPARATOR_COMPOUND_HEADERS)(
+      `refuses a compound here-document header after a separator through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow("<< outside a standalone top-level simple-command here-document redirection");
+      }, 5_000,
+    );
+
+    it(`accepts << and <<< body lines through ${entryPoint}`, () => {
+      expect(check("cat <<'EOF'\n<<\n<<<\nEOF")).toBe(0);
+    }, 5_000);
+
+    it.each(["[", "(", "{", "${other:-[}"])(`accepts a parameter default before a heredoc through ${entryPoint}: %s`, (value) => {
+      expect(check(`: "\${prefix:-${value}}" <<'EOF'\nnp? ci\nEOF`)).toBe(0);
+    }, 5_000);
+
+    it.each(["<<EOF", "<<-EOF"])(`resumes commands after a continued unquoted delimiter through ${entryPoint}: %s`, (operator) => {
+      expect(() => check(`: ${operator}\nEO\\\nF\nnp? ci`)).toThrow("a command word with a glob character: np? ci (physical line 4)");
+      expect(check(`: ${operator}\nEO\\\nF\necho ok`)).toBe(0);
+    }, 5_000);
+
+    it.each(["'EOF'", '"EOF"'])(`keeps a quoted delimiter literal through ${entryPoint}: %s`, (delimiter) => {
+      expect(check(`: <<${delimiter}\nEO\\\nF\nnp? ci\nEOF`)).toBe(0);
+    }, 5_000);
+
+    it(`keeps an escaped backslash before an unquoted delimiter through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF\ndata\\\\\nEOF\nnp? ci")).toThrow("a command word with a glob character: np? ci (physical line 4)");
+    }, 5_000);
+
+    it(`ignores quoted delimiter lookalikes through ${entryPoint}`, () => {
+      expect(check(`: <<'EOF' "<<PHANTOM"\npayload\nEOF\necho ok`)).toBe(0);
+      expect(() => check(`: <<'EOF' "<<PHANTOM"\npayload\nEOF\nnp? ci`)).toThrow("a command word with a glob character");
+      expect(check('echo "<<X"\necho ok')).toBe(0);
+    }, 5_000);
+
+    it(`queues delimiters in source order through ${entryPoint}`, () => {
+      const run = ": 3<<'FIRST' 4<<'SECOND'\nnp? ci\nFIRST\n<<< data\nSECOND";
+      expect(check(run)).toBe(0);
+      expect(() => check(`${run}\nnp? ci`)).toThrow("a command word with a glob character: np? ci (physical line 6)");
+    }, 5_000);
+
+    it(`refuses a header before a multiline quote through ${entryPoint}`, () => {
+      expect(() => check(': <<EOF "\nargument"\npayload\nEOF')).toThrow(
+        'an unclassified here-document header: : <<EOF " (physical line 1)',
+      );
+    }, 5_000);
+
+    it(`refuses a header after a continued quote through ${entryPoint}`, () => {
+      expect(() => check(': "\nargument" <<EOF\npayload\nEOF')).toThrow(
+        'an unclassified here-document header in a continued quote: argument" <<EOF (physical line 2)',
+      );
+    }, 5_000);
+
+    it(`refuses an unmodelled header continuation through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF \\\n argument\npayload\nEOF")).toThrow(
+        "an unclassified here-document header continuation: : <<EOF \\ (physical line 1)",
+      );
+    }, 5_000);
+
+    it(`refuses a missing body boundary through ${entryPoint}`, () => {
+      expect(() => check(": <<EOF\nnp? ci")).toThrow(
+        "an unclassified here-document body boundary (missing delimiter): : <<EOF (physical line 1)",
+      );
+    }, 5_000);
+
+    it.each(["time A=1>/dev/null echo ok", "time -p A=1>/dev/null echo ok", "coproc echo ok", "function f", "in echo ok", "]] echo ok"])(
+      `refuses an unmodeled reserved word through ${entryPoint}: %s`, (run) => {
+        expect(() => check(run)).toThrow(`a ${run.split(" ")[0]} reserved word in command position`);
+      }, 5_000,
+    );
+
+    it(`checks assignments after the workflow-used ! prefix through ${entryPoint}`, () => {
+      expect(check("! A=plain echo ok")).toBe(0);
+      expect(() => check("! A=1>/dev/null echo ok")).toThrow("an assignment containing < or > before a command word");
+      expect(() => check("! A=1 npm ci")).toThrow("a run block containing npm is refused");
+    }, 5_000);
+
+    it.each(["for", "while", "if", "case", "then", "do", "done", "select", "until", "else", "elif", "fi", "esac", "in", "function", "!", "[[", "]]"])(
+      `accepts a reserved-word argument before a heredoc through ${entryPoint}: %s`, (word) => {
+        expect(check(`echo ${word} <<'EOF'\nnp? ci\nEOF`)).toBe(0);
+      }, 5_000,
+    );
+
+    it.each(["cat <<EOF", "cat <<-'EOF'"])(`preserves a real here-document body through ${entryPoint}: %s`, (header) => {
+      const body = header.includes("<<-") ? "\tnp? ci\n\tEOF" : "np? ci\nEOF";
+      expect(check(`${header}\n${body}`)).toBe(0);
+    }, 5_000);
+
+    it.each(["cat <<<x", 'echo "<<x"', "y=$((a<<b))"])(`preserves a pinned block through ${entryPoint}: %s`, (header) => {
+      const entry = EXACT_BLOCK_ALLOWLIST[0];
+      const original = entry.text;
+      try {
+        entry.text = `${header}\necho ok`;
+        expect(check(entry.text)).toBe(0);
+      } finally {
+        entry.text = original;
+      }
+    }, 5_000);
+  }
+
+  it.each([
+    ["echo for <<'EOF'\npayload\nEOF", "for\n"],
+    [": \"${prefix:-[}\" <<'EOF'\nnp? ci\nEOF\nprintf after", "after"],
+    [": <<EOF\nEO\\\nF\nprintf after", "after"],
+    [": <<'EOF'\nEO\\\nF\nprintf body\nEOF\nprintf after", "after"],
+    [": 3<<'FIRST' 4<<'SECOND'\nnp? ci\nFIRST\n<<< data\nSECOND\nprintf after", "after"],
+    [": <<EOF \\\n argument\npayload\nEOF\nprintf after", "after"],
+    [': <<EOF "\nargument"\npayload\nEOF\nprintf after', "after"],
+    [': "\nargument" <<EOF\npayload\nEOF\nprintf after', "after"],
+  ])("checks heredoc boundaries with real bash: %s", (run, output) => {
+    const result = spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe(output);
+    expect(result.stderr).toBe("");
+  }, 5_000);
+
+  it("shows real bash executes the time-prefixed assignment", () => {
+    const result = spawnSync("bash", ["-c", "echo() { printf ran >&2; }; time A=1>/dev/null echo ok"], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("ran");
+  }, 5_000);
+
+  it.each(["x=$[1<<2]", "x=${a:-<<b}"])("checks expansion parsing with real bash: %s", (header) => {
+    const result = spawnSync("bash", ["-c", `${header}\nprintf accepted`], { encoding: "utf8", timeout: 5_000, env: { ...process.env, b: "(" } });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("accepted");
+    expect(result.stderr).toBe("");
+  }, 5_000);
+
+  it("refuses a command word that spells npm with ANSI-C quoting", () => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell("$'np\\155' ci"), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with ANSI-C quoting: $'np\\155' ci (physical line 1)`,
+    );
+  }, 5_000);
+
+  it.each([
+    "np? ci", "n*p ci", "np[m] ci", "./np? ci", "/usr/bin/np? ci", "n?? ci",
+    "n[p][m] ci", "np[[:alpha:]] ci", '"np?" ci', "np\\? ci", "np[ ci",
+  ])("refuses a command word with a glob character: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(
+      `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has a command word with a glob character: ${run} (physical line 1)`,
+    );
+  }, 5_000);
+
+  it.each([
+    "<> /dev/null n$'p\\155' ci", ">| /dev/null n$'p\\155' ci",
+    ">/dev/null np? ci", "2>&1 npm ci", "&>/dev/null npm ci",
+    "> /dev/null np? ci", "</dev/null np? ci", ">>x np? ci",
+    "A=x >out B=y 2>&1 </dev/null np? ci", "<<<text npm ci", "{fd}>out npm ci",
+    "echo ok; <> /dev/null npm ci", "if true; then 2>&1 npm ci; fi", ">/dev/null",
+  ])("refuses a leading redirection: %s", (run) => {
+    const shape = run.startsWith("<<<") ? "<< outside a standalone top-level simple-command here-document redirection" : "a leading redirection";
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has ${shape}: ${run} (physical line 1)`;
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    "A=1>/dev/null echo ok", "A=1<>/dev/null n$'p\\155' ci", "A=x>|/dev/null npm ci",
+    'A="1>2" echo ok', 'A="1<2" echo ok', "B=plain A=1>/dev/null echo ok",
+    "A=1>/dev/null command -v echo", "A=1>/dev/null command -V echo",
+    "A=1>/dev/null env", "A=1>/dev/null command",
+  ])("refuses an assignment containing < or > before a command word: %s", (run) => {
+    const reason = `workflow ${WORKFLOW} job build step 1 (install step): cannot establish the npm ci directory: an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values): ${run} (physical line 1)`;
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    "A+=1>/dev/null echo ok", "A+=1<>/dev/null n$'p\\155' ci", "A+=x>|/dev/null n$'p\\155' ci",
+  ])("refuses an append assignment containing an attached redirection before a command word: %s", (run) => {
+    const reason = "an unapproved run block has an assignment containing < or > before a command word";
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    ["A+=plain n$'p\\155' ci", "command word with ANSI-C quoting"],
+    ['A+="plain value" np? ci', "command word with a glob character"],
+  ])("refuses a restricted command word after an append assignment: %s", (run, reason) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it.each([
+    'A+="plain value" echo ok', 'A+="plain value"', "A+=1>/dev/null", "A+=1<>/dev/null", "A+=x>|/dev/null",
+  ])("preserves the quoted-value or assignment-only append outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+  }, 5_000);
+
+  it.each([
+    "A=plain echo ok", "A=plain echo ok >/dev/null", 'A="$(printf x 2>/dev/null)"',
+    "A=plain command -v echo", "A=plain command -V echo",
+    "A=plain env", "A=plain command",
+    'A="$(printf x 2>/dev/null)"; echo ok', "A=1>/dev/null", "A=x>|/dev/null",
+  ])("preserves the assignment or trailing-redirection outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+  }, 5_000);
+
+  it.each([
+    ["A=1>/dev/null echo ok", "", "input"],
+    ["A=1<>/dev/null n$'p\\155' ci", "output", ""],
+    ["A=x>|/dev/null npm ci", "", "input"],
+    ["A+=1>/dev/null echo ok", "", "input"],
+    ["A+=1<>/dev/null n$'p\\155' ci", "output", ""],
+    ["A+=x>|/dev/null n$'p\\155' ci", "", "input"],
+  ])("shows real bash applies the assignment's attached redirection and runs the command: %s", (run, stdout, input) => {
+    const result = spawnSync("bash", ["-c", `echo() { IFS= read -r value; printf output; printf 'ran:%s' "$value" >&2; return 17; }; npm() { echo; }; ${run}`], {
+      encoding: "utf8",
+      input: "input\n",
+      timeout: 5_000,
+    });
+    expect(result.status).toBe(17);
+    expect(result.stdout).toBe(stdout);
+    expect(result.stderr).toBe(`ran:${input}`);
+  }, 5_000);
+
+  it("preserves redirections after the command word", () => {
+    expect(assertNpmCiLockfilesRead(stepWithShell("echo ok >/dev/null"), READ_TRACKED, WORKFLOW)).toBe(0);
+    const entry = EXACT_BLOCK_ALLOWLIST[0];
+    const original = entry.text;
+    try {
+      entry.text = "npm --version 2>&1";
+      expect(assertNpmCiLockfilesRead(stepWithShell(entry.text), READ_TRACKED, WORKFLOW)).toBe(0);
+      expect(assertNpmCiWorkflowTree(stepWithShell(entry.text), READ_TRACKED, REPO, WORKFLOW).installs).toBe(0);
+    } finally {
+      entry.text = original;
+    }
+    expect(() => assertNpmCiLockfilesRead(stepWithShell("npm ci >/dev/null"), READ_TRACKED, WORKFLOW)).toThrow("a run block containing npm is refused");
+  }, 5_000);
+
+  it.each(["<> /dev/null n$'p\\155' ci", ">| /dev/null n$'p\\155' ci"])("shows real bash executes the redirected command: %s", (run) => {
+    const result = spawnSync("bash", ["-c", `npm() { printf '%s' "$*" >&2; return 17; }; ${run}`], {
+      encoding: "utf8",
+      timeout: 5_000,
+    });
+    expect(result.status).toBe(17);
+    expect(result.stderr).toBe("ci");
+  }, 5_000);
+
+  it("skips a leading assignment with a quoted substitution payload", () => {
+    const assignment = `pin="$(node -p "require('./p.json').optionalDependencies?.['p'] ?? ''")"`;
+    expect(assertNpmCiLockfilesRead(stepWithShell(assignment), READ_TRACKED, WORKFLOW)).toBe(0);
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(`${assignment} np? ci`), READ_TRACKED, WORKFLOW)).toThrow("command word with a glob character");
+  }, 5_000);
+
+  it.each(["n$'p\\155' ci", "./n$'p\\155' ci", "n$'p'$'m' ci"])("refuses ANSI-C quoting within the command word: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow("command word with ANSI-C quoting");
+  }, 5_000);
+
+  it.each(['[ -f x ]', '[[ -n "$X" ]]', "echo ok", "echo case", '"echo" case'])("preserves the plain command outcome: %s", (run) => {
+    expect(assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toBe(0);
+  }, 5_000);
+
+  it.each(['"npm" ci', "'npm' ci", "n\\pm ci"])("preserves the plain npm refusal: %s", (run) => {
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow("a run block containing npm is refused");
+  }, 5_000);
+
+  it.each([
+    "case x in\n  x)\n    $'np\\155' ci\n    ;;\nesac",
+    "case x in\n  x) echo ok;;\n  *) echo ok;;\nesac",
+    'case "$v" in a|*.txt) echo ok;; esac',
+    "if true; then case x in x) echo ok;; esac; fi",
+    "'echo' case\nnp? ci",
+  ])("refuses case or the following glob command: %s", (run) => {
+    const reason = run.startsWith("'echo'") ? "command word with a glob character" : "case reserved word in command position";
+    expect(() => assertNpmCiLockfilesRead(stepWithShell(run), READ_TRACKED, WORKFLOW)).toThrow(reason);
+    expect(() => assertNpmCiWorkflowTree(stepWithShell(run), READ_TRACKED, REPO, WORKFLOW)).toThrow(reason);
+  }, 5_000);
+
+  it("accepts the workflow macOS bash version check and rejects a nonmatching version", () => {
+    const workflow = parseWorkflow(readFileSync(join(REPO, ".github/workflows/test.yml"), "utf8"));
+    const run = workflow.jobs["promote-latest-fixtures"].steps.find((step) => typeof step.run === "string")?.run ?? "";
+    const checks = run.split("\n").filter((line) => line.includes("::error::expected the macOS system bash"));
+    expect(checks).toHaveLength(1);
+    const check = checks[0].trim();
+    expect(assertNpmCiLockfilesRead(stepWithShell(check), READ_TRACKED, WORKFLOW)).toBe(0);
+    for (const [version, status] of [["GNU bash, version 3.2.57(1)-release", 0], ["GNU bash, version 5.2.37(1)-release", 1]] as const) {
+      const result = spawnSync("bash", ["-c", 'v="$1"; ' + check, "bash-version-check", version], { encoding: "utf8", timeout: 5_000 });
+      expect(result.error).toBeUndefined();
+      expect(result.status).toBe(status);
+    }
+  }, 5_000);
+
+  it("accepts the bracket builtin", () => {
+    expect(assertNpmCiLockfilesRead(stepWithShell("if [ -f x ]; then echo ok; fi"), READ_TRACKED, WORKFLOW)).toBe(0);
   }, 5_000);
 });
 
@@ -1690,6 +2141,13 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
       writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
       for (const [line, expected] of [
         ["{npm,} ci", "ci"],
+        ["./np? ci", "ci"],
+        [`${stubDir}/np? ci`, "ci"],
+        ["n?? ci", "ci"],
+        ["n[p][m] ci", "ci"],
+        ["np[[:alpha:]] ci", "ci"],
+        ["n$'p\\155' ci", "ci"],
+        [">/dev/null np? ci", "ci"],
         ["$'npm' $'ci'", "ci"],
         ["npm </dev/null ci", "ci"],
         ['printf "%s" "$(npm ci)"', "ci"],
@@ -1699,6 +2157,7 @@ describe("the workflow guard refuses conservative install-like spellings", () =>
       ] as const) {
         rmSync(argvFile, { force: true });
         const result = spawnSync("bash", ["-c", line], {
+          cwd: stubDir,
           env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
           encoding: "utf8",
           timeout: 5_000,
@@ -1833,6 +2292,274 @@ it.each([
   );
   expect(runWithStubNpm(run).at(-1)).toBe(argument);
 }, 15_000);
+
+describe("the run-block guard refuses split-word continuations and command words that begin with an unquoted brace (#941)", () => {
+  const WORKFLOW = "workflow-941";
+  const read = (run: string) => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW);
+  const tree = (run: string) => assertNpmCiWorkflowTree(workflowStep(run), READ_TRACKED, REPO, WORKFLOW);
+
+  /** Run bash with a stub command on PATH that records its argv; return that argv. */
+  function bashWithStub(command: string, script: string): string {
+    const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+    try {
+      const argvFile = join(stubDir, "argv");
+      writeFileSync(join(stubDir, command), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
+      const result = spawnSync("bash", ["-c", script], {
+        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
+        encoding: "utf8",
+        timeout: 5_000,
+      });
+      expect(result.error).toBeUndefined();
+      return readFileSync(argvFile, "utf8");
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }
+
+  /** Run bash with a stub npm that records its argv and return that argv; throws when npm did not run. */
+  function bashWithStubNpm(script: string): string {
+    return bashWithStub("npm", script);
+  }
+
+  it("refuses a continuation that joins two halves of one word, naming the physical line", () => {
+    const run = "n\\\npm ci";
+    const reason = "an unapproved run block has a backslash-newline continuation inside a word: n\\ (physical line 1)";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStubNpm(run)).toBe("ci");
+  }, 15_000);
+
+  it.each([
+    ["npm ci \\\n  --ignore-scripts", "run block containing npm is refused unless"],
+    ["echo a \\\n  b", ""],
+  ])("keeps a word-boundary continuation classified as before: %s", (run, reason) => {
+    if (reason === "") {
+      expect(read(run)).toBe(0);
+      expect(tree(run).installs).toBe(0);
+      expect(spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 }).stdout).toBe("a b\n");
+    } else {
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(runWithStubNpm(run)).toEqual(["ci", "--ignore-scripts"]);
+    }
+  }, 15_000);
+
+  it("conservatively refuses a command word that begins with an unquoted brace", () => {
+    const run = "{n,}pm ci";
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    // Bash expands the leading brace into the command word and its first argument.
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it.each(["echo ok; {n,}pm ci", "echo ok && {n,}pm ci"])(
+    "refuses a brace command word that starts a clause after a separator: %s", (run) => {
+      const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(bashWithStubNpm(run)).toBe("pm ci");
+    }, 15_000,
+  );
+
+  it.each(["''{n,}pm ci", "env ''{n,}pm ci"])(
+    "refuses a brace command word after empty quotes: %s", (run) => {
+      const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+      expect(() => read(run)).toThrow(reason);
+      expect(() => tree(run)).toThrow(reason);
+      expect(bashWithStubNpm(run)).toBe("pm ci");
+    }, 15_000,
+  );
+
+  it("accepts a wholly quoted brace command word", () => {
+    const run = "'{n,}pm' ci";
+    expect(read(run)).toBe(0);
+    expect(tree(run).installs).toBe(0);
+    expect(bashWithStub("{n,}pm", run)).toBe("ci");
+  }, 15_000);
+
+  it.each([
+    "env FOO=bar {n,}pm ci",
+    "exec -a x {n,}pm ci",
+  ])("refuses a brace-leading command word after a modelled prefix assignment or option value: %s", (run) => {
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it.each([
+    '"env" FOO=bar {n,}pm ci',
+    "\\env FOO=bar {n,}pm ci",
+    'env FOO="bar" {n,}pm ci',
+  ])("refuses a brace-leading command word after a statically quoted or escaped prefix: %s", (run) => {
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStubNpm(run)).toBe("pm ci");
+  }, 15_000);
+
+  it("refuses a literal brace word as the command word after a prefix", () => {
+    const run = "env FOO=bar {foo}bar one";
+    const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
+    expect(() => read(run)).toThrow(reason);
+    expect(() => tree(run)).toThrow(reason);
+    expect(bashWithStub("{foo}bar", run)).toBe("one");
+  }, 15_000);
+
+  it("preserves mid-word brace expansion and a standalone brace group", () => {
+    const midWord = "mkdir -p dir/{a,b}";
+    const group = "{ echo ok; }";
+    for (const run of [midWord, group]) {
+      expect(read(run)).toBe(0);
+      expect(tree(run).installs).toBe(0);
+    }
+    const cwd = mkdtempSync(join(tmpdir(), "brace-words-"));
+    try {
+      const result = spawnSync("bash", ["-c", midWord], { cwd, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(existsSync(join(cwd, "dir", "a")) && existsSync(join(cwd, "dir", "b"))).toBe(true);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+    expect(spawnSync("bash", ["-c", group], { encoding: "utf8", timeout: 5_000 }).stdout).toBe("ok\n");
+  }, 15_000);
+
+  it("accepts a line ending in an escaped backslash, and bash runs two commands", () => {
+    const run = "echo ok \\\\\necho done";
+    expect(read(run)).toBe(0);
+    expect(tree(run).installs).toBe(0);
+    const result = spawnSync("bash", ["-c", run], { encoding: "utf8", timeout: 5_000 });
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe("ok \\\ndone\n");
+  }, 15_000);
+});
+
+describe("the workflow guard follows a script through a statically quoted prefix (#941)", () => {
+  const WORKFLOW = "workflow-941-decoded-walk";
+  const tracked = new Set(["package-lock.json"]);
+  const prefixed = [
+    '"env" FOO=bar bash scripts/check.sh',
+    "\\env FOO=bar bash scripts/check.sh",
+    'env FOO="bar" bash scripts/check.sh',
+  ];
+  const install = /does not read the lockfile and is refused/;
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const run of prefixed) {
+    it(`follows ${run} in a run block`, () => {
+      expect(assertNpmCiLockfilesRead(workflowStep(run), tracked, WORKFLOW)).toBe(0);
+      withTree({ "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+
+    it(`follows ${run} from a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+  }
+});
+
+describe("the workflow guard follows the decoded interpreter word (#941)", () => {
+  const WORKFLOW = "workflow-941-interpreter-word";
+  const tracked = new Set(["package-lock.json"]);
+  const spellings = [
+    String.raw`\bash scripts/check.sh`,
+    "'bash' scripts/check.sh",
+    String.raw`"bash" scripts/check.sh`,
+    String.raw`'ba'"sh" scripts/check.sh`,
+  ];
+  const install = /does not read the lockfile and is refused/;
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const run of spellings) {
+    it(`follows ${run} in a run block`, () => {
+      withTree({ "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+
+    it(`follows ${run} from a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+  }
+});
+
+describe("the workflow guard refuses leading env options other than a lone - and follows leading NAME=value assignments (#941)", () => {
+  const WORKFLOW = "workflow-941-env-options";
+  const tracked = new Set(["package-lock.json"]);
+  const refused = [
+    ["env -S 'bash check.sh'", "-S"],
+    ["env --split-string 'bash check.sh'", "--split-string"],
+    ["env -u FOO bash check.sh", "-u"],
+    ["env -C sub bash check.sh", "-C"],
+    ["env --chdir=sub bash check.sh", "--chdir=sub"],
+    ["env -i bash check.sh", "-i"],
+  ] as [string, string][];
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const [run, option] of refused) {
+    it(`refuses ${run} in a run block`, () => {
+      withTree({ "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(
+          `an unapproved run block has an env option: ${option}`,
+        );
+      });
+    }, 10_000);
+
+    it(`refuses ${run} in a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(
+          /an unapproved run block has an env option: /,
+        );
+      });
+    }, 10_000);
+  }
+
+  for (const [place, run] of [
+    ["a run block", "env FOO=bar bash check.sh"],
+    ["a followed script", "bash scripts/outer.sh"],
+  ] as const) {
+    it(`still follows an env assignment command in ${place}`, () => {
+      withTree({
+        "scripts/outer.sh": "env FOO=bar bash check.sh\n",
+        "check.sh": "npx some-tool\n",
+      }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(
+          /does not read the lockfile and is refused/,
+        );
+      });
+    }, 10_000);
+  }
+});
 
 describe("the workflow guard bounds global tool versions", () => {
   const WORKFLOW = "workflow-v";
@@ -2230,6 +2957,184 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  function expectFollowedInstall(run: string, script = "scripts/install.sh", extraFiles: Record<string, string> = {}) {
+    const root = makeTreeFixture({ [script]: "npm ci\n", "package-lock.json": "{}\n", ...extraFiles });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(["package-lock.json"]), root, "workflow-options");
+      expect(report.followed).toContain(script);
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["a post-operand escaped version word", "bash scripts/install.sh --ver\\sion"],
+    ["a preceding pipeline", "printf input | cat; bash scripts/install.sh"],
+    ["a Bash option value", "bash -o pipefail scripts/install.sh"],
+  ])("follows a script with %s", (_label, run) => {
+    expectFollowedInstall(run);
+  });
+
+  it.each(["node <<JS scripts/install.sh\nconsole.log(1)\nJS", "bash <<SH scripts/install.sh\nprintf data\nSH"])(
+    "follows a script operand after a heredoc: %s", (run) => {
+      expectFollowedInstall(run);
+    },
+  );
+
+  it.each([
+    ["Node", "node", "scripts/marker.js", 'process.stdout.write("marker")\n', 'process.stdout.write("stdin")'],
+    ["Bash", "bash", "scripts/marker.sh", "printf marker\n", "printf stdin"],
+  ])("checks with real %s that a script operand after a heredoc runs the script", (_label, interpreter, script, content, program) => {
+    const run = `${interpreter} <<MARKER ${script}\n${program}\nMARKER`;
+    const root = makeTreeFixture({ [script]: content });
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["-c", run], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("marker");
+      const report = assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-options");
+      expect(report.followed).toContain(script);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("checks with real Bash that -O consumes its value", () => {
+    const root = makeTreeFixture({ "scripts/marker.sh": "printf marker\n" });
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["-O", "extglob", "scripts/marker.sh"], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).toBe(0);
+      expect(result.stdout).toBe("marker");
+      expectFollowedInstall("bash -O extglob scripts/install.sh");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses an operand after --, as real Bash does not show its version", () => {
+    const root = makeTreeFixture({});
+    const env = { ...process.env };
+    delete env.BASH_ENV;
+    delete env.ENV;
+    try {
+      const result = spawnSync("bash", ["--", "--version"], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).not.toContain("GNU bash, version");
+      expect(() => assertNpmCiWorkflowTree(workflowStep("bash -- --version", "."), new Set(), root, "workflow-options")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a script for a standalone bash version request", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("bash --version", "."), new Set(), root, "workflow-options");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a JS program read from a heredoc on stdin", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("node - state.json <<'JS'\nconsole.log(1)\nJS", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a JS stdin heredoc program in a followed shell file", () => {
+    const root = makeTreeFixture({ "scripts/check.sh": "node - \"$f\" <<'X'\nconsole.log(1)\nX\n" });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("bash scripts/check.sh", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual(["scripts/check.sh"]);
+      expect(report.unresolved).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([["single", "'"], ["double", '"']])(
+    "refuses a stdin program whose %s-quoted << argument is not a heredoc, as real Node runs its stdin", (_label, quote) => {
+      const argument = `${quote}<<x${quote}`;
+      const piped = `printf 'process.stdout.write("ran")\\n' | node - ${argument}`;
+      const root = makeTreeFixture({ "scripts/stdin.sh": `node - ${argument}\n` });
+      const env = { ...process.env };
+      delete env.BASH_ENV;
+      delete env.ENV;
+      try {
+        const result = spawnSync("bash", ["-c", piped], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("ran");
+        for (const run of [piped, `node - ${argument}`]) {
+          expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-stdin")).toThrow(/: stdin \(physical line/);
+        }
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/stdin.sh", "."), new Set(), root, "workflow-stdin")).toThrow(
+          /unresolved script invocation in scripts\/stdin\.sh \(line 1\) token stdin:/,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(["node -", "node"])(
+    "refuses a piped stdin program for %s with a heredoc on fd 2, as real Node runs the piped program", (interpreter) => {
+      const piped = `printf 'process.stdout.write("ran")\\n' | ${interpreter} 2<<'X'\nignored\nX`;
+      const root = makeTreeFixture({ "scripts/stdin.sh": `${piped}\n` });
+      const env = { ...process.env };
+      delete env.BASH_ENV;
+      delete env.ENV;
+      try {
+        const result = spawnSync("bash", ["-c", piped], { cwd: root, env, encoding: "utf8", timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe("ran");
+        expect(() => assertNpmCiWorkflowTree(workflowStep(piped, "."), new Set(), root, "workflow-stdin")).toThrow(/: stdin \(physical line/);
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/stdin.sh", "."), new Set(), root, "workflow-stdin")).toThrow(
+          /unresolved script invocation in scripts\/stdin\.sh \(line 1\) token stdin:/,
+        );
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not follow a JS program read from a heredoc on fd 0", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("node - 0<<'X'\nconsole.log(1)\nX", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a JS interpreter", "node -"],
+    ["a piped JS interpreter", "printf x | node -"],
+    ["a shell", "bash -"],
+  ])("refuses a program read from stdin by %s", (_label, run) => {
+    const root = makeTreeFixture({});
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-stdin")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows a quoted interpreter in a followed shell file", () => {
+    expectFollowedInstall("bash scripts/outer.sh", "scripts/x.sh", { "scripts/outer.sh": 'timeout 5 "bash" scripts/x.sh\n' });
   });
 
   it("refuses a literal interpreter path outside the repository", () => {
@@ -3119,7 +4024,7 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
     }
   });
 
-  it("refuses a wrapped interpreter after an unknown cd in a run block", () => {
+  it("refuses a wrapped interpreter in a run block outright", () => {
     const root = makeTreeFixture({
       "scripts/install.sh": "npm ci\n",
       "package-lock.json": "{}\n",
@@ -3130,7 +4035,7 @@ describe("the workflow guard propagates an unknown cwd and scans substitutions (
         new Set(["package-lock.json"]),
         root,
         "workflow-embedded",
-      )).toThrow(/cannot resolve a script invocation after a non-literal directory change/);
+      )).toThrow(/listed exec wrapper: timeout/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -3194,13 +4099,6 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
       files: { "scripts/noop.sh": "echo clean\n" },
       tracked: new Set(),
       installs: null,
-    },
-    {
-      label: "wrapped interpreter",
-      text: "timeout 5 bash scripts/inst.sh",
-      files: { "scripts/inst.sh": "npm ci\n" },
-      tracked: new Set(["package-lock.json"]),
-      installs: 1,
     },
     {
       label: "substitution",
@@ -3305,6 +4203,29 @@ describe("the workflow guard scans run blocks and followed scripts with one scan
         root,
         "workflow-wrapped-script",
       )).toThrow(/unresolved script invocation in scripts\/inner\.sh \(line 3\) token scripts\/inst\.sh/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["for", false, 'for item in "$(bash scripts/install.sh)"; do echo ok; done'],
+    ["select", false, 'select item in "$(bash scripts/install.sh)"; do break; done'],
+    ["for", true, 'for item in "$(bash scripts/install.sh)"; do echo ok; done'],
+    ["select", true, 'select item in "$(bash scripts/install.sh)"; do break; done'],
+    ["case", true, 'case "$(bash scripts/install.sh)" in x) echo ok;; esac'],
+  ] as const)("scans substitutions in accepted %s headers (followed script: %s)", (_header, asScript, text) => {
+    const root = makeTreeFixture({
+      "scripts/outer.sh": `${text}\n`,
+      "scripts/install.sh": "npm ci\n",
+    });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(asScript ? "bash scripts/outer.sh" : text, "."),
+        new Set(),
+        root,
+        "workflow-header-substitution",
+      )).toThrow(/scripts\/install\.sh.*cannot bind the npm install to a tracked lockfile/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -4151,7 +5072,7 @@ describe("the workflow guard judges a reserved-word condition (#820 round 18)", 
         new Set(),
         root,
         "workflow-reserved",
-      )).toThrow(/cannot resolve a dynamic script path|unresolved script invocation/);
+      )).toThrow(asScript ? /cannot resolve a dynamic script path|unresolved script invocation/ : /a coproc reserved word in command position/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -4809,4 +5730,340 @@ describe("the workflow guard's known limits from review round 21 (cli#975)", () 
       }
     },
   );
+});
+
+describe("the workflow guard refuses unmodelled env, sudo, exec and xargs options, listed wrappers and runner expressions in command position (#941)", () => {
+  const WORKFLOW = "workflow-wrapper";
+  const bashEnv = { ...process.env };
+  delete bashEnv.BASH_ENV;
+  delete bashEnv.ENV;
+
+  const shapes = [
+    "timeout 5 n$'p\\155' ci",
+    "nice -n 5 n$'p\\155' ci",
+    "stdbuf -oL n$'p\\155' ci",
+    "setsid n$'p\\155' ci",
+    "chroot / n$'p\\155' ci",
+    "env -u FOO n$'p\\155' ci",
+    "sudo -u runner n$'p\\155' ci",
+    "sudo -g group n$'p\\155' ci",
+    "exec -a x n$'p\\155' ci",
+    "xargs -n 1 n$'p\\155' ci",
+    "timeout 5 np? ci",
+    "hash -p /tmp/x$'\\155' zz && zz ci",
+  ];
+  const placements = [
+    (line: string) => line,
+    (line: string) => `true && ${line}`,
+    (line: string) => `if true; then ${line}; fi`,
+  ];
+
+  function expectRefused(run: string, pattern: RegExp) {
+    expect(() => assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toThrow(pattern);
+    const root = makeTreeFixture({ "package-lock.json": "{}\n" });
+    try {
+      expect(() => assertNpmCiWorkflowTree(
+        workflowStep(run, "."),
+        new Set(["package-lock.json"]),
+        root,
+        WORKFLOW,
+      )).toThrow(pattern);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  for (const shape of shapes) {
+    for (const place of placements) {
+      it(`refuses ${place(shape)}`, () => {
+        expectRefused(place(shape), /cannot establish the npm ci directory/);
+      }, 5_000);
+    }
+  }
+
+  it.each([
+    "timeout", "nice", "stdbuf", "setsid", "chroot",
+    "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch",
+  ])("refuses the listed wrapper %s outright", (wrapper) => {
+    expectRefused(`${wrapper} true`, new RegExp(`listed exec wrapper: ${wrapper}`));
+  }, 5_000);
+
+  const splitStrings = [
+    'export x=p; env -S \'bash -c "n${x}m ci"\'',
+    "env -S 'npm ci'",
+  ];
+  it.each([
+    ...splitStrings,
+    "env -S'npm ci'",
+    "env --split-string 'npm ci'",
+    "env --split-string='npm ci'",
+  ])("refuses the env split-string option: %s", (run) => {
+    expectRefused(run, /an unapproved run block has an env option: /);
+  }, 5_000);
+
+  it.each(["env A=~ echo ok", "env A=x:~/y echo ok"])("refuses a word after env whose unquoted tilde bash expands: %s", (run) => {
+    expectRefused(run, /static value|cannot establish|no static/);
+  }, 5_000);
+
+  it.each(["-s", "-i", "--shell", "--login"])("refuses the sudo shell option %s", (option) => {
+    expectRefused(`sudo ${option} 'npm ci'`, /unrecognised sudo option/);
+  }, 5_000);
+
+  const splitProbe = spawnSync("env", ["-S", "true"], { encoding: "utf8", timeout: 5_000 });
+  const envLacksSplitString = splitProbe.status !== 0 && /(?:illegal|invalid|unrecognized|unrecognised|unknown) option/.test(splitProbe.stderr ?? "");
+  if (envLacksSplitString) {
+    console.warn(`SKIP real env -S controls: env lacks -S (${splitProbe.error?.message ?? splitProbe.stderr.trim()})`);
+  }
+  it.skipIf(envLacksSplitString).each(splitStrings)("real env -S reparses its command string: %s", (run) => {
+    expect(splitProbe.status).toBe(0);
+    expect(bashArgv(run)).toBe("ci");
+  }, 10_000);
+
+  it.each([
+    "${{ matrix.cmd }} ci",
+    "${{ env.CMD }} ci",
+    "${{ github.event.inputs.cmd }} ci",
+  ])("refuses a runner expression in command position: %s", (run) => {
+    expectRefused(run, /runner expression in command position/);
+  }, 5_000);
+
+  it("names the listed wrapper it refuses", () => {
+    expect(() => assertNpmCiLockfilesRead(workflowStep("timeout 5 n$'p\\155' ci"), READ_TRACKED, WORKFLOW))
+      .toThrow(/listed exec wrapper: timeout/);
+  }, 5_000);
+
+  it.each([
+    ["env n$'p\\155' ci", /word without a static value after env/],
+    ["sudo n$'p\\155' ci", /word without a static value after sudo/],
+    ["n$'p\\155' ci", /command word with ANSI-C quoting/],
+  ])("still refuses the control: %s", (run, reason) => {
+    expectRefused(run, reason);
+  }, 5_000);
+
+  /** Run the row under real bash with a stub npm on PATH; return the argv npm received, or null. */
+  function bashArgv(run: string, timeout = 5_000): string | null {
+    const stubDir = mkdtempSync(join(tmpdir(), "npm-stub-"));
+    try {
+      const argvFile = join(stubDir, "argv");
+      writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
+      const result = spawnSync("bash", ["-c", run], {
+        cwd: stubDir,
+        env: { ...bashEnv, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
+        encoding: "utf8",
+        timeout,
+      });
+      // A timeout or a signal is a harness failure, not a missing argv: a
+      // non-zero exit is still allowed because the row may legitimately fail.
+      if (result.error !== undefined) throw result.error;
+      if (result.signal !== null) throw new Error(`bash was killed by ${result.signal}`);
+      try {
+        return readFileSync(argvFile, "utf8");
+      } catch {
+        return null;
+      }
+    } finally {
+      rmSync(stubDir, { recursive: true, force: true });
+    }
+  }
+
+  it("fails the real-bash helper when the control does not finish", () => {
+    expect(() => bashArgv("while :; do :; done", 250)).toThrow(/timed out|ETIMEDOUT|killed|SIGTERM/);
+  }, 5_000);
+
+  it("fails the real-bash helper when the child dies on a signal without a spawn error", () => {
+    expect(() => bashArgv("kill -TERM $$", 1_000)).toThrow(/killed by SIGTERM/);
+  }, 5_000);
+
+  const statics: { run: string; reason: RegExp; argv: string | null }[] = [
+    // Statically quoted prefix, wrapper and command spellings real bash runs.
+    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /an unapproved run block has an env option: -u/, argv: "ci" },
+    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /an unapproved run block has an env option: -u/, argv: "ci" },
+    { run: '"timeout" 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
+    { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
+    { run: '"${{ matrix.cmd }}" ci', reason: /runner expression in command position/, argv: null },
+
+    // An unknown short or long option on each modelled prefix.
+    { run: "env -Z npm ci", reason: /an unapproved run block has an env option: -Z/, argv: null },
+    { run: "env --bogus npm ci", reason: /an unapproved run block has an env option: --bogus/, argv: null },
+    { run: "sudo -Z npm ci", reason: /unrecognised sudo option/, argv: null },
+    { run: "sudo --bogus npm ci", reason: /unrecognised sudo option/, argv: null },
+    { run: "exec -Z npm ci", reason: /unrecognised exec option/, argv: null },
+    { run: "exec --bogus npm ci", reason: /unrecognised exec option/, argv: null },
+    { run: "xargs -Z npm ci", reason: /unrecognised xargs option/, argv: null },
+    { run: "xargs --bogus npm ci", reason: /unrecognised xargs option/, argv: null },
+
+    // A modelled option whose value is missing at the end of the line.
+    { run: "env -u", reason: /an unapproved run block has an env option: -u/, argv: null },
+    { run: "sudo -u", reason: /sudo option without a value/, argv: null },
+    { run: "exec -a", reason: /exec option without a value/, argv: null },
+    { run: "xargs -n", reason: /xargs option without a value/, argv: null },
+  ];
+
+  for (const row of statics) {
+    it(`refuses ${row.run} with a real-bash control`, () => {
+      expectRefused(row.run, row.reason);
+      expect(bashArgv(row.run)).toBe(row.argv);
+    }, 10_000);
+  }
+
+  it.each([
+    'timeout 5 "n${{ matrix.rest }}" ci',
+    'timeout 5 x "n${{ matrix.rest }}" ci',
+  ])("refuses a listed wrapper regardless of its arguments: %s", (run) => {
+    expectRefused(run, /listed exec wrapper: timeout/);
+    expect(bashArgv(run)).toBeNull();
+  }, 10_000);
+
+  it("refuses a dynamic word after a modelled prefix: env -${OPT} --version", () => {
+    expectRefused("env -${OPT} --version", /word without a static value after env/);
+    expect(bashArgv("env -${OPT} --version")).toBeNull();
+  }, 10_000);
+
+  it("keeps a backslash inside single quotes literal, so 'en\\v' is not env", () => {
+    const run = "'en\\v' -u FOO n$'p\\155' ci";
+    expect(assertNpmCiLockfilesRead(workflowStep(run), READ_TRACKED, WORKFLOW)).toBe(0);
+    const root = makeTreeFixture({ "package-lock.json": "{}\n" });
+    try {
+      expect(assertNpmCiWorkflowTree(workflowStep(run), new Set(["package-lock.json"]), root, WORKFLOW).installs).toBe(0);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+    expect(bashArgv(run)).toBeNull();
+  }, 10_000);
+
+  const hasXargs = spawnSync("bash", ["-c", "command -v xargs >/dev/null 2>&1"], { encoding: "utf8", timeout: 5_000, env: bashEnv }).status === 0;
+  const dynamicWords: { run: string; argv: string | null }[] = [
+    { run: 'CMD=npm\nenv "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNVAL=FOO\nenv -u "$DYNVAL" "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNOPT=u\nenv -"$DYNOPT" FOO "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nexec "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNVAL=x\nexec -a "$DYNVAL" "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nDYNOPT=a\nexec -"$DYNOPT" x "$CMD" ci', argv: "ci" },
+    { run: 'CMD=npm\nsudo -u nobody "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nDYNVAL=nobody\nsudo -u "$DYNVAL" "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nDYNOPT=u\nsudo -"$DYNOPT" nobody "$CMD" ci', argv: null },
+    { run: 'CMD=npm\nxargs "$CMD" ci', argv: hasXargs ? "ci" : null },
+    { run: 'CMD=npm\nDYNVAL=1\nxargs -n "$DYNVAL" "$CMD" ci', argv: hasXargs ? "ci" : null },
+    { run: 'CMD=npm\nDYNOPT=n\nxargs -"$DYNOPT" 1 "$CMD" ci', argv: hasXargs ? "ci" : null },
+  ];
+  for (const row of dynamicWords) {
+    it(`refuses a dynamic word in each position after a modelled prefix: ${row.run.split("\n").pop()}`, () => {
+      expectRefused(row.run, /cannot establish the npm ci directory/);
+      expect(bashArgv(row.run)).toBe(row.argv);
+    }, 10_000);
+  }
+
+  const bashWords = [
+    String.raw`'en\v'`,
+    String.raw`"en\v"`,
+    String.raw`en\v`,
+    String.raw`"a\$b"`,
+    String.raw`a\$b`,
+    String.raw`"a\\b"`,
+    String.raw`a\\b`,
+    String.raw`'a\*'`,
+    String.raw`'$HOME'`,
+    String.raw`a\ b`,
+    "'a`b'",
+    '"A=~"',
+    "'~'",
+  ];
+  it.each(bashWords)("decodes %s as bash splits it", (word) => {
+    const result = spawnSync("bash", ["-c", `printf '%s\\n' ${word}`], { encoding: "utf8", timeout: 5_000, env: bashEnv });
+    expect(result.status).toBe(0);
+    expect(staticWordValue(word)).toBe(result.stdout.replace(/\n$/, ""));
+  }, 5_000);
+
+  it.each([String.raw`$HOME`, '"${HOME}"', "`printf x`", 'n${{ matrix.rest }}', "a*", "~", "n{pm,}", "{1..9}", "$[1+2]", "A=~", "A=x:~/y"
+  ])("has no static value for an expanding or globbing word: %s", (word) => {
+    expect(staticWordValue(word)).toBeNull();
+  });
+
+  it.each(["A=~", "A=x:~/y"])("bash expands an unquoted tilde in the assignment value %s", (word) => {
+    const result = spawnSync("bash", ["-c", `${word}; printf '%s' "$A"`], { encoding: "utf8", timeout: 5_000, env: bashEnv });
+    expect(result.status).toBe(0);
+    expect(result.stdout).not.toContain("~");
+  }, 5_000);
+});
+
+describe("the workflow guard matches command names by decoded value (#941)", () => {
+  const fixture = {
+    "package-lock.json": "{}\n",
+    "scripts/package-lock.json": "{}\n",
+    "scripts/inst.sh": "npm ci\n",
+  };
+
+  function expectTreeRefused(line: string, run: string, tracked: string[], pattern: RegExp) {
+    const root = makeTreeFixture({ ...fixture, ...(run.startsWith("bash scripts/inner.sh") ? { "scripts/inner.sh": `${line}\n` } : {}) });
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(tracked), root, "workflow-command-words")).toThrow(pattern);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  const sourced = [
+    ["quoted source", "'source'"],
+    ["escaped source", "sour\\ce"],
+    ["quoted .", "'.'"],
+    ["escaped .", "\\."],
+  ];
+  for (const [label, word] of sourced) {
+    const line = `${word} "scripts/inst.sh"`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`follows ${label} in ${place} and refuses its install`, () => {
+        expectTreeRefused(line, run, [], /cannot bind the npm install to a tracked lockfile/);
+      }, 5_000);
+    }
+  }
+
+  const evaluated = [
+    ["quoted eval", "'eval'"],
+    ["escaped eval", "ev\\al"],
+  ];
+  for (const [label, word] of evaluated) {
+    const line = `${word} 'bash scripts/inst.sh'`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`refuses ${label} in ${place}`, () => {
+        const pattern = place === "a run block"
+          ? /cannot resolve a dynamic script path to one repository file: eval/
+          : /not on UNRESOLVED_INVOCATION_ALLOWLIST/;
+        expectTreeRefused(line, run, [], pattern);
+      }, 5_000);
+    }
+  }
+
+  const changed = [
+    ["quoted cd", "'cd'", /scripts\/package-lock\.json is not a lockfile the gate reads/, /scripts\/package-lock\.json is not a lockfile the gate reads/],
+    ["escaped cd", "c\\d", /scripts\/package-lock\.json is not a lockfile the gate reads/, /scripts\/package-lock\.json is not a lockfile the gate reads/],
+    ["quoted pushd", "'pushd'", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["escaped pushd", "pu\\shd", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["quoted popd", "'popd'", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+    ["escaped popd", "po\\pd", /non-literal directory change/, /not on UNRESOLVED_INVOCATION_ALLOWLIST/],
+  ] as const;
+  for (const [label, word, runPattern, followedPattern] of changed) {
+    const line = `${word} scripts\nbash inst.sh`;
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`applies ${label} in ${place}`, () => {
+        expectTreeRefused(line, run, ["package-lock.json"], place === "a run block" ? runPattern : followedPattern);
+      }, 5_000);
+    }
+  }
+
+  for (const [place, run] of [["a run block", "'made-up-command' --status"], ["a followed script", "bash scripts/inner.sh"]] as const) {
+    it(`refuses an unknown quoted command word in ${place}`, () => {
+      expectTreeRefused("'made-up-command' --status", run, [], /unrecognised quoted or escaped command word/);
+    }, 5_000);
+  }
+
+  for (const [label, line] of [
+    ["quoted builtin", "'builtin' source scripts/inst.sh"],
+    ["hash", "hash -p /tmp/x npm"],
+  ] as const) {
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`refuses ${label} in ${place}`, () => {
+        expectTreeRefused(line, run, [], /an unapproved run block has an unrecognised command word/);
+      }, 5_000);
+    }
+  }
 });

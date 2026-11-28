@@ -2,15 +2,44 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { load } from "js-yaml";
 
-type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string; env?: Record<string, unknown> };
+type WorkflowStep = { name?: string; run?: string; uses?: string; "working-directory"?: string; shell?: string; env?: Record<string, unknown> };
 type WorkflowJob = {
   steps: WorkflowStep[];
-  defaults?: { run?: { "working-directory"?: string } };
+  defaults?: { run?: { "working-directory"?: string; shell?: string } };
   env?: Record<string, unknown>;
 };
 
-export function parseWorkflow(source: string) {
-  return load(source) as { jobs: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"]; env?: Record<string, unknown> };
+type SourceLines = WeakMap<object, Map<string, number>>;
+
+export function parseWorkflow(source: string, locations?: SourceLines) {
+  const stack: { line: number; children: { value: unknown; line: number }[] }[] = [];
+  return load(source, locations === undefined ? undefined : {
+    listener(event, state) {
+      if (event === "open") {
+        stack.push({ line: state.line + 1, children: [] });
+        return;
+      }
+      const node = stack.pop();
+      if (node === undefined) return;
+      if (state.kind === "mapping" && state.result !== null && typeof state.result === "object") {
+        const keys = new Map<string, number>();
+        for (let index = 0; index + 1 < node.children.length; index += 2) {
+          const key = node.children[index];
+          if (key.value === "<<") {
+            const merged = node.children[index + 1].value;
+            for (const source of Array.isArray(merged) ? merged : [merged]) {
+              if (source === null || typeof source !== "object") continue;
+              for (const [name, line] of locations.get(source) ?? []) {
+                if (!keys.has(name)) keys.set(name, line);
+              }
+            }
+          } else if (typeof key.value === "string") keys.set(key.value, key.line);
+        }
+        if (keys.size > 0) locations.set(state.result, keys);
+      }
+      stack.at(-1)?.children.push({ value: state.result, line: node.line });
+    },
+  }) as { jobs: Record<string, WorkflowJob>; defaults?: WorkflowJob["defaults"]; env?: Record<string, unknown> };
 }
 
 export function scanQuotedValue(value: string): string[] | null {
@@ -99,11 +128,25 @@ const HELPER_CALL = new RegExp(
 type AllowlistEntry = { text: string; reason: string };
 
 /**
- * Approved complete run blocks containing npm. Text is pinned here, independent
- * of workflow input. Variable or substitution indirection such as n${x}pm and
+ * Approved complete run blocks. Text is pinned here, independent of workflow
+ * input. Variable or substitution indirection such as n${x}pm and
  * $(printf n)pm is outside the spelling check.
  */
 export const EXACT_BLOCK_ALLOWLIST: readonly AllowlistEntry[] = [
+  {
+    text: [
+      'export HOME=$(mktemp -d)',
+      'export TPS_VAULT_KEY="ci-release-smoke"',
+      'timeout 15 /tmp/tps-release-smoke branch init --name release-smoke 2>&1 | tee /tmp/tps-branch.log || true',
+      'if grep -qE "Branch identity created|Listening on" /tmp/tps-branch.log; then',
+      '  echo "✅ Noise handshake OK"',
+      'else',
+      '  echo "❌ Noise handshake failed"',
+      '  exit 1',
+      'fi',
+    ].join("\n"),
+    reason: "release smoke test bounds one branch binary with timeout; it runs no npm or npx",
+  },
   {
     text: "bun --no-install scripts/check-npm-pin-release-age.mjs",
     reason: "release npm pin age gate block",
@@ -367,6 +410,10 @@ function hasUnbalancedLineQuotes(lines: PhysicalLine[]): boolean {
   return false;
 }
 
+function isScalarAssignment(text: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*\+?=/.test(text);
+}
+
 /** Check physical run-step lines containing npm against approved blocks and shapes. */
 export function npmCiLockDirs(run: string, workdir: string, label: string): string[] {
   const lines = physicalLines(run);
@@ -375,9 +422,58 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
   };
   const approved = EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""));
   const flagged = lines.filter((entry) => containsNpm(entry.text));
+  let unestablished: { entry: PhysicalLine; text: string } | null = null;
+  if (!approved) {
+    for (const entry of logicalShellLines(run, refuse, true)) {
+      if (entry.body) continue;
+      for (const clause of splitClauses(entry.text, true)) {
+        for (const token of clause.tokens) {
+          if (isScalarAssignment(token.text) || (!token.quoted && SHELL_KEYWORDS.has(token.text))) continue;
+          if (!token.quoted && SHELL_RESERVED.has(token.text) && !RUN_COMPOUND_HEADERS.has(token.text)) {
+            refuse(entry, `an unapproved run block has a ${token.text} reserved word in command position`);
+          }
+          break;
+        }
+        const commandIndex = clause.tokens.findIndex((token) =>
+          !isScalarAssignment(token.text) && (token.quoted || !SHELL_KEYWORDS.has(token.text)));
+        if (commandIndex > 0 && clause.tokens.slice(0, commandIndex).some((token) =>
+          isScalarAssignment(token.text) && /[<>]/.test(token.text))) {
+          refuse(entry, "an unapproved run block has an assignment containing < or > before a command word (redirection check includes quoted values)");
+        }
+        const word = commandWord(clause.tokens, true, (reason) => refuse(entry, reason));
+        if (word === null) continue;
+        if (word.value === null && word.prefixed) {
+          refuse(entry, `an unapproved run block has a word without a static value after ${word.prefix}: ${word.token.text}`);
+        }
+        const text = word.token.text;
+        if (/^(?:[0-9]*[<>]|\{[A-Za-z_][A-Za-z0-9_]*\}[<>])/.test(text)) {
+          refuse(entry, "an unapproved run block has a leading redirection");
+        }
+        if (!word.token.quoted && text === "case") {
+          refuse(entry, "an unapproved run block has a case reserved word in command position");
+        }
+        if (text.includes("${{")) {
+          refuse(entry, "an unapproved run block has a runner expression in command position");
+        }
+        if (text.includes("$'")) {
+          refuse(entry, "an unapproved run block has a command word with ANSI-C quoting");
+        }
+        if (text !== "[" && text !== "[[" && /[*?\[]/.test(text)) {
+          refuse(entry, "an unapproved run block has a command word with a glob character");
+        }
+        if (text !== "[" && text !== "[[" && staticWordValue(text) === null && !isVariableWord(text) &&
+            unestablished === null) {
+          unestablished = { entry, text };
+        }
+      }
+    }
+  }
   if (!approved && flagged.length > 0 &&
       (run.includes("`") || run.includes("$(") || hasUnbalancedLineQuotes(lines))) {
     refuse(lines.find((entry) => entry.text.includes("$(")) ?? flagged[0], "unapproved run block has a shell wrapper");
+  }
+  if (!approved && unestablished !== null) {
+    refuse(unestablished.entry, `an unapproved run block cannot establish the command word: ${unestablished.text}`);
   }
   const helpers: PhysicalLine[] = [];
   for (const entry of lines) {
@@ -438,15 +534,26 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
 }
 
 export function assertNpmCiLockfilesRead(source: string, tracked: Set<string>, workflowName?: string): number {
-  const workflow = parseWorkflow(source);
+  const locations: SourceLines = new WeakMap();
+  const workflow = parseWorkflow(source, locations);
   let installs = 0;
   for (const [jobName, job] of Object.entries(workflow.jobs ?? {})) {
     const defaultWorkdir = job.defaults?.run?.["working-directory"] ?? workflow.defaults?.run?.["working-directory"] ?? "";
+    const defaultShellSource = job.defaults?.run?.shell != null ? job.defaults.run : workflow.defaults?.run;
+    const defaultShell = defaultShellSource?.shell;
     for (const [index, step] of job.steps.entries()) {
-      if (step.run === undefined) continue;
+      const run = step.run;
+      if (run === undefined) continue;
       const label = `${workflowName === undefined ? "" : `workflow ${workflowName} `}job ${jobName} step ${index + 1}${step.name ? ` (${step.name})` : ""}`;
-      const dirs = npmCiLockDirs(step.run, step["working-directory"] ?? defaultWorkdir, label);
-      const helperLines = physicalLines(step.run).filter((entry) => HELPER_CALL.test(entry.text));
+      const shell = step.shell ?? defaultShell;
+      if (shell !== undefined && shell !== "bash" &&
+          !EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === run.replace(/\n+$/, ""))) {
+        const shellSource = step.shell != null ? step : defaultShellSource;
+        const line = (shellSource === undefined ? undefined : locations.get(shellSource)?.get("shell")) ?? locations.get(step)?.get("run");
+        throw new Error(`${label}: cannot establish the npm ci directory: the step's effective shell is ${shell}, not the default bash (physical line ${line})`);
+      }
+      const dirs = npmCiLockDirs(run, step["working-directory"] ?? defaultWorkdir, label);
+      const helperLines = physicalLines(run).filter((entry) => HELPER_CALL.test(entry.text));
       for (const [installIndex, dir] of dirs.entries()) {
         installs++;
         const lockfile = dir === "" ? "package-lock.json" : `${dir}/package-lock.json`;
@@ -537,6 +644,8 @@ export const UNRESOLVED_INVOCATION_ALLOWLIST: readonly UnresolvedInvocationAllow
   { script: "scripts/test-tps-office-supervisor.sh", line: 158, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 166, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 173, token: '"$hook_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '1,/^validate_control_values$/p' \"$sup\" >\"$hook_fixture/startup.sh\"", reason: "generated supervisor slice written by this test (no npm install)" },
+  { script: "scripts/test-tps-office-supervisor.sh", line: 1089, token: "-c", target: "scripts/test-tps-office-supervisor.sh", assignment: 'ps_as_agent() { su -s /bin/bash "agent-probe" -c "exec \'$real_nono\' ps --json"; }', reason: "reads the agent's nono session registry; no npm install" },
+  { script: "scripts/test-tps-office-supervisor.sh", line: 1160, token: '"$bare_sup"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -E 's|--profile \\\\?\"\\$NONO_PROFILE\\\\?\"|--profile tps-office|g' \"$sup\" >\"$bare_sup\"", reason: "runs the supervisor copy with its profile argument rewritten" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 197, token: '"$secret_fixture/startup.sh"', target: "scripts/test-tps-office-supervisor.sh", source: "docker/tps-office-supervisor.sh", assignment: "sed -n '/^SECRETS_DIR=/,/^validate_control_values$/p' \"$sup\" | sed \"s|^SECRETS_DIR=.*|SECRETS_DIR=\\\"$secret_fixture/secrets\\\"|\"", reason: "generated supervisor slice written by this test's group from $sup (no npm install)" },
   { script: "scripts/test-tps-office-supervisor.sh", line: 251, token: '"$shutdown_fixture/run.sh"', target: "scripts/test-tps-office-supervisor.sh", assignment: "cat >\"$shutdown_fixture/run.sh\" <<'RUN'", reason: "$shutdown_fixture/run.sh is the generated supervisor fixture written by this script (no npm install)" },
   { script: "docker/tps-office-supervisor.sh", line: 351, token: "-c", target: "docker/tps-office-supervisor.sh", assignment: 'su -s /bin/bash "$user" -c "echo probe > \'$probe_file\'" >/dev/null 2>&1', reason: "inline landlock probe run as another user; no npm install" },
@@ -606,6 +715,7 @@ const SHELL_RESERVED = new Set([
   "!", "case", "coproc", "do", "done", "elif", "else", "esac", "fi", "for",
   "function", "if", "in", "select", "then", "time", "until", "while", "{", "}", "[[", "]]",
 ]);
+const RUN_COMPOUND_HEADERS = new Set(["for", "select", "fi", "done", "esac", "{", "}", "[["]);
 const SHELL_INTERPRETERS = new Set(["bash", "sh", "zsh", "dash", "ksh"]);
 const JS_INTERPRETERS = new Set(["node", "bun", "deno", "tsx"]);
 const INTERPRETERS = new Set([...SHELL_INTERPRETERS, ...JS_INTERPRETERS]);
@@ -615,6 +725,69 @@ const BUN_SUBCOMMANDS = new Set(["run", "test", "install", "i", "add", "remove",
 const DENO_SUBCOMMANDS = new Set(["run", "test", "task", "install", "cache", "check", "lint", "fmt", "bench", "doc", "info", "eval", "repl", "publish", "compile", "coverage"]);
 const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"]);
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
+// Command words the guard handles by decoded value: it follows the word,
+// validates its invocation shape, or knows it runs no repository script. A
+// name-shaped quoted command word whose decoded value is absent is refused.
+// `env` is here for its leading-assignment form: the guard follows leading
+// `NAME=value` assignments and refuses a leading option other than a lone `-`;
+// see the docs' Limits for the `env` forms that are not followed or refused.
+// `builtin` and `hash` are not handled.
+const HANDLED_COMMAND_WORDS = new Set([
+  "source", ".", "eval",
+  "cd", "pushd", "popd",
+  "bash", "sh", "zsh", "dash", "ksh", "node", "bun", "deno", "tsx",
+  "npm", "npx", "su",
+  "env", "command", "exec", "sudo", "xargs", "nohup", "time",
+  "[", "[[",
+  "docker", "setsid", "timeout", "nice", "chroot", "stdbuf",
+  "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch",
+]);
+
+/** The decoded static command word the guard compares, or null when it has none. */
+function decodedCommandWord(word: WalkedWord): string | null {
+  return word.value;
+}
+
+// Finite prefix-option grammars for unapproved run blocks. Unlisted options
+// refuse the step: guessing an option's arity can turn its value into the
+// command word.
+type PrefixOptionGrammar = {
+  shortValue: Set<string>;
+  shortFlag: Set<string>;
+  longValue: Set<string>;
+  longFlag: Set<string>;
+};
+const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
+  sudo: {
+    shortValue: new Set(["u", "g", "C", "D", "h", "p", "r", "t", "U"]),
+    shortFlag: new Set(["A", "B", "b", "E", "e", "H", "K", "k", "l", "n", "P", "S", "V", "v"]),
+    longValue: new Set(["user", "group", "close-from", "chdir", "host", "prompt", "role", "type", "other-user"]),
+    longFlag: new Set(["askpass", "background", "bell", "preserve-env", "edit", "set-home", "remove-timestamp", "reset-timestamp", "list", "non-interactive", "no-update", "preserve-groups", "stdin", "version", "validate"]),
+  },
+  exec: {
+    shortValue: new Set(["a"]),
+    shortFlag: new Set(["c", "l"]),
+    longValue: new Set(["argv0"]),
+    longFlag: new Set(["clear", "login", "help", "version"]),
+  },
+  xargs: {
+    shortValue: new Set(["a", "d", "E", "I", "L", "n", "P", "s"]),
+    shortFlag: new Set(["0", "o", "p", "r", "t", "x", "e", "i"]),
+    longValue: new Set(["arg-file", "delimiter", "eof", "replace", "max-lines", "max-args", "max-procs", "max-chars"]),
+    longFlag: new Set(["null", "open-tty", "interactive", "no-run-if-empty", "verbose", "exit", "show-limits", "help", "version"]),
+  },
+};
+
+// Command words the guard refuses rather than models: `builtin` runs another
+// builtin and `hash` changes command lookup. The tests pin `hash` and a quoted
+// `builtin`.
+const UNRECOGNISED_COMMAND_WORDS = new Set(["builtin", "hash"]);
+
+// A listed exec wrapper is refused outright in unapproved run blocks.
+const UNMODELLED_WRAPPERS = new Set([
+  "timeout", "nice", "stdbuf", "setsid", "chroot", "ionice", "chrt",
+  "taskset", "flock", "unbuffer", "script", "watch",
+]);
 
 function stripOuterQuotes(value: string): string {
   if (value.length >= 2 && ((value[0] === '"' && value[value.length - 1] === '"') || (value[0] === "'" && value[value.length - 1] === "'"))) {
@@ -623,9 +796,95 @@ function stripOuterQuotes(value: string): string {
   return value;
 }
 
-/** The literal word a token spells once quotes are dropped and escapes removed. */
-function literalWord(text: string): string {
-  return text.replace(/\\(.)/g, "$1").replace(/['"]/g, "");
+/**
+ * A word's static value, decoded with bash's quoting rules. Null when the word
+ * contains a parameter, command, arithmetic or brace expansion, an unescaped
+ * backquote, an unquoted `~` anywhere (bash also expands one after `=` or `:` in
+ * an assignment value), or an unquoted glob: the shell may run a different word
+ * than the text spells, so the guard cannot establish it statically. The guard
+ * never evaluates an expansion.
+ */
+export function staticWordValue(text: string): string | null {
+  const expansionAt = (index: number, doubleQuoted: boolean): boolean => {
+    const next = text[index + 1];
+    if (next === undefined) return false;
+    if (next === "(" || next === "{" || next === "[") return true;
+    return /[A-Za-z0-9_@*#?$!-]/.test(next) || (!doubleQuoted && (next === "'" || next === '"'));
+  };
+  const braces: boolean[] = [];
+  let value = "";
+  let quote: "" | "'" | '"' = "";
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (quote === "'") {
+      // Inside single quotes every character is literal, a backslash included.
+      if (char === "'") quote = "";
+      else value += char;
+      continue;
+    }
+    if (quote === '"') {
+      if (char === '"') {
+        quote = "";
+        continue;
+      }
+      if (char === "\\") {
+        const next = text[index + 1];
+        if (next === "$" || next === "`" || next === '"' || next === "\\") {
+          value += next;
+          index++;
+        } else if (next === "\n") index++;
+        else value += "\\";
+        continue;
+      }
+      if (char === "`" || (char === "$" && expansionAt(index, true))) return null;
+      value += char;
+      continue;
+    }
+    if (char === "'") {
+      quote = "'";
+      continue;
+    }
+    if (char === '"') {
+      quote = '"';
+      continue;
+    }
+    if (char === "\\") {
+      const next = text[index + 1];
+      if (next === "\n") index++;
+      else if (next === undefined) value += "\\";
+      else {
+        value += next;
+        index++;
+      }
+      continue;
+    }
+    if (char === "`" || (char === "$" && expansionAt(index, false))) return null;
+    if (char === "*") return null;
+    if (braces.length > 0 && (char === "," || (char === "." && text[index + 1] === "."))) braces[braces.length - 1] = true;
+    if (char === "{") {
+      braces.push(false);
+      value += char;
+      continue;
+    }
+    if (char === "}") {
+      if (braces.pop() === true) return null;
+      value += char;
+      continue;
+    }
+    if (char === "?" || char === "[") return null;
+    if (char === "~") return null;
+    value += char;
+  }
+  return value;
+}
+
+/**
+ * A variable word: `$NAME` or `${NAME}` (optionally indexed), optionally followed
+ * by `/` and any non-space text, which may itself expand. It is an accepted
+ * dynamic form here; the tree scanner resolves such words where it can.
+ */
+function isVariableWord(text: string): boolean {
+  return /^\$(?:\{?[A-Za-z_][A-Za-z0-9_]*(?:\[[^\]]*\])?\}?)(?:\/\S*)?$/.test(stripOuterQuotes(text));
 }
 
 function isShellScript(rel: string, content: string): boolean {
@@ -665,31 +924,65 @@ function resolveDynamicSuffix(ctx: TreeContext, token: string, bases: string[] =
 }
 
 type Invocation = { rel: string } | { dynamic: string; cwdUnknown?: true; missing?: true };
-type ShellToken = { text: string; quoted: boolean };
+type ShellToken = { text: string; quoted: boolean; hereDocument?: number; literalHereDocuments?: number[] };
+type WordToken = { text: string; quoted: boolean; end?: number };
 type LogicalLine = { text: string; line: number; body: boolean; quoteContinued?: boolean; tail?: string };
 type Clause = { tokens: ShellToken[]; piped: boolean };
 
+/**
+ * A brace is a shell operator only as a standalone word: `{n,}pm` and
+ * `dir/{a,b}` are one word, `{ echo ok; }` is a group.
+ */
+function standaloneBrace(line: string, index: number): boolean {
+  const separates = (char: string | undefined): boolean => char === undefined || /[\s;&|()<>]/.test(char);
+  return separates(line[index - 1]) && separates(line[index + 1]);
+}
+
 /** Split a line into words, keeping quoted spans whole and honoring escapes and substitutions. */
-function shellTokens(line: string): ShellToken[] {
+function shellTokens(line: string, keepRedirectAmpersand = false, hereDocuments = false): ShellToken[] {
   const tokens: ShellToken[] = [];
   let index = 0;
   while (index < line.length) {
     const char = line[index];
+    if (hereDocuments && char === "\n") {
+      tokens.push({ text: "\n", quoted: false });
+      index++;
+      continue;
+    }
     if (/\s/.test(char)) {
       index++;
       continue;
     }
-    if (char === "#") break;
-    if (/[;&|(){}]/.test(char)) {
+    if (char === "#") {
+      if (!hereDocuments) break;
+      const end = line.indexOf("\n", index);
+      index = end === -1 ? line.length : end;
+      continue;
+    }
+    if (hereDocuments && line.startsWith("<<<", index)) {
+      tokens.push({ text: "<<<", quoted: false });
+      index += 3;
+      continue;
+    }
+    if (hereDocuments && line.startsWith("<<", index)) {
+      const operator = line.startsWith("<<-", index) ? "<<-" : "<<";
+      tokens.push({ text: operator, quoted: false, hereDocument: index });
+      index += operator.length;
+      continue;
+    }
+    if (/[;&|()]/.test(char) || ((char === "{" || char === "}") && standaloneBrace(line, index))) {
       tokens.push({ text: char, quoted: false });
       index++;
       continue;
     }
     let text = "";
     let quoted = false;
+    const literalHereDocuments: number[] = [];
     while (index < line.length) {
       const next = line[index];
-      if (/\s/.test(next) || /[;&|(){}]/.test(next)) break;
+      if (hereDocuments && line.startsWith("<<", index)) break;
+      if (/\s/.test(next) || (/[;&|()]/.test(next) &&
+          !(keepRedirectAmpersand && ((next === "&" && /[<>]$/.test(text)) || (next === "|" && />$/.test(text)))))) break;
       if (next === "\\") {
         text += next;
         index++;
@@ -703,12 +996,35 @@ function shellTokens(line: string): ShellToken[] {
         index++;
         while (index < line.length) {
           const inner = line[index];
+          // Keep quoted substitutions whole when locating the outer command word.
+          if (hereDocuments && quote === '"' && inner === "`") {
+            const end = backtickEnd(line, index);
+            const after = end === null ? line.length : end + 1;
+            text += line.slice(index, after);
+            index = after;
+            continue;
+          }
+          if (hereDocuments && quote === '"' && inner === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+            const end = expansionEnd(line, index + 1, literalHereDocuments);
+            text += line.slice(index, end);
+            index = end;
+            continue;
+          }
+          if (keepRedirectAmpersand && quote === '"' && isScalarAssignment(text) && inner === "$" && line[index + 1] === "(") {
+            const span = parenSpan(line, index + 1);
+            if (span !== null && "end" in span) {
+              text += line.slice(index, span.end + 1);
+              index = span.end + 1;
+              continue;
+            }
+          }
           if (inner === "\\" && quote === '"') {
             text += inner;
             index++;
             if (index < line.length) text += line[index++];
             continue;
           }
+          if (hereDocuments && line.startsWith("<<", index)) literalHereDocuments.push(index);
           text += inner;
           index++;
           if (inner === quote) break;
@@ -729,10 +1045,17 @@ function shellTokens(line: string): ShellToken[] {
             if (index < line.length) text += line[index++];
             continue;
           }
+          if (hereDocuments && line.startsWith("<<", index)) literalHereDocuments.push(index);
           text += inner;
           index++;
           if (inner === "'") break;
         }
+        continue;
+      }
+      if (hereDocuments && next === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+        const end = expansionEnd(line, index + 1, literalHereDocuments);
+        text += line.slice(index, end);
+        index = end;
         continue;
       }
       if (next === "$" && line[index + 1] === "(") {
@@ -759,6 +1082,13 @@ function shellTokens(line: string): ShellToken[] {
         }
         continue;
       }
+      if (hereDocuments && next === "`") {
+        const end = backtickEnd(line, index);
+        const after = end === null ? line.length : end + 1;
+        text += line.slice(index, after);
+        index = after;
+        continue;
+      }
       if (next === "`") {
         text += next;
         index++;
@@ -772,9 +1102,41 @@ function shellTokens(line: string): ShellToken[] {
       text += next;
       index++;
     }
-    tokens.push({ text, quoted });
+    tokens.push({ text, quoted, ...(hereDocuments ? { literalHereDocuments } : {}) });
   }
   return tokens;
+}
+
+/** Keep expansion contents opaque when recognizing top-level redirections. */
+function expansionEnd(line: string, open: number, literalHereDocuments?: number[]): number {
+  const close = ({ "(": ")", "{": "}", "[": "]" } as Record<string, string>)[line[open]];
+  let quote = "";
+  for (let index = open + 1; index < line.length; index++) {
+    const char = line[index];
+    if (char === "\\" && quote !== "'") { index++; continue; }
+    if (quote === '"' && char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+      index = expansionEnd(line, index + 1, literalHereDocuments) - 1;
+      continue;
+    }
+    if (quote === '"' && char === "`") {
+      index = backtickEnd(line, index) ?? line.length;
+      continue;
+    }
+    if (quote !== "") {
+      if (quote !== "`" && line.startsWith("<<", index)) literalHereDocuments?.push(index);
+      if (char === (quote === "ansi" ? "'" : quote)) quote = "";
+      continue;
+    }
+    if (char === "$" && line[index + 1] === "'") { quote = "ansi"; index++; continue; }
+    if (char === "'" || char === '"' || char === "`") { quote = char; continue; }
+    if (char === "$" && /[({\[]/.test(line[index + 1] ?? "")) {
+      index = expansionEnd(line, index + 1, literalHereDocuments) - 1;
+      continue;
+    }
+    if (close !== "}" && char === line[open]) { index = expansionEnd(line, index, literalHereDocuments) - 1; continue; }
+    if (char === close) return index + 1;
+  }
+  return line.length;
 }
 
 /** Strip a word-boundary comment, preserving `#` inside quoted spans and URLs. */
@@ -797,6 +1159,36 @@ function stripWordBoundaryComment(line: string): string {
   return line;
 }
 
+type HereDocument = { delimiter: string; quoted: boolean; stripTabs: boolean; line: number };
+type HereDocumentState = { pending: HereDocument[]; continued: string };
+
+function hereDocumentHeaders(line: string, number: number): HereDocument[] {
+  return shellTokens(line, true, true).flatMap((token) => {
+    if (token.hereDocument === undefined) return [];
+    const match = line.slice(token.hereDocument).match(/^<<(-)?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2(?=[ \t\n]|[;&|<>]|$)/);
+    return match === null ? [] : [{
+      delimiter: match[3], quoted: match[2] !== "", stripTabs: match[1] === "-", line: number,
+    }];
+  });
+}
+
+/** Both scanners must agree on where command scanning resumes. */
+function hereDocumentLine(state: HereDocumentState, physical: string): "body" | "end" | null {
+  const header = state.pending[0];
+  if (header === undefined) return null;
+  const backslashes = physical.match(/\\+$/)?.[0].length ?? 0;
+  if (!header.quoted && backslashes % 2 === 1) {
+    state.continued += physical.slice(0, -1);
+    return "body";
+  }
+  const joined = state.continued + physical;
+  const candidate = header.stripTabs ? joined.replace(/^\t+/, "") : joined;
+  state.continued = "";
+  if (candidate !== header.delimiter) return "body";
+  state.pending.shift();
+  return "end";
+}
+
 /**
  * Physical-line positions that begin inside a multi-line quote. Command scanning
  * skips these lines: they are string data, not shell words.
@@ -804,14 +1196,11 @@ function stripWordBoundaryComment(line: string): string {
 function quoteStartMask(raw: string[]): boolean[] {
   const mask: boolean[] = [];
   let quote = "";
-  let delimiter: string | null = null;
-  let stripTabs = false;
-  for (const rawLine of raw) {
+  const documents: HereDocumentState = { pending: [], continued: "" };
+  for (const [number, rawLine] of raw.entries()) {
     const physical = rawLine.replace(/\r$/, "");
-    if (delimiter !== null) {
-      const candidate = stripTabs ? physical.replace(/^\t+/, "") : physical;
+    if (hereDocumentLine(documents, physical) !== null) {
       mask.push(true);
-      if (candidate === delimiter) delimiter = null;
       continue;
     }
     mask.push(quote !== "");
@@ -836,11 +1225,7 @@ function quoteStartMask(raw: string[]): boolean[] {
     if (quote === "") {
       // Unknown => refuse: a here-document header is matched after the comment
       // is stripped, so `# <<EOF` prose cannot swallow the lines below it.
-      const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
-      if (heredoc !== null) {
-        delimiter = heredoc[3];
-        stripTabs = heredoc[1] === "-";
-      }
+      documents.pending.push(...hereDocumentHeaders(line, number + 1));
     }
   }
   return mask;
@@ -848,17 +1233,27 @@ function quoteStartMask(raw: string[]): boolean[] {
 
 /**
  * Join continuations, strip word-boundary comments and mark here-document body
- * lines. Bodies are kept for the install classifier (a heredoc fed to a shell
- * runs its text); command scanning ignores body lines.
+ * lines. Bodies are kept for the install classifier; command scanning ignores
+ * body lines.
  */
-function logicalShellLines(text: string): LogicalLine[] {
+function logicalShellLines(text: string, refuseHeader: ((entry: PhysicalLine, reason: string) => never) | null = (entry, reason) => {
+  throw new Error(`${reason}: ${entry.text} (physical line ${entry.line})`);
+}, strictRunBlock = false): LogicalLine[] {
   const raw = text.split("\n");
   const mask = quoteStartMask(raw);
   const lines: LogicalLine[] = [];
+  let headerPrefix = "";
   let buffer = "";
   let start = 0;
-  let delimiter: string | null = null;
-  let stripTabs = false;
+  const documents: HereDocumentState = { pending: [], continued: "" };
+  // A trailing backslash continues the line only when it is unescaped: an even
+  // run of backslashes ends in a literal backslash, so `echo ok \\` is a
+  // complete command and bash starts a new line after it.
+  const endsWithContinuation = (value: string): boolean => {
+    let backslashes = 0;
+    for (let at = value.length - 1; at >= 0 && value[at] === "\\"; at--) backslashes++;
+    return backslashes % 2 === 1;
+  };
   const flush = (quoteContinued = false, tail = "") => {
     const trimmed = buffer.trim();
     if (trimmed !== "") lines.push({ text: trimmed, line: start, body: false, quoteContinued, tail });
@@ -866,47 +1261,141 @@ function logicalShellLines(text: string): LogicalLine[] {
   };
   for (let index = 0; index < raw.length; index++) {
     const physical = raw[index].replace(/\r$/, "");
-    if (delimiter !== null) {
-      const candidate = stripTabs ? physical.replace(/^\t+/, "") : physical;
-      if (candidate === delimiter) {
-        delimiter = null;
-        continue;
-      }
+    const body = hereDocumentLine(documents, physical);
+    if (body !== null) {
+      if (body === "end") continue;
       const trimmed = physical.trim();
       if (trimmed !== "") lines.push({ text: trimmed, line: index + 1, body: true });
       continue;
     }
+    const physicalStart = headerPrefix.length;
+    headerPrefix += (mask[index] ? physical : stripWordBoundaryComment(physical)) + "\n";
+    let headerCount = 0;
+    if (refuseHeader !== null && physical.includes("<<")) {
+      const operators = shellTokens(headerPrefix, true, true);
+      const literal = new Set(operators.flatMap((token) => token.literalHereDocuments ?? []));
+      const accepted = new Set<number>();
+      let simple = true;
+      let commandPosition = true;
+      let depth = 0;
+      for (const token of operators) {
+        if (!token.quoted && /^[({]$/.test(token.text)) depth++;
+        else if (!token.quoted && /^[)}]$/.test(token.text)) depth--;
+        if (!token.quoted && /^[;&|\n]$/.test(token.text)) {
+          simple = !strictRunBlock || depth === 0;
+          commandPosition = true;
+        } else {
+          if (!token.quoted && (/^[(){}]$/.test(token.text) ||
+              (commandPosition && (SHELL_HEADERS.has(token.text) || SHELL_KEYWORDS.has(token.text))))) simple = false;
+          if (!isScalarAssignment(token.text)) commandPosition = false;
+        }
+        if (simple && token.hereDocument !== undefined &&
+            headerPrefix[token.hereDocument - 1] !== "<" && headerPrefix[token.hereDocument + 2] !== "<") {
+          accepted.add(token.hereDocument);
+        }
+      }
+      for (let at = headerPrefix.indexOf("<<", physicalStart); at !== -1; at = headerPrefix.indexOf("<<", at + 1)) {
+        if (literal.has(at) || (!strictRunBlock && (headerPrefix[at - 1] === "<" || headerPrefix[at + 2] === "<"))) continue;
+        if (!accepted.has(at) || !/^<<-?[ \t]*(['"]?)[A-Za-z_][A-Za-z0-9_]*\1(?=[ \t\n]|[;&|<>]|$)/.test(headerPrefix.slice(at))) {
+          refuseHeader({ text: physical.trim(), line: index + 1 }, strictRunBlock ? "an unapproved run block has << outside a standalone top-level simple-command here-document redirection" : "an unclassified here-document header outside a standalone simple-command redirection");
+        }
+        headerCount++;
+      }
+    }
     if (mask[index]) {
+      if (refuseHeader !== null && headerCount > 0) {
+        refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header in a continued quote");
+      }
       buffer = "";
       continue;
     }
     const line = stripWordBoundaryComment(physical);
     if (buffer === "") start = index + 1;
-    if (/\\$/.test(line)) {
-      buffer += line.slice(0, -1);
+    const heredocs = hereDocumentHeaders(line, index + 1);
+    if (refuseHeader !== null && (headerCount !== heredocs.length ||
+        (headerCount > 0 && hasUnbalancedLineQuotes([{ text: line, line: index + 1 }])))) {
+      refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header");
+    }
+    if (refuseHeader !== null && heredocs.length > 0 && (buffer !== "" || endsWithContinuation(line))) {
+      refuseHeader({ text: physical.trim(), line: index + 1 }, "an unclassified here-document header continuation");
+    }
+    if (endsWithContinuation(line)) {
+      const joined = line.slice(0, -1);
+      const next = index + 1 < raw.length ? raw[index + 1].replace(/\r$/, "") : "";
+      if (refuseHeader !== null && strictRunBlock && joined !== "" && !/\s$/.test(joined) &&
+          next !== "" && !/^\s/.test(next)) {
+        refuseHeader({ text: physical.trim(), line: index + 1 }, "an unapproved run block has a backslash-newline continuation inside a word");
+      }
+      buffer += joined;
       continue;
     }
     buffer += line;
-    const heredoc = line.match(/<<(-)?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2/);
     flush(
-      heredoc === null && index + 1 < raw.length && mask[index + 1] === true,
+      heredocs.length === 0 && index + 1 < raw.length && mask[index + 1] === true,
       raw.slice(index + 1).join("\n"),
     );
-    if (heredoc !== null) {
-      delimiter = heredoc[3];
-      stripTabs = heredoc[1] === "-";
-    }
+    documents.pending.push(...heredocs);
+  }
+  const unclosed = documents.pending[0];
+  if (refuseHeader !== null && unclosed !== undefined) {
+    refuseHeader({ text: raw[unclosed.line - 1].trim(), line: unclosed.line }, "an unclassified here-document body boundary (missing delimiter)");
   }
   flush();
   return lines;
 }
 
-function splitClauses(line: string): Clause[] {
+/**
+ * The first character a word decodes to, and whether a quote produced it, so a
+ * brace after empty quotes (`''{n,}pm`) is still an unquoted brace. Null when
+ * the word decodes to nothing but quotes.
+ */
+function leadingDecodedChar(text: string): { char: string; quoted: boolean } | null {
+  let quote: "" | "'" | '"' = "";
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index];
+    if (quote === "'") {
+      if (char === "'") { quote = ""; continue; }
+      return { char, quoted: true };
+    }
+    if (quote === '"') {
+      if (char === '"') { quote = ""; continue; }
+      if (char === "\\") {
+        const next = text[index + 1];
+        if (next === "$" || next === "`" || next === '"' || next === "\\") return { char: next, quoted: true };
+        if (next === "\n") { index++; continue; }
+        return { char: "\\", quoted: true };
+      }
+      return { char, quoted: true };
+    }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (char === "\\") {
+      const next = text[index + 1];
+      return next === undefined ? null : { char: next, quoted: true };
+    }
+    return { char, quoted: false };
+  }
+  return null;
+}
+
+/**
+ * The command-word walk refuses a word whose first decoded character is an
+ * unquoted `{`, so `''{n,}pm` counts and `'{n,}pm'` does not: the guard does not
+ * read brace expansion statically, and bash can run a different word than the
+ * text spells. A `{`-delimited descriptor followed by a redirection (`{fd}>out`)
+ * is left to the leading-redirection check.
+ */
+function isBraceCommandWord(text: string): boolean {
+  const lead = leadingDecodedChar(text);
+  return lead !== null && lead.char === "{" && !lead.quoted &&
+    !/^\{[A-Za-z_][A-Za-z0-9_]*\}[<>]/.test(text);
+}
+
+function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
   const clauses: Clause[] = [];
   let current: ShellToken[] = [];
   let piped = false;
   let nextPiped = false;
-  for (const token of shellTokens(line)) {
+  for (const token of shellTokens(line, keepRedirectAmpersand)) {
     if (/^(?:;|&|\||\(|\)|\{|\})$/.test(token.text)) {
       if (current.length > 0) clauses.push({ tokens: current, piped });
       current = [];
@@ -919,42 +1408,217 @@ function splitClauses(line: string): Clause[] {
 }
 
 /**
- * Skip VAR=val assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
- * the reserved words that introduce a command clause; a `for`/`case`/`select`
- * header is not an invocation.
+ * Consume a prefix command's options and return the index of the first token
+ * after them, which may be an assignment. An option the grammar does not list
+ * refuses the step.
  */
-function commandWord(tokens: ShellToken[]): { index: number; token: ShellToken } | null {
-  let index = 0;
-  let sawPrefix = false;
+function consumePrefixOptionWords(
+  command: string,
+  grammar: PrefixOptionGrammar,
+  tokens: readonly WordToken[],
+  index: number,
+  refuse: (reason: string) => never,
+): number {
+  const stop = (reason: string): number => refuse(reason);
   while (index < tokens.length) {
     const token = tokens[index];
-    const text = stripOuterQuotes(token.text);
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
+    const text = staticWordValue(token.text);
+    // A nonstatic word may expand to an option; it is returned to the caller,
+    // which refuses it in a run block (a followed script may skip it without
+    // recording it).
+    if (text === null) return index;
+    if (!text.startsWith("-") || text === "-") return index;
+    if (text === "--") return index + 1;
+    if (text.startsWith("--")) {
+      const equals = text.indexOf("=");
+      const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
+      if (grammar.longValue.has(name)) {
+        if (equals !== -1) {
+          index++;
+          continue;
+        }
+        if (index + 1 >= tokens.length) return stop(`an unapproved run block has a ${command} option without a value`);
+        if (staticWordValue(tokens[index + 1].text) === null) {
+          return stop(`an unapproved run block cannot establish the command word: ${tokens[index + 1].text}`);
+        }
+        index += 2;
+        continue;
+      }
+      if (grammar.longFlag.has(name)) {
+        index++;
+        continue;
+      }
+      return stop(`an unapproved run block has an unrecognised ${command} option`);
+    }
+    const letters = text.slice(1);
+    let takesNext = false;
+    let known = true;
+    for (let letter = 0; letter < letters.length; letter++) {
+      const flag = letters[letter];
+      if (grammar.shortValue.has(flag)) {
+        takesNext = letter === letters.length - 1;
+        break;
+      }
+      if (!grammar.shortFlag.has(flag)) {
+        known = false;
+        break;
+      }
+    }
+    if (!known) return stop(`an unapproved run block has an unrecognised ${command} option`);
+    if (takesNext) {
+      if (index + 1 >= tokens.length) return stop(`an unapproved run block has a ${command} option without a value`);
+      if (staticWordValue(tokens[index + 1].text) === null) {
+        return stop(`an unapproved run block cannot establish the command word: ${tokens[index + 1].text}`);
+      }
+    }
+    index += takesNext ? 2 : 1;
+  }
+  return index;
+}
+
+/** One clause's command word and the words after it, decoded where static. */
+type WalkedWord = {
+  index: number;
+  token: WordToken;
+  /** The command word decoded with bash's quoting rules; null when it is not static. */
+  value: string | null;
+  /** True when a prefix command was consumed before the command word. */
+  prefixed: boolean;
+  /** The prefix command word consumed before the command word, or null. */
+  prefix: string | null;
+  /** The words after the command word, each decoded when it has a static value. */
+  args: WordToken[];
+  /** The same words as written, with their quotes and escapes. */
+  rawArgs: readonly WordToken[];
+};
+
+/** Decode each word that has a static value, keeping the raw word otherwise. */
+function decodedWords(tokens: readonly WordToken[]): WordToken[] {
+  return tokens.map((token) => {
+    const value = staticWordValue(token.text);
+    return value === null ? token : { ...token, text: value };
+  });
+}
+
+/**
+ * Walk a clause's words and return its command word. Prefixes, options and
+ * command names are recognised by their decoded static value. `refuse` is
+ * required:
+ * an option outside the modelled `env`, `sudo`, `exec` or `xargs` grammar, a leading `env` option other than a lone
+ * `-`, a word in `UNRECOGNISED_COMMAND_WORDS`, or a command word beginning with an unquoted `{`
+ * is refused. `env` follows leading `NAME=value` assignments; a quoted or
+ * escaped assignment and `env -` are not followed. A
+ * word after a prefix with no static value is returned with a null value, so
+ * the caller judges it (a run block refuses it; a followed script may skip it
+ * without recording it). `refuseWrapper` is supplied only by run-block
+ * validation; discovery follows a listed wrapper's payload. The result carries
+ * the command word and the arguments decoded where they have a static value, so
+ * discovery consumes that one result.
+ */
+function walkCommandWord(
+  tokens: readonly WordToken[],
+  includeCase: boolean,
+  refuse: (reason: string) => never,
+  braceRefuse?: (reason: string) => never,
+  refuseWrapper?: (reason: string) => never,
+): WalkedWord | null {
+  let index = 0;
+  let sawPrefix = false;
+  let prefix = "";
+  const onBrace = braceRefuse ?? refuse;
+  const walked = (at: number, token: WordToken, value: string | null): WalkedWord =>
+    ({ index: at, token, value, prefixed: sawPrefix, prefix: sawPrefix ? prefix : null, args: decodedWords(tokens.slice(at + 1)), rawArgs: tokens.slice(at + 1) });
+  while (index < tokens.length) {
+    const token = tokens[index];
+    if (isBraceCommandWord(token.text)) {
+      onBrace("an unapproved run block conservatively refuses a command word beginning with an unquoted {");
+    }
+    const value = staticWordValue(token.text);
+    // After a prefix every word up to and including the command word must be
+    // static; the caller judges a null value.
+    if (sawPrefix && value === null) return walked(index, token, null);
+    if (isScalarAssignment(token.text)) {
       index++;
       continue;
     }
+    const text = value ?? stripOuterQuotes(token.text);
+    if (includeCase && !token.quoted && text === "case") return walked(index, token, value);
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
-    if (!token.quoted && PREFIX_COMMANDS.has(text)) {
+    if (PREFIX_COMMANDS.has(text)) {
       // `command -v`/`-V` looks a name up; it runs no command.
       if (text === "command") {
         const next = tokens[index + 1];
-        if (next !== undefined && !next.quoted && /^-[vV]$/.test(next.text)) return null;
+        const nextText = next === undefined ? null : staticWordValue(next.text);
+        if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
       }
       sawPrefix = true;
+      prefix = text;
       index++;
+      if (text === "env") {
+        // Leading NAME=value assignments, then the command word. A lone `-` is returned
+        // as the command word, so `env -` stops payload discovery (see the docs' Limits).
+        while (index < tokens.length) {
+          const word = tokens[index];
+          const decoded = staticWordValue(word.text);
+          if (decoded === null) {
+            if (isBraceCommandWord(word.text)) {
+              onBrace("an unapproved run block conservatively refuses a command word beginning with an unquoted {");
+            }
+            return walked(index, word, null);
+          }
+          if (isScalarAssignment(word.text)) {
+            index++;
+            continue;
+          }
+          if (decoded.startsWith("-") && decoded !== "-") {
+            refuse(`an unapproved run block has an env option: ${decoded}`);
+          }
+          break;
+        }
+        continue;
+      }
+      const grammar = PREFIX_OPTION_GRAMMAR[text];
+      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse);
       continue;
+    }
+    if (UNRECOGNISED_COMMAND_WORDS.has(text)) {
+      refuse(`an unapproved run block has an unrecognised command word: ${text}`);
+    }
+    if (UNMODELLED_WRAPPERS.has(text)) {
+      // In an unapproved run block a listed wrapper is refused without
+      // inspecting its arguments; discovery follows its payload instead.
+      if (refuseWrapper !== undefined) refuseWrapper(`an unapproved run block has a listed exec wrapper: ${text}`);
+      return walked(index, token, value);
     }
     if (!token.quoted && SHELL_KEYWORDS.has(text)) {
       index++;
       continue;
     }
-    if (sawPrefix && !token.quoted && text.startsWith("-") && text !== "-") {
+    if (sawPrefix && text.startsWith("-") && text !== "-") {
       index++;
       continue;
     }
-    return { index, token };
+    return walked(index, token, value);
   }
   return null;
+}
+
+/**
+ * Skip variable assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
+ * the reserved words that introduce a command clause; a `for`/`case`/`select`
+ * header is not an invocation unless `case` is requested for refusal. Prefix
+ * options of `env`, `sudo`, `exec` and `xargs` are consumed from their finite
+ * grammars and their unmodelled options are refused; other prefixes' options are
+ * not checked. This entry point is run-block validation, so a listed wrapper is
+ * refused too.
+ */
+function commandWord(
+  tokens: ShellToken[],
+  includeCase: boolean,
+  refuse: (reason: string) => never,
+  braceRefuse?: (reason: string) => never,
+): WalkedWord | null {
+  return walkCommandWord(tokens, includeCase, refuse, braceRefuse, refuse);
 }
 
 function firstNonFlag(tokens: ShellToken[]): ShellToken | undefined {
@@ -1437,6 +2101,7 @@ type ShellState = ShellOrigin & {
   staged: boolean;
   /** Physical line reported for every invocation inside a command substitution. */
   lineOverride?: number;
+  reviewedHeaders?: boolean;
   /** Command-substitution nesting depth. */
   depth: number;
 };
@@ -1539,50 +2204,74 @@ function clauseInvocations(
   clause: Clause,
   entryText: string,
   number: number,
+  word: WalkedWord | null,
 ): ClauseInvocation[] {
   const at = state.source === "run-block" ? `${state.label}: ${entryText}` : lineAt(state, number);
   const found: ClauseInvocation[] = [];
   const embedded = (): ClauseInvocation[] => {
-    for (const invocation of embeddedInvocations(clause)) {
+    for (const invocation of embeddedInvocations(word)) {
       const token = "rel" in invocation ? { text: invocation.rel, quoted: false } : { text: invocation.dynamic, quoted: false };
       found.push({ invocation: resolveInvocation(ctx, state, token, at), embedded: true });
     }
     return found;
   };
-  const word = commandWord(clause.tokens);
   if (word === null) return embedded();
   const quote = word.token.text[0];
   if ((quote === "'" || quote === '"') && !word.token.text.endsWith(quote)) return embedded();
-  const command = stripOuterQuotes(word.token.text);
-  const base = command.split("/").pop() ?? command;
+  const command = decodedCommandWord(word);
+  const base = command === null ? "" : command.split("/").pop() ?? command;
   // A reserved word the guard does not model is never a command it can judge.
-  if (!word.token.quoted && SHELL_RESERVED.has(command)) {
+  if (command !== null && SHELL_RESERVED.has(command)) {
     return [{ invocation: { dynamic: command }, embedded: false }];
   }
-  if (!word.token.quoted && (command === "source" || command === ".")) {
-    const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
+  if (command === "source" || command === ".") {
+    const argument = firstNonFlag(word.args);
     found.push({ invocation: argument === undefined ? { dynamic: command } : resolveInvocation(ctx, state, argument, at), embedded: false });
     return found;
   }
-  if (!word.token.quoted && command === "eval") return [{ invocation: { dynamic: "eval" }, embedded: false }];
-  if (!word.token.quoted && (command === "cd" || command === "pushd" || command === "popd")) return [];
-  if (!word.token.quoted && (base === "npm" || base === "npx")) return [];
-  if (!word.token.quoted && command === "su") {
-    const args = clause.tokens.slice(word.index + 1).map((token) => stripOuterQuotes(token.text));
+  if (command === "eval") return [{ invocation: { dynamic: "eval" }, embedded: false }];
+  if (command === "cd" || command === "pushd" || command === "popd") return [];
+  if (base === "npm" || base === "npx") return [];
+  if (command === "su") {
+    const args = word.args.map((token) => stripOuterQuotes(token.text));
     return args.includes("-c") ? [{ invocation: { dynamic: "-c" }, embedded: false }] : [];
   }
   if (INTERPRETERS.has(base)) {
-    const args = clause.tokens.slice(word.index + 1);
-    const texts = args.map((token) => stripOuterQuotes(token.text));
-    if (clause.piped) return [{ invocation: { dynamic: args[0]?.text ?? "stdin" }, embedded: false }];
-    const heredoc = texts.find((text) => text.includes("<<"));
-    if (heredoc !== undefined) {
+    const args = word.args;
+    const options: string[] = [];
+    let argument: ShellToken | undefined;
+    for (let index = 0; index < args.length; index++) {
+      const text = stripOuterQuotes(args[index].text);
+      if (text === "--") {
+        argument = args[index + 1];
+        break;
+      }
+      if (/^(?:\d*)?[<>]/.test(text) || (text.startsWith("-") && text !== "-")) {
+        options.push(text);
+        if (base === "bash" && (text === "-o" || text === "-O")) index++;
+        continue;
+      }
+      argument = args[index];
+      break;
+    }
+    // For an interpreter in command position (a listed wrapper's payload is
+    // judged by embeddedInvocations instead), a real script operand takes
+    // precedence over stdin redirection. A heredoc or here-string is a word
+    // that begins, as written, with an unquoted `<<` or `0<<`; a quoted or
+    // escaped `<<` is an ordinary argument. Shell program heredocs are refused;
+    // a JS program supplied by a heredoc on stdin is not followed, like `-e`.
+    // Without such a heredoc, the checks below judge a `-` operand.
+    const stdinProgram = argument === undefined || stripOuterQuotes(argument.text) === "-";
+    const heredocAt = stdinProgram ? word.rawArgs.findIndex((token) => /^0?<</.test(token.text)) : -1;
+    if (heredocAt !== -1) {
+      const heredoc = stripOuterQuotes(args[heredocAt].text);
       return SHELL_INTERPRETERS.has(base) ? [{ invocation: { dynamic: heredoc }, embedded: false }] : [];
     }
-    const inline = texts.find((text) => text === "-c" || text === "-s");
+    const inline = options.find((text) => text === "-c" || text === "-s");
     if (inline !== undefined) return [{ invocation: { dynamic: inline }, embedded: false }];
-    if (JS_INTERPRETERS.has(base) && texts.some((text) => text === "-e" || text === "-p")) return [];
-    if (texts.some((text) => VERSION_FLAGS.has(text))) return [];
+    if (JS_INTERPRETERS.has(base) && options.some((text) => text === "-e" || text === "-p")) return [];
+    if (options.some((text) => VERSION_FLAGS.has(text))) return [];
+    if (clause.piped && argument === undefined) return [{ invocation: { dynamic: "stdin" }, embedded: false }];
     if (base === "bun" || base === "deno") {
       const subcommands = base === "bun" ? BUN_SUBCOMMANDS : DENO_SUBCOMMANDS;
       const first = args[0] === undefined ? "" : stripOuterQuotes(args[0].text);
@@ -1604,12 +2293,13 @@ function clauseInvocations(
         return [{ invocation: resolveInvocation(ctx, state, script, at), embedded: false }];
       }
     }
-    const argument = firstNonFlag(args);
     if (argument === undefined) return [{ invocation: { dynamic: "stdin" }, embedded: false }];
+    if (stripOuterQuotes(argument.text) === "-") return [{ invocation: { dynamic: "stdin" }, embedded: false }];
     return [{ invocation: resolveInvocation(ctx, state, argument, at), embedded: false }];
   }
-  if (SCRIPT_EXTENSION.test(command)) {
-    return [{ invocation: resolveInvocation(ctx, state, word.token, at), embedded: false }];
+  const spelled = command ?? stripOuterQuotes(word.token.text);
+  if (SCRIPT_EXTENSION.test(spelled)) {
+    return [{ invocation: resolveInvocation(ctx, state, { ...word.token, text: spelled }, at), embedded: false }];
   }
   return embedded();
 }
@@ -1624,7 +2314,11 @@ function clauseInvocations(
  */
 function scanShellText(ctx: TreeContext, initial: ShellState, text: string): void {
   const state: ShellState = { ...initial };
-  for (const entry of logicalShellLines(text)) {
+  const reviewed = state.reviewedHeaders || (state.source === "run-block" && EXACT_BLOCK_ALLOWLIST.some((entry) => entry.text === text.replace(/\n+$/, "")));
+  const refuseHeader = (entry: PhysicalLine, reason: string): never => {
+    throw new Error(`${lineAt(state, state.lineOverride ?? entry.line)}: ${reason}: ${entry.text} (physical line ${entry.line})`);
+  };
+  for (const entry of logicalShellLines(text, reviewed ? null : refuseHeader, state.source === "run-block")) {
     const number = state.lineOverride ?? entry.line;
     if (entry.body) {
       if (state.classifyInstalls && !state.rule1Exempt && isInstallLine(entry.text)) {
@@ -1666,11 +2360,34 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     let clauseInstall = false;
     const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
-      const word = commandWord(clause.tokens);
+      const word = walkCommandWord(clause.tokens, false,
+        (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); },
+        state.source === "run-block" && !reviewed
+          ? (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); }
+          : undefined);
+      if (word !== null && word.value === null && word.prefixed && state.source === "run-block") {
+        throw new Error(`${lineAt(state, number)}: an unapproved run block has a word without a static value after ${word.prefix}: ${word.token.text}: ${entry.text}`);
+      }
+      if (word !== null && word.value === null && word.token.text !== "[" && word.token.text !== "[[" &&
+          !/[$`*?\[]/.test(word.token.text) && (word.prefixed || !isVariableWord(word.token.text))) {
+        // Refuse a non-static command word instead of passing it to discovery
+        // unfollowed; plain variables, substitutions and glob/case patterns
+        // keep their existing handling.
+        if (state.source === "followed-script") {
+          pushUnresolved(ctx, state.file, number, word.token.text, state.label, state.chain);
+          continue;
+        }
+        throw new Error(`${lineAt(state, number)}: cannot establish the command word: ${word.token.text}: ${entry.text}`);
+      }
+      if (word !== null && word.value !== null && /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(word.value) &&
+          word.value !== word.token.text && !HANDLED_COMMAND_WORDS.has(word.value) &&
+          !SCRIPT_EXTENSION.test(word.value)) {
+        throw new Error(`${lineAt(state, number)}: unrecognised quoted or escaped command word: ${word.token.text}: ${entry.text}`);
+      }
       if (word !== null) {
-        const command = stripOuterQuotes(word.token.text);
-        if (!word.token.quoted && command === "cd") {
-          const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
+        const command = decodedCommandWord(word);
+        if (command === "cd") {
+          const argument = firstNonFlag(word.args);
           const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
           const at = state.source === "run-block" ? `${state.label}: ${entry.text}` : lineAt(state, number);
           const resolved = resolveCdTarget(ctx, target, state.cwd, state.scriptDir, state.bindings, at);
@@ -1685,7 +2402,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
           }
           continue;
         }
-        if (!word.token.quoted && (command === "pushd" || command === "popd")) {
+        if (command === "pushd" || command === "popd") {
           state.cwdUnknown = true;
           continue;
         }
@@ -1701,9 +2418,8 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       // substitution. With more words after it the clause is a prefix
       // environment assignment plus a command, and the value cannot be
       // evaluated, so the clause is refused: a run block throws and a followed
-      // script records an unresolved entry. An unquoted `cd`, `pushd` or
-      // `popd` clause is handled above and continues before this check, so it
-      // is not refused
+      // script records an unresolved entry. A `cd`, `pushd` or `popd` clause is
+      // handled above and continues before this check, so it is not refused
       // (cli#975). An assignment-only clause is judged
       // by that substitution's own scan below. A value the lexer cannot close
       // (nested quotes, cli#975) keeps the earlier skip: its clause words are
@@ -1728,7 +2444,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
         );
       }
       if (!assignmentSubstitution && !assignmentClause) {
-        for (const item of clauseInvocations(ctx, state, clause, entry.text, number)) {
+        for (const item of clauseInvocations(ctx, state, clause, entry.text, number, word)) {
           if (item.embedded && reviewedWrapped) continue;
           followInvocation(ctx, state, item.invocation, entry.text, number);
         }
@@ -1761,7 +2477,7 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       }
     }
     for (const body of substitutions.bodies) {
-      scanShellText(ctx, { ...state, depth: state.depth + 1, classifyInstalls: false, lineOverride: number }, body);
+      scanShellText(ctx, { ...state, depth: state.depth + 1, classifyInstalls: false, lineOverride: number, reviewedHeaders: reviewed }, body);
     }
   }
 }
@@ -1884,7 +2600,7 @@ function npmTokens(line: string): { command: string; args: string[] } | null {
     // A quoted or backslash-escaped command word is still a literal `npm` when
     // its shell value is exactly `npm`/`npx`; anything else (e.g. `$NPM`) is not
     // a shape this scanner can read, and handleInstall refuses it.
-    const text = literalWord(tokens[index].text);
+    const text = staticWordValue(tokens[index].text);
     if (text !== "npm" && text !== "npx") continue;
     return { command: text, args: tokens.slice(index + 1).map((token) => stripOuterQuotes(token.text)) };
   }
@@ -1991,26 +2707,25 @@ function handleInstall(
   ctx.installs++;
 }
 
-function embeddedInvocations(clause: Clause): Invocation[] {
-  const tokens = clause.tokens;
-  const word = commandWord(tokens);
-  const wordIndex = word === null ? -1 : word.index;
+function embeddedInvocations(word: WalkedWord | null): Invocation[] {
   const found: Invocation[] = [];
-  const base = word === null ? "" : (stripOuterQuotes(word.token.text).split("/").pop() ?? "");
+  const command = word === null ? "" : word.value ?? stripOuterQuotes(word.token.text);
+  const base = command.split("/").pop() ?? "";
   if (word !== null && (word.token.quoted || /^\$/.test(word.token.text))) {
-    const argument = tokens[wordIndex + 1];
+    const argument = word.args[0];
     if (argument !== undefined && !argument.quoted && /^(?:\.\/|scripts\/|\.github\/scripts\/)/.test(argument.text) && SCRIPT_EXTENSION.test(argument.text)) {
       found.push({ rel: argument.text });
     }
   }
   if (!EMBEDDED_WRAPPERS.has(base)) return found;
-  for (const [index, token] of tokens.entries()) {
-    if (index <= wordIndex || token.quoted) continue;
+  for (const [index, token] of word.args.entries()) {
     const text = stripOuterQuotes(token.text);
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
-    const argument = tokens[index + 1];
-    // Unknown => refuse: a wrapped interpreter whose payload is absent,
-    // `-c`/`-s`, or a here-document cannot be resolved to one repository file.
+    const argument = word.args[index + 1];
+    // Unknown => refuse: a wrapped interpreter whose payload is absent or
+    // `-c`/`-s`, or a wrapped shell whose next word holds `<<`, cannot be
+    // resolved to one repository file. The direct interpreter's `-` and
+    // heredoc rules are not applied here (cli#975).
     if (argument === undefined) {
       found.push({ dynamic: `${text} stdin` });
       continue;
@@ -2068,6 +2783,12 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
     scanNonShellScript(ctx, rel, content, origin);
     return;
   }
+  let bindings: Map<string, VariableBinding[]>;
+  try {
+    bindings = collectBindings(content);
+  } catch (error) {
+    throw new Error(`${origin.label}: script ${rel}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+  }
   scanShellText(
     ctx,
     {
@@ -2077,7 +2798,7 @@ function scanScript(ctx: TreeContext, rel: string, content: string, origin: Shel
       chain: [...origin.chain, rel],
       file: rel,
       scriptDir: rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : "",
-      bindings: collectBindings(content),
+      bindings,
       source: "followed-script",
       classifyInstalls: true,
       rule1Exempt: rel === "scripts/npm-ci-tracked-lock.sh",
@@ -2124,8 +2845,15 @@ function invocationsIn(line: string, found: Invocation[] = [], seen = new Set<st
   };
   const tokens = shellTokens(line);
   const scriptFile = new RegExp(String.raw`^${SCRIPT_FILE}$`);
-  const isCommandWord = (token: ShellToken) => !token.quoted && /^(?:bash|sh|node|bun)$/.test(token.text);
-  const isScriptWord = (token: ShellToken | undefined) => token !== undefined && !token.quoted && scriptFile.test(token.text);
+  const isCommandWord = (token: ShellToken) => {
+    const value = staticWordValue(token.text);
+    return value !== null && /^(?:bash|sh|node|bun)$/.test(value);
+  };
+  const isScriptWord = (token: ShellToken | undefined) => {
+    if (token === undefined) return false;
+    const value = staticWordValue(token.text);
+    return value !== null && scriptFile.test(value);
+  };
   const isCommandPosition = (index: number): boolean => {
     if (index === 0) return true;
     const previous = tokens[index - 1].text;
@@ -2144,18 +2872,19 @@ function invocationsIn(line: string, found: Invocation[] = [], seen = new Set<st
           found.push({ dynamic: argument.text });
         }
       } else if (isScriptWord(argument)) {
-        add(argument.text);
+        add(staticWordValue(argument.text)!);
       }
       continue;
     }
     if (!isCommandPosition(index)) continue;
-    if (!token.quoted && (token.text === "source" || token.text === ".")) {
+    const value = staticWordValue(token.text);
+    if (value === "source" || value === ".") {
       const argument = tokens[index + 1];
-      if (isScriptWord(argument)) add(argument.text);
+      if (isScriptWord(argument)) add(staticWordValue(argument!.text)!);
       continue;
     }
-    if (!token.quoted && token.text.startsWith("./") && scriptFile.test(token.text)) {
-      add(token.text);
+    if (value !== null && value.startsWith("./") && scriptFile.test(value)) {
+      add(value);
       continue;
     }
     if ((token.quoted || /^\$/.test(token.text)) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(token.text)) {
