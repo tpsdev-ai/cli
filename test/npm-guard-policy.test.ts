@@ -483,6 +483,19 @@ describe("paths", () => {
       else process.env.GITHUB_ACTIONS = saved;
     }
   });
+
+  test("under Actions an override naming the production root is refused", () => {
+    const saved = process.env.GITHUB_ACTIONS;
+    process.env.GITHUB_ACTIONS = "true";
+    try {
+      const refused = selectRoot(PRODUCTION_ROOT);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.reason).toContain("GITHUB_ACTIONS");
+    } finally {
+      if (saved === undefined) delete process.env.GITHUB_ACTIONS;
+      else process.env.GITHUB_ACTIONS = saved;
+    }
+  });
 });
 
 describe("shims", () => {
