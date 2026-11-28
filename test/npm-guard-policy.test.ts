@@ -682,6 +682,50 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
     }
   });
 
+  test("a password containing one @ leaves no fragment on stdout or stderr", () => {
+    const { root, logPath } = makeGuardRoot();
+    const result = runShim("npm", ["ci", "https://alice:TOP@SECRET@registry.example/x"], {
+      GITHUB_JOB: "test",
+      [ROOT_ENV]: root,
+      FAKE_NPM_LOG: logPath,
+    });
+    expect(result.status).not.toBe(0);
+    for (const output of [result.stdout, result.stderr]) {
+      for (const fragment of ["alice", "TOP", "SECRET"]) {
+        expect(output).not.toContain(fragment);
+      }
+    }
+    expect(result.stderr).toContain("https://registry.example/x");
+  });
+
+  test("a password containing two @ and a control byte leaves no fragment", () => {
+    const password = "SEG-1@SEG-2@\u009bSEG-3";
+    const { root, logPath } = makeGuardRoot();
+    const result = runShim("npm", ["ci", `https://carol:${password}@registry.example/y`], {
+      GITHUB_JOB: "test",
+      [ROOT_ENV]: root,
+      FAKE_NPM_LOG: logPath,
+    });
+    expect(result.status).not.toBe(0);
+    for (const output of [result.stdout, result.stderr]) {
+      for (const fragment of ["carol", "SEG-1", "SEG-2", "SEG-3"]) {
+        expect(output).not.toContain(fragment);
+      }
+    }
+    expect(result.stderr).toContain("https://registry.example/y");
+  });
+
+  test("an @ in the path after a clean authority survives", () => {
+    const { root, logPath } = makeGuardRoot();
+    const result = runShim("npm", ["ci", "https://registry.example/@scope/pkg"], {
+      GITHUB_JOB: "test",
+      [ROOT_ENV]: root,
+      FAKE_NPM_LOG: logPath,
+    });
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("https://registry.example/@scope/pkg");
+  });
+
   test("a secret-bearing argv is not echoed by the shim", () => {
     const secret = "guardleak-7f3a9c";
     const refused = makeGuardRoot();

@@ -4,8 +4,8 @@
 export const SUPPORTED_INSTALL_PATH = "scripts/npm-ci-tracked-lock.sh";
 
 // Blank the whole value of `--otp`/`--password` in both spellings and of any
-// argument containing `_authToken` before sanitizing, then drop the whole
-// userinfo of any `scheme://userinfo@host`, whitespace and control bytes included.
+// argument containing `_authToken` before sanitizing, then drop everything up to
+// the last `@` of any URL authority, whitespace and control bytes included.
 export function redactArgs(argv) {
   const redacted = [];
   for (let i = 0; i < argv.length; i += 1) {
@@ -29,7 +29,12 @@ export function redactArgs(argv) {
       redacted.push(`${arg.slice(0, kept)}[REDACTED]`);
       continue;
     }
-    redacted.push(arg.replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/@]*@/g, "$1"));
+    redacted.push(
+      arg.replace(/([A-Za-z][A-Za-z0-9+.-]*:\/\/)[^/?#]*/g, (match, scheme) => {
+        const at = match.lastIndexOf("@");
+        return at === -1 ? match : scheme + match.slice(at + 1);
+      }),
+    );
   }
   return redacted;
 }
