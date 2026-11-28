@@ -213,9 +213,14 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(JSON.parse(readFileSync(archived, "utf-8")).ackedAt).toBe(oldIso);
   });
 
-  test("an ack of a record still in new/ removes it, so a later check presents nothing", async () => {
+  test("an ack of a record still in new/ removes it and leaves a .reason file beside it, so a later check presents nothing", async () => {
     const sent = sendMessage(OWNER, signedBody("acked unread"), SENDER);
+    const reasonPath = `${sent.filePath}.reason`;
+    const reasonBytes = "parked because the relay refused\n";
+    writeFileSync(reasonPath, reasonBytes, "utf-8");
     expect(ackMessage(OWNER, sent.id)?.ackedAt).toEqual(expect.any(String));
+    expect(existsSync(sent.filePath)).toBe(false);
+    expect(readFileSync(reasonPath, "utf-8")).toBe(reasonBytes);
     const inbox = getInbox(OWNER);
     expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json"))).toEqual([]);
     expect(await checkMessages(OWNER)).toEqual([]);
