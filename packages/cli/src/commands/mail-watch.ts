@@ -134,21 +134,41 @@ function fileIdentity(path: string, file: string): string {
  * or empty `new/` means no files, but a failed listing must not be read as
  * "every file left" (see processNew).
  */
-function listNewFiles(dir: string): NewFile[] | null {
+type NewListing = NewFile[] & { unstatable: Map<string, string> };
+
+function listNewFiles(dir: string): NewListing | null {
   try {
-    const files: NewFile[] = [];
+    const files = [] as unknown as NewListing;
+    // A per-entry stat failure other than ENOENT (a symlink loop, a symlink
+    // through a regular file) is that ENTRY's problem, not the listing's: skip
+    // it and keep its dedup state (processNew treats its name as present). An
+    // entry that vanished (ENOENT) keeps today's behaviour and is dropped
+    // silently.
+    files.unstatable = new Map();
     for (const file of readdirSync(dir).filter(isMailboxMessageFile)) {
       try {
         const identity = fileIdentity(join(dir, file), file);
         files.push({ file, identity, fileKey: identity.split(":").slice(0, -2).join(":") });
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT") files.unstatable.set(file, code ?? String(err));
       }
     }
     return files;
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
+    const empty = [] as unknown as NewListing;
+    empty.unstatable = new Map();
+    return empty;
   }
+}
+
+/** The file name an identity (`file:dev:ino:size:mtime`) or a fileKey (`file:dev:ino`) belongs to. */
+function fileOfIdentity(identity: string): string {
+  return identity.split(":").slice(0, -4).join(":");
+}
+function fileOfKey(fileKey: string): string {
+  return fileKey.split(":").slice(0, -2).join(":");
 }
 
 /**
@@ -271,6 +291,22 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // A resident identity's verdict prevents repeated verification and logging.
   // Clear absent identities before verification yields.
   const classified = new Map<string, string>();
+  // new/ entries already reported as unstat-able. The warning is logged once
+  // per continuous failure: it is logged again if the failure stops and recurs.
+  const warnedUnstatable = new Set<string>();
+
+  // Name each entry a listing could not stat and keep one warning per
+  // continuous failure; a file this listing stats again leaves the set. Every
+  // successful listing of new/ (the scan and the trim) reports through it, so a
+  // failure that persists into the next scan is not named twice.
+  const reportUnstatable = (entries: Map<string, string>) => {
+    for (const [file, code] of entries) {
+      if (warnedUnstatable.has(file)) continue;
+      warnedUnstatable.add(file);
+      console.error(`[mail-watch] ${opts.agent}: skipping ${file} — cannot stat ${join(inbox.fresh, file)} (${code})`);
+    }
+    for (const file of warnedUnstatable) if (!entries.has(file)) warnedUnstatable.delete(file);
+  };
 
   // Verified records waiting for a free slot. The concurrency cap must hold
   // WITHOUT dropping the rest, so over-cap records wait here and are delivered
@@ -337,12 +373,14 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const present = new Set(files.map(({ identity }) => identity));
       const paths = new Set(files.map(({ file }) => file));
       const fileKeys = new Set(files.map(({ fileKey }) => fileKey));
-      for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file)) pendingEnvelopeIds.delete(file);
-      for (const file of classified.keys()) if (!present.has(file)) classified.delete(file);
-      for (const file of unresolvedAttempts.keys()) if (!present.has(file)) unresolvedAttempts.delete(file);
+      const kept = files.unstatable;
+      reportUnstatable(kept);
+      for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file) && !kept.has(file)) pendingEnvelopeIds.delete(file);
+      for (const file of classified.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) classified.delete(file);
+      for (const file of unresolvedAttempts.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) unresolvedAttempts.delete(file);
       for (const [envId, filesWithId] of presented) {
         for (const fileKey of filesWithId) {
-          if (fileKeys.has(fileKey)) continue;
+          if (fileKeys.has(fileKey) || kept.has(fileOfKey(fileKey))) continue;
           const file = fileKey.split(":").slice(0, -2).join(":");
           if (paths.has(file) && !pendingEnvelopeIds.has(file)) {
             pendingEnvelopeIds.set(file, envId);
@@ -489,19 +527,24 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
         console.error("[mail-watch] cannot list new/; keeping the current dedup state");
         return;
       }
+      // Report and clear before the rescan decision: this listing succeeded, so
+      // its names must be warned (and a recovered name cleared) even when a new
+      // identity sends us into the rescan.
+      reportUnstatable(atTrim.unstatable);
       if (atTrim.some(({ identity }) => !present.has(identity))) {
         rescan = true;
         return;
       }
       const trimPresent = new Set(atTrim.map(({ identity }) => identity));
       const trimPaths = new Set(atTrim.map(({ file }) => file));
-      for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file)) pendingEnvelopeIds.delete(file);
-      for (const identity of classified.keys()) if (!trimPresent.has(identity)) classified.delete(identity);
-      for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity)) unresolvedAttempts.delete(identity);
+      const trimKept = new Set([...kept.keys(), ...atTrim.unstatable.keys()]);
+      for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file) && !trimKept.has(file)) pendingEnvelopeIds.delete(file);
+      for (const identity of classified.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) classified.delete(identity);
+      for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) unresolvedAttempts.delete(identity);
       const held = new Set(pendingEnvelopeIds.values());
       const trimFileKeys = new Set(atTrim.map(({ fileKey }) => fileKey));
       for (const [envId, filesWithId] of presented) {
-        for (const fileKey of filesWithId) if (!trimFileKeys.has(fileKey)) filesWithId.delete(fileKey);
+        for (const fileKey of filesWithId) if (!trimFileKeys.has(fileKey) && !trimKept.has(fileOfKey(fileKey))) filesWithId.delete(fileKey);
         if (filesWithId.size === 0 && !held.has(envId)) presented.delete(envId);
       }
     } finally {
