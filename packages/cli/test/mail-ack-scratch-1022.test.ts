@@ -183,7 +183,7 @@ test("a failed leftover sweep warns with path and code without failing the ack",
   const ack = mail.ackMessageAtPath(target, mail.getInbox(agent).root);
   expect(ack.read).toBe(true);
   expect(ack.ackedAt).toBeDefined();
-  expect(fs.existsSync(target)).toBe(false);
+  expect(JSON.parse(fs.readFileSync(target, "utf8")).ackedAt).toBe(ack.ackedAt);
   expect(fs.existsSync(leftover)).toBe(true);
   expect(warn).toHaveBeenCalledTimes(1);
   expect(warn.mock.calls[0][0]).toContain(leftover);
@@ -263,7 +263,7 @@ test("distinct records ack across processes without sweeping a live scratch", as
         expect(results[i].id).toBe(`${role}-${i}`);
         expect(results[i].read).toBe(true);
         expect(results[i].ackedAt).toBeDefined();
-        expect(fs.existsSync(join(cur, `${role}-${i}.json`))).toBe(false);
+        expect(JSON.parse(fs.readFileSync(join(cur, `${role}-${i}.json`), "utf8")).ackedAt).toBe(results[i].ackedAt);
       }
     }
     expect(fs.readdirSync(cur).filter(isScratchName)).toEqual([]);
@@ -272,7 +272,7 @@ test("distinct records ack across processes without sweeping a live scratch", as
   }
 }, 30_000);
 
-test("concurrent acks of one record produce one ack and no leftover scratch", async () => {
+test("concurrent acks of one cur/ record both stamp it and leave no leftover scratch", async () => {
   const worker = join(root, "ack-worker.ts");
   fs.writeFileSync(worker, `
     import * as fs from "node:fs";
@@ -306,12 +306,13 @@ test("concurrent acks of one record produce one ack and no leftover scratch", as
     for (const child of children) expect(await waitForChildExit(child, 10_000)).toBe(0);
 
     const outcomes = fs.readdirSync(root).filter((name) => name.endsWith("-acked") || name.endsWith("-gone") || name.endsWith("-error"));
-    expect(outcomes.filter((name) => name.endsWith("-acked"))).toHaveLength(1);
-    expect(outcomes.filter((name) => name.endsWith("-gone"))).toHaveLength(1);
+    // A cur/ record is kept after an ack (cli#1098), so the second ack stamps it again.
+    expect(outcomes.filter((name) => name.endsWith("-acked"))).toHaveLength(2);
+    expect(outcomes.filter((name) => name.endsWith("-gone"))).toEqual([]);
     expect(outcomes.filter((name) => name.endsWith("-error"))).toEqual([]);
     const inbox = mail.getInbox(agent);
-    expect(fs.readdirSync(inbox.cur)).toEqual([]);
-    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.readdirSync(inbox.cur)).toEqual(["record.json"]);
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).ackedAt).toEqual(expect.any(String));
   } finally {
     await Promise.all(children.map((child) => stopChild(child)));
   }

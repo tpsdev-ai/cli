@@ -103,7 +103,10 @@ test("many startup records and an overlapping timer produce no busy promotions",
   expect(logs.filter((line) => line.includes("(busy)"))).toEqual([]);
   expect(sent).toHaveLength(24);
   expect(new Set(sent.map((envelope) => envelope.content)).size).toBe(24);
-  expect(fs.readdirSync(join(root, BRIDGE, "cur")).filter((file) => file.endsWith(".json"))).toEqual([]);
+  // Each forwarded record stays in cur/, stamped by the ack (cli#1098).
+  const kept = fs.readdirSync(join(root, BRIDGE, "cur")).filter((file) => file.endsWith(".json"));
+  expect(kept).toHaveLength(24);
+  for (const file of kept) expect(JSON.parse(fs.readFileSync(join(root, BRIDGE, "cur", file), "utf8")).ackedAt).toEqual(expect.any(String));
 });
 
 test("timer retries, watcher notifications and a replay never forward a record twice", async () => {

@@ -14,7 +14,7 @@ for (const runtime of ["claude-code", "codex", "gemini"]) {
       expect(run.status, run.stderr).toBe(0);
       const measured = run.stdout.split("\n").find((line) => line.startsWith("MEASURED "));
       expect(measured, run.stdout + run.stderr).toBeDefined();
-      expect(JSON.parse(measured!.slice(9))).toEqual({ launches: 1, bridgeStill: true, ordinaryGone: true, replies: 1 });
+      expect(JSON.parse(measured!.slice(9))).toEqual({ launches: 1, bridgeStill: true, ordinaryAcked: true, replies: 1 });
     } finally { rmSync(root, { recursive: true, force: true }); }
   }, 10_000);
 }

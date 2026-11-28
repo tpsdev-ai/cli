@@ -11,6 +11,7 @@ import {
   existsSync,
   mkdirSync,
   readdirSync,
+  readFileSync,
   watch,
   writeFileSync,
   rmSync,
@@ -39,6 +40,17 @@ export { assertBridgeAdapterName, BRIDGE_ADAPTER_NAME_RE, validateBridgeAdapterN
 
 export { BRIDGE_ADAPTERS, resolveBridgeAgentId } from "@tpsdev-ai/agent";
 import { configureBridgeIdentity, processStartToken } from "@tpsdev-ai/agent";
+
+/** True when the record at `path` is read, acked or already forwarded (fields forward() also
+ *  skips on); false when it cannot be read. */
+function isForwardedOrAcked(path: string): boolean {
+  try {
+    const record = JSON.parse(readFileSync(path, "utf-8")) as { read?: unknown; ackedAt?: unknown; bridgeSentAt?: unknown } | null;
+    return Boolean(record?.read || record?.ackedAt || record?.bridgeSentAt);
+  } catch {
+    return false;
+  }
+}
 
 export interface BridgeCoreConfig {
   bridgeAgentId?: string;
@@ -224,6 +236,9 @@ Message: ${envelope.content}`;
     const promoteFile = async (file: string, recovery = false) => {
       if (recovery ? !file.endsWith(".json") : !isMailboxMessageFile(file)) return;
       const fullPath = join(recovery ? cur : fresh, file);
+      // cli#1098: an acked record stays in cur/. Skip one that forward() would
+      // skip before re-verifying and claiming it.
+      if (recovery && isForwardedOrAcked(fullPath)) return;
       if (!existsSync(fullPath)) return;
       try {
         const result = recovery

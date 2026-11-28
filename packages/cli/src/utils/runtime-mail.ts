@@ -83,15 +83,12 @@ export function sendRuntimeMail(cfg: RuntimeMailConfig, to: string, body: string
  * The completion boundary. Call this ONLY after the reply has been attempted
  * AND any auto-commit has finished. A failed reply send is logged and the ack
  * is still attempted: the task already ran, and re-running it to retry the reply
- * would repeat its side effects. Acking earlier deletes the `cur/` record
- * that the auto-commit scope guard reads (cli#380 defect 7), and NOT acking
- * leaves the record to be re-presented (and the task re-run) every lease period
- * forever.
+ * would repeat its side effects. Without an ack, the record is eligible for
+ * re-presentation (and the task re-run) on each successful poll after its lease
+ * expires.
  *
- * Acking removes the `cur/` record; nothing records the ack itself (the
- * mailbox archive has no ack event and does not bind a row to the record's
- * verification verdict or envelopeId), so re-presentation — not an audit trail
- * — is what ack prevents.
+ * Acking stamps and keeps the `cur/` record, which can be removed by GC or
+ * archived outside GC's scan (cli#1098); re-presentation is what ack prevents.
  */
 export function completeRuntimeMail(cfg: RuntimeMailConfig, id: string): void {
   const acked = ackMessage(cfg.agentId, id);
