@@ -53,7 +53,7 @@ must have a static value; a word without one is refused. In followed shell files
 the walk may skip such a word without recording it.
 In unapproved run blocks, command words containing `*`, `?`, `[` or `$'` are
 refused; `[` and `[[` themselves remain accepted. The guard follows `env` through
-leading `NAME=value` and `NAME+=value` assignments, and refuses a leading `env`
+leading `NAME=value` assignments, and refuses a leading `env`
 option unless it is a lone `-`. The guard consumes the `sudo`,
 `exec` and `xargs` options from a finite grammar and refuses unmodelled options,
 including `sudo -s`/`-i`/`--shell`/`--login`. These refusals apply in run blocks
