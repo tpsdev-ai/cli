@@ -2959,6 +2959,62 @@ describe("the install classifier in a followed shell script refuses wrapper shap
     }
   });
 
+  function expectFollowedInstall(run: string, script = "scripts/install.sh", extraFiles: Record<string, string> = {}) {
+    const root = makeTreeFixture({ [script]: "npm ci\n", "package-lock.json": "{}\n", ...extraFiles });
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(["package-lock.json"]), root, "workflow-options");
+      expect(report.followed).toContain(script);
+      expect(report.installs).toBe(1);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  it.each([
+    ["a post-operand escaped version word", "bash scripts/install.sh --ver\\sion"],
+    ["a preceding pipeline", "printf input | cat; bash scripts/install.sh"],
+    ["a Bash option value", "bash -o pipefail scripts/install.sh"],
+  ])("follows a script with %s", (_label, run) => {
+    expectFollowedInstall(run);
+  });
+
+  it("does not follow a script for a standalone bash version request", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("bash --version", "."), new Set(), root, "workflow-options");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not follow a JS program read from a heredoc on stdin", () => {
+    const root = makeTreeFixture({});
+    try {
+      const report = assertNpmCiWorkflowTree(workflowStep("node - state.json <<'JS'\nconsole.log(1)\nJS", "."), new Set(), root, "workflow-stdin");
+      expect(report.followed).toEqual([]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ["a JS interpreter", "node -"],
+    ["a piped JS interpreter", "printf x | node -"],
+    ["a shell", "bash -"],
+  ])("refuses a program read from stdin by %s", (_label, run) => {
+    const root = makeTreeFixture({});
+    try {
+      expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), new Set(), root, "workflow-stdin")).toThrow();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("follows a quoted interpreter in a followed shell file", () => {
+    expectFollowedInstall("bash scripts/outer.sh", "scripts/x.sh", { "scripts/outer.sh": 'timeout 5 "bash" scripts/x.sh\n' });
+  });
+
   it("refuses a literal interpreter path outside the repository", () => {
     expect(() => probeTree({ "scripts/install.sh": "bash /tmp/gen.sh\n" })).toThrow(
       /unresolved script invocation in scripts\/install\.sh \(line 1\) token \/tmp\/gen\.sh/,
@@ -5556,6 +5612,9 @@ describe("the workflow guard's known limits from review round 21 (cli#975)", () 
 
 describe("the workflow guard refuses unmodelled env, sudo, exec and xargs options, listed wrappers and runner expressions in command position (#941)", () => {
   const WORKFLOW = "workflow-wrapper";
+  const bashEnv = { ...process.env };
+  delete bashEnv.BASH_ENV;
+  delete bashEnv.ENV;
 
   const shapes = [
     "timeout 5 n$'p\\155' ci",
@@ -5667,7 +5726,7 @@ describe("the workflow guard refuses unmodelled env, sudo, exec and xargs option
       writeFileSync(join(stubDir, "npm"), '#!/bin/sh\nprintf "%s" "$*" > "$STUB_ARGV"\n', { mode: 0o755 });
       const result = spawnSync("bash", ["-c", run], {
         cwd: stubDir,
-        env: { ...process.env, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
+        env: { ...bashEnv, PATH: `${stubDir}:${process.env.PATH ?? ""}`, STUB_ARGV: argvFile },
         encoding: "utf8",
         timeout,
       });
@@ -5750,7 +5809,7 @@ describe("the workflow guard refuses unmodelled env, sudo, exec and xargs option
     expect(bashArgv(run)).toBeNull();
   }, 10_000);
 
-  const hasXargs = spawnSync("bash", ["-c", "command -v xargs >/dev/null 2>&1"], { encoding: "utf8", timeout: 5_000 }).status === 0;
+  const hasXargs = spawnSync("bash", ["-c", "command -v xargs >/dev/null 2>&1"], { encoding: "utf8", timeout: 5_000, env: bashEnv }).status === 0;
   const dynamicWords: { run: string; argv: string | null }[] = [
     { run: 'CMD=npm\nenv "$CMD" ci', argv: "ci" },
     { run: 'CMD=npm\nDYNVAL=FOO\nenv -u "$DYNVAL" "$CMD" ci', argv: "ci" },
@@ -5788,7 +5847,7 @@ describe("the workflow guard refuses unmodelled env, sudo, exec and xargs option
     "'~'",
   ];
   it.each(bashWords)("decodes %s as bash splits it", (word) => {
-    const result = spawnSync("bash", ["-c", `printf '%s\\n' ${word}`], { encoding: "utf8", timeout: 5_000 });
+    const result = spawnSync("bash", ["-c", `printf '%s\\n' ${word}`], { encoding: "utf8", timeout: 5_000, env: bashEnv });
     expect(result.status).toBe(0);
     expect(staticWordValue(word)).toBe(result.stdout.replace(/\n$/, ""));
   }, 5_000);
@@ -5799,7 +5858,7 @@ describe("the workflow guard refuses unmodelled env, sudo, exec and xargs option
   });
 
   it.each(["A=~", "A=x:~/y"])("bash expands an unquoted tilde in the assignment value %s", (word) => {
-    const result = spawnSync("bash", ["-c", `${word}; printf '%s' "$A"`], { encoding: "utf8", timeout: 5_000 });
+    const result = spawnSync("bash", ["-c", `${word}; printf '%s' "$A"`], { encoding: "utf8", timeout: 5_000, env: bashEnv });
     expect(result.status).toBe(0);
     expect(result.stdout).not.toContain("~");
   }, 5_000);

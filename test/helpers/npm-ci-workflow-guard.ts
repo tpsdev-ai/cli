@@ -2235,16 +2235,33 @@ function clauseInvocations(
   }
   if (INTERPRETERS.has(base)) {
     const args = word.args;
-    const texts = args.map((token) => stripOuterQuotes(token.text));
-    if (clause.piped) return [{ invocation: { dynamic: args[0]?.text ?? "stdin" }, embedded: false }];
-    const heredoc = texts.find((text) => text.includes("<<"));
+    const options: string[] = [];
+    let argument: ShellToken | undefined;
+    for (let index = 0; index < args.length; index++) {
+      const text = stripOuterQuotes(args[index].text);
+      if (text === "--") {
+        argument = args[index + 1];
+        break;
+      }
+      if (/^(?:\d*)?[<>]/.test(text) || (text.startsWith("-") && text !== "-")) {
+        options.push(text);
+        if (base === "bash" && (text === "-o" || text === "-O")) index++;
+        continue;
+      }
+      argument = args[index];
+      break;
+    }
+    // A heredoc is a redirection, not an option: it supplies the program only when the program comes from stdin.
+    const stdinProgram = argument === undefined || stripOuterQuotes(argument.text) === "-";
+    const heredoc = (stdinProgram ? args.map((token) => stripOuterQuotes(token.text)) : options).find((text) => text.includes("<<"));
     if (heredoc !== undefined) {
       return SHELL_INTERPRETERS.has(base) ? [{ invocation: { dynamic: heredoc }, embedded: false }] : [];
     }
-    const inline = texts.find((text) => text === "-c" || text === "-s");
+    const inline = options.find((text) => text === "-c" || text === "-s");
     if (inline !== undefined) return [{ invocation: { dynamic: inline }, embedded: false }];
-    if (JS_INTERPRETERS.has(base) && texts.some((text) => text === "-e" || text === "-p")) return [];
-    if (texts.some((text) => VERSION_FLAGS.has(text))) return [];
+    if (JS_INTERPRETERS.has(base) && options.some((text) => text === "-e" || text === "-p")) return [];
+    if (options.some((text) => VERSION_FLAGS.has(text))) return [];
+    if (clause.piped && argument === undefined) return [{ invocation: { dynamic: "stdin" }, embedded: false }];
     if (base === "bun" || base === "deno") {
       const subcommands = base === "bun" ? BUN_SUBCOMMANDS : DENO_SUBCOMMANDS;
       const first = args[0] === undefined ? "" : stripOuterQuotes(args[0].text);
@@ -2266,8 +2283,8 @@ function clauseInvocations(
         return [{ invocation: resolveInvocation(ctx, state, script, at), embedded: false }];
       }
     }
-    const argument = firstNonFlag(args);
     if (argument === undefined) return [{ invocation: { dynamic: "stdin" }, embedded: false }];
+    if (stripOuterQuotes(argument.text) === "-") return [{ invocation: { dynamic: "stdin" }, embedded: false }];
     return [{ invocation: resolveInvocation(ctx, state, argument, at), embedded: false }];
   }
   const spelled = command ?? stripOuterQuotes(word.token.text);
@@ -2692,7 +2709,6 @@ function embeddedInvocations(word: WalkedWord | null): Invocation[] {
   }
   if (!EMBEDDED_WRAPPERS.has(base)) return found;
   for (const [index, token] of word.args.entries()) {
-    if (token.quoted) continue;
     const text = stripOuterQuotes(token.text);
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
     const argument = word.args[index + 1];
