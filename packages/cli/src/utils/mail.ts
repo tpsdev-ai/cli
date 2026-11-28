@@ -2253,10 +2253,10 @@ export function setBridgeSentAtPath(path: string, sentAt: string, mailboxRoot: s
 export function ackMessageAtPath(path: string, mailboxRoot: string): MailMessage {
   // cli#1098: an acked cur/ record is kept, stamped, as the openclaw-tps-mail
   // ack keeps it, so a reply obligation's receipt scan still finds a delivered
-  // reply after the recipient acks it; gcMessages ages it out. A new/ or dlq/
-  // record is deleted instead, with nothing written to it first (a later check
-  // could promote or re-drive it, and promote() clears a stamp); a failed
-  // delete fails the ack.
+  // reply after the recipient acks it; the record can later be removed by GC
+  // or archived outside GC's scan. A new/ or dlq/ record is deleted instead,
+  // with nothing written to it first (a later check could promote or re-drive
+  // it, and promote() clears a stamp); a failed delete fails the ack.
   const inCur = basename(dirname(path)) === "cur";
   const result = updateExistingRecord<MailMessage>(path, (msg) => {
     msg.read = true;
