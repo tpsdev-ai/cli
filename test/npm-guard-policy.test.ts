@@ -4,7 +4,7 @@
  *
  * The shim tests run `sh` on the committed shims against a fake recorded npm (a
  * small node script that logs its argv), in a per-test root with
- * GITHUB_ACTIONS unset, so no lane needs a real npm.
+ * GITHUB_ACTIONS unset, so this test file needs no real npm.
  */
 import { afterAll, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
@@ -209,6 +209,32 @@ describe("policy table", () => {
     }
   });
 
+  test("every reviewed caller decides its exact argv in the jobs that list it", () => {
+    const shapes = new Map();
+    for (const entry of EXPECTED) {
+      const key = JSON.stringify(entry.argv);
+      const shape = shapes.get(key) ?? { argv: entry.argv, jobs: [] };
+      shape.jobs.push(entry.job);
+      shapes.set(key, shape);
+    }
+    for (const shape of shapes.values()) {
+      const shell =
+        shape.argv[0] === "run" ||
+        (shape.argv[0] === "stage" && shape.argv[1] === "publish");
+      const expected = shell ? [...shape.argv, "--script-shell", scriptShellPath()] : [...shape.argv];
+      for (const job of shape.jobs) {
+        const decision = decide("npm", shape.argv, job);
+        expect(decision.allow).toBe(true);
+        if (decision.allow) expect(decision.argv).toEqual(expected);
+      }
+      for (const job of [...JOBS, undefined, "no-such-job"]) {
+        expect(decide("npm", shape.argv, job).allow).toBe(
+          job !== undefined && shape.jobs.includes(job),
+        );
+      }
+    }
+  });
+
   test("the meta job allows the dist-tags read and refuses it in another job", () => {
     expect(decide("npm", ["view", SPEC_VALUE, "version"], "meta").allow).toBe(true);
     expect(decide("npm", ["view", SPEC_VALUE, "dist-tags.latest"], "meta").allow).toBe(true);
@@ -337,6 +363,12 @@ describe("script shell", () => {
     const run = decide("npm", ["run", "build"], "test");
     expect(run.allow).toBe(true);
     if (run.allow) expect(run.argv.slice(2)).toEqual(["--script-shell", scriptShellPath()]);
+
+    const typecheck = decide("npm", ["run", "typecheck:test"], "test");
+    expect(typecheck.allow).toBe(true);
+    if (typecheck.allow) {
+      expect(typecheck.argv.slice(2)).toEqual(["--script-shell", scriptShellPath()]);
+    }
 
     const publish = decide(
       "npm",
@@ -535,7 +567,7 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
     expect(existsSync(logPath)).toBe(false);
   });
 
-  test("the npx shim refuses before spawning", () => {
+  test("the npx shim refuses before spawning the recorded npm", () => {
     const { root, logPath } = makeGuardRoot();
     const result = runShim("npx", ["--version"], {
       GITHUB_JOB: "test",
@@ -624,6 +656,29 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
         expect(result.stderr).toContain("[REDACTED]");
         expect(existsSync(logPath)).toBe(false);
       }
+    }
+  });
+
+  test("a URL userinfo with whitespace or a control byte leaves no fragment", () => {
+    const separators = [" ", "\t", "\n", "\u009b"];
+    for (const [index, separator] of separators.entries()) {
+      const user = `user${index}${separator}name`;
+      const password = `pass${index}${separator}word`;
+      const url = `https://${user}:${password}@registry.example/x`;
+      const { root, logPath } = makeGuardRoot();
+      const result = runShim("npm", ["ci", url], {
+        GITHUB_JOB: "test",
+        [ROOT_ENV]: root,
+        FAKE_NPM_LOG: logPath,
+      });
+      expect(result.status).not.toBe(0);
+      for (const output of [result.stdout, result.stderr]) {
+        for (const fragment of [user, password, `user${index}`, "name", `pass${index}`, "word"]) {
+          expect(output).not.toContain(fragment);
+        }
+      }
+      expect(result.stderr).toContain("https://registry.example/x");
+      expect(existsSync(logPath)).toBe(false);
     }
   });
 
