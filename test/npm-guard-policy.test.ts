@@ -331,7 +331,7 @@ describe("refused verbs and shapes", () => {
     }
   });
 
-  test("the spec slot accepts only a package name, not a flag, a word, or a URL", () => {
+  test("the spec slot accepts only a package name, not a flag, whitespace, a semicolon, or a URL", () => {
     for (const value of ["--json", "pkg name", "pkg;id", "https://evil.example/x.tgz"]) {
       expect(decide("npm", ["view", value, "version"], "meta").allow).toBe(false);
       expect(
