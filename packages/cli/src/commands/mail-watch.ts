@@ -134,7 +134,7 @@ function fileIdentity(path: string, file: string): string {
  * or empty `new/` means no files, but a failed listing must not be read as
  * "every file left" (see processNew).
  */
-type NewListing = NewFile[] & { unstatable: Map<string, string> };
+type NewListing = NewFile[] & { unstatable: Map<string, string>; listedGone: Set<string> };
 
 function listNewFiles(dir: string): NewListing | null {
   try {
@@ -145,6 +145,9 @@ function listNewFiles(dir: string): NewListing | null {
     // entry that vanished (ENOENT) keeps today's behaviour and is dropped
     // silently.
     files.unstatable = new Map();
+    // Listed names whose stat returned ENOENT: silent, but not proof the name
+    // was absent, so they do not end a continuous unstatable failure.
+    files.listedGone = new Set();
     for (const file of readdirSync(dir).filter(isMailboxMessageFile)) {
       try {
         const identity = fileIdentity(join(dir, file), file);
@@ -152,6 +155,7 @@ function listNewFiles(dir: string): NewListing | null {
       } catch (err) {
         const code = (err as NodeJS.ErrnoException).code;
         if (code !== "ENOENT") files.unstatable.set(file, code ?? String(err));
+        else files.listedGone.add(file);
       }
     }
     return files;
@@ -159,6 +163,7 @@ function listNewFiles(dir: string): NewListing | null {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") return null;
     const empty = [] as unknown as NewListing;
     empty.unstatable = new Map();
+    empty.listedGone = new Set();
     return empty;
   }
 }
@@ -299,13 +304,13 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // continuous failure; a file this listing stats again leaves the set. Every
   // successful listing of new/ (the scan and the trim) reports through it, so a
   // failure that persists into the next scan is not named twice.
-  const reportUnstatable = (entries: Map<string, string>) => {
+  const reportUnstatable = (entries: Map<string, string>, listedGone: Set<string>) => {
     for (const [file, code] of entries) {
       if (warnedUnstatable.has(file)) continue;
       warnedUnstatable.add(file);
       console.error(`[mail-watch] ${opts.agent}: skipping ${file} — cannot stat ${join(inbox.fresh, file)} (${code})`);
     }
-    for (const file of warnedUnstatable) if (!entries.has(file)) warnedUnstatable.delete(file);
+    for (const file of warnedUnstatable) if (!entries.has(file) && !listedGone.has(file)) warnedUnstatable.delete(file);
   };
 
   // Verified records waiting for a free slot. The concurrency cap must hold
@@ -374,7 +379,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const paths = new Set(files.map(({ file }) => file));
       const fileKeys = new Set(files.map(({ fileKey }) => fileKey));
       const kept = files.unstatable;
-      reportUnstatable(kept);
+      reportUnstatable(kept, files.listedGone);
       for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file) && !kept.has(file)) pendingEnvelopeIds.delete(file);
       for (const file of classified.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) classified.delete(file);
       for (const file of unresolvedAttempts.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) unresolvedAttempts.delete(file);
@@ -530,7 +535,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       // Report and clear before the rescan decision: this listing succeeded, so
       // its names must be warned (and a recovered name cleared) even when a new
       // identity sends us into the rescan.
-      reportUnstatable(atTrim.unstatable);
+      reportUnstatable(atTrim.unstatable, atTrim.listedGone);
       if (atTrim.some(({ identity }) => !present.has(identity))) {
         rescan = true;
         return;
