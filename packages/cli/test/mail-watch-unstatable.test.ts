@@ -1,8 +1,8 @@
 /**
- * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails in the scan's
- * listing with an error other than ENOENT is that entry's problem. The watcher
- * names it once per continuous failure and still presents the readable records
- * beside it.
+ * mail-watch cli#1099: a `*.json` entry in new/ whose stat fails in either
+ * listing (the scan's or the trim's) with an error other than ENOENT is that
+ * entry's problem. The watcher names it once per continuous failure and still
+ * presents the readable records beside it.
  */
 
 import { describe, it, expect, beforeEach, afterEach, spyOn, mock } from "bun:test";
@@ -254,6 +254,108 @@ describe("watchMail: an unstat-able new/ entry", () => {
       expect(received).toEqual([env.messageId]);
     } finally {
       watcher?.stop();
+    }
+  }, 15_000);
+
+  it("names an entry that fails only at the trim listing once, and keeps the record", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let fresh = "";
+    let name = "";
+    let real = "";
+    let mutated = false;
+    let watcher: MailWatcher | undefined;
+    try {
+      fresh = getInbox(AGENT).fresh;
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        beforeVerify: async () => {
+          if (mutated || name === "") return;
+          mutated = true;
+          real = makeUnstatable(fresh, name);
+        },
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "unstatable only at the trim listing", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      name = onlyNewFileName();
+
+      // Statable in the scan's listing, so the record is delivered; delivery
+      // follows the trim listing, so restoring now leaves the failure to it.
+      await waitFor(() => received.length > 0, 5000, () => `log: ${lines.join(" | ")}`);
+      expect(real).not.toBe("");
+      restoreStatable(fresh, name, real);
+
+      const named = () => lines.filter((l) => l.includes(`${name} `) && l.includes("(ELOOP)"));
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+      const restoredAt = polls;
+      await waitFor(() => polls - restoredAt >= 4, 5000);
+      expect(named()).toHaveLength(1);
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
+    }
+  }, 15_000);
+
+  it("does not name a trim-listing failure twice while it continues", async () => {
+    const received: string[] = [];
+    const lines: string[] = [];
+    const logSpy = spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(" "));
+    });
+    let polls = 0;
+    let fresh = "";
+    let name = "";
+    let real = "";
+    let mutated = false;
+    let watcher: MailWatcher | undefined;
+    try {
+      fresh = getInbox(AGENT).fresh;
+      watcher = watchMail({
+        agent: AGENT,
+        debounceMs: 20,
+        pollMs: 25,
+        watchImpl: NO_FS_EVENTS,
+        onPoll: () => { polls++; },
+        beforeVerify: async () => {
+          if (mutated || name === "") return;
+          mutated = true;
+          real = makeUnstatable(fresh, name);
+        },
+        onMessage: (msg) => { received.push(msg.id); },
+      });
+      await sleep(60);
+
+      const env = buildSignedEnvelope(SENDER, AGENT, "still unstatable at the next scan", SEEDS);
+      sendMessage(AGENT, JSON.stringify(env), SENDER);
+      name = onlyNewFileName();
+
+      await waitFor(() => received.length > 0, 5000, () => `log: ${lines.join(" | ")}`);
+      expect(real).not.toBe("");
+
+      // The trim listing names it; the same failure at the next scan does not.
+      const named = () => lines.filter((l) => l.includes(`${name} `) && l.includes("(ELOOP)"));
+      await waitFor(() => named().length === 1, 5000, () => `log: ${lines.join(" | ")}`);
+      const warnedAt = polls;
+      await waitFor(() => polls - warnedAt >= 4, 5000);
+      expect(named()).toHaveLength(1);
+
+      restoreStatable(fresh, name, real);
+      expect(received).toEqual([env.messageId]);
+    } finally {
+      watcher?.stop();
+      logSpy.mockRestore();
     }
   }, 15_000);
 

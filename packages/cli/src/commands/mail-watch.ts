@@ -295,6 +295,19 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
   // per continuous failure: it is logged again if the failure stops and recurs.
   const warnedUnstatable = new Set<string>();
 
+  // Name each entry a listing could not stat and keep one warning per
+  // continuous failure; a file this listing stats again leaves the set. Both
+  // listings report through it, so a failure that persists into the next scan
+  // is not named twice.
+  const reportUnstatable = (entries: Map<string, string>) => {
+    for (const [file, code] of entries) {
+      if (warnedUnstatable.has(file)) continue;
+      warnedUnstatable.add(file);
+      console.error(`[mail-watch] ${opts.agent}: skipping ${file} — cannot stat ${join(inbox.fresh, file)} (${code})`);
+    }
+    for (const file of warnedUnstatable) if (!entries.has(file)) warnedUnstatable.delete(file);
+  };
+
   // Verified records waiting for a free slot. The concurrency cap must hold
   // WITHOUT dropping the rest, so over-cap records wait here and are delivered
   // as slots free.
@@ -361,12 +374,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const paths = new Set(files.map(({ file }) => file));
       const fileKeys = new Set(files.map(({ fileKey }) => fileKey));
       const kept = files.unstatable;
-      for (const [file, code] of kept) {
-        if (warnedUnstatable.has(file)) continue;
-        warnedUnstatable.add(file);
-        console.error(`[mail-watch] ${opts.agent}: skipping ${file} — cannot stat ${join(inbox.fresh, file)} (${code})`);
-      }
-      for (const file of warnedUnstatable) if (!kept.has(file)) warnedUnstatable.delete(file);
+      reportUnstatable(kept);
       for (const file of pendingEnvelopeIds.keys()) if (!paths.has(file) && !kept.has(file)) pendingEnvelopeIds.delete(file);
       for (const file of classified.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) classified.delete(file);
       for (const file of unresolvedAttempts.keys()) if (!present.has(file) && !kept.has(fileOfIdentity(file))) unresolvedAttempts.delete(file);
@@ -526,6 +534,7 @@ export function watchMail(opts: MailWatchOptions): MailWatcher {
       const trimPresent = new Set(atTrim.map(({ identity }) => identity));
       const trimPaths = new Set(atTrim.map(({ file }) => file));
       const trimKept = new Set([...kept.keys(), ...atTrim.unstatable.keys()]);
+      reportUnstatable(atTrim.unstatable);
       for (const file of pendingEnvelopeIds.keys()) if (!trimPaths.has(file) && !trimKept.has(file)) pendingEnvelopeIds.delete(file);
       for (const identity of classified.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) classified.delete(identity);
       for (const identity of unresolvedAttempts.keys()) if (!trimPresent.has(identity) && !trimKept.has(fileOfIdentity(identity))) unresolvedAttempts.delete(identity);
