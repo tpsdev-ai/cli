@@ -526,3 +526,29 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(ack.stderr).toContain("external-tier mail cannot be acknowledged");
   });
 });
+
+test("an ack in new/ succeeds without a dlq/ directory and preserves its sidecar", () => {
+  const root = mkdtempSync(join(tmpdir(), "tps-ack-no-dlq-"));
+  try {
+    const fresh = join(root, "new");
+    mkdirSync(fresh);
+    mkdirSync(join(root, "cur"));
+    const path = join(fresh, "message.json");
+    const reasonPath = `${path}.reason`;
+    const original = JSON.stringify({ id: "message", read: false });
+    writeFileSync(path, original, "utf-8");
+    writeFileSync(reasonPath, "keep\n", "utf-8");
+
+    const withoutDlq = ackMessageAtPath(path, root);
+    expect(withoutDlq.ackedAt).toEqual(expect.any(String));
+    expect(existsSync(path)).toBe(false);
+
+    mkdirSync(join(root, "dlq"));
+    writeFileSync(path, original, "utf-8");
+    expect(ackMessageAtPath(path, root)).toEqual({ ...withoutDlq, ackedAt: expect.any(String) });
+    expect(existsSync(path)).toBe(false);
+    expect(readFileSync(reasonPath, "utf-8")).toBe("keep\n");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

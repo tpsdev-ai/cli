@@ -633,7 +633,15 @@ export function updateExistingRecord<T extends object>(
         if (err?.code === "ENOENT") return { status: "gone" };
         throw Object.assign(new Error(`cannot remove ${path}: ${err?.message ?? String(err)}`), { code: err?.code, path });
       }
-      if (options.removeReasonSidecar && physicallyIn("dlq")) {
+      let inDlq = false;
+      if (options.removeReasonSidecar) {
+        try {
+          inDlq = physicallyIn("dlq");
+        } catch (err: any) {
+          if (err?.code !== "ENOENT" || err?.path !== join(realRoot, "dlq")) throw err;
+        }
+      }
+      if (inDlq) {
         const sidecar = `${path}.reason`;
         try {
           unlinkSync(sidecar);
