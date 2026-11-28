@@ -2379,9 +2379,9 @@ describe("the run-block guard refuses split-word continuations and command words
   }, 15_000);
 
   it.each([
-    "env -u FOO {n,}pm ci",
+    "env FOO=bar {n,}pm ci",
     "exec -a x {n,}pm ci",
-  ])("refuses a brace-leading command word after a modelled prefix's option value: %s", (run) => {
+  ])("refuses a brace-leading command word after a modelled prefix assignment or option value: %s", (run) => {
     const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
     expect(() => read(run)).toThrow(reason);
     expect(() => tree(run)).toThrow(reason);
@@ -2389,10 +2389,10 @@ describe("the run-block guard refuses split-word continuations and command words
   }, 15_000);
 
   it.each([
-    '"env" -u FOO {n,}pm ci',
-    "\\env -u FOO {n,}pm ci",
-    'env "-u" FOO {n,}pm ci',
-  ])("refuses a brace-leading command word after a statically quoted or escaped prefix or quoted prefix option: %s", (run) => {
+    '"env" FOO=bar {n,}pm ci',
+    "\\env FOO=bar {n,}pm ci",
+    'env FOO="bar" {n,}pm ci',
+  ])("refuses a brace-leading command word after a statically quoted or escaped prefix: %s", (run) => {
     const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
     expect(() => read(run)).toThrow(reason);
     expect(() => tree(run)).toThrow(reason);
@@ -2400,7 +2400,7 @@ describe("the run-block guard refuses split-word continuations and command words
   }, 15_000);
 
   it("refuses a literal brace word as the command word after a prefix", () => {
-    const run = "env -u FOO {foo}bar one";
+    const run = "env FOO=bar {foo}bar one";
     const reason = "an unapproved run block conservatively refuses a command word beginning with an unquoted {";
     expect(() => read(run)).toThrow(reason);
     expect(() => tree(run)).toThrow(reason);
@@ -2435,13 +2435,13 @@ describe("the run-block guard refuses split-word continuations and command words
   }, 15_000);
 });
 
-describe("the workflow guard follows a script through a statically quoted prefix or option (#941)", () => {
+describe("the workflow guard follows a script through a statically quoted prefix (#941)", () => {
   const WORKFLOW = "workflow-941-decoded-walk";
   const tracked = new Set(["package-lock.json"]);
   const prefixed = [
-    '"env" -u FOO bash scripts/check.sh',
-    "\\env -u FOO bash scripts/check.sh",
-    'env "-u" FOO bash scripts/check.sh',
+    '"env" FOO=bar bash scripts/check.sh',
+    "\\env FOO=bar bash scripts/check.sh",
+    'env FOO="bar" bash scripts/check.sh',
   ];
   const install = /does not read the lockfile and is refused/;
 
@@ -2505,15 +2505,16 @@ describe("the workflow guard follows the decoded interpreter word (#941)", () =>
   }
 });
 
-describe("the workflow guard refuses env working-directory options (#941)", () => {
-  const WORKFLOW = "workflow-941-env-chdir";
+describe("the workflow guard refuses every env option and accepts leading assignments (#941)", () => {
+  const WORKFLOW = "workflow-941-env-options";
   const tracked = new Set(["package-lock.json"]);
-  const options = [
-    ["env -C sub bash check.sh", "env -C changes the working directory and is refused"],
-    ["env -Csub bash check.sh", "env -C changes the working directory and is refused"],
-    ["env -iC sub bash check.sh", "env -C changes the working directory and is refused"],
-    ["env --chdir sub bash check.sh", "env --chdir changes the working directory and is refused"],
-    ["env --chdir=sub bash check.sh", "env --chdir changes the working directory and is refused"],
+  const refused = [
+    ["env -S 'bash check.sh'", "-S"],
+    ["env --split-string 'bash check.sh'", "--split-string"],
+    ["env -u FOO bash check.sh", "-u"],
+    ["env -C sub bash check.sh", "-C"],
+    ["env --chdir=sub bash check.sh", "--chdir=sub"],
+    ["env -i bash check.sh", "-i"],
   ] as [string, string][];
 
   const withTree = (files: Record<string, string>, body: (root: string) => void) => {
@@ -2525,11 +2526,11 @@ describe("the workflow guard refuses env working-directory options (#941)", () =
     }
   };
 
-  for (const [run, reason] of options) {
+  for (const [run, option] of refused) {
     it(`refuses ${run} in a run block`, () => {
       withTree({ "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
         expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(
-          `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: ${reason}: ${run} (physical line 1)`,
+          `an unapproved run block has an env option: ${option}`,
         );
       });
     }, 10_000);
@@ -2537,7 +2538,23 @@ describe("the workflow guard refuses env working-directory options (#941)", () =
     it(`refuses ${run} in a followed script`, () => {
       withTree({ "scripts/outer.sh": `${run}\n`, "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
         expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(
-          `workflow ${WORKFLOW} job build step 1: script scripts/outer.sh (invocation scripts/outer.sh), line 1: ${reason}: ${run}`,
+          /an unapproved run block has an env option: /,
+        );
+      });
+    }, 10_000);
+  }
+
+  for (const [place, run] of [
+    ["a run block", "env FOO=bar bash check.sh"],
+    ["a followed script", "bash scripts/outer.sh"],
+  ] as const) {
+    it(`still follows an env assignment command in ${place}`, () => {
+      withTree({
+        "scripts/outer.sh": "env FOO=bar bash check.sh\n",
+        "check.sh": "npx some-tool\n",
+      }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(
+          /does not read the lockfile and is refused/,
         );
       });
     }, 10_000);
@@ -5584,8 +5601,8 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
   }
 
   it.each([
-    "timeout", "nice", "stdbuf", "setsid", "chroot", "hash",
-    "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch", "builtin",
+    "timeout", "nice", "stdbuf", "setsid", "chroot",
+    "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch",
   ])("refuses the listed wrapper %s outright", (wrapper) => {
     expectRefused(`${wrapper} true`, new RegExp(`listed exec wrapper: ${wrapper}`));
   }, 5_000);
@@ -5600,7 +5617,7 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     "env --split-string 'npm ci'",
     "env --split-string='npm ci'",
   ])("refuses the env split-string option: %s", (run) => {
-    expectRefused(run, /unrecognised env option/);
+    expectRefused(run, /an unapproved run block has an env option: /);
   }, 5_000);
 
   it.each(["env A=~ echo ok", "env A=x:~/y echo ok"])("refuses a word after env whose unquoted tilde bash expands: %s", (run) => {
@@ -5678,15 +5695,15 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
 
   const statics: { run: string; reason: RegExp; argv: string | null }[] = [
     // Statically quoted prefix, wrapper and command spellings real bash runs.
-    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
-    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /word without a static value after env/, argv: "ci" },
+    { run: 'env "-u" FOO n$\'p\\155\' ci', reason: /an unapproved run block has an env option: -u/, argv: "ci" },
+    { run: '"env" -u FOO n$\'p\\155\' ci', reason: /an unapproved run block has an env option: -u/, argv: "ci" },
     { run: '"timeout" 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
     { run: '"timeout" -k 5 5 n$\'p\\155\' ci', reason: /listed exec wrapper: timeout/, argv: "ci" },
     { run: '"${{ matrix.cmd }}" ci', reason: /runner expression in command position/, argv: null },
 
     // An unknown short or long option on each modelled prefix.
-    { run: "env -Z npm ci", reason: /unrecognised env option/, argv: null },
-    { run: "env --bogus npm ci", reason: /unrecognised env option/, argv: null },
+    { run: "env -Z npm ci", reason: /an unapproved run block has an env option: -Z/, argv: null },
+    { run: "env --bogus npm ci", reason: /an unapproved run block has an env option: --bogus/, argv: null },
     { run: "sudo -Z npm ci", reason: /unrecognised sudo option/, argv: null },
     { run: "sudo --bogus npm ci", reason: /unrecognised sudo option/, argv: null },
     { run: "exec -Z npm ci", reason: /unrecognised exec option/, argv: null },
@@ -5695,7 +5712,7 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
     { run: "xargs --bogus npm ci", reason: /unrecognised xargs option/, argv: null },
 
     // A modelled option whose value is missing at the end of the line.
-    { run: "env -u", reason: /env option without a value/, argv: null },
+    { run: "env -u", reason: /an unapproved run block has an env option: -u/, argv: null },
     { run: "sudo -u", reason: /sudo option without a value/, argv: null },
     { run: "exec -a", reason: /exec option without a value/, argv: null },
     { run: "xargs -n", reason: /xargs option without a value/, argv: null },
@@ -5856,5 +5873,16 @@ describe("the workflow guard matches command words by decoded value (#941)", () 
     it(`refuses an unknown quoted command word in ${place}`, () => {
       expectTreeRefused("'made-up-command' --status", run, [], /unrecognised quoted or escaped command word/);
     }, 5_000);
+  }
+
+  for (const [label, line] of [
+    ["quoted builtin", "'builtin' source scripts/inst.sh"],
+    ["hash", "hash -p /tmp/x npm"],
+  ] as const) {
+    for (const [place, run] of [["a run block", line], ["a followed script", "bash scripts/inner.sh"]] as const) {
+      it(`refuses ${label} in ${place}`, () => {
+        expectTreeRefused(line, run, [], /an unapproved run block has an unrecognised command word/);
+      }, 5_000);
+    }
   }
 });

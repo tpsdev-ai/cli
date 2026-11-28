@@ -442,6 +442,9 @@ export function npmCiLockDirs(run: string, workdir: string, label: string): stri
         }
         const word = commandWord(clause.tokens, true, (reason) => refuse(entry, reason));
         if (word === null) continue;
+        if (word.value === null && word.prefixed) {
+          refuse(entry, `an unapproved run block has a word without a static value after ${word.prefix}: ${word.token.text}`);
+        }
         const text = word.token.text;
         if (/^(?:[0-9]*[<>]|\{[A-Za-z_][A-Za-z0-9_]*\}[<>])/.test(text)) {
           refuse(entry, "an unapproved run block has a leading redirection");
@@ -725,7 +728,8 @@ const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", 
 // Command words the guard handles by decoded value: it follows the word,
 // validates its invocation shape, or knows it runs no repository script. A
 // name-shaped quoted or escaped spelling whose decoded value is absent is
-// refused.
+// refused. `env` is here for its `NAME=value` form; every `env` option is
+// refused, and `builtin` and `hash` are not handled.
 const HANDLED_COMMAND_WORDS = new Set([
   "source", ".", "eval",
   "cd", "pushd", "popd",
@@ -734,7 +738,7 @@ const HANDLED_COMMAND_WORDS = new Set([
   "env", "command", "exec", "sudo", "xargs", "nohup", "time",
   "[", "[[",
   "docker", "setsid", "timeout", "nice", "chroot", "stdbuf",
-  "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch", "builtin", "hash",
+  "ionice", "chrt", "taskset", "flock", "unbuffer", "script", "watch",
 ]);
 
 /** The decoded static command word the guard compares, or null when it has none. */
@@ -752,12 +756,6 @@ type PrefixOptionGrammar = {
   longFlag: Set<string>;
 };
 const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
-  env: {
-    shortValue: new Set(["u", "C"]),
-    shortFlag: new Set(["i", "0", "v"]),
-    longValue: new Set(["unset", "chdir"]),
-    longFlag: new Set(["ignore-environment", "null", "debug", "help", "version"]),
-  },
   sudo: {
     shortValue: new Set(["u", "g", "C", "D", "h", "p", "r", "t", "U"]),
     shortFlag: new Set(["A", "B", "b", "E", "e", "H", "K", "k", "l", "n", "P", "S", "V", "v"]),
@@ -778,10 +776,14 @@ const PREFIX_OPTION_GRAMMAR: Record<string, PrefixOptionGrammar> = {
   },
 };
 
-// Listed exec wrappers are refused outright in unapproved run blocks.
+// Command words the guard knows but refuses: `builtin` runs another builtin and
+// `hash` changes command lookup, so neither is handled.
+const UNRECOGNISED_COMMAND_WORDS = new Set(["builtin", "hash"]);
+
+// A listed exec wrapper is refused outright in unapproved run blocks.
 const UNMODELLED_WRAPPERS = new Set([
   "timeout", "nice", "stdbuf", "setsid", "chroot", "ionice", "chrt",
-  "taskset", "flock", "unbuffer", "script", "watch", "builtin", "hash",
+  "taskset", "flock", "unbuffer", "script", "watch",
 ]);
 
 function stripOuterQuotes(value: string): string {
@@ -1405,25 +1407,16 @@ function splitClauses(line: string, keepRedirectAmpersand = false): Clause[] {
 /**
  * Consume a prefix command's options and return the index of the first token
  * after them, which may be an assignment. An option the grammar does not list
- * refuses the step in strict mode; without a refusal the walk stops there.
+ * refuses the step.
  */
 function consumePrefixOptionWords(
   command: string,
   grammar: PrefixOptionGrammar,
   tokens: readonly WordToken[],
   index: number,
-  refuse?: (reason: string) => never,
-  chdirRefuse?: (reason: string) => never,
+  refuse: (reason: string) => never,
 ): number {
-  const refuseChdir = (reason: string): never => {
-    if (chdirRefuse !== undefined) return chdirRefuse(reason);
-    if (refuse !== undefined) return refuse(reason);
-    throw new Error(reason);
-  };
-  const stop = (reason: string): number => {
-    if (refuse !== undefined) refuse(reason);
-    return index;
-  };
+  const stop = (reason: string): number => refuse(reason);
   while (index < tokens.length) {
     const token = tokens[index];
     const text = staticWordValue(token.text);
@@ -1435,9 +1428,6 @@ function consumePrefixOptionWords(
     if (text.startsWith("--")) {
       const equals = text.indexOf("=");
       const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
-      if (command === "env" && name === "chdir") {
-        refuseChdir("env --chdir changes the working directory and is refused");
-      }
       if (grammar.longValue.has(name)) {
         if (equals !== -1) {
           index++;
@@ -1461,9 +1451,6 @@ function consumePrefixOptionWords(
     let known = true;
     for (let letter = 0; letter < letters.length; letter++) {
       const flag = letters[letter];
-      if (command === "env" && flag === "C") {
-        refuseChdir("env -C changes the working directory and is refused");
-      }
       if (grammar.shortValue.has(flag)) {
         takesNext = letter === letters.length - 1;
         break;
@@ -1493,6 +1480,8 @@ type WalkedWord = {
   value: string | null;
   /** True when a prefix command was consumed before the command word. */
   prefixed: boolean;
+  /** The prefix command word consumed before the command word, or null. */
+  prefix: string | null;
   /** The words after the command word, each decoded when it has a static value. */
   args: WordToken[];
 };
@@ -1507,40 +1496,39 @@ function decodedWords(tokens: readonly WordToken[]): WordToken[] {
 
 /**
  * Walk a clause's words and return its command word. Prefixes, options and
- * reserved words are recognised by their decoded static value in decoded mode,
- * so a statically quoted prefix or option matches like an unquoted one. A
- * `refuse` callback turns the strict run-block checks on; listed wrappers are
- * refused outright. `braceRefuse` is called for a word whose first decoded
- * character is an unquoted `{`. The result carries the command word and the
- * arguments decoded where they have a static value, so discovery consumes that
- * one result.
+ * reserved words are recognised by their decoded static value, so a quoted or
+ * escaped prefix or option matches like an unquoted one. `refuse` is required:
+ * an option a prefix does not model, an `env` option, `builtin` or `hash`, or a
+ * command word beginning with an unquoted `{` is refused. `env` accepts only
+ * leading `NAME=value` assignments. A word after a prefix with no static value
+ * is returned with a null value, so the caller judges it (a run block refuses
+ * it; a followed script records it). `refuseWrapper` is supplied only by
+ * run-block validation; discovery follows a listed wrapper's payload. The
+ * result carries the command word and the arguments decoded where they have a
+ * static value, so discovery consumes that one result.
  */
 function walkCommandWord(
   tokens: readonly WordToken[],
   includeCase: boolean,
-  decoded: boolean,
-  refuse?: (reason: string) => never,
+  refuse: (reason: string) => never,
   braceRefuse?: (reason: string) => never,
-  chdirRefuse?: (reason: string) => never,
+  refuseWrapper?: (reason: string) => never,
 ): WalkedWord | null {
   let index = 0;
   let sawPrefix = false;
   let prefix = "";
   const onBrace = braceRefuse ?? refuse;
   const walked = (at: number, token: WordToken, value: string | null): WalkedWord =>
-    ({ index: at, token, value, prefixed: sawPrefix, args: decodedWords(tokens.slice(at + 1)) });
+    ({ index: at, token, value, prefixed: sawPrefix, prefix: sawPrefix ? prefix : null, args: decodedWords(tokens.slice(at + 1)) });
   while (index < tokens.length) {
     const token = tokens[index];
-    if (onBrace !== undefined && isBraceCommandWord(token.text)) {
+    if (isBraceCommandWord(token.text)) {
       onBrace("an unapproved run block conservatively refuses a command word beginning with an unquoted {");
     }
-    const value = decoded ? staticWordValue(token.text) : null;
+    const value = staticWordValue(token.text);
     // After a prefix every word up to and including the command word must be
-    // static; the plain-variable command word is accepted only without one.
-    if (decoded && sawPrefix && value === null) {
-      if (refuse !== undefined) refuse(`an unapproved run block has a word without a static value after ${prefix}: ${token.text}`);
-      return walked(index, token, null);
-    }
+    // static; the caller judges a null value.
+    if (sawPrefix && value === null) return walked(index, token, null);
     if (isScalarAssignment(token.text)) {
       index++;
       continue;
@@ -1548,32 +1536,56 @@ function walkCommandWord(
     const text = value ?? stripOuterQuotes(token.text);
     if (includeCase && !token.quoted && text === "case") return walked(index, token, value);
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
-    if ((decoded || !token.quoted) && PREFIX_COMMANDS.has(text)) {
+    if (PREFIX_COMMANDS.has(text)) {
       // `command -v`/`-V` looks a name up; it runs no command.
       if (text === "command") {
         const next = tokens[index + 1];
-        const nextText = next === undefined ? null : decoded ? staticWordValue(next.text) : next.quoted ? null : next.text;
+        const nextText = next === undefined ? null : staticWordValue(next.text);
         if (nextText !== null && /^-[vV]$/.test(nextText)) return null;
       }
       sawPrefix = true;
       prefix = text;
       index++;
+      if (text === "env") {
+        // Only leading NAME=value assignments, then the command.
+        while (index < tokens.length) {
+          const word = tokens[index];
+          const decoded = staticWordValue(word.text);
+          if (decoded === null) {
+            if (isBraceCommandWord(word.text)) {
+              onBrace("an unapproved run block conservatively refuses a command word beginning with an unquoted {");
+            }
+            return walked(index, word, null);
+          }
+          if (isScalarAssignment(word.text)) {
+            index++;
+            continue;
+          }
+          if (decoded.startsWith("-") && decoded !== "-") {
+            refuse(`an unapproved run block has an env option: ${decoded}`);
+          }
+          break;
+        }
+        continue;
+      }
       const grammar = PREFIX_OPTION_GRAMMAR[text];
-      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse, chdirRefuse);
+      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse);
       continue;
     }
-    if ((decoded || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
-      // Listed wrappers are refused without inspecting their arguments.
-      if (refuse !== undefined) {
-        refuse(`an unapproved run block has a listed exec wrapper: ${text}`);
-      }
+    if (UNRECOGNISED_COMMAND_WORDS.has(text)) {
+      refuse(`an unapproved run block has an unrecognised command word: ${text}`);
+    }
+    if (UNMODELLED_WRAPPERS.has(text)) {
+      // In an unapproved run block a listed wrapper is refused without
+      // inspecting its arguments; discovery follows its payload instead.
+      if (refuseWrapper !== undefined) refuseWrapper(`an unapproved run block has a listed exec wrapper: ${text}`);
       return walked(index, token, value);
     }
     if (!token.quoted && SHELL_KEYWORDS.has(text)) {
       index++;
       continue;
     }
-    if (sawPrefix && (decoded || !token.quoted) && text.startsWith("-") && text !== "-") {
+    if (sawPrefix && text.startsWith("-") && text !== "-") {
       index++;
       continue;
     }
@@ -1585,17 +1597,18 @@ function walkCommandWord(
 /**
  * Skip variable assignments, env/command/exec/sudo/xargs/nohup/time prefixes and
  * the reserved words that introduce a command clause; a `for`/`case`/`select`
- * header is not an invocation unless `case` is requested for refusal. A
- * `refuse` callback turns the strict run-block checks on: prefix options are
- * consumed from the finite grammar, and listed wrappers are refused outright.
+ * header is not an invocation unless `case` is requested for refusal. Prefix
+ * options are consumed from the finite grammar and unmodelled options are
+ * refused; this entry point is run-block validation, so a listed wrapper is
+ * refused too.
  */
 function commandWord(
   tokens: ShellToken[],
-  includeCase = false,
-  refuse?: (reason: string) => never,
+  includeCase: boolean,
+  refuse: (reason: string) => never,
   braceRefuse?: (reason: string) => never,
 ): WalkedWord | null {
-  return walkCommandWord(tokens, includeCase, refuse !== undefined, refuse, braceRefuse);
+  return walkCommandWord(tokens, includeCase, refuse, braceRefuse, refuse);
 }
 
 function firstNonFlag(tokens: ShellToken[]): ShellToken | undefined {
@@ -2313,11 +2326,14 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
     let clauseInstall = false;
     const reviewedWrapped = REVIEWED_WRAPPED_PAYLOAD_ALLOWLIST.some((reviewed) => reviewed.text === entry.text);
     for (const clause of splitClauses(entry.text)) {
-      const word = walkCommandWord(clause.tokens, false, true, undefined,
+      const word = walkCommandWord(clause.tokens, false,
+        (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); },
         state.source === "run-block" && !reviewed
           ? (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); }
-          : undefined,
-        (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); });
+          : undefined);
+      if (word !== null && word.value === null && word.prefixed && state.source === "run-block") {
+        throw new Error(`${lineAt(state, number)}: an unapproved run block has a word without a static value after ${word.prefix}: ${word.token.text}: ${entry.text}`);
+      }
       if (word !== null && word.value === null && word.token.text !== "[" && word.token.text !== "[[" &&
           !/[$`*?\[]/.test(word.token.text) && (word.prefixed || !isVariableWord(word.token.text))) {
         // Refuse a non-static command word instead of passing it to discovery

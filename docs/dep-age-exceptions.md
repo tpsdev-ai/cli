@@ -43,22 +43,27 @@ is literal, a backslash included; inside double quotes a backslash escapes only
 `$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
 next character. A word containing a parameter, command, arithmetic or brace expansion, an unescaped backquote, an unquoted `~` or an unquoted glob has no static value.
 Prefix, option and wrapper matching read the static value, so a statically quoted
-spelling matches like an unquoted one. A word with no static value in command
-position is refused, naming it, except a plain variable command word with no
-prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
+spelling matches like an unquoted one. In an unapproved run block, a word with no
+static value in command position is refused, naming it, except a plain variable
+command word with no prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
 a backslash-newline continuation
 inside a word is refused, naming the physical line. The same command-word walk
 refuses a command word whose first decoded character is an unquoted `{`:
 `''{n,}pm` counts, `'{n,}pm'` does not. A standalone `{` is a group, and
-`{fd}>out` is refused as a leading redirection. After `env`, `sudo`, `exec` or `xargs`, every word up to and
-including the command word must have a static value; a word without one is refused.
+`{fd}>out` is refused as a leading redirection. In unapproved run blocks, after
+`env`, `sudo`, `exec` or `xargs` every word up to and including the command word
+must have a static value; a word without one is refused. In followed shell files
+such a word is not followed.
 Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
-remain accepted. The guard consumes the `env`, `sudo`, `exec` and `xargs` options
-from a finite grammar and refuses unmodelled options, including
-`env -S`/`--split-string` and `sudo -s`/`-i`/`--shell`/`--login`. In unapproved run blocks, the listed wrappers
+remain accepted. `env` accepts only leading `NAME=value` assignments followed by
+the command; every `env` option is refused. The guard consumes the `sudo`,
+`exec` and `xargs` options from a finite grammar and refuses unmodelled options,
+including `sudo -s`/`-i`/`--shell`/`--login`. These refusals apply in run blocks
+and followed shell files. In unapproved run blocks, the listed wrappers
 (`timeout`, `nice`, `stdbuf`, `setsid`, `chroot`, `ionice`, `chrt`, `taskset`, `flock`,
-`unbuffer`, `script`, `watch`, `builtin` and `hash`) are refused outright; a `${{ ... }}` runner
-expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
+`unbuffer`, `script` and `watch`) are refused outright; `builtin` and `hash` are
+refused as unrecognised command words in run blocks and followed shell files. A
+`${{ ... }}` runner expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
 this best-effort lint does not model compound commands. These checks read a
 run block's top-level clauses only: commands inside `$(...)` or backtick
 substitutions, and text after a quote that spans physical lines, are not checked.
@@ -92,9 +97,9 @@ cannot close skips the clause, and nested quoting inside substitutions is a
 known limit (cli#975). It passes an install only as a bounded global
 install or when it resolves to a tracked lockfile, and any invocation or install
 it cannot resolve is refused unless a reviewed allowlist entry names it; an
-unresolved-invocation refusal names the step and the invocation path. It is not a boundary
-against an author who deliberately evades it; review is, and a runtime npm
-guard in CI is the structural fix, tracked separately (cli#948). Installs inside
+unresolved-invocation refusal names the step and the invocation path. It is a fail-closed lint over reviewed workflow changes, not a boundary against
+an author who deliberately evades it; runtime enforcement of every install is
+cli#948. Installs inside
 followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
 `package.json` are not inspected. A `$'...'` span is a quote in which a backslash
 escapes the next character and `$(` and a backtick are literal.

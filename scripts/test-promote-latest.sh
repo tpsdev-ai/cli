@@ -2787,7 +2787,7 @@ d="$(new_fixture log-unset)"
 mkdir -p "$d/cwd-unset" "$d/cwd-empty"
 root_before="$(find "$d/root" -type f | wc -l | tr -d ' ')"
 (
-  cd "$d/cwd-unset" && env -u PROMOTE_SUPERVISOR_LOG "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
+  cd "$d/cwd-unset" && unset PROMOTE_SUPERVISOR_LOG && "${NODE_BIN:-node}" "$here/npm-supervisor.mjs" 5 1 -- \
     "${NODE_BIN:-node}" -e 'process.exit(3)'
 ) >"$d/out-unset.txt" 2>"$d/err-unset.txt"
 rc_unset=$?
