@@ -286,8 +286,8 @@ describe("mail promotion enforcement (ops-8mhg)", () => {
     const first = await checkMessages("kern");
     expect(first.length).toBe(1);
 
-    // Simulate the maildir forgetting the record: ackMessage unlinks it from
-    // cur/, then cur/ and archive/ are wiped. The gate used to read exactly
+    // Simulate the maildir forgetting the record: it is acked, then cur/ and
+    // archive/ are wiped. The gate used to read exactly
     // those mutable directories, so the consumed id became unknown again.
     expect(ackMessage("kern", first[0]!.id)).not.toBeNull();
     rmSync(inbox.cur, { recursive: true, force: true });

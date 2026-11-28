@@ -56,7 +56,7 @@ await new Promise((r) => setTimeout(r, 300));
 console.log("MEASURED " + JSON.stringify({
   launches: existsSync(launchLog) ? readFileSync(launchLog, "utf8").trim().split("\n").length : 0,
   bridgeStill: existsSync(join(process.env.TPS_MAIL_DIR, "kern", "cur", "bridge.json")),
-  ordinaryGone: !existsSync(join(process.env.TPS_MAIL_DIR, "kern", "cur", "ordinary.json")),
+  ordinaryAcked: JSON.parse(readFileSync(join(process.env.TPS_MAIL_DIR, "kern", "cur", "ordinary.json"), "utf8")).ackedAt !== undefined,
   replies: readdirSync(join(process.env.TPS_MAIL_DIR, "flint", "new")).length, error,
 }));
 process.exit(0);

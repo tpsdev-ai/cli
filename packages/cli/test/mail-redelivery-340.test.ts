@@ -4,10 +4,10 @@
  * with the printed command).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
-import { ackMessage, checkMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage } from "../src/utils/mail.js";
+import { ackMessage, ackMessageAtPath, checkMessages, gcMessages, getInbox, LEASE_TIMEOUT_MS, sendMessage, updateExistingRecord } from "../src/utils/mail.js";
 import { buildSignedEnvelope, startStubFlair, writeKeyFile, type StubFlair } from "./helpers/stub-flair.js";
 
 const TPS_BIN = resolve(import.meta.dir, "../bin/tps.ts");
@@ -72,8 +72,8 @@ describe("mail check re-delivery reason (cli#340)", () => {
     return runCli(["mail", "check", ...args], agentId);
   }
 
-  async function runCli(args: string[], agentId: string): Promise<{ status: number; stdout: string; stderr: string }> {
-    const proc = Bun.spawn(["bun", TPS_BIN, ...args], {
+  async function runCli(args: string[], agentId: string, preload?: string): Promise<{ status: number; stdout: string; stderr: string }> {
+    const proc = Bun.spawn(["bun", ...(preload ? [`--preload=${preload}`] : []), TPS_BIN, ...args], {
       cwd: tempRoot,
       env: {
         ...process.env,
@@ -144,14 +144,171 @@ describe("mail check re-delivery reason (cli#340)", () => {
     expect(await checkMessages(OWNER)).toEqual([]);
   });
 
-  test("an acked record is not re-delivered", async () => {
+  test("an acked record stays in cur/ and is neither re-delivered nor re-leased", async () => {
     const sent = sendMessage(OWNER, signedBody("ack me"), SENDER);
     const delivered = await checkMessages(OWNER);
     expect(delivered.length).toBe(1);
-    ackMessage(OWNER, sent.id);
-    expect(readdirSync(getInbox(OWNER).cur).filter((f) => f.endsWith(".json"))).toEqual([]);
 
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    const acked = JSON.parse(readFileSync(curPath(), "utf-8"));
+    expect(acked.read).toBe(true);
+    expect(acked.ackedAt).toEqual(expect.any(String));
+    // The ack drops the checkout; the lease sweep skips a read record before it
+    // checks the lease.
+    expect(acked.checkedOutAt).toBeUndefined();
+
+    const check = await runCheck([OWNER]);
+    expect(check.status, check.stderr).toBe(0);
+    expect(check.stdout).toContain("No new messages.");
     expect(await checkMessages(OWNER)).toEqual([]);
+    expect(JSON.parse(readFileSync(curPath(), "utf-8"))).toEqual(acked);
+  });
+
+  test("an ack through an aliased path to cur/ keeps the record, chosen by its physical directory", async () => {
+    sendMessage(OWNER, signedBody("ack me through an alias"), SENDER);
+    expect((await checkMessages(OWNER)).length).toBe(1);
+    const real = curPath();
+    const root = dirname(dirname(real));
+    symlinkSync(dirname(real), join(root, "cur-alias"));
+    const acked = ackMessageAtPath(join(root, "cur-alias", basename(real)), root);
+    expect(acked.ackedAt).toEqual(expect.any(String));
+    // Kept and stamped in cur/, as a literal cur/ path would be; not deleted.
+    expect(existsSync(real)).toBe(true);
+    expect(JSON.parse(readFileSync(real, "utf-8")).ackedAt).toBe(acked.ackedAt);
+  });
+
+  test("an explicit remove takes precedence over removeUnlessIn for a cur/ record", async () => {
+    sendMessage(OWNER, signedBody("remove wins"), SENDER);
+    expect((await checkMessages(OWNER)).length).toBe(1);
+    const real = curPath();
+    const result = updateExistingRecord(real, (record: object) => record, { mailboxRoot: dirname(dirname(real)), remove: true, removeUnlessIn: "cur" });
+    expect(result.status).toBe("updated");
+    expect(existsSync(real)).toBe(false);
+  });
+
+  test("mail check archives an old acked cur/ record before GC can delete it", async () => {
+    const sent = sendMessage(OWNER, signedBody("archive before GC"), SENDER);
+    expect(await checkMessages(OWNER)).toHaveLength(1);
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+
+    const path = curPath();
+    const record = JSON.parse(readFileSync(path, "utf-8"));
+    expect(record.ackedAt).toEqual(expect.any(String));
+    const old = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000);
+    const oldIso = old.toISOString();
+    record.timestamp = oldIso;
+    record.receivedAt = oldIso;
+    record.ackedAt = oldIso;
+    writeFileSync(path, JSON.stringify(record, null, 2), "utf-8");
+    utimesSync(path, old, old);
+
+    const check = await runCheck([OWNER]);
+    expect(check.status, check.stderr).toBe(0);
+    const inbox = getInbox(OWNER);
+    expect(readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))).toEqual([]);
+    const archived = join(inbox.root, "archive", oldIso.slice(0, 7), basename(path));
+    expect(existsSync(archived)).toBe(true);
+    expect(JSON.parse(readFileSync(archived, "utf-8")).ackedAt).toBe(oldIso);
+  });
+
+  test("an ack of a record still in new/ removes it, so a later check presents nothing", async () => {
+    const sent = sendMessage(OWNER, signedBody("acked unread"), SENDER);
+    expect(ackMessage(OWNER, sent.id)?.ackedAt).toEqual(expect.any(String));
+    const inbox = getInbox(OWNER);
+    expect(readdirSync(inbox.fresh).filter((f) => f.endsWith(".json"))).toEqual([]);
+    expect(await checkMessages(OWNER)).toEqual([]);
+    expect(readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))).toEqual([]);
+  });
+
+  test("gcMessages removes an acked record when its delivery and its ack are both over 24 hours old or its delivery is over 48 hours old, and keeps the others", async () => {
+    // body -> [delivery age, ack age], in hours
+    const ages: Record<string, [number, number]> = {
+      "old delivery, old ack": [25, 25],
+      "fresh delivery, fresh ack": [0, 0],
+      "old delivery, fresh ack": [30, 0],
+      "delivery past the hard cutoff, fresh ack": [49, 0],
+    };
+    for (const body of Object.keys(ages)) {
+      const sent = sendMessage(OWNER, signedBody(body), SENDER);
+      await checkMessages(OWNER);
+      ackMessage(OWNER, sent.id);
+    }
+    const inbox = getInbox(OWNER);
+    const hoursAgo = (hours: number) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+    const bodies = () => readdirSync(inbox.cur).filter((f) => f.endsWith(".json"))
+      .map((f) => JSON.parse(readFileSync(join(inbox.cur, f), "utf-8")).body as string).sort();
+    expect(bodies()).toEqual(Object.keys(ages).sort());
+    for (const f of readdirSync(inbox.cur).filter((name) => name.endsWith(".json"))) {
+      const path = join(inbox.cur, f);
+      const record = JSON.parse(readFileSync(path, "utf-8"));
+      const [delivery, ack] = ages[record.body]!;
+      record.timestamp = hoursAgo(delivery);
+      record.receivedAt = record.timestamp;
+      record.ackedAt = hoursAgo(ack);
+      writeFileSync(path, JSON.stringify(record, null, 2), "utf-8");
+    }
+
+    expect(gcMessages(OWNER)).toBe(2);
+    expect(bodies()).toEqual(["fresh delivery, fresh ack", "old delivery, fresh ack"]);
+  });
+
+  test("an ack whose delete of a new/ record fails exits non-zero, names the path and the error, and writes nothing to the record", async () => {
+    const sent = sendMessage(OWNER, signedBody("delete fails"), SENDER);
+    const before = readFileSync(sent.filePath, "utf-8");
+    // The spawned CLI's unlink of this one record fails, as a filesystem error would.
+    const preload = join(tempRoot, "unlink-fault-preload.ts");
+    writeFileSync(preload, [
+      'import { mock } from "bun:test";',
+      'import * as fs from "node:fs";',
+      'import { resolve } from "node:path";',
+      `const target = resolve(${JSON.stringify(sent.filePath)});`,
+      "const unlink = fs.unlinkSync;",
+      'mock.module("node:fs", () => ({',
+      "  ...fs,",
+      "  unlinkSync: (path: any) => {",
+      '    if (resolve(String(path)) === target) throw Object.assign(new Error("EIO: i/o error, unlink"), { code: "EIO", syscall: "unlink", path: String(path) });',
+      "    return unlink(path);",
+      "  },",
+      "}));",
+    ].join("\n"));
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER, preload);
+    expect(ack.status).toBe(1);
+    expect(ack.stdout).not.toContain("Acked");
+    expect(ack.stderr).toContain(`cannot remove ${resolve(sent.filePath)}: EIO`);
+    expect(readFileSync(sent.filePath, "utf-8")).toBe(before);
+
+    // Nothing was acked, so the next check delivers the record as unacked mail.
+    const delivered = await checkMessages(OWNER);
+    expect(delivered.map((m) => [m.id, m.ackedAt])).toEqual([[sent.id, undefined]]);
+  });
+
+  test("an ack through the CLI deletes a dlq/ record, and a later check does not re-drive it", async () => {
+    const sent = sendMessage(OWNER, signedBody("parked"), SENDER);
+    // Flair is unreachable for this check, so the record is parked in dlq/ as retryable.
+    process.env.FLAIR_URL = "http://127.0.0.1:1";
+    try {
+      expect(await checkMessages(OWNER)).toEqual([]);
+    } finally {
+      process.env.FLAIR_URL = stub.url;
+    }
+    const inbox = getInbox(OWNER);
+    const records = (dir: string) => readdirSync(dir).filter((f) => f.endsWith(".json"));
+    expect(records(inbox.dlq)).toHaveLength(1);
+    expect(readFileSync(join(inbox.dlq, `${records(inbox.dlq)[0]!}.reason`), "utf-8")).toContain("class: verify-unavailable");
+
+    const ack = await runCli(["mail", "ack", sent.id, "--agent", OWNER], OWNER);
+    expect(ack.status, ack.stderr).toBe(0);
+    expect(ack.stdout).toContain(`Acked ${sent.id}`);
+    expect(records(inbox.dlq)).toEqual([]);
+
+    const check = await runCheck([OWNER]);
+    expect(check.status, check.stderr).toBe(0);
+    expect(check.stdout).toContain("No new messages.");
+    expect(records(inbox.cur)).toEqual([]);
+    expect(records(inbox.dlq)).toEqual([]);
   });
 
   test("human output marks a re-delivery once and --json carries the field", async () => {
@@ -247,7 +404,8 @@ describe("mail check re-delivery reason (cli#340)", () => {
       acks.exited,
     ]);
     expect({ status, stdout, stderr }).toEqual({ status: 0, stdout: expect.any(String), stderr: "" });
-    expect(readdirSync(getInbox(OWNER).cur).filter((f) => f.endsWith(".json"))).toEqual([]);
+    // The acked cur/ record is kept, stamped (cli#1098).
+    expect(JSON.parse(readFileSync(curPath(), "utf-8")).ackedAt).toEqual(expect.any(String));
   });
 
   test("external-tier re-delivery names the refusal instead of an ack command", async () => {

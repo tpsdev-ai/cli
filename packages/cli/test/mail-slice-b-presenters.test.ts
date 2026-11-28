@@ -5,11 +5,11 @@ const patchShared = createPatchShared();
 import { afterEach, beforeEach, describe, expect, spyOn, test, mock } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { runMail } from "../src/commands/mail.js";
-import { ackMessage, getInbox, nackMessage, promote, recoverPromoted, sendMessage, verifyMailAction } from "../src/utils/mail.js";
+import { ackMessage, ackMessageAtPath, getInbox, nackMessage, promote, recoverPromoted, sendMessage, verifyMailAction } from "../src/utils/mail.js";
 import { signOutboundBody } from "../src/utils/mail-sign.js";
 import { stubFlairHandler } from "./helpers/stub-flair.js";
 import { mailboxReplayStore } from "../../agent/src/lib/mailbox-policy.js";
@@ -242,12 +242,26 @@ describe("ack and nack re-check the intent under their own lock", () => {
     expect(readFileSync(r.path, "utf8")).toBe(before);
   });
 
+  test("an ack through an aliased path to cur/ refuses an in_progress record and leaves it unchanged (cli#1098)", async () => {
+    const r = await promotedRecord();
+    writeIntent(r, IN_PROGRESS());
+    const before = readFileSync(r.path, "utf8");
+    const root = getInbox("kern").root;
+    symlinkSync(dirname(r.path), join(root, "cur-alias"));
+    // The withhold check is chosen by the record's physical directory, so the
+    // alias is refused exactly as the literal cur/ path is.
+    expect(() => ackMessageAtPath(join(root, "cur-alias", basename(r.path)), root)).toThrow("mail action refused");
+    expect(readFileSync(r.path, "utf8")).toBe(before);
+  });
+
   test("ackMessage and nackMessage act on a record with no intent", async () => {
     const nacked = await promotedRecord();
     expect(nackMessage("kern", nacked.id, "retry later")?.nackedAt).toBeDefined();
     const acked = await promotedRecord();
-    expect(ackMessage("kern", acked.id)?.ackedAt).toBeDefined();
-    expect(existsSync(acked.path)).toBe(false);
+    const stamp = ackMessage("kern", acked.id)?.ackedAt;
+    expect(stamp).toBeDefined();
+    // The acked cur/ record is kept, stamped (cli#1098).
+    expect(JSON.parse(readFileSync(acked.path, "utf8")).ackedAt).toBe(stamp);
   });
 });
 
@@ -317,7 +331,8 @@ describe("tps mail ack / nack (the command)", () => {
       expect(JSON.parse(readFileSync(nacked.path, "utf8")).nackedAt).toBeDefined();
       const acked = await promotedRecord();
       await runMail({ action: "ack", agent: "kern", messageId: acked.id } as never);
-      expect(existsSync(acked.path)).toBe(false);
+      // The acked cur/ record is kept, stamped (cli#1098).
+      expect(JSON.parse(readFileSync(acked.path, "utf8")).ackedAt).toEqual(expect.any(String));
     } finally { restore(); }
   });
 });
