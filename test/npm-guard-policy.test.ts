@@ -331,7 +331,7 @@ describe("refused verbs and shapes", () => {
     }
   });
 
-  test("the spec slot accepts only a package name, not a flag, whitespace, a semicolon, or a URL", () => {
+  test("the spec slot refuses a flag, a space, a semicolon and a URL", () => {
     for (const value of ["--json", "pkg name", "pkg;id", "https://evil.example/x.tgz"]) {
       expect(decide("npm", ["view", value, "version"], "meta").allow).toBe(false);
       expect(
@@ -795,14 +795,14 @@ process.exit(Number(process.env.FAKE_NPM_EXIT || "0"));
 
   test("two URLs in one argument both lose their userinfo", () => {
     const { root, logPath } = makeGuardRoot();
-    const result = runShim("npm", ["ci", "https://a.example https://alice:SECRET@b.example/x"], {
+    const result = runShim("npm", ["ci", "https://bob:FIRST@a.example https://alice:SECRET@b.example/x"], {
       GITHUB_JOB: "test",
       [ROOT_ENV]: root,
       FAKE_NPM_LOG: logPath,
     });
     expect(result.status).not.toBe(0);
     for (const output of [result.stdout, result.stderr]) {
-      for (const fragment of ["alice", "SECRET"]) {
+      for (const fragment of ["bob", "FIRST", "alice", "SECRET"]) {
         expect(output).not.toContain(fragment);
       }
     }
