@@ -2505,7 +2505,7 @@ describe("the workflow guard follows the decoded interpreter word (#941)", () =>
   }
 });
 
-describe("the workflow guard refuses every env option and accepts leading assignments (#941)", () => {
+describe("the workflow guard refuses leading env options and follows leading assignments (#941)", () => {
   const WORKFLOW = "workflow-941-env-options";
   const tracked = new Set(["package-lock.json"]);
   const refused = [

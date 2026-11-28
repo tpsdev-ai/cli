@@ -727,9 +727,11 @@ const VERSION_FLAGS = new Set(["--version", "-v", "--help", "-h", "--revision"])
 const EMBEDDED_WRAPPERS = new Set(["docker", "su", "setsid", "timeout", "nice", "chroot", "stdbuf"]);
 // Command words the guard handles by decoded value: it follows the word,
 // validates its invocation shape, or knows it runs no repository script. A
-// name-shaped quoted or escaped spelling whose decoded value is absent is
-// refused. `env` is here for its `NAME=value` form; every `env` option is
-// refused, and `builtin` and `hash` are not handled.
+// name-shaped quoted or escaped command word whose decoded value is absent is
+// refused. `env` is here for its leading-assignment form: the guard follows
+// leading `NAME=value` and `NAME+=value` assignments and refuses a leading
+// option except a lone `-`; a quoted or escaped assignment, and `env -`, are
+// not followed and not refused, and `builtin` and `hash` are not handled.
 const HANDLED_COMMAND_WORDS = new Set([
   "source", ".", "eval",
   "cd", "pushd", "popd",
@@ -1496,16 +1498,18 @@ function decodedWords(tokens: readonly WordToken[]): WordToken[] {
 
 /**
  * Walk a clause's words and return its command word. Prefixes, options and
- * reserved words are recognised by their decoded static value, so a quoted or
- * escaped prefix or option matches like an unquoted one. `refuse` is required:
- * an option a prefix does not model, an `env` option, `builtin` or `hash`, or a
- * command word beginning with an unquoted `{` is refused. `env` accepts only
- * leading `NAME=value` assignments. A word after a prefix with no static value
- * is returned with a null value, so the caller judges it (a run block refuses
- * it; a followed script records it). `refuseWrapper` is supplied only by
- * run-block validation; discovery follows a listed wrapper's payload. The
- * result carries the command word and the arguments decoded where they have a
- * static value, so discovery consumes that one result.
+ * reserved words are recognised by their decoded static value; a quoted or
+ * escaped command word matches its plain spelling. `refuse` is required:
+ * an option a prefix does not model, a leading `env` option other than a lone
+ * `-`, `builtin` or `hash`, or a command word beginning with an unquoted `{`
+ * is refused. `env` follows leading `NAME=value` and `NAME+=value`
+ * assignments; a quoted or escaped assignment and `env -` are not followed. A
+ * word after a prefix with no static value is returned with a null value, so
+ * the caller judges it (a run block refuses it; a followed script may skip it
+ * without recording it). `refuseWrapper` is supplied only by run-block
+ * validation; discovery follows a listed wrapper's payload. The result carries
+ * the command word and the arguments decoded where they have a static value, so
+ * discovery consumes that one result.
  */
 function walkCommandWord(
   tokens: readonly WordToken[],

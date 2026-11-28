@@ -28,9 +28,7 @@ normalization, or use these shapes without backticks, `$(` or multiline quotes:
   `--registry=https://<host>[/<path>]` with a non-empty host; that line may not contain `$`, a backtick,
   a quote, `;`, `&`, `|`, `<`, `>`, `(`, `)`, `{`, `}` or `\`.
 
-Refusals name the workflow, job, step and physical line. The spelling check is a
-best-effort lint: variable or substitution indirection such as `n${x}pm` or
-`$(printf n)pm`, and composite-action shells, are not covered.
+Refusals name the workflow, job, step and physical line.
 
 A step whose effective shell — its own `shell:`, else its job's
 `defaults.run.shell`, else the workflow's — is set to anything other than
@@ -42,8 +40,8 @@ word's static value with bash's quoting rules: inside single quotes every charac
 is literal, a backslash included; inside double quotes a backslash escapes only
 `$`, a backquote, `\"`, `\\` and newline; outside quotes a backslash escapes the
 next character. A word containing a parameter, command, arithmetic or brace expansion, an unescaped backquote, an unquoted `~` or an unquoted glob has no static value.
-Prefix, option and wrapper matching read the static value, so a statically quoted
-spelling matches like an unquoted one. In an unapproved run block, a word with no
+Command-word matching reads the static value, so a quoted or escaped command word
+matches its plain spelling. In an unapproved run block, a word with no
 static value in command position is refused, naming it, except a plain variable
 command word with no prefix before it, and the `[` and `[[` command words. In unapproved run blocks,
 a backslash-newline continuation
@@ -53,10 +51,11 @@ refuses a command word whose first decoded character is an unquoted `{`:
 `{fd}>out` is refused as a leading redirection. In unapproved run blocks, after
 `env`, `sudo`, `exec` or `xargs` every word up to and including the command word
 must have a static value; a word without one is refused. In followed shell files
-such a word is not followed.
-Command words containing `*`, `?`, `[` or `$'` are refused; `[` and `[[` themselves
-remain accepted. `env` accepts only leading `NAME=value` assignments followed by
-the command; every `env` option is refused. The guard consumes the `sudo`,
+the walk may skip such a word without recording it.
+In unapproved run blocks, command words containing `*`, `?`, `[` or `$'` are
+refused; `[` and `[[` themselves remain accepted. The guard follows `env` through
+leading `NAME=value` and `NAME+=value` assignments, and refuses a leading `env`
+option unless it is a lone `-`. The guard consumes the `sudo`,
 `exec` and `xargs` options from a finite grammar and refuses unmodelled options,
 including `sudo -s`/`-i`/`--shell`/`--login`. These refusals apply in run blocks
 and followed shell files. In unapproved run blocks, the listed wrappers
@@ -64,9 +63,10 @@ and followed shell files. In unapproved run blocks, the listed wrappers
 `unbuffer`, `script` and `watch`) are refused outright; `builtin` and `hash` are
 refused as unrecognised command words in run blocks and followed shell files. A
 `${{ ... }}` runner expression in command position is refused however it is quoted. Command-position `time`, `coproc`, `function`, `in` and `]]` are refused in unapproved run blocks; `!` is skipped before the assignment search. `case` in command position is refused in unapproved run blocks;
-this best-effort lint does not model compound commands. These checks read a
-run block's top-level clauses only: commands inside `$(...)` or backtick
-substitutions, and text after a quote that spans physical lines, are not checked.
+this best-effort lint does not model compound commands. Substitution bodies are
+scanned in their own state, where the command-word and prefix-option refusals
+apply but the run-block glob refusal does not; text after a quote that spans
+physical lines is not checked.
 The guard follows repository scripts a workflow invokes by a literal path,
 recursively, and local composite actions (`uses: ./...`). One scanner reads
 workflow and action `run:` blocks and followed shell files: it splits clauses,
@@ -103,6 +103,13 @@ cli#948. Installs inside
 followed JavaScript or TypeScript scripts and `npm run`/`bun run` targets in
 `package.json` are not inspected. A `$'...'` span is a quote in which a backslash
 escapes the next character and `$(` and a backtick are literal.
+
+Limits: variable or substitution indirection such as `n${x}pm` or
+`$(printf n)pm`, and composite-action shells (cli#948), are not covered; the
+parser limits are cited above (cli#975). A quoted or escaped `env` assignment
+and `env -` are not followed and not refused. A followed shell file gets the
+command-word and prefix-option refusals but not the run-block glob refusal, and
+may skip a nonstatic prefixed word without recording it.
 
 In a followed shell script, a logical line (continuations joined, word-boundary
 comments stripped, here-document headers matched after comment stripping,
