@@ -253,7 +253,9 @@ test("a bare relative record update contends for the root lock before sweeping",
   try {
     process.chdir(inbox.cur);
     expect(mail.ackMessageAtPath("record.json", inbox.root).read).toBe(true);
-    expect(fs.existsSync(target)).toBe(false);
+    // cli#1098: the record is physically in cur/, so the ack keeps it there, stamped,
+    // although the bare relative path names no directory.
+    expect(JSON.parse(fs.readFileSync(target, "utf8")).read).toBe(true);
     expect(fs.existsSync(old)).toBe(false);
     expect(fs.readFileSync(fresh, "utf8")).toBe("{ fresh");
   } finally {
