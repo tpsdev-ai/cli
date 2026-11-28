@@ -1,0 +1,11 @@
+#!/bin/sh
+# npm guard shim (cli#948): decide first, then spawn the recorded npm.
+# No `set -x`: a command line may carry a registry credential.
+self=$0
+case $self in
+  */*) ;;
+  *) self=$(command -v "$self") ;;
+esac
+[ -n "$self" ] || exit 1
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P) || exit 1
+exec node "$dir/forward.mjs" npm "$@"

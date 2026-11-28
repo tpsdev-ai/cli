@@ -1,0 +1,13 @@
+#!/bin/sh
+# The guard's script shell (cli#948 design v2 item 5): it puts the guard's
+# directory first on PATH, then execs /bin/sh.
+self=$0
+case $self in
+  */*) ;;
+  *) self=$(command -v "$self") ;;
+esac
+[ -n "$self" ] || exit 1
+dir=$(CDPATH= cd -- "$(dirname -- "$self")" && pwd -P) || exit 1
+PATH="$dir:$PATH"
+export PATH
+exec /bin/sh "$@"
