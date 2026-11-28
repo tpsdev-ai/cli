@@ -1,0 +1,1 @@
+- **mail watch keeps warning once for a name that stays listed while its stat fails or returns ENOENT.** The warning resets only when the name is absent from a listing or stats successfully, as documented. ([#1107](https://github.com/tpsdev-ai/cli/issues/1107))
