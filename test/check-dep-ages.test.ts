@@ -2470,16 +2470,51 @@ describe("the workflow guard follows a script through a statically quoted prefix
   }
 });
 
+describe("the workflow guard follows the decoded interpreter word (#941)", () => {
+  const WORKFLOW = "workflow-941-interpreter-word";
+  const tracked = new Set(["package-lock.json"]);
+  const spellings = [
+    String.raw`\bash scripts/check.sh`,
+    "'bash' scripts/check.sh",
+    String.raw`"bash" scripts/check.sh`,
+    String.raw`'ba'"sh" scripts/check.sh`,
+  ];
+  const install = /does not read the lockfile and is refused/;
+
+  const withTree = (files: Record<string, string>, body: (root: string) => void) => {
+    const root = makeTreeFixture(files);
+    try {
+      body(root);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  for (const run of spellings) {
+    it(`follows ${run} in a run block`, () => {
+      withTree({ "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+
+    it(`follows ${run} from a followed script`, () => {
+      withTree({ "scripts/outer.sh": `${run}\n`, "scripts/check.sh": "npx some-tool\n" }, (root) => {
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(install);
+      });
+    }, 10_000);
+  }
+});
+
 describe("the workflow guard refuses env working-directory options (#941)", () => {
   const WORKFLOW = "workflow-941-env-chdir";
   const tracked = new Set(["package-lock.json"]);
   const options = [
-    ["env -C sub bash check.sh", /env -C changes the working directory and is refused/],
-    ["env -Csub bash check.sh", /env -C changes the working directory and is refused/],
-    ["env -iC sub bash check.sh", /env -C changes the working directory and is refused/],
-    ["env --chdir sub bash check.sh", /env --chdir changes the working directory and is refused/],
-    ["env --chdir=sub bash check.sh", /env --chdir changes the working directory and is refused/],
-  ] as [string, RegExp][];
+    ["env -C sub bash check.sh", "env -C changes the working directory and is refused"],
+    ["env -Csub bash check.sh", "env -C changes the working directory and is refused"],
+    ["env -iC sub bash check.sh", "env -C changes the working directory and is refused"],
+    ["env --chdir sub bash check.sh", "env --chdir changes the working directory and is refused"],
+    ["env --chdir=sub bash check.sh", "env --chdir changes the working directory and is refused"],
+  ] as [string, string][];
 
   const withTree = (files: Record<string, string>, body: (root: string) => void) => {
     const root = makeTreeFixture(files);
@@ -2493,13 +2528,17 @@ describe("the workflow guard refuses env working-directory options (#941)", () =
   for (const [run, reason] of options) {
     it(`refuses ${run} in a run block`, () => {
       withTree({ "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
-        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(reason);
+        expect(() => assertNpmCiWorkflowTree(workflowStep(run, "."), tracked, root, WORKFLOW)).toThrow(
+          `workflow ${WORKFLOW} job build step 1: cannot establish the npm ci directory: ${reason}: ${run} (physical line 1)`,
+        );
       });
     }, 10_000);
 
     it(`refuses ${run} in a followed script`, () => {
       withTree({ "scripts/outer.sh": `${run}\n`, "check.sh": "true\n", "sub/check.sh": "npx some-tool\n" }, (root) => {
-        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(reason);
+        expect(() => assertNpmCiWorkflowTree(workflowStep("bash scripts/outer.sh", "."), tracked, root, WORKFLOW)).toThrow(
+          `workflow ${WORKFLOW} job build step 1: script scripts/outer.sh (invocation scripts/outer.sh), line 1: ${reason}: ${run}`,
+        );
       });
     }, 10_000);
   }
@@ -5631,6 +5670,10 @@ describe("the workflow guard refuses unknown options, listed wrappers and runner
 
   it("fails the real-bash helper when the control does not finish", () => {
     expect(() => bashArgv("while :; do :; done", 250)).toThrow(/timed out|ETIMEDOUT|killed|SIGTERM/);
+  }, 5_000);
+
+  it("fails the real-bash helper when the child dies on a signal without a spawn error", () => {
+    expect(() => bashArgv("kill -TERM $$", 1_000)).toThrow(/killed by SIGTERM/);
   }, 5_000);
 
   const statics: { run: string; reason: RegExp; argv: string | null }[] = [

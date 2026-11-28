@@ -1394,7 +1394,13 @@ function consumePrefixOptionWords(
   tokens: readonly WordToken[],
   index: number,
   refuse?: (reason: string) => never,
+  chdirRefuse?: (reason: string) => never,
 ): number {
+  const refuseChdir = (reason: string): never => {
+    if (chdirRefuse !== undefined) return chdirRefuse(reason);
+    if (refuse !== undefined) return refuse(reason);
+    throw new Error(reason);
+  };
   const stop = (reason: string): number => {
     if (refuse !== undefined) refuse(reason);
     return index;
@@ -1411,7 +1417,7 @@ function consumePrefixOptionWords(
       const equals = text.indexOf("=");
       const name = equals === -1 ? text.slice(2) : text.slice(2, equals);
       if (command === "env" && name === "chdir") {
-        throw new Error("env --chdir changes the working directory and is refused");
+        refuseChdir("env --chdir changes the working directory and is refused");
       }
       if (grammar.longValue.has(name)) {
         if (equals !== -1) {
@@ -1437,7 +1443,7 @@ function consumePrefixOptionWords(
     for (let letter = 0; letter < letters.length; letter++) {
       const flag = letters[letter];
       if (command === "env" && flag === "C") {
-        throw new Error("env -C changes the working directory and is refused");
+        refuseChdir("env -C changes the working directory and is refused");
       }
       if (grammar.shortValue.has(flag)) {
         takesNext = letter === letters.length - 1;
@@ -1460,13 +1466,35 @@ function consumePrefixOptionWords(
   return index;
 }
 
+/** One clause's command word and the words after it, decoded where static. */
+type WalkedWord = {
+  index: number;
+  token: WordToken;
+  /** The command word decoded with bash's quoting rules; null when it is not static. */
+  value: string | null;
+  /** True when a prefix command was consumed before the command word. */
+  prefixed: boolean;
+  /** The words after the command word, each decoded when it has a static value. */
+  args: WordToken[];
+};
+
+/** Decode each word that has a static value, keeping the raw word otherwise. */
+function decodedWords(tokens: readonly WordToken[]): WordToken[] {
+  return tokens.map((token) => {
+    const value = staticWordValue(token.text);
+    return value === null ? token : { ...token, text: value };
+  });
+}
+
 /**
  * Walk a clause's words and return its command word. Prefixes, options and
  * reserved words are recognised by their decoded static value in decoded mode,
  * so a statically quoted prefix or option matches like an unquoted one. A
  * `refuse` callback turns the strict run-block checks on; listed wrappers are
  * refused outright. `braceRefuse` is called for a word whose first decoded
- * character is an unquoted `{`.
+ * character is an unquoted `{`. The result carries the command word and the
+ * arguments decoded where they have a static value, so discovery consumes that
+ * one result.
  */
 function walkCommandWord(
   tokens: readonly WordToken[],
@@ -1474,11 +1502,14 @@ function walkCommandWord(
   decoded: boolean,
   refuse?: (reason: string) => never,
   braceRefuse?: (reason: string) => never,
-): { index: number; token: WordToken } | null {
+  chdirRefuse?: (reason: string) => never,
+): WalkedWord | null {
   let index = 0;
   let sawPrefix = false;
   let prefix = "";
   const onBrace = braceRefuse ?? refuse;
+  const walked = (at: number, token: WordToken, value: string | null): WalkedWord =>
+    ({ index: at, token, value, prefixed: sawPrefix, args: decodedWords(tokens.slice(at + 1)) });
   while (index < tokens.length) {
     const token = tokens[index];
     if (onBrace !== undefined && isBraceCommandWord(token.text)) {
@@ -1489,14 +1520,14 @@ function walkCommandWord(
     // static; the plain-variable command word is accepted only without one.
     if (decoded && sawPrefix && value === null) {
       if (refuse !== undefined) refuse(`an unapproved run block has a word without a static value after ${prefix}: ${token.text}`);
-      return { index, token };
+      return walked(index, token, null);
     }
     if (isScalarAssignment(token.text)) {
       index++;
       continue;
     }
     const text = value ?? stripOuterQuotes(token.text);
-    if (includeCase && !token.quoted && text === "case") return { index, token };
+    if (includeCase && !token.quoted && text === "case") return walked(index, token, value);
     if (!token.quoted && SHELL_HEADERS.has(text)) return null;
     if ((decoded || !token.quoted) && PREFIX_COMMANDS.has(text)) {
       // `command -v`/`-V` looks a name up; it runs no command.
@@ -1509,7 +1540,7 @@ function walkCommandWord(
       prefix = text;
       index++;
       const grammar = PREFIX_OPTION_GRAMMAR[text];
-      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse);
+      if (grammar !== undefined) index = consumePrefixOptionWords(text, grammar, tokens, index, refuse, chdirRefuse);
       continue;
     }
     if ((decoded || !token.quoted) && UNMODELLED_WRAPPERS.has(text)) {
@@ -1517,7 +1548,7 @@ function walkCommandWord(
       if (refuse !== undefined) {
         refuse(`an unapproved run block has a listed exec wrapper: ${text}`);
       }
-      return { index, token };
+      return walked(index, token, value);
     }
     if (!token.quoted && SHELL_KEYWORDS.has(text)) {
       index++;
@@ -1527,7 +1558,7 @@ function walkCommandWord(
       index++;
       continue;
     }
-    return { index, token };
+    return walked(index, token, value);
   }
   return null;
 }
@@ -1544,7 +1575,7 @@ function commandWord(
   includeCase = false,
   refuse?: (reason: string) => never,
   braceRefuse?: (reason: string) => never,
-): { index: number; token: ShellToken } | null {
+): WalkedWord | null {
   return walkCommandWord(tokens, includeCase, refuse !== undefined, refuse, braceRefuse);
 }
 
@@ -2131,12 +2162,12 @@ function clauseInvocations(
   clause: Clause,
   entryText: string,
   number: number,
-  word: { index: number; token: WordToken } | null,
+  word: WalkedWord | null,
 ): ClauseInvocation[] {
   const at = state.source === "run-block" ? `${state.label}: ${entryText}` : lineAt(state, number);
   const found: ClauseInvocation[] = [];
   const embedded = (): ClauseInvocation[] => {
-    for (const invocation of embeddedInvocations(clause, word)) {
+    for (const invocation of embeddedInvocations(word)) {
       const token = "rel" in invocation ? { text: invocation.rel, quoted: false } : { text: invocation.dynamic, quoted: false };
       found.push({ invocation: resolveInvocation(ctx, state, token, at), embedded: true });
     }
@@ -2145,14 +2176,14 @@ function clauseInvocations(
   if (word === null) return embedded();
   const quote = word.token.text[0];
   if ((quote === "'" || quote === '"') && !word.token.text.endsWith(quote)) return embedded();
-  const command = stripOuterQuotes(word.token.text);
+  const command = word.value ?? stripOuterQuotes(word.token.text);
   const base = command.split("/").pop() ?? command;
   // A reserved word the guard does not model is never a command it can judge.
   if (!word.token.quoted && SHELL_RESERVED.has(command)) {
     return [{ invocation: { dynamic: command }, embedded: false }];
   }
   if (!word.token.quoted && (command === "source" || command === ".")) {
-    const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
+    const argument = firstNonFlag(word.args);
     found.push({ invocation: argument === undefined ? { dynamic: command } : resolveInvocation(ctx, state, argument, at), embedded: false });
     return found;
   }
@@ -2160,11 +2191,11 @@ function clauseInvocations(
   if (!word.token.quoted && (command === "cd" || command === "pushd" || command === "popd")) return [];
   if (!word.token.quoted && (base === "npm" || base === "npx")) return [];
   if (!word.token.quoted && command === "su") {
-    const args = clause.tokens.slice(word.index + 1).map((token) => stripOuterQuotes(token.text));
+    const args = word.args.map((token) => stripOuterQuotes(token.text));
     return args.includes("-c") ? [{ invocation: { dynamic: "-c" }, embedded: false }] : [];
   }
   if (INTERPRETERS.has(base)) {
-    const args = clause.tokens.slice(word.index + 1);
+    const args = word.args;
     const texts = args.map((token) => stripOuterQuotes(token.text));
     if (clause.piped) return [{ invocation: { dynamic: args[0]?.text ?? "stdin" }, embedded: false }];
     const heredoc = texts.find((text) => text.includes("<<"));
@@ -2201,7 +2232,7 @@ function clauseInvocations(
     return [{ invocation: resolveInvocation(ctx, state, argument, at), embedded: false }];
   }
   if (SCRIPT_EXTENSION.test(command)) {
-    return [{ invocation: resolveInvocation(ctx, state, word.token, at), embedded: false }];
+    return [{ invocation: resolveInvocation(ctx, state, { ...word.token, text: command }, at), embedded: false }];
   }
   return embedded();
 }
@@ -2265,11 +2296,23 @@ function scanShellText(ctx: TreeContext, initial: ShellState, text: string): voi
       const word = walkCommandWord(clause.tokens, false, true, undefined,
         state.source === "run-block" && !reviewed
           ? (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); }
-          : undefined);
+          : undefined,
+        (reason) => { throw new Error(`${lineAt(state, number)}: ${reason}: ${entry.text}`); });
+      if (word !== null && word.value === null && word.token.text !== "[" && word.token.text !== "[[" &&
+          !/[$`*?\[]/.test(word.token.text) && (word.prefixed || !isVariableWord(word.token.text))) {
+        // Refuse a non-static command word instead of passing it to discovery
+        // unfollowed; plain variables, substitutions and glob/case patterns
+        // keep their existing handling.
+        if (state.source === "followed-script") {
+          pushUnresolved(ctx, state.file, number, word.token.text, state.label, state.chain);
+          continue;
+        }
+        throw new Error(`${lineAt(state, number)}: cannot establish the command word: ${word.token.text}: ${entry.text}`);
+      }
       if (word !== null) {
-        const command = stripOuterQuotes(word.token.text);
+        const command = word.value ?? stripOuterQuotes(word.token.text);
         if (!word.token.quoted && command === "cd") {
-          const argument = firstNonFlag(clause.tokens.slice(word.index + 1));
+          const argument = firstNonFlag(word.args);
           const target = argument === undefined ? "" : stripOuterQuotes(argument.text).replace(/^--\s*/, "");
           const at = state.source === "run-block" ? `${state.label}: ${entry.text}` : lineAt(state, number);
           const resolved = resolveCdTarget(ctx, target, state.cwd, state.scriptDir, state.bindings, at);
@@ -2590,23 +2633,22 @@ function handleInstall(
   ctx.installs++;
 }
 
-function embeddedInvocations(clause: Clause, word: { index: number; token: WordToken } | null): Invocation[] {
-  const tokens = clause.tokens;
-  const wordIndex = word === null ? -1 : word.index;
+function embeddedInvocations(word: WalkedWord | null): Invocation[] {
   const found: Invocation[] = [];
-  const base = word === null ? "" : (stripOuterQuotes(word.token.text).split("/").pop() ?? "");
+  const command = word === null ? "" : word.value ?? stripOuterQuotes(word.token.text);
+  const base = command.split("/").pop() ?? "";
   if (word !== null && (word.token.quoted || /^\$/.test(word.token.text))) {
-    const argument = tokens[wordIndex + 1];
+    const argument = word.args[0];
     if (argument !== undefined && !argument.quoted && /^(?:\.\/|scripts\/|\.github\/scripts\/)/.test(argument.text) && SCRIPT_EXTENSION.test(argument.text)) {
       found.push({ rel: argument.text });
     }
   }
   if (!EMBEDDED_WRAPPERS.has(base)) return found;
-  for (const [index, token] of tokens.entries()) {
-    if (index <= wordIndex || token.quoted) continue;
+  for (const [index, token] of word.args.entries()) {
+    if (token.quoted) continue;
     const text = stripOuterQuotes(token.text);
     if (!/^(?:bash|sh|node|bun)$/.test(text)) continue;
-    const argument = tokens[index + 1];
+    const argument = word.args[index + 1];
     // Unknown => refuse: a wrapped interpreter whose payload is absent,
     // `-c`/`-s`, or a here-document cannot be resolved to one repository file.
     if (argument === undefined) {
